@@ -546,6 +546,10 @@ impl DriveConfigs {
         &self.configs
     }
 
+    pub fn has_root_device(&self) -> bool {
+        self.configs.iter().any(DriveConfig::is_root_device)
+    }
+
     pub(crate) fn from_validated_single(
         config: DriveConfig,
     ) -> Result<Self, std::collections::TryReserveError> {

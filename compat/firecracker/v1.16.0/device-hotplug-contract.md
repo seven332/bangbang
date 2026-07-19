@@ -52,18 +52,19 @@ admission and marks the worker terminal.
 
 Pmem insertion additionally maps the already-open file on the owner thread,
 allocates the first 2-MiB-aligned guest range outside DRAM, the full virtio-mem
-reservation, and every live pmem range, creates one exact private HVF shadow,
-and registers that shadow before endpoint publication. A failed endpoint
-publication unregisters the unpublished shadow without flushing it. Failure to
-undo that registration is terminal because the guest-memory inventory is no
+reservation, and every live pmem range, then registers a cloned lease on that
+exact file-backed mapping before endpoint publication. A failed endpoint
+publication unregisters the unpublished mapping without flushing it. Failure
+to undo that registration is terminal because the host-mapping inventory is no
 longer trustworthy.
 
 Removal first unpublishes MMIO and ECAM reachability, closes endpoint admission,
 and drains already admitted work and messages while retaining exact leases. A
 recoverable preparation failure republishes the same endpoint. Pmem removal
-then flushes only its writable shadow to the exact backing and unregisters that
-one range; an unmap failure retains the mapping for retry and restores endpoint
-reachability. The endpoint commit boundary finally releases device state,
+then synchronizes only the exact persistent file prefix with `MS_SYNC` and
+unregisters that one direct range; an unmap failure retains every lease HVF may
+still reference for retry and restores endpoint reachability. The endpoint
+commit boundary finally releases device state,
 interrupt routes, BAR, PCI function, dispatcher registration, mapping, backing,
 metrics generation, guest range, and configuration before capacity can be
 reused. Incomplete insertion cleanup, failure to restore a preparation-stage
@@ -171,9 +172,9 @@ evidence.
 
 ## Explicit exclusions
 
-These slices do not implement root block/pmem insertion or removal, vhost-user
-block, async/io_uring, automatic guest PCI notification, PCI state in native-v1
-snapshots, direct file-backed HVF pmem mapping, pmem dirty tracking, externally
+These slices do not implement runtime root block/pmem insertion or removal,
+vhost-user block, async/io_uring, automatic guest PCI notification, PCI state
+in native-v1 snapshots, pmem dirty tracking, externally
 certified vmnet connectivity, or Firecracker's KVM eventfd, timerfd, and
 interrupt-controller implementation identities. PCI snapshot profiles remain
 rejected before artifact mutation. Apple-approved production vmnet credentials

@@ -70,10 +70,10 @@ use crate::pci::{
     PciSegment, PciSegmentError, PciType0Configuration, SharedPciSegment, register_ecam_handler,
 };
 use crate::pmem::{
-    PmemFileBacking, PmemMmioDeviceRegistration, PmemMmioLayout, PmemMmioRegistrationError,
-    PmemUpdate, PmemUpdateError, PreparedPmemDevice, PreparedPmemDeviceError, PreparedPmemDevices,
-    VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus,
-    VirtioPmemMmioHandler,
+    PmemConfig, PmemFileBacking, PmemMmioDeviceRegistration, PmemMmioLayout,
+    PmemMmioRegistrationError, PmemUpdate, PmemUpdateError, PreparedPmemDevice,
+    PreparedPmemDeviceError, PreparedPmemDevices, VirtioPmemDeviceNotificationDispatch,
+    VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus, VirtioPmemMmioHandler,
 };
 use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use crate::serial::{
@@ -3273,6 +3273,7 @@ pub enum Arm64BootResourceError {
     RootDriveCommandLine {
         source: BootCommandLineError,
     },
+    RootDeviceConflict,
     PrepareBlockDevices {
         source: PreparedBlockDeviceError,
     },
@@ -3436,9 +3437,10 @@ impl fmt::Display for Arm64BootResourceError {
             Self::RootDriveCommandLine { source } => {
                 write!(
                     f,
-                    "failed to append root-drive kernel command-line arguments: {source}"
+                    "failed to append root-device kernel command-line arguments: {source}"
                 )
             }
+            Self::RootDeviceConflict => f.write_str("multiple root devices are configured"),
             Self::PrepareBlockDevices { source } => {
                 write!(f, "failed to prepare block devices: {source}")
             }
@@ -3624,6 +3626,7 @@ impl std::error::Error for Arm64BootResourceError {
             | Self::MemorySizeOverflow { .. }
             | Self::MemorySizeExceedsArchitecturalMaximum { .. }
             | Self::VmGenIdRandom
+            | Self::RootDeviceConflict
             | Self::BlockInterruptLineCount { .. }
             | Self::PmemInterruptLineCount { .. }
             | Self::NetworkInterruptLineCount { .. }
@@ -3861,7 +3864,11 @@ impl Arm64BootResources {
                 .with_appended_kernel_args(["pci=off"])
                 .map_err(|source| Arm64BootResourceError::PciCommandLine { source })?;
         }
-        append_root_drive_command_line(&mut loaded_boot_source, controller.drive_configs())?;
+        append_root_device_command_line(
+            &mut loaded_boot_source,
+            controller.drive_configs(),
+            controller.pmem_configs(),
+        )?;
         let prepared_pmems = PreparedPmemDevices::from_config_slice_with_layout_and_backings(
             controller.pmem_configs(),
             &layout,
@@ -4432,20 +4439,42 @@ fn initial_vmclock_abi_bytes() -> Vec<u8> {
     bytes
 }
 
-fn append_root_drive_command_line(
+fn append_root_device_command_line(
     loaded_boot_source: &mut LoadedBootSource,
     drive_configs: &[DriveConfig],
+    pmem_configs: &[PmemConfig],
 ) -> Result<(), Arm64BootResourceError> {
-    if let Some(root_drive) = drive_configs.iter().find(|config| config.is_root_device()) {
-        let root_arg = root_drive
-            .partuuid()
-            .map(|partuuid| format!("root=PARTUUID={partuuid}"))
-            .unwrap_or_else(|| "root=/dev/vda".to_string());
-        let mode_arg = if root_drive.is_read_only() {
-            "ro"
-        } else {
-            "rw"
-        };
+    let mut root_drives = drive_configs
+        .iter()
+        .filter(|config| config.is_root_device());
+    let root_drive = root_drives.next();
+    let mut root_pmems = pmem_configs
+        .iter()
+        .enumerate()
+        .filter(|(_, config)| config.root_device());
+    let root_pmem = root_pmems.next();
+    if (root_drive.is_some() && root_pmem.is_some())
+        || root_drives.next().is_some()
+        || root_pmems.next().is_some()
+    {
+        return Err(Arm64BootResourceError::RootDeviceConflict);
+    }
+
+    let root = root_drive
+        .map(|root_drive| {
+            let root_arg = root_drive
+                .partuuid()
+                .map(|partuuid| format!("root=PARTUUID={partuuid}"))
+                .unwrap_or_else(|| "root=/dev/vda".to_string());
+            (root_arg, root_drive.is_read_only())
+        })
+        .or_else(|| {
+            root_pmem
+                .map(|(index, root_pmem)| (format!("root=/dev/pmem{index}"), root_pmem.read_only()))
+        });
+
+    if let Some((root_arg, read_only)) = root {
+        let mode_arg = if read_only { "ro" } else { "rw" };
         loaded_boot_source.command_line = loaded_boot_source
             .command_line
             .with_appended_kernel_args([root_arg.as_str(), mode_arg])
@@ -4919,7 +4948,7 @@ mod tests {
         PCI_ECAM_RESERVED_START, PCI_HOST_BRIDGE_DEVICE_ID, PCI_HOST_BRIDGE_VENDOR_ID,
     };
     use crate::pmem::{
-        PmemConfigInput, PmemMmioLayout, PreparedPmemDeviceError, VIRTIO_PMEM_ALIGNMENT,
+        PmemConfig, PmemConfigInput, PmemMmioLayout, PreparedPmemDeviceError, VIRTIO_PMEM_ALIGNMENT,
     };
     use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
     use crate::serial::{
@@ -5220,9 +5249,20 @@ mod tests {
     }
 
     fn add_pmem(controller: &mut crate::VmmController, id: &str, path: &Path, read_only: bool) {
+        add_pmem_with_root(controller, id, path, false, read_only);
+    }
+
+    fn add_pmem_with_root(
+        controller: &mut crate::VmmController,
+        id: &str,
+        path: &Path,
+        root_device: bool,
+        read_only: bool,
+    ) {
         controller
             .handle_action(VmmAction::PutPmem(
                 PmemConfigInput::new(id, path.to_string_lossy().into_owned())
+                    .with_root_device(root_device)
                     .with_read_only(read_only),
             ))
             .expect("pmem config should be stored");
@@ -8712,6 +8752,113 @@ mod tests {
             fdt_bootargs(&resources),
             "console=ttyS0 pci=off root=/dev/vda rw"
         );
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_read_only_root_pmem_boot_args() {
+        let kernel = temp_file("kernel-root-pmem-ro", &arm64_image());
+        let pmem = temp_file("pmem-root-ro", &[0x5a; 512]);
+        let mut controller = controller_with_kernel_and_boot_args(kernel.path(), "console=ttyS0");
+        add_pmem_with_root(&mut controller, "root", pmem.path(), true, true);
+
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config_with_pmem_lines(&[], &[line(32)]),
+        )
+        .expect("boot resources should assemble with read-only root pmem");
+
+        assert_eq!(
+            resources.loaded_boot_source.command_line.as_str(),
+            "console=ttyS0 pci=off root=/dev/pmem0 ro"
+        );
+        assert_eq!(
+            fdt_bootargs(&resources),
+            "console=ttyS0 pci=off root=/dev/pmem0 ro"
+        );
+    }
+
+    #[test]
+    fn root_pmem_uses_stable_configuration_index_and_writable_mode() {
+        let kernel = temp_file("kernel-root-pmem-index", &arm64_image());
+        let data = temp_file("pmem-data-before-root", &[0x41; 512]);
+        let root = temp_file("pmem-root-index-one", &[0x52; 512]);
+        let mut controller = controller_with_kernel_and_boot_args(kernel.path(), "console=ttyS0");
+        add_pmem(&mut controller, "data", data.path(), true);
+        add_pmem_with_root(&mut controller, "root", root.path(), true, false);
+
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config_with_pmem_lines(&[], &[line(32), line(33)]),
+        )
+        .expect("boot resources should preserve root pmem index");
+
+        assert_eq!(
+            resources.loaded_boot_source.command_line.as_str(),
+            "console=ttyS0 pci=off root=/dev/pmem1 rw"
+        );
+        assert_eq!(resources.pmem_devices[0].id(), "data");
+        assert_eq!(resources.pmem_devices[1].id(), "root");
+    }
+
+    #[test]
+    fn startup_defensively_rejects_dual_block_and_pmem_root_before_backing_open() {
+        let kernel = temp_file("kernel-dual-root", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        let drive = DriveConfigInput::new(
+            "block_root",
+            "block_root",
+            missing_path("dual-root-block"),
+            true,
+        )
+        .validate()
+        .expect("block root should validate independently");
+        let pmem = PmemConfig::try_from(
+            PmemConfigInput::new(
+                "pmem_root",
+                missing_path("dual-root-pmem")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .with_root_device(true),
+        )
+        .expect("pmem root should validate independently");
+        controller.commit_drive_config(drive);
+        controller.commit_pmem_config(pmem);
+
+        let err = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config_with_pmem_lines(&[line(32)], &[line(33)]),
+        )
+        .expect_err("defensive startup root check should reject inconsistent state");
+
+        assert!(matches!(err, Arm64BootResourceError::RootDeviceConflict));
+        assert_eq!(err.to_string(), "multiple root devices are configured");
+    }
+
+    #[test]
+    fn startup_defensively_rejects_two_pmem_roots_before_backing_open() {
+        let kernel = temp_file("kernel-two-pmem-roots", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        for (id, path) in [
+            ("pmem_root_one", missing_path("pmem-root-one")),
+            ("pmem_root_two", missing_path("pmem-root-two")),
+        ] {
+            let pmem = PmemConfig::try_from(
+                PmemConfigInput::new(id, path.to_string_lossy().into_owned())
+                    .with_root_device(true),
+            )
+            .expect("pmem root should validate independently");
+            controller.commit_pmem_config(pmem);
+        }
+
+        let err = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config_with_pmem_lines(&[], &[line(32), line(33)]),
+        )
+        .expect_err("defensive startup root check should reject two pmem roots");
+
+        assert!(matches!(err, Arm64BootResourceError::RootDeviceConflict));
+        assert_eq!(err.to_string(), "multiple root devices are configured");
     }
 
     #[test]

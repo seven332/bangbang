@@ -5668,7 +5668,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_pmem_root_device_fails_before_starting() {
+    fn config_file_pmem_root_device_starts_with_replaced_config() {
         let config_path = unique_config_path("pmem-root-device");
         let config = r#"{
             "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
@@ -5685,20 +5685,11 @@ mod tests {
             TestInstanceStarter,
         );
 
-        let err = super::apply_startup_config_file(
-            &mut vmm,
-            Some(config_path.to_str().expect("UTF-8 path")),
-        )
-        .expect_err("pmem root device should fail");
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("pmem root device should apply before startup");
 
-        assert_eq!(
-            err,
-            ProcessError::ConfigFile(super::ConfigFileError::Apply(VmmActionError::PmemConfig(
-                PmemConfigError::UnsupportedRootDevice
-            )))
-        );
-        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
-        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
         let data = vmm
             .handle_action(VmmAction::GetVmConfig)
             .expect("VM config should be returned");
@@ -5706,8 +5697,8 @@ mod tests {
             panic!("expected VM config");
         };
         assert_eq!(config.pmem_configs().len(), 1);
-        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem-old.img");
-        assert!(!config.pmem_configs()[0].root_device());
+        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem-new.img");
+        assert!(config.pmem_configs()[0].root_device());
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }

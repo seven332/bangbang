@@ -21,11 +21,12 @@ virtio-balloon reporting and zero-safe best-effort Darwin discard, bounded
 virtio-rng, targeted and rate-limited virtio-pmem flush, a block-granular
 virtio-mem plug/unplug lifecycle, the no-interrupt aarch64 PL031 RTC,
 DeviceTree VMGenID including native-v1 replacement notification, and startup
-VMClock discovery. Non-root PCI pmem attach/delete now includes exact dynamic
-mapping, flush, teardown, and range reuse; PCI network attach/delete now owns
-per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime, pmem
-root or direct file-backed mapping, optional-device snapshots, and mutable
-VMClock restore remain explicit limits. Host discard never promises
+VMClock discovery. Pmem now registers its retained file-backed mapping directly
+with HVF, supports deterministic read-only or writable root boot, and retains
+exact dynamic PCI flush, teardown, and range reuse; PCI network attach/delete
+owns per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime,
+pmem snapshot state, and mutable VMClock restore remain explicit limits. Host
+discard never promises
 synchronous RSS or footprint reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
@@ -50,8 +51,9 @@ balloon, entropy, and virtio-mem interrupt/I/O operations. Runtime block,
 network, and pmem in-place PATCH keeps working in either startup transport;
 PCI-mode block and non-root pmem PUT/DELETE use failure-atomic owner-thread
 transactions in Running or Paused state, with explicit guest rescan/removal and
-exact capacity reuse. Pmem additionally owns a dynamic HVF shadow, targeted
-flush/unmap, and reusable aligned guest range. PCI-mode network PUT/DELETE uses
+exact capacity reuse. Pmem additionally owns a shared direct-mapping lease,
+exact-prefix synchronous flush/unmap, and reusable aligned guest range.
+PCI-mode network PUT/DELETE uses
 the same owner-thread boundary with independent MMDS-only or vmnet packet I/O,
 generation-safe metrics, and exact cleanup. Automatic guest hotplug
 notification, PCI snapshot persistence, external vmnet connectivity
@@ -714,6 +716,17 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true,"is_read_only":true}'
 ```
 
+Alternatively, configure exactly one pmem root before startup. Pmem order
+determines the Linux device name (`/dev/pmem0`, `/dev/pmem1`, and so on), and a
+block root and pmem root cannot coexist:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket \
+  -X PUT http://localhost/pmem/rootfs \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"rootfs","path_on_host":"/tmp/rootfs.ext4","root_device":true,"read_only":true}'
+```
+
 With the process started using `--enable-pci`, attach and remove a non-root
 drive after startup:
 
@@ -750,9 +763,10 @@ failures leave the prior configuration intact. Default MMIO sessions reject
 the operations before opening the proposed path. In production-contained mode,
 runtime PUT can consume only an exact still-unused `drive-backing` or
 `pmem-backing` grant from the initial manifest; an aborted insertion restores
-that authority without ambient path fallback. Pmem removal flushes and unmaps
-only its exact dynamic HVF shadow before releasing the guest range. Incomplete
-cleanup is terminal rather than leaving a damaged worker live. See the
+that authority without ambient path fallback. Pmem removal synchronizes the
+exact file prefix and unmaps only its direct lease before releasing the guest
+range. Incomplete cleanup is terminal rather than leaving a damaged worker
+live. See the
 [runtime device hotplug contract](compat/firecracker/v1.16.0/device-hotplug-contract.md).
 Aggregate certification also pins one shared 31-endpoint budget across fixed,
 block, pmem, and network functions; equal ID strings remain type-scoped,
@@ -1011,7 +1025,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 81 implemented-and-verified, 317 audit-required, three
+delivery overlay with 84 implemented-and-verified, 314 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1079,7 +1093,9 @@ the normal production build, exact external config/metadata/kernel/initrd
 adoption by the normal worker, config-file and delayed API block/pmem adoption,
 startup-CLI/config-file and delayed-API logger/metrics/serial adoption,
 pathname-replacement identity, exact role/access and one-time failures,
-read-only guest-write rejection, writable block persistence, pmem read/flush,
+read-only guest-write rejection, writable block persistence, direct read-only
+pmem root boot from the exact granted descriptor after pathname replacement,
+pmem read/flush,
 guest console output through the transferred serial descriptor, terminal
 metrics, concurrent output-session isolation, preauthorized live block
 replacement, limiter-only backing retention, redacted failure atomicity, and

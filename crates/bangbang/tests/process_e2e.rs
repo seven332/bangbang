@@ -1457,29 +1457,25 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         "/pmem/pmem0",
         r#"{"id":"pmem0","path_on_host":"secret-root-pmem.img","root_device":true}"#,
     );
-    assert_bad_request_response(&pmem_root_device_response, "PUT /pmem/pmem0 root_device");
-    assert_response_contains(
-        &pmem_root_device_response,
-        r#"{"fault_message":"pmem root_device is not supported"}"#,
-        "PUT /pmem/pmem0 root_device",
-    );
+    assert_no_content_response(&pmem_root_device_response, "PUT /pmem/pmem0 root_device");
     assert!(
         !pmem_root_device_response.contains("secret-root-pmem.img"),
-        "PUT /pmem/pmem0 root_device must not echo rejected path; response:\n{pmem_root_device_response}"
+        "PUT /pmem/pmem0 root_device must not echo the accepted path; response:\n{pmem_root_device_response}"
     );
     let pmem_vm_config_after_root_device = http_get(&socket_path, "/vm/config");
     assert_ok_response(
         &pmem_vm_config_after_root_device,
-        "GET /vm/config after rejected PUT /pmem/pmem0 root_device",
+        "GET /vm/config after PUT /pmem/pmem0 root_device",
     );
     assert_response_contains(
         &pmem_vm_config_after_root_device,
-        r#""path_on_host":"secret-new-pmem.img""#,
-        "GET /vm/config after rejected PUT /pmem/pmem0 root_device",
+        r#""path_on_host":"secret-root-pmem.img""#,
+        "GET /vm/config after PUT /pmem/pmem0 root_device",
     );
-    assert!(
-        !pmem_vm_config_after_root_device.contains("secret-root-pmem.img"),
-        "rejected root-device pmem update must not replace stored path: {pmem_vm_config_after_root_device}"
+    assert_response_contains(
+        &pmem_vm_config_after_root_device,
+        r#""root_device":true"#,
+        "GET /vm/config after PUT /pmem/pmem0 root_device",
     );
 
     let pmem_empty_path_response = http_put_json(
@@ -1500,7 +1496,7 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
     );
     assert_response_contains(
         &pmem_vm_config_after_empty_path,
-        r#""path_on_host":"secret-new-pmem.img""#,
+        r#""path_on_host":"secret-root-pmem.img""#,
         "GET /vm/config after rejected PUT /pmem/pmem0 empty path",
     );
 
@@ -1872,7 +1868,7 @@ fn executable_no_api_config_file_entropy_rate_limiter_reaches_startup_failure_wi
 }
 
 #[test]
-fn executable_config_file_pmem_root_device_fails_before_socket() {
+fn executable_config_file_pmem_root_device_reaches_startup_failure_without_publishing_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let (config_path, pmem_path) = write_pmem_root_device_startup_config(&test_dir);
@@ -1884,7 +1880,7 @@ fn executable_config_file_pmem_root_device_fails_before_socket() {
         &["--config-file", path_text(&config_path)],
     );
 
-    assert_pmem_root_device_startup_failure(
+    assert_pmem_root_device_reaches_instance_start(
         &output,
         &socket_path,
         &pmem_path,
@@ -1893,7 +1889,8 @@ fn executable_config_file_pmem_root_device_fails_before_socket() {
 }
 
 #[test]
-fn executable_no_api_config_file_pmem_root_device_fails_before_socket() {
+fn executable_no_api_config_file_pmem_root_device_reaches_startup_failure_without_publishing_socket()
+ {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let (config_path, pmem_path) = write_pmem_root_device_startup_config(&test_dir);
@@ -1905,7 +1902,7 @@ fn executable_no_api_config_file_pmem_root_device_fails_before_socket() {
         &["--config-file", path_text(&config_path), "--no-api"],
     );
 
-    assert_pmem_root_device_startup_failure(
+    assert_pmem_root_device_reaches_instance_start(
         &output,
         &socket_path,
         &pmem_path,
@@ -4655,7 +4652,7 @@ fn assert_entropy_rate_limiter_startup_failure(
     }
 }
 
-fn assert_pmem_root_device_startup_failure(
+fn assert_pmem_root_device_reaches_instance_start(
     output: &support::CompletedProcess,
     socket_path: &std::path::Path,
     pmem_path: &std::path::Path,
@@ -4685,9 +4682,9 @@ fn assert_pmem_root_device_startup_failure(
     );
     assert!(
         output.stderr.contains(
-            "bangbang: config-file error: failed to apply config-file action: pmem root_device is not supported"
+            "bangbang: config-file error: failed to apply config-file action: failed to start microVM"
         ),
-        "{case_name} stderr should describe pmem root-device rejection; stderr:\n{}",
+        "{case_name} stderr should show that pmem root admission reached instance start; stderr:\n{}",
         output.stderr
     );
     let pmem_path_text = path_text(pmem_path);

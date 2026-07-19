@@ -1,8 +1,6 @@
-use std::io;
-use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
-use bangbang_runtime::memory::{GuestMemory, GuestMemoryLayout, GuestMemoryRange};
+use bangbang_runtime::memory::{GuestMemory, GuestMemoryRange};
 use bangbang_runtime::pmem::PreparedPmemDevice;
 use bangbang_runtime::{BackendError, VmBackend};
 
@@ -31,8 +29,6 @@ const VCPU_TOPOLOGY_ALREADY_STARTED_MESSAGE: &str = "GIC must be created before 
 const GIC_NOT_CREATED_FOR_VCPU_TOPOLOGY_MESSAGE: &str =
     "GIC must be created before starting a vCPU topology";
 const VCPU_TOPOLOGY_ALREADY_OWNED_MESSAGE: &str = "vCPU topology has already started";
-const PMEM_SHADOW_COPY_BUFFER_SIZE: usize = 64 * 1024;
-
 #[derive(Debug)]
 pub struct HvfBackend {
     vm_created: bool,
@@ -635,185 +631,12 @@ fn pmem_host_memory_mappings(
 fn pmem_host_memory_mapping(
     device: &PreparedPmemDevice,
 ) -> Result<HvfHostMemoryMapping, HvfGuestMemoryMappingError> {
-    let label = pmem_mapping_label(device);
-    let memory = pmem_shadow_memory(device).map_err(|source| {
-        HvfGuestMemoryMappingError::host_mapping(&label, device.guest_range(), source)
-    })?;
-    let backing = device.backing().file().try_clone().map_err(|source| {
-        BackendError::Hypervisor(format!(
-            "failed to clone HVF pmem backing handle for {label} at range {}: {source}",
-            device.guest_range(),
-        ))
-    })?;
-    Ok(HvfHostMemoryMapping::new_pmem_shadow(
-        label,
-        memory,
+    Ok(HvfHostMemoryMapping::new_pmem(
+        pmem_mapping_label(device),
+        device.guest_range(),
+        device.mapping().clone(),
         pmem_memory_permissions(device.mapping().is_read_only()),
-        backing,
-        device.mapping().file_len(),
-        device.mapping().is_read_only(),
     ))
-}
-
-fn pmem_shadow_memory(
-    device: &PreparedPmemDevice,
-) -> Result<GuestMemory, HvfGuestMemoryMappingError> {
-    let range = device.guest_range();
-    let layout = GuestMemoryLayout::new(vec![range]).map_err(|source| {
-        BackendError::Hypervisor(format!(
-            "failed to build HVF pmem shadow layout for range {range}: {source}"
-        ))
-    })?;
-    let mut memory = GuestMemory::allocate(&layout).map_err(|source| {
-        BackendError::Hypervisor(format!(
-            "failed to allocate HVF pmem shadow memory for range {range}: {source}"
-        ))
-    })?;
-    let Some(region) = memory.regions().first() else {
-        return Err(BackendError::Hypervisor(format!(
-            "HVF pmem shadow memory has no region for range {range}"
-        ))
-        .into());
-    };
-
-    validate_pmem_shadow_size(range, region.host_size(), device.mapping().host_size())?;
-    copy_pmem_backing_to_shadow(device, &mut memory)?;
-
-    Ok(memory)
-}
-
-fn validate_pmem_shadow_size(
-    range: GuestMemoryRange,
-    shadow_size: usize,
-    pmem_size: usize,
-) -> Result<(), HvfGuestMemoryMappingError> {
-    if shadow_size == pmem_size {
-        return Ok(());
-    }
-
-    Err(BackendError::Hypervisor(format!(
-        "HVF pmem shadow memory for range {range} has size {shadow_size}, expected {pmem_size}"
-    ))
-    .into())
-}
-
-fn copy_pmem_backing_to_shadow(
-    device: &PreparedPmemDevice,
-    memory: &mut GuestMemory,
-) -> Result<(), HvfGuestMemoryMappingError> {
-    let range = device.guest_range();
-    let mut buffer = [0_u8; PMEM_SHADOW_COPY_BUFFER_SIZE];
-    let mut copied = 0;
-    let file_len = device.mapping().file_len();
-
-    while copied < file_len {
-        let read_len = pmem_shadow_read_len(file_len - copied)?;
-        let Some(chunk) = buffer.get_mut(..read_len) else {
-            return Err(BackendError::Hypervisor(format!(
-                "HVF pmem shadow copy chunk of {read_len} bytes is larger than the copy buffer"
-            ))
-            .into());
-        };
-
-        read_pmem_shadow_chunk(device, chunk, copied)?;
-
-        let destination = range.start().checked_add(copied).ok_or_else(|| {
-            BackendError::Hypervisor(format!(
-                "HVF pmem shadow copy offset {copied} overflows guest address space"
-            ))
-        })?;
-        memory.write_slice(chunk, destination).map_err(|source| {
-            BackendError::Hypervisor(format!(
-                "failed to write HVF pmem shadow memory at {destination}: {source}"
-            ))
-        })?;
-
-        let read_len = u64::try_from(read_len).map_err(|_| {
-            BackendError::Hypervisor(format!(
-                "HVF pmem shadow copy chunk length {read_len} does not fit the guest address space"
-            ))
-        })?;
-        copied = copied.checked_add(read_len).ok_or_else(|| {
-            BackendError::Hypervisor(format!(
-                "HVF pmem shadow copy offset {copied} overflows guest address space"
-            ))
-        })?;
-    }
-
-    Ok(())
-}
-
-fn read_pmem_shadow_chunk(
-    device: &PreparedPmemDevice,
-    chunk: &mut [u8],
-    offset: u64,
-) -> Result<(), HvfGuestMemoryMappingError> {
-    let range = device.guest_range();
-    let mut filled = 0;
-
-    while filled < chunk.len() {
-        let Some(remaining) = chunk.get_mut(filled..) else {
-            return Err(BackendError::Hypervisor(format!(
-                "HVF pmem shadow copy filled length {filled} exceeds chunk length {}",
-                chunk.len()
-            ))
-            .into());
-        };
-        let file_offset = checked_pmem_shadow_file_offset(offset, filled)?;
-
-        match device.backing().file().read_at(remaining, file_offset) {
-            Ok(0) => {
-                return Err(BackendError::Hypervisor(format!(
-                    "failed to read HVF pmem backing into shadow for range {range}: {}",
-                    io::Error::from(io::ErrorKind::UnexpectedEof)
-                ))
-                .into());
-            }
-            Ok(read_len) => {
-                filled = filled.checked_add(read_len).ok_or_else(|| {
-                    BackendError::Hypervisor(format!(
-                        "HVF pmem shadow copy filled length {filled} overflows"
-                    ))
-                })?;
-            }
-            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
-            Err(source) => {
-                return Err(BackendError::Hypervisor(format!(
-                    "failed to read HVF pmem backing into shadow for range {range}: {source}"
-                ))
-                .into());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn checked_pmem_shadow_file_offset(
-    offset: u64,
-    filled: usize,
-) -> Result<u64, HvfGuestMemoryMappingError> {
-    let filled = u64::try_from(filled).map_err(|_| {
-        BackendError::Hypervisor(format!(
-            "HVF pmem shadow copy filled length {filled} does not fit the backing file offset"
-        ))
-    })?;
-
-    offset.checked_add(filled).ok_or_else(|| {
-        BackendError::Hypervisor(format!(
-            "HVF pmem shadow copy file offset {offset}+{filled} overflows"
-        ))
-        .into()
-    })
-}
-
-fn pmem_shadow_read_len(remaining: u64) -> Result<usize, HvfGuestMemoryMappingError> {
-    usize::try_from(remaining.min(PMEM_SHADOW_COPY_BUFFER_SIZE as u64)).map_err(|_| {
-        BackendError::Hypervisor(format!(
-            "HVF pmem shadow copy remaining length {remaining} does not fit this host"
-        ))
-        .into()
-    })
 }
 
 fn pmem_memory_permissions(read_only: bool) -> HvfMemoryPermissions {
@@ -881,7 +704,7 @@ impl Drop for HvfBackend {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::Write;
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1357,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn pmem_mapping_before_vm_checks_state_before_shadow_copy() {
+    fn pmem_mapping_before_vm_checks_state_before_host_registration() {
         let page_size = page_size();
         let mut backend = HvfBackend::new_with_memory_mapper(Arc::new(RecordingMapper::default()));
         let layout =
@@ -1396,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn pmem_mapping_checks_guest_permissions_before_shadow_copy() {
+    fn pmem_mapping_checks_guest_permissions_before_host_registration() {
         let page_size = page_size();
         let mapper = Arc::new(RecordingMapper::default());
         let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
@@ -1426,7 +1249,7 @@ mod tests {
                 devices.as_slice(),
                 HvfMemoryPermissions::new(false, false, false),
             )
-            .expect_err("invalid permissions should fail before pmem shadow copy");
+            .expect_err("invalid permissions should fail before pmem host registration");
 
         assert!(matches!(
             err,
@@ -1466,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_pmem_mapping_checks_state_before_shadow_copy() {
+    fn duplicate_pmem_mapping_checks_state_before_host_registration() {
         let page_size = page_size();
         let mapper = Arc::new(RecordingMapper::default());
         let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
@@ -1716,12 +1539,14 @@ mod tests {
     }
 
     #[test]
-    fn pmem_shadow_memory_copies_file_bytes_and_zero_fills_padding() {
+    fn pmem_host_mapping_registers_exact_runtime_mapping() {
         let payload = [0x11, 0x22, 0x33, 0x44, 0x55];
-        let backing = TempPmemFile::with_bytes("shadow-copy", &payload)
+        let backing = TempPmemFile::with_bytes("direct-owner", &payload)
             .expect("pmem backing file should be created");
+        let page_size = page_size();
         let layout =
-            GuestMemoryLayout::new(vec![range(0, page_size())]).expect("layout should be valid");
+            GuestMemoryLayout::new(vec![range(0, page_size)]).expect("layout should be valid");
+        let memory = GuestMemory::allocate(&layout).expect("guest memory should allocate");
         let mut configs = PmemConfigs::new();
         configs.upsert(pmem_config(PmemConfigInput::new(
             "pmem0",
@@ -1730,39 +1555,51 @@ mod tests {
         let devices =
             PreparedPmemDevices::from_configs(&configs, &layout).expect("pmem should prepare");
         let device = &devices.as_slice()[0];
-        let shadow =
-            super::pmem_shadow_memory(device).expect("pmem shadow memory should be created");
-        let mut copied = [0; 5];
+        let expected_address = device.mapping().host_address().as_ptr() as usize;
+        let expected_size = device.mapping().host_size();
+        let expected_range = device.guest_range();
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
+        backend.vm_created = true;
 
-        shadow
-            .read_slice(&mut copied, device.guest_range().start())
-            .expect("shadow payload should be readable");
+        backend
+            .map_guest_memory_with_pmem_devices_and_configured_mapper(
+                memory,
+                devices.as_slice(),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("guest and direct pmem memory should map");
 
-        assert_eq!(copied, payload);
+        let maps = mapper.maps();
+        let (request, permissions) = maps
+            .get(1)
+            .copied()
+            .expect("pmem should be the second map request");
+        assert_eq!(request.range(), expected_range);
+        assert_eq!(request.host_address(), expected_address);
+        assert_eq!(request.size(), expected_size);
+        assert_eq!(permissions, HvfMemoryPermissions::new(true, true, false));
 
-        let padding_offset =
-            u64::try_from(payload.len()).expect("payload length should fit guest address space");
-        let padding_address = device
-            .guest_range()
-            .start()
-            .checked_add(padding_offset)
-            .expect("padding address should fit guest address space");
-        let mut padding = [0xff];
-
-        shadow
-            .read_slice(&mut padding, padding_address)
-            .expect("shadow padding should be readable");
-
-        assert_eq!(padding, [0]);
+        let mut observed = [0; 5];
+        // SAFETY: the prepared device retains the live mapping and the
+        // destination fits within its nonzero file-backed prefix.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                device.mapping().host_address().as_ptr().cast::<u8>(),
+                observed.as_mut_ptr(),
+                observed.len(),
+            );
+        }
+        assert_eq!(observed, payload);
     }
 
     #[test]
-    fn pmem_shadow_memory_preserves_backing_file_position() {
-        let payload = [0x11, 0x22, 0x33, 0x44, 0x55];
-        let backing = TempPmemFile::with_bytes("shadow-position", &payload)
+    fn pmem_host_mapping_does_not_reopen_the_configured_path() {
+        let backing = TempPmemFile::with_bytes("direct-no-reopen", b"authoritative")
             .expect("pmem backing file should be created");
+        let page_size = page_size();
         let layout =
-            GuestMemoryLayout::new(vec![range(0, page_size())]).expect("layout should be valid");
+            GuestMemoryLayout::new(vec![range(0, page_size)]).expect("layout should be valid");
         let mut configs = PmemConfigs::new();
         configs.upsert(pmem_config(PmemConfigInput::new(
             "pmem0",
@@ -1770,60 +1607,17 @@ mod tests {
         )));
         let devices =
             PreparedPmemDevices::from_configs(&configs, &layout).expect("pmem should prepare");
-        let device = &devices.as_slice()[0];
-        let mut file = device
-            .backing()
-            .file()
-            .try_clone()
-            .expect("pmem backing file clone should succeed");
+        let moved_path = backing.path().with_extension("moved");
+        std::fs::rename(backing.path(), &moved_path)
+            .expect("configured path should move after preparation");
 
-        file.seek(SeekFrom::Start(1))
-            .expect("test should set backing file position");
-        let position_before = file
-            .stream_position()
-            .expect("test should read backing file position");
+        let host_mappings = super::pmem_host_memory_mappings(devices.as_slice())
+            .expect("host mapping should use the retained mapping lease");
 
-        let _shadow =
-            super::pmem_shadow_memory(device).expect("pmem shadow memory should be created");
-
-        let position_after = file
-            .stream_position()
-            .expect("test should read backing file position");
-
-        assert_eq!(position_after, position_before);
+        std::fs::rename(&moved_path, backing.path())
+            .expect("test backing path should be restored for cleanup");
+        assert_eq!(host_mappings.len(), 1);
     }
-
-    #[test]
-    fn pmem_shadow_memory_reports_truncated_backing_without_path_leak() {
-        let payload = [0x11, 0x22, 0x33, 0x44, 0x55];
-        let backing = TempPmemFile::with_bytes("shadow-truncated", &payload)
-            .expect("pmem backing file should be created");
-        let layout =
-            GuestMemoryLayout::new(vec![range(0, page_size())]).expect("layout should be valid");
-        let mut configs = PmemConfigs::new();
-        configs.upsert(pmem_config(PmemConfigInput::new(
-            "pmem0",
-            backing.path_text(),
-        )));
-        let devices =
-            PreparedPmemDevices::from_configs(&configs, &layout).expect("pmem should prepare");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(backing.path())
-            .expect("pmem backing should open for truncation")
-            .set_len(1)
-            .expect("pmem backing should truncate");
-
-        let err = super::pmem_host_memory_mappings(devices.as_slice())
-            .expect_err("truncated pmem backing should fail shadow copy");
-        let message = err.to_string();
-
-        assert!(message.contains("pmem device `pmem0`"));
-        assert!(message.contains(&devices.as_slice()[0].guest_range().to_string()));
-        assert!(message.contains("failed to read HVF pmem backing into shadow"));
-        assert!(!message.contains(&backing.path_text()));
-    }
-
     #[test]
     fn unmap_guest_memory_clears_active_mapping() {
         let page_size = page_size();

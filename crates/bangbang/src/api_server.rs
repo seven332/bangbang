@@ -9366,20 +9366,25 @@ mod tests {
             "{rate_limiter_response}"
         );
 
+        let root_device_response = request_over_socket(
+            &mut vmm,
+            "p-put-root-device",
+            &request_with_body(
+                "PUT",
+                "/pmem/pmem0",
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem-root.img","root_device":true,"rate_limiter":{"ops":{"size":1,"refill_time":1}}}"#,
+            ),
+        );
+        assert!(
+            root_device_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{root_device_response}"
+        );
+
         for (socket_name, request, fault_message) in [
             (
                 "p-put-bad",
                 request_with_body("PUT", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
                 "Malformed HTTP request.",
-            ),
-            (
-                "p-put-root-device",
-                request_with_body(
-                    "PUT",
-                    "/pmem/pmem0",
-                    r#"{"id":"pmem0","path_on_host":"/tmp/pmem-new.img","root_device":true}"#,
-                ),
-                "pmem root_device is not supported",
             ),
             (
                 "p-put-empty-path",
@@ -9424,9 +9429,79 @@ mod tests {
             panic!("expected VM config");
         };
         assert_eq!(config.pmem_configs().len(), 1);
-        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem-new.img");
-        assert!(!config.pmem_configs()[0].root_device());
+        assert_eq!(
+            config.pmem_configs()[0].path_on_host(),
+            "/tmp/pmem-root.img"
+        );
+        assert!(config.pmem_configs()[0].root_device());
         assert!(config.pmem_configs()[0].rate_limiter().is_some());
+    }
+
+    #[test]
+    fn root_device_conflicts_across_block_and_pmem_are_atomic() {
+        let mut block_first = test_controller();
+        let block_root = request_over_socket(
+            &mut block_first,
+            "rb1",
+            &request_with_body(
+                "PUT",
+                "/drives/rootfs",
+                r#"{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true}"#,
+            ),
+        );
+        assert!(block_root.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let rejected_pmem = request_over_socket(
+            &mut block_first,
+            "rp2",
+            &request_with_body(
+                "PUT",
+                "/pmem/root_pmem",
+                r#"{"id":"root_pmem","path_on_host":"/tmp/root.pmem","root_device":true}"#,
+            ),
+        );
+        assert!(rejected_pmem.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            rejected_pmem.contains(r#"{"fault_message":"a root device is already configured"}"#)
+        );
+        let block_first_config = request_over_socket(
+            &mut block_first,
+            "c1",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(block_first_config.contains(r#""drive_id":"rootfs""#));
+        assert!(!block_first_config.contains(r#""id":"root_pmem""#));
+
+        let mut pmem_first = test_controller();
+        let pmem_root = request_over_socket(
+            &mut pmem_first,
+            "rp1",
+            &request_with_body(
+                "PUT",
+                "/pmem/root_pmem",
+                r#"{"id":"root_pmem","path_on_host":"/tmp/root.pmem","root_device":true}"#,
+            ),
+        );
+        assert!(pmem_root.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let rejected_block = request_over_socket(
+            &mut pmem_first,
+            "rb2",
+            &request_with_body(
+                "PUT",
+                "/drives/rootfs",
+                r#"{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true}"#,
+            ),
+        );
+        assert!(rejected_block.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            rejected_block.contains(r#"{"fault_message":"a root drive is already configured"}"#)
+        );
+        let pmem_first_config = request_over_socket(
+            &mut pmem_first,
+            "c2",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(pmem_first_config.contains(r#""id":"root_pmem""#));
+        assert!(!pmem_first_config.contains(r#""drive_id":"rootfs""#));
     }
 
     #[test]

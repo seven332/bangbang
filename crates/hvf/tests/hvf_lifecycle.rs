@@ -4337,6 +4337,264 @@ fn prepares_internal_hvf_arm64_boot_session() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn guest_write_to_writable_pmem_is_visible_before_any_pmem_flush() {
+    use std::os::unix::fs::FileExt;
+
+    use bangbang_hvf::{HvfArm64BootSessionConfig, HvfBackend, HvfVcpuRunStepOutcome};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::{PmemConfigInput, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT};
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    const WRITE_OFFSET: u64 = 4096;
+    const WRITE_VALUE: u32 = 0x5a6b_7c8d;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("direct-pmem-kernel", &image)
+        .expect("temp direct-pmem kernel should be created");
+    let pmem = TempFile::new_len("direct-pmem-backing", VIRTIO_PMEM_ALIGNMENT)
+        .expect("temp direct-pmem backing should be created");
+    let observer =
+        std::fs::File::open(pmem.path()).expect("independent direct-pmem observer should open");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("direct-pmem boot source should configure");
+    controller
+        .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            path_text(pmem.path()),
+        )))
+        .expect("direct-pmem device should configure");
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    );
+    let mut backend = HvfBackend::new();
+    let mut session = backend
+        .prepare_arm64_boot_session(&controller, config)
+        .expect("direct-pmem session should prepare");
+    let boot_registers = session
+        .boot_registers()
+        .expect("direct-pmem session should retain boot registers");
+    let target = session.runtime_resources().pmem_devices[0]
+        .guest_range()
+        .start()
+        .checked_add(WRITE_OFFSET)
+        .expect("direct-pmem guest target should fit");
+    let program = arm64_store_u32_and_hvc_program(target.raw_value(), WRITE_VALUE);
+    session
+        .guest_memory_mut()
+        .expect("direct-pmem session should expose ordinary guest memory")
+        .write_slice(&program, boot_registers.kernel_entry)
+        .expect("direct-pmem guest program should replace the test kernel entry");
+
+    let mut before = [0_u8; std::mem::size_of::<u32>()];
+    observer
+        .read_exact_at(&mut before, WRITE_OFFSET)
+        .expect("direct-pmem observer should read before the guest write");
+    assert_eq!(before, [0; std::mem::size_of::<u32>()]);
+
+    assert!(matches!(
+        session
+            .run_once_and_handle_mmio()
+            .expect("direct-pmem guest should reach HVC without a mapping exit"),
+        HvfVcpuRunStepOutcome::Hvc { exit, .. } if exit.immediate() == 0
+    ));
+
+    let mut observed = [0_u8; std::mem::size_of::<u32>()];
+    observer
+        .read_exact_at(&mut observed, WRITE_OFFSET)
+        .expect("independent observer should read the live file mapping");
+    assert_eq!(
+        u32::from_le_bytes(observed),
+        WRITE_VALUE,
+        "guest writes must be visible through the backing descriptor before a virtio-pmem or teardown flush"
+    );
+
+    session
+        .shutdown()
+        .expect("direct-pmem session should shut down after the pre-flush observation");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn direct_pmem_mapping_has_bounded_process_memory_growth() {
+    use bangbang_hvf::{HvfArm64BootSessionConfig, HvfBackend};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::{PmemConfig, PmemConfigInput, PmemFileBacking, PmemMmioLayout};
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    const PMEM_LEN: u64 = 64 * 1024 * 1024;
+    const VIRTUAL_SIZE_SLACK: u64 = 16 * 1024 * 1024;
+    const RESIDENT_SIZE_SLACK: u64 = 32 * 1024 * 1024;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("bounded-pmem-kernel", &image)
+        .expect("bounded-pmem kernel should be created");
+    let pmem = TempFile::new_len("bounded-direct-pmem", PMEM_LEN)
+        .expect("bounded direct-pmem backing should be created");
+    let pmem_config = PmemConfig::try_from(PmemConfigInput::new("pmem0", path_text(pmem.path())))
+        .expect("bounded direct-pmem config should validate");
+    let backing =
+        PmemFileBacking::open(&pmem_config).expect("bounded direct-pmem backing should open");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("direct-pmem boot source should configure");
+    let session_config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    )
+    .with_pci_enabled();
+    let mut backend = HvfBackend::new();
+    let mut session = backend
+        .prepare_arm64_boot_session(&controller, session_config)
+        .expect("direct-pmem session should prepare");
+    let before = process_memory_usage().expect("pre-insert process memory usage should read");
+    session
+        .insert_runtime_pmem_device(&pmem_config, backing)
+        .expect("bounded direct-pmem device should map and publish");
+    let after = process_memory_usage().expect("post-insert process memory usage should read");
+    let growth = after.saturating_growth_from(before);
+
+    assert!(
+        growth.virtual_size <= PMEM_LEN + VIRTUAL_SIZE_SLACK,
+        "one {PMEM_LEN}-byte direct pmem insertion must not add a second full-size virtual mapping; before {before:?}, after {after:?}, growth {growth:?}"
+    );
+    assert!(
+        growth.resident_size <= PMEM_LEN + RESIDENT_SIZE_SLACK,
+        "direct pmem insertion must keep resident growth within one backing plus generous framework slack; before {before:?}, after {after:?}, growth {growth:?}"
+    );
+
+    session
+        .remove_runtime_pmem_device("pmem0")
+        .expect("bounded direct-pmem device should flush and unmap");
+    session
+        .shutdown()
+        .expect("bounded direct-pmem session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn guest_write_to_read_only_pmem_faults_without_mutating_backing() {
+    use std::os::unix::fs::FileExt;
+
+    use bangbang_hvf::{
+        HvfArm64BootSessionConfig, HvfBackend, HvfVcpuExitResolveError, HvfVcpuRunnerError,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::{PmemConfigInput, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT};
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    const WRITE_OFFSET: u64 = 4096;
+    const WRITE_VALUE: u32 = 0xa5b6_c7d8;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("read-only-pmem-kernel", &image)
+        .expect("temp read-only-pmem kernel should be created");
+    let pmem = TempFile::new_len("read-only-pmem-backing", VIRTIO_PMEM_ALIGNMENT)
+        .expect("temp read-only-pmem backing should be created");
+    let observer =
+        std::fs::File::open(pmem.path()).expect("independent read-only-pmem observer should open");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("read-only-pmem boot source should configure");
+    controller
+        .handle_action(VmmAction::PutPmem(
+            PmemConfigInput::new("pmem0", path_text(pmem.path())).with_read_only(true),
+        ))
+        .expect("read-only-pmem device should configure");
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    );
+    let mut backend = HvfBackend::new();
+    let mut session = backend
+        .prepare_arm64_boot_session(&controller, config)
+        .expect("read-only-pmem session should prepare");
+    let boot_registers = session
+        .boot_registers()
+        .expect("read-only-pmem session should retain boot registers");
+    let target = session.runtime_resources().pmem_devices[0]
+        .guest_range()
+        .start()
+        .checked_add(WRITE_OFFSET)
+        .expect("read-only-pmem guest target should fit");
+    let program = arm64_store_u32_and_hvc_program(target.raw_value(), WRITE_VALUE);
+    session
+        .guest_memory_mut()
+        .expect("read-only-pmem session should expose ordinary guest memory")
+        .write_slice(&program, boot_registers.kernel_entry)
+        .expect("read-only-pmem guest program should replace the test kernel entry");
+
+    let err = session
+        .run_once_and_handle_mmio()
+        .expect_err("guest write to read-only pmem should fault before HVC");
+    assert!(
+        matches!(
+            err,
+            HvfVcpuRunnerError::VcpuExitResolve(HvfVcpuExitResolveError::MmioResolve { .. })
+        ),
+        "read-only pmem write should surface as an unowned write fault, got {err:?}"
+    );
+
+    let mut observed = [0_u8; std::mem::size_of::<u32>()];
+    observer
+        .read_exact_at(&mut observed, WRITE_OFFSET)
+        .expect("independent observer should read after the rejected guest write");
+    assert_eq!(
+        observed,
+        [0; std::mem::size_of::<u32>()],
+        "a guest write fault must not mutate the read-only pmem backing"
+    );
+
+    session
+        .shutdown()
+        .expect("read-only-pmem session should shut down after the fault proof");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn prepares_owned_hvf_arm64_boot_session() {
     use bangbang_hvf::{
         ARM64_LINUX_BOOT_CPSR, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
@@ -6024,6 +6282,63 @@ fn host_page_size() -> Result<u64, std::num::TryFromIntError> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessMemoryUsage {
+    virtual_size: u64,
+    resident_size: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ProcessMemoryUsage {
+    const fn saturating_growth_from(self, baseline: Self) -> Self {
+        Self {
+            virtual_size: self.virtual_size.saturating_sub(baseline.virtual_size),
+            resident_size: self.resident_size.saturating_sub(baseline.resident_size),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn process_memory_usage() -> std::io::Result<ProcessMemoryUsage> {
+    let mut task_info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let expected_size =
+        i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "proc_taskinfo size exceeds c_int",
+            )
+        })?;
+    // SAFETY: `task_info` points to writable storage of exactly
+    // `expected_size` bytes. The current PID and fixed task-info flavor need no
+    // additional lifetime, ownership, or thread-local guarantees.
+    let returned_size = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            task_info.as_mut_ptr().cast(),
+            expected_size,
+        )
+    };
+    if returned_size == expected_size {
+        // SAFETY: an exact successful `PROC_PIDTASKINFO` result initialized the
+        // complete `proc_taskinfo` output object.
+        let task_info = unsafe { task_info.assume_init() };
+        Ok(ProcessMemoryUsage {
+            virtual_size: task_info.pti_virtual_size,
+            resident_size: task_info.pti_resident_size,
+        })
+    } else if returned_size == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "proc_pidinfo returned a partial task record",
+        ))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct TempSnapshotArtifacts {
     directory: std::path::PathBuf,
 }
@@ -6139,6 +6454,33 @@ fn arm64_image() -> Result<Vec<u8>, &'static str> {
     )?;
     write_u32_le(&mut bytes, ARM64_IMAGE_MAGIC_OFFSET, ARM64_IMAGE_MAGIC)?;
     Ok(bytes)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn arm64_store_u32_and_hvc_program(target: u64, value: u32) -> Vec<u8> {
+    const MOVZ_X0: u32 = 0xd280_0000;
+    const MOVK_X0: u32 = 0xf280_0000;
+    const MOVZ_W1: u32 = 0x5280_0001;
+    const MOVK_W1_LSL_16: u32 = 0x72a0_0001;
+    const STR_W1_X0: u32 = 0xb900_0001;
+    const DMB_ISH: u32 = 0xd503_3bbf;
+    const HVC_ZERO: u32 = 0xd400_0002;
+
+    let mut instructions = Vec::with_capacity(9);
+    instructions.push(MOVZ_X0 | u32::from(target as u16) << 5);
+    for halfword in 1..4_u32 {
+        let immediate = ((target >> (halfword * 16)) & u64::from(u16::MAX)) as u32;
+        instructions.push(MOVK_X0 | (halfword << 21) | (immediate << 5));
+    }
+    instructions.push(MOVZ_W1 | u32::from(value as u16) << 5);
+    instructions.push(MOVK_W1_LSL_16 | ((value >> 16) << 5));
+    instructions.push(STR_W1_X0);
+    instructions.push(DMB_ISH);
+    instructions.push(HVC_ZERO);
+    instructions
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

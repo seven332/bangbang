@@ -733,7 +733,7 @@
     {
       "id": "api-operation:PUT /pmem/{id}",
       "family": "api-contract",
-      "summary": "Configure a validated file-backed virtio-pmem device before startup, or transactionally attach one non-root pmem device after startup when public all-virtio PCI transport is enabled. Running and Paused insertion opens or reserves the exact contained grant before owner-thread mapping, assigns the first reusable aligned guest range, registers an exact writable or read-only HVF shadow, publishes the PCI endpoint, and commits configuration and grant consumption only after every live owner succeeds. Default MMIO, duplicate, root, invalid backing, grant, mapping, and capacity failures are stable, redacted, and nonmutating.",
+      "summary": "Configure a validated file-backed virtio-pmem device before startup, including one deterministic root across ordinary block and pmem, or transactionally attach one non-root pmem device after startup when public all-virtio PCI transport is enabled. Startup and Running/Paused insertion retain the exact direct or contained descriptor, map one file/private-tail range, register a cloned lease on that authoritative mapping with HVF, and commit configuration and grant consumption only after every live owner succeeds. Root conflicts and duplicate, invalid backing, grant, mapping, capacity, and unsupported runtime-root failures are stable, redacted, and nonmutating.",
       "source_refs": [
         "api-operation:PUT /pmem/{id}"
       ],
@@ -1116,7 +1116,7 @@
     {
       "id": "api-path:/pmem/{id}",
       "family": "api-contract",
-      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs and strict fields, preserves the public configuration projection until live commits succeed, redacts backing and grant details on failure, and retains default-MMIO and root mutation as stable nonmutating rejections. Pmem root boot/direct host mapping, dirty tracking, and snapshot state remain separately audited semantic work.",
+      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration including deterministic root boot, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs, strict fields, and the one-block-or-pmem-root invariant before authority use; preserves the public projection until live commits succeed; maps the retained file/private-tail range directly into HVF; synchronizes exactly the file prefix; redacts backing, descriptor, grant, and address details; and retains default-MMIO and runtime-root mutation as stable nonmutating rejections. Dirty tracking, snapshot state, and broad pmem certification remain separately audited.",
       "source_refs": [
         "api-path:/pmem/{id}"
       ],
@@ -3244,11 +3244,45 @@
     {
       "id": "api-property:Pmem.path_on_host",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Pmem.path_on_host.",
+      "summary": "Retain and report the required nonempty host path while deferring direct opens until startup, or adopt an exact contained PmemBacking descriptor without reopening its tag. Startup and runtime PCI map the validated nonzero regular file plus volatile aligned tail once and register cloned leases on that authoritative range directly with HVF. Mapping, publication, replacement, and removal are failure-atomic and diagnostics redact path, grant, descriptor, and host-address details.",
       "source_refs": [
         "api-property:Pmem.path_on_host"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "direct and contained pmem backing preparation and commit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "direct Pmem host-mapping ownership and exact flush/unmap"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemFileBacking, PmemBackingMapping, and PreparedPmemDevice"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "pmem path storage, projection, startup, and redaction tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "pre-flush backing coherence and bounded direct-mapping process-memory tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_boots_read_only_pmem_root_from_exact_granted_descriptor"
+        }
+      ]
     },
     {
       "id": "api-property:Pmem.rate_limiter",
@@ -3262,20 +3296,83 @@
     {
       "id": "api-property:Pmem.read_only",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Pmem.read_only.",
+      "summary": "Default read_only to false, require matching descriptor access, and expose the stored value. Writable pmem uses a shared write-capable host mapping and read/write non-executable guest registration. Read-only pmem uses a private write-capable host mapping required by HVF while guest registration stays read-only and non-executable, so host writes are copy-on-write and guest writes fault without mutating the backing. Both profiles synchronize only the exact file prefix.",
       "source_refs": [
         "api-property:Pmem.read_only"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/backend.rs",
+          "anchor": "direct pmem HVF read-only or read/write map request"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "pmem_file_mapping_flags and PmemBackingMapping::flush"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "read-only MMIO and writable PCI pmem-root boot tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "guest_write_to_read_only_pmem_faults_without_mutating_backing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "backing_mapping_read_only_host_write_is_private and exact flush-call tests"
+        }
+      ]
     },
     {
       "id": "api-property:Pmem.root_device",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Pmem.root_device.",
+      "summary": "Default root_device to false and admit true before startup with exactly one root across ordinary block and pmem configurations. Same-ID replacement excludes the replaced entry, preserves pmem order, and validates before grant claim or mutation. Startup derives root=/dev/pmem<i> from that stable order and appends ro or rw; Running and Paused root insertion, replacement, and removal remain nonmutating rejections.",
       "source_refs": [
         "api-property:Pmem.root_device"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "cross-family block and pmem root admission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemConfigs root validation and stable replacement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "append_root_device_command_line"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "root_device_conflicts_across_block_and_pmem_are_atomic"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_boots_read_only_and_writable_pmem_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_boots_read_only_pmem_root_from_exact_granted_descriptor"
+        }
+      ]
     },
     {
       "id": "api-property:RateLimiter.bandwidth",
@@ -4956,7 +5053,7 @@
     {
       "id": "corpus:pmem",
       "family": "storage",
-      "summary": "The non-root runtime PCI subset now includes transactional PUT/PATCH/DELETE, exact direct and contained backing ownership, aligned first-fit guest-range allocation, dynamic HVF shadow registration, targeted flush before unmap, rollback, metrics, cleanup, and signed same-ID/slot/range reuse. Continue auditing the broad pmem corpus for root-device boot, direct host-file mapping, dirty policy, sharing/huge-page guidance, performance, and snapshot state.",
+      "summary": "Startup and non-root runtime PCI pmem now include deterministic root boot, transactional PUT/PATCH/DELETE, exact direct and contained descriptor ownership, one authoritative file/private-tail mapping registered directly with HVF, exact-prefix MS_SYNC, aligned first-fit guest ranges, rollback, metrics, cleanup, and signed direct/contained root and same-ID/slot/range reuse. Continue auditing the broad pmem corpus for dirty policy, sharing/huge-page guidance, performance, snapshot state, and aggregate completeness.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -6004,7 +6101,7 @@
     {
       "id": "non-swagger-route:DELETE /pmem/{id}",
       "family": "storage",
-      "summary": "Remove one non-root live virtio-pmem endpoint through the pinned bodyless Firecracker route when public all-virtio PCI transport is enabled. Owner-thread teardown first removes endpoint reachability while retaining exact leases, flushes and unregisters only that device's dynamic HVF shadow, then irreversibly releases endpoint, MSI-X, BAR, function, dispatcher, mapping, backing, metrics generation, guest range, and configuration ownership. Pre-commit mapping failure restores the same endpoint; failed restoration or post-boundary corruption is terminal. Missing, root, and default-MMIO requests are nonmutating.",
+      "summary": "Remove one non-root live virtio-pmem endpoint through the pinned bodyless Firecracker route when public all-virtio PCI transport is enabled. Owner-thread teardown first removes endpoint reachability while retaining exact leases, synchronizes the persistent prefix and unregisters only that device's direct HVF mapping, then irreversibly releases endpoint, MSI-X, BAR, function, dispatcher, mapping, backing, metrics generation, guest range, and configuration ownership. Pre-commit failure restores the same endpoint, failed unmap retains every lease HVF may reference, and failed restoration or post-boundary corruption is terminal. Missing, root, and default-MMIO requests are nonmutating.",
       "source_refs": [
         "non-swagger-route:DELETE /pmem/{id}"
       ],
@@ -6050,7 +6147,7 @@
         {
           "kind": "local",
           "path": "crates/hvf/src/memory.rs",
-          "anchor": "exact runtime pmem flush, unmap failure retry, restore, and shadow isolation tests"
+          "anchor": "exact direct runtime pmem flush, unmap failure lifetime, restore, and mapping isolation tests"
         },
         {
           "kind": "local",
@@ -6738,7 +6835,7 @@
     {
       "id": "semantic.storage:pmem-root-mapping-flush-and-state",
       "family": "storage",
-      "summary": "Non-root startup and runtime pmem now provide selected MMIO-or-PCI activation, runtime PCI attach/update/delete, aligned shadow mapping, targeted persistence flush, limiting/retry, exact cleanup, contained authority, metrics, and signed same-range reuse. Continue auditing root-device boot, direct host-file HVF mapping, dirty policy, sharing/performance outcomes, and snapshot state before promoting this aggregate storage record.",
+      "summary": "Startup and non-root runtime pmem now provide selected MMIO-or-PCI activation, deterministic root boot, runtime PCI attach/update/delete, one direct authoritative file/private-tail mapping, exact-prefix persistence flush, limiting/retry, exact cleanup, contained descriptor authority, metrics, and signed root/protection/coherence/range-reuse evidence. Continue auditing dirty policy, sharing/performance outcomes, snapshot state, and every remaining pmem leaf before promoting this aggregate storage record.",
       "source_refs": [
         "corpus:pmem"
       ],

@@ -718,9 +718,17 @@ impl VmmController {
             });
         }
 
-        self.drive_configs
+        let config = self
+            .drive_configs
             .validate_insert(input)
-            .map_err(VmmActionError::DriveConfig)
+            .map_err(VmmActionError::DriveConfig)?;
+        if config.is_root_device() && self.pmem_configs.has_root_device() {
+            return Err(VmmActionError::DriveConfig(
+                block::DriveConfigError::RootDeviceAlreadyConfigured,
+            ));
+        }
+
+        Ok(config)
     }
 
     pub fn commit_drive_config(&mut self, config: block::DriveConfig) {
@@ -869,11 +877,21 @@ impl VmmController {
             });
         }
 
-        input.try_into().map_err(VmmActionError::PmemConfig)
+        let config = self
+            .pmem_configs
+            .validate_insert(input)
+            .map_err(VmmActionError::PmemConfig)?;
+        if config.root_device() && self.drive_configs.has_root_device() {
+            return Err(VmmActionError::PmemConfig(
+                pmem::PmemConfigError::RootDeviceAlreadyConfigured,
+            ));
+        }
+
+        Ok(config)
     }
 
     pub fn commit_pmem_config(&mut self, config: pmem::PmemConfig) {
-        self.pmem_configs.upsert(config);
+        self.pmem_configs.commit_insert(config);
         self.snapshot_load_history_fresh = false;
     }
 
@@ -4187,29 +4205,124 @@ mod tests {
     }
 
     #[test]
-    fn put_pmem_rejects_root_device_without_mutating() {
+    fn put_pmem_accepts_root_device_and_replaces_in_place() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem-old.img")))
             .expect("pmem config should be stored");
 
-        let err = controller
+        let data = controller
             .handle_action(VmmAction::PutPmem(
                 pmem_input("pmem0", "/tmp/pmem-new.img").with_root_device(true),
             ))
-            .expect_err("pmem root device should fail");
+            .expect("pmem root device should replace the same id");
 
-        assert_eq!(
-            err,
-            VmmActionError::PmemConfig(PmemConfigError::UnsupportedRootDevice)
-        );
+        assert_eq!(data, VmmData::Empty);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert_eq!(controller.pmem_configs().len(), 1);
         assert_eq!(
             controller.pmem_configs()[0].path_on_host(),
-            "/tmp/pmem-old.img"
+            "/tmp/pmem-new.img"
+        );
+        assert!(controller.pmem_configs()[0].root_device());
+    }
+
+    #[test]
+    fn put_pmem_rejects_existing_block_root_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            )))
+            .expect("block root should be stored");
+        controller
+            .handle_action(VmmAction::PutPmem(pmem_input(
+                "pmem0",
+                "/tmp/original-data.pmem",
+            )))
+            .expect("original non-root pmem should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutPmem(
+                pmem_input("pmem0", "/tmp/root.pmem").with_root_device(true),
+            ))
+            .expect_err("pmem root should conflict with block root");
+
+        assert_eq!(
+            err,
+            VmmActionError::PmemConfig(PmemConfigError::RootDeviceAlreadyConfigured)
+        );
+        assert_eq!(controller.pmem_configs().len(), 1);
+        assert_eq!(
+            controller.pmem_configs()[0].path_on_host(),
+            "/tmp/original-data.pmem"
         );
         assert!(!controller.pmem_configs()[0].root_device());
+        assert_eq!(controller.drive_configs().len(), 1);
+        assert!(controller.drive_configs()[0].is_root_device());
+    }
+
+    #[test]
+    fn put_drive_rejects_existing_pmem_root_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "data",
+                "/tmp/original-data.ext4",
+                false,
+            )))
+            .expect("original non-root drive should be stored");
+        controller
+            .handle_action(VmmAction::PutPmem(
+                pmem_input("pmem0", "/tmp/root.pmem").with_root_device(true),
+            ))
+            .expect("pmem root should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "data",
+                "/tmp/rootfs.ext4",
+                true,
+            )))
+            .expect_err("block root should conflict with pmem root");
+
+        assert_eq!(
+            err,
+            VmmActionError::DriveConfig(DriveConfigError::RootDeviceAlreadyConfigured)
+        );
+        assert_eq!(controller.drive_configs().len(), 1);
+        assert_eq!(
+            controller.drive_configs()[0].path_on_host(),
+            PathBuf::from("/tmp/original-data.ext4")
+        );
+        assert!(!controller.drive_configs()[0].is_root_device());
+        assert_eq!(controller.pmem_configs().len(), 1);
+        assert!(controller.pmem_configs()[0].root_device());
+    }
+
+    #[test]
+    fn replacing_pmem_root_with_non_root_releases_global_root_selection() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutPmem(
+                pmem_input("pmem0", "/tmp/root.pmem").with_root_device(true),
+            ))
+            .expect("pmem root should be stored");
+        controller
+            .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/data.pmem")))
+            .expect("same-id non-root should replace pmem root");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            )))
+            .expect("block root should succeed after pmem root replacement");
+
+        assert!(!controller.pmem_configs()[0].root_device());
+        assert!(controller.drive_configs()[0].is_root_device());
     }
 
     #[test]
