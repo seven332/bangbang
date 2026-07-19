@@ -62,7 +62,7 @@ const METADATA_FILE_MAX_BYTES: usize = CONFIG_FILE_MAX_BYTES;
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const FIRECRACKER_DEFAULT_NOFILE_LIMIT: RawFd = 2048;
-const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &["enable-pci", "no-seccomp", "seccomp-filter"];
+const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &["no-seccomp", "seccomp-filter"];
 
 fn main() -> ExitCode {
     #[cfg(target_os = "macos")]
@@ -152,6 +152,13 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
         }
         Command::Run(config) => {
             let config = *config;
+            if config.enable_pci {
+                HvfBackend::validate_pci_support().map_err(|source| {
+                    ProcessError::BadConfiguration(format!(
+                        "--enable-pci is unavailable on this host: {source}"
+                    ))
+                })?;
+            }
             let vmnet_authority = match contained.as_ref() {
                 Some(session) => ProcessVmnetAuthority::Contained(
                     session
@@ -187,6 +194,7 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
                 api_sock,
                 boot_timer,
                 config_file,
+                enable_pci,
                 http_api_max_payload_size,
                 id,
                 logger_config,
@@ -214,6 +222,7 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
                 effective_mmds_size_limit,
             )
             .with_boot_timer_enabled(boot_timer)
+            .with_pci_enabled(enable_pci)
             .with_process_metrics_diagnostics(process_metrics_diagnostics)
             .with_process_signal_metrics(signal_metrics.clone())
             .with_snapshot_capture_cancellation(snapshot_cancellation.clone())
@@ -1743,6 +1752,7 @@ struct StartupConfig {
     api_sock: String,
     boot_timer: bool,
     config_file: Option<String>,
+    enable_pci: bool,
     http_api_max_payload_size: usize,
     id: String,
     logger_config: Option<LoggerConfigInput>,
@@ -1873,6 +1883,7 @@ impl Default for StartupConfig {
             api_sock: DEFAULT_API_SOCK_PATH.to_string(),
             boot_timer: false,
             config_file: None,
+            enable_pci: false,
             http_api_max_payload_size: HTTP_MAX_PAYLOAD_SIZE,
             id: DEFAULT_INSTANCE_ID.to_string(),
             logger_config: None,
@@ -1947,6 +1958,7 @@ impl Args {
         let mut api_sock_seen = false;
         let mut boot_timer_seen = false;
         let mut config_file_seen = false;
+        let mut enable_pci_seen = false;
         let mut http_api_max_payload_size_seen = false;
         let mut id_seen = false;
         let mut logger_config = LoggerConfigInput::new();
@@ -1989,6 +2001,16 @@ impl Args {
                     }
                     config.boot_timer = true;
                     boot_timer_seen = true;
+                    index += 1;
+                }
+                "--enable-pci" => {
+                    if enable_pci_seen {
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --enable-pci",
+                        ));
+                    }
+                    config.enable_pci = true;
+                    enable_pci_seen = true;
                     index += 1;
                 }
                 value_arg if is_value_arg(value_arg, "--config-file") => {
@@ -2288,6 +2310,7 @@ fn help_text() -> String {
             "Options:\n",
             "      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n",
             "      --boot-timer      Enable Firecracker-compatible guest boot-time logging\n",
+            "      --enable-pci      Enable PCIe transport for all configured virtio devices\n",
             "      --config-file <PATH>\n",
             "                         Firecracker-shaped config file for API-enabled startup\n",
             "      --http-api-max-payload-size <BYTES>\n",
@@ -2471,6 +2494,7 @@ fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
     [
         ("--help=", "help"),
         ("--boot-timer=", "boot-timer"),
+        ("--enable-pci=", "enable-pci"),
         ("--no-api=", "no-api"),
         ("--show-level=", "show-level"),
         ("--show-log-origin=", "show-log-origin"),
@@ -3493,6 +3517,7 @@ mod tests {
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
         assert!(!config.boot_timer);
         assert_eq!(config.config_file, None);
+        assert!(!config.enable_pci);
         assert_eq!(config.http_api_max_payload_size, HTTP_MAX_PAYLOAD_SIZE);
         assert_eq!(config.mmds_size_limit, None);
         assert_eq!(config.effective_mmds_size_limit(), HTTP_MAX_PAYLOAD_SIZE);
@@ -3526,6 +3551,7 @@ mod tests {
         assert!(help.contains("Non-negative MMDS data store size"));
         assert!(help.contains("GET /vm/config"));
         assert!(help.contains("--boot-timer"));
+        assert!(help.contains("--enable-pci"));
         assert!(help.contains("--config-file <PATH>"));
         assert!(help.contains("GET /machine-config"));
         assert!(help.contains("GET /mmds"));
@@ -3582,6 +3608,13 @@ mod tests {
         let args = parse(&["-h"]).expect("short help arg should parse");
 
         assert_eq!(args.command, Command::Help);
+    }
+
+    #[test]
+    fn parse_enable_pci_arg() {
+        let config = parse_run(&["--enable-pci"]).expect("enable-pci arg should parse");
+
+        assert!(config.enable_pci);
     }
 
     #[test]
@@ -4218,6 +4251,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_enable_pci() {
+        let err =
+            parse(&["--enable-pci", "--enable-pci"]).expect_err("duplicate enable-pci should fail");
+
+        assert_eq!(err, "duplicate argument: --enable-pci");
+    }
+
+    #[test]
     fn rejects_duplicate_http_api_max_payload_size() {
         let err = parse(&[
             "--http-api-max-payload-size",
@@ -4692,6 +4733,13 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --boot-timer; use --boot-timer"
+        );
+
+        let err = parse(&["--enable-pci=true"]).expect_err("flag with value should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --enable-pci; use --enable-pci"
         );
 
         let err = parse(&["--show-level=true"]).expect_err("flag with value should fail");

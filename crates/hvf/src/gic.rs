@@ -1040,11 +1040,38 @@ impl GuestMessageInterrupt for HvfGicMsiRoute {
     }
 }
 
-/// Device-scoped GICv2m leases and their authority-safe runtime registry.
-pub struct HvfGicMsiDeviceInterruptResources {
-    allocator: HvfGicMsiInterruptAllocator,
+#[derive(Debug)]
+struct HvfGicMsiSharedInterruptState {
+    active_resources: usize,
     interrupts: Option<Vec<HvfGicMsiInterrupt>>,
+}
+
+struct HvfGicMsiSharedInterruptOwner {
+    allocator: HvfGicMsiInterruptAllocator,
+    routes: Vec<Arc<dyn GuestMessageInterrupt>>,
+    state: Mutex<HvfGicMsiSharedInterruptState>,
+}
+
+impl fmt::Debug for HvfGicMsiSharedInterruptOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicMsiSharedInterruptOwner")
+            .field("routes", &"<redacted>")
+            .field("state", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// One independently revocable registry backed by a shared VM GICv2m pool.
+///
+/// Linux assigns MSI messages according to the vectors that each driver
+/// actually requests, which can be fewer than a device's maximum MSI-X table
+/// size. Every PCI function therefore resolves against the complete VM pool
+/// instead of a host-predicted device subrange. Exact leases remain live until
+/// the last registry releases them.
+pub struct HvfGicMsiDeviceInterruptResources {
+    owner: Arc<HvfGicMsiSharedInterruptOwner>,
     registry: GuestMessageInterruptRegistry,
+    registered: bool,
 }
 
 impl HvfGicMsiDeviceInterruptResources {
@@ -1078,7 +1105,7 @@ impl HvfGicMsiDeviceInterruptResources {
             };
             routes.push(Arc::new(route));
         }
-        let registry = match GuestMessageInterruptRegistry::new(routes) {
+        let registry = match GuestMessageInterruptRegistry::new(routes.clone()) {
             Ok(registry) => registry,
             Err(source) => {
                 return Err(rollback_device_interrupts(
@@ -1089,14 +1116,76 @@ impl HvfGicMsiDeviceInterruptResources {
             }
         };
         Ok(Self {
-            allocator,
-            interrupts: Some(interrupts),
+            owner: Arc::new(HvfGicMsiSharedInterruptOwner {
+                allocator,
+                routes,
+                state: Mutex::new(HvfGicMsiSharedInterruptState {
+                    active_resources: 1,
+                    interrupts: Some(interrupts),
+                }),
+            }),
             registry,
+            registered: true,
         })
     }
 
     pub fn lease_count(&self) -> usize {
-        self.interrupts.as_ref().map_or(0, Vec::len)
+        self.owner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.interrupts.as_ref().map(Vec::len))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn shared_registry(&self) -> Result<Self, HvfGicMsiDeviceInterruptResourceError> {
+        let registry = GuestMessageInterruptRegistry::new(self.owner.routes.clone())
+            .map_err(|source| HvfGicMsiDeviceInterruptResourceError::Registry { source })?;
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| HvfGicMsiDeviceInterruptResourceError::StatePoisoned)?;
+        if state.interrupts.is_none() {
+            return Err(HvfGicMsiDeviceInterruptResourceError::Released);
+        }
+        state.active_resources = state
+            .active_resources
+            .checked_add(1)
+            .ok_or(HvfGicMsiDeviceInterruptResourceError::ResourceCountOverflow)?;
+        drop(state);
+
+        Ok(Self {
+            owner: Arc::clone(&self.owner),
+            registry,
+            registered: true,
+        })
+    }
+
+    fn release_shared_leases_if_unowned(&self) -> Result<(), GuestMessageInterruptResourcesError> {
+        let interrupts = {
+            let mut state = self.owner.state.lock().map_err(|_| {
+                GuestMessageInterruptResourcesError::new(
+                    "shared GICv2m interrupt resource state is unavailable",
+                )
+            })?;
+            if state.active_resources != 0 {
+                return Ok(());
+            }
+            state.interrupts.take()
+        };
+        let Some(interrupts) = interrupts else {
+            return Ok(());
+        };
+        if let Err(source) = self.owner.allocator.release_many(&interrupts) {
+            if let Ok(mut state) = self.owner.state.lock()
+                && state.interrupts.is_none()
+            {
+                state.interrupts = Some(interrupts);
+            }
+            return Err(GuestMessageInterruptResourcesError::new(source.to_string()));
+        }
+        Ok(())
     }
 }
 
@@ -1105,6 +1194,7 @@ impl fmt::Debug for HvfGicMsiDeviceInterruptResources {
         f.debug_struct("HvfGicMsiDeviceInterruptResources")
             .field("leases", &"<redacted>")
             .field("registry", &self.registry)
+            .field("registered", &self.registered)
             .finish_non_exhaustive()
     }
 }
@@ -1118,14 +1208,26 @@ impl GuestMessageInterruptResources for HvfGicMsiDeviceInterruptResources {
         self.registry
             .release()
             .map_err(|source| GuestMessageInterruptResourcesError::new(source.to_string()))?;
-        let Some(interrupts) = self.interrupts.as_ref() else {
-            return Ok(());
-        };
-        self.allocator
-            .release_many(interrupts)
-            .map_err(|source| GuestMessageInterruptResourcesError::new(source.to_string()))?;
-        self.interrupts = None;
-        Ok(())
+        if self.registered {
+            let mut state = self.owner.state.lock().map_err(|_| {
+                GuestMessageInterruptResourcesError::new(
+                    "shared GICv2m interrupt resource state is unavailable",
+                )
+            })?;
+            state.active_resources = state.active_resources.checked_sub(1).ok_or_else(|| {
+                GuestMessageInterruptResourcesError::new(
+                    "shared GICv2m interrupt resource count underflowed",
+                )
+            })?;
+            self.registered = false;
+        }
+        self.release_shared_leases_if_unowned()
+    }
+}
+
+impl Drop for HvfGicMsiDeviceInterruptResources {
+    fn drop(&mut self) {
+        let _ = GuestMessageInterruptResources::release(self);
     }
 }
 
@@ -1155,6 +1257,9 @@ pub enum HvfGicMsiDeviceInterruptResourceError {
     Registry {
         source: GuestMessageInterruptRegistryError,
     },
+    StatePoisoned,
+    Released,
+    ResourceCountOverflow,
     Rollback {
         primary: String,
         cleanup: HvfGicMsiInterruptReleaseError,
@@ -1176,6 +1281,13 @@ impl fmt::Display for HvfGicMsiDeviceInterruptResourceError {
             Self::Registry { source } => {
                 write!(f, "failed to build the device message registry: {source}")
             }
+            Self::StatePoisoned => {
+                f.write_str("shared GICv2m interrupt resource state is unavailable")
+            }
+            Self::Released => f.write_str("shared GICv2m interrupt resources were released"),
+            Self::ResourceCountOverflow => {
+                f.write_str("shared GICv2m interrupt resource count overflowed")
+            }
             Self::Rollback { primary, cleanup } => {
                 write!(f, "{primary}; GICv2m rollback also failed: {cleanup}")
             }
@@ -1190,7 +1302,10 @@ impl std::error::Error for HvfGicMsiDeviceInterruptResourceError {
             Self::Route { source } => Some(source),
             Self::Registry { source } => Some(source),
             Self::Rollback { cleanup, .. } => Some(cleanup),
-            Self::MetadataAllocation => None,
+            Self::MetadataAllocation
+            | Self::StatePoisoned
+            | Self::Released
+            | Self::ResourceCountOverflow => None,
         }
     }
 }
@@ -2528,6 +2643,15 @@ fn create_real_gic(msi: Option<HvfGicMsiConfiguration>) -> Result<CreatedHvfGic,
         metadata,
         msi_signaler,
     })
+}
+
+/// Resolves every Hypervisor.framework symbol required by PCI/MSI startup
+/// without creating a VM or publishing caller-controlled values.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn validate_real_gic_msi_support() -> Result<(), HvfGicError> {
+    let _ = LoadedHvfGicApi::load(true)?;
+    let _ = LoadedHvfGicMsiSignalApi::load()?;
+    Ok(())
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -4302,6 +4426,10 @@ mod tests {
         assert_eq!(allocator.remaining(), 0);
 
         let interrupt = resources
+            .owner
+            .state
+            .lock()
+            .expect("shared resource state should be healthy")
             .interrupts
             .as_ref()
             .expect("resources should retain leases")[1]
@@ -4321,6 +4449,44 @@ mod tests {
             registry.signal(message),
             Err(GuestMessageInterruptRegistryError::NotActive { .. })
         ));
+    }
+
+    #[test]
+    fn msi_shared_registries_resolve_the_full_pool_and_release_on_the_last_owner() {
+        let metadata = metadata_from_parameters(parameters_with_msi(3))
+            .expect("valid MSI demand should produce metadata");
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            FakeGicApi::default(),
+        )
+        .expect("MSI metadata should produce a signaler");
+        let allocator = signaler.allocator();
+        let mut owner = HvfGicMsiDeviceInterruptResources::allocate(&signaler, 3)
+            .expect("shared interrupt pool should allocate");
+        let mut peer = owner
+            .shared_registry()
+            .expect("peer registry should share every live route");
+        let interrupt = owner
+            .owner
+            .state
+            .lock()
+            .expect("shared resource state should be healthy")
+            .interrupts
+            .as_ref()
+            .expect("resources should retain leases")[2]
+            .clone();
+        let message = GuestMessage::new(signaler.address, interrupt.raw_value());
+
+        peer.registry()
+            .signal(message)
+            .expect("peer registry should resolve a route anywhere in the pool");
+        peer.release()
+            .expect("peer registry should release independently");
+        assert_eq!(allocator.remaining(), 0);
+        owner
+            .release()
+            .expect("last owner should return every shared lease");
+        assert_eq!(allocator.remaining(), 3);
     }
 
     #[test]

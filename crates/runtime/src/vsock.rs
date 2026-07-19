@@ -20,12 +20,14 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
+use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
     VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
+use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
@@ -89,7 +91,8 @@ const VSOCK_HOST_CONNECT_COMMAND: &str = "connect";
 
 pub type VirtioVsockMmioHandler =
     VirtioMmioRegisterHandler<VirtioVsockConfigSpace, VirtioVsockDevice>;
-pub(crate) type VsockHostWakeup = (Vec<RawFd>, Vec<RawFd>, Option<Instant>);
+/// Host file descriptors and deadline that should wake a running vsock device.
+pub type VsockHostWakeup = (Vec<RawFd>, Vec<RawFd>, Option<Instant>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VsockConfigInput {
@@ -8753,6 +8756,71 @@ impl VirtioMmioDeviceActivationHandler for VirtioVsockDevice {
 
     fn reset(&mut self) {
         VirtioVsockDevice::reset(self);
+    }
+}
+
+impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
+    pub fn dispatch_vsock_queue_notifications(
+        &self,
+        memory: &mut GuestMemory,
+    ) -> Result<
+        VirtioVsockDeviceNotificationDispatch,
+        VirtioPciDeviceOperationError<
+            VirtioVsockDeviceNotificationError,
+            VirtioVsockDeviceNotificationDispatch,
+        >,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let drained_notifications =
+                    core.queue_notifications.take_pending_queue_notifications();
+                let dispatch = core.activation.dispatch_drained_queue_notifications_at(
+                    memory,
+                    drained_notifications,
+                    Instant::now(),
+                );
+                let (rx_interrupt, tx_interrupt) = match &dispatch {
+                    Ok(dispatch) => (
+                        dispatch
+                            .rx_queue_dispatch()
+                            .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt),
+                        dispatch
+                            .tx_queue_dispatch()
+                            .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt),
+                    ),
+                    Err(error) => (
+                        error
+                            .completed_rx_dispatch()
+                            .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt),
+                        error
+                            .completed_tx_dispatch()
+                            .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt),
+                    ),
+                };
+                if rx_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue {
+                        queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX as u16,
+                    });
+                }
+                if tx_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue {
+                        queue_index: VIRTIO_VSOCK_TX_QUEUE_INDEX as u16,
+                    });
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        VirtioPciDeviceOperationError::combine(dispatch, work.drain_interrupt_intents())
+    }
+
+    pub fn host_wakeup(
+        &self,
+    ) -> Result<Result<VsockHostWakeup, TryReserveError>, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| core.activation.host_wakeup())
     }
 }
 

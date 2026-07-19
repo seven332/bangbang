@@ -5109,11 +5109,40 @@
     {
       "id": "firecracker-argument:enable-pci",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --enable-pci.",
+      "summary": "Enable Firecracker v1.16 all-virtio PCI startup on the supported macOS arm64 Hypervisor.framework path while retaining explicit snapshot and runtime-hotplug limits.",
       "source_refs": [
         "firecracker-argument:enable-pci"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "--enable-pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "pci_all_virtio_gic_msi_configuration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "Arm64BootPciValidationConfig::all_virtio_devices"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_all_startup_virtio_devices_over_product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_accepts_enable_pci_after_host_preflight"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:http-api-max-payload-size",

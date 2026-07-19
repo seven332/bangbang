@@ -250,6 +250,7 @@ pub struct Arm64BootPciValidationConfig {
     device_id: u16,
     modern_virtio_rng: bool,
     data_devices: bool,
+    all_virtio_devices: bool,
 }
 
 impl Arm64BootPciValidationConfig {
@@ -262,6 +263,7 @@ impl Arm64BootPciValidationConfig {
             device_id: Self::FIRECRACKER_TEST_DEVICE_ID,
             modern_virtio_rng: false,
             data_devices: false,
+            all_virtio_devices: false,
         }
     }
 
@@ -276,6 +278,7 @@ impl Arm64BootPciValidationConfig {
             device_id: 0x1044,
             modern_virtio_rng: true,
             data_devices: false,
+            all_virtio_devices: false,
         }
     }
 
@@ -290,6 +293,23 @@ impl Arm64BootPciValidationConfig {
             device_id: 0,
             modern_virtio_rng: false,
             data_devices: true,
+            all_virtio_devices: false,
+        }
+    }
+
+    /// Selects the production all-virtio PCI transport.
+    ///
+    /// Unlike the narrower validation selectors, this mode is intended to be
+    /// reached from the process `--enable-pci` flag. Platform devices remain
+    /// on their legacy transports.
+    #[doc(hidden)]
+    pub const fn all_virtio_devices() -> Self {
+        Self {
+            vendor_id: crate::virtio_pci::VIRTIO_PCI_VENDOR_ID,
+            device_id: 0,
+            modern_virtio_rng: false,
+            data_devices: false,
+            all_virtio_devices: true,
         }
     }
 
@@ -309,6 +329,11 @@ impl Arm64BootPciValidationConfig {
     #[doc(hidden)]
     pub const fn is_data_devices(self) -> bool {
         self.data_devices
+    }
+
+    #[doc(hidden)]
+    pub const fn is_all_virtio_devices(self) -> bool {
+        self.all_virtio_devices
     }
 }
 
@@ -350,14 +375,22 @@ impl Arm64BootSerialDeviceConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arm64BootEntropyDeviceConfig {
     pub mmio_layout: EntropyMmioLayout,
-    pub interrupt_line: GuestInterruptLine,
+    pub interrupt_line: Option<GuestInterruptLine>,
 }
 
 impl Arm64BootEntropyDeviceConfig {
     pub const fn new(mmio_layout: EntropyMmioLayout, interrupt_line: GuestInterruptLine) -> Self {
         Self {
             mmio_layout,
-            interrupt_line,
+            interrupt_line: Some(interrupt_line),
+        }
+    }
+
+    #[doc(hidden)]
+    pub const fn for_pci(mmio_layout: EntropyMmioLayout) -> Self {
+        Self {
+            mmio_layout,
+            interrupt_line: None,
         }
     }
 }
@@ -365,14 +398,22 @@ impl Arm64BootEntropyDeviceConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arm64BootMemoryHotplugDeviceConfig {
     pub mmio_layout: VirtioMemMmioLayout,
-    pub interrupt_line: GuestInterruptLine,
+    pub interrupt_line: Option<GuestInterruptLine>,
 }
 
 impl Arm64BootMemoryHotplugDeviceConfig {
     pub const fn new(mmio_layout: VirtioMemMmioLayout, interrupt_line: GuestInterruptLine) -> Self {
         Self {
             mmio_layout,
-            interrupt_line,
+            interrupt_line: Some(interrupt_line),
+        }
+    }
+
+    #[doc(hidden)]
+    pub const fn for_pci(mmio_layout: VirtioMemMmioLayout) -> Self {
+        Self {
+            mmio_layout,
+            interrupt_line: None,
         }
     }
 }
@@ -398,9 +439,17 @@ pub struct Arm64BootResources {
     #[doc(hidden)]
     pub pci_network_devices: Vec<PreparedNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
+    #[doc(hidden)]
+    pub pci_vsock_device: Option<PreparedVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
+    #[doc(hidden)]
+    pub pci_balloon_device: Option<PreparedBalloonDevice>,
     pub memory_hotplug_device: Option<Arm64BootMemoryHotplugDevice>,
+    #[doc(hidden)]
+    pub pci_memory_hotplug_device: Option<PreparedVirtioMemDevice>,
     pub entropy_device: Option<Arm64BootEntropyDevice>,
+    #[doc(hidden)]
+    pub pci_entropy_device: Option<PreparedEntropyDevice>,
     pub pci_validation: Option<Arm64BootPciValidationResources>,
 }
 
@@ -466,9 +515,17 @@ pub struct Arm64BootRuntimeResources {
     #[doc(hidden)]
     pub pci_network_devices: Vec<PreparedNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
+    #[doc(hidden)]
+    pub pci_vsock_device: Option<PreparedVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
+    #[doc(hidden)]
+    pub pci_balloon_device: Option<PreparedBalloonDevice>,
     pub memory_hotplug_device: Option<Arm64BootMemoryHotplugDevice>,
+    #[doc(hidden)]
+    pub pci_memory_hotplug_device: Option<PreparedVirtioMemDevice>,
     pub entropy_device: Option<Arm64BootEntropyDevice>,
+    #[doc(hidden)]
+    pub pci_entropy_device: Option<PreparedEntropyDevice>,
     pub pci_validation: Option<Arm64BootPciValidationResources>,
 }
 
@@ -1068,9 +1125,13 @@ pub fn install_snapshot_v1_runtime(
         network_devices: Vec::new(),
         pci_network_devices: Vec::new(),
         vsock_device: None,
+        pci_vsock_device: None,
         balloon_device: None,
+        pci_balloon_device: None,
         memory_hotplug_device: None,
+        pci_memory_hotplug_device: None,
         entropy_device: None,
+        pci_entropy_device: None,
         pci_validation: None,
     };
 
@@ -2213,7 +2274,8 @@ impl<'a> Arm64BootEntropySource<'a> {
         Self { source }
     }
 
-    fn into_inner(self) -> &'a mut dyn VirtioRngEntropySource {
+    #[doc(hidden)]
+    pub fn into_inner(self) -> &'a mut dyn VirtioRngEntropySource {
         self.source
     }
 }
@@ -2230,12 +2292,27 @@ pub trait Arm64BootEntropySourceProvider {
         &mut self,
         device: &Arm64BootEntropyDevice,
     ) -> Result<Arm64BootEntropySource<'_>, Arm64BootEntropySourceError>;
+
+    /// Returns an entropy source for a transport without an MMIO registration.
+    fn pci_entropy_source(
+        &mut self,
+    ) -> Result<Arm64BootEntropySource<'_>, Arm64BootEntropySourceError> {
+        Err(Arm64BootEntropySourceError::new(
+            "entropy source provider does not support PCI transport",
+        ))
+    }
 }
 
 impl Arm64BootEntropySourceProvider for VirtioRngOsEntropySource {
     fn entropy_source(
         &mut self,
         _device: &Arm64BootEntropyDevice,
+    ) -> Result<Arm64BootEntropySource<'_>, Arm64BootEntropySourceError> {
+        Ok(Arm64BootEntropySource::new(self))
+    }
+
+    fn pci_entropy_source(
+        &mut self,
     ) -> Result<Arm64BootEntropySource<'_>, Arm64BootEntropySourceError> {
         Ok(Arm64BootEntropySource::new(self))
     }
@@ -3177,6 +3254,9 @@ pub enum Arm64BootResourceError {
     BootSourceLoad {
         source: BootSourceLoadError,
     },
+    PciCommandLine {
+        source: BootCommandLineError,
+    },
     RootDriveCommandLine {
         source: BootCommandLineError,
     },
@@ -3275,6 +3355,10 @@ pub enum Arm64BootResourceError {
         devices: usize,
         lines: usize,
     },
+    EntropyInterruptLineCount {
+        devices: usize,
+        lines: usize,
+    },
     BlockDeviceMetadataAllocation {
         source: TryReserveError,
     },
@@ -3329,6 +3413,12 @@ impl fmt::Display for Arm64BootResourceError {
             }
             Self::BootSourceLoad { source } => {
                 write!(f, "failed to load boot source: {source}")
+            }
+            Self::PciCommandLine { source } => {
+                write!(
+                    f,
+                    "failed to append PCI kernel command-line arguments: {source}"
+                )
             }
             Self::RootDriveCommandLine { source } => {
                 write!(
@@ -3440,6 +3530,10 @@ impl fmt::Display for Arm64BootResourceError {
                 f,
                 "memory hotplug MMIO device count {devices} does not match interrupt line count {lines}"
             ),
+            Self::EntropyInterruptLineCount { devices, lines } => write!(
+                f,
+                "entropy MMIO device count {devices} does not match interrupt line count {lines}"
+            ),
             Self::BlockDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate block device metadata: {source}")
             }
@@ -3480,6 +3574,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::GuestMemoryAllocation { source } => Some(source),
             Self::DirtyTracking { source } => Some(source),
             Self::BootSourceLoad { source } => Some(source),
+            Self::PciCommandLine { source } => Some(source),
             Self::RootDriveCommandLine { source } => Some(source),
             Self::PrepareBlockDevices { source } => Some(source),
             Self::PreparePmemDevices { source } => Some(source),
@@ -3522,7 +3617,8 @@ impl std::error::Error for Arm64BootResourceError {
             | Self::VsockInterruptLineCount { .. }
             | Self::VsockStartupResourceCount { .. }
             | Self::BalloonInterruptLineCount { .. }
-            | Self::MemoryHotplugInterruptLineCount { .. } => None,
+            | Self::MemoryHotplugInterruptLineCount { .. }
+            | Self::EntropyInterruptLineCount { .. } => None,
         }
     }
 }
@@ -3683,7 +3779,10 @@ impl Arm64BootResources {
         let boot_source_config = controller
             .boot_source_config()
             .ok_or(Arm64BootResourceError::MissingBootSource)?;
-        let pci_data_devices = pci_validation.is_some_and(|config| config.is_data_devices());
+        let pci_all_virtio =
+            pci_validation.is_some_and(Arm64BootPciValidationConfig::is_all_virtio_devices);
+        let pci_data_devices = pci_validation
+            .is_some_and(|config| config.is_data_devices() || config.is_all_virtio_devices());
         validate_block_interrupt_line_count(
             if pci_data_devices {
                 0
@@ -3709,16 +3808,18 @@ impl Arm64BootResources {
             network_interrupt_lines.len(),
         )?;
         validate_vsock_interrupt_line_count(
-            controller.vsock_config().is_some(),
+            controller.vsock_config().is_some() && !pci_all_virtio,
             vsock_interrupt_line.is_some(),
         )?;
         validate_balloon_interrupt_line_count(
-            controller.balloon_config().is_some(),
+            controller.balloon_config().is_some() && !pci_all_virtio,
             balloon_interrupt_line.is_some(),
         )?;
         validate_memory_hotplug_interrupt_line_count(
-            controller.memory_hotplug_config().is_some(),
-            memory_hotplug_device.is_some(),
+            controller.memory_hotplug_config().is_some() && !pci_all_virtio,
+            memory_hotplug_device
+                .and_then(|device| device.interrupt_line)
+                .is_some(),
         )?;
 
         let machine_config = controller.machine_config();
@@ -3736,6 +3837,12 @@ impl Arm64BootResources {
         let mut loaded_boot_source = boot_source
             .load_with_files(&layout, &mut memory, boot_files)
             .map_err(|source| Arm64BootResourceError::BootSourceLoad { source })?;
+        if pci_validation.is_none() {
+            loaded_boot_source.command_line = loaded_boot_source
+                .command_line
+                .with_appended_kernel_args(["pci=off"])
+                .map_err(|source| Arm64BootResourceError::PciCommandLine { source })?;
+        }
         append_root_drive_command_line(&mut loaded_boot_source, controller.drive_configs())?;
         let prepared_pmems = PreparedPmemDevices::from_config_slice_with_layout_and_backings(
             controller.pmem_configs(),
@@ -3831,158 +3938,192 @@ impl Arm64BootResources {
                 supplied: true,
             });
         }
-        let vsock_device = match (
-            controller.vsock_config(),
-            vsock_interrupt_line,
-            supplied_vsock_listener,
-        ) {
-            (Some(config), Some(interrupt_line), Some(listener)) => {
-                let prepared_vsock =
-                    PreparedVsockDevice::from_config_with_supplied_host_socket(config, listener)
-                        .map_err(|source| Arm64BootResourceError::PrepareVsockDevice { source })?;
-                let vsock_mmio = prepared_vsock
-                    .register_mmio_with_dispatcher(vsock_mmio_layout, mmio_dispatcher)
-                    .map_err(|source| Arm64BootResourceError::RegisterVsockMmio {
-                        source: Box::new(source),
-                    })?;
-                let (dispatcher, registration) = vsock_mmio.into_parts();
-                mmio_dispatcher = dispatcher;
-                let (device, fdt_device) =
-                    arm64_boot_vsock_device_metadata(registration, interrupt_line);
-                fdt_devices.try_reserve_exact(1).map_err(|source| {
-                    Arm64BootResourceError::VsockDeviceMetadataAllocation { source }
-                })?;
-                fdt_devices.push(fdt_device);
-                Some(device)
-            }
-            (Some(config), Some(interrupt_line), None) => {
-                let prepared_vsock = PreparedVsockDevice::from_config_with_host_socket(config)
-                    .map_err(|source| Arm64BootResourceError::PrepareVsockDevice { source })?;
-                let vsock_mmio = prepared_vsock
-                    .register_mmio_with_dispatcher(vsock_mmio_layout, mmio_dispatcher)
-                    .map_err(|source| Arm64BootResourceError::RegisterVsockMmio {
-                        source: Box::new(source),
-                    })?;
-                let (dispatcher, registration) = vsock_mmio.into_parts();
-                mmio_dispatcher = dispatcher;
-                let (device, fdt_device) =
-                    arm64_boot_vsock_device_metadata(registration, interrupt_line);
-                fdt_devices.try_reserve_exact(1).map_err(|source| {
-                    Arm64BootResourceError::VsockDeviceMetadataAllocation { source }
-                })?;
-                fdt_devices.push(fdt_device);
-                Some(device)
-            }
-            (None, None, None) => None,
-            (Some(_), None, _) | (None, Some(_), _) => {
-                return Err(vsock_interrupt_line_count_error(
-                    controller.vsock_config().is_some(),
-                    vsock_interrupt_line.is_some(),
-                ));
-            }
-            (None, None, Some(_)) => {
+        let prepared_vsock = match (controller.vsock_config(), supplied_vsock_listener) {
+            (Some(config), Some(listener)) => Some(
+                PreparedVsockDevice::from_config_with_supplied_host_socket(config, listener)
+                    .map_err(|source| Arm64BootResourceError::PrepareVsockDevice { source })?,
+            ),
+            (Some(config), None) => Some(
+                PreparedVsockDevice::from_config_with_host_socket(config)
+                    .map_err(|source| Arm64BootResourceError::PrepareVsockDevice { source })?,
+            ),
+            (None, None) => None,
+            (None, Some(_)) => {
                 return Err(Arm64BootResourceError::VsockStartupResourceCount {
                     configured: false,
                     supplied: true,
                 });
             }
         };
-        let balloon_device = match (controller.balloon_config(), balloon_interrupt_line) {
-            (Some(config), Some(interrupt_line)) => {
-                let prepared_balloon = PreparedBalloonDevice::from_config(config)
-                    .map_err(|source| Arm64BootResourceError::PrepareBalloonDevice { source })?;
-                let balloon_mmio = prepared_balloon
-                    .register_mmio_with_dispatcher(balloon_mmio_layout, mmio_dispatcher)
-                    .map_err(|source| Arm64BootResourceError::RegisterBalloonMmio {
-                        source: Box::new(source),
+        let (vsock_device, pci_vsock_device) =
+            match (prepared_vsock, vsock_interrupt_line, pci_all_virtio) {
+                (Some(prepared), None, true) => (None, Some(prepared)),
+                (Some(prepared), Some(interrupt_line), false) => {
+                    let vsock_mmio = prepared
+                        .register_mmio_with_dispatcher(vsock_mmio_layout, mmio_dispatcher)
+                        .map_err(|source| Arm64BootResourceError::RegisterVsockMmio {
+                            source: Box::new(source),
+                        })?;
+                    let (dispatcher, registration) = vsock_mmio.into_parts();
+                    mmio_dispatcher = dispatcher;
+                    let (device, fdt_device) =
+                        arm64_boot_vsock_device_metadata(registration, interrupt_line);
+                    fdt_devices.try_reserve_exact(1).map_err(|source| {
+                        Arm64BootResourceError::VsockDeviceMetadataAllocation { source }
                     })?;
-                let (dispatcher, registration) = balloon_mmio.into_parts();
-                mmio_dispatcher = dispatcher;
-                let (device, fdt_device) =
-                    arm64_boot_balloon_device_metadata(registration, interrupt_line);
-                fdt_devices.try_reserve_exact(1).map_err(|source| {
-                    Arm64BootResourceError::BalloonDeviceMetadataAllocation { source }
-                })?;
-                fdt_devices.push(fdt_device);
-                Some(device)
-            }
-            (None, None) => None,
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(balloon_interrupt_line_count_error(
-                    controller.balloon_config().is_some(),
-                    balloon_interrupt_line.is_some(),
-                ));
-            }
-        };
-        let memory_hotplug_device =
-            match (controller.memory_hotplug_config(), memory_hotplug_device) {
-                (Some(config), Some(device_config)) => {
-                    let mut reserved_ranges = Vec::new();
-                    reserved_ranges
-                        .try_reserve_exact(layout.ranges().len())
-                        .map_err(|source| {
-                            Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
+                    fdt_devices.push(fdt_device);
+                    (Some(device), None)
+                }
+                (None, None, _) => (None, None),
+                (prepared, interrupt_line, _) => {
+                    return Err(vsock_interrupt_line_count_error(
+                        prepared.is_some(),
+                        interrupt_line.is_some(),
+                    ));
+                }
+            };
+
+        let prepared_balloon = controller
+            .balloon_config()
+            .map(PreparedBalloonDevice::from_config)
+            .transpose()
+            .map_err(|source| Arm64BootResourceError::PrepareBalloonDevice { source })?;
+        let (balloon_device, pci_balloon_device) =
+            match (prepared_balloon, balloon_interrupt_line, pci_all_virtio) {
+                (Some(prepared), None, true) => (None, Some(prepared)),
+                (Some(prepared), Some(interrupt_line), false) => {
+                    let balloon_mmio = prepared
+                        .register_mmio_with_dispatcher(balloon_mmio_layout, mmio_dispatcher)
+                        .map_err(|source| Arm64BootResourceError::RegisterBalloonMmio {
+                            source: Box::new(source),
                         })?;
-                    reserved_ranges.extend_from_slice(layout.ranges());
-                    reserved_ranges
-                        .try_reserve_exact(pmem_devices.len())
-                        .map_err(|source| {
-                            Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
-                        })?;
-                    reserved_ranges
-                        .extend(pmem_devices.iter().map(PreparedPmemDevice::guest_range));
-                    let prepared_mem = PreparedVirtioMemDevice::from_config_with_reserved_ranges(
+                    let (dispatcher, registration) = balloon_mmio.into_parts();
+                    mmio_dispatcher = dispatcher;
+                    let (device, fdt_device) =
+                        arm64_boot_balloon_device_metadata(registration, interrupt_line);
+                    fdt_devices.try_reserve_exact(1).map_err(|source| {
+                        Arm64BootResourceError::BalloonDeviceMetadataAllocation { source }
+                    })?;
+                    fdt_devices.push(fdt_device);
+                    (Some(device), None)
+                }
+                (None, None, _) => (None, None),
+                (prepared, interrupt_line, _) => {
+                    return Err(balloon_interrupt_line_count_error(
+                        prepared.is_some(),
+                        interrupt_line.is_some(),
+                    ));
+                }
+            };
+
+        let prepared_memory_hotplug = match controller.memory_hotplug_config() {
+            Some(config) => {
+                let mut reserved_ranges = Vec::new();
+                reserved_ranges
+                    .try_reserve_exact(layout.ranges().len())
+                    .map_err(|source| {
+                        Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
+                    })?;
+                reserved_ranges.extend_from_slice(layout.ranges());
+                reserved_ranges
+                    .try_reserve_exact(pmem_devices.len())
+                    .map_err(|source| {
+                        Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
+                    })?;
+                reserved_ranges.extend(pmem_devices.iter().map(PreparedPmemDevice::guest_range));
+                Some(
+                    PreparedVirtioMemDevice::from_config_with_reserved_ranges(
                         config,
                         &reserved_ranges,
                     )
                     .map_err(|source| {
                         Arm64BootResourceError::PrepareMemoryHotplugDevice { source }
-                    })?;
-                    let mem_mmio = prepared_mem
-                        .register_mmio_with_dispatcher(device_config.mmio_layout, mmio_dispatcher)
-                        .map_err(|source| Arm64BootResourceError::RegisterMemoryHotplugMmio {
-                            source: Box::new(source),
-                        })?;
-                    let (dispatcher, registration) = mem_mmio.into_parts();
-                    mmio_dispatcher = dispatcher;
-                    let (device, fdt_device) = arm64_boot_memory_hotplug_device_metadata(
-                        registration,
-                        device_config.interrupt_line,
-                    );
-                    fdt_devices.try_reserve_exact(1).map_err(|source| {
-                        Arm64BootResourceError::MemoryHotplugDeviceMetadataAllocation { source }
-                    })?;
-                    fdt_devices.push(fdt_device);
-                    Some(device)
-                }
-                (None, None) => None,
-                (Some(_), None) | (None, Some(_)) => {
-                    return Err(memory_hotplug_interrupt_line_count_error(
-                        controller.memory_hotplug_config().is_some(),
-                        memory_hotplug_device.is_some(),
-                    ));
-                }
-            };
-        let entropy_device = match entropy_device {
-            Some(config) => {
-                let entropy_mmio = PreparedEntropyDevice::from_config(
-                    controller.entropy_config().unwrap_or_default(),
+                    })?,
                 )
-                .register_mmio_with_dispatcher(config.mmio_layout, mmio_dispatcher)
-                .map_err(|source| Arm64BootResourceError::RegisterEntropyMmio {
-                    source: Box::new(source),
-                })?;
-                let (dispatcher, registration) = entropy_mmio.into_parts();
-                mmio_dispatcher = dispatcher;
-                let (device, fdt_device) =
-                    arm64_boot_entropy_device_metadata(registration, config.interrupt_line);
-                fdt_devices.try_reserve_exact(1).map_err(|source| {
-                    Arm64BootResourceError::EntropyDeviceMetadataAllocation { source }
-                })?;
-                fdt_devices.push(fdt_device);
-                Some(device)
             }
             None => None,
+        };
+        let (memory_hotplug_device, pci_memory_hotplug_device) = match (
+            prepared_memory_hotplug,
+            memory_hotplug_device,
+            pci_all_virtio,
+        ) {
+            (
+                Some(prepared),
+                None
+                | Some(Arm64BootMemoryHotplugDeviceConfig {
+                    interrupt_line: None,
+                    ..
+                }),
+                true,
+            ) => (None, Some(prepared)),
+            (Some(prepared), Some(device_config), false) => {
+                let interrupt_line = device_config
+                    .interrupt_line
+                    .ok_or_else(|| memory_hotplug_interrupt_line_count_error(true, false))?;
+                let mem_mmio = prepared
+                    .register_mmio_with_dispatcher(device_config.mmio_layout, mmio_dispatcher)
+                    .map_err(|source| Arm64BootResourceError::RegisterMemoryHotplugMmio {
+                        source: Box::new(source),
+                    })?;
+                let (dispatcher, registration) = mem_mmio.into_parts();
+                mmio_dispatcher = dispatcher;
+                let (device, fdt_device) =
+                    arm64_boot_memory_hotplug_device_metadata(registration, interrupt_line);
+                fdt_devices.try_reserve_exact(1).map_err(|source| {
+                    Arm64BootResourceError::MemoryHotplugDeviceMetadataAllocation { source }
+                })?;
+                fdt_devices.push(fdt_device);
+                (Some(device), None)
+            }
+            (None, None, _) => (None, None),
+            (prepared, device_config, _) => {
+                return Err(memory_hotplug_interrupt_line_count_error(
+                    prepared.is_some(),
+                    device_config
+                        .and_then(|config| config.interrupt_line)
+                        .is_some(),
+                ));
+            }
+        };
+
+        let (entropy_device, pci_entropy_device) = match entropy_device {
+            Some(config) => {
+                let prepared = PreparedEntropyDevice::from_config(
+                    controller.entropy_config().unwrap_or_default(),
+                );
+                if pci_all_virtio {
+                    if config.interrupt_line.is_some() {
+                        return Err(Arm64BootResourceError::EntropyInterruptLineCount {
+                            devices: 0,
+                            lines: 1,
+                        });
+                    }
+                    (None, Some(prepared))
+                } else {
+                    let interrupt_line = config.interrupt_line.ok_or(
+                        Arm64BootResourceError::EntropyInterruptLineCount {
+                            devices: 1,
+                            lines: 0,
+                        },
+                    )?;
+                    let entropy_mmio = prepared
+                        .register_mmio_with_dispatcher(config.mmio_layout, mmio_dispatcher)
+                        .map_err(|source| Arm64BootResourceError::RegisterEntropyMmio {
+                            source: Box::new(source),
+                        })?;
+                    let (dispatcher, registration) = entropy_mmio.into_parts();
+                    mmio_dispatcher = dispatcher;
+                    let (device, fdt_device) =
+                        arm64_boot_entropy_device_metadata(registration, interrupt_line);
+                    fdt_devices.try_reserve_exact(1).map_err(|source| {
+                        Arm64BootResourceError::EntropyDeviceMetadataAllocation { source }
+                    })?;
+                    fdt_devices.push(fdt_device);
+                    (Some(device), None)
+                }
+            }
+            None => (None, None),
         };
         let rtc_device = rtc_device
             .map(|rtc| register_rtc_mmio(&mut mmio_dispatcher, rtc))
@@ -4038,9 +4179,13 @@ impl Arm64BootResources {
             network_devices,
             pci_network_devices,
             vsock_device,
+            pci_vsock_device,
             balloon_device,
+            pci_balloon_device,
             memory_hotplug_device,
+            pci_memory_hotplug_device,
             entropy_device,
+            pci_entropy_device,
             pci_validation,
         })
     }
@@ -4067,9 +4212,13 @@ impl Arm64BootResources {
                 network_devices: self.network_devices,
                 pci_network_devices: self.pci_network_devices,
                 vsock_device: self.vsock_device,
+                pci_vsock_device: self.pci_vsock_device,
                 balloon_device: self.balloon_device,
+                pci_balloon_device: self.pci_balloon_device,
                 memory_hotplug_device: self.memory_hotplug_device,
+                pci_memory_hotplug_device: self.pci_memory_hotplug_device,
                 entropy_device: self.entropy_device,
+                pci_entropy_device: self.pci_entropy_device,
                 pci_validation: self.pci_validation,
             },
         }
@@ -4083,7 +4232,10 @@ fn prepare_pci_validation(
     let plan = Arm64PciAddressPlan::firecracker_v1_16()
         .map_err(|source| Arm64BootResourceError::PciAddressPlan { source })?;
     let mut segment = PciSegment::new();
-    let function_lease = if config.is_modern_virtio_rng() || config.is_data_devices() {
+    let function_lease = if config.is_modern_virtio_rng()
+        || config.is_data_devices()
+        || config.is_all_virtio_devices()
+    {
         None
     } else {
         Some(
@@ -4676,8 +4828,9 @@ mod tests {
 
     use super::{
         ARM64_BOOT_VMCLOCK_ADDRESS, ARM64_BOOT_VMCLOCK_SIZE, ARM64_BOOT_VMGENID_ADDRESS,
-        ARM64_BOOT_VMGENID_SIZE, Arm64BootEntropySource, Arm64BootEntropySourceError,
-        Arm64BootEntropySourceProvider, Arm64BootNetworkNotificationOutcome,
+        ARM64_BOOT_VMGENID_SIZE, Arm64BootEntropyDeviceConfig, Arm64BootEntropySource,
+        Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
+        Arm64BootMemoryHotplugDeviceConfig, Arm64BootNetworkNotificationOutcome,
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
         Arm64BootPciValidationConfig, Arm64BootResourceConfig, Arm64BootResourceError,
         Arm64BootResources, Arm64BootRtcDeviceConfig, Arm64BootRtcMmioRegistrationError,
@@ -7492,9 +7645,12 @@ mod tests {
         assert!(resources.mmio_dispatcher.regions().is_empty());
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
-            DEFAULT_KERNEL_COMMAND_LINE
+            format!("{DEFAULT_KERNEL_COMMAND_LINE} pci=off")
         );
-        assert_eq!(fdt_bootargs(&resources), DEFAULT_KERNEL_COMMAND_LINE);
+        assert_eq!(
+            fdt_bootargs(&resources),
+            format!("{DEFAULT_KERNEL_COMMAND_LINE} pci=off")
+        );
         assert!(read_fdt(&resources).find("/uart@40002000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40006000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40007000").is_none());
@@ -7637,6 +7793,100 @@ mod tests {
         assert!(parts.runtime.block_devices.is_empty());
         assert!(parts.runtime.pmem_mmio_devices.is_empty());
         assert!(parts.runtime.network_devices.is_empty());
+    }
+
+    #[test]
+    fn assembles_all_virtio_pci_devices_without_legacy_mmio_publication() {
+        let kernel = temp_file("kernel-with-all-virtio-pci", &arm64_image());
+        let block = temp_file("all-virtio-pci-block", &[0x5a; 512]);
+        let pmem = temp_file("all-virtio-pci-pmem", b"pmem");
+        let socket_path = missing_path("all-virtio-pci-vsock.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        add_pmem(&mut controller, "pmem0", pmem.path(), false);
+        add_network(&mut controller, "eth0", "vmnet:shared");
+        add_vsock(&mut controller, 42, &socket_path);
+        add_balloon(&mut controller, 4);
+        add_memory_hotplug(&mut controller);
+
+        let mut config = valid_config(&[]);
+        config.gic = valid_gic_with_msi();
+        config.memory_hotplug_device = Some(Arm64BootMemoryHotplugDeviceConfig::for_pci(
+            VirtioMemMmioLayout::new(TEST_MEMORY_HOTPLUG_MMIO_BASE, MmioRegionId::new(120)),
+        ));
+        config.entropy_device = Some(Arm64BootEntropyDeviceConfig::for_pci(
+            EntropyMmioLayout::new(TEST_ENTROPY_MMIO_BASE, MmioRegionId::new(100)),
+        ));
+
+        let resources =
+            Arm64BootResources::assemble_from_controller_with_startup_resources_and_pci_validation(
+                &controller,
+                config,
+                VmStartupResources::default(),
+                Some(Arm64BootPciValidationConfig::all_virtio_devices()),
+            )
+            .expect("boot resources should assemble with every virtio device on PCI");
+
+        assert_eq!(resources.pci_block_devices.len(), 1);
+        assert_eq!(resources.pmem_devices.len(), 1);
+        assert_eq!(resources.pci_network_devices.len(), 1);
+        assert!(resources.pci_vsock_device.is_some());
+        assert!(resources.pci_balloon_device.is_some());
+        assert!(resources.pci_memory_hotplug_device.is_some());
+        assert!(resources.pci_entropy_device.is_some());
+        assert!(resources.block_devices.is_empty());
+        assert!(resources.pmem_mmio_devices.is_empty());
+        assert!(resources.network_devices.is_empty());
+        assert!(resources.vsock_device.is_none());
+        assert!(resources.balloon_device.is_none());
+        assert!(resources.memory_hotplug_device.is_none());
+        assert!(resources.entropy_device.is_none());
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+        assert_eq!(
+            resources
+                .pci_validation
+                .as_ref()
+                .expect("PCI host resources should remain retained")
+                .segment()
+                .with_segment(|segment| segment.function_count())
+                .expect("all-virtio PCI segment should not be poisoned"),
+            1,
+            "product PCI assembly should retain only the host bridge before endpoint publication"
+        );
+        assert!(
+            !resources
+                .loaded_boot_source
+                .command_line
+                .as_str()
+                .contains("pci=off")
+        );
+
+        let tree = read_fdt(&resources);
+        assert!(tree.find("/pci@70000000").is_some());
+        for address in [
+            TEST_BLOCK_MMIO_BASE,
+            TEST_PMEM_MMIO_BASE,
+            TEST_NETWORK_MMIO_BASE,
+            TEST_VSOCK_MMIO_BASE,
+            TEST_BALLOON_MMIO_BASE,
+            TEST_MEMORY_HOTPLUG_MMIO_BASE,
+            TEST_ENTROPY_MMIO_BASE,
+        ] {
+            assert!(
+                tree.find(&format!("/virtio_mmio@{:x}", address.raw_value()))
+                    .is_none(),
+                "all-virtio PCI mode must not publish a virtio-mmio node at {address}"
+            );
+        }
+
+        let parts = resources.into_parts();
+        assert_eq!(parts.runtime.pci_block_devices.len(), 1);
+        assert_eq!(parts.runtime.pmem_devices.len(), 1);
+        assert_eq!(parts.runtime.pci_network_devices.len(), 1);
+        assert!(parts.runtime.pci_vsock_device.is_some());
+        assert!(parts.runtime.pci_balloon_device.is_some());
+        assert!(parts.runtime.pci_memory_hotplug_device.is_some());
+        assert!(parts.runtime.pci_entropy_device.is_some());
     }
 
     #[test]
@@ -8223,9 +8473,12 @@ mod tests {
         assert_eq!(resources.mmio_dispatcher.regions().len(), 2);
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
-            DEFAULT_KERNEL_COMMAND_LINE
+            format!("{DEFAULT_KERNEL_COMMAND_LINE} pci=off")
         );
-        assert_eq!(fdt_bootargs(&resources), DEFAULT_KERNEL_COMMAND_LINE);
+        assert_eq!(
+            fdt_bootargs(&resources),
+            format!("{DEFAULT_KERNEL_COMMAND_LINE} pci=off")
+        );
         assert!(read_fdt(&resources).find("/virtio_mmio@40009000").is_some());
         assert!(read_fdt(&resources).find("/virtio_mmio@4000a000").is_some());
     }
@@ -8367,9 +8620,12 @@ mod tests {
 
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
-            "console=ttyS0 root=/dev/vda ro"
+            "console=ttyS0 pci=off root=/dev/vda ro"
         );
-        assert_eq!(fdt_bootargs(&resources), "console=ttyS0 root=/dev/vda ro");
+        assert_eq!(
+            fdt_bootargs(&resources),
+            "console=ttyS0 pci=off root=/dev/vda ro"
+        );
     }
 
     #[test]
@@ -8392,9 +8648,12 @@ mod tests {
 
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
-            "console=ttyS0 root=/dev/vda rw"
+            "console=ttyS0 pci=off root=/dev/vda rw"
         );
-        assert_eq!(fdt_bootargs(&resources), "console=ttyS0 root=/dev/vda rw");
+        assert_eq!(
+            fdt_bootargs(&resources),
+            "console=ttyS0 pci=off root=/dev/vda rw"
+        );
     }
 
     #[test]
@@ -8417,11 +8676,11 @@ mod tests {
 
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
-            "console=ttyS0 root=PARTUUID=0eaa91a0-01 ro"
+            "console=ttyS0 pci=off root=PARTUUID=0eaa91a0-01 ro"
         );
         assert_eq!(
             fdt_bootargs(&resources),
-            "console=ttyS0 root=PARTUUID=0eaa91a0-01 ro"
+            "console=ttyS0 pci=off root=PARTUUID=0eaa91a0-01 ro"
         );
     }
 
@@ -8445,9 +8704,9 @@ mod tests {
 
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
-            "console=ttyS0"
+            "console=ttyS0 pci=off"
         );
-        assert_eq!(fdt_bootargs(&resources), "console=ttyS0");
+        assert_eq!(fdt_bootargs(&resources), "console=ttyS0 pci=off");
     }
 
     #[test]
@@ -8471,18 +8730,18 @@ mod tests {
 
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
-            "console=ttyS0 root=/dev/vda ro -- /init"
+            "console=ttyS0 pci=off root=/dev/vda ro -- /init"
         );
         assert_eq!(
             fdt_bootargs(&resources),
-            "console=ttyS0 root=/dev/vda ro -- /init"
+            "console=ttyS0 pci=off root=/dev/vda ro -- /init"
         );
     }
 
     #[test]
     fn root_drive_boot_args_overflow_fails_before_block_preparation() {
         let kernel = temp_file("kernel-root-overflow", &arm64_image());
-        let boot_args = "a".repeat(aarch64::CMDLINE_MAX_SIZE - 1);
+        let boot_args = "a".repeat(aarch64::CMDLINE_MAX_SIZE - 1 - " pci=off".len());
         let mut controller = controller_with_kernel_and_boot_args(kernel.path(), &boot_args);
         add_drive(
             &mut controller,

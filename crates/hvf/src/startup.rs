@@ -3,7 +3,7 @@
 use std::collections::TryReserveError;
 use std::fmt;
 use std::io::{self, Write as _};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -12,11 +12,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bangbang_runtime::balloon::{
-    BalloonMmioLayout, BalloonUpdateError, VirtioBalloonDeviceNotificationError,
+    BalloonConfig, BalloonHintingCommandError, BalloonHintingStartInput, BalloonHintingStatus,
+    BalloonHintingStatusError, BalloonMmioLayout, BalloonStats, BalloonStatsError,
+    BalloonStatsUpdateInput, BalloonUpdateError, VIRTIO_BALLOON_DEVICE_ID,
+    VirtioBalloonConfigSpace, VirtioBalloonDevice, VirtioBalloonDeviceNotificationError,
+    VirtioBalloonQueueLayout,
 };
 use bangbang_runtime::block::{
-    BlockMmioLayout, DriveConfig, VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_QUEUE_SIZES,
-    VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceNotificationError,
+    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveRateLimiterConfig, DriveUpdateError,
+    VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_QUEUE_SIZES, VirtioBlockConfigSpace, VirtioBlockDevice,
+    VirtioBlockDeviceNotificationError,
 };
 use bangbang_runtime::boot::BootSourceFiles;
 use bangbang_runtime::boot_timer::{
@@ -34,8 +39,10 @@ use bangbang_runtime::interrupt::{
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
 use bangbang_runtime::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
-    MemoryHotplugUpdateError, VirtioMemMmioLayout, VirtioMemMutationExecutor,
+    MemoryHotplugUpdateError, VIRTIO_MEM_DEVICE_ID, VIRTIO_MEM_QUEUE_SIZES, VirtioMemConfigSpace,
+    VirtioMemDevice, VirtioMemMmioLayout, VirtioMemMutationExecutor,
 };
+use bangbang_runtime::message_interrupt::GuestMessageInterruptResources;
 use bangbang_runtime::metrics::{
     SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
     SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
@@ -43,16 +50,17 @@ use bangbang_runtime::metrics::{
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegionId};
 use bangbang_runtime::network::{
-    NetworkMmioLayout, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_QUEUE_SIZES, VirtioNetworkConfigSpace,
-    VirtioNetworkDevice, VirtioNetworkDeviceNotificationError,
+    NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioLayout, VIRTIO_NET_DEVICE_ID,
+    VIRTIO_NET_QUEUE_SIZES, VirtioNetworkConfigSpace, VirtioNetworkDevice,
+    VirtioNetworkDeviceNotificationError,
 };
 use bangbang_runtime::pci::{
     PCI_FIRST_ENDPOINT_DEVICE, PciBarAddressSpace, PciBarAllocator, PciClassCode,
     PciType0Configuration,
 };
 use bangbang_runtime::pmem::{
-    PmemMmioLayout, VIRTIO_PMEM_DEVICE_ID, VIRTIO_PMEM_QUEUE_SIZES, VirtioPmemConfigSpace,
-    VirtioPmemDevice, VirtioPmemFlushStatus,
+    PmemMmioLayout, PmemUpdate, PmemUpdateError, VIRTIO_PMEM_DEVICE_ID, VIRTIO_PMEM_QUEUE_SIZES,
+    VirtioPmemConfigSpace, VirtioPmemDevice, VirtioPmemFlushStatus,
 };
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{SerialConfig, SharedSerialOutput, SharedSerialOutputBuffer};
@@ -88,10 +96,13 @@ use bangbang_runtime::virtio::{
 };
 use bangbang_runtime::virtio_pci::{
     PublishedVirtioPciEndpoint, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VirtioPciDeviceOperationError,
-    VirtioPciDiagnostics, VirtioPciEndpointError, VirtioPciEndpointPhase, VirtioPciIdentity,
-    VirtioPciPublicationError,
+    VirtioPciDiagnostics, VirtioPciEndpoint, VirtioPciEndpointError, VirtioPciEndpointPhase,
+    VirtioPciIdentity, VirtioPciPublicationError,
 };
-use bangbang_runtime::vsock::VsockMmioLayout;
+use bangbang_runtime::vsock::{
+    VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockConfigSpace, VirtioVsockDevice,
+    VsockHostWakeup, VsockMmioLayout,
+};
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
 use crate::backend::HvfBackend;
@@ -162,6 +173,7 @@ pub struct HvfArm64BootSessionConfig {
     pub serial_device: Option<HvfArm64BootSerialDeviceConfig>,
     pub gic_msi: Option<HvfGicMsiConfiguration>,
     pub pci_validation: Option<Arm64BootPciValidationConfig>,
+    pub pci_enabled: bool,
 }
 
 impl HvfArm64BootSessionConfig {
@@ -185,6 +197,7 @@ impl HvfArm64BootSessionConfig {
             serial_device: None,
             gic_msi: None,
             pci_validation: None,
+            pci_enabled: false,
         }
     }
 
@@ -241,6 +254,13 @@ impl HvfArm64BootSessionConfig {
     /// process configuration.
     pub const fn with_pci_validation(mut self, validation: Arm64BootPciValidationConfig) -> Self {
         self.pci_validation = Some(validation);
+        self
+    }
+
+    /// Selects production PCI transport for every configured virtio device.
+    #[must_use]
+    pub const fn with_pci_enabled(mut self) -> Self {
+        self.pci_enabled = true;
         self
     }
 }
@@ -526,6 +546,26 @@ type PublishedPciPmem = PublishedVirtioPciEndpoint<
     VirtioPmemDevice,
     HvfGicMsiDeviceInterruptResources,
 >;
+type PublishedPciBalloon = PublishedVirtioPciEndpoint<
+    VirtioBalloonConfigSpace,
+    VirtioBalloonDevice,
+    HvfGicMsiDeviceInterruptResources,
+>;
+type PublishedPciVsock = PublishedVirtioPciEndpoint<
+    VirtioVsockConfigSpace,
+    VirtioVsockDevice,
+    HvfGicMsiDeviceInterruptResources,
+>;
+type PublishedPciEntropy = PublishedVirtioPciEndpoint<
+    UnsupportedVirtioDeviceConfig,
+    VirtioRngDevice,
+    HvfGicMsiDeviceInterruptResources,
+>;
+type PublishedPciMemoryHotplug = PublishedVirtioPciEndpoint<
+    VirtioMemConfigSpace,
+    VirtioMemDevice,
+    HvfGicMsiDeviceInterruptResources,
+>;
 
 #[derive(Debug)]
 struct HvfArm64BootPciBlockDevice {
@@ -550,12 +590,40 @@ struct HvfArm64BootPciPmemDevice {
     queue_deliveries: usize,
 }
 
+#[derive(Debug)]
+struct HvfArm64BootPciBalloonDevice {
+    published: PublishedPciBalloon,
+    queue_deliveries: usize,
+}
+
+#[derive(Debug)]
+struct HvfArm64BootPciVsockDevice {
+    published: PublishedPciVsock,
+    queue_deliveries: usize,
+}
+
+#[derive(Debug)]
+struct HvfArm64BootPciEntropyDevice {
+    published: PublishedPciEntropy,
+    queue_deliveries: usize,
+}
+
+#[derive(Debug)]
+struct HvfArm64BootPciMemoryHotplugDevice {
+    published: PublishedPciMemoryHotplug,
+    queue_deliveries: usize,
+}
+
 /// Stable class label in hidden PCI data-device diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfArm64BootPciDataDeviceKind {
+    Balloon,
     Block,
     Network,
     Pmem,
+    Vsock,
+    Entropy,
+    MemoryHotplug,
 }
 
 /// Redacted diagnostics for one hidden PCI data endpoint.
@@ -593,23 +661,66 @@ impl std::error::Error for HvfArm64BootPciDataError {}
 struct HvfArm64BootPciDataDevices {
     validation: Arm64BootPciValidationResources,
     dispatcher: Arc<Mutex<MmioDispatcher>>,
+    msi_interrupts: Option<HvfGicMsiDeviceInterruptResources>,
+    balloon: Option<HvfArm64BootPciBalloonDevice>,
     block: Vec<HvfArm64BootPciBlockDevice>,
     network: Vec<HvfArm64BootPciNetworkDevice>,
     pmem: Vec<HvfArm64BootPciPmemDevice>,
+    vsock: Option<HvfArm64BootPciVsockDevice>,
+    entropy: Option<HvfArm64BootPciEntropyDevice>,
+    memory_hotplug: Option<HvfArm64BootPciMemoryHotplugDevice>,
 }
 
 impl HvfArm64BootPciDataDevices {
+    fn shared_msi_registry(
+        &self,
+    ) -> Result<HvfGicMsiDeviceInterruptResources, HvfArm64BootPciDataError> {
+        self.msi_interrupts
+            .as_ref()
+            .ok_or_else(|| {
+                HvfArm64BootPciDataError::new(
+                    "PCI data endpoint requires shared GICv2m interrupt resources",
+                )
+            })?
+            .shared_registry()
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to share PCI data GICv2m routes: {source}"
+                ))
+            })
+    }
+
     fn diagnostics(
         &self,
     ) -> Result<Vec<HvfArm64BootPciDataDeviceDiagnostics>, HvfArm64BootPciDataError> {
         let mut diagnostics = Vec::new();
         diagnostics
-            .try_reserve_exact(self.block.len() + self.network.len() + self.pmem.len())
+            .try_reserve_exact(
+                self.block.len()
+                    + self.network.len()
+                    + self.pmem.len()
+                    + usize::from(self.balloon.is_some())
+                    + usize::from(self.vsock.is_some())
+                    + usize::from(self.entropy.is_some())
+                    + usize::from(self.memory_hotplug.is_some()),
+            )
             .map_err(|source| {
                 HvfArm64BootPciDataError::new(format!(
                     "failed to allocate PCI data-device diagnostics: {source}"
                 ))
             })?;
+        if let Some(device) = &self.balloon {
+            diagnostics.push(HvfArm64BootPciDataDeviceDiagnostics {
+                kind: HvfArm64BootPciDataDeviceKind::Balloon,
+                id: "balloon0".to_string(),
+                transport: device
+                    .published
+                    .endpoint()
+                    .diagnostics()
+                    .map_err(pci_data_endpoint_error)?,
+                queue_deliveries: device.queue_deliveries,
+            });
+        }
         for device in &self.block {
             diagnostics.push(HvfArm64BootPciDataDeviceDiagnostics {
                 kind: HvfArm64BootPciDataDeviceKind::Block,
@@ -638,6 +749,42 @@ impl HvfArm64BootPciDataDevices {
             diagnostics.push(HvfArm64BootPciDataDeviceDiagnostics {
                 kind: HvfArm64BootPciDataDeviceKind::Pmem,
                 id: device.pmem_id.clone(),
+                transport: device
+                    .published
+                    .endpoint()
+                    .diagnostics()
+                    .map_err(pci_data_endpoint_error)?,
+                queue_deliveries: device.queue_deliveries,
+            });
+        }
+        if let Some(device) = &self.vsock {
+            diagnostics.push(HvfArm64BootPciDataDeviceDiagnostics {
+                kind: HvfArm64BootPciDataDeviceKind::Vsock,
+                id: "vsock0".to_string(),
+                transport: device
+                    .published
+                    .endpoint()
+                    .diagnostics()
+                    .map_err(pci_data_endpoint_error)?,
+                queue_deliveries: device.queue_deliveries,
+            });
+        }
+        if let Some(device) = &self.entropy {
+            diagnostics.push(HvfArm64BootPciDataDeviceDiagnostics {
+                kind: HvfArm64BootPciDataDeviceKind::Entropy,
+                id: "entropy0".to_string(),
+                transport: device
+                    .published
+                    .endpoint()
+                    .diagnostics()
+                    .map_err(pci_data_endpoint_error)?,
+                queue_deliveries: device.queue_deliveries,
+            });
+        }
+        if let Some(device) = &self.memory_hotplug {
+            diagnostics.push(HvfArm64BootPciDataDeviceDiagnostics {
+                kind: HvfArm64BootPciDataDeviceKind::MemoryHotplug,
+                id: "mem0".to_string(),
                 transport: device
                     .published
                     .endpoint()
@@ -828,10 +975,313 @@ impl HvfArm64BootPciDataDevices {
         retry_after
     }
 
+    fn dispatch_vsock(&mut self, memory: &mut GuestMemory, metrics: &SharedVsockDeviceMetrics) {
+        let Some(device) = self.vsock.as_mut() else {
+            return;
+        };
+        let result = device
+            .published
+            .endpoint()
+            .dispatch_vsock_queue_notifications(memory);
+        match &result {
+            Ok(dispatch) => metrics.record_notification_dispatch(dispatch),
+            Err(error) => {
+                if let Some(completed) = error.completed_device_operation() {
+                    metrics.record_notification_dispatch(completed);
+                }
+                if let Some(source) = error.device_error() {
+                    metrics.record_notification_error(source);
+                }
+                if error.endpoint_error().is_some() {
+                    metrics.record_muxer_event_failure();
+                }
+            }
+        }
+        let delivered = match &result {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) if error.endpoint_error().is_none() => {
+                error.device_error().is_some_and(|source| {
+                    source
+                        .completed_rx_dispatch()
+                        .is_some_and(|dispatch| dispatch.needs_queue_interrupt())
+                        || source
+                            .completed_tx_dispatch()
+                            .is_some_and(|dispatch| dispatch.needs_queue_interrupt())
+                })
+            }
+            Err(_) => false,
+        };
+        if delivered {
+            device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+        }
+    }
+
+    fn dispatch_balloon(
+        &mut self,
+        memory: &mut GuestMemory,
+        metrics: &SharedBalloonDeviceMetrics,
+        statistics_trigger: bool,
+    ) -> Result<(), BalloonUpdateError> {
+        let Some(device) = self.balloon.as_mut() else {
+            return Ok(());
+        };
+        let result = if statistics_trigger {
+            device
+                .published
+                .endpoint()
+                .trigger_balloon_statistics_update(memory)
+        } else {
+            device
+                .published
+                .endpoint()
+                .dispatch_balloon_queue_notifications(memory)
+        };
+        match &result {
+            Ok(dispatch) => metrics.record_notification_dispatch(dispatch),
+            Err(error) => {
+                if let Some(completed) = error.completed_device_operation() {
+                    metrics.record_notification_dispatch(completed);
+                }
+                if let Some(source) = error.device_error() {
+                    if statistics_trigger
+                        || !matches!(
+                            source,
+                            VirtioBalloonDeviceNotificationError::Inactive { .. }
+                        )
+                    {
+                        metrics.record_event_failure();
+                    }
+                    if let Some(completed) = source.completed_notification_dispatch() {
+                        metrics.record_notification_dispatch(completed);
+                    }
+                }
+                if error.endpoint_error().is_some() {
+                    metrics.record_event_failure();
+                }
+            }
+        }
+        let delivered = match &result {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) if error.endpoint_error().is_none() => error
+                .device_error()
+                .and_then(|source| source.completed_notification_dispatch())
+                .is_some_and(|dispatch| dispatch.needs_queue_interrupt()),
+            Err(_) => false,
+        };
+        if delivered {
+            device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+        }
+        if statistics_trigger && let Err(source) = result {
+            if let Some(device_error) = source.device_error()
+                && matches!(
+                    device_error,
+                    VirtioBalloonDeviceNotificationError::Inactive { .. }
+                )
+            {
+                return Ok(());
+            }
+            return Err(BalloonUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn dispatch_entropy(
+        &mut self,
+        memory: &mut GuestMemory,
+        entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+        metrics: &SharedEntropyDeviceMetrics,
+    ) -> Option<Duration> {
+        let device = self.entropy.as_mut()?;
+        let result = device
+            .published
+            .endpoint()
+            .dispatch_rng_queue_notifications(memory, entropy_source);
+        let mut retry_after = None;
+        match &result {
+            Ok(dispatch) => {
+                metrics.record_notification_dispatch(dispatch);
+                retry_after = dispatch.rate_limiter_retry_after();
+            }
+            Err(error) => {
+                if let Some(completed) = error.completed_device_operation() {
+                    metrics.record_notification_dispatch(completed);
+                    retry_after = completed.rate_limiter_retry_after();
+                }
+                if let Some(source) = error.device_error() {
+                    metrics.record_notification_error(source);
+                    retain_earliest_retry(&mut retry_after, source.rate_limiter_retry_after());
+                }
+                if error.endpoint_error().is_some() {
+                    metrics.record_event_failure();
+                }
+            }
+        }
+        let delivered = match &result {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) if error.endpoint_error().is_none() => error
+                .device_error()
+                .and_then(|source| source.completed_dispatch())
+                .is_some_and(|dispatch| dispatch.needs_queue_interrupt()),
+            Err(_) => false,
+        };
+        if delivered {
+            device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+        }
+        retry_after
+    }
+
+    fn dispatch_memory_hotplug(
+        &mut self,
+        memory: &mut GuestMemory,
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
+    ) {
+        let Some(device) = self.memory_hotplug.as_mut() else {
+            return;
+        };
+        let result = device
+            .published
+            .endpoint()
+            .dispatch_mem_queue_notifications_with_executor(memory, mutation_executor);
+        let delivered = match &result {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) if error.endpoint_error().is_none() => error
+                .device_error()
+                .and_then(|source| source.completed_dispatch())
+                .is_some_and(|dispatch| dispatch.needs_queue_interrupt()),
+            Err(_) => false,
+        };
+        if delivered {
+            device.queue_deliveries = device.queue_deliveries.saturating_add(1);
+        }
+    }
+
+    fn balloon_updater(&self) -> Option<HvfArm64BootPciBalloonDeviceUpdater> {
+        self.balloon.as_ref().map(|device| {
+            HvfArm64BootPciBalloonDeviceUpdater::new(device.published.endpoint().clone())
+        })
+    }
+
+    fn block_updater(&self) -> Option<HvfArm64BootPciBlockDeviceUpdater> {
+        (!self.block.is_empty()).then(|| {
+            HvfArm64BootPciBlockDeviceUpdater::new(
+                self.block
+                    .iter()
+                    .map(|device| (device.drive_id.clone(), device.published.endpoint().clone()))
+                    .collect(),
+            )
+        })
+    }
+
+    fn network_updater(&self) -> Option<HvfArm64BootPciNetworkDeviceUpdater> {
+        (!self.network.is_empty()).then(|| {
+            HvfArm64BootPciNetworkDeviceUpdater::new(
+                self.network
+                    .iter()
+                    .map(|device| (device.iface_id.clone(), device.published.endpoint().clone()))
+                    .collect(),
+            )
+        })
+    }
+
+    fn pmem_updater(&self) -> Option<HvfArm64BootPciPmemDeviceUpdater> {
+        (!self.pmem.is_empty()).then(|| {
+            HvfArm64BootPciPmemDeviceUpdater::new(
+                self.pmem
+                    .iter()
+                    .map(|device| (device.pmem_id.clone(), device.published.endpoint().clone()))
+                    .collect(),
+            )
+        })
+    }
+
+    fn update_memory_hotplug(
+        &self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        let device = self
+            .memory_hotplug
+            .as_ref()
+            .ok_or(MemoryHotplugUpdateError::ActiveSessionUnavailable)?;
+        match device
+            .published
+            .endpoint()
+            .update_mem_requested_size(update)
+        {
+            Ok(()) => Ok(()),
+            Err(VirtioPciDeviceOperationError::Device(source)) => Err(*source),
+            Err(source) => Err(MemoryHotplugUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            }),
+        }
+    }
+
+    fn memory_hotplug_status(
+        &self,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        let device = self
+            .memory_hotplug
+            .as_ref()
+            .ok_or(MemoryHotplugStatusError::ActiveSessionUnavailable)?;
+        let plugged_size = device
+            .published
+            .endpoint()
+            .plugged_size()
+            .map_err(|source| MemoryHotplugStatusError::ActiveSessionCommand {
+                message: source.to_string(),
+            })?;
+        MemoryHotplugStatus::try_from_plugged_size_bytes(config, plugged_size, requested_size_mib)
+    }
+
+    fn vsock_wakeup(&self) -> Result<Option<VsockHostWakeup>, HvfArm64BootPciDataError> {
+        let Some(device) = self.vsock.as_ref() else {
+            return Ok(None);
+        };
+        let wakeup = device
+            .published
+            .endpoint()
+            .host_wakeup()
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to access PCI vsock endpoint wakeup state: {source}"
+                ))
+            })?
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to allocate PCI vsock wakeup state: {source}"
+                ))
+            })?;
+        Ok(Some(wakeup))
+    }
+
     fn teardown(&mut self) -> Result<(), HvfArm64BootPciDataError> {
         let mut dispatcher = self.dispatcher.lock().map_err(|_| {
             HvfArm64BootPciDataError::new("PCI data-device MMIO dispatcher is unavailable")
         })?;
+        if let Some(device) = self.memory_hotplug.as_mut() {
+            device
+                .published
+                .teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| pci_data_teardown_error("memory-hotplug", "mem0", source))?;
+            self.memory_hotplug = None;
+        }
+        if let Some(device) = self.entropy.as_mut() {
+            device
+                .published
+                .teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| pci_data_teardown_error("entropy", "entropy0", source))?;
+            self.entropy = None;
+        }
+        if let Some(device) = self.vsock.as_mut() {
+            device
+                .published
+                .teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| pci_data_teardown_error("vsock", "vsock0", source))?;
+            self.vsock = None;
+        }
         while let Some(device) = self.pmem.last_mut() {
             device
                 .published
@@ -853,7 +1303,213 @@ impl HvfArm64BootPciDataDevices {
                 .map_err(|source| pci_data_teardown_error("block", &device.drive_id, source))?;
             self.block.pop();
         }
+        if let Some(device) = self.balloon.as_mut() {
+            device
+                .published
+                .teardown(&mut dispatcher, self.validation.bar_allocator_mut())
+                .map_err(|source| pci_data_teardown_error("balloon", "balloon0", source))?;
+            self.balloon = None;
+        }
+        if let Some(interrupts) = self.msi_interrupts.as_mut() {
+            interrupts.release().map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to release shared PCI data GICv2m routes: {source}"
+                ))
+            })?;
+            self.msi_interrupts = None;
+        }
         Ok(())
+    }
+}
+
+/// Cloneable live-update handle for production PCI block endpoints.
+#[derive(Debug, Clone)]
+pub struct HvfArm64BootPciBlockDeviceUpdater {
+    endpoints: Vec<(
+        String,
+        VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice>,
+    )>,
+}
+
+impl HvfArm64BootPciBlockDeviceUpdater {
+    fn new(
+        endpoints: Vec<(
+            String,
+            VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice>,
+        )>,
+    ) -> Self {
+        Self { endpoints }
+    }
+
+    pub fn update_block_device_with_opened(
+        &self,
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+    ) -> Result<(), DriveUpdateError> {
+        let endpoint = self
+            .endpoints
+            .iter()
+            .find_map(|(drive_id, endpoint)| (drive_id == config.drive_id()).then_some(endpoint))
+            .ok_or_else(|| DriveUpdateError::UnknownDrive {
+                drive_id: config.drive_id().to_string(),
+            })?;
+        endpoint
+            .update_block_device_with_opened(config, backing, rate_limiter_update)
+            .map_err(|source| DriveUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            })
+    }
+}
+
+/// Cloneable live-update handle for production PCI network endpoints.
+#[derive(Debug, Clone)]
+pub struct HvfArm64BootPciNetworkDeviceUpdater {
+    endpoints: Vec<(
+        String,
+        VirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice>,
+    )>,
+}
+
+impl HvfArm64BootPciNetworkDeviceUpdater {
+    fn new(
+        endpoints: Vec<(
+            String,
+            VirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice>,
+        )>,
+    ) -> Self {
+        Self { endpoints }
+    }
+
+    pub fn update_network_interface(
+        &self,
+        update: &NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        let endpoint = self
+            .endpoints
+            .iter()
+            .find_map(|(iface_id, endpoint)| (iface_id == update.iface_id()).then_some(endpoint))
+            .ok_or_else(|| NetworkInterfaceUpdateError::UnknownInterface {
+                iface_id: update.iface_id().to_string(),
+            })?;
+        endpoint
+            .update_network_rate_limiters(update)
+            .map_err(|source| NetworkInterfaceUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            })
+    }
+}
+
+/// Cloneable live-update handle for production PCI pmem endpoints.
+#[derive(Debug, Clone)]
+pub struct HvfArm64BootPciPmemDeviceUpdater {
+    endpoints: Vec<(
+        String,
+        VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice>,
+    )>,
+}
+
+impl HvfArm64BootPciPmemDeviceUpdater {
+    fn new(
+        endpoints: Vec<(
+            String,
+            VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice>,
+        )>,
+    ) -> Self {
+        Self { endpoints }
+    }
+
+    pub fn update_pmem(&self, update: &PmemUpdate) -> Result<bool, PmemUpdateError> {
+        let endpoint = self
+            .endpoints
+            .iter()
+            .find_map(|(pmem_id, endpoint)| (pmem_id == update.id()).then_some(endpoint))
+            .ok_or(PmemUpdateError::UnknownPmem)?;
+        endpoint.update_pmem_rate_limiter(update).map_err(|source| {
+            PmemUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            }
+        })
+    }
+}
+
+/// Cloneable live-update handle for a production PCI balloon endpoint.
+#[derive(Debug, Clone)]
+pub struct HvfArm64BootPciBalloonDeviceUpdater {
+    endpoint: VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice>,
+}
+
+impl HvfArm64BootPciBalloonDeviceUpdater {
+    fn new(endpoint: VirtioPciEndpoint<VirtioBalloonConfigSpace, VirtioBalloonDevice>) -> Self {
+        Self { endpoint }
+    }
+
+    pub fn update_balloon_config(&self, config: BalloonConfig) -> Result<(), BalloonUpdateError> {
+        match self.endpoint.update_balloon_config(config) {
+            Ok(()) => Ok(()),
+            Err(VirtioPciDeviceOperationError::Device(source)) => Err(*source),
+            Err(source) => Err(BalloonUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            }),
+        }
+    }
+
+    pub fn update_balloon_statistics(
+        &self,
+        input: BalloonStatsUpdateInput,
+    ) -> Result<(), BalloonUpdateError> {
+        match self.endpoint.update_balloon_statistics(input) {
+            Ok(()) => Ok(()),
+            Err(VirtioPciDeviceOperationError::Device(source)) => Err(*source),
+            Err(source) => Err(BalloonUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            }),
+        }
+    }
+
+    pub fn balloon_stats(&self, config: BalloonConfig) -> Result<BalloonStats, BalloonStatsError> {
+        match self.endpoint.balloon_stats(config) {
+            Ok(stats) => Ok(stats),
+            Err(VirtioPciDeviceOperationError::Device(source)) => Err(*source),
+            Err(source) => Err(BalloonStatsError::ActiveSessionCommand {
+                message: source.to_string(),
+            }),
+        }
+    }
+
+    pub fn balloon_hinting_status(
+        &self,
+    ) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+        match self.endpoint.balloon_hinting_status() {
+            Ok(status) => Ok(status),
+            Err(VirtioPciDeviceOperationError::Device(source)) => Err(*source),
+            Err(source) => Err(BalloonHintingStatusError::ActiveSessionCommand {
+                message: source.to_string(),
+            }),
+        }
+    }
+
+    pub fn start_balloon_hinting(
+        &self,
+        input: BalloonHintingStartInput,
+    ) -> Result<(), BalloonHintingCommandError> {
+        match self.endpoint.start_balloon_hinting(input) {
+            Ok(()) => Ok(()),
+            Err(VirtioPciDeviceOperationError::Device(source)) => Err(*source),
+            Err(source) => Err(BalloonHintingCommandError::ActiveSessionCommand {
+                message: source.to_string(),
+            }),
+        }
+    }
+
+    pub fn stop_balloon_hinting(&self) -> Result<(), BalloonHintingCommandError> {
+        match self.endpoint.stop_balloon_hinting() {
+            Ok(()) => Ok(()),
+            Err(VirtioPciDeviceOperationError::Device(source)) => Err(*source),
+            Err(source) => Err(BalloonHintingCommandError::ActiveSessionCommand {
+                message: source.to_string(),
+            }),
+        }
     }
 }
 
@@ -2371,6 +3027,9 @@ pub enum HvfArm64BootRunLoopWakeupMonitorError {
     CollectVsockWakeupFds {
         source: Arm64BootVsockWakeupFdsError,
     },
+    PciVsockWakeup {
+        message: String,
+    },
     PollFdAllocation {
         source: TryReserveError,
     },
@@ -2400,6 +3059,9 @@ impl fmt::Display for HvfArm64BootRunLoopWakeupMonitorError {
             }
             Self::CollectVsockWakeupFds { source } => {
                 write!(f, "failed to collect boot vsock wakeup fds: {source}")
+            }
+            Self::PciVsockWakeup { message } => {
+                write!(f, "failed to collect PCI vsock wakeup fds: {message}")
             }
             Self::PollFdAllocation { source } => {
                 write!(
@@ -2434,6 +3096,7 @@ impl std::error::Error for HvfArm64BootRunLoopWakeupMonitorError {
             Self::PollFdAllocation { source } => Some(source),
             Self::ThreadSpawn { source } => Some(source),
             Self::MmioDispatcher { .. }
+            | Self::PciVsockWakeup { .. }
             | Self::TooManyPollFds { .. }
             | Self::CreateStopPipe { .. }
             | Self::StopSignal { .. }
@@ -2672,6 +3335,30 @@ impl HvfArm64BootSession<'_> {
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
         &self.runtime_resources
+    }
+
+    pub fn pci_balloon_device_updater(&self) -> Option<HvfArm64BootPciBalloonDeviceUpdater> {
+        self.pci_data_devices
+            .as_ref()
+            .and_then(HvfArm64BootPciDataDevices::balloon_updater)
+    }
+
+    pub fn pci_block_device_updater(&self) -> Option<HvfArm64BootPciBlockDeviceUpdater> {
+        self.pci_data_devices
+            .as_ref()
+            .and_then(HvfArm64BootPciDataDevices::block_updater)
+    }
+
+    pub fn pci_network_device_updater(&self) -> Option<HvfArm64BootPciNetworkDeviceUpdater> {
+        self.pci_data_devices
+            .as_ref()
+            .and_then(HvfArm64BootPciDataDevices::network_updater)
+    }
+
+    pub fn pci_pmem_device_updater(&self) -> Option<HvfArm64BootPciPmemDeviceUpdater> {
+        self.pci_data_devices
+            .as_ref()
+            .and_then(HvfArm64BootPciDataDevices::pmem_updater)
     }
 
     /// Return the exact validated cache presentation selected before VM creation.
@@ -3549,6 +4236,19 @@ impl HvfArm64BootSession<'_> {
         &mut self,
     ) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError>
     {
+        if self
+            .pci_data_devices
+            .as_ref()
+            .is_some_and(|devices| devices.vsock.is_some())
+        {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootVsockNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            if let Some(devices) = self.pci_data_devices.as_mut() {
+                devices.dispatch_vsock(memory, &self.vsock_device_metrics);
+            }
+            return Ok(HvfArm64BootVsockNotificationDispatches::new(Vec::new()));
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootVsockNotificationDispatchError::MapGuestMemory { source }
@@ -3580,6 +4280,17 @@ impl HvfArm64BootSession<'_> {
         HvfArm64BootBalloonNotificationDispatches,
         HvfArm64BootBalloonNotificationDispatchError,
     > {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_mut()
+            .filter(|devices| devices.balloon.is_some())
+        {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootBalloonNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let _ = devices.dispatch_balloon(memory, &self.balloon_device_metrics, false);
+            return Ok(HvfArm64BootBalloonNotificationDispatches::new(Vec::new()));
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootBalloonNotificationDispatchError::MapGuestMemory { source }
@@ -3617,6 +4328,24 @@ impl HvfArm64BootSession<'_> {
         HvfArm64BootMemoryHotplugNotificationDispatches,
         HvfArm64BootMemoryHotplugNotificationDispatchError,
     > {
+        if self
+            .pci_data_devices
+            .as_ref()
+            .is_some_and(|devices| devices.memory_hotplug.is_some())
+        {
+            let (memory, mut mutation_executor) = self
+                .backend
+                .mapped_guest_memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .map_err(|source| {
+                    HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
+                })?;
+            if let Some(devices) = self.pci_data_devices.as_mut() {
+                devices.dispatch_memory_hotplug(memory, &mut mutation_executor);
+            }
+            return Ok(HvfArm64BootMemoryHotplugNotificationDispatches::new(
+                Vec::new(),
+            ));
+        }
         let dispatches = {
             let (memory, mut mutation_executor) = self
                 .backend
@@ -3644,6 +4373,13 @@ impl HvfArm64BootSession<'_> {
         &mut self,
         update: MemoryHotplugSizeUpdate,
     ) -> Result<(), MemoryHotplugUpdateError> {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_ref()
+            .filter(|devices| devices.memory_hotplug.is_some())
+        {
+            return devices.update_memory_hotplug(update);
+        }
         update_memory_hotplug_requested_size_and_signal_interrupt(
             &self.runtime_resources,
             &self.mmio_dispatcher,
@@ -3657,6 +4393,13 @@ impl HvfArm64BootSession<'_> {
         config: MemoryHotplugConfig,
         requested_size_mib: u64,
     ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_ref()
+            .filter(|devices| devices.memory_hotplug.is_some())
+        {
+            return devices.memory_hotplug_status(config, requested_size_mib);
+        }
         memory_hotplug_status(
             &self.runtime_resources,
             &self.mmio_dispatcher,
@@ -3668,6 +4411,22 @@ impl HvfArm64BootSession<'_> {
     pub fn trigger_balloon_statistics_update_and_signal_interrupts(
         &mut self,
     ) -> Result<(), BalloonUpdateError> {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_mut()
+            .filter(|devices| devices.balloon.is_some())
+        {
+            let memory = self
+                .backend
+                .mapped_guest_memory_mut()
+                .map_err(balloon_update_error_from_display)?;
+            let result = devices.dispatch_balloon(memory, &self.balloon_device_metrics, true);
+            if result.is_err() {
+                self.balloon_device_metrics
+                    .record_statistics_update_failure();
+            }
+            return result;
+        }
         let result = (|| {
             let dispatches = {
                 let memory = self
@@ -3708,6 +4467,28 @@ impl HvfArm64BootSession<'_> {
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_mut()
+            .filter(|devices| devices.entropy.is_some())
+        {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootEntropyNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let source = match entropy_source.pci_entropy_source() {
+                Ok(source) => source,
+                Err(_) => {
+                    self.entropy_device_metrics
+                        .record_entropy_source_provider_failure();
+                    return Ok(HvfArm64BootEntropyNotificationDispatches::new(Vec::new()));
+                }
+            };
+            let retry_after =
+                devices.dispatch_entropy(memory, source.into_inner(), &self.entropy_device_metrics);
+            let mut dispatches = HvfArm64BootEntropyNotificationDispatches::new(Vec::new());
+            dispatches.rate_limiter_retry_after = retry_after;
+            return Ok(dispatches);
+        }
         dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
             self.backend,
             &self.mmio_dispatcher,
@@ -4404,6 +5185,30 @@ impl OwnedHvfArm64BootSession {
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
         &self.runtime_resources
+    }
+
+    pub fn pci_balloon_device_updater(&self) -> Option<HvfArm64BootPciBalloonDeviceUpdater> {
+        self.pci_data_devices
+            .as_ref()
+            .and_then(HvfArm64BootPciDataDevices::balloon_updater)
+    }
+
+    pub fn pci_block_device_updater(&self) -> Option<HvfArm64BootPciBlockDeviceUpdater> {
+        self.pci_data_devices
+            .as_ref()
+            .and_then(HvfArm64BootPciDataDevices::block_updater)
+    }
+
+    pub fn pci_network_device_updater(&self) -> Option<HvfArm64BootPciNetworkDeviceUpdater> {
+        self.pci_data_devices
+            .as_ref()
+            .and_then(HvfArm64BootPciDataDevices::network_updater)
+    }
+
+    pub fn pci_pmem_device_updater(&self) -> Option<HvfArm64BootPciPmemDeviceUpdater> {
+        self.pci_data_devices
+            .as_ref()
+            .and_then(HvfArm64BootPciDataDevices::pmem_updater)
     }
 
     /// Return the exact validated cache presentation selected before VM creation.
@@ -5270,6 +6075,19 @@ impl OwnedHvfArm64BootSession {
         &mut self,
     ) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError>
     {
+        if self
+            .pci_data_devices
+            .as_ref()
+            .is_some_and(|devices| devices.vsock.is_some())
+        {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootVsockNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            if let Some(devices) = self.pci_data_devices.as_mut() {
+                devices.dispatch_vsock(memory, &self.vsock_device_metrics);
+            }
+            return Ok(HvfArm64BootVsockNotificationDispatches::new(Vec::new()));
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootVsockNotificationDispatchError::MapGuestMemory { source }
@@ -5301,6 +6119,17 @@ impl OwnedHvfArm64BootSession {
         HvfArm64BootBalloonNotificationDispatches,
         HvfArm64BootBalloonNotificationDispatchError,
     > {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_mut()
+            .filter(|devices| devices.balloon.is_some())
+        {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootBalloonNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let _ = devices.dispatch_balloon(memory, &self.balloon_device_metrics, false);
+            return Ok(HvfArm64BootBalloonNotificationDispatches::new(Vec::new()));
+        }
         let dispatches = {
             let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
                 HvfArm64BootBalloonNotificationDispatchError::MapGuestMemory { source }
@@ -5338,6 +6167,24 @@ impl OwnedHvfArm64BootSession {
         HvfArm64BootMemoryHotplugNotificationDispatches,
         HvfArm64BootMemoryHotplugNotificationDispatchError,
     > {
+        if self
+            .pci_data_devices
+            .as_ref()
+            .is_some_and(|devices| devices.memory_hotplug.is_some())
+        {
+            let (memory, mut mutation_executor) = self
+                .backend
+                .mapped_guest_memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .map_err(|source| {
+                    HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
+                })?;
+            if let Some(devices) = self.pci_data_devices.as_mut() {
+                devices.dispatch_memory_hotplug(memory, &mut mutation_executor);
+            }
+            return Ok(HvfArm64BootMemoryHotplugNotificationDispatches::new(
+                Vec::new(),
+            ));
+        }
         let dispatches = {
             let (memory, mut mutation_executor) = self
                 .backend
@@ -5365,6 +6212,13 @@ impl OwnedHvfArm64BootSession {
         &mut self,
         update: MemoryHotplugSizeUpdate,
     ) -> Result<(), MemoryHotplugUpdateError> {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_ref()
+            .filter(|devices| devices.memory_hotplug.is_some())
+        {
+            return devices.update_memory_hotplug(update);
+        }
         update_memory_hotplug_requested_size_and_signal_interrupt(
             &self.runtime_resources,
             &self.mmio_dispatcher,
@@ -5378,6 +6232,13 @@ impl OwnedHvfArm64BootSession {
         config: MemoryHotplugConfig,
         requested_size_mib: u64,
     ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_ref()
+            .filter(|devices| devices.memory_hotplug.is_some())
+        {
+            return devices.memory_hotplug_status(config, requested_size_mib);
+        }
         memory_hotplug_status(
             &self.runtime_resources,
             &self.mmio_dispatcher,
@@ -5389,6 +6250,22 @@ impl OwnedHvfArm64BootSession {
     pub fn trigger_balloon_statistics_update_and_signal_interrupts(
         &mut self,
     ) -> Result<(), BalloonUpdateError> {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_mut()
+            .filter(|devices| devices.balloon.is_some())
+        {
+            let memory = self
+                .backend
+                .mapped_guest_memory_mut()
+                .map_err(balloon_update_error_from_display)?;
+            let result = devices.dispatch_balloon(memory, &self.balloon_device_metrics, true);
+            if result.is_err() {
+                self.balloon_device_metrics
+                    .record_statistics_update_failure();
+            }
+            return result;
+        }
         let result = (|| {
             let dispatches = {
                 let memory = self
@@ -5429,6 +6306,28 @@ impl OwnedHvfArm64BootSession {
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_mut()
+            .filter(|devices| devices.entropy.is_some())
+        {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootEntropyNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let source = match entropy_source.pci_entropy_source() {
+                Ok(source) => source,
+                Err(_) => {
+                    self.entropy_device_metrics
+                        .record_entropy_source_provider_failure();
+                    return Ok(HvfArm64BootEntropyNotificationDispatches::new(Vec::new()));
+                }
+            };
+            let retry_after =
+                devices.dispatch_entropy(memory, source.into_inner(), &self.entropy_device_metrics);
+            let mut dispatches = HvfArm64BootEntropyNotificationDispatches::new(Vec::new());
+            dispatches.rate_limiter_retry_after = retry_after;
+            return Ok(dispatches);
+        }
         dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
             &mut self.backend,
             &self.mmio_dispatcher,
@@ -5446,6 +6345,7 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
         start_run_loop_vsock_wakeup_monitor(
             &self.runtime_resources,
+            self.pci_data_devices.as_ref(),
             &self.mmio_dispatcher,
             self.runner.control(),
             self.run_loop_wakeup.clone(),
@@ -5580,6 +6480,23 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_mut()
+            .filter(|devices| devices.entropy.is_some())
+        {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootEntropyNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let retry_after = devices.dispatch_entropy(
+                memory,
+                &mut self.entropy_source,
+                &self.entropy_device_metrics,
+            );
+            let mut dispatches = HvfArm64BootEntropyNotificationDispatches::new(Vec::new());
+            dispatches.rate_limiter_retry_after = retry_after;
+            return Ok(dispatches);
+        }
         dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
             &mut self.backend,
             &self.mmio_dispatcher,
@@ -5744,6 +6661,28 @@ where
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
+        if let Some(devices) = self
+            .session
+            .pci_data_devices
+            .as_mut()
+            .filter(|devices| devices.entropy.is_some())
+        {
+            let memory =
+                self.session
+                    .backend
+                    .mapped_guest_memory_mut()
+                    .map_err(|source| {
+                        HvfArm64BootEntropyNotificationDispatchError::MapGuestMemory { source }
+                    })?;
+            let retry_after = devices.dispatch_entropy(
+                memory,
+                &mut self.session.entropy_source,
+                &self.session.entropy_device_metrics,
+            );
+            let mut dispatches = HvfArm64BootEntropyNotificationDispatches::new(Vec::new());
+            dispatches.rate_limiter_retry_after = retry_after;
+            return Ok(dispatches);
+        }
         dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
             &mut self.session.backend,
             &self.session.mmio_dispatcher,
@@ -6833,15 +7772,28 @@ fn run_boot_session_coordinated_vcpu_step(
 
 fn start_run_loop_vsock_wakeup_monitor(
     runtime_resources: &Arm64BootRuntimeResources,
+    pci_data_devices: Option<&HvfArm64BootPciDataDevices>,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
     vcpu_control: HvfVcpuRunControl,
     wakeup_token: HvfArm64BootRunLoopWakeupToken,
 ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
-    if runtime_resources.vsock_device.is_none() {
+    let pci_vsock = pci_data_devices.filter(|devices| devices.vsock.is_some());
+    if runtime_resources.vsock_device.is_none() && pci_vsock.is_none() {
         return Ok(HvfArm64BootRunLoopWakeupMonitor::inactive());
     }
 
-    let (read_fds, write_fds, deadline) = {
+    let (read_fds, write_fds, deadline) = if let Some(devices) = pci_vsock {
+        devices
+            .vsock_wakeup()
+            .map_err(
+                |source| HvfArm64BootRunLoopWakeupMonitorError::PciVsockWakeup {
+                    message: source.to_string(),
+                },
+            )?
+            .ok_or_else(|| HvfArm64BootRunLoopWakeupMonitorError::PciVsockWakeup {
+                message: "PCI vsock endpoint disappeared".to_string(),
+            })?
+    } else {
         let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(dispatcher)
             .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
         runtime_resources
@@ -6953,6 +7905,7 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
         start_run_loop_vsock_wakeup_monitor(
             &self.runtime_resources,
+            self.pci_data_devices.as_ref(),
             &self.mmio_dispatcher,
             self.runner.control(),
             self.run_loop_wakeup.clone(),
@@ -7087,6 +8040,23 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
+        if let Some(devices) = self
+            .pci_data_devices
+            .as_mut()
+            .filter(|devices| devices.entropy.is_some())
+        {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootEntropyNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let retry_after = devices.dispatch_entropy(
+                memory,
+                &mut self.entropy_source,
+                &self.entropy_device_metrics,
+            );
+            let mut dispatches = HvfArm64BootEntropyNotificationDispatches::new(Vec::new());
+            dispatches.rate_limiter_retry_after = retry_after;
+            return Ok(dispatches);
+        }
         dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
             self.backend,
             &self.mmio_dispatcher,
@@ -9400,9 +10370,31 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         .map_err(|source| HvfArm64BootSessionError::CacheTopology { source })?;
     let (cache_source, cache_hierarchy) = prepared_cache.into_parts();
     let retained_cache_hierarchy = cache_hierarchy.clone();
+    if config.pci_enabled && config.pci_validation.is_some() {
+        return Err(HvfArm64BootSessionError::PciData {
+            source: HvfArm64BootPciDataError::new(
+                "production PCI transport cannot be combined with an internal PCI validation selector",
+            ),
+        });
+    }
+    let pci_validation = if config.pci_enabled {
+        Some(Arm64BootPciValidationConfig::all_virtio_devices())
+    } else {
+        config.pci_validation
+    };
+    let pci_all_virtio =
+        pci_validation.is_some_and(Arm64BootPciValidationConfig::is_all_virtio_devices);
+    let gic_msi = if pci_all_virtio {
+        Some(
+            pci_all_virtio_gic_msi_configuration(controller, &config)
+                .map_err(|source| HvfArm64BootSessionError::PciData { source })?,
+        )
+    } else {
+        config.gic_msi
+    };
     <HvfBackend as VmBackend>::create_vm(backend)
         .map_err(|source| HvfArm64BootSessionError::CreateVm { source })?;
-    let gic = *match config.gic_msi {
+    let gic = *match gic_msi {
         Some(configuration) => backend.create_gic_with_msi(configuration),
         None => backend.create_gic(),
     }
@@ -9410,9 +10402,9 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     let timer = gic
         .arm64_fdt_timer_interrupts()
         .map_err(|source| HvfArm64BootSessionError::TimerMetadata { source })?;
-    let pci_data_mode = config
-        .pci_validation
-        .is_some_and(|validation| validation.is_data_devices());
+    let pci_data_mode = pci_validation.is_some_and(|validation| {
+        validation.is_data_devices() || validation.is_all_virtio_devices()
+    });
     let interrupt_lines = allocate_interrupt_lines(
         &gic,
         HvfArm64BootInterruptRequest {
@@ -9431,12 +10423,14 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
             } else {
                 controller.network_interface_configs().len()
             },
-            vsock_configured: controller.vsock_config().is_some(),
+            vsock_configured: controller.vsock_config().is_some() && !pci_all_virtio,
             balloon_configured: controller.balloon_config().is_some()
-                && config.balloon_device.is_some(),
-            entropy_configured: config.entropy_device.is_some(),
+                && config.balloon_device.is_some()
+                && !pci_all_virtio,
+            entropy_configured: config.entropy_device.is_some() && !pci_all_virtio,
             memory_hotplug_configured: controller.memory_hotplug_config().is_some()
-                && config.memory_hotplug_device.is_some(),
+                && config.memory_hotplug_device.is_some()
+                && !pci_all_virtio,
             serial_configured: config.serial_device.is_some(),
         },
     )?;
@@ -9449,14 +10443,26 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         .serial_device
         .zip(interrupt_lines.serial)
         .map(|(serial, interrupt_line)| serial.into_runtime(interrupt_line));
-    let runtime_entropy = config
-        .entropy_device
-        .zip(interrupt_lines.entropy)
-        .map(|(entropy, interrupt_line)| entropy.into_runtime(interrupt_line));
-    let runtime_memory_hotplug = config
-        .memory_hotplug_device
-        .zip(interrupt_lines.memory_hotplug)
-        .map(|(memory_hotplug, interrupt_line)| memory_hotplug.into_runtime(interrupt_line));
+    let runtime_entropy = if pci_all_virtio {
+        config
+            .entropy_device
+            .map(|entropy| RuntimeArm64BootEntropyDeviceConfig::for_pci(entropy.mmio_layout))
+    } else {
+        config
+            .entropy_device
+            .zip(interrupt_lines.entropy)
+            .map(|(entropy, interrupt_line)| entropy.into_runtime(interrupt_line))
+    };
+    let runtime_memory_hotplug = if pci_all_virtio {
+        config.memory_hotplug_device.map(|memory_hotplug| {
+            RuntimeArm64BootMemoryHotplugDeviceConfig::for_pci(memory_hotplug.mmio_layout)
+        })
+    } else {
+        config
+            .memory_hotplug_device
+            .zip(interrupt_lines.memory_hotplug)
+            .map(|(memory_hotplug, interrupt_line)| memory_hotplug.into_runtime(interrupt_line))
+    };
     let resources =
         Arm64BootResources::assemble_from_controller_with_startup_resources_and_pci_validation(
             controller,
@@ -9488,7 +10494,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
                 entropy_device: runtime_entropy,
             },
             startup_resources,
-            config.pci_validation,
+            pci_validation,
         )
         .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
     let boot_registers = HvfArm64BootRegisters {
@@ -9600,7 +10606,11 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         .map_err(|source| HvfArm64BootSessionError::StartPmemRetryWakeupScheduler { source })?
     };
     let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
-    let entropy_retry_wakeup_scheduler = if runtime.entropy_device.is_none() {
+    let entropy_retry_wakeup_scheduler = if runtime.entropy_device.is_none()
+        && pci_data_devices
+            .as_ref()
+            .is_none_or(|devices| devices.entropy.is_none())
+    {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
     } else {
         let vcpu_control = runner.control();
@@ -9746,6 +10756,66 @@ fn pci_data_resource_demand(
     Ok(HvfArm64BootPciDataResourceDemand { endpoints, routes })
 }
 
+fn pci_all_virtio_resource_demand(
+    block_count: usize,
+    network_count: usize,
+    pmem_count: usize,
+    balloon_queue_count: Option<usize>,
+    vsock_configured: bool,
+    entropy_configured: bool,
+    memory_hotplug_configured: bool,
+) -> Result<HvfArm64BootPciDataResourceDemand, HvfArm64BootPciDataError> {
+    let mut demand = pci_data_resource_demand(block_count, network_count, pmem_count)?;
+    let balloon_routes = balloon_queue_count
+        .map(|count| {
+            count.checked_add(1).ok_or_else(|| {
+                HvfArm64BootPciDataError::new("PCI all-virtio balloon MSI-X route count overflowed")
+            })
+        })
+        .transpose()?;
+    for routes in [
+        balloon_routes,
+        vsock_configured.then_some(VIRTIO_VSOCK_QUEUE_SIZES.len() + 1),
+        entropy_configured.then_some(VIRTIO_RNG_QUEUE_SIZES.len() + 1),
+        memory_hotplug_configured.then_some(VIRTIO_MEM_QUEUE_SIZES.len() + 1),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        demand.endpoints = demand.endpoints.checked_add(1).ok_or_else(|| {
+            HvfArm64BootPciDataError::new("PCI all-virtio endpoint count overflowed")
+        })?;
+        demand.routes = demand.routes.checked_add(routes).ok_or_else(|| {
+            HvfArm64BootPciDataError::new("PCI all-virtio MSI-X route count overflowed")
+        })?;
+    }
+    Ok(demand)
+}
+
+fn pci_all_virtio_gic_msi_configuration(
+    controller: &VmmController,
+    config: &HvfArm64BootSessionConfig,
+) -> Result<HvfGicMsiConfiguration, HvfArm64BootPciDataError> {
+    let balloon_queue_count = controller
+        .balloon_config()
+        .map(|balloon| VirtioBalloonQueueLayout::from_config(balloon).queue_count());
+    let demand = pci_all_virtio_resource_demand(
+        controller.drive_configs().len(),
+        controller.network_interface_configs().len(),
+        controller.pmem_configs().len(),
+        balloon_queue_count,
+        controller.vsock_config().is_some(),
+        config.entropy_device.is_some(),
+        controller.memory_hotplug_config().is_some(),
+    )?;
+    let routes = u32::try_from(demand.routes.max(1)).map_err(|_| {
+        HvfArm64BootPciDataError::new("PCI all-virtio MSI-X route count does not fit u32")
+    })?;
+    let routes = NonZeroU32::new(routes)
+        .ok_or_else(|| HvfArm64BootPciDataError::new("PCI all-virtio MSI-X route count is zero"))?;
+    Ok(HvfGicMsiConfiguration::new(routes))
+}
+
 fn pci_data_available_bar_count(
     allocator: &PciBarAllocator,
 ) -> Result<usize, HvfArm64BootPciDataError> {
@@ -9872,14 +10942,30 @@ fn prepare_pci_data_devices(
     let Some(validation) = runtime.pci_validation.as_ref() else {
         return Ok(None);
     };
-    if !validation.config().is_data_devices() {
+    let all_virtio = validation.config().is_all_virtio_devices();
+    if !validation.config().is_data_devices() && !all_virtio {
         return Ok(None);
     }
 
     let block_count = runtime.pci_block_devices.len();
     let network_count = runtime.pci_network_devices.len();
     let pmem_count = runtime.pmem_devices.len();
-    let demand = pci_data_resource_demand(block_count, network_count, pmem_count)?;
+    let demand = if all_virtio {
+        pci_all_virtio_resource_demand(
+            block_count,
+            network_count,
+            pmem_count,
+            runtime
+                .pci_balloon_device
+                .as_ref()
+                .map(|prepared| prepared.queue_sizes().len()),
+            runtime.pci_vsock_device.is_some(),
+            runtime.pci_entropy_device.is_some(),
+            runtime.pci_memory_hotplug_device.is_some(),
+        )?
+    } else {
+        pci_data_resource_demand(block_count, network_count, pmem_count)?
+    };
     let available_slots = validation
         .segment()
         .with_segment(|segment| segment.available_endpoint_slots())
@@ -9928,10 +11014,26 @@ fn prepare_pci_data_devices(
     let mut manager = HvfArm64BootPciDataDevices {
         validation,
         dispatcher: Arc::clone(dispatcher),
+        msi_interrupts: None,
+        balloon: None,
         block: Vec::new(),
         network: Vec::new(),
         pmem: Vec::new(),
+        vsock: None,
+        entropy: None,
+        memory_hotplug: None,
     };
+    if demand.routes != 0 {
+        manager.msi_interrupts = Some(
+            HvfGicMsiDeviceInterruptResources::allocate(signaler, demand.routes).map_err(
+                |source| {
+                    HvfArm64BootPciDataError::new(format!(
+                        "failed to allocate shared PCI data MSI-X routes: {source}"
+                    ))
+                },
+            )?,
+        );
+    }
     manager
         .block
         .try_reserve_exact(block_count)
@@ -9963,23 +11065,62 @@ fn prepare_pci_data_devices(
         .map_err(|source| HvfArm64BootPciDataError::new(source.to_string()))?;
     let pmem_type = VirtioDeviceType::new(VIRTIO_PMEM_DEVICE_ID)
         .map_err(|source| HvfArm64BootPciDataError::new(source.to_string()))?;
+    let balloon_type = VirtioDeviceType::new(VIRTIO_BALLOON_DEVICE_ID)
+        .map_err(|source| HvfArm64BootPciDataError::new(source.to_string()))?;
+    let vsock_type = VirtioDeviceType::new(VIRTIO_VSOCK_DEVICE_ID)
+        .map_err(|source| HvfArm64BootPciDataError::new(source.to_string()))?;
+    let entropy_type = VirtioDeviceType::new(VIRTIO_RNG_DEVICE_ID)
+        .map_err(|source| HvfArm64BootPciDataError::new(source.to_string()))?;
+    let memory_hotplug_type = VirtioDeviceType::new(VIRTIO_MEM_DEVICE_ID)
+        .map_err(|source| HvfArm64BootPciDataError::new(source.to_string()))?;
+    let balloon = runtime.pci_balloon_device.take();
     let blocks = std::mem::take(&mut runtime.pci_block_devices);
     let networks = std::mem::take(&mut runtime.pci_network_devices);
+    let vsock = runtime.pci_vsock_device.take();
+    let entropy = runtime.pci_entropy_device.take();
+    let memory_hotplug = runtime.pci_memory_hotplug_device.take();
     let segment = manager.validation.segment().clone();
     let mut endpoint_index = 0usize;
 
     let publish_result: Result<(), HvfArm64BootPciDataError> = (|| {
+        if let Some(prepared) = balloon {
+            let (config_space, available_features, queue_sizes, device) = prepared.into_parts();
+            let interrupts = manager.shared_msi_registry()?;
+            let region_id = pci_data_region_id(endpoint_index)?;
+            let published = {
+                let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
+                    HvfArm64BootPciDataError::new(
+                        "PCI data-device MMIO dispatcher is unavailable during publication",
+                    )
+                })?;
+                PublishedVirtioPciEndpoint::publish(
+                    VirtioPciIdentity::new(balloon_type, available_features),
+                    queue_sizes.as_slice(),
+                    config_space,
+                    device,
+                    false,
+                    manager.validation.bar_allocator_mut(),
+                    segment.clone(),
+                    &mut dispatcher,
+                    region_id,
+                    interrupts,
+                )
+                .map_err(|source| {
+                    HvfArm64BootPciDataError::new(format!(
+                        "failed to publish PCI balloon endpoint: {source}"
+                    ))
+                })?
+            };
+            manager.balloon = Some(HvfArm64BootPciBalloonDevice {
+                published,
+                queue_deliveries: 0,
+            });
+            endpoint_index += 1;
+        }
+
         for prepared in blocks {
             let (drive_id, config_space, device) = prepared.into_parts();
-            let interrupts = HvfGicMsiDeviceInterruptResources::allocate(
-                signaler,
-                VIRTIO_BLOCK_QUEUE_SIZES.len() + 1,
-            )
-            .map_err(|source| {
-                HvfArm64BootPciDataError::new(format!(
-                    "failed to allocate PCI block MSI-X routes: {source}"
-                ))
-            })?;
+            let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
                 let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
@@ -10015,15 +11156,7 @@ fn prepare_pci_data_devices(
 
         for prepared in networks {
             let (iface_id, host_dev_name, config_space, device) = prepared.into_parts();
-            let interrupts = HvfGicMsiDeviceInterruptResources::allocate(
-                signaler,
-                VIRTIO_NET_QUEUE_SIZES.len() + 1,
-            )
-            .map_err(|source| {
-                HvfArm64BootPciDataError::new(format!(
-                    "failed to allocate PCI network MSI-X routes: {source}"
-                ))
-            })?;
+            let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
                 let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
@@ -10066,15 +11199,7 @@ fn prepare_pci_data_devices(
                 prepared.mapping().file_len(),
                 prepared.rate_limiter(),
             );
-            let interrupts = HvfGicMsiDeviceInterruptResources::allocate(
-                signaler,
-                VIRTIO_PMEM_QUEUE_SIZES.len() + 1,
-            )
-            .map_err(|source| {
-                HvfArm64BootPciDataError::new(format!(
-                    "failed to allocate PCI pmem MSI-X routes: {source}"
-                ))
-            })?;
+            let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
                 let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
@@ -10108,6 +11233,112 @@ fn prepare_pci_data_devices(
             });
             endpoint_index += 1;
         }
+
+        if let Some(prepared) = vsock {
+            let (_, _, config_space, device) = prepared.into_parts();
+            let interrupts = manager.shared_msi_registry()?;
+            let region_id = pci_data_region_id(endpoint_index)?;
+            let published = {
+                let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
+                    HvfArm64BootPciDataError::new(
+                        "PCI data-device MMIO dispatcher is unavailable during publication",
+                    )
+                })?;
+                PublishedVirtioPciEndpoint::publish(
+                    VirtioPciIdentity::new(vsock_type, config_space.available_features()),
+                    &VIRTIO_VSOCK_QUEUE_SIZES,
+                    config_space,
+                    device,
+                    false,
+                    manager.validation.bar_allocator_mut(),
+                    segment.clone(),
+                    &mut dispatcher,
+                    region_id,
+                    interrupts,
+                )
+                .map_err(|source| {
+                    HvfArm64BootPciDataError::new(format!(
+                        "failed to publish PCI vsock endpoint: {source}"
+                    ))
+                })?
+            };
+            manager.vsock = Some(HvfArm64BootPciVsockDevice {
+                published,
+                queue_deliveries: 0,
+            });
+            endpoint_index += 1;
+        }
+
+        if let Some(prepared) = entropy {
+            let (config_space, device) = prepared.into_parts();
+            let interrupts = manager.shared_msi_registry()?;
+            let region_id = pci_data_region_id(endpoint_index)?;
+            let published = {
+                let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
+                    HvfArm64BootPciDataError::new(
+                        "PCI data-device MMIO dispatcher is unavailable during publication",
+                    )
+                })?;
+                PublishedVirtioPciEndpoint::publish(
+                    VirtioPciIdentity::new(entropy_type, VIRTIO_MMIO_VERSION_1_FEATURE),
+                    &VIRTIO_RNG_QUEUE_SIZES,
+                    config_space,
+                    device,
+                    false,
+                    manager.validation.bar_allocator_mut(),
+                    segment.clone(),
+                    &mut dispatcher,
+                    region_id,
+                    interrupts,
+                )
+                .map_err(|source| {
+                    HvfArm64BootPciDataError::new(format!(
+                        "failed to publish PCI entropy endpoint: {source}"
+                    ))
+                })?
+            };
+            manager.entropy = Some(HvfArm64BootPciEntropyDevice {
+                published,
+                queue_deliveries: 0,
+            });
+            endpoint_index += 1;
+        }
+
+        if let Some(prepared) = memory_hotplug {
+            let (config_space, device) = prepared.into_parts();
+            let interrupts = manager.shared_msi_registry()?;
+            let region_id = pci_data_region_id(endpoint_index)?;
+            let published = {
+                let mut dispatcher = manager.dispatcher.lock().map_err(|_| {
+                    HvfArm64BootPciDataError::new(
+                        "PCI data-device MMIO dispatcher is unavailable during publication",
+                    )
+                })?;
+                PublishedVirtioPciEndpoint::publish(
+                    VirtioPciIdentity::new(memory_hotplug_type, config_space.available_features()),
+                    &VIRTIO_MEM_QUEUE_SIZES,
+                    config_space,
+                    device,
+                    false,
+                    manager.validation.bar_allocator_mut(),
+                    segment.clone(),
+                    &mut dispatcher,
+                    region_id,
+                    interrupts,
+                )
+                .map_err(|source| {
+                    HvfArm64BootPciDataError::new(format!(
+                        "failed to publish PCI memory-hotplug endpoint: {source}"
+                    ))
+                })?
+            };
+            manager.memory_hotplug = Some(HvfArm64BootPciMemoryHotplugDevice {
+                published,
+                queue_deliveries: 0,
+            });
+            endpoint_index += 1;
+        }
+        debug_assert_eq!(endpoint_index, demand.endpoints);
         Ok(())
     })();
 
@@ -10378,11 +11609,12 @@ mod tests {
         collect_network_notification_dispatches, collect_vsock_notification_dispatches,
         dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
-        lock_boot_mmio_dispatcher_runtime, pci_data_available_bar_count, pci_data_bar_plan,
-        pci_data_region_id, pci_data_resource_demand, preflight_pci_data_dispatcher,
-        quiesce_limiter_retry_wakeups, record_entropy_dispatch_metrics,
-        record_pmem_dispatch_metrics, replace_vmgenid_and_signal_with, run_boot_session_loop,
-        run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        lock_boot_mmio_dispatcher_runtime, pci_all_virtio_resource_demand,
+        pci_data_available_bar_count, pci_data_bar_plan, pci_data_region_id,
+        pci_data_resource_demand, preflight_pci_data_dispatcher, quiesce_limiter_retry_wakeups,
+        record_entropy_dispatch_metrics, record_pmem_dispatch_metrics,
+        replace_vmgenid_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
+        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
         signal_network_queue_interrupts, signal_pmem_queue_interrupts,
         signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at,
@@ -18910,10 +20142,12 @@ mod tests {
 
         assert_eq!(default.gic_msi, None);
         assert_eq!(default.pci_validation, None);
+        assert!(!default.pci_enabled);
         assert_eq!(
             default.clone().with_gic_msi(configuration).gic_msi,
             Some(configuration)
         );
+        assert!(default.clone().with_pci_enabled().pci_enabled);
         let validation = Arm64BootPciValidationConfig::firecracker_test_endpoint();
         assert_eq!(
             default.with_pci_validation(validation).pci_validation,
@@ -18940,6 +20174,27 @@ mod tests {
         assert_eq!(
             route_overflow.to_string(),
             "PCI data MSI-X route count overflowed"
+        );
+    }
+
+    #[test]
+    fn pci_all_virtio_resource_demand_includes_every_endpoint_shape() {
+        let demand = pci_all_virtio_resource_demand(2, 3, 5, Some(4), true, true, true)
+            .expect("bounded all-virtio device counts should fit resource demand");
+        assert_eq!(demand.endpoints, 14);
+        assert_eq!(demand.routes, 36);
+
+        let no_devices = pci_all_virtio_resource_demand(0, 0, 0, None, false, false, false)
+            .expect("an empty all-virtio machine should have zero endpoint demand");
+        assert_eq!(no_devices.endpoints, 0);
+        assert_eq!(no_devices.routes, 0);
+
+        let balloon_overflow =
+            pci_all_virtio_resource_demand(0, 0, 0, Some(usize::MAX), false, false, false)
+                .expect_err("overflowing balloon route demand should fail preflight");
+        assert_eq!(
+            balloon_overflow.to_string(),
+            "PCI all-virtio balloon MSI-X route count overflowed"
         );
     }
 

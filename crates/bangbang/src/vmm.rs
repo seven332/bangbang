@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use bangbang_hvf::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
     HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugDeviceConfig,
+    HvfArm64BootPciBalloonDeviceUpdater, HvfArm64BootPciBlockDeviceUpdater,
+    HvfArm64BootPciNetworkDeviceUpdater, HvfArm64BootPciPmemDeviceUpdater,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
     HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
@@ -573,25 +575,29 @@ impl ProcessSessionDiagnostics for () {}
 #[derive(Debug, Clone)]
 pub(crate) struct BootRunLoopBlockDeviceUpdater {
     block_devices: Vec<Arm64BootBlockDevice>,
-    mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    mmio_dispatcher: Option<Arc<Mutex<MmioDispatcher>>>,
+    pci_updater: Option<HvfArm64BootPciBlockDeviceUpdater>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct BootRunLoopNetworkInterfaceUpdater {
     network_devices: Vec<Arm64BootNetworkDevice>,
-    mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    mmio_dispatcher: Option<Arc<Mutex<MmioDispatcher>>>,
+    pci_updater: Option<HvfArm64BootPciNetworkDeviceUpdater>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct BootRunLoopPmemDeviceUpdater {
     pmem_devices: Vec<Arm64BootPmemDevice>,
-    mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    mmio_dispatcher: Option<Arc<Mutex<MmioDispatcher>>>,
+    pci_updater: Option<HvfArm64BootPciPmemDeviceUpdater>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct BootRunLoopBalloonDeviceUpdater {
-    balloon_device: Arm64BootBalloonDevice,
-    mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    balloon_device: Option<Arm64BootBalloonDevice>,
+    mmio_dispatcher: Option<Arc<Mutex<MmioDispatcher>>>,
+    pci_updater: Option<HvfArm64BootPciBalloonDeviceUpdater>,
 }
 
 impl BootRunLoopBalloonDeviceUpdater {
@@ -600,69 +606,142 @@ impl BootRunLoopBalloonDeviceUpdater {
         mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     ) -> Self {
         Self {
-            balloon_device,
-            mmio_dispatcher,
+            balloon_device: Some(balloon_device),
+            mmio_dispatcher: Some(mmio_dispatcher),
+            pci_updater: None,
+        }
+    }
+
+    fn from_pci(pci_updater: HvfArm64BootPciBalloonDeviceUpdater) -> Self {
+        Self {
+            balloon_device: None,
+            mmio_dispatcher: None,
+            pci_updater: Some(pci_updater),
         }
     }
 
     fn update_balloon_config(&self, config: BalloonConfig) -> Result<(), BalloonUpdateError> {
+        if let Some(updater) = &self.pci_updater {
+            return updater.update_balloon_config(config);
+        }
         let mut dispatcher = self
             .mmio_dispatcher
+            .as_ref()
+            .ok_or(BalloonUpdateError::ActiveSessionUnavailable)?
             .lock()
             .map_err(|_| BalloonUpdateError::MmioDispatcherUnavailable)?;
 
-        update_balloon_config_for_device(&self.balloon_device, &mut dispatcher, config)
+        update_balloon_config_for_device(
+            self.balloon_device
+                .as_ref()
+                .ok_or(BalloonUpdateError::ActiveSessionUnavailable)?,
+            &mut dispatcher,
+            config,
+        )
     }
 
     fn update_balloon_statistics(
         &self,
         input: BalloonStatsUpdateInput,
     ) -> Result<(), BalloonUpdateError> {
+        if let Some(updater) = &self.pci_updater {
+            return updater.update_balloon_statistics(input);
+        }
         let mut dispatcher = self
             .mmio_dispatcher
+            .as_ref()
+            .ok_or(BalloonUpdateError::ActiveSessionUnavailable)?
             .lock()
             .map_err(|_| BalloonUpdateError::MmioDispatcherUnavailable)?;
 
-        update_balloon_statistics_for_device(&self.balloon_device, &mut dispatcher, input)
+        update_balloon_statistics_for_device(
+            self.balloon_device
+                .as_ref()
+                .ok_or(BalloonUpdateError::ActiveSessionUnavailable)?,
+            &mut dispatcher,
+            input,
+        )
     }
 
     fn balloon_stats(&self, config: BalloonConfig) -> Result<BalloonStats, BalloonStatsError> {
+        if let Some(updater) = &self.pci_updater {
+            return updater.balloon_stats(config);
+        }
         let mut dispatcher = self
             .mmio_dispatcher
+            .as_ref()
+            .ok_or(BalloonStatsError::ActiveSessionUnavailable)?
             .lock()
             .map_err(|_| BalloonStatsError::MmioDispatcherUnavailable)?;
 
-        balloon_stats_for_device(&self.balloon_device, &mut dispatcher, config)
+        balloon_stats_for_device(
+            self.balloon_device
+                .as_ref()
+                .ok_or(BalloonStatsError::ActiveSessionUnavailable)?,
+            &mut dispatcher,
+            config,
+        )
     }
 
     fn balloon_hinting_status(&self) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+        if let Some(updater) = &self.pci_updater {
+            return updater.balloon_hinting_status();
+        }
         let mut dispatcher = self
             .mmio_dispatcher
+            .as_ref()
+            .ok_or(BalloonHintingStatusError::ActiveSessionUnavailable)?
             .lock()
             .map_err(|_| BalloonHintingStatusError::MmioDispatcherUnavailable)?;
 
-        balloon_hinting_status_for_device(&self.balloon_device, &mut dispatcher)
+        balloon_hinting_status_for_device(
+            self.balloon_device
+                .as_ref()
+                .ok_or(BalloonHintingStatusError::ActiveSessionUnavailable)?,
+            &mut dispatcher,
+        )
     }
 
     fn start_balloon_hinting(
         &self,
         input: BalloonHintingStartInput,
     ) -> Result<(), BalloonHintingCommandError> {
+        if let Some(updater) = &self.pci_updater {
+            return updater.start_balloon_hinting(input);
+        }
         let mut dispatcher = self
             .mmio_dispatcher
+            .as_ref()
+            .ok_or(BalloonHintingCommandError::ActiveSessionUnavailable)?
             .lock()
             .map_err(|_| BalloonHintingCommandError::MmioDispatcherUnavailable)?;
 
-        start_balloon_hinting_for_device(&self.balloon_device, &mut dispatcher, input)
+        start_balloon_hinting_for_device(
+            self.balloon_device
+                .as_ref()
+                .ok_or(BalloonHintingCommandError::ActiveSessionUnavailable)?,
+            &mut dispatcher,
+            input,
+        )
     }
 
     fn stop_balloon_hinting(&self) -> Result<(), BalloonHintingCommandError> {
+        if let Some(updater) = &self.pci_updater {
+            return updater.stop_balloon_hinting();
+        }
         let mut dispatcher = self
             .mmio_dispatcher
+            .as_ref()
+            .ok_or(BalloonHintingCommandError::ActiveSessionUnavailable)?
             .lock()
             .map_err(|_| BalloonHintingCommandError::MmioDispatcherUnavailable)?;
 
-        stop_balloon_hinting_for_device(&self.balloon_device, &mut dispatcher)
+        stop_balloon_hinting_for_device(
+            self.balloon_device
+                .as_ref()
+                .ok_or(BalloonHintingCommandError::ActiveSessionUnavailable)?,
+            &mut dispatcher,
+        )
     }
 }
 
@@ -673,7 +752,16 @@ impl BootRunLoopBlockDeviceUpdater {
     ) -> Self {
         Self {
             block_devices,
-            mmio_dispatcher,
+            mmio_dispatcher: Some(mmio_dispatcher),
+            pci_updater: None,
+        }
+    }
+
+    fn from_pci(pci_updater: HvfArm64BootPciBlockDeviceUpdater) -> Self {
+        Self {
+            block_devices: Vec::new(),
+            mmio_dispatcher: None,
+            pci_updater: Some(pci_updater),
         }
     }
 
@@ -692,8 +780,13 @@ impl BootRunLoopBlockDeviceUpdater {
         backing: Option<BlockFileBacking>,
         rate_limiter_update: Option<DriveRateLimiterConfig>,
     ) -> Result<(), DriveUpdateError> {
+        if let Some(updater) = &self.pci_updater {
+            return updater.update_block_device_with_opened(config, backing, rate_limiter_update);
+        }
         let mut dispatcher = self
             .mmio_dispatcher
+            .as_ref()
+            .ok_or(DriveUpdateError::ActiveSessionUnavailable)?
             .lock()
             .map_err(|_| DriveUpdateError::MmioDispatcherUnavailable)?;
 
@@ -714,7 +807,16 @@ impl BootRunLoopNetworkInterfaceUpdater {
     ) -> Self {
         Self {
             network_devices,
-            mmio_dispatcher,
+            mmio_dispatcher: Some(mmio_dispatcher),
+            pci_updater: None,
+        }
+    }
+
+    fn from_pci(pci_updater: HvfArm64BootPciNetworkDeviceUpdater) -> Self {
+        Self {
+            network_devices: Vec::new(),
+            mmio_dispatcher: None,
+            pci_updater: Some(pci_updater),
         }
     }
 
@@ -722,8 +824,13 @@ impl BootRunLoopNetworkInterfaceUpdater {
         &self,
         update: &NetworkInterfaceUpdate,
     ) -> Result<(), NetworkInterfaceUpdateError> {
+        if let Some(updater) = &self.pci_updater {
+            return updater.update_network_interface(update);
+        }
         let mut dispatcher = self
             .mmio_dispatcher
+            .as_ref()
+            .ok_or(NetworkInterfaceUpdateError::ActiveSessionUnavailable)?
             .lock()
             .map_err(|_| NetworkInterfaceUpdateError::MmioDispatcherUnavailable)?;
 
@@ -742,13 +849,27 @@ impl BootRunLoopPmemDeviceUpdater {
     ) -> Self {
         Self {
             pmem_devices,
-            mmio_dispatcher,
+            mmio_dispatcher: Some(mmio_dispatcher),
+            pci_updater: None,
+        }
+    }
+
+    fn from_pci(pci_updater: HvfArm64BootPciPmemDeviceUpdater) -> Self {
+        Self {
+            pmem_devices: Vec::new(),
+            mmio_dispatcher: None,
+            pci_updater: Some(pci_updater),
         }
     }
 
     fn update_pmem(&self, update: &PmemUpdate) -> Result<bool, PmemUpdateError> {
+        if let Some(updater) = &self.pci_updater {
+            return updater.update_pmem(update);
+        }
         let mut dispatcher = self
             .mmio_dispatcher
+            .as_ref()
+            .ok_or(PmemUpdateError::ActiveSessionUnavailable)?
             .lock()
             .map_err(|_| PmemUpdateError::MmioDispatcherUnavailable)?;
 
@@ -1363,6 +1484,7 @@ where
     process_signal_metrics: Option<SharedSignalMetrics>,
     snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation,
     terminal_snapshot_load_failure: bool,
+    pci_enabled: bool,
     vmnet_authority: ProcessVmnetAuthority,
     grant_authority: Option<GrantAuthority>,
     boot_grant_state: BootGrantState,
@@ -1397,6 +1519,12 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
 
     pub(crate) fn with_boot_timer_enabled(mut self, enabled: bool) -> Self {
         self.starter.boot_timer_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn with_pci_enabled(mut self, enabled: bool) -> Self {
+        self.pci_enabled = enabled;
+        self.starter.pci_enabled = enabled;
         self
     }
 }
@@ -1444,6 +1572,7 @@ where
             process_signal_metrics: None,
             snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation::default(),
             terminal_snapshot_load_failure: false,
+            pci_enabled: false,
             vmnet_authority: ProcessVmnetAuthority::Direct,
             grant_authority: None,
             boot_grant_state: BootGrantState::PathBased,
@@ -2009,12 +2138,18 @@ where
     }
 
     fn create_snapshot(&mut self, input: SnapshotCreateInput) -> Result<VmmData, VmmActionError> {
+        if self.pci_enabled {
+            return Err(VmmActionError::SnapshotUnsupported);
+        }
         self.publish_native_v1_snapshot(&input)
             .map_err(native_v1_snapshot_publication_action_error)?;
         Ok(VmmData::Empty)
     }
 
     fn load_snapshot(&mut self, input: SnapshotLoadInput) -> Result<VmmData, VmmActionError> {
+        if self.pci_enabled {
+            return Err(VmmActionError::SnapshotUnsupported);
+        }
         let resume_requested = self
             .restore_native_v1_snapshot(&input)
             .map_err(native_v1_snapshot_load_action_error)?;
@@ -2778,6 +2913,7 @@ where
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HvfInstanceStartExecutor {
     boot_timer_enabled: bool,
+    pci_enabled: bool,
     serial_output: SharedSerialOutputBuffer,
     active_serial_output: Option<SharedSerialOutput>,
 }
@@ -2853,6 +2989,9 @@ impl HvfInstanceStartExecutor {
                     DEFAULT_BOOT_TIMER_MMIO_REGION_ID,
                 ),
             ));
+        }
+        if self.pci_enabled {
+            config = config.with_pci_enabled();
         }
 
         config
@@ -3978,31 +4117,49 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
     }
 
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
-        Some(BootRunLoopBlockDeviceUpdater::new(
-            self.runtime_resources().block_devices.clone(),
-            self.mmio_dispatcher(),
-        ))
+        self.pci_block_device_updater()
+            .map(BootRunLoopBlockDeviceUpdater::from_pci)
+            .or_else(|| {
+                Some(BootRunLoopBlockDeviceUpdater::new(
+                    self.runtime_resources().block_devices.clone(),
+                    self.mmio_dispatcher(),
+                ))
+            })
     }
 
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
-        Some(BootRunLoopNetworkInterfaceUpdater::new(
-            self.runtime_resources().network_devices.clone(),
-            self.mmio_dispatcher(),
-        ))
+        self.pci_network_device_updater()
+            .map(BootRunLoopNetworkInterfaceUpdater::from_pci)
+            .or_else(|| {
+                Some(BootRunLoopNetworkInterfaceUpdater::new(
+                    self.runtime_resources().network_devices.clone(),
+                    self.mmio_dispatcher(),
+                ))
+            })
     }
 
     fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
-        Some(BootRunLoopPmemDeviceUpdater::new(
-            self.runtime_resources().pmem_mmio_devices.clone(),
-            self.mmio_dispatcher(),
-        ))
+        self.pci_pmem_device_updater()
+            .map(BootRunLoopPmemDeviceUpdater::from_pci)
+            .or_else(|| {
+                Some(BootRunLoopPmemDeviceUpdater::new(
+                    self.runtime_resources().pmem_mmio_devices.clone(),
+                    self.mmio_dispatcher(),
+                ))
+            })
     }
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
-        self.runtime_resources()
-            .balloon_device
-            .clone()
-            .map(|device| BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher()))
+        self.pci_balloon_device_updater()
+            .map(BootRunLoopBalloonDeviceUpdater::from_pci)
+            .or_else(|| {
+                self.runtime_resources()
+                    .balloon_device
+                    .clone()
+                    .map(|device| {
+                        BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher())
+                    })
+            })
     }
 
     fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
@@ -4225,31 +4382,49 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
     }
 
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
-        Some(BootRunLoopBlockDeviceUpdater::new(
-            self.runtime_resources().block_devices.clone(),
-            self.mmio_dispatcher(),
-        ))
+        self.pci_block_device_updater()
+            .map(BootRunLoopBlockDeviceUpdater::from_pci)
+            .or_else(|| {
+                Some(BootRunLoopBlockDeviceUpdater::new(
+                    self.runtime_resources().block_devices.clone(),
+                    self.mmio_dispatcher(),
+                ))
+            })
     }
 
     fn network_interface_updater(&self) -> Option<BootRunLoopNetworkInterfaceUpdater> {
-        Some(BootRunLoopNetworkInterfaceUpdater::new(
-            self.runtime_resources().network_devices.clone(),
-            self.mmio_dispatcher(),
-        ))
+        self.pci_network_device_updater()
+            .map(BootRunLoopNetworkInterfaceUpdater::from_pci)
+            .or_else(|| {
+                Some(BootRunLoopNetworkInterfaceUpdater::new(
+                    self.runtime_resources().network_devices.clone(),
+                    self.mmio_dispatcher(),
+                ))
+            })
     }
 
     fn pmem_device_updater(&self) -> Option<BootRunLoopPmemDeviceUpdater> {
-        Some(BootRunLoopPmemDeviceUpdater::new(
-            self.runtime_resources().pmem_mmio_devices.clone(),
-            self.mmio_dispatcher(),
-        ))
+        self.pci_pmem_device_updater()
+            .map(BootRunLoopPmemDeviceUpdater::from_pci)
+            .or_else(|| {
+                Some(BootRunLoopPmemDeviceUpdater::new(
+                    self.runtime_resources().pmem_mmio_devices.clone(),
+                    self.mmio_dispatcher(),
+                ))
+            })
     }
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
-        self.runtime_resources()
-            .balloon_device
-            .clone()
-            .map(|device| BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher()))
+        self.pci_balloon_device_updater()
+            .map(BootRunLoopBalloonDeviceUpdater::from_pci)
+            .or_else(|| {
+                self.runtime_resources()
+                    .balloon_device
+                    .clone()
+                    .map(|device| {
+                        BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher())
+                    })
+            })
     }
 
     fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
@@ -8600,6 +8775,31 @@ mod tests {
 
         assert!(snapshot_destination_machine_config(untracked, true).track_dirty_pages());
         assert!(!snapshot_destination_machine_config(tracked, false).track_dirty_pages());
+    }
+
+    #[test]
+    fn pci_mode_rejects_native_v1_snapshot_actions_before_mutation() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut load_vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+        load_vmm.pci_enabled = true;
+
+        assert_eq!(
+            load_vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(true))),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(load_vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!load_vmm.has_started_session());
+
+        let mut create_vmm = snapshot_profile_vmm(FakeStarter::success(12));
+        create_vmm.pci_enabled = true;
+        assert_eq!(
+            create_vmm.handle_action(snapshot_create_action(SnapshotType::Full)),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        assert_eq!(create_vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!create_vmm.has_started_session());
     }
 
     #[test]

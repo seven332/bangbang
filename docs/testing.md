@@ -93,9 +93,9 @@ requires `[1af4:1044]` and the standard `virtio_rng` driver, reads a bounded
 deterministic payload from `/dev/hwrng`, and compares marker-bounded
 `/proc/interrupts` snapshots proving independent queue and configuration MSI-X
 delivery. Before VM destruction it must unpublish the endpoint and prove stale
-rejection plus exact slot, BAR, and GICv2m vector reuse. Both signed cases are
-internal conformance evidence, not unsigned-test substitutes or product PCI,
-runtime attach/delete, hotplug, or snapshot claims.
+rejection plus exact slot, BAR, and GICv2m vector reuse. Both focused signed
+cases remain internal conformance evidence and are not unsigned-test
+substitutes for the product all-virtio gate.
 
 The hidden PCI data-device conformance mode additionally requires the signed
 `guest_boot` cases
@@ -107,9 +107,28 @@ perform real block write/`fsync`, pmem read/write/flush, and MMDS curl traffic,
 and require programmed, unmasked, distinct queue/configuration MSI-X vectors.
 The retained runtime inventory must contain no block, pmem, or network MMIO
 registration/FDT node in this mode, and explicit reverse teardown must finish
-before VM destruction. Existing MMIO signed cases remain required. This hidden
-static-startup evidence does not make `--enable-pci`, runtime attach/delete,
-guest rescan/removal, hotplug, or PCI snapshot state public.
+before VM destruction. Existing MMIO signed cases remain required. These hidden
+cases do not by themselves certify the public selector, runtime attach/delete,
+guest rescan/removal, hotplug, or PCI snapshot state.
+
+Public `--enable-pci` changes additionally require
+`macos_arm64::signed_executable_runs_all_startup_virtio_devices_over_product_pci`
+through
+`scripts/run-integration-tests.sh --test executable_hvf_e2e -- <name> --exact`.
+The test must launch the signed product binary with the exact flag, configure
+balloon, root/data block, MMDS-only network, pmem, vsock, entropy, and
+virtio-mem, and require Linux to enumerate their deterministic BDF/device IDs
+with no virtio-MMIO FDT nodes. Positive evidence must include root/data reads,
+guest block write/`fsync`, MMDS traffic, pmem read/write/flush, at least 1 MiB
+of bidirectional vsock I/O, entropy output, balloon inflate/reporting, and the
+virtio-mem grow/shrink lifecycle. The same session must prove existing live
+block backing/limiter, network limiter, and pmem limiter PATCH paths still
+operate through PCI handles. Default signed MMIO cases, exact/attached/
+duplicate parser tests, supported-host pre-readiness process startup,
+unsupported-target compilation, complete capacity/rollback unit tests, and
+native-v1 PCI rejection are mandatory companions. This gate does not certify
+runtime attach/delete, guest rescan/removal, PCI snapshot persistence, or
+external vmnet connectivity.
 
 Ordered HVF vCPU-topology changes require a signed `hvf_lifecycle` baseline
 that creates one VM and GIC before two permanent owner-thread runners, proves
@@ -1557,7 +1576,7 @@ interrupts, mutable VMClock restore signaling or guest observation,
 or broader RTC-adjacent time/identity behavior is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 
-For vsock specifically, this evidence validates the **implemented supported live virtio-MMIO/Unix-socket subset**:
+For vsock specifically, this evidence validates the **implemented supported live MMIO-or-PCI startup/Unix-socket subset**:
 dynamic 64-KiB credit windows with wrapping
 counters, two-second request/shutdown cleanup, 256 retained connections per
 direction, `EVENT_IDX`, ≥1-MiB bidirectional signed transfer for both initiation
@@ -1580,31 +1599,33 @@ These tests prove the narrow fixed facet, not general dynamic brokerage,
 outbound-network entitlement, cross-filesystem publication, or hard revocation.
 
 For Network/MMDS specifically, this evidence validates the supported
-public virtio-MMIO/MMDS-only subset: guest-visible MTU, MMDS v1 and v2 through API and
+public MMDS-only subset over the selected startup transport: guest-visible MTU,
+MMDS v1 and v2 through API and
 metadata-file/no-api startup, limiter-driven guest progress without a second
 queue notification, two MAC-selected interfaces, and two process-local V2
 token/value/queue/metrics/cleanup domains with post-peer-exit survivor
 progress. The signed cases use bounded marker/event synchronization, redact
 private values and diagnostics, select every configured interface in MMDS
 config, and therefore do not open vmnet or require its restricted entitlement.
-The separate hidden PCI conformance case reuses the same authority-free MMDS
-packet implementation and proves a static modern virtio-pci network endpoint;
-it does not change public transport selection. The tests do not execute
+The separate hidden PCI conformance case and the product all-virtio case reuse
+the same authority-free MMDS packet implementation and prove a modern
+virtio-pci network endpoint. The tests do not execute
 direct-vmnet external connectivity, returned MAC, MTU, or
 maximum-packet reconciliation, packet-available callbacks, Firecracker v1.16.0
 PCI attach/remove, broader MMDS TCP behavior, limiter-specific metrics, or
 network snapshot state.
 
 For block specifically, this evidence validates the supported public file-backed
-virtio-MMIO subset, including initial attachment, guest I/O, root/data ordering,
+subset over MMIO by default or PCI with `--enable-pci`, including initial
+attachment, guest I/O, root/data ordering,
 cache/flush behavior, runtime refresh and limiter updates, and stable rejected
 runtime PUT/DELETE and vhost-user paths. Normal production-bundle evidence also
 validates exact read-only/read-write drive-grant adoption, one-time identity,
 failure-atomic public state, and preauthorized live refresh without ambient
 path reopening. It does not execute Firecracker
 v1.16.0's optional PCI hotplug/hot-unplug flow or an external vhost-user backend.
-The hidden static PCI conformance case proves the same canonical block devices
-through modern virtio-pci but does not expose attach/delete or a public selector.
+The hidden static and product all-virtio PCI cases prove the same canonical
+block devices through modern virtio-pci but do not expose runtime attach/delete.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.
@@ -1616,6 +1637,10 @@ other boot args they need, for example:
 ```sh
 console=ttyS0 reboot=k panic=1 pci=off
 ```
+
+The VMM supplies `pci=off` when the default MMIO transport is selected, so new
+product tests normally should not duplicate it. PCI-mode tests must omit it and
+may use a separate guest-test selector only to choose fixture assertions.
 
 Set `is_read_only=true` when attaching the cached squashfs rootfs so the guest
 receives `ro`. Use writable root mode only with a scratch copy of the generated

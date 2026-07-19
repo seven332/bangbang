@@ -898,7 +898,7 @@ is resource-specific:
   positional writes and a data sync for guest queue-driven flush requests and
   after clean HVF unmap; read-only shadows never write back, and failed unmap
   cleanup does not flush memory that HVF may still reference. Startup also
-  attaches each prepared pmem device as a guest-visible virtio-mmio/FDT node
+  attaches each prepared pmem device over the selected virtio-MMIO/FDT or modern PCI transport
   whose config-space exposes the assigned `start` and `size` values. It does
   not normalize stored host paths, and shadow allocation, HVF registration,
   MMIO attachment, flush, or writeback errors
@@ -1370,7 +1370,7 @@ is resource-specific:
   write. The edge-rising SPI is asserted only afterward; signal failure means
   the new value is already committed and requires another complete replacement
   and notification or session discard, never a claimed rollback.
-- `/vsock` is an **implemented supported live virtio-MMIO/Unix-socket subset**
+- `/vsock` is an **implemented supported live MMIO-or-PCI startup/Unix-socket subset**
   that stores the configured Unix socket path during repeatable pre-boot
   configuration and stably rejects post-start replacement. Startup can attach a
   guest-visible virtio-vsock device whose internal MMIO handler
@@ -1511,20 +1511,24 @@ files and no private stages.
 
 ## Public-HVF GICv2m Capability Boundary
 
-The macOS 15+ GICv2m path is an internal, explicit startup opt-in. MSI-specific
-Hypervisor.framework symbols are loaded only after that opt-in, and the default
-backend, public process configuration, and guest FDT expose no MSI controller.
+The macOS 15+ GICv2m path is an explicit startup opt-in selected by the public
+`--enable-pci` flag. MSI-specific Hypervisor.framework symbols are probed before
+API/no-API readiness and loaded for VM construction only after that opt-in; the
+default backend configuration and guest FDT expose no MSI controller.
 The configured frame and interrupt range are validated before publication; the
 legacy and MSI allocators are disjoint, INTID 1019 is kept outside the pinned
 Linux driver's usable domain, and the send address is derived internally from
-the frame's `SETSPI` register. Device resources atomically reserve a complete
-vector set and expose only an exact address/data registry backed by opaque,
-generation-bound interrupt capabilities. Ambiguous duplicate registry routes,
-foreign allocators, and stale generations fail closed; multiple table entries
-may still use the same one valid tuple. Registry and signaler diagnostics
+the frame's `SETSPI` register. Startup atomically reserves the complete checked
+VM vector pool and builds one exact address/data route per opaque,
+generation-bound interrupt capability. Linux chooses MSI messages from the
+vectors each driver actually requests, not from each device's maximum table
+size, so every function receives an independently revocable registry over that
+same exact pool. Ambiguous duplicate routes, foreign allocators, out-of-range
+messages, and stale generations fail closed; this grants no host interrupt
+primitive outside the configured VM GIC. Registry and signaler diagnostics
 redact message values. Quiesce closes new admission and drains in-flight sends
-before revocation; release returns the complete vector set under the allocation
-lock, so a stale capability cannot target a later device or VM after reuse.
+before revocation; the final registry owner returns the complete pool under the
+allocation lock, so a stale capability cannot target a later VM after reuse.
 
 Hypervisor.framework does not make message delivery transactional. A returned
 error cannot prove that the guest did not observe the interrupt, so a future
@@ -1532,22 +1536,24 @@ device owner must define its own retry and teardown policy. The modern
 virtio-pci transport does not blindly retry an ambiguous host send; its
 spec-defined masking path retains pending state for later unmask delivery.
 Current signed coverage separately proves raw host-to-vCPU delivery,
-pinned-Linux GICv2m discovery, identity-only PCI enumeration, standard
-virtio-rng use of independently programmed queue/configuration MSI-X vectors,
-and hidden static block, network/MMDS, and pmem endpoints using exact per-device
-registries. It does not prove interrupt remapping, public product-device PCI
-selection, or Firecracker's KVM ITS behavior. MSI-bearing GIC metadata is
-rejected by the native-v1 snapshot profile rather than silently omitted.
+pinned-Linux GICv2m discovery, focused identity/virtio-rng/data-device
+conformance, and the signed product process booting every configured virtio
+class with positive queue/configuration MSI-X and real I/O. It does not prove
+interrupt remapping, runtime PCI attach/delete, external vmnet connectivity, or
+Firecracker's KVM ITS behavior. MSI-bearing GIC metadata is rejected by the
+native-v1 snapshot profile rather than silently omitted.
 
-## Internal PCI Ownership Boundary
+## PCI Ownership Boundary
 
-PCI is reachable only from an explicit HVF validation-session constructor; the
-production process parser, HTTP controller, and default boot-session
-constructors never select it. That path publishes one 1 MiB ECAM handler only
-after the complete Firecracker-shaped configuration aperture and 32/64-bit BAR
-windows validate against guest RAM, GIC/GICv2m, and all configured platform and
-virtio-MMIO devices. The FDT binds the host to the validated GICv2m phandle and
-advertises neither an ITS nor an `msi-map`.
+The production process selects PCI only through exact `--enable-pci` syntax on
+the supported macOS arm64/HVF path. Unsupported targets or missing GIC/MSI
+symbols fail before readiness. Configuration-dependent endpoint, slot,
+512-KiB BAR, dispatcher-region, and maximum queue-plus-config vector demand is
+checked before any endpoint is guest-visible. The path publishes one 1 MiB ECAM
+handler only after the Firecracker-shaped configuration and 32/64-bit BAR
+windows validate against guest RAM, GIC/GICv2m, and platform devices. The FDT
+binds the host to the validated GICv2m phandle and advertises neither an ITS nor
+an `msi-map`; every virtio legacy SPI/MMIO/FDT node is structurally suppressed.
 
 MMIO publication and PCI slot/BAR allocation use opaque owner provenance plus
 monotonic generations. Registration builds a complete candidate bus before
@@ -1557,25 +1563,26 @@ generation, and exact registered state before mutation, so a stale capability
 cannot remove a later occupant after reuse. Ownership and address details are
 redacted from capability `Debug` output.
 
-The identity-only `[0042:0000]` endpoint remains a pinned mock. A separate
-validation mode publishes `[1af4:1044]` behind a single exact 512-KiB BAR and
-two device-owned GICv2m vectors. A hidden data mode publishes canonical block,
-network, and pmem devices only after the complete slot/BAR/route demand passes,
-allocates no data legacy SPIs, and exposes no simultaneous data MMIO/FDT nodes.
+The identity-only `[0042:0000]`, deterministic entropy source, and hidden data
+selectors remain focused conformance tools. Product mode instead publishes
+balloon, block, network, pmem, vsock, entropy, and virtio-mem in deterministic
+Firecracker order and allows no mixed virtio transport. Platform devices remain
+MMIO, while default process startup remains wholly virtio-MMIO and retains
+`pci=off`.
 PCI configuration, BAR publication, MSI-X routing, and each virtio device share
 one ordered endpoint lifecycle: reverse teardown first removes the exact
 MMIO/function registrations, then closes and drains device work, revokes
-message routes, and releases BAR and vector leases. Signed teardown plus the
+message registries, and releases BAR and finally shared vector leases. Signed
+teardown plus the
 lower-level reuse gate prevent an old endpoint from signaling or unpublishing
 its successor. The PCI MMDS proof uses only process-local runtime packet state
 and opens no vmnet resource or extra host authority.
 
-The deterministic entropy source, hidden data selector, and redacted diagnostic
-views exist only for the signed conformance harness. They grant no arbitrary
-host resource authority and establish no public PCI selection, hotplug,
-attach/delete, or snapshot contract. Native-v1 treats any PCI validation
-resources as an unsupported inventory rather than persisting or silently
-dropping them.
+The hidden selectors and redacted diagnostic views grant no arbitrary host
+resource authority. Public PCI is a startup transport only: runtime
+attach/delete and guest rescan/removal remain rejected, and native-v1 rejects
+the immutable PCI profile before capture/load work rather than persisting or
+silently dropping its state.
 
 ## HVF Entitlements
 
@@ -1751,7 +1758,7 @@ mapping is shared across VMs. Lowering requested size asks the guest to
 cooperate; it is not host-forced device deletion, snapshot admission, or a
 promise that untrusted guest progress will release memory.
 
-The current virtio-balloon foundation derives a startup-attached virtio-mmio/FDT
+The current virtio-balloon foundation derives a startup-attached selected-transport virtio
 shell from stored control-plane configuration. It exposes guest-visible
 identity, feature, queue, and config-space registers without changing mapping
 ownership. Guest config-space writes update only local device register state.
@@ -2087,7 +2094,7 @@ The current scaffold does not implement:
   while the path still matches the created socket inode. `EVENT_IDX` is active
   on RX/TX, indirect descriptors are a supported bangbang extension, and event
   queue notifications otherwise remain no-op dispatch metadata. This
-  **implemented supported live virtio-MMIO/Unix-socket subset** still is not full
+  **implemented supported live MMIO-or-PCI startup/Unix-socket subset** still is not full
   containment: there is no global host-path broker, PATCH/DELETE/runtime
   hotplug, broader CID routing, or full event payload dispatch. Native-v1
   snapshot UDS override, event-queue `TRANSPORT_RESET`, and post-restore RX
