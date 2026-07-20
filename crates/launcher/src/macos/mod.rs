@@ -1,3 +1,5 @@
+pub(crate) mod block_control;
+pub(crate) mod block_device;
 pub(crate) mod code_sign;
 pub(crate) mod daemon;
 pub(crate) mod publish;

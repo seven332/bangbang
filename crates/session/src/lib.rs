@@ -12,11 +12,11 @@ pub use codec::{
     VmnetAuthority, VmnetAuthorityError, WorkerPolicy, encode_frame,
 };
 pub use grant::{
-    BatchId, GRANT_HEADER_BYTES, GrantAccess, GrantFrame, GrantId, GrantObjectKind, GrantRecord,
-    MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES, MAX_GRANT_DATAGRAM_BYTES, MAX_GRANT_ID_BYTES,
-    MAX_GRANT_RECORDS, MAX_GRANTS, MAX_SNAPSHOT_OUTPUT_CHILD_BYTES, MAX_SOCKET_CHILD_BYTES,
-    ObjectIdentity, ResourceRole, SnapshotOutputChild, SocketChild, decode_grant_frame,
-    encode_grant_frame,
+    BatchId, BlockDeviceGrant, GRANT_HEADER_BYTES, GrantAccess, GrantFrame, GrantId,
+    GrantObjectKind, GrantRecord, MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES,
+    MAX_GRANT_DATAGRAM_BYTES, MAX_GRANT_ID_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS,
+    MAX_SNAPSHOT_OUTPUT_CHILD_BYTES, MAX_SOCKET_CHILD_BYTES, ObjectIdentity, ResourceRole,
+    SnapshotOutputChild, SocketChild, decode_grant_frame, encode_grant_frame,
 };
 pub use state::{LauncherLifecycle, LauncherState, WorkerLifecycle, WorkerState};
 
@@ -32,8 +32,11 @@ pub const SOCKET_BROKER_FD: libc::c_int = 5;
 /// Fixed descriptor used only by the private launcher-vhost-user broker.
 pub const VHOST_USER_BROKER_FD: libc::c_int = 6;
 
+/// Fixed descriptor used only by the private launcher block-control broker.
+pub const BLOCK_CONTROL_BROKER_FD: libc::c_int = 7;
+
 /// Private environment marker installed by the production launcher.
-pub const SESSION_ENV_KEY: &str = "BANGBANG_INTERNAL_SESSION_V5";
+pub const SESSION_ENV_KEY: &str = "BANGBANG_INTERNAL_SESSION_V6";
 
 /// Exact value required for [`SESSION_ENV_KEY`].
-pub const SESSION_ENV_VALUE: &str = "5";
+pub const SESSION_ENV_VALUE: &str = "6";

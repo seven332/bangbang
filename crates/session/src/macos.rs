@@ -3,12 +3,23 @@
 use std::io;
 use std::os::fd::RawFd;
 
+pub mod block_control;
 pub mod bookmark;
 pub mod grant_registry;
 pub mod grant_transport;
 pub mod runtime;
 pub mod socket_broker;
 pub mod vhost_user_broker;
+
+/// Canonicalizes the stable security-relevant status of a block descriptor.
+///
+/// Darwin may discard pathname-resolution flags such as `O_NOFOLLOW` after
+/// the open file description is used. Access, append, and nonblocking state
+/// remain meaningful for capability revalidation.
+#[must_use]
+pub fn normalized_block_status_flags(flags: libc::c_int) -> Option<u32> {
+    u32::try_from(flags & (libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK)).ok()
+}
 
 /// Kernel-authenticated identity of a connected local-socket peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +144,15 @@ mod tests {
         assert_eq!(
             verify_peer_pid(left.as_raw_fd(), current).expect("datagram peer PID should verify"),
             current
+        );
+    }
+
+    #[test]
+    fn block_status_normalization_excludes_path_resolution_flags() {
+        let flags = libc::O_RDWR | libc::O_NONBLOCK | libc::O_NOFOLLOW;
+        assert_eq!(
+            normalized_block_status_flags(flags),
+            u32::try_from(libc::O_RDWR | libc::O_NONBLOCK).ok()
         );
     }
 }

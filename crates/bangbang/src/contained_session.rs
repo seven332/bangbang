@@ -277,10 +277,17 @@ mod platform {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
+    use bangbang_runtime::block::{
+        BlockDeviceControl, BlockDeviceControlError, BlockDeviceGeometry, BlockFileBacking,
+    };
     use bangbang_runtime::boot::BootSourceFiles;
     use bangbang_runtime::snapshot_artifact::{
         SnapshotArtifactKind, SnapshotArtifactOutput, SnapshotStagingOwnership,
         SnapshotStagingTracker, SnapshotStagingTrackingError,
+    };
+    use bangbang_session::macos::block_control::{
+        BlockControlError, BlockControlMessage, BlockControlOperation, BlockControlTarget,
+        receive_block_control_message, send_block_control_message,
     };
     use bangbang_session::macos::grant_registry::{
         CommittedGrantBatch, DirectoryGrantRegistry, FileGrantRegistry, GrantRegistry,
@@ -297,8 +304,9 @@ mod platform {
     };
     use bangbang_session::macos::{set_cloexec, verify_peer, verify_peer_pid};
     use bangbang_session::{
-        Frame, FrameDecoder, GRANT_FD, GrantAccess, GrantId, Message, ObjectIdentity, Readiness,
-        ResourceRole, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId,
+        BLOCK_CONTROL_BROKER_FD, BlockDeviceGrant, Frame, FrameDecoder, GRANT_FD, GrantAccess,
+        GrantId, GrantObjectKind, Message, ObjectIdentity, Readiness, ResourceRole,
+        SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId,
         SnapshotOutputChild, TerminalCategory, VHOST_USER_BROKER_FD, VmnetAuthority,
         WorkerLifecycle, WorkerPolicy, encode_frame,
     };
@@ -310,6 +318,7 @@ mod platform {
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     const VHOST_USER_BROKER_TIMEOUT: Duration = Duration::from_secs(2);
+    const BLOCK_CONTROL_BROKER_TIMEOUT: Duration = Duration::from_secs(2);
     #[cfg(feature = "grant-integration-probe")]
     const GRANT_DELAY_PROBE: &str = "--bangbang-internal-grant-delay-v1";
     #[cfg(feature = "grant-integration-probe")]
@@ -373,6 +382,7 @@ mod platform {
     #[derive(Clone)]
     pub(crate) struct GrantAuthority {
         registry: Arc<Mutex<Option<FileGrantRegistry>>>,
+        block_control: Option<BlockControlBrokerAuthority>,
     }
 
     /// One exact file grant reserved for a failure-atomic runtime transaction.
@@ -381,6 +391,15 @@ mod platform {
         id: GrantId,
         original: Option<GrantedFile>,
         duplicate: Option<File>,
+    }
+
+    /// One exact drive grant reserved for a failure-atomic runtime transaction.
+    pub(crate) struct PreparedDriveBackingClaim {
+        registry: Arc<Mutex<Option<FileGrantRegistry>>>,
+        block_control: Option<BlockControlBrokerAuthority>,
+        id: GrantId,
+        original: Option<GrantedFile>,
+        duplicate: Option<GrantedFile>,
     }
 
     impl std::fmt::Debug for PreparedFileGrantClaim {
@@ -420,6 +439,93 @@ mod platform {
         }
     }
 
+    impl std::fmt::Debug for PreparedDriveBackingClaim {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PreparedDriveBackingClaim")
+                .field("authority", &"<redacted>")
+                .field(
+                    "block_control",
+                    &self.block_control.as_ref().map(|_| "<redacted>"),
+                )
+                .field("original", &self.original.as_ref().map(|_| "<reserved>"))
+                .field("duplicate", &self.duplicate.as_ref().map(|_| "<owned>"))
+                .finish()
+        }
+    }
+
+    impl PreparedDriveBackingClaim {
+        pub(crate) fn take_snapshot_read_only_file(&mut self) -> Result<File, GrantClaimError> {
+            let duplicate = self.duplicate.take().ok_or(GrantClaimError)?;
+            if duplicate.access() != GrantAccess::ReadOnly
+                || duplicate.kind() != GrantObjectKind::RegularFile
+                || duplicate.block_device().is_some()
+            {
+                return Err(GrantClaimError);
+            }
+            Ok(File::from(duplicate.into_owned_fd()))
+        }
+
+        pub(crate) fn take_backing(
+            &mut self,
+            is_read_only: bool,
+        ) -> Result<BlockFileBacking, GrantClaimError> {
+            let duplicate = self.duplicate.take().ok_or(GrantClaimError)?;
+            let expected_access = if is_read_only {
+                GrantAccess::ReadOnly
+            } else {
+                GrantAccess::ReadWrite
+            };
+            if duplicate.access() != expected_access {
+                return Err(GrantClaimError);
+            }
+            match (duplicate.kind(), duplicate.block_device()) {
+                (GrantObjectKind::RegularFile, None) => {
+                    BlockFileBacking::from_file(File::from(duplicate.into_owned_fd()), is_read_only)
+                        .map_err(|_| GrantClaimError)
+                }
+                (GrantObjectKind::BlockDevice, Some(block_device)) => {
+                    let target = BlockControlTarget::new(
+                        self.id.clone(),
+                        duplicate.access(),
+                        duplicate.identity(),
+                        duplicate.status_flags(),
+                        block_device,
+                    )
+                    .ok_or(GrantClaimError)?;
+                    let control = self.block_control.clone().ok_or(GrantClaimError)?;
+                    BlockFileBacking::from_file_with_block_device_control(
+                        File::from(duplicate.into_owned_fd()),
+                        is_read_only,
+                        Arc::new(ContainedBlockDeviceControl { control, target }),
+                    )
+                    .map_err(|_| GrantClaimError)
+                }
+                _ => Err(GrantClaimError),
+            }
+        }
+
+        pub(crate) fn commit(mut self) {
+            self.original.take();
+        }
+    }
+
+    impl Drop for PreparedDriveBackingClaim {
+        fn drop(&mut self) {
+            let Some(original) = self.original.take() else {
+                return;
+            };
+            let mut registry = match self.registry.lock() {
+                Ok(registry) => registry,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(registry) = registry.as_mut() else {
+                return;
+            };
+            let _ = registry.restore_drive_backing(self.id.clone(), original);
+        }
+    }
+
     impl std::fmt::Debug for GrantAuthority {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -430,9 +536,21 @@ mod platform {
     }
 
     impl GrantAuthority {
+        #[cfg(test)]
         fn new(registry: FileGrantRegistry) -> Self {
             Self {
                 registry: Arc::new(Mutex::new(Some(registry))),
+                block_control: None,
+            }
+        }
+
+        fn new_with_block_control(
+            registry: FileGrantRegistry,
+            block_control: BlockControlBrokerAuthority,
+        ) -> Self {
+            Self {
+                registry: Arc::new(Mutex::new(Some(registry))),
+                block_control: Some(block_control),
             }
         }
 
@@ -493,6 +611,34 @@ mod platform {
                 id,
                 original: Some(original),
                 duplicate: Some(File::from(duplicate.into_owned_fd())),
+            }))
+        }
+
+        pub(crate) fn prepare_drive_backing_claim(
+            &self,
+            reference: &Path,
+            access: GrantAccess,
+        ) -> Result<Option<PreparedDriveBackingClaim>, GrantClaimError> {
+            let Some(id) = grant_reference_id(reference)? else {
+                return Ok(None);
+            };
+            if !matches!(access, GrantAccess::ReadOnly | GrantAccess::ReadWrite) {
+                return Err(GrantClaimError);
+            }
+            let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            let registry = registry.as_mut().ok_or(GrantClaimError)?;
+            let duplicate = registry
+                .duplicate_drive_backing(&id, access)
+                .map_err(|_| GrantClaimError)?;
+            let original = registry
+                .take_drive_backing(&id, access)
+                .map_err(|_| GrantClaimError)?;
+            Ok(Some(PreparedDriveBackingClaim {
+                registry: Arc::clone(&self.registry),
+                block_control: self.block_control.clone(),
+                id,
+                original: Some(original),
+                duplicate: Some(duplicate),
             }))
         }
 
@@ -586,6 +732,9 @@ mod platform {
         }
 
         fn invalidate(&self) {
+            if let Some(block_control) = &self.block_control {
+                block_control.invalidate();
+            }
             let mut registry = match self.registry.lock() {
                 Ok(registry) => registry,
                 Err(error) => error.into_inner(),
@@ -1129,6 +1278,357 @@ mod platform {
         }
     }
 
+    struct BlockControlBrokerState {
+        socket: UnixDatagram,
+        session: SessionId,
+        launcher_pid: libc::pid_t,
+        next_sequence: u64,
+    }
+
+    /// Shared serial authority for exact launcher-brokered block controls.
+    #[derive(Clone)]
+    struct BlockControlBrokerAuthority {
+        state: Arc<Mutex<Option<BlockControlBrokerState>>>,
+        shutdown: Arc<UnixDatagram>,
+    }
+
+    impl std::fmt::Debug for BlockControlBrokerAuthority {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("BlockControlBrokerAuthority")
+                .field("state", &"<redacted>")
+                .field("shutdown", &"<owned>")
+                .finish()
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BlockControlResponse {
+        Inspected(BlockDeviceGrant),
+        Synchronized,
+    }
+
+    impl BlockControlBrokerAuthority {
+        fn new(
+            socket: UnixDatagram,
+            session: SessionId,
+            launcher_pid: libc::pid_t,
+        ) -> Result<Self, ContainedSessionError> {
+            let shutdown = socket.try_clone().map_err(|_| ContainedSessionError)?;
+            Ok(Self {
+                state: Arc::new(Mutex::new(Some(BlockControlBrokerState {
+                    socket,
+                    session,
+                    launcher_pid,
+                    next_sequence: 1,
+                }))),
+                shutdown: Arc::new(shutdown),
+            })
+        }
+
+        fn request(
+            &self,
+            operation: BlockControlOperation,
+            target: &BlockControlTarget,
+        ) -> Result<BlockControlResponse, BlockDeviceControlError> {
+            let mut locked = match self.state.lock() {
+                Ok(locked) => locked,
+                Err(_) => {
+                    let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+                    return Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData));
+                }
+            };
+            let Some(mut state) = locked.take() else {
+                return Err(BlockDeviceControlError::new(io::ErrorKind::BrokenPipe));
+            };
+            let Some(next_sequence) = state.next_sequence.checked_add(1) else {
+                return Err(poison_block_control_state(
+                    state,
+                    &self.shutdown,
+                    io::ErrorKind::InvalidData,
+                ));
+            };
+            let Some(deadline) = Instant::now().checked_add(BLOCK_CONTROL_BROKER_TIMEOUT) else {
+                return Err(poison_block_control_state(
+                    state,
+                    &self.shutdown,
+                    io::ErrorKind::TimedOut,
+                ));
+            };
+            if verify_peer_pid(state.socket.as_raw_fd(), state.launcher_pid).is_err() {
+                return Err(poison_block_control_state(
+                    state,
+                    &self.shutdown,
+                    io::ErrorKind::PermissionDenied,
+                ));
+            }
+            let request = match operation {
+                BlockControlOperation::Inspect => BlockControlMessage::Inspect {
+                    session: state.session,
+                    sequence: state.next_sequence,
+                    target: target.clone(),
+                },
+                BlockControlOperation::SynchronizeCache => BlockControlMessage::SynchronizeCache {
+                    session: state.session,
+                    sequence: state.next_sequence,
+                    target: target.clone(),
+                },
+            };
+            loop {
+                let Some(remaining) = broker_remaining(deadline) else {
+                    return Err(poison_block_control_state(
+                        state,
+                        &self.shutdown,
+                        io::ErrorKind::TimedOut,
+                    ));
+                };
+                if state.socket.set_write_timeout(Some(remaining)).is_err() {
+                    return Err(poison_block_control_state(
+                        state,
+                        &self.shutdown,
+                        io::ErrorKind::Other,
+                    ));
+                }
+                match send_block_control_message(&state.socket, &request) {
+                    Ok(()) => break,
+                    Err(BlockControlError::Io(io::ErrorKind::Interrupted)) => continue,
+                    Err(BlockControlError::Io(
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut,
+                    )) => {
+                        return Err(poison_block_control_state(
+                            state,
+                            &self.shutdown,
+                            io::ErrorKind::TimedOut,
+                        ));
+                    }
+                    Err(BlockControlError::Io(kind)) => {
+                        return Err(poison_block_control_state(state, &self.shutdown, kind));
+                    }
+                    Err(BlockControlError::Invalid) => {
+                        return Err(poison_block_control_state(
+                            state,
+                            &self.shutdown,
+                            io::ErrorKind::InvalidData,
+                        ));
+                    }
+                }
+            }
+
+            let response = loop {
+                let Some(remaining) = broker_remaining(deadline) else {
+                    return Err(poison_block_control_state(
+                        state,
+                        &self.shutdown,
+                        io::ErrorKind::TimedOut,
+                    ));
+                };
+                if state.socket.set_read_timeout(Some(remaining)).is_err() {
+                    return Err(poison_block_control_state(
+                        state,
+                        &self.shutdown,
+                        io::ErrorKind::Other,
+                    ));
+                }
+                match receive_block_control_message(&state.socket) {
+                    Ok(response) => break response,
+                    Err(BlockControlError::Io(io::ErrorKind::Interrupted)) => continue,
+                    Err(BlockControlError::Io(
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut,
+                    )) => {
+                        return Err(poison_block_control_state(
+                            state,
+                            &self.shutdown,
+                            io::ErrorKind::TimedOut,
+                        ));
+                    }
+                    Err(BlockControlError::Io(kind)) => {
+                        return Err(poison_block_control_state(state, &self.shutdown, kind));
+                    }
+                    Err(BlockControlError::Invalid) => {
+                        return Err(poison_block_control_state(
+                            state,
+                            &self.shutdown,
+                            io::ErrorKind::InvalidData,
+                        ));
+                    }
+                }
+            };
+            if verify_peer_pid(state.socket.as_raw_fd(), state.launcher_pid).is_err()
+                || response.session() != state.session
+                || response.sequence() != state.next_sequence
+                || response.target() != target
+                || response.operation() != operation
+            {
+                return Err(poison_block_control_state(
+                    state,
+                    &self.shutdown,
+                    io::ErrorKind::InvalidData,
+                ));
+            }
+            let result = match (operation, response) {
+                (
+                    BlockControlOperation::Inspect,
+                    BlockControlMessage::Inspected { observed, .. },
+                ) => Ok(BlockControlResponse::Inspected(observed)),
+                (
+                    BlockControlOperation::SynchronizeCache,
+                    BlockControlMessage::Synchronized { .. },
+                ) => Ok(BlockControlResponse::Synchronized),
+                (_, BlockControlMessage::Failed { kind, .. }) => {
+                    Err(BlockDeviceControlError::new(kind))
+                }
+                _ => {
+                    return Err(poison_block_control_state(
+                        state,
+                        &self.shutdown,
+                        io::ErrorKind::InvalidData,
+                    ));
+                }
+            };
+            state.next_sequence = next_sequence;
+            *locked = Some(state);
+            result
+        }
+
+        fn invalidate(&self) {
+            // This independently owned handle is intentionally used before the
+            // request mutex so a blocked exchange wakes immediately.
+            let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+            let mut locked = match self.state.lock() {
+                Ok(locked) => locked,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(state) = locked.take() {
+                let _ = state.socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    fn poison_block_control_state(
+        state: BlockControlBrokerState,
+        shutdown: &UnixDatagram,
+        kind: io::ErrorKind,
+    ) -> BlockDeviceControlError {
+        let _ = shutdown.shutdown(std::net::Shutdown::Both);
+        let _ = state.socket.shutdown(std::net::Shutdown::Both);
+        BlockDeviceControlError::new(kind)
+    }
+
+    struct ContainedBlockDeviceControl {
+        control: BlockControlBrokerAuthority,
+        target: BlockControlTarget,
+    }
+
+    impl std::fmt::Debug for ContainedBlockDeviceControl {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ContainedBlockDeviceControl")
+                .field("control", &"<redacted>")
+                .field("target", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl BlockDeviceControl for ContainedBlockDeviceControl {
+        fn inspect(&self, file: &File) -> Result<BlockDeviceGeometry, BlockDeviceControlError> {
+            validate_contained_block_descriptor(file, &self.target)?;
+            let BlockControlResponse::Inspected(observed) = self
+                .control
+                .request(BlockControlOperation::Inspect, &self.target)?
+            else {
+                return Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData));
+            };
+            checked_observed_geometry(&self.target, observed)
+        }
+
+        fn synchronize_cache(&self, file: &File) -> Result<(), BlockDeviceControlError> {
+            validate_contained_block_descriptor(file, &self.target)?;
+            match self
+                .control
+                .request(BlockControlOperation::SynchronizeCache, &self.target)?
+            {
+                BlockControlResponse::Synchronized => Ok(()),
+                BlockControlResponse::Inspected(_) => {
+                    Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData))
+                }
+            }
+        }
+    }
+
+    fn checked_observed_geometry(
+        target: &BlockControlTarget,
+        observed: BlockDeviceGrant,
+    ) -> Result<BlockDeviceGeometry, BlockDeviceControlError> {
+        let geometry =
+            BlockDeviceGeometry::new(observed.logical_block_size(), observed.block_count())
+                .ok_or(BlockDeviceControlError::new(io::ErrorKind::InvalidData))?;
+        if geometry.len() != observed.capacity() || observed != target.block_device() {
+            return Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData));
+        }
+        Ok(geometry)
+    }
+
+    fn validate_contained_block_descriptor(
+        file: &File,
+        target: &BlockControlTarget,
+    ) -> Result<(), BlockDeviceControlError> {
+        // SAFETY: F_GETFD and F_GETFL inspect the live transferred descriptor.
+        let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        // SAFETY: F_GETFL inspects status flags on the same descriptor.
+        let status_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if descriptor_flags < 0 || status_flags < 0 {
+            return Err(BlockDeviceControlError::new(
+                io::Error::last_os_error().kind(),
+            ));
+        }
+        if descriptor_flags & libc::FD_CLOEXEC == 0 {
+            return Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData));
+        }
+        if bangbang_session::macos::normalized_block_status_flags(status_flags)
+            != Some(target.status_flags())
+        {
+            return Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData));
+        }
+        if !block_access_matches(status_flags, target.access()) {
+            return Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData));
+        }
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: stat is writable and the transferred descriptor remains live.
+        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(BlockDeviceControlError::new(
+                io::Error::last_os_error().kind(),
+            ));
+        }
+        // SAFETY: Successful fstat initialized the complete structure.
+        let stat = unsafe { stat.assume_init() };
+        let identity = ObjectIdentity {
+            device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
+            inode: stat.st_ino,
+        };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFBLK {
+            return Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData));
+        }
+        if identity != target.identity() {
+            return Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData));
+        }
+        if u64::from(u32::from_ne_bytes(stat.st_rdev.to_ne_bytes()))
+            != target.block_device().target_device()
+        {
+            return Err(BlockDeviceControlError::new(io::ErrorKind::InvalidData));
+        }
+        Ok(())
+    }
+
+    fn block_access_matches(flags: libc::c_int, access: GrantAccess) -> bool {
+        match access {
+            GrantAccess::ReadOnly => flags & libc::O_ACCMODE == libc::O_RDONLY,
+            GrantAccess::ReadWrite => flags & libc::O_ACCMODE == libc::O_RDWR,
+            GrantAccess::WriteOnly | GrantAccess::CreateChildren | GrantAccess::ConnectChildren => {
+                false
+            }
+        }
+    }
+
     /// Fixed redacted contained vhost-user broker failure.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum VhostUserBrokerConnectError {
@@ -1409,6 +1909,7 @@ mod platform {
             set_cloexec(GRANT_FD).map_err(|_| ContainedSessionError)?;
             set_cloexec(SOCKET_BROKER_FD).map_err(|_| ContainedSessionError)?;
             set_cloexec(VHOST_USER_BROKER_FD).map_err(|_| ContainedSessionError)?;
+            set_cloexec(BLOCK_CONTROL_BROKER_FD).map_err(|_| ContainedSessionError)?;
             // SAFETY: The validated private bootstrap contract transfers the
             // fixed descriptor exactly once into this process object.
             let owned = unsafe { OwnedFd::from_raw_fd(SESSION_FD) };
@@ -1423,6 +1924,9 @@ mod platform {
             // SAFETY: The private bootstrap contract transfers fixed vhost broker fd 6 once.
             let vhost_broker_owned = unsafe { OwnedFd::from_raw_fd(VHOST_USER_BROKER_FD) };
             let vhost_broker_socket = UnixDatagram::from(vhost_broker_owned);
+            // SAFETY: The private bootstrap contract transfers fixed block-control fd 7 once.
+            let block_control_owned = unsafe { OwnedFd::from_raw_fd(BLOCK_CONTROL_BROKER_FD) };
+            let block_control_socket = UnixDatagram::from(block_control_owned);
             stream
                 .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
                 .map_err(|_| ContainedSessionError)?;
@@ -1433,6 +1937,8 @@ mod platform {
             verify_peer_pid(broker_socket.as_raw_fd(), parent)
                 .map_err(|_| ContainedSessionError)?;
             verify_peer_pid(vhost_broker_socket.as_raw_fd(), parent)
+                .map_err(|_| ContainedSessionError)?;
+            verify_peer_pid(block_control_socket.as_raw_fd(), parent)
                 .map_err(|_| ContainedSessionError)?;
 
             let mut decoder = FrameDecoder::default();
@@ -1527,7 +2033,10 @@ mod platform {
                 ControlState::Cancelled
             };
             let control = Arc::new(SharedControl::new(initial_state));
-            let file_grants = GrantAuthority::new(grants.take_file_registry());
+            let block_control =
+                BlockControlBrokerAuthority::new(block_control_socket, session, parent)?;
+            let file_grants =
+                GrantAuthority::new_with_block_control(grants.take_file_registry(), block_control);
             let directory_grants = DirectoryGrantAuthority::new(grants.take_directory_registry());
             let socket_broker = SocketBrokerAuthority::new(broker_socket, session, parent);
             let vhost_user_broker =
@@ -2093,7 +2602,7 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use std::fs::{self, OpenOptions};
-        use std::io::Read as _;
+        use std::io::{self, Read as _};
         use std::mem::MaybeUninit;
         use std::os::fd::{AsRawFd, OwnedFd};
         use std::os::unix::fs::OpenOptionsExt;
@@ -2103,7 +2612,12 @@ mod platform {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Barrier};
         use std::thread;
+        use std::time::{Duration, Instant};
 
+        use bangbang_session::macos::block_control::{
+            BlockControlError, BlockControlMessage, BlockControlOperation, BlockControlTarget,
+            receive_block_control_message, send_block_control_message,
+        };
         use bangbang_session::macos::bookmark::create_implicit_bookmark;
         use bangbang_session::macos::grant_registry::{GrantRegistry, StagedGrantBatch};
         use bangbang_session::macos::grant_transport::ReceivedGrant;
@@ -2112,13 +2626,14 @@ mod platform {
             send_vhost_user_broker_message,
         };
         use bangbang_session::{
-            BatchId, GrantAccess, GrantFrame, GrantId, GrantObjectKind, GrantRecord,
-            ObjectIdentity, ResourceRole, SessionId,
+            BatchId, BlockDeviceGrant, GrantAccess, GrantFrame, GrantId, GrantObjectKind,
+            GrantRecord, ObjectIdentity, ResourceRole, SessionId,
         };
 
         use super::{
-            DirectoryGrantAuthority, GrantAuthority, GrantClaimError, VhostUserBrokerAuthority,
-            VhostUserBrokerConnectError, exact_resource_limit,
+            BlockControlBrokerAuthority, BlockControlResponse, DirectoryGrantAuthority,
+            GrantAuthority, GrantClaimError, VhostUserBrokerAuthority, VhostUserBrokerConnectError,
+            checked_observed_geometry, exact_resource_limit,
         };
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -2226,6 +2741,7 @@ mod platform {
                         inode: stat.st_ino,
                     },
                     status_flags: u32::try_from(flags).expect("status flags should fit"),
+                    block_device: None,
                 },
                 descriptor,
             )
@@ -2510,9 +3026,21 @@ mod platform {
                         ResourceRole::DriveBacking,
                         GrantAccess::ReadWrite,
                     )
-                    .expect("exact read-write drive claim should validate")
-                    .is_some()
+                    .is_err()
             );
+            let mut drive = authority
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-rw"),
+                    GrantAccess::ReadWrite,
+                )
+                .expect("dedicated read-write drive claim should validate")
+                .expect("drive reference should reserve a backing");
+            drop(
+                drive
+                    .take_backing(false)
+                    .expect("regular drive backing should adopt"),
+            );
+            drive.commit();
             assert!(
                 authority
                     .claim_file(
@@ -2577,9 +3105,21 @@ mod platform {
                         ResourceRole::DriveBacking,
                         GrantAccess::ReadOnly,
                     )
-                    .expect("wrong-role failure should preserve drive grant")
-                    .is_some()
+                    .is_err()
             );
+            let mut drive = authority
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-ro"),
+                    GrantAccess::ReadOnly,
+                )
+                .expect("wrong-role failure should preserve drive grant")
+                .expect("drive reference should reserve a backing");
+            drop(
+                drive
+                    .take_backing(true)
+                    .expect("regular drive backing should adopt"),
+            );
+            drive.commit();
 
             let mut mixed_registry = file_registry();
             let mixed_authority = GrantAuthority::new(mixed_registry.take_file_registry());
@@ -2641,54 +3181,72 @@ mod platform {
         }
 
         #[test]
-        fn prepared_file_claim_restores_exact_authority_on_abort_and_consumes_on_commit() {
+        fn prepared_drive_claim_restores_exact_authority_on_abort_and_consumes_on_commit() {
             let mut registry = file_registry();
             let authority = GrantAuthority::new(registry.take_file_registry());
+            let mut snapshot_root = authority
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-ro"),
+                    GrantAccess::ReadOnly,
+                )
+                .expect("read-only snapshot root should prepare")
+                .expect("explicit snapshot root should reserve a grant");
+            drop(
+                snapshot_root
+                    .take_snapshot_read_only_file()
+                    .expect("regular read-only root should remain a dedicated drive claim"),
+            );
+            drop(snapshot_root);
+            assert!(
+                authority
+                    .prepare_drive_backing_claim(
+                        Path::new("bangbang-grant:drive-ro"),
+                        GrantAccess::ReadOnly,
+                    )
+                    .expect("aborted snapshot root should restore authority")
+                    .is_some()
+            );
+
             let mut prepared = authority
-                .prepare_file_claim(
+                .prepare_drive_backing_claim(
                     Path::new("bangbang-grant:drive-rw"),
-                    ResourceRole::DriveBacking,
                     GrantAccess::ReadWrite,
                 )
                 .expect("exact runtime grant should prepare")
                 .expect("explicit reference should reserve a grant");
             let duplicate = prepared
-                .take_file()
-                .expect("prepared claim should expose one duplicate");
+                .take_backing(false)
+                .expect("prepared claim should expose one backing");
             drop(duplicate);
             drop(prepared);
-            assert!(
-                authority
-                    .claim_file(
-                        Path::new("bangbang-grant:drive-rw"),
-                        ResourceRole::DriveBacking,
-                        GrantAccess::ReadWrite,
-                    )
-                    .expect("aborted claim should restore authority")
-                    .is_some()
-            );
+            let restored = authority
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-rw"),
+                    GrantAccess::ReadWrite,
+                )
+                .expect("aborted claim should restore authority")
+                .expect("aborted claim should reserve again");
+            drop(restored);
 
             let mut commit_registry = file_registry();
             let commit_authority = GrantAuthority::new(commit_registry.take_file_registry());
             let mut committed = commit_authority
-                .prepare_file_claim(
+                .prepare_drive_backing_claim(
                     Path::new("bangbang-grant:drive-rw"),
-                    ResourceRole::DriveBacking,
                     GrantAccess::ReadWrite,
                 )
                 .expect("exact runtime grant should prepare")
                 .expect("explicit reference should reserve a grant");
             drop(
                 committed
-                    .take_file()
-                    .expect("committed claim should expose one duplicate"),
+                    .take_backing(false)
+                    .expect("committed claim should expose one backing"),
             );
             committed.commit();
             assert!(
                 commit_authority
-                    .claim_file(
+                    .prepare_drive_backing_claim(
                         Path::new("bangbang-grant:drive-rw"),
-                        ResourceRole::DriveBacking,
                         GrantAccess::ReadWrite,
                     )
                     .is_err()
@@ -2838,6 +3396,336 @@ mod platform {
             drop(peer.join().expect("broker peer should join"));
         }
 
+        fn block_control_target() -> BlockControlTarget {
+            BlockControlTarget::new(
+                GrantId::parse("block-drive").expect("grant should parse"),
+                GrantAccess::ReadWrite,
+                ObjectIdentity {
+                    device: 71,
+                    inode: 72,
+                },
+                u32::try_from(libc::O_RDWR | libc::O_NONBLOCK).expect("flags should fit"),
+                BlockDeviceGrant::new(73, 512, 32).expect("block tuple should validate"),
+            )
+            .expect("block target should validate")
+        }
+
+        #[test]
+        fn contained_block_geometry_must_match_the_adopted_grant_exactly() {
+            let target = block_control_target();
+            let expected = target.block_device();
+            let geometry = checked_observed_geometry(&target, expected)
+                .expect("exact adopted geometry should validate");
+            assert_eq!(geometry.logical_block_size(), expected.logical_block_size());
+            assert_eq!(geometry.block_count(), expected.block_count());
+            assert_eq!(geometry.len(), expected.capacity());
+
+            let changed = BlockDeviceGrant::new(
+                expected.target_device(),
+                expected.logical_block_size(),
+                expected.block_count() - 1,
+            )
+            .expect("changed geometry should remain structurally valid");
+            assert_eq!(
+                checked_observed_geometry(&target, changed)
+                    .expect_err("fresh geometry drift must fail closed")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
+        fn respond_to_block_control(
+            socket: &UnixDatagram,
+            request: BlockControlMessage,
+        ) -> BlockControlOperation {
+            let operation = request.operation();
+            let response = match request {
+                BlockControlMessage::Inspect {
+                    session,
+                    sequence,
+                    target,
+                } => BlockControlMessage::Inspected {
+                    session,
+                    sequence,
+                    observed: target.block_device(),
+                    target,
+                },
+                BlockControlMessage::SynchronizeCache {
+                    session,
+                    sequence,
+                    target,
+                } => BlockControlMessage::Synchronized {
+                    session,
+                    sequence,
+                    target,
+                },
+                _ => panic!("worker must send only block-control requests"),
+            };
+            send_block_control_message(socket, &response).expect("response should send");
+            operation
+        }
+
+        #[test]
+        fn block_control_authority_reuses_failure_and_serializes_concurrent_requests() {
+            let session = SessionId::from_bytes([61; 32]);
+            let target = block_control_target();
+            let (worker, launcher) = UnixDatagram::pair().expect("block broker pair should open");
+            // SAFETY: Both connected peers belong to this test process.
+            let pid = unsafe { libc::getpid() };
+            let authority = BlockControlBrokerAuthority::new(worker, session, pid)
+                .expect("block authority should initialize");
+            let launcher_target = target.clone();
+            let (release_peer, hold_peer) = std::sync::mpsc::channel();
+            let peer = thread::spawn(move || {
+                let first = receive_block_control_message(&launcher)
+                    .expect("initial block request should receive");
+                assert_eq!(
+                    first,
+                    BlockControlMessage::Inspect {
+                        session,
+                        sequence: 1,
+                        target: launcher_target.clone(),
+                    }
+                );
+                send_block_control_message(
+                    &launcher,
+                    &BlockControlMessage::Failed {
+                        session,
+                        sequence: 1,
+                        target: launcher_target,
+                        operation: BlockControlOperation::Inspect,
+                        kind: io::ErrorKind::PermissionDenied,
+                    },
+                )
+                .expect("correlated endpoint failure should send");
+
+                let second = receive_block_control_message(&launcher)
+                    .expect("one serialized request should receive");
+                assert_eq!(second.sequence(), 2);
+                launcher
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .expect("serialization probe timeout should set");
+                assert!(matches!(
+                    receive_block_control_message(&launcher),
+                    Err(BlockControlError::Io(
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ))
+                ));
+                launcher
+                    .set_read_timeout(None)
+                    .expect("serialization probe timeout should clear");
+                let first_operation = respond_to_block_control(&launcher, second);
+                let third = receive_block_control_message(&launcher)
+                    .expect("second serialized request should receive");
+                assert_eq!(third.sequence(), 3);
+                let second_operation = respond_to_block_control(&launcher, third);
+                hold_peer
+                    .recv()
+                    .expect("peer should remain live through response validation");
+                (first_operation, second_operation)
+            });
+
+            let failure = authority
+                .request(BlockControlOperation::Inspect, &target)
+                .expect_err("correlated failure should return to the caller");
+            assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
+
+            let barrier = Arc::new(Barrier::new(3));
+            let inspect_authority = authority.clone();
+            let inspect_target = target.clone();
+            let inspect_barrier = Arc::clone(&barrier);
+            let inspect = thread::spawn(move || {
+                inspect_barrier.wait();
+                inspect_authority.request(BlockControlOperation::Inspect, &inspect_target)
+            });
+            let sync_authority = authority.clone();
+            let sync_target = target.clone();
+            let sync_barrier = Arc::clone(&barrier);
+            let synchronize = thread::spawn(move || {
+                sync_barrier.wait();
+                sync_authority.request(BlockControlOperation::SynchronizeCache, &sync_target)
+            });
+            barrier.wait();
+
+            let inspect_result = inspect.join().expect("inspect caller should join");
+            let synchronize_result = synchronize.join().expect("sync caller should join");
+            release_peer
+                .send(())
+                .expect("peer should release after caller validation");
+            let operations = peer.join().expect("block broker peer should join");
+            assert_ne!(operations.0, operations.1);
+            assert_eq!(
+                inspect_result,
+                Ok(BlockControlResponse::Inspected(target.block_device())),
+                "serialized operation order: {operations:?}; sync result: {synchronize_result:?}"
+            );
+            assert_eq!(synchronize_result, Ok(BlockControlResponse::Synchronized));
+        }
+
+        #[test]
+        fn block_control_authority_poison_is_permanent_after_ambiguous_response() {
+            let session = SessionId::from_bytes([62; 32]);
+            let target = block_control_target();
+            let (worker, launcher) = UnixDatagram::pair().expect("block broker pair should open");
+            // SAFETY: Both connected peers belong to this test process.
+            let pid = unsafe { libc::getpid() };
+            let authority = BlockControlBrokerAuthority::new(worker, session, pid)
+                .expect("block authority should initialize");
+            let peer = thread::spawn(move || {
+                let request = receive_block_control_message(&launcher)
+                    .expect("ambiguous request should receive");
+                let target = request.target().clone();
+                send_block_control_message(
+                    &launcher,
+                    &BlockControlMessage::Inspected {
+                        session,
+                        sequence: request.sequence() + 1,
+                        observed: target.block_device(),
+                        target,
+                    },
+                )
+                .expect("wrong-sequence response should send");
+            });
+            assert_eq!(
+                authority
+                    .request(BlockControlOperation::Inspect, &target)
+                    .expect_err("wrong response must poison authority")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            peer.join().expect("ambiguous peer should join");
+            assert_eq!(
+                authority
+                    .request(BlockControlOperation::Inspect, &target)
+                    .expect_err("poisoned authority must remain closed")
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            let debug = format!("{authority:?}");
+            assert!(!debug.contains("block-drive"));
+            assert!(!debug.contains("6161"));
+        }
+
+        #[test]
+        fn block_control_authority_timeout_poison_and_shutdown_wakeup_are_bounded() {
+            let session = SessionId::from_bytes([63; 32]);
+            let target = block_control_target();
+            let (worker, launcher) = UnixDatagram::pair().expect("timeout pair should open");
+            // SAFETY: Both connected peers belong to this test process.
+            let pid = unsafe { libc::getpid() };
+            let timed = BlockControlBrokerAuthority::new(worker, session, pid)
+                .expect("timeout authority should initialize");
+            let started = Instant::now();
+            assert_eq!(
+                timed
+                    .request(BlockControlOperation::Inspect, &target)
+                    .expect_err("missing response should time out")
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+            assert!(started.elapsed() >= Duration::from_secs(1));
+            assert!(started.elapsed() < Duration::from_secs(4));
+            drop(launcher);
+            assert_eq!(
+                timed
+                    .request(BlockControlOperation::Inspect, &target)
+                    .expect_err("timed-out authority must remain poisoned")
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+
+            let (worker, launcher) = UnixDatagram::pair().expect("shutdown pair should open");
+            let authority = BlockControlBrokerAuthority::new(worker, session, pid)
+                .expect("shutdown authority should initialize");
+            let requesting = authority.clone();
+            let request_target = target.clone();
+            let requester = thread::spawn(move || {
+                requesting.request(BlockControlOperation::Inspect, &request_target)
+            });
+            receive_block_control_message(&launcher)
+                .expect("blocked request should reach the peer");
+            let started = Instant::now();
+            authority.invalidate();
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "independent shutdown must wake the serialized request"
+            );
+            assert!(
+                requester
+                    .join()
+                    .expect("blocked requester should join")
+                    .is_err()
+            );
+            assert_eq!(
+                authority
+                    .request(BlockControlOperation::Inspect, &target)
+                    .expect_err("invalidated authority must remain closed")
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
+
+        #[test]
+        fn block_control_authority_rejects_wrong_peer_sequence_overflow_and_lock_poison() {
+            let session = SessionId::from_bytes([64; 32]);
+            let target = block_control_target();
+            // SAFETY: `getpid` has no pointer or ownership contract.
+            let pid = unsafe { libc::getpid() };
+
+            let (worker, _launcher) = UnixDatagram::pair().expect("peer pair should open");
+            let wrong_peer = BlockControlBrokerAuthority::new(
+                worker,
+                session,
+                pid.checked_add(1).expect("test PID should fit"),
+            )
+            .expect("wrong-peer authority should initialize");
+            assert_eq!(
+                wrong_peer
+                    .request(BlockControlOperation::Inspect, &target)
+                    .expect_err("wrong peer must poison before sending")
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+
+            let (worker, _launcher) = UnixDatagram::pair().expect("overflow pair should open");
+            let overflow = BlockControlBrokerAuthority::new(worker, session, pid)
+                .expect("overflow authority should initialize");
+            overflow
+                .state
+                .lock()
+                .expect("overflow state should lock")
+                .as_mut()
+                .expect("overflow state should be active")
+                .next_sequence = u64::MAX;
+            assert_eq!(
+                overflow
+                    .request(BlockControlOperation::Inspect, &target)
+                    .expect_err("wrapped sequence must poison before sending")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+
+            let (worker, _launcher) = UnixDatagram::pair().expect("poison pair should open");
+            let poisoned = BlockControlBrokerAuthority::new(worker, session, pid)
+                .expect("poison authority should initialize");
+            let state = Arc::clone(&poisoned.state);
+            assert!(
+                thread::spawn(move || {
+                    let _held = state.lock().expect("state should lock before poisoning");
+                    panic!("intentional block-control lock poison");
+                })
+                .join()
+                .is_err()
+            );
+            assert_eq!(
+                poisoned
+                    .request(BlockControlOperation::Inspect, &target)
+                    .expect_err("lock poison must close the authority")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
         #[test]
         fn file_authority_invalidation_serializes_with_a_claim() {
             let mut registry = file_registry();
@@ -2896,8 +3784,22 @@ mod platform {
     #[derive(Debug)]
     pub(crate) struct PreparedFileGrantClaim;
 
+    #[derive(Debug)]
+    pub(crate) struct PreparedDriveBackingClaim;
+
     impl PreparedFileGrantClaim {
         pub(crate) fn take_file(&mut self) -> Result<std::fs::File, GrantClaimError> {
+            Err(GrantClaimError)
+        }
+
+        pub(crate) fn commit(self) {}
+    }
+
+    impl PreparedDriveBackingClaim {
+        pub(crate) fn take_backing(
+            &mut self,
+            _is_read_only: bool,
+        ) -> Result<bangbang_runtime::block::BlockFileBacking, GrantClaimError> {
             Err(GrantClaimError)
         }
 
@@ -2937,6 +3839,17 @@ mod platform {
             _role: ResourceRole,
             _access: GrantAccess,
         ) -> Result<Option<PreparedFileGrantClaim>, GrantClaimError> {
+            match grant_reference_id(reference)? {
+                Some(_) => Err(GrantClaimError),
+                None => Ok(None),
+            }
+        }
+
+        pub(crate) fn prepare_drive_backing_claim(
+            &self,
+            reference: &Path,
+            _access: GrantAccess,
+        ) -> Result<Option<PreparedDriveBackingClaim>, GrantClaimError> {
             match grant_reference_id(reference)? {
                 Some(_) => Err(GrantClaimError),
                 None => Ok(None),
@@ -3029,7 +3942,7 @@ mod platform {
 
 pub(crate) use platform::{
     ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
-    PreparedFileGrantClaim,
+    PreparedDriveBackingClaim, PreparedFileGrantClaim,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use platform::{

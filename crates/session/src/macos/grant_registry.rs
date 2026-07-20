@@ -10,9 +10,11 @@ use std::path::Path;
 
 use crate::macos::bookmark::{BookmarkError, ScopedBookmark};
 use crate::macos::grant_transport::ReceivedGrant;
+use crate::macos::normalized_block_status_flags;
 use crate::{
-    BatchId, GrantAccess, GrantId, GrantObjectKind, GrantRecord, MAX_BATCH_BOOKMARK_BYTES,
-    MAX_BOOKMARK_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS, ObjectIdentity, ResourceRole, SessionId,
+    BatchId, BlockDeviceGrant, GrantAccess, GrantId, GrantObjectKind, GrantRecord,
+    MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS, ObjectIdentity,
+    ResourceRole, SessionId,
 };
 
 /// Redacted staging or adoption failure.
@@ -85,6 +87,15 @@ impl GrantRegistry {
         take_file(&mut self.files, id, role, access)
     }
 
+    /// Adopts one exact regular or block-special drive backing once.
+    pub fn take_drive_backing(
+        &mut self,
+        id: &GrantId,
+        access: GrantAccess,
+    ) -> Result<GrantedFile, GrantRegistryError> {
+        take_drive_backing(&mut self.files, id, access)
+    }
+
     /// Atomically adopts an ordered set of exact existing-file descriptors.
     ///
     /// Every request is validated, including duplicate IDs, before any entry is
@@ -107,7 +118,7 @@ impl GrantRegistry {
         duplicate_files(&self.files, requests)
     }
 
-    /// Moves all regular-file grants into a sendable one-time registry.
+    /// Moves all existing-file grants into a sendable one-time registry.
     pub fn take_file_registry(&mut self) -> FileGrantRegistry {
         FileGrantRegistry {
             entries: std::mem::take(&mut self.files),
@@ -177,6 +188,15 @@ impl FileGrantRegistry {
         take_file(&mut self.entries, id, role, access)
     }
 
+    /// Adopts one exact regular or block-special drive backing once.
+    pub fn take_drive_backing(
+        &mut self,
+        id: &GrantId,
+        access: GrantAccess,
+    ) -> Result<GrantedFile, GrantRegistryError> {
+        take_drive_backing(&mut self.entries, id, access)
+    }
+
     /// Atomically adopts an ordered set of exact existing-file descriptors.
     pub fn take_files(
         &mut self,
@@ -193,6 +213,19 @@ impl FileGrantRegistry {
         duplicate_files(&self.entries, requests)
     }
 
+    /// Duplicates one exact drive backing without adopting the original.
+    pub fn duplicate_drive_backing(
+        &self,
+        id: &GrantId,
+        access: GrantAccess,
+    ) -> Result<GrantedFile, GrantRegistryError> {
+        let file = self.entries.get(id).ok_or(GrantRegistryError)?;
+        if !matches_drive_backing(file, access) {
+            return Err(GrantRegistryError);
+        }
+        duplicate_file(file)
+    }
+
     /// Returns one reserved file grant to the same registry after an aborted
     /// consumer transaction.
     pub fn restore_file(
@@ -200,7 +233,24 @@ impl FileGrantRegistry {
         id: GrantId,
         file: GrantedFile,
     ) -> Result<(), GrantRegistryError> {
-        if self.entries.contains_key(&id) {
+        if self.entries.contains_key(&id) || file.role == ResourceRole::DriveBacking {
+            return Err(GrantRegistryError);
+        }
+        let previous = self.entries.insert(id, file);
+        debug_assert!(previous.is_none());
+        Ok(())
+    }
+
+    /// Returns one reserved drive backing after an aborted transaction.
+    pub fn restore_drive_backing(
+        &mut self,
+        id: GrantId,
+        file: GrantedFile,
+    ) -> Result<(), GrantRegistryError> {
+        if self.entries.contains_key(&id)
+            || file.role != ResourceRole::DriveBacking
+            || !matches!(file.access, GrantAccess::ReadOnly | GrantAccess::ReadWrite)
+        {
             return Err(GrantRegistryError);
         }
         let previous = self.entries.insert(id, file);
@@ -332,9 +382,23 @@ fn take_file(
 ) -> Result<GrantedFile, GrantRegistryError> {
     let matches = matches!(
         entries.get(id),
-        Some(file) if file.role == role && file.access == access
+        Some(file) if matches_generic_file(file, role, access)
     );
     if !matches {
+        return Err(GrantRegistryError);
+    }
+    entries.remove(id).ok_or(GrantRegistryError)
+}
+
+fn take_drive_backing(
+    entries: &mut HashMap<GrantId, GrantedFile>,
+    id: &GrantId,
+    access: GrantAccess,
+) -> Result<GrantedFile, GrantRegistryError> {
+    if !entries
+        .get(id)
+        .is_some_and(|file| matches_drive_backing(file, access))
+    {
         return Err(GrantRegistryError);
     }
     entries.remove(id).ok_or(GrantRegistryError)
@@ -349,7 +413,7 @@ fn take_files(
         if !ids.insert(id)
             || !matches!(
                 entries.get(id),
-                Some(file) if file.role == *role && file.access == *access
+                Some(file) if matches_generic_file(file, *role, *access)
             )
         {
             return Err(GrantRegistryError);
@@ -385,7 +449,7 @@ fn duplicate_files(
         if !ids.insert(id)
             || !matches!(
                 entries.get(id),
-                Some(file) if file.role == *role && file.access == *access
+                Some(file) if matches_generic_file(file, *role, *access)
             )
         {
             return Err(GrantRegistryError);
@@ -398,30 +462,57 @@ fn duplicate_files(
         .map_err(|_| GrantRegistryError)?;
     for (id, _, _) in requests {
         let file = entries.get(id).ok_or(GrantRegistryError)?;
-        // SAFETY: the source descriptor remains live for fcntl; success returns
-        // an independently owned close-on-exec descriptor.
-        let descriptor =
-            unsafe { libc::fcntl(file.descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if descriptor < 0 {
-            return Err(GrantRegistryError);
-        }
-        // SAFETY: descriptor is the fresh duplicate returned above.
-        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
-        files.push(GrantedFile {
-            role: file.role,
-            access: file.access,
-            identity: file.identity,
-            descriptor,
-        });
+        files.push(duplicate_file(file)?);
     }
     Ok(files)
+}
+
+fn matches_generic_file(file: &GrantedFile, role: ResourceRole, access: GrantAccess) -> bool {
+    role != ResourceRole::DriveBacking
+        && file.role == role
+        && file.access == access
+        && file.kind == GrantObjectKind::RegularFile
+        && file.block_device.is_none()
+}
+
+fn matches_drive_backing(file: &GrantedFile, access: GrantAccess) -> bool {
+    file.role == ResourceRole::DriveBacking
+        && file.access == access
+        && matches!(access, GrantAccess::ReadOnly | GrantAccess::ReadWrite)
+        && matches!(
+            (file.kind, file.block_device),
+            (GrantObjectKind::RegularFile, None) | (GrantObjectKind::BlockDevice, Some(_))
+        )
+}
+
+fn duplicate_file(file: &GrantedFile) -> Result<GrantedFile, GrantRegistryError> {
+    // SAFETY: the source descriptor remains live for fcntl; success returns
+    // an independently owned close-on-exec descriptor.
+    let descriptor = unsafe { libc::fcntl(file.descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(GrantRegistryError);
+    }
+    // SAFETY: descriptor is the fresh duplicate returned above.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    Ok(GrantedFile {
+        role: file.role,
+        access: file.access,
+        kind: file.kind,
+        identity: file.identity,
+        status_flags: file.status_flags,
+        block_device: file.block_device,
+        descriptor,
+    })
 }
 
 /// Adopted existing-file capability.
 pub struct GrantedFile {
     role: ResourceRole,
     access: GrantAccess,
+    kind: GrantObjectKind,
     identity: ObjectIdentity,
+    status_flags: u32,
+    block_device: Option<BlockDeviceGrant>,
     descriptor: OwnedFd,
 }
 
@@ -431,7 +522,13 @@ impl fmt::Debug for GrantedFile {
             .debug_struct("GrantedFile")
             .field("role", &self.role)
             .field("access", &self.access)
+            .field("kind", &self.kind)
             .field("identity", &"<redacted>")
+            .field("status_flags", &"<redacted>")
+            .field(
+                "block_device",
+                &self.block_device.as_ref().map(|_| "<redacted>"),
+            )
             .field("descriptor", &"<owned>")
             .finish()
     }
@@ -444,10 +541,28 @@ impl GrantedFile {
         self.access
     }
 
+    /// Returns the authenticated descriptor kind.
+    #[must_use]
+    pub const fn kind(&self) -> GrantObjectKind {
+        self.kind
+    }
+
     /// Returns the verified stable identity without exposing a path.
     #[must_use]
     pub const fn identity(&self) -> ObjectIdentity {
         self.identity
+    }
+
+    /// Returns the authenticated stable status flags.
+    #[must_use]
+    pub const fn status_flags(&self) -> u32 {
+        self.status_flags
+    }
+
+    /// Returns authenticated block metadata, if this is a block-special drive.
+    #[must_use]
+    pub const fn block_device(&self) -> Option<BlockDeviceGrant> {
+        self.block_device
     }
 
     /// Returns the live descriptor without transferring ownership.
@@ -618,21 +733,28 @@ impl StagedGrantBatch {
                 kind,
                 identity,
                 status_flags,
+                block_device,
             } => {
                 self.require_open_batch()?;
-                if kind != GrantObjectKind::RegularFile
-                    || role.is_scoped_directory()
+                if role.is_scoped_directory()
                     || !role.permits(access)
+                    || !matches!(
+                        (kind, block_device),
+                        (GrantObjectKind::RegularFile, None)
+                            | (GrantObjectKind::BlockDevice, Some(_))
+                    )
+                    || (kind == GrantObjectKind::BlockDevice && role != ResourceRole::DriveBacking)
                 {
                     return Err(GrantRegistryError);
                 }
                 let descriptor = descriptor.ok_or(GrantRegistryError)?;
                 validate_descriptor(
                     descriptor.as_raw_fd(),
-                    GrantObjectKind::RegularFile,
+                    kind,
                     access,
                     identity,
                     Some(status_flags),
+                    block_device,
                 )?;
                 self.insert_identity_role(&id, role, identity)?;
                 self.entries.insert(
@@ -640,7 +762,10 @@ impl StagedGrantBatch {
                     StagedResource::File {
                         role,
                         access,
+                        kind,
                         identity,
+                        status_flags,
+                        block_device,
                         descriptor,
                     },
                 );
@@ -670,6 +795,7 @@ impl StagedGrantBatch {
                     GrantObjectKind::Directory,
                     access,
                     identity,
+                    None,
                     None,
                 )?;
                 self.insert_identity_role(&id, role, identity)?;
@@ -808,7 +934,10 @@ impl StagedGrantBatch {
                 StagedResource::File {
                     role,
                     access,
+                    kind,
                     identity,
+                    status_flags,
+                    block_device,
                     descriptor,
                 } => {
                     files.insert(
@@ -816,7 +945,10 @@ impl StagedGrantBatch {
                         GrantedFile {
                             role,
                             access,
+                            kind,
                             identity,
+                            status_flags,
+                            block_device,
                             descriptor,
                         },
                     );
@@ -867,7 +999,10 @@ enum StagedResource {
     File {
         role: ResourceRole,
         access: GrantAccess,
+        kind: GrantObjectKind,
         identity: ObjectIdentity,
+        status_flags: u32,
+        block_device: Option<BlockDeviceGrant>,
         descriptor: OwnedFd,
     },
     Directory {
@@ -888,6 +1023,7 @@ fn validate_descriptor(
     access: GrantAccess,
     identity: ObjectIdentity,
     expected_status_flags: Option<u32>,
+    expected_block_device: Option<BlockDeviceGrant>,
 ) -> Result<(), GrantRegistryError> {
     // SAFETY: F_GETFD and F_GETFL inspect the live received descriptor.
     let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
@@ -897,8 +1033,15 @@ fn validate_descriptor(
         || status_flags < 0
         || descriptor_flags & libc::FD_CLOEXEC == 0
         || !access_matches(status_flags, access)
-        || expected_status_flags
-            .is_some_and(|expected| u32::try_from(status_flags).ok() != Some(expected))
+        || (kind == GrantObjectKind::BlockDevice && status_flags & libc::O_APPEND != 0)
+        || expected_status_flags.is_some_and(|expected| {
+            let actual = if kind == GrantObjectKind::BlockDevice {
+                normalized_block_status_flags(status_flags)
+            } else {
+                u32::try_from(status_flags).ok()
+            };
+            actual != Some(expected)
+        })
     {
         return Err(GrantRegistryError);
     }
@@ -906,13 +1049,22 @@ fn validate_descriptor(
     let actual_kind = match stat.st_mode & libc::S_IFMT {
         libc::S_IFREG => GrantObjectKind::RegularFile,
         libc::S_IFDIR => GrantObjectKind::Directory,
+        libc::S_IFBLK => GrantObjectKind::BlockDevice,
         _ => return Err(GrantRegistryError),
     };
     let actual_identity = ObjectIdentity {
         device: normalized_device(stat.st_dev),
         inode: stat.st_ino,
     };
-    if actual_kind != kind || actual_identity != identity {
+    let target_device = normalized_device(stat.st_rdev);
+    if actual_kind != kind
+        || actual_identity != identity
+        || match (kind, expected_block_device) {
+            (GrantObjectKind::BlockDevice, Some(block)) => target_device != block.target_device(),
+            (GrantObjectKind::RegularFile | GrantObjectKind::Directory, None) => target_device != 0,
+            _ => true,
+        }
+    {
         return Err(GrantRegistryError);
     }
     Ok(())
@@ -1206,6 +1358,7 @@ mod tests {
                         inode: stat.st_ino,
                     },
                     status_flags: u32::try_from(flags).expect("flags should fit"),
+                    block_device: None,
                 },
                 Some(descriptor),
             ))
@@ -1238,6 +1391,76 @@ mod tests {
     }
 
     #[test]
+    fn dedicated_drive_operations_preserve_complete_block_metadata() {
+        let source = File::open("/dev/null").expect("descriptor fixture should open");
+        let descriptor = duplicate(&source);
+        let stat = descriptor_stat(descriptor.as_raw_fd()).expect("fixture stat should read");
+        // SAFETY: F_GETFL only observes the live fixture descriptor.
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+        let status_flags = normalized_block_status_flags(flags)
+            .expect("normalized status flags should fit the wire");
+        let identity = ObjectIdentity {
+            device: normalized_device(stat.st_dev),
+            inode: stat.st_ino,
+        };
+        let block_device =
+            BlockDeviceGrant::new(77, 4096, 16).expect("block metadata should validate");
+        let id = GrantId::parse("block-drive").expect("grant ID should parse");
+        let mut registry = FileGrantRegistry {
+            entries: HashMap::from([(
+                id.clone(),
+                GrantedFile {
+                    role: ResourceRole::DriveBacking,
+                    access: GrantAccess::ReadOnly,
+                    kind: GrantObjectKind::BlockDevice,
+                    identity,
+                    status_flags,
+                    block_device: Some(block_device),
+                    descriptor,
+                },
+            )]),
+        };
+
+        assert!(
+            registry
+                .take_file(&id, ResourceRole::DriveBacking, GrantAccess::ReadOnly)
+                .is_err(),
+            "generic adoption must not erase drive authority"
+        );
+        let duplicated = registry
+            .duplicate_drive_backing(&id, GrantAccess::ReadOnly)
+            .expect("dedicated duplication should succeed");
+        assert_ne!(
+            duplicated.as_raw_fd(),
+            registry
+                .entries
+                .get(&id)
+                .expect("original block grant should remain")
+                .as_raw_fd()
+        );
+        assert_eq!(duplicated.kind(), GrantObjectKind::BlockDevice);
+        assert_eq!(duplicated.identity(), identity);
+        assert_eq!(duplicated.status_flags(), status_flags);
+        assert_eq!(duplicated.block_device(), Some(block_device));
+        drop(duplicated);
+
+        let reserved = registry
+            .take_drive_backing(&id, GrantAccess::ReadOnly)
+            .expect("dedicated take should reserve the block grant");
+        assert!(registry.is_empty());
+        registry
+            .restore_drive_backing(id.clone(), reserved)
+            .expect("dedicated restore should preserve the block grant");
+        let restored = registry
+            .take_drive_backing(&id, GrantAccess::ReadOnly)
+            .expect("restored block grant should remain adoptable");
+        assert_eq!(restored.kind(), GrantObjectKind::BlockDevice);
+        assert_eq!(restored.identity(), identity);
+        assert_eq!(restored.status_flags(), status_flags);
+        assert_eq!(restored.block_device(), Some(block_device));
+    }
+
+    #[test]
     fn file_registry_batch_adoption_is_failure_atomic() {
         let kernel_id = GrantId::parse("kernel").expect("kernel ID should parse");
         let initrd_id = GrantId::parse("initrd").expect("initrd ID should parse");
@@ -1258,10 +1481,13 @@ mod tests {
                     GrantedFile {
                         role: ResourceRole::KernelImage,
                         access: GrantAccess::ReadOnly,
+                        kind: GrantObjectKind::RegularFile,
                         identity: ObjectIdentity {
                             device: normalized_device(kernel_stat.st_dev),
                             inode: kernel_stat.st_ino,
                         },
+                        status_flags: 0,
+                        block_device: None,
                         descriptor: kernel_descriptor,
                     },
                 ),
@@ -1270,10 +1496,13 @@ mod tests {
                     GrantedFile {
                         role: ResourceRole::InitrdImage,
                         access: GrantAccess::ReadOnly,
+                        kind: GrantObjectKind::RegularFile,
                         identity: ObjectIdentity {
                             device: normalized_device(initrd_stat.st_dev),
                             inode: initrd_stat.st_ino,
                         },
+                        status_flags: 0,
+                        block_device: None,
                         descriptor: initrd_descriptor,
                     },
                 ),
@@ -1546,6 +1775,7 @@ mod tests {
                     kind: GrantObjectKind::RegularFile,
                     identity,
                     status_flags: u32::try_from(flags).expect("flags should fit"),
+                    block_device: None,
                 },
                 Some(descriptor),
             ))
@@ -1689,6 +1919,7 @@ mod tests {
                             inode: u64::MAX,
                         },
                         status_flags: u32::try_from(flags).expect("flags should fit"),
+                        block_device: None,
                     },
                     Some(descriptor),
                 ))
@@ -1739,6 +1970,7 @@ mod tests {
                     kind: GrantObjectKind::RegularFile,
                     identity,
                     status_flags: u32::try_from(flags).expect("flags should fit"),
+                    block_device: None,
                 },
                 Some(first),
             ))
@@ -1756,6 +1988,7 @@ mod tests {
                         kind: GrantObjectKind::RegularFile,
                         identity,
                         status_flags: u32::try_from(flags).expect("flags should fit"),
+                        block_device: None,
                     },
                     Some(second),
                 ))
