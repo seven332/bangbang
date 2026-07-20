@@ -8589,11 +8589,17 @@ mod tests {
         BalloonHintingStatus, BalloonHintingStatusError, BalloonStats, BalloonStatsError,
         BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
     };
+    use bangbang_runtime::block::async_executor::{
+        BlockAsyncCompletionDisposition, BlockAsyncDrive, BlockAsyncDriveGeneration,
+        BlockAsyncExecutor, BlockAsyncExecutorConfig, BlockAsyncHostIo, BlockAsyncOperation,
+        BlockAsyncRequestIdentity, BlockAsyncScheduleOutcome, BlockAsyncTransferResult,
+        drain_block_async_drives,
+    };
     use bangbang_runtime::block::{
-        BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigError, DriveConfigInput,
-        DriveConfigs, DriveRateLimiterConfig, DriveRuntimeMutationError, DriveTokenBucketConfig,
-        DriveUpdateError, DriveUpdateInput, PreparedBlockDevice, PreparedBlockDevices,
-        RuntimeBlockDeviceResource,
+        BlockFileBacking, BlockMmioLayout, DriveCacheType, DriveConfig, DriveConfigError,
+        DriveConfigInput, DriveConfigs, DriveRateLimiterConfig, DriveRuntimeMutationError,
+        DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput, PreparedBlockDevice,
+        PreparedBlockDevices, RuntimeBlockDeviceResource,
     };
     use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
     use bangbang_runtime::cpu::{CpuConfigInput, CpuConfigKvmCapability};
@@ -10028,6 +10034,56 @@ mod tests {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("fake run loop command failed")
         }
+    }
+
+    #[derive(Debug)]
+    struct BlockingBlockHost {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl BlockAsyncHostIo for BlockingBlockHost {
+        fn read_at(
+            &self,
+            _backing: &BlockFileBacking,
+            _offset: u64,
+            destination: &mut [u8],
+        ) -> BlockAsyncTransferResult {
+            self.entered
+                .send(())
+                .expect("blocked host entry should be observed");
+            if self
+                .release
+                .lock()
+                .expect("blocked host release should lock")
+                .recv_timeout(Duration::from_secs(5))
+                .is_err()
+            {
+                return BlockAsyncTransferResult::failed(0, std::io::ErrorKind::TimedOut);
+            }
+            destination.fill(0x5a);
+            BlockAsyncTransferResult::complete(destination.len())
+        }
+
+        fn write_at(
+            &self,
+            _backing: &BlockFileBacking,
+            _offset: u64,
+            _source: &[u8],
+        ) -> BlockAsyncTransferResult {
+            BlockAsyncTransferResult::failed(0, std::io::ErrorKind::Unsupported)
+        }
+
+        fn flush(&self, _backing: &BlockFileBacking) -> Result<(), std::io::ErrorKind> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SupervisorAsyncBlockState {
+        executor: BlockAsyncExecutor,
+        drive: BlockAsyncDrive,
+        memory: GuestMemory,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -13210,6 +13266,139 @@ mod tests {
         drop(supervisor);
 
         assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_stays_responsive_while_async_block_host_call_blocks() {
+        let temporary = TempFilePath::create_with_bytes("async-block-owner", &[0; 16 * 1024]);
+        let backing_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temporary.path())
+            .expect("async block backing should open");
+        let backing = Arc::new(
+            BlockFileBacking::from_file(backing_file, false)
+                .expect("async block backing should validate"),
+        );
+        let (host_entered_sender, host_entered_receiver) = mpsc::channel();
+        let (host_release_sender, host_release_receiver) = mpsc::channel();
+        let executor = BlockAsyncExecutor::with_config_and_host(
+            BlockAsyncExecutorConfig::new(1, 1, 1, 4, 4),
+            Arc::new(BlockingBlockHost {
+                entered: host_entered_sender,
+                release: Mutex::new(host_release_receiver),
+            }),
+        )
+        .expect("async block executor should start");
+        let mut drive = BlockAsyncDrive::new(
+            BlockAsyncDriveGeneration::new(1),
+            backing,
+            DriveCacheType::Unsafe,
+            executor.handle(),
+        )
+        .expect("async block drive should bind");
+        let range = GuestMemoryRange::new(GuestAddress::new(0), 64 * 1024)
+            .expect("async block guest range should validate");
+        let layout =
+            GuestMemoryLayout::new(vec![range]).expect("async block guest layout should validate");
+        let memory = GuestMemory::allocate(&layout).expect("async block guest should allocate");
+        drive
+            .admit(
+                BlockAsyncOperation::read(
+                    BlockAsyncRequestIdentity::new(0, 1, GuestAddress::new(0x200)),
+                    GuestAddress::new(0x100),
+                    0,
+                    4,
+                )
+                .expect("async block read should validate"),
+            )
+            .expect("async block read should admit");
+        let state = Arc::new(Mutex::new(SupervisorAsyncBlockState {
+            executor,
+            drive,
+            memory,
+        }));
+
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(71).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            71
+        );
+
+        let schedule_state = Arc::clone(&state);
+        supervisor
+            .run_command(move |_| {
+                let mut state = schedule_state
+                    .lock()
+                    .expect("async block state should lock");
+                let SupervisorAsyncBlockState { drive, memory, .. } = &mut *state;
+                let outcome = drive
+                    .schedule_one(memory)
+                    .map_err(|_| FakeRunLoopCommandError)?;
+                if !matches!(outcome, BlockAsyncScheduleOutcome::Submitted { .. }) {
+                    return Err(FakeRunLoopCommandError);
+                }
+                Ok(())
+            })
+            .expect("owner should submit host work without blocking");
+        host_entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("host worker should enter blocked call");
+
+        let marker = supervisor
+            .run_command(|_| Ok::<_, FakeRunLoopCommandError>(0x1442_u16))
+            .expect("ordinary owner command must finish while host I/O is blocked");
+        assert_eq!(marker, 0x1442);
+
+        host_release_sender
+            .send(())
+            .expect("blocked host call should release");
+        let drain_state = Arc::clone(&state);
+        let (completion_count, guest_bytes) = supervisor
+            .run_command(move |_| {
+                let mut state = drain_state.lock().expect("async block state should lock");
+                let SupervisorAsyncBlockState {
+                    executor,
+                    drive,
+                    memory,
+                } = &mut *state;
+                let outcome = drain_block_async_drives(
+                    executor,
+                    std::slice::from_mut(drive),
+                    memory,
+                    BlockAsyncCompletionDisposition::Apply,
+                )
+                .map_err(|_| FakeRunLoopCommandError)?;
+                let mut guest_bytes = [0_u8; 4];
+                memory
+                    .read_slice(&mut guest_bytes, GuestAddress::new(0x100))
+                    .map_err(|_| FakeRunLoopCommandError)?;
+                executor.shutdown().map_err(|_| FakeRunLoopCommandError)?;
+                Ok::<_, FakeRunLoopCommandError>((outcome.completions().len(), guest_bytes))
+            })
+            .expect("owner should drain and stop async block work");
+        assert_eq!(completion_count, 1);
+        assert_eq!(guest_bytes, [0x5a; 4]);
+
+        drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 
