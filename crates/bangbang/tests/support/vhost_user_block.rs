@@ -177,7 +177,9 @@ impl VhostUserBlockBackend {
         let worker = thread::spawn(move || {
             let _socket_guard = SocketPathGuard(socket_path);
             let result = (|| {
-                let stream = accept_frontend(&listener, &receiver)?;
+                let Some(stream) = accept_frontend(&listener, &receiver)? else {
+                    return Ok(());
+                };
                 run_backend(stream, backing, options, &receiver, &worker_report)
             })();
             if let Err(error) = &result {
@@ -314,14 +316,14 @@ fn open_backing(path: &Path, read_only: bool) -> Result<File, String> {
 fn accept_frontend(
     listener: &UnixListener,
     control: &Receiver<BackendControl>,
-) -> Result<UnixStream, String> {
+) -> Result<Option<UnixStream>, String> {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream
                     .set_nonblocking(false)
                     .map_err(io_kind("configure accepted vhost-user stream"))?;
-                return Ok(stream);
+                return Ok(Some(stream));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => {
@@ -333,7 +335,7 @@ fn accept_frontend(
         }
         match control.try_recv() {
             Ok(BackendControl::Disconnect) | Err(TryRecvError::Disconnected) => {
-                return Err("test vhost-user backend stopped before connection".to_string());
+                return Ok(None);
             }
             Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
         }
@@ -841,7 +843,7 @@ impl BackendState {
     }
 
     fn handle_get_config(
-        &self,
+        &mut self,
         stream: &mut UnixStream,
         request: &VhostUserRequest,
     ) -> Result<(), String> {
@@ -852,6 +854,15 @@ impl BackendState {
             || request.body[12..].iter().any(|byte| *byte != 0)
         {
             return Err("frontend requested an unexpected block config range".to_string());
+        }
+        self.capacity_bytes = self
+            .backing
+            .metadata()
+            .map_err(io_kind("refresh test vhost-user backing capacity"))?
+            .len();
+        if self.capacity_bytes == 0 || !self.capacity_bytes.is_multiple_of(VIRTIO_BLOCK_SECTOR_SIZE)
+        {
+            return Err("test vhost-user backing must contain complete sectors".to_string());
         }
         let mut config = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
         config[..8]
@@ -1034,6 +1045,9 @@ impl BackendState {
                     {
                         self.queue.enabled = false;
                         acknowledge(stream, &request)?;
+                    }
+                    Ok(request) if request.code == VHOST_USER_GET_CONFIG => {
+                        self.handle_get_config(stream, &request)?;
                     }
                     Ok(_) => return Err("active frontend sent an unexpected request".to_string()),
                     Err(error) if error == "vhost-user frontend disconnected" => {
@@ -1363,6 +1377,10 @@ impl BackendState {
                 match error.kind() {
                     io::ErrorKind::Interrupted => continue,
                     io::ErrorKind::WouldBlock => return Ok(()),
+                    io::ErrorKind::BrokenPipe => {
+                        self.update_report(|report| report.frontend_closed = true);
+                        return Ok(());
+                    }
                     _ => {
                         return Err(format!(
                             "test vhost-user call write failed: {:?}",

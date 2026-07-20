@@ -1763,9 +1763,17 @@ host-seed reads, guest direct synchronous write/readback, FLUSH, exact
 socket-only `GET /vm/config`, one complete shared-memory export, one 256-entry
 queue, backend-call interrupts, snapshot rejection before staging, backend
 death metrics, continued API responsiveness, frontend close, and socket
-cleanup. Runtime vhost replacement/hotplug, contained socket authority,
-dynamic-memory coexistence, async/io_uring, and vhost snapshot state remain
-outside this subset.
+cleanup. The MMIO case additionally resizes its scratch backing, uses ID-only
+PATCH to fetch the second exact config, and makes Linux observe and write the
+new capacity through a real SPI notification. The product-PCI lifecycle repeats
+capacity refresh through MSI-X, rejects invalid negotiation without
+publication, attaches a new non-root backend, performs guest read/write/fsync,
+manually removes and DELETEs the function, then repeats the same ID and released
+slot while Paused. The ordinary anonymous-memory hotplug case proves a candidate
+vhost listener sees zero connections and no public mutation; duplicate IDs
+likewise reject before connection. Contained socket authority, dynamic-memory
+coexistence, same-ID live reconnect, async/io_uring, automatic guest PCI
+notification, and vhost snapshot state remain outside this subset.
 
 The `bangbang-vhost-user` crate retains a portable protocol boundary.
 Native-endian golden tests cover the exact pinned
@@ -1778,6 +1786,10 @@ Darwin kqueue readability. Runtime tests additionally prove feature
 intersection, exact config preservation, shared-memory and ring bounds,
 pre-activation reset, Firecracker's pre-acknowledged protocol bit, activation
 order, calls/kicks, disconnect terminalization, and snapshot/update rejection.
+The active peer also polls repeated post-activation CONFIG requests; focused
+tests prove exact replacement, generation/interrupt publication, malformed
+reply preservation, optional config-change latency metrics, and generation-safe
+removal/reuse.
 The signed fixture is a separate strict regular-file backend that maps only
 transferred regions and validates direct/indirect guest descriptors; it is test
 infrastructure, not a shipped storage service.

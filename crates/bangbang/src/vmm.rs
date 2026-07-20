@@ -38,6 +38,7 @@ use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveBackendConfig, DriveConfig, DriveConfigError,
     DriveConfigInput, DriveRateLimiterConfig, DriveRuntimeMutationError, DriveUpdateError,
     DriveUpdateInput, PreparedBlockDevice, PreparedVhostUserBlockFrontend,
+    RuntimeBlockDeviceResource,
 };
 use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
 use bangbang_runtime::boot_timer::BootTimerMmioLayout;
@@ -511,7 +512,14 @@ pub(crate) trait ProcessSessionDiagnostics {
 
     fn insert_runtime_block_device(
         &mut self,
-        _prepared: PreparedBlockDevice,
+        _resource: RuntimeBlockDeviceResource,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn preflight_runtime_vhost_user_block_device(
+        &mut self,
+        _drive_id: &str,
     ) -> Result<(), DriveRuntimeMutationError> {
         Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
     }
@@ -2153,60 +2161,106 @@ where
             ));
         }
         let prepared_config = self.controller.prepare_runtime_drive_insert(input)?;
-        let config = prepared_config.config();
-        let DriveBackendConfig::File {
-            path_on_host,
-            is_read_only,
-            ..
-        } = config.backend()
-        else {
-            return Err(VmmActionError::DriveRuntimeMutation(
-                DriveRuntimeMutationError::UnsupportedBackend,
-            ));
-        };
-        let mut grant_claim: Option<PreparedFileGrantClaim> = match &self.grant_authority {
-            Some(authority) => Some(
-                authority
-                    .prepare_file_claim(
-                        path_on_host,
-                        ResourceRole::DriveBacking,
-                        grant_access_for_read_only(*is_read_only),
+        let config = prepared_config.config().clone();
+        match config.backend() {
+            DriveBackendConfig::VhostUser { socket } => {
+                if self.grant_authority.is_some() {
+                    return Err(VmmActionError::DriveConfig(
+                        DriveConfigError::ContainedVhostUserUnsupported,
+                    ));
+                }
+                if self.controller.memory_hotplug_config().is_some() {
+                    return Err(VmmActionError::DriveConfig(
+                        DriveConfigError::IncompatibleMemoryHotplug,
+                    ));
+                }
+                let session = self.started_session.as_mut().ok_or({
+                    VmmActionError::DriveRuntimeMutation(
+                        DriveRuntimeMutationError::ActiveSessionUnavailable,
                     )
-                    .map_err(|_| VmmActionError::ResourceGrant)?
-                    .ok_or(VmmActionError::ResourceGrant)?,
-            ),
-            None => None,
-        };
-        let backing = match grant_claim.as_mut() {
-            Some(claim) => Some(
-                BlockFileBacking::from_file(
-                    claim
-                        .take_file()
-                        .map_err(|_| VmmActionError::ResourceGrant)?,
-                    *is_read_only,
+                })?;
+                session
+                    .preflight_runtime_vhost_user_block_device(config.drive_id())
+                    .map_err(VmmActionError::DriveRuntimeMutation)?;
+                let stream =
+                    direct_vhost_user::connect(socket, DIRECT_VHOST_USER_OPERATION_TIMEOUT)
+                        .map_err(|source| {
+                            VmmActionError::DriveRuntimeMutation(
+                                DriveRuntimeMutationError::PrepareDevice {
+                                    message: source.to_string(),
+                                },
+                            )
+                        })?;
+                let frontend = PreparedVhostUserBlockFrontend::discover(
+                    stream,
+                    config.cache_type(),
+                    DIRECT_VHOST_USER_OPERATION_TIMEOUT,
                 )
-                .map_err(|_| VmmActionError::ResourceGrant)?,
-            ),
-            None => None,
-        };
-        // Backing open/stat work is completed on the API thread. The prepared
-        // object crosses the run-loop command boundary with no ambient path use.
-        let prepared_device = PreparedBlockDevice::from_config_with_backing(config, backing)
-            .map_err(|source| {
-                VmmActionError::DriveRuntimeMutation(DriveRuntimeMutationError::PrepareDevice {
-                    message: source.to_string(),
-                })
-            })?;
-        let session = self.started_session.as_mut().ok_or({
-            VmmActionError::DriveRuntimeMutation(
-                DriveRuntimeMutationError::ActiveSessionUnavailable,
-            )
-        })?;
-        session
-            .insert_runtime_block_device(prepared_device)
-            .map_err(VmmActionError::DriveRuntimeMutation)?;
-        if let Some(claim) = grant_claim {
-            claim.commit();
+                .map_err(|source| {
+                    VmmActionError::DriveRuntimeMutation(DriveRuntimeMutationError::PrepareDevice {
+                        message: source.to_string(),
+                    })
+                })?;
+                session
+                    .insert_runtime_block_device(RuntimeBlockDeviceResource::vhost_user(
+                        config, frontend,
+                    ))
+                    .map_err(VmmActionError::DriveRuntimeMutation)?;
+            }
+            DriveBackendConfig::File {
+                path_on_host,
+                is_read_only,
+                ..
+            } => {
+                let mut grant_claim: Option<PreparedFileGrantClaim> = match &self.grant_authority {
+                    Some(authority) => Some(
+                        authority
+                            .prepare_file_claim(
+                                path_on_host,
+                                ResourceRole::DriveBacking,
+                                grant_access_for_read_only(*is_read_only),
+                            )
+                            .map_err(|_| VmmActionError::ResourceGrant)?
+                            .ok_or(VmmActionError::ResourceGrant)?,
+                    ),
+                    None => None,
+                };
+                let backing = match grant_claim.as_mut() {
+                    Some(claim) => Some(
+                        BlockFileBacking::from_file(
+                            claim
+                                .take_file()
+                                .map_err(|_| VmmActionError::ResourceGrant)?,
+                            *is_read_only,
+                        )
+                        .map_err(|_| VmmActionError::ResourceGrant)?,
+                    ),
+                    None => None,
+                };
+                // Backing open/stat work is completed on the API thread. The prepared
+                // object crosses the run-loop command boundary with no ambient path use.
+                let prepared_device = PreparedBlockDevice::from_config_with_backing(
+                    &config, backing,
+                )
+                .map_err(|source| {
+                    VmmActionError::DriveRuntimeMutation(DriveRuntimeMutationError::PrepareDevice {
+                        message: source.to_string(),
+                    })
+                })?;
+                let session = self.started_session.as_mut().ok_or({
+                    VmmActionError::DriveRuntimeMutation(
+                        DriveRuntimeMutationError::ActiveSessionUnavailable,
+                    )
+                })?;
+                session
+                    .insert_runtime_block_device(RuntimeBlockDeviceResource::prepared(
+                        prepared_device,
+                    ))
+                    .map_err(VmmActionError::DriveRuntimeMutation)?;
+                if let Some(claim) = grant_claim {
+                    claim.commit();
+                }
+            }
         }
         self.controller.commit_runtime_drive_insert(prepared_config);
         Ok(VmmData::Empty)
@@ -2565,48 +2619,57 @@ where
         let refresh_backing = input.path_on_host().is_some();
         let rate_limiter_update = input.rate_limiter();
         let updated_config = self.controller.updated_drive_config(input)?;
-        let DriveBackendConfig::File {
-            path_on_host,
-            is_read_only,
-            ..
-        } = updated_config.backend()
-        else {
-            return Err(VmmActionError::DriveUpdate(
-                DriveUpdateError::UnsupportedBackend,
-            ));
-        };
-        if refresh_backing || rate_limiter_update.is_some() {
-            let Some(session) = self.started_session.as_mut() else {
-                return Err(VmmActionError::DriveUpdate(
-                    DriveUpdateError::ActiveSessionUnavailable,
-                ));
-            };
-
-            let backing_update = if refresh_backing {
-                match &self.grant_authority {
-                    Some(authority) => match authority
-                        .claim_file(
-                            path_on_host,
-                            ResourceRole::DriveBacking,
-                            grant_access_for_read_only(*is_read_only),
-                        )
-                        .map_err(|_| VmmActionError::ResourceGrant)?
-                    {
-                        Some(file) => BlockBackingUpdate::Provided(
-                            BlockFileBacking::from_file(file, *is_read_only)
-                                .map_err(|_| VmmActionError::ResourceGrant)?,
-                        ),
+        match updated_config.backend() {
+            DriveBackendConfig::VhostUser { .. } => {
+                debug_assert!(!refresh_backing);
+                debug_assert!(rate_limiter_update.is_none());
+                let session = self
+                    .started_session
+                    .as_mut()
+                    .ok_or(VmmActionError::DriveUpdate(
+                        DriveUpdateError::ActiveSessionUnavailable,
+                    ))?;
+                session
+                    .update_block_device(&updated_config, BlockBackingUpdate::Unchanged, None)
+                    .map_err(VmmActionError::DriveUpdate)?;
+            }
+            DriveBackendConfig::File {
+                path_on_host,
+                is_read_only,
+                ..
+            } if refresh_backing || rate_limiter_update.is_some() => {
+                let session = self
+                    .started_session
+                    .as_mut()
+                    .ok_or(VmmActionError::DriveUpdate(
+                        DriveUpdateError::ActiveSessionUnavailable,
+                    ))?;
+                let backing_update = if refresh_backing {
+                    match &self.grant_authority {
+                        Some(authority) => match authority
+                            .claim_file(
+                                path_on_host,
+                                ResourceRole::DriveBacking,
+                                grant_access_for_read_only(*is_read_only),
+                            )
+                            .map_err(|_| VmmActionError::ResourceGrant)?
+                        {
+                            Some(file) => BlockBackingUpdate::Provided(
+                                BlockFileBacking::from_file(file, *is_read_only)
+                                    .map_err(|_| VmmActionError::ResourceGrant)?,
+                            ),
+                            None => BlockBackingUpdate::ConfiguredPath,
+                        },
                         None => BlockBackingUpdate::ConfiguredPath,
-                    },
-                    None => BlockBackingUpdate::ConfiguredPath,
-                }
-            } else {
-                BlockBackingUpdate::Unchanged
-            };
-
-            session
-                .update_block_device(&updated_config, backing_update, rate_limiter_update)
-                .map_err(VmmActionError::DriveUpdate)?;
+                    }
+                } else {
+                    BlockBackingUpdate::Unchanged
+                };
+                session
+                    .update_block_device(&updated_config, backing_update, rate_limiter_update)
+                    .map_err(VmmActionError::DriveUpdate)?;
+            }
+            DriveBackendConfig::File { .. } => {}
         }
         self.controller.commit_drive_update(updated_config)?;
 
@@ -5056,7 +5119,14 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
 
     fn insert_runtime_block_device(
         &mut self,
-        _prepared: PreparedBlockDevice,
+        _resource: RuntimeBlockDeviceResource,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn preflight_runtime_vhost_user_block_device(
+        &mut self,
+        _drive_id: &str,
     ) -> Result<(), DriveRuntimeMutationError> {
         Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
     }
@@ -5233,6 +5303,12 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         backing: Option<BlockFileBacking>,
         rate_limiter_update: Option<DriveRateLimiterConfig>,
     ) -> Result<(), DriveUpdateError> {
+        if config.is_vhost_user() {
+            if backing.is_some() || rate_limiter_update.is_some() {
+                return Err(DriveUpdateError::UnsupportedBackend);
+            }
+            return OwnedHvfArm64BootSession::refresh_vhost_user_block_config(self, config);
+        }
         if self.uses_pci_data_devices() {
             return OwnedHvfArm64BootSession::update_runtime_block_device_with_opened(
                 self,
@@ -5248,9 +5324,16 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
 
     fn insert_runtime_block_device(
         &mut self,
-        prepared: PreparedBlockDevice,
+        resource: RuntimeBlockDeviceResource,
     ) -> Result<(), DriveRuntimeMutationError> {
-        OwnedHvfArm64BootSession::insert_runtime_block_device(self, prepared)
+        OwnedHvfArm64BootSession::insert_runtime_block_resource(self, resource)
+    }
+
+    fn preflight_runtime_vhost_user_block_device(
+        &mut self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        OwnedHvfArm64BootSession::preflight_runtime_vhost_user_block_device(self, drive_id)
     }
 
     fn remove_runtime_block_device(
@@ -5501,7 +5584,14 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
 
     fn insert_runtime_block_device(
         &mut self,
-        _prepared: PreparedBlockDevice,
+        _resource: RuntimeBlockDeviceResource,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
+    fn preflight_runtime_vhost_user_block_device(
+        &mut self,
+        _drive_id: &str,
     ) -> Result<(), DriveRuntimeMutationError> {
         Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
     }
@@ -5665,6 +5755,12 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         backing: Option<BlockFileBacking>,
         rate_limiter_update: Option<DriveRateLimiterConfig>,
     ) -> Result<(), DriveUpdateError> {
+        if config.is_vhost_user() {
+            if backing.is_some() || rate_limiter_update.is_some() {
+                return Err(DriveUpdateError::UnsupportedBackend);
+            }
+            return OwnedHvfArm64BootSession::refresh_vhost_user_block_config(self, config);
+        }
         if self.uses_pci_data_devices() {
             return OwnedHvfArm64BootSession::update_runtime_block_device_with_opened(
                 self,
@@ -5680,9 +5776,16 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
 
     fn insert_runtime_block_device(
         &mut self,
-        prepared: PreparedBlockDevice,
+        resource: RuntimeBlockDeviceResource,
     ) -> Result<(), DriveRuntimeMutationError> {
-        OwnedHvfArm64BootSession::insert_runtime_block_device(self, prepared)
+        OwnedHvfArm64BootSession::insert_runtime_block_resource(self, resource)
+    }
+
+    fn preflight_runtime_vhost_user_block_device(
+        &mut self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        OwnedHvfArm64BootSession::preflight_runtime_vhost_user_block_device(self, drive_id)
     }
 
     fn remove_runtime_block_device(
@@ -5870,9 +5973,17 @@ where
 
     fn insert_runtime_block_device(
         &mut self,
-        prepared: PreparedBlockDevice,
+        resource: RuntimeBlockDeviceResource,
     ) -> Result<(), DriveRuntimeMutationError> {
-        self.session.insert_runtime_block_device(prepared)
+        self.session.insert_runtime_block_device(resource)
+    }
+
+    fn preflight_runtime_vhost_user_block_device(
+        &mut self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        self.session
+            .preflight_runtime_vhost_user_block_device(drive_id)
     }
 
     fn remove_runtime_block_device(
@@ -7313,6 +7424,14 @@ where
         let _ = self.control.request_stop();
     }
 
+    fn fail_terminal_block_update(&self, error: &DriveUpdateError) {
+        self.status
+            .record(BootRunLoopWorkerStatus::Failed(error.to_string()));
+        self.admission.shutdown();
+        self.pause_gate.shutdown();
+        let _ = self.control.request_stop();
+    }
+
     fn fail_runtime_pmem_mutation(&self, error: &PmemRuntimeMutationError) {
         self.status
             .record(BootRunLoopWorkerStatus::Failed(error.to_string()));
@@ -7762,6 +7881,7 @@ where
         rate_limiter_update: Option<DriveRateLimiterConfig>,
     ) -> Result<(), DriveUpdateError> {
         let drive_id = config.drive_id();
+        let is_vhost_user = config.is_vhost_user();
         if !matches!(
             self.status(),
             BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
@@ -7789,20 +7909,32 @@ where
 
         let result = self
             .run_command(move |session| {
-                session.update_block_device_with_opened(&config, backing, rate_limiter_update)
+                let update_started = is_vhost_user.then(Instant::now);
+                session.update_block_device_with_opened(&config, backing, rate_limiter_update)?;
+                Ok::<_, DriveUpdateError>(update_started.map(|started| {
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+                }))
             })
             .map_err(drive_update_error_from_boot_run_loop_command);
-        if result.is_ok() {
+        if let Err(error @ DriveUpdateError::TerminalActiveSessionCommand { .. }) = &result {
+            self.fail_terminal_block_update(error);
+        }
+        if let Ok(config_change_time_us) = &result {
             self.record_block_device_update(drive_id);
+            if let Some(duration_us) = *config_change_time_us
+                && let Some(metrics) = &self.block_device_metrics
+            {
+                metrics.record_config_change_time_for_drive(drive_id, duration_us);
+            }
         } else {
             self.record_block_device_update_failure(drive_id);
         }
-        result
+        result.map(|_| ())
     }
 
     fn insert_runtime_block_device(
         &mut self,
-        prepared: PreparedBlockDevice,
+        resource: RuntimeBlockDeviceResource,
     ) -> Result<(), DriveRuntimeMutationError> {
         if !matches!(
             self.status(),
@@ -7811,12 +7943,29 @@ where
             return Err(DriveRuntimeMutationError::ActiveSessionUnavailable);
         }
         let result = self
-            .run_command(move |session| session.insert_runtime_block_device(prepared))
+            .run_command(move |session| session.insert_runtime_block_device(resource))
             .map_err(drive_runtime_mutation_error_from_boot_run_loop_command);
         if let Err(error @ DriveRuntimeMutationError::TerminalInsertion { .. }) = &result {
             self.fail_runtime_block_mutation(error);
         }
         result
+    }
+
+    fn preflight_runtime_vhost_user_block_device(
+        &mut self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(DriveRuntimeMutationError::ActiveSessionUnavailable);
+        }
+        let drive_id = drive_id.to_string();
+        self.run_command(move |session| {
+            session.preflight_runtime_vhost_user_block_device(&drive_id)
+        })
+        .map_err(drive_runtime_mutation_error_from_boot_run_loop_command)
     }
 
     fn remove_runtime_block_device(
@@ -8178,6 +8327,7 @@ mod tests {
     use std::fs::{self, File, OpenOptions, remove_file};
     use std::io::{Cursor, Seek, SeekFrom, Write};
     use std::num::NonZeroUsize;
+    use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -8192,6 +8342,7 @@ mod tests {
         BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigError, DriveConfigInput,
         DriveConfigs, DriveRateLimiterConfig, DriveRuntimeMutationError, DriveTokenBucketConfig,
         DriveUpdateError, DriveUpdateInput, PreparedBlockDevice, PreparedBlockDevices,
+        RuntimeBlockDeviceResource,
     };
     use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
     use bangbang_runtime::cpu::{CpuConfigInput, CpuConfigKvmCapability};
@@ -8670,6 +8821,10 @@ mod tests {
         block_insert_count: usize,
         last_block_insert: Option<String>,
         block_insert_result: Option<DriveRuntimeMutationError>,
+        vhost_block_preflight_count: usize,
+        vhost_block_preflight_result: Option<DriveRuntimeMutationError>,
+        vhost_block_insert_count: usize,
+        last_vhost_block_insert: Option<String>,
         block_remove_count: usize,
         last_block_remove: Option<String>,
         block_remove_result: Option<DriveRuntimeMutationError>,
@@ -8740,6 +8895,10 @@ mod tests {
                 block_insert_count: 0,
                 last_block_insert: None,
                 block_insert_result: None,
+                vhost_block_preflight_count: 0,
+                vhost_block_preflight_result: None,
+                vhost_block_insert_count: 0,
+                last_vhost_block_insert: None,
                 block_remove_count: 0,
                 last_block_remove: None,
                 block_remove_result: None,
@@ -8798,6 +8957,12 @@ mod tests {
         fn with_block_insert_result(id: u64, result: DriveRuntimeMutationError) -> Self {
             let mut session = Self::new(id);
             session.block_insert_result = Some(result);
+            session
+        }
+
+        fn with_vhost_block_preflight_result(id: u64, result: DriveRuntimeMutationError) -> Self {
+            let mut session = Self::new(id);
+            session.vhost_block_preflight_result = Some(result);
             session
         }
 
@@ -8976,14 +9141,33 @@ mod tests {
 
         fn insert_runtime_block_device(
             &mut self,
-            prepared: PreparedBlockDevice,
+            resource: RuntimeBlockDeviceResource,
         ) -> Result<(), DriveRuntimeMutationError> {
-            self.block_insert_count += 1;
-            self.last_block_insert = Some(prepared.drive_id().to_string());
-            self.runtime_device_events
-                .push(format!("block:insert:{}", prepared.drive_id()));
+            let drive_id = resource.drive_id().to_string();
+            if resource.is_vhost_user() {
+                self.vhost_block_insert_count += 1;
+                self.last_vhost_block_insert = Some(drive_id.clone());
+                self.runtime_device_events
+                    .push(format!("block:vhost-insert:{drive_id}"));
+            } else {
+                self.block_insert_count += 1;
+                self.last_block_insert = Some(drive_id.clone());
+                self.runtime_device_events
+                    .push(format!("block:insert:{drive_id}"));
+            }
             match self.block_insert_result.clone() {
                 Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn preflight_runtime_vhost_user_block_device(
+            &mut self,
+            _drive_id: &str,
+        ) -> Result<(), DriveRuntimeMutationError> {
+            self.vhost_block_preflight_count += 1;
+            match self.vhost_block_preflight_result.clone() {
+                Some(error) => Err(error),
                 None => Ok(()),
             }
         }
@@ -9725,6 +9909,7 @@ mod tests {
         max_steps_sender: mpsc::Sender<usize>,
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
+        block_device_update_result: Option<Result<(), DriveUpdateError>>,
         runtime_device_events: Arc<Mutex<Vec<String>>>,
         runtime_block_events: Arc<Mutex<Vec<String>>>,
         runtime_block_insert_result: Option<DriveRuntimeMutationError>,
@@ -9775,6 +9960,7 @@ mod tests {
                     FakeRunLoopOutcome::Terminal,
                 )]))),
                 block_device_updater: None,
+                block_device_update_result: None,
                 runtime_device_events: Arc::default(),
                 runtime_block_events: Arc::default(),
                 runtime_block_insert_result: None,
@@ -9914,6 +10100,11 @@ mod tests {
 
         fn with_block_device_updater(mut self, updater: BootRunLoopBlockDeviceUpdater) -> Self {
             self.block_device_updater = Some(updater);
+            self
+        }
+
+        fn with_block_device_update_result(mut self, result: Result<(), DriveUpdateError>) -> Self {
+            self.block_device_update_result = Some(result);
             self
         }
 
@@ -10096,18 +10287,34 @@ mod tests {
             self.block_device_updater.clone()
         }
 
+        fn update_block_device_with_opened(
+            &mut self,
+            config: &DriveConfig,
+            backing: Option<BlockFileBacking>,
+            rate_limiter_update: Option<DriveRateLimiterConfig>,
+        ) -> Result<(), DriveUpdateError> {
+            if let Some(result) = self.block_device_update_result.clone() {
+                return result;
+            }
+            self.block_device_updater
+                .clone()
+                .ok_or(DriveUpdateError::ActiveSessionUnavailable)?
+                .update_block_device_with_opened(config, backing, rate_limiter_update)
+        }
+
         fn insert_runtime_block_device(
             &mut self,
-            prepared: PreparedBlockDevice,
+            resource: RuntimeBlockDeviceResource,
         ) -> Result<(), DriveRuntimeMutationError> {
+            let drive_id = resource.drive_id();
             self.runtime_device_events
                 .lock()
                 .expect("fake runtime device events should lock")
-                .push(format!("block:insert:{}", prepared.drive_id()));
+                .push(format!("block:insert:{drive_id}"));
             self.runtime_block_events
                 .lock()
                 .expect("fake runtime block events should lock")
-                .push(format!("insert:{}", prepared.drive_id()));
+                .push(format!("insert:{drive_id}"));
             match self.runtime_block_insert_result.clone() {
                 Some(source) => Err(source),
                 None => Ok(()),
@@ -14350,7 +14557,7 @@ mod tests {
         let prepared = PreparedBlockDevice::from_config_with_backing(&config, None)
             .expect("runtime block backing should prepare");
         supervisor
-            .insert_runtime_block_device(prepared)
+            .insert_runtime_block_device(RuntimeBlockDeviceResource::prepared(prepared))
             .expect("paused worker should insert block device");
         supervisor
             .remove_runtime_block_device("data")
@@ -14399,7 +14606,7 @@ mod tests {
         let prepared = PreparedBlockDevice::from_config_with_backing(&config, None)
             .expect("runtime block backing should prepare");
         let error = supervisor
-            .insert_runtime_block_device(prepared)
+            .insert_runtime_block_device(RuntimeBlockDeviceResource::prepared(prepared))
             .expect_err("injected publication failure should be returned");
 
         assert!(matches!(
@@ -14454,7 +14661,7 @@ mod tests {
         let prepared = PreparedBlockDevice::from_config_with_backing(&config, None)
             .expect("runtime block backing should prepare");
         let error = supervisor
-            .insert_runtime_block_device(prepared)
+            .insert_runtime_block_device(RuntimeBlockDeviceResource::prepared(prepared))
             .expect_err("terminal publication cleanup failure should be returned");
 
         assert!(matches!(
@@ -15166,7 +15373,11 @@ mod tests {
         std::thread::scope(|scope| {
             let block_handle = command_handle.clone();
             let block = scope.spawn(move || {
-                block_handle.run(move |session| session.insert_runtime_block_device(prepared_block))
+                block_handle.run(move |session| {
+                    session.insert_runtime_block_device(RuntimeBlockDeviceResource::prepared(
+                        prepared_block,
+                    ))
+                })
             });
             let pmem_handle = command_handle.clone();
             let pmem = scope.spawn(move || {
@@ -15223,6 +15434,128 @@ mod tests {
         drop(supervisor);
 
         assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_records_successful_vhost_config_change_latency() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["vhost"]);
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_block_device_update_result(Ok(()))
+                .with_block_device_metrics(metrics)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(41).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            41
+        );
+        let config = DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+            .with_socket("/private/vhost.sock")
+            .validate()
+            .expect("vhost-user drive should validate");
+
+        supervisor
+            .update_block_device(&config, BlockBackingUpdate::Unchanged, None)
+            .expect("vhost-user config refresh should run on worker");
+
+        let diagnostics = supervisor.metrics_diagnostics();
+        let aggregate = diagnostics
+            .block_device_metrics()
+            .expect("aggregate block metrics should be present");
+        assert_eq!(aggregate.update_count(), 1);
+        assert_eq!(aggregate.update_fails(), 0);
+        assert!(aggregate.config_change_time_us().is_some());
+        let per_drive = diagnostics
+            .block_device_metrics_by_drive()
+            .expect("per-drive block metrics should be present")
+            .iter()
+            .find_map(|(drive_id, metrics)| (drive_id == "vhost").then_some(metrics))
+            .expect("vhost metrics should be present");
+        assert_eq!(per_drive.update_count(), 1);
+        assert_eq!(
+            per_drive.config_change_time_us(),
+            aggregate.config_change_time_us()
+        );
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_terminalizes_ambiguous_vhost_config_change() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["vhost"]);
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_block_device_update_result(Err(
+                    DriveUpdateError::TerminalActiveSessionCommand {
+                        message: "injected ambiguous configuration interrupt".to_string(),
+                    },
+                ))
+                .with_block_device_metrics(metrics)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(42).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            42
+        );
+        let config = DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+            .with_socket("/private/vhost.sock")
+            .validate()
+            .expect("vhost-user drive should validate");
+
+        let error = supervisor
+            .update_block_device(&config, BlockBackingUpdate::Unchanged, None)
+            .expect_err("ambiguous vhost config delivery should fail terminally");
+
+        assert!(matches!(
+            error,
+            DriveUpdateError::TerminalActiveSessionCommand { message }
+                if message == "injected ambiguous configuration interrupt"
+        ));
+        assert!(matches!(
+            supervisor.status(),
+            BootRunLoopWorkerStatus::Failed(message)
+                if message.contains("injected ambiguous configuration interrupt")
+        ));
+        assert_eq!(
+            supervisor.admission_state(),
+            BootRunLoopCommandAdmissionState::Shutdown
+        );
+        assert_eq!(control.request_stop_count(), 1);
+        let aggregate = supervisor
+            .metrics_diagnostics()
+            .block_device_metrics()
+            .expect("aggregate block metrics should be present");
+        assert_eq!(aggregate.update_count(), 0);
+        assert_eq!(aggregate.update_fails(), 1);
+        assert_eq!(aggregate.config_change_time_us(), None);
+
+        drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 
@@ -16631,7 +16964,7 @@ mod tests {
     }
 
     #[test]
-    fn vhost_user_runtime_update_rejects_before_touching_the_active_session() {
+    fn vhost_user_runtime_update_accepts_id_only_and_rejects_fields_before_session() {
         let mut vmm = configured_vmm(FakeStarter::success(31));
         vmm.handle_action(VmmAction::PutDrive(
             DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
@@ -16642,6 +16975,18 @@ mod tests {
             .commit_instance_start()
             .expect("test controller should enter running state");
         vmm.started_session = Some(FakeSession::new(31));
+
+        vmm.handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+            "vhost", "vhost", None,
+        )))
+        .expect("ID-only vhost-user update should refresh the active session");
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("started session should remain available")
+                .block_update_count,
+            1
+        );
 
         let error = vmm
             .handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
@@ -16663,11 +17008,11 @@ mod tests {
             .started_session
             .as_ref()
             .expect("started session should remain available");
-        assert_eq!(session.block_update_count, 0);
+        assert_eq!(session.block_update_count, 1);
     }
 
     #[test]
-    fn vhost_user_runtime_removal_rejects_before_touching_the_active_session() {
+    fn vhost_user_runtime_removal_commits_after_active_session_success() {
         let mut vmm = configured_vmm(FakeStarter::success(32));
         vmm.pci_enabled = true;
         vmm.handle_action(VmmAction::PutDrive(
@@ -16680,27 +17025,84 @@ mod tests {
             .expect("test controller should enter running state");
         vmm.started_session = Some(FakeSession::new(32));
 
-        let error = vmm
+        let data = vmm
             .handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
                 HotUnplugDeviceKind::Drive,
                 "vhost",
             )))
-            .expect_err("vhost-user runtime removal should reject");
+            .expect("vhost-user runtime removal should succeed");
 
-        assert_eq!(
-            error,
-            VmmActionError::DriveRuntimeMutation(DriveRuntimeMutationError::UnsupportedBackend)
-        );
-        assert_eq!(vmm.drive_configs().len(), 1);
-        assert_eq!(
-            vmm.drive_configs()[0].socket(),
-            Some(Path::new("/private/vhost.sock"))
-        );
+        assert_eq!(data, VmmData::Empty);
+        assert!(vmm.drive_configs().is_empty());
         let session = vmm
             .started_session
             .as_ref()
             .expect("started session should remain available");
-        assert_eq!(session.block_remove_count, 0);
+        assert_eq!(session.block_remove_count, 1);
+        assert_eq!(session.last_block_remove.as_deref(), Some("vhost"));
+    }
+
+    #[test]
+    fn vhost_user_runtime_insert_preflight_rejects_before_socket_connection() {
+        for (case, preflight_error) in [
+            (
+                "anonymous",
+                DriveRuntimeMutationError::PrepareDevice {
+                    message: "vhost-user block requires shared guest memory".to_string(),
+                },
+            ),
+            (
+                "capacity",
+                DriveRuntimeMutationError::PrepareDevice {
+                    message: "runtime PCI endpoint capacity is exhausted".to_string(),
+                },
+            ),
+        ] {
+            let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let socket = std::env::temp_dir().join(format!(
+                "bb-vhost-runtime-preflight-{}-{id}.sock",
+                std::process::id()
+            ));
+            let listener = UnixListener::bind(&socket).expect("test vhost listener should bind");
+            listener
+                .set_nonblocking(true)
+                .expect("test vhost listener should become nonblocking");
+            let mut vmm = configured_vmm(FakeStarter::success(33));
+            vmm.pci_enabled = true;
+            vmm.controller
+                .commit_instance_start()
+                .expect("test controller should enter running state");
+            vmm.started_session = Some(FakeSession::with_vhost_block_preflight_result(
+                33,
+                preflight_error.clone(),
+            ));
+
+            let error = vmm
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                        .with_socket(&socket),
+                ))
+                .expect_err("owner preflight should reject runtime vhost-user insertion");
+
+            assert_eq!(
+                error,
+                VmmActionError::DriveRuntimeMutation(preflight_error),
+                "{case} preflight should preserve its typed failure"
+            );
+            assert!(vmm.drive_configs().is_empty());
+            let session = vmm
+                .started_session
+                .as_ref()
+                .expect("started session should remain available");
+            assert_eq!(session.vhost_block_preflight_count, 1);
+            assert_eq!(session.vhost_block_insert_count, 0);
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "{case} preflight must fail before any socket connection"
+            );
+            fs::remove_file(&socket).expect("test vhost socket should clean up");
+        }
     }
 
     #[test]

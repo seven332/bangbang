@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::balloon::{VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDiscardOutcome};
@@ -1258,6 +1258,7 @@ impl PutApiRequestMetrics {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockDeviceMetrics {
+    config_change_time_us: Option<u64>,
     event_fails: u64,
     execute_fails: u64,
     invalid_reqs_count: u64,
@@ -1276,8 +1277,13 @@ pub struct BlockDeviceMetrics {
 }
 
 impl BlockDeviceMetrics {
-    const fn delta_since(self, previous: Self) -> Self {
+    fn delta_since(self, previous: Self) -> Self {
         Self {
+            config_change_time_us: if self.config_change_time_us == previous.config_change_time_us {
+                None
+            } else {
+                self.config_change_time_us
+            },
             event_fails: incremental_delta(self.event_fails, previous.event_fails),
             execute_fails: incremental_delta(self.execute_fails, previous.execute_fails),
             invalid_reqs_count: incremental_delta(
@@ -1309,7 +1315,8 @@ impl BlockDeviceMetrics {
     }
 
     pub const fn is_empty(self) -> bool {
-        self.event_fails == 0
+        self.config_change_time_us.is_none()
+            && self.event_fails == 0
             && self.execute_fails == 0
             && self.invalid_reqs_count == 0
             && self.flush_count == 0
@@ -1324,6 +1331,10 @@ impl BlockDeviceMetrics {
             && self.write_count == 0
             && self.read_agg.is_empty()
             && self.write_agg.is_empty()
+    }
+
+    pub const fn config_change_time_us(self) -> Option<u64> {
+        self.config_change_time_us
     }
 
     pub const fn event_fails(self) -> u64 {
@@ -1388,6 +1399,11 @@ impl BlockDeviceMetrics {
 
     pub const fn with_event_fails(mut self, event_fails: u64) -> Self {
         self.event_fails = event_fails;
+        self
+    }
+
+    pub const fn with_config_change_time_us(mut self, config_change_time_us: u64) -> Self {
+        self.config_change_time_us = Some(config_change_time_us);
         self
     }
 
@@ -1466,6 +1482,10 @@ impl BlockDeviceMetrics {
 
     const fn merged_with(self, other: Self) -> Self {
         Self {
+            config_change_time_us: match other.config_change_time_us {
+                Some(value) => Some(value),
+                None => self.config_change_time_us,
+            },
             event_fails: self.event_fails.saturating_add(other.event_fails),
             execute_fails: self.execute_fails.saturating_add(other.execute_fails),
             invalid_reqs_count: self
@@ -1624,8 +1644,22 @@ impl SharedBlockDeviceMetrics {
         record_atomic_metric(&self.inner.update_fails, 1);
     }
 
+    pub fn record_config_change_time_us(&self, duration_us: u64) {
+        self.inner
+            .config_change_time_us
+            .store(duration_us, Ordering::Relaxed);
+        self.inner
+            .config_change_time_recorded
+            .store(true, Ordering::Release);
+    }
+
     pub fn snapshot(&self) -> BlockDeviceMetrics {
         BlockDeviceMetrics {
+            config_change_time_us: self
+                .inner
+                .config_change_time_recorded
+                .load(Ordering::Acquire)
+                .then(|| self.inner.config_change_time_us.load(Ordering::Relaxed)),
             event_fails: self.inner.event_fails.load(Ordering::Relaxed),
             execute_fails: self.inner.execute_fails.load(Ordering::Relaxed),
             invalid_reqs_count: self.inner.invalid_reqs_count.load(Ordering::Relaxed),
@@ -1730,6 +1764,8 @@ impl SharedBlockDeviceMetrics {
 
 #[derive(Debug)]
 struct SharedBlockDeviceMetricsInner {
+    config_change_time_recorded: AtomicBool,
+    config_change_time_us: AtomicU64,
     event_fails: AtomicU64,
     execute_fails: AtomicU64,
     invalid_reqs_count: AtomicU64,
@@ -1756,6 +1792,8 @@ struct SharedBlockDeviceMetricsInner {
 impl Default for SharedBlockDeviceMetricsInner {
     fn default() -> Self {
         Self {
+            config_change_time_recorded: AtomicBool::new(false),
+            config_change_time_us: AtomicU64::new(0),
             event_fails: AtomicU64::new(0),
             execute_fails: AtomicU64::new(0),
             invalid_reqs_count: AtomicU64::new(0),
@@ -2074,6 +2112,36 @@ impl SharedBlockDeviceMetricsRegistry {
         })
     }
 
+    /// Validates one prospective runtime drive without reserving a metrics
+    /// generation or changing the visible registry.
+    pub fn preflight_drive(&self, drive_id: &str) -> Result<(), BlockDeviceMetricsRegistryError> {
+        let state = lock_block_metrics_registry(&self.per_drive);
+        if state.entries.iter().any(|entry| entry.drive_id == drive_id)
+            || state
+                .reservations
+                .iter()
+                .any(|reservation| reservation.drive_id == drive_id)
+        {
+            return Err(BlockDeviceMetricsRegistryError::DuplicateDrive);
+        }
+        let claimed_capacity = state
+            .entries
+            .len()
+            .checked_add(state.reservations.len())
+            .ok_or(BlockDeviceMetricsRegistryError::Capacity)?;
+        if claimed_capacity >= state.capacity
+            || state.entries.capacity() < state.capacity
+            || state.reservations.capacity() < state.capacity
+        {
+            return Err(BlockDeviceMetricsRegistryError::Capacity);
+        }
+        state
+            .next_generation
+            .checked_add(1)
+            .ok_or(BlockDeviceMetricsRegistryError::GenerationExhausted)?;
+        Ok(())
+    }
+
     /// Claims exact drop ownership for a drive that was registered when the
     /// bounded inventory was constructed.
     pub fn claim_drive_lease(
@@ -2162,6 +2230,13 @@ impl SharedBlockDeviceMetricsRegistry {
         self.aggregate.record_update_failure();
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_update_failure();
+        }
+    }
+
+    pub fn record_config_change_time_for_drive(&self, drive_id: &str, duration_us: u64) {
+        self.aggregate.record_config_change_time_us(duration_us);
+        if let Some(metrics) = self.per_drive(drive_id) {
+            metrics.record_config_change_time_us(duration_us);
         }
     }
 
@@ -5854,6 +5929,12 @@ fn block_device_metrics_json_object(
     metrics: BlockDeviceMetrics,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut block = serde_json::Map::new();
+    if let Some(duration_us) = metrics.config_change_time_us() {
+        block.insert(
+            "config_change_time_us".to_string(),
+            serde_json::Value::Number(duration_us.into()),
+        );
+    }
     block.insert(
         "event_fails".to_string(),
         serde_json::Value::Number(metrics.event_fails().into()),
@@ -7680,6 +7761,64 @@ mod tests {
     }
 
     #[test]
+    fn vhost_config_change_time_is_optional_and_scoped_to_updated_drive() {
+        let registry = SharedBlockDeviceMetricsRegistry::from_drive_ids(["file", "vhost"]);
+        registry.record_config_change_time_for_drive("vhost", 37);
+
+        assert_eq!(
+            registry.aggregate_snapshot().config_change_time_us(),
+            Some(37)
+        );
+        let by_drive = registry.per_drive_snapshot();
+        assert_eq!(
+            by_drive
+                .iter()
+                .find_map(|(drive_id, metrics)| (drive_id == "vhost")
+                    .then_some(metrics.config_change_time_us())),
+            Some(Some(37))
+        );
+        assert!(by_drive.iter().all(|(drive_id, metrics)| {
+            drive_id != "file" || metrics.config_change_time_us().is_none()
+        }));
+
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new()
+            .with_block_device_metrics(registry.aggregate_snapshot())
+            .with_block_device_metrics_by_drive(by_drive);
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+        let line = &output.lines()[0];
+        assert!(line.contains(r#""block":{"config_change_time_us":37"#));
+        assert!(line.contains(r#""block_vhost":{"config_change_time_us":37"#));
+        assert!(!line.contains("block_file"));
+
+        let old_generation = registry
+            .claim_drive_lease("vhost")
+            .expect("existing vhost metrics generation should be claimable");
+        drop(old_generation);
+        assert!(registry.per_drive("vhost").is_none());
+        let replacement_generation = registry
+            .prepare_drive("vhost")
+            .expect("released vhost metrics identity should prepare")
+            .publish();
+        assert_eq!(
+            registry
+                .per_drive("vhost")
+                .expect("replacement generation should publish")
+                .snapshot()
+                .config_change_time_us(),
+            None,
+            "same-ID reinsertion must not inherit the removed generation's store"
+        );
+        assert_eq!(
+            registry.aggregate_snapshot().config_change_time_us(),
+            Some(37),
+            "aggregate latest-value store should retain the VM-wide last success"
+        );
+        drop(replacement_generation);
+    }
+
+    #[test]
     fn shared_block_device_metrics_snapshot_is_per_instance() {
         let first = SharedBlockDeviceMetrics::default();
         let second = SharedBlockDeviceMetrics::default();
@@ -7744,6 +7883,10 @@ mod tests {
         let registry =
             SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(["rootfs"], 2)
                 .expect("bounded metrics registry should allocate");
+        registry
+            .preflight_drive("data")
+            .expect("preflight should accept free identity and capacity");
+        assert!(registry.per_drive("data").is_none());
         let prepared = registry
             .prepare_drive("data")
             .expect("second metrics entry should prepare");
@@ -7751,6 +7894,14 @@ mod tests {
         assert_eq!(
             registry.prepare_drive("data").unwrap_err(),
             BlockDeviceMetricsRegistryError::DuplicateDrive
+        );
+        assert_eq!(
+            registry.preflight_drive("data").unwrap_err(),
+            BlockDeviceMetricsRegistryError::DuplicateDrive
+        );
+        assert_eq!(
+            registry.preflight_drive("other").unwrap_err(),
+            BlockDeviceMetricsRegistryError::Capacity
         );
         assert_eq!(
             registry.prepare_drive("other").unwrap_err(),

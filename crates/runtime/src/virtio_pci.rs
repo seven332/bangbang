@@ -2587,6 +2587,19 @@ impl fmt::Display for VirtioPciEndpointError {
     }
 }
 
+impl VirtioPciEndpointError {
+    /// Reports whether a failed guest-message signal may already have reached
+    /// the guest and therefore cannot be rolled back honestly.
+    pub fn delivery_ambiguous(&self) -> bool {
+        matches!(
+            self,
+            Self::MessageRegistry {
+                source: GuestMessageInterruptRegistryError::Signal { source }
+            } if source.delivery_ambiguous()
+        )
+    }
+}
+
 impl std::error::Error for VirtioPciEndpointError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
