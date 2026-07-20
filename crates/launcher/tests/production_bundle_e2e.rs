@@ -5,6 +5,9 @@
     clippy::unwrap_used
 )]
 
+#[path = "../../../tests/support/vhost_user_block.rs"]
+mod vhost_user_block;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,8 +30,9 @@ use bangbang_launcher::{
 };
 use bangbang_session::{
     Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD,
-    SOCKET_BROKER_FD, SessionId, WorkerPolicy, encode_frame,
+    SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy, encode_frame,
 };
+use vhost_user_block::{VhostUserBlockBackend, VhostUserBlockBackendOptions};
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
 const GRANT_TEST_BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH";
@@ -89,10 +93,19 @@ const OUTPUT_SERIAL_SEED: &[u8] = b"serial-seed\n";
 const OUTPUT_REPLACEMENT: &[u8] = b"replacement-path-must-remain-unused\n";
 const API_SOCKET_DIRECTORY_ID: &str = "grant-api-socket-directory-1365";
 const VSOCK_SOCKET_DIRECTORY_ID: &str = "grant-vsock-socket-directory-1365";
+const VHOST_USER_SOCKET_DIRECTORY_ID: &str = "grant-vhost-user-socket-directory-1449";
 const API_SOCKET_CHILD: &str = "api-1365.sock";
 const VSOCK_SOCKET_CHILD: &str = "vsock-1365.sock";
+const VHOST_USER_SOCKET_CHILD_ONE: &str = "vhost-one.sock";
+const VHOST_USER_SOCKET_CHILD_TWO: &str = "vhost-two.sock";
 const API_SOCKET_REF: &str = "bangbang-grant:grant-api-socket-directory-1365/api-1365.sock";
 const VSOCK_SOCKET_REF: &str = "bangbang-grant:grant-vsock-socket-directory-1365/vsock-1365.sock";
+const VHOST_USER_SOCKET_REF_ONE: &str =
+    "bangbang-grant:grant-vhost-user-socket-directory-1449/vhost-one.sock";
+const VHOST_USER_SOCKET_REF_TWO: &str =
+    "bangbang-grant:grant-vhost-user-socket-directory-1449/vhost-two.sock";
+const CONTAINED_VHOST_USER_HOST_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_HOST";
+const CONTAINED_VHOST_USER_SUCCESS_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_ro_OK";
 const SNAPSHOT_KERNEL_ID: &str = "grant-snapshot-kernel-1368";
 const SNAPSHOT_ROOT_ID: &str = "grant-snapshot-root-1368";
 const SNAPSHOT_METRICS_ID: &str = "grant-snapshot-metrics-1368";
@@ -116,6 +129,7 @@ const SNAPSHOT_STATE_INPUT_REF: &str = "bangbang-grant:grant-snapshot-state-inpu
 const SNAPSHOT_MEMORY_INPUT_REF: &str = "bangbang-grant:grant-snapshot-memory-input-1368";
 const SNAPSHOT_DESCRIBE_INPUT_REF: &str = "bangbang-grant:grant-snapshot-describe-input-1368";
 const SNAPSHOT_STAGING_HOLD_OPTION: &str = "--bangbang-internal-snapshot-staging-hold-v1";
+const SNAPSHOT_STAGING_RECORD_BYTES: u64 = 128;
 const SNAPSHOT_STATE_CHILD: &str = "state-1368.snap";
 const SNAPSHOT_MEMORY_CHILD: &str = "memory-1368.snap";
 const SNAPSHOT_REPEAT_STATE_CHILD: &str = "state-repeat-1368.snap";
@@ -1240,7 +1254,11 @@ fn grant_test_bundle_recovers_recorded_snapshot_staging_after_worker_sigkill() {
             .wait_for_snapshot_staging(PROCESS_TIMEOUT)
             .expect("recorded memory staging file should appear");
         record_watch
-            .wait_for_child(".snapshot-memory-owner", PROCESS_TIMEOUT)
+            .wait_for_child_with_len(
+                ".snapshot-memory-owner",
+                SNAPSHOT_STAGING_RECORD_BYTES,
+                PROCESS_TIMEOUT,
+            )
             .expect("worker must durably record ownership before the test hold");
 
         let mut moved_owned = None;
@@ -1431,6 +1449,171 @@ fn normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers() {
 }
 
 #[test]
+fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers() {
+    let bundle = production_bundle();
+    let fixture = SocketDirectoryGrantFixture::new_with_vhost_user("vhost-user");
+    let first_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_ONE);
+    let second_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_TWO);
+    let first_backing = fixture.vhost_user_backing("vhost-one.img");
+    let second_backing = fixture.vhost_user_backing("vhost-two.img");
+    let backing_len = 8 * 512_u64;
+    create_sized_file(&first_backing, backing_len);
+    create_sized_file(&second_backing, backing_len);
+    OpenOptions::new()
+        .write(true)
+        .open(&first_backing)
+        .expect("first contained vhost backing should open")
+        .write_all(CONTAINED_VHOST_USER_HOST_MARKER)
+        .expect("contained vhost host marker should write");
+    let first_backend = VhostUserBlockBackend::start(
+        &first_socket,
+        &first_backing,
+        VhostUserBlockBackendOptions::regular(false),
+    )
+    .expect("first contained vhost backend should start");
+    let second_backend = VhostUserBlockBackend::start(
+        &second_socket,
+        &second_backing,
+        VhostUserBlockBackendOptions::regular(false),
+    )
+    .expect("second contained vhost backend should start");
+
+    let mut running = spawn_ready_socket_grant_api_launcher(&bundle, &fixture, "vhost-user");
+    let worker = only_worker_pid(&running.child);
+    assert!(
+        child_pids(worker).is_empty(),
+        "contained vhost connection must not retain a helper"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT contained-vhost machine config",
+    );
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "boot_args": "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.vhost-user-block=ro",
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot source should serialize"),
+        ),
+        204,
+        "PUT contained-vhost boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": GUEST_ROOTFS_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT contained-vhost rootfs",
+        ),
+        (
+            "/drives/vhost_one",
+            serde_json::json!({
+                "drive_id": "vhost_one",
+                "is_root_device": false,
+                "cache_type": "Writeback",
+                "socket": VHOST_USER_SOCKET_REF_ONE,
+            }),
+            "PUT first contained-vhost child",
+        ),
+        (
+            "/drives/vhost_two",
+            serde_json::json!({
+                "drive_id": "vhost_two",
+                "is_root_device": false,
+                "cache_type": "Writeback",
+                "socket": VHOST_USER_SOCKET_REF_TWO,
+            }),
+            "PUT second contained-vhost child",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("drive request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    let before_start = http_get(&running.socket, "/vm/config");
+    assert!(before_start.contains(VHOST_USER_SOCKET_REF_ONE));
+    assert!(before_start.contains(VHOST_USER_SOCKET_REF_TWO));
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start contained-vhost guest",
+    );
+    first_backend
+        .wait_for_activation(PROCESS_TIMEOUT)
+        .expect("first contained vhost backend should activate");
+    second_backend
+        .wait_for_activation(PROCESS_TIMEOUT)
+        .expect("second contained vhost backend should activate");
+    assert!(
+        child_pids(worker).is_empty(),
+        "active contained vhost streams must not retain a helper"
+    );
+    wait_for_file_prefix(
+        &first_backing,
+        CONTAINED_VHOST_USER_SUCCESS_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should complete contained vhost-user block I/O");
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/drives/vhost_one",
+            r#"{"drive_id":"vhost_one"}"#,
+        ),
+        204,
+        "PATCH active contained-vhost child",
+    );
+    assert_eq!(
+        first_backend.report().config_requests,
+        2,
+        "startup and PATCH should use the existing first frontend"
+    );
+    assert_eq!(second_backend.report().config_requests, 1);
+
+    stop_running_launcher(&mut running, "contained-vhost guest shutdown");
+    first_backend
+        .wait_for_frontend_close(PROCESS_TIMEOUT)
+        .expect("first contained vhost frontend should close");
+    second_backend
+        .wait_for_frontend_close(PROCESS_TIMEOUT)
+        .expect("second contained vhost frontend should close");
+    let first_report = first_backend
+        .finish()
+        .expect("first contained vhost backend should finish");
+    let second_report = second_backend
+        .finish()
+        .expect("second contained vhost backend should finish");
+    assert!(first_report.activated && second_report.activated);
+    assert!(!first_socket.exists() && !second_socket.exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
 fn normal_bundle_routes_host_vsock_through_supplied_granted_listener() {
     let bundle = production_bundle();
     let fixture = SocketDirectoryGrantFixture::new("host-vsock");
@@ -1539,13 +1722,7 @@ fn normal_bundle_routes_host_vsock_through_supplied_granted_listener() {
     );
 
     verify_deterministic_stream(&mut stream, GRANTED_HOST_VSOCK_GUEST_SEED, PROCESS_TIMEOUT)
-        .unwrap_or_else(|error| {
-            let marker = fs::read(&fixture.devices.data).unwrap_or_default();
-            panic!(
-                "guest-to-host deterministic stream should verify: {error}; guest marker: {:?}",
-                String::from_utf8_lossy(&marker)
-            )
-        });
+        .expect("guest-to-host deterministic stream should verify");
     write_deterministic_stream(&mut stream, GRANTED_HOST_VSOCK_HOST_SEED, PROCESS_TIMEOUT)
         .expect("host-to-guest deterministic stream should write");
     stream
@@ -3545,12 +3722,15 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
         UnixDatagram::pair().expect("grant socketpair should open");
     let (_broker_parent, broker_child_endpoint) =
         UnixDatagram::pair().expect("broker socketpair should open");
+    let (_vhost_broker_parent, vhost_broker_child_endpoint) =
+        UnixDatagram::pair().expect("vhost broker socketpair should open");
     parent
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bootstrap read timeout should set");
     let child_fd = child_endpoint.as_raw_fd();
     let grant_child_fd = grant_child_endpoint.as_raw_fd();
     let broker_child_fd = broker_child_endpoint.as_raw_fd();
+    let vhost_broker_child_fd = vhost_broker_child_endpoint.as_raw_fd();
     let mut command = Command::new(worker_executable(&bundle));
     command
         .env_clear()
@@ -3572,6 +3752,9 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
             if libc::dup2(broker_child_fd, SOCKET_BROKER_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if libc::dup2(vhost_broker_child_fd, VHOST_USER_BROKER_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -3581,6 +3764,7 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
     drop(child_endpoint);
     drop(grant_child_endpoint);
     drop(broker_child_endpoint);
+    drop(vhost_broker_child_endpoint);
 
     let mut hello_bytes = vec![0_u8; 56];
     parent
@@ -4478,10 +4662,19 @@ struct SocketDirectoryGrantFixture {
     _socket_root: TestDir,
     api_directory: PathBuf,
     vsock_directory: PathBuf,
+    vhost_user_directory: PathBuf,
 }
 
 impl SocketDirectoryGrantFixture {
     fn new(case: &str) -> Self {
+        Self::build(case, false)
+    }
+
+    fn new_with_vhost_user(case: &str) -> Self {
+        Self::build(case, true)
+    }
+
+    fn build(case: &str, include_vhost_user: bool) -> Self {
         let devices = GuestDeviceGrantFixture::new(case);
         let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
         let socket_root = TestDir(
@@ -4490,8 +4683,11 @@ impl SocketDirectoryGrantFixture {
         fs::create_dir(socket_root.path()).expect("short socket root should be created");
         let api_directory = socket_root.path().join("a");
         let vsock_directory = socket_root.path().join("v");
+        let vhost_user_directory = socket_root.path().join("u");
         fs::create_dir(&api_directory).expect("API socket directory should be created");
         fs::create_dir(&vsock_directory).expect("vsock socket directory should be created");
+        fs::create_dir(&vhost_user_directory)
+            .expect("vhost-user socket directory should be created");
 
         let mut manifest: serde_json::Value = serde_json::from_slice(
             &fs::read(&devices.manifest).expect("device grant manifest should read"),
@@ -4515,6 +4711,14 @@ impl SocketDirectoryGrantFixture {
                 "source": path_text(&vsock_directory),
             }),
         ]);
+        if include_vhost_user {
+            grants.push(serde_json::json!({
+                "id": VHOST_USER_SOCKET_DIRECTORY_ID,
+                "role": "vhost-user-socket-directory",
+                "access": "connect-children",
+                "source": path_text(&vhost_user_directory),
+            }));
+        }
         fs::write(
             &devices.manifest,
             serde_json::to_vec(&manifest).expect("socket grant manifest should serialize"),
@@ -4526,6 +4730,7 @@ impl SocketDirectoryGrantFixture {
             _socket_root: socket_root,
             api_directory,
             vsock_directory,
+            vhost_user_directory,
         }
     }
 
@@ -4543,17 +4748,31 @@ impl SocketDirectoryGrantFixture {
         PathBuf::from(path)
     }
 
+    fn vhost_user_socket(&self, child: &str) -> PathBuf {
+        self.vhost_user_directory.join(child)
+    }
+
+    fn vhost_user_backing(&self, child: &str) -> PathBuf {
+        self.vhost_user_directory.join(child)
+    }
+
     fn sensitive_strings(&self) -> Vec<String> {
         let mut sensitive = self.devices.sensitive_strings();
         sensitive.extend([
             path_text(&self.api_directory).to_owned(),
             path_text(&self.vsock_directory).to_owned(),
+            path_text(&self.vhost_user_directory).to_owned(),
             API_SOCKET_DIRECTORY_ID.to_owned(),
             VSOCK_SOCKET_DIRECTORY_ID.to_owned(),
+            VHOST_USER_SOCKET_DIRECTORY_ID.to_owned(),
             API_SOCKET_REF.to_owned(),
             VSOCK_SOCKET_REF.to_owned(),
+            VHOST_USER_SOCKET_REF_ONE.to_owned(),
+            VHOST_USER_SOCKET_REF_TWO.to_owned(),
             API_SOCKET_CHILD.to_owned(),
             VSOCK_SOCKET_CHILD.to_owned(),
+            VHOST_USER_SOCKET_CHILD_ONE.to_owned(),
+            VHOST_USER_SOCKET_CHILD_TWO.to_owned(),
         ]);
         sensitive
     }
@@ -5963,23 +6182,32 @@ impl DirectoryChangeWatch {
         }
     }
 
-    fn wait_for_child(&self, child: &str, timeout: Duration) -> Result<PathBuf, String> {
+    fn wait_for_child_with_len(
+        &self,
+        child: &str,
+        expected_len: u64,
+        timeout: Duration,
+    ) -> Result<PathBuf, String> {
         let child = self.path.join(child);
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| "directory child deadline overflowed".to_owned())?;
         loop {
-            if child.is_file() {
+            if child
+                .metadata()
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_len)
+            {
                 return Ok(child);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("timed out waiting for directory child".to_owned());
             }
+            let poll = remaining.min(Duration::from_millis(10));
             let timeout = libc::timespec {
-                tv_sec: libc::time_t::try_from(remaining.as_secs())
+                tv_sec: libc::time_t::try_from(poll.as_secs())
                     .map_err(|_| "directory child timeout did not fit time_t".to_owned())?,
-                tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+                tv_nsec: libc::c_long::from(poll.subsec_nanos()),
             };
             let mut event = MaybeUninit::<libc::kevent>::uninit();
             // SAFETY: The live queue has one writable output event and a live timeout.
@@ -5997,7 +6225,7 @@ impl DirectoryChangeWatch {
                 continue;
             }
             if count == 0 {
-                return Err("timed out waiting for directory child event".to_owned());
+                continue;
             }
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {

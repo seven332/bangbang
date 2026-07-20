@@ -124,8 +124,9 @@ use bangbang_session::{GrantAccess, ResourceRole, VmnetAuthority};
 use crate::anchored_socket::{AnchoredSocketGuard, bind as bind_anchored_socket};
 #[cfg(target_os = "macos")]
 use crate::contained_session::{
-    ClaimedSocketDirectory, DirectoryGrantAuthority, SnapshotStagingRecordTracker,
-    SocketBrokerAuthority,
+    ClaimedSocketDirectory, ClaimedVhostUserSocket, DirectoryGrantAuthority,
+    PreparedVhostUserSocketClaim, SnapshotStagingRecordTracker, SocketBrokerAuthority,
+    VhostUserBrokerAuthority, socket_directory_reference,
 };
 use crate::contained_session::{
     GrantAuthority, GrantClaimError, PreparedFileGrantClaim, grant_reference_id,
@@ -1562,6 +1563,10 @@ where
     #[cfg(target_os = "macos")]
     socket_broker_authority: Option<SocketBrokerAuthority>,
     #[cfg(target_os = "macos")]
+    vhost_user_broker_authority: Option<VhostUserBrokerAuthority>,
+    #[cfg(target_os = "macos")]
+    vhost_user_grant_states: BTreeMap<String, ClaimedVhostUserSocket>,
+    #[cfg(target_os = "macos")]
     socket_namespace: Option<WorkerSocketNamespace>,
     #[cfg(target_os = "macos")]
     vsock_grant_state: VsockGrantState,
@@ -1656,6 +1661,10 @@ where
             #[cfg(target_os = "macos")]
             socket_broker_authority: None,
             #[cfg(target_os = "macos")]
+            vhost_user_broker_authority: None,
+            #[cfg(target_os = "macos")]
+            vhost_user_grant_states: BTreeMap::new(),
+            #[cfg(target_os = "macos")]
             socket_namespace: None,
             #[cfg(target_os = "macos")]
             vsock_grant_state: VsockGrantState::PathBased,
@@ -1698,10 +1707,12 @@ where
         mut self,
         authority: Option<DirectoryGrantAuthority>,
         broker: Option<SocketBrokerAuthority>,
+        vhost_user_broker: Option<VhostUserBrokerAuthority>,
         namespace: Option<WorkerSocketNamespace>,
     ) -> Self {
         self.directory_grant_authority = authority;
         self.socket_broker_authority = broker;
+        self.vhost_user_broker_authority = vhost_user_broker;
         self.socket_namespace = namespace;
         self
     }
@@ -1883,6 +1894,142 @@ where
         self.controller.record_load_snapshot_latency_us(duration_us);
     }
 
+    #[cfg(target_os = "macos")]
+    fn preflight_contained_startup_resources(&self) -> Result<(), VmmActionError> {
+        let Some(grant_authority) = &self.grant_authority else {
+            return Ok(());
+        };
+        if !grant_authority.is_active() {
+            return Err(VmmActionError::ResourceGrant);
+        }
+
+        let boot_uses_grants = self
+            .controller
+            .boot_source_config()
+            .map(|config| {
+                let kernel = grant_reference_id(config.kernel_image_path())?.is_some();
+                let initrd = config
+                    .initrd_path()
+                    .map(grant_reference_id)
+                    .transpose()?
+                    .flatten()
+                    .is_some();
+                Ok::<_, GrantClaimError>(kernel || initrd)
+            })
+            .transpose()
+            .map_err(|_| VmmActionError::ResourceGrant)?
+            .unwrap_or(false);
+        if !matches!(
+            (&self.boot_grant_state, boot_uses_grants),
+            (BootGrantState::Prepared(_), true) | (BootGrantState::PathBased, false)
+        ) {
+            return Err(VmmActionError::ResourceGrant);
+        }
+
+        let mut expected_file_drives = 0_usize;
+        let mut expected_vhost_drives = 0_usize;
+        let directory_authority = self.directory_grant_authority.as_ref();
+        for config in self.controller.drive_configs() {
+            match config.backend() {
+                DriveBackendConfig::File { path_on_host, .. } => {
+                    let tagged = grant_reference_id(path_on_host)
+                        .map_err(|_| VmmActionError::ResourceGrant)?
+                        .is_some();
+                    expected_file_drives += usize::from(tagged);
+                    if tagged
+                        != matches!(
+                            self.drive_grant_states.get(config.drive_id()),
+                            Some(BackingGrantState::Prepared(_))
+                        )
+                    {
+                        return Err(VmmActionError::ResourceGrant);
+                    }
+                }
+                DriveBackendConfig::VhostUser { socket } => {
+                    expected_vhost_drives += 1;
+                    let authority = directory_authority.ok_or(VmmActionError::ResourceGrant)?;
+                    let lease = self
+                        .vhost_user_grant_states
+                        .get(config.drive_id())
+                        .ok_or(VmmActionError::ResourceGrant)?;
+                    if !authority
+                        .validates_vhost_user_lease(socket, lease)
+                        .map_err(|_| VmmActionError::ResourceGrant)?
+                    {
+                        return Err(VmmActionError::ResourceGrant);
+                    }
+                }
+            }
+        }
+        if self.drive_grant_states.len() != expected_file_drives
+            || self.vhost_user_grant_states.len() != expected_vhost_drives
+        {
+            return Err(VmmActionError::ResourceGrant);
+        }
+
+        let mut expected_pmem = 0_usize;
+        for config in self.controller.pmem_configs() {
+            let tagged = grant_reference_id(Path::new(config.path_on_host()))
+                .map_err(|_| VmmActionError::ResourceGrant)?
+                .is_some();
+            expected_pmem += usize::from(tagged);
+            if tagged
+                != matches!(
+                    self.pmem_grant_states.get(config.id()),
+                    Some(BackingGrantState::Prepared(_))
+                )
+            {
+                return Err(VmmActionError::ResourceGrant);
+            }
+        }
+        if self.pmem_grant_states.len() != expected_pmem {
+            return Err(VmmActionError::ResourceGrant);
+        }
+
+        let serial_uses_grant = self
+            .controller
+            .serial_config()
+            .serial_out_path()
+            .map(grant_reference_id)
+            .transpose()
+            .map_err(|_| VmmActionError::ResourceGrant)?
+            .flatten()
+            .is_some();
+        if !matches!(
+            (&self.serial_grant_state, serial_uses_grant),
+            (SerialGrantState::Prepared(_), true) | (SerialGrantState::PathBased, false)
+        ) {
+            return Err(VmmActionError::ResourceGrant);
+        }
+
+        let expected_vsock = self
+            .controller
+            .vsock_config()
+            .map(|config| socket_directory_reference(config.uds_path()))
+            .transpose()
+            .map_err(|_| VmmActionError::ResourceGrant)?
+            .flatten();
+        match (&self.vsock_grant_state, expected_vsock) {
+            (VsockGrantState::PathBased, None) => {}
+            (VsockGrantState::Prepared(claim), Some((grant_id, child)))
+                if claim.grant_id == grant_id && claim.child == child => {}
+            _ => return Err(VmmActionError::ResourceGrant),
+        }
+
+        if expected_vhost_drives > 0 {
+            let authority = directory_authority.ok_or(VmmActionError::ResourceGrant)?;
+            if !authority.is_active() {
+                return Err(VmmActionError::ResourceGrant);
+            }
+            self.vhost_user_broker_authority
+                .as_ref()
+                .ok_or(VmmActionError::ResourceGrant)?
+                .preflight()
+                .map_err(|_| VmmActionError::ResourceGrant)?;
+        }
+        Ok(())
+    }
+
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
         self.controller.preflight_instance_start()?;
         validate_process_vmnet_authority(&self.controller, self.vmnet_authority)
@@ -1892,16 +2039,31 @@ where
             .drive_configs()
             .iter()
             .any(DriveConfig::is_vhost_user);
-        if has_vhost_user_drives && self.grant_authority.is_some() {
-            return Err(VmmActionError::DriveConfig(
-                DriveConfigError::ContainedVhostUserUnsupported,
-            ));
-        }
         if has_vhost_user_drives && self.controller.memory_hotplug_config().is_some() {
             return Err(VmmActionError::DriveConfig(
                 DriveConfigError::IncompatibleMemoryHotplug,
             ));
         }
+        #[cfg(target_os = "macos")]
+        let vsock_grant_consumed = matches!(self.vsock_grant_state, VsockGrantState::Consumed);
+        #[cfg(not(target_os = "macos"))]
+        let vsock_grant_consumed = false;
+        if matches!(self.boot_grant_state, BootGrantState::Consumed)
+            || self
+                .drive_grant_states
+                .values()
+                .any(|state| matches!(state, BackingGrantState::Consumed))
+            || self
+                .pmem_grant_states
+                .values()
+                .any(|state| matches!(state, BackingGrantState::Consumed))
+            || matches!(self.serial_grant_state, SerialGrantState::Consumed)
+            || vsock_grant_consumed
+        {
+            return Err(VmmActionError::ResourceGrant);
+        }
+        #[cfg(target_os = "macos")]
+        self.preflight_contained_startup_resources()?;
         let mut vhost_user_block_frontends = BTreeMap::new();
         for config in self
             .controller
@@ -1914,6 +2076,27 @@ where
                     "vhost-user drive has no socket",
                 ))
             })?;
+            #[cfg(target_os = "macos")]
+            let stream = if self.grant_authority.is_some() {
+                let lease = self
+                    .vhost_user_grant_states
+                    .get(config.drive_id())
+                    .ok_or(VmmActionError::ResourceGrant)?;
+                self.vhost_user_broker_authority
+                    .as_ref()
+                    .ok_or(VmmActionError::ResourceGrant)?
+                    .connect(lease.grant_id(), lease.child())
+                    .map_err(|source| {
+                        VmmActionError::InstanceStart(BackendError::Hypervisor(source.to_string()))
+                    })?
+            } else {
+                direct_vhost_user::connect(socket, DIRECT_VHOST_USER_OPERATION_TIMEOUT).map_err(
+                    |source| {
+                        VmmActionError::InstanceStart(BackendError::Hypervisor(source.to_string()))
+                    },
+                )?
+            };
+            #[cfg(not(target_os = "macos"))]
             let stream = direct_vhost_user::connect(socket, DIRECT_VHOST_USER_OPERATION_TIMEOUT)
                 .map_err(|source| {
                     VmmActionError::InstanceStart(BackendError::Hypervisor(source.to_string()))
@@ -1935,25 +2118,6 @@ where
                 )));
             }
         }
-        #[cfg(target_os = "macos")]
-        let vsock_grant_consumed = matches!(self.vsock_grant_state, VsockGrantState::Consumed);
-        #[cfg(not(target_os = "macos"))]
-        let vsock_grant_consumed = false;
-        if matches!(self.boot_grant_state, BootGrantState::Consumed)
-            || self
-                .drive_grant_states
-                .values()
-                .any(|state| matches!(state, BackingGrantState::Consumed))
-            || self
-                .pmem_grant_states
-                .values()
-                .any(|state| matches!(state, BackingGrantState::Consumed))
-            || matches!(self.serial_grant_state, SerialGrantState::Consumed)
-            || vsock_grant_consumed
-        {
-            return Err(VmmActionError::ResourceGrant);
-        }
-
         let boot_files =
             match std::mem::replace(&mut self.boot_grant_state, BootGrantState::Consumed) {
                 BootGrantState::PathBased => {
@@ -2091,16 +2255,30 @@ where
             return self.insert_runtime_drive(input);
         }
         let config = self.controller.prepare_drive_config(input)?;
-        if config.is_vhost_user() && self.grant_authority.is_some() {
-            return Err(VmmActionError::DriveConfig(
-                DriveConfigError::ContainedVhostUserUnsupported,
-            ));
-        }
         if config.is_vhost_user() && self.controller.memory_hotplug_config().is_some() {
             return Err(VmmActionError::DriveConfig(
                 DriveConfigError::IncompatibleMemoryHotplug,
             ));
         }
+        #[cfg(target_os = "macos")]
+        let prepared_vhost_claim: Option<PreparedVhostUserSocketClaim> =
+            if config.is_vhost_user() && self.grant_authority.is_some() {
+                if self.vhost_user_broker_authority.is_none() {
+                    return Err(VmmActionError::ResourceGrant);
+                }
+                Some(
+                    self.directory_grant_authority
+                        .as_ref()
+                        .ok_or(VmmActionError::ResourceGrant)?
+                        .prepare_vhost_user_socket(
+                            config.socket().ok_or(VmmActionError::ResourceGrant)?,
+                        )
+                        .map_err(|_| VmmActionError::ResourceGrant)?
+                        .ok_or(VmmActionError::ResourceGrant)?,
+                )
+            } else {
+                None
+            };
         let backing = match (&self.grant_authority, config.backend()) {
             (
                 Some(authority),
@@ -2122,17 +2300,36 @@ where
             (None, _) | (Some(_), DriveBackendConfig::VhostUser { .. }) => None,
         };
         let drive_id = config.drive_id().to_string();
+        let is_vhost_user = config.is_vhost_user();
+        #[cfg(target_os = "macos")]
+        let vhost_lease = prepared_vhost_claim.map(PreparedVhostUserSocketClaim::commit);
 
         self.controller.commit_drive_config(config);
         match backing {
             Some(backing) => {
                 self.drive_grant_states
-                    .insert(drive_id, BackingGrantState::Prepared(backing));
+                    .insert(drive_id.clone(), BackingGrantState::Prepared(backing));
             }
             None => {
                 self.drive_grant_states.remove(&drive_id);
             }
         }
+        #[cfg(target_os = "macos")]
+        match vhost_lease {
+            Some(lease) => {
+                self.vhost_user_grant_states.insert(drive_id.clone(), lease);
+            }
+            None => {
+                self.vhost_user_grant_states.remove(&drive_id);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = is_vhost_user;
+        #[cfg(target_os = "macos")]
+        debug_assert!(
+            self.grant_authority.is_none()
+                || is_vhost_user == self.vhost_user_grant_states.contains_key(&drive_id)
+        );
         Ok(VmmData::Empty)
     }
 
@@ -2164,24 +2361,61 @@ where
         let config = prepared_config.config().clone();
         match config.backend() {
             DriveBackendConfig::VhostUser { socket } => {
-                if self.grant_authority.is_some() {
-                    return Err(VmmActionError::DriveConfig(
-                        DriveConfigError::ContainedVhostUserUnsupported,
-                    ));
-                }
                 if self.controller.memory_hotplug_config().is_some() {
                     return Err(VmmActionError::DriveConfig(
                         DriveConfigError::IncompatibleMemoryHotplug,
                     ));
                 }
-                let session = self.started_session.as_mut().ok_or({
-                    VmmActionError::DriveRuntimeMutation(
+                self.started_session
+                    .as_mut()
+                    .ok_or(VmmActionError::DriveRuntimeMutation(
                         DriveRuntimeMutationError::ActiveSessionUnavailable,
-                    )
-                })?;
-                session
+                    ))?
                     .preflight_runtime_vhost_user_block_device(config.drive_id())
                     .map_err(VmmActionError::DriveRuntimeMutation)?;
+                #[cfg(target_os = "macos")]
+                let prepared_vhost_claim: Option<PreparedVhostUserSocketClaim> =
+                    if self.grant_authority.is_some() {
+                        self.vhost_user_broker_authority
+                            .as_ref()
+                            .ok_or(VmmActionError::ResourceGrant)?
+                            .preflight()
+                            .map_err(|_| VmmActionError::ResourceGrant)?;
+                        Some(
+                            self.directory_grant_authority
+                                .as_ref()
+                                .ok_or(VmmActionError::ResourceGrant)?
+                                .prepare_vhost_user_socket(socket)
+                                .map_err(|_| VmmActionError::ResourceGrant)?
+                                .ok_or(VmmActionError::ResourceGrant)?,
+                        )
+                    } else {
+                        None
+                    };
+                #[cfg(target_os = "macos")]
+                let stream = match prepared_vhost_claim.as_ref() {
+                    Some(claim) => self
+                        .vhost_user_broker_authority
+                        .as_ref()
+                        .ok_or(VmmActionError::ResourceGrant)?
+                        .connect(claim.grant_id(), claim.child())
+                        .map_err(|source| {
+                            VmmActionError::DriveRuntimeMutation(
+                                DriveRuntimeMutationError::PrepareDevice {
+                                    message: source.to_string(),
+                                },
+                            )
+                        })?,
+                    None => direct_vhost_user::connect(socket, DIRECT_VHOST_USER_OPERATION_TIMEOUT)
+                        .map_err(|source| {
+                            VmmActionError::DriveRuntimeMutation(
+                                DriveRuntimeMutationError::PrepareDevice {
+                                    message: source.to_string(),
+                                },
+                            )
+                        })?,
+                };
+                #[cfg(not(target_os = "macos"))]
                 let stream =
                     direct_vhost_user::connect(socket, DIRECT_VHOST_USER_OPERATION_TIMEOUT)
                         .map_err(|source| {
@@ -2201,11 +2435,22 @@ where
                         message: source.to_string(),
                     })
                 })?;
-                session
+                #[cfg(target_os = "macos")]
+                let drive_id = config.drive_id().to_string();
+                self.started_session
+                    .as_mut()
+                    .ok_or(VmmActionError::DriveRuntimeMutation(
+                        DriveRuntimeMutationError::ActiveSessionUnavailable,
+                    ))?
                     .insert_runtime_block_device(RuntimeBlockDeviceResource::vhost_user(
                         config, frontend,
                     ))
                     .map_err(VmmActionError::DriveRuntimeMutation)?;
+                #[cfg(target_os = "macos")]
+                if let Some(claim) = prepared_vhost_claim {
+                    let lease = claim.commit();
+                    self.vhost_user_grant_states.insert(drive_id, lease);
+                }
             }
             DriveBackendConfig::File {
                 path_on_host,
@@ -2289,6 +2534,8 @@ where
             .remove_runtime_block_device(prepared.drive_id())
             .map_err(VmmActionError::DriveRuntimeMutation)?;
         self.drive_grant_states.remove(prepared.drive_id());
+        #[cfg(target_os = "macos")]
+        self.vhost_user_grant_states.remove(prepared.drive_id());
         self.controller.commit_runtime_drive_removal(prepared);
         Ok(VmmData::Empty)
     }
@@ -8327,7 +8574,11 @@ mod tests {
     use std::fs::{self, File, OpenOptions, remove_file};
     use std::io::{Cursor, Seek, SeekFrom, Write};
     use std::num::NonZeroUsize;
+    #[cfg(target_os = "macos")]
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
+    #[cfg(target_os = "macos")]
+    use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -8414,7 +8665,19 @@ mod tests {
         BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
         VmmActionError, VmmController, VmmData,
     };
+    #[cfg(target_os = "macos")]
+    use bangbang_session::SessionId;
     use bangbang_session::VmnetAuthority;
+    #[cfg(target_os = "macos")]
+    use bangbang_session::macos::vhost_user_broker::{
+        VhostUserBrokerMessage, receive_vhost_user_broker_message, send_vhost_user_broker_message,
+    };
+
+    #[cfg(target_os = "macos")]
+    use crate::contained_session::{
+        TestVhostDirectory, VhostUserBrokerAuthority, empty_grant_authority_for_vhost_test,
+        vhost_directory_authority_for_test,
+    };
 
     use crate::host_network::virtio_vmnet::VmnetVirtioNetworkPacketIoStopError;
     use crate::host_network::vmnet::{
@@ -8422,6 +8685,8 @@ mod tests {
         VmnetInterfaceDescriptorError, VmnetOperation, VmnetPacketIoBackend, VmnetPacketIoError,
         VmnetReadPacket, VmnetStatus, VmnetWritePacket,
     };
+    #[cfg(target_os = "macos")]
+    use crate::vhost_user_block::{VhostUserBlockBackend, VhostUserBlockBackendOptions};
 
     use super::{
         BackingGrantState, BlockBackingUpdate, BootGrantState, BootRunLoopBlockDeviceUpdater,
@@ -11205,6 +11470,113 @@ mod tests {
         )))
         .expect("boot source should configure");
         vmm
+    }
+
+    #[cfg(target_os = "macos")]
+    fn contained_vhost_vmm(
+        starter: FakeStarter,
+    ) -> (ProcessVmm<FakeStarter>, TestVhostDirectory, UnixDatagram) {
+        let (directory_authority, directory) = vhost_directory_authority_for_test();
+        let (worker, launcher) = UnixDatagram::pair().expect("vhost broker pair should open");
+        // SAFETY: Both connected broker endpoints belong to this test process.
+        let pid = unsafe { libc::getpid() };
+        let broker =
+            VhostUserBrokerAuthority::for_test(worker, SessionId::from_bytes([71; 32]), pid);
+        let vmm = configured_vmm(starter)
+            .with_grant_authority(Some(empty_grant_authority_for_vhost_test()))
+            .with_socket_grant_authority(Some(directory_authority), None, Some(broker), None);
+        (vmm, directory, launcher)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn put_contained_vhost_config(vmm: &mut ProcessVmm<FakeStarter>, drive_id: &str) {
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new_without_path_on_host(drive_id, drive_id, false)
+                .with_socket("bangbang-grant:vhost-directory/backend.sock"),
+        ))
+        .expect("contained vhost-user drive should configure");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_no_vhost_broker_request(socket: &UnixDatagram, context: &str) {
+        socket
+            .set_nonblocking(true)
+            .expect("broker observer should become nonblocking");
+        let mut frame = [0_u8; 256];
+        let error = socket
+            .recv(&mut frame)
+            .expect_err("zero-request boundary must leave broker empty");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{context}");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_contained_startup_preflight_rejects_before_broker(
+        mutate: impl FnOnce(&mut ProcessVmm<FakeStarter>),
+        context: &str,
+    ) {
+        let (mut vmm, _directory, launcher) = contained_vhost_vmm(FakeStarter::success(72));
+        put_contained_vhost_config(&mut vmm, "vhost");
+        mutate(&mut vmm);
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::ResourceGrant),
+            "{context}"
+        );
+        assert_eq!(vmm.starter.calls, 0, "{context}");
+        assert_no_vhost_broker_request(&launcher, context);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_connected_vhost_broker(
+        launcher: UnixDatagram,
+        socket_path: PathBuf,
+        expected_requests: u64,
+        request_count: Arc<AtomicU64>,
+        validated: mpsc::Receiver<()>,
+        hold: mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            for expected_sequence in 1..=expected_requests {
+                let received = receive_vhost_user_broker_message(&launcher)
+                    .expect("runtime broker request should arrive");
+                assert!(received.descriptor.is_none());
+                let VhostUserBrokerMessage::Connect {
+                    session,
+                    sequence,
+                    grant_id,
+                    child,
+                } = received.message
+                else {
+                    panic!("worker should send Connect");
+                };
+                assert_eq!(sequence, expected_sequence);
+                assert_eq!(grant_id.as_bytes(), b"vhost-directory");
+                assert_eq!(child.as_bytes(), b"backend.sock");
+                let stream = UnixStream::connect(&socket_path)
+                    .expect("test broker should connect the exact backend child");
+                stream
+                    .set_nonblocking(true)
+                    .expect("brokered stream should be nonblocking");
+                send_vhost_user_broker_message(
+                    &launcher,
+                    &VhostUserBrokerMessage::Connected {
+                        session,
+                        sequence,
+                        grant_id,
+                        child,
+                    },
+                    Some(stream.as_raw_fd()),
+                )
+                .expect("connected descriptor should return");
+                request_count.fetch_add(1, Ordering::Relaxed);
+                validated
+                    .recv()
+                    .expect("receiver should validate each brokered stream");
+            }
+            hold.recv()
+                .expect("launcher facet should remain live through final peer validation");
+        })
     }
 
     fn snapshot_profile_vmm(starter: FakeStarter) -> ProcessVmm<FakeStarter> {
@@ -16893,6 +17265,370 @@ mod tests {
             session.last_memory_hotplug_status_requested_size_mib,
             Some(256)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_vhost_startup_preflights_every_grant_before_first_broker_request() {
+        assert_contained_startup_preflight_rejects_before_broker(
+            |vmm| {
+                vmm.controller
+                    .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                        "bangbang-grant:missing-kernel",
+                    )))
+                    .expect("controller-only boot fixture should configure");
+            },
+            "missing boot grant",
+        );
+        assert_contained_startup_preflight_rejects_before_broker(
+            |vmm| {
+                vmm.controller
+                    .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                        "file",
+                        "file",
+                        "bangbang-grant:missing-drive",
+                        false,
+                    )))
+                    .expect("controller-only drive fixture should configure");
+            },
+            "missing file-drive grant",
+        );
+        assert_contained_startup_preflight_rejects_before_broker(
+            |vmm| {
+                vmm.controller
+                    .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                        "pmem",
+                        "bangbang-grant:missing-pmem",
+                    )))
+                    .expect("controller-only pmem fixture should configure");
+            },
+            "missing pmem grant",
+        );
+        assert_contained_startup_preflight_rejects_before_broker(
+            |vmm| {
+                vmm.controller
+                    .handle_action(VmmAction::PutSerial(
+                        SerialConfigInput::new()
+                            .with_serial_out_path("bangbang-grant:missing-serial"),
+                    ))
+                    .expect("controller-only serial fixture should configure");
+            },
+            "missing serial grant",
+        );
+        assert_contained_startup_preflight_rejects_before_broker(
+            |vmm| {
+                vmm.controller
+                    .handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+                        3,
+                        "bangbang-grant:missing-vsock/v.sock",
+                    )))
+                    .expect("controller-only vsock fixture should configure");
+            },
+            "missing vsock grant",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_vhost_preboot_rejects_ambient_and_missing_grants_without_broker_io() {
+        for socket in [
+            "/tmp/ambient-vhost.sock",
+            "bangbang-grant:missing/backend.sock",
+            "bangbang-grant:vhost-directory",
+        ] {
+            let (mut vmm, _directory, launcher) = contained_vhost_vmm(FakeStarter::success(73));
+            assert_eq!(
+                vmm.handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                        .with_socket(socket),
+                )),
+                Err(VmmActionError::ResourceGrant)
+            );
+            assert!(vmm.drive_configs().is_empty());
+            assert_no_vhost_broker_request(&launcher, "rejected preboot vhost reference");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_vhost_preboot_replacement_keeps_session_directory_reusable() {
+        let (mut vmm, _directory, launcher) = contained_vhost_vmm(FakeStarter::success(78));
+        put_contained_vhost_config(&mut vmm, "vhost");
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("bangbang-grant:vhost-directory/second.sock"),
+        ))
+        .expect("same-ID preboot replacement should borrow the retained directory");
+        assert_eq!(
+            vmm.drive_configs()[0].socket(),
+            Some(Path::new("bangbang-grant:vhost-directory/second.sock"))
+        );
+        assert_eq!(
+            vmm.vhost_user_grant_states
+                .get("vhost")
+                .expect("replacement lease should exist")
+                .child()
+                .as_bytes(),
+            b"second.sock"
+        );
+
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "vhost",
+            "vhost",
+            "/tmp/ordinary-backing",
+            false,
+        )))
+        .expect("file replacement should drop only the per-drive vhost lease");
+        assert!(!vmm.vhost_user_grant_states.contains_key("vhost"));
+        put_contained_vhost_config(&mut vmm, "vhost");
+        assert_eq!(
+            vmm.vhost_user_grant_states
+                .get("vhost")
+                .expect("retained directory should issue a new lease")
+                .child()
+                .as_bytes(),
+            b"backend.sock"
+        );
+        assert_no_vhost_broker_request(&launcher, "preboot replacement");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_vhost_normal_broker_failure_is_retryable_with_retained_lease() {
+        let (mut vmm, _directory, launcher) = contained_vhost_vmm(FakeStarter::success(74));
+        put_contained_vhost_config(&mut vmm, "vhost");
+        let (release, hold) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            for expected_sequence in 1..=2 {
+                let received = receive_vhost_user_broker_message(&launcher)
+                    .expect("contained startup request should arrive");
+                let VhostUserBrokerMessage::Connect {
+                    session,
+                    sequence,
+                    grant_id,
+                    child,
+                } = received.message
+                else {
+                    panic!("worker should send Connect");
+                };
+                assert_eq!(sequence, expected_sequence);
+                send_vhost_user_broker_message(
+                    &launcher,
+                    &VhostUserBrokerMessage::Failed {
+                        session,
+                        sequence,
+                        grant_id,
+                        child,
+                        kind: std::io::ErrorKind::ConnectionRefused,
+                    },
+                    None,
+                )
+                .expect("bounded endpoint failure should return");
+            }
+            hold.recv()
+                .expect("launcher facet should remain live through peer validation");
+        });
+
+        for _ in 0..2 {
+            assert_eq!(
+                vmm.handle_action(VmmAction::InstanceStart),
+                Err(VmmActionError::InstanceStart(BackendError::Hypervisor(
+                    "contained vhost-user socket connection failed".to_string()
+                )))
+            );
+            assert_eq!(vmm.starter.calls, 0);
+            assert!(vmm.vhost_user_grant_states.contains_key("vhost"));
+        }
+        release
+            .send(())
+            .expect("launcher facet should release after validation");
+        peer.join().expect("broker peer should join");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_vhost_patch_duplicate_put_and_owner_preflight_are_zero_request() {
+        let (mut vmm, _directory, launcher) = contained_vhost_vmm(FakeStarter::success(75));
+        put_contained_vhost_config(&mut vmm, "vhost");
+        vmm.pci_enabled = true;
+        vmm.controller
+            .commit_instance_start()
+            .expect("test controller should enter running state");
+        vmm.started_session = Some(FakeSession::new(75));
+
+        vmm.handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+            "vhost", "vhost", None,
+        )))
+        .expect("ID-only PATCH should use the active frontend");
+        assert!(
+            vmm.handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                    .with_socket("bangbang-grant:vhost-directory/backend.sock"),
+            ))
+            .is_err(),
+            "same-ID runtime PUT should remain a duplicate"
+        );
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("session should remain available")
+                .block_update_count,
+            1
+        );
+        assert_no_vhost_broker_request(&launcher, "PATCH and duplicate PUT");
+
+        let (mut vmm, _directory, launcher) = contained_vhost_vmm(FakeStarter::success(76));
+        vmm.pci_enabled = true;
+        vmm.controller
+            .commit_instance_start()
+            .expect("test controller should enter running state");
+        vmm.started_session = Some(FakeSession::with_vhost_block_preflight_result(
+            76,
+            DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI endpoint capacity is exhausted".to_string(),
+            },
+        ));
+        assert!(
+            vmm.handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new_without_path_on_host("new", "new", false)
+                    .with_socket("bangbang-grant:vhost-directory/backend.sock"),
+            ))
+            .is_err()
+        );
+        assert!(vmm.drive_configs().is_empty());
+        assert!(vmm.vhost_user_grant_states.is_empty());
+        assert_no_vhost_broker_request(&launcher, "owner preflight");
+        assert!(
+            vmm.directory_grant_authority
+                .as_ref()
+                .expect("directory authority should remain")
+                .prepare_vhost_user_socket(Path::new("bangbang-grant:vhost-directory/backend.sock"))
+                .expect("owner preflight should preserve fresh authority")
+                .is_some()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_vhost_runtime_rolls_back_then_deletes_and_reuses_retained_grant() {
+        let (mut vmm, directory, launcher) = contained_vhost_vmm(FakeStarter::success(77));
+        let socket_path = directory.path().join("backend.sock");
+        let backing = TempFilePath::create_with_bytes("contained-vhost-backing", &[0; 4096]);
+        vmm.pci_enabled = true;
+        vmm.controller
+            .commit_instance_start()
+            .expect("test controller should enter running state");
+        vmm.started_session = Some(FakeSession::new(77));
+        let request_count = Arc::new(AtomicU64::new(0));
+        let (validated, validation) = mpsc::channel();
+        let (release, hold) = mpsc::channel();
+        let broker = spawn_connected_vhost_broker(
+            launcher,
+            socket_path.clone(),
+            3,
+            Arc::clone(&request_count),
+            validation,
+            hold,
+        );
+        let input = || {
+            DriveConfigInput::new_without_path_on_host("runtime", "runtime", false)
+                .with_socket("bangbang-grant:vhost-directory/backend.sock")
+        };
+
+        let rejected_backend = VhostUserBlockBackend::start(
+            &socket_path,
+            backing.path(),
+            VhostUserBlockBackendOptions::missing_version_one(false),
+        )
+        .expect("rejected backend should start");
+        assert_eq!(
+            vmm.handle_action(VmmAction::PutDrive(input())),
+            Err(VmmActionError::DriveRuntimeMutation(
+                DriveRuntimeMutationError::PrepareDevice {
+                    message: "vhost-user backend lacks required virtio features".to_string(),
+                }
+            )),
+            "invalid negotiation should reject runtime publication",
+        );
+        validated
+            .send(())
+            .expect("rejected stream validation should release its sender");
+        let rejected_report = rejected_backend
+            .finish()
+            .expect("rejected backend should finish cleanly");
+        assert!(rejected_report.discovery_rejected);
+        assert!(vmm.drive_configs().is_empty());
+        assert!(vmm.vhost_user_grant_states.is_empty());
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("session should remain")
+                .vhost_block_insert_count,
+            0
+        );
+
+        let backend = VhostUserBlockBackend::start(
+            &socket_path,
+            backing.path(),
+            VhostUserBlockBackendOptions::regular(false),
+        )
+        .expect("retry backend should start");
+        vmm.handle_action(VmmAction::PutDrive(input()))
+            .expect("restored fresh grant should publish on retry");
+        validated
+            .send(())
+            .expect("retry stream validation should release its sender");
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert!(vmm.vhost_user_grant_states.contains_key("runtime"));
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("session should remain")
+                .vhost_block_insert_count,
+            1
+        );
+        drop(backend);
+
+        vmm.handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+            "runtime", "runtime", None,
+        )))
+        .expect("ID-only PATCH should stay on the live endpoint");
+        vmm.handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+            HotUnplugDeviceKind::Drive,
+            "runtime",
+        )))
+        .expect("runtime vhost drive should delete");
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        assert!(vmm.drive_configs().is_empty());
+        assert!(vmm.vhost_user_grant_states.is_empty());
+
+        let backend = VhostUserBlockBackend::start(
+            &socket_path,
+            backing.path(),
+            VhostUserBlockBackendOptions::regular(false),
+        )
+        .expect("reinsert backend should start");
+        vmm.handle_action(VmmAction::PutDrive(input()))
+            .expect("same ID should reinsert through retained session authority");
+        validated
+            .send(())
+            .expect("reinserted stream validation should release its sender");
+        assert_eq!(request_count.load(Ordering::Relaxed), 3);
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert!(vmm.vhost_user_grant_states.contains_key("runtime"));
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("session should remain")
+                .vhost_block_insert_count,
+            2
+        );
+        drop(backend);
+        release
+            .send(())
+            .expect("launcher facet should release after the third validation");
+        broker.join().expect("broker peer should join");
     }
 
     #[test]

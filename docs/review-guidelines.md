@@ -128,7 +128,7 @@ can require matching real/effective credentials, session identity, the inherited
 endpoint, and `LOCAL_PEERPID == getppid()` because App Sandbox denies its
 parent-code lookup.
 No public/VM/resource side effect may precede random-session `Start` and the
-independently validated `Prepared`/grant-ack/`Proceed` gates. Keep lifecycle v4
+independently validated `Prepared`/grant-ack/`Proceed` gates. Keep lifecycle v5
 frames at 4096 bytes or less, sequences exact, message/state variants closed,
 diagnostics redacted, and the all-zero identity exclusive to the initial
 greeting. Even an empty grant batch must be acknowledged before `Proceed`.

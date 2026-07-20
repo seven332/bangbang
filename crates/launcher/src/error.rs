@@ -78,6 +78,8 @@ pub enum LauncherError {
     GrantProtocol,
     /// The closed launcher-vsock broker protocol failed.
     SocketBroker,
+    /// The closed launcher-vhost-user broker protocol failed.
+    VhostUserBroker,
     /// The private per-VM runtime namespace failed validation or cleanup.
     RuntimeNamespace,
     /// Waiting for the embedded worker failed.
@@ -130,6 +132,7 @@ impl fmt::Display for LauncherError {
             Self::GrantPreparation => formatter.write_str("resource grant preparation failed"),
             Self::GrantProtocol => formatter.write_str("private resource grant failed"),
             Self::SocketBroker => formatter.write_str("private socket broker failed"),
+            Self::VhostUserBroker => formatter.write_str("private vhost-user broker failed"),
             Self::RuntimeNamespace => {
                 formatter.write_str("private worker runtime namespace failed")
             }

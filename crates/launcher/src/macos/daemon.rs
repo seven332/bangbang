@@ -615,7 +615,8 @@ impl FailureCategory {
             }
             LauncherError::SessionProtocol
             | LauncherError::GrantProtocol
-            | LauncherError::SocketBroker => Self::Session,
+            | LauncherError::SocketBroker
+            | LauncherError::VhostUserBroker => Self::Session,
             LauncherError::WorkerPolicy | LauncherError::RuntimeNamespace => Self::Runtime,
             LauncherError::SignalSetup(_)
             | LauncherError::DaemonHandoff

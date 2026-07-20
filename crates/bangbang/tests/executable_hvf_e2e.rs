@@ -8,7 +8,7 @@
 )]
 
 mod support;
-#[path = "support/vhost_user_block.rs"]
+#[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

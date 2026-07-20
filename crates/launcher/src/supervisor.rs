@@ -122,6 +122,7 @@ fn launch_prepared(
         crate::macos::supervise::AuxiliaryChannels::new(
             &mut spawned.grants,
             &mut spawned.socket_broker,
+            &mut spawned.vhost_user_broker,
         ),
         lifecycle,
         wakeups,

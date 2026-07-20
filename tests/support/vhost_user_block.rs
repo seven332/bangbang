@@ -1,3 +1,4 @@
+// Shared by the signed executable and production-bundle integration targets.
 #![allow(
     dead_code,
     reason = "the signed executable test selects backend controls per focused scenario"

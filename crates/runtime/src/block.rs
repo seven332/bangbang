@@ -1090,7 +1090,6 @@ pub enum DriveConfigError {
     EmptyPathOnHost,
     EmptySocket,
     InvalidVhostUserConfiguration,
-    ContainedVhostUserUnsupported,
     IncompatibleMemoryHotplug,
     UnsupportedIoEngine {
         io_engine: DriveIoEngine,
@@ -1172,9 +1171,6 @@ impl fmt::Display for DriveConfigError {
             Self::EmptySocket => f.write_str("drive socket must not be empty"),
             Self::InvalidVhostUserConfiguration => {
                 f.write_str("vhost-user drive contains incompatible file-backed fields")
-            }
-            Self::ContainedVhostUserUnsupported => {
-                f.write_str("vhost-user drive is unsupported in contained mode")
             }
             Self::IncompatibleMemoryHotplug => {
                 f.write_str("vhost-user drive is incompatible with dynamic memory hotplug")

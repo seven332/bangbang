@@ -192,12 +192,21 @@ pub(super) fn send_raw(
     // call. The raw descriptors remain owned by the caller.
     let sent = unsafe { libc::sendmsg(socket, &raw const message, 0) };
     if sent < 0 {
-        return Err(GrantTransportError::Io(io::Error::last_os_error().kind()));
+        let error = io::Error::last_os_error();
+        return Err(GrantTransportError::Io(send_error_kind(&error)));
     }
     if usize::try_from(sent).ok() != Some(payload.len()) {
         return Err(GrantTransportError::Invalid);
     }
     Ok(())
+}
+
+fn send_error_kind(error: &io::Error) -> io::ErrorKind {
+    if error.raw_os_error() == Some(libc::ENOBUFS) {
+        io::ErrorKind::WouldBlock
+    } else {
+        error.kind()
+    }
 }
 
 fn parse_control(
@@ -346,6 +355,18 @@ mod tests {
         // SAFETY: F_GETFD reads flags from the live owned descriptor.
         let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn normalizes_darwin_enobufs_as_retryable_backpressure() {
+        assert_eq!(
+            send_error_kind(&io::Error::from_raw_os_error(libc::ENOBUFS)),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            send_error_kind(&io::Error::from_raw_os_error(libc::EINVAL)),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

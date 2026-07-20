@@ -8,8 +8,8 @@ pub const MAX_FRAME_BYTES: usize = 4096;
 pub const HEADER_BYTES: usize = 56;
 const MAX_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - HEADER_BYTES;
 const MAX_BUFFER_BYTES: usize = MAX_FRAME_BYTES * 2;
-const MAGIC: [u8; 4] = *b"BBS4";
-const VERSION: u16 = 4;
+const MAGIC: [u8; 4] = *b"BBS5";
+const VERSION: u16 = 5;
 const CREDENTIAL_POLICY_BYTES: usize = 32;
 const VMNET_AUTHORITY_BYTES: usize = 64;
 const WORKER_POLICY_BYTES: usize = CREDENTIAL_POLICY_BYTES + VMNET_AUTHORITY_BYTES;
@@ -1129,8 +1129,8 @@ mod tests {
         };
         let encoded = encode_frame(frame).expect("policy should encode");
         assert_eq!(encoded.len(), HEADER_BYTES + WORKER_POLICY_BYTES);
-        assert_eq!(&encoded[..4], b"BBS4");
-        assert_eq!(&encoded[4..6], &4_u16.to_be_bytes());
+        assert_eq!(&encoded[..4], b"BBS5");
+        assert_eq!(&encoded[4..6], &5_u16.to_be_bytes());
 
         let mut decoder = FrameDecoder::default();
         decoder.push(&encoded).expect("frame should buffer");

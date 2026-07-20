@@ -52,7 +52,7 @@ pub(crate) fn grant_reference_id(reference: &Path) -> Result<Option<GrantId>, Gr
     GrantId::parse(id).map(Some).map_err(|_| GrantClaimError)
 }
 
-fn socket_directory_reference(
+pub(crate) fn socket_directory_reference(
     reference: &Path,
 ) -> Result<Option<(GrantId, SocketChild)>, GrantClaimError> {
     let reference = reference.as_os_str().as_bytes();
@@ -266,9 +266,9 @@ mod platform {
     use std::env;
     use std::ffi::OsStr;
     use std::fs::File;
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::mem::MaybeUninit;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::path::Path;
     use std::rc::Rc;
@@ -291,12 +291,16 @@ mod platform {
         SnapshotStagingKind, SnapshotStagingName, SnapshotStagingOwnershipRecord, WorkerNamespace,
         WorkerSocketNamespace,
     };
+    use bangbang_session::macos::vhost_user_broker::{
+        VhostUserBrokerError, VhostUserBrokerMessage, receive_vhost_user_broker_message,
+        send_vhost_user_broker_message,
+    };
     use bangbang_session::macos::{set_cloexec, verify_peer, verify_peer_pid};
     use bangbang_session::{
         Frame, FrameDecoder, GRANT_FD, GrantAccess, GrantId, Message, ObjectIdentity, Readiness,
         ResourceRole, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId,
-        SnapshotOutputChild, TerminalCategory, VmnetAuthority, WorkerLifecycle, WorkerPolicy,
-        encode_frame,
+        SnapshotOutputChild, TerminalCategory, VHOST_USER_BROKER_FD, VmnetAuthority,
+        WorkerLifecycle, WorkerPolicy, encode_frame,
     };
 
     use super::{
@@ -305,6 +309,7 @@ mod platform {
     };
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+    const VHOST_USER_BROKER_TIMEOUT: Duration = Duration::from_secs(2);
     #[cfg(feature = "grant-integration-probe")]
     const GRANT_DELAY_PROBE: &str = "--bangbang-internal-grant-delay-v1";
     #[cfg(feature = "grant-integration-probe")]
@@ -429,6 +434,13 @@ mod platform {
             Self {
                 registry: Arc::new(Mutex::new(Some(registry))),
             }
+        }
+
+        pub(crate) fn is_active(&self) -> bool {
+            self.registry
+                .lock()
+                .map(|registry| registry.is_some())
+                .unwrap_or(false)
         }
 
         pub(crate) fn claim_read_only_file(
@@ -585,7 +597,136 @@ mod platform {
     /// One exact contained socket-directory claim.
     pub(crate) struct ClaimedSocketDirectory {
         pub(crate) directory: GrantedDirectory,
+        pub(crate) grant_id: GrantId,
         pub(crate) child: SocketChild,
+    }
+
+    /// One durable per-drive lease on a retained vhost-user directory child.
+    #[derive(Clone)]
+    pub(crate) struct ClaimedVhostUserSocket {
+        _directory: Rc<GrantedDirectory>,
+        grant_id: GrantId,
+        child: SocketChild,
+    }
+
+    impl std::fmt::Debug for ClaimedVhostUserSocket {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ClaimedVhostUserSocket")
+                .field("directory", &"<retained>")
+                .field("grant_id", &"<redacted>")
+                .field("child", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl ClaimedVhostUserSocket {
+        pub(crate) fn grant_id(&self) -> &GrantId {
+            &self.grant_id
+        }
+
+        pub(crate) fn child(&self) -> &SocketChild {
+            &self.child
+        }
+    }
+
+    enum PreparedVhostUserDirectory {
+        Reserved(Option<GrantedDirectory>),
+        Retained(Rc<GrantedDirectory>),
+        Committed,
+    }
+
+    fn abort_vhost_user_claim_invariant() -> ! {
+        // A prepared claim is committed only after external endpoint
+        // publication. An internal ownership violation cannot be reported as
+        // recoverable without exposing inconsistent public/private state.
+        std::process::abort()
+    }
+
+    /// Failure-atomic first adoption or reuse of one retained vhost child.
+    pub(crate) struct PreparedVhostUserSocketClaim {
+        authority: DirectoryGrantAuthority,
+        grant_id: GrantId,
+        child: SocketChild,
+        directory: PreparedVhostUserDirectory,
+    }
+
+    impl std::fmt::Debug for PreparedVhostUserSocketClaim {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let state = match self.directory {
+                PreparedVhostUserDirectory::Reserved(_) => "<reserved>",
+                PreparedVhostUserDirectory::Retained(_) => "<retained>",
+                PreparedVhostUserDirectory::Committed => "<committed>",
+            };
+            formatter
+                .debug_struct("PreparedVhostUserSocketClaim")
+                .field("authority", &"<redacted>")
+                .field("grant_id", &"<redacted>")
+                .field("child", &"<redacted>")
+                .field("state", &state)
+                .finish()
+        }
+    }
+
+    impl PreparedVhostUserSocketClaim {
+        pub(crate) fn grant_id(&self) -> &GrantId {
+            &self.grant_id
+        }
+
+        pub(crate) fn child(&self) -> &SocketChild {
+            &self.child
+        }
+
+        pub(crate) fn commit(mut self) -> ClaimedVhostUserSocket {
+            let directory = match &mut self.directory {
+                PreparedVhostUserDirectory::Reserved(original) => {
+                    let Ok(mut retained) = self.authority.retained_vhost.try_borrow_mut() else {
+                        abort_vhost_user_claim_invariant();
+                    };
+                    if retained.contains_key(&self.grant_id) {
+                        abort_vhost_user_claim_invariant();
+                    }
+                    let Some(original) = original.take() else {
+                        abort_vhost_user_claim_invariant();
+                    };
+                    let directory = Rc::new(original);
+                    let previous = retained.insert(self.grant_id.clone(), Rc::clone(&directory));
+                    debug_assert!(previous.is_none());
+                    directory
+                }
+                PreparedVhostUserDirectory::Retained(directory) => Rc::clone(directory),
+                PreparedVhostUserDirectory::Committed => abort_vhost_user_claim_invariant(),
+            };
+            self.directory = PreparedVhostUserDirectory::Committed;
+            ClaimedVhostUserSocket {
+                _directory: directory,
+                grant_id: self.grant_id.clone(),
+                child: self.child.clone(),
+            }
+        }
+    }
+
+    impl Drop for PreparedVhostUserSocketClaim {
+        fn drop(&mut self) {
+            let PreparedVhostUserDirectory::Reserved(original) = &mut self.directory else {
+                return;
+            };
+            let Some(original) = original.take() else {
+                abort_vhost_user_claim_invariant();
+            };
+            let Ok(mut registry) = self.authority.registry.try_borrow_mut() else {
+                abort_vhost_user_claim_invariant();
+            };
+            let Some(registry) = registry.as_mut() else {
+                abort_vhost_user_claim_invariant();
+            };
+            if registry
+                .restore_scoped_directory(self.grant_id.clone(), original)
+                .is_err()
+            {
+                abort_vhost_user_claim_invariant();
+            }
+        }
     }
 
     /// One retained snapshot-output directory paired with one validated child.
@@ -721,6 +862,7 @@ mod platform {
     pub(crate) struct DirectoryGrantAuthority {
         registry: Rc<RefCell<Option<DirectoryGrantRegistry>>>,
         retained_snapshot: Rc<RefCell<HashMap<GrantId, Rc<GrantedDirectory>>>>,
+        retained_vhost: Rc<RefCell<HashMap<GrantId, Rc<GrantedDirectory>>>>,
     }
 
     impl std::fmt::Debug for DirectoryGrantAuthority {
@@ -737,7 +879,72 @@ mod platform {
             Self {
                 registry: Rc::new(RefCell::new(Some(registry))),
                 retained_snapshot: Rc::new(RefCell::new(HashMap::new())),
+                retained_vhost: Rc::new(RefCell::new(HashMap::new())),
             }
+        }
+
+        pub(crate) fn is_active(&self) -> bool {
+            self.registry
+                .try_borrow()
+                .map(|registry| registry.is_some())
+                .unwrap_or(false)
+        }
+
+        pub(crate) fn validates_vhost_user_lease(
+            &self,
+            reference: &Path,
+            lease: &ClaimedVhostUserSocket,
+        ) -> Result<bool, GrantClaimError> {
+            let Some((grant_id, child)) = socket_directory_reference(reference)? else {
+                return Ok(false);
+            };
+            if grant_id != lease.grant_id || child != lease.child {
+                return Ok(false);
+            }
+            let retained = self
+                .retained_vhost
+                .try_borrow()
+                .map_err(|_| GrantClaimError)?;
+            Ok(retained
+                .get(&grant_id)
+                .is_some_and(|directory| Rc::ptr_eq(directory, &lease._directory)))
+        }
+
+        pub(crate) fn prepare_vhost_user_socket(
+            &self,
+            reference: &Path,
+        ) -> Result<Option<PreparedVhostUserSocketClaim>, GrantClaimError> {
+            let Some((grant_id, child)) = socket_directory_reference(reference)? else {
+                return Ok(None);
+            };
+            let mut retained = self
+                .retained_vhost
+                .try_borrow_mut()
+                .map_err(|_| GrantClaimError)?;
+            if let Some(directory) = retained.get(&grant_id) {
+                return Ok(Some(PreparedVhostUserSocketClaim {
+                    authority: self.clone(),
+                    grant_id,
+                    child,
+                    directory: PreparedVhostUserDirectory::Retained(Rc::clone(directory)),
+                }));
+            }
+            retained.try_reserve(1).map_err(|_| GrantClaimError)?;
+            drop(retained);
+            let directory = self
+                .registry
+                .try_borrow_mut()
+                .map_err(|_| GrantClaimError)?
+                .as_mut()
+                .ok_or(GrantClaimError)?
+                .take_scoped_directory(&grant_id, ResourceRole::VhostUserSocketDirectory)
+                .map_err(|_| GrantClaimError)?;
+            Ok(Some(PreparedVhostUserSocketClaim {
+                authority: self.clone(),
+                grant_id,
+                child,
+                directory: PreparedVhostUserDirectory::Reserved(Some(directory)),
+            }))
         }
 
         pub(crate) fn claim_socket_directory(
@@ -756,7 +963,11 @@ mod platform {
                 .ok_or(GrantClaimError)?
                 .take_scoped_directory(&id, role)
                 .map_err(|_| GrantClaimError)?;
-            Ok(Some(ClaimedSocketDirectory { directory, child }))
+            Ok(Some(ClaimedSocketDirectory {
+                directory,
+                grant_id: id,
+                child,
+            }))
         }
 
         pub(crate) fn claim_snapshot_outputs(
@@ -853,6 +1064,9 @@ mod platform {
             if let Ok(mut retained) = self.retained_snapshot.try_borrow_mut() {
                 retained.clear();
             }
+            if let Ok(mut retained) = self.retained_vhost.try_borrow_mut() {
+                retained.clear();
+            }
         }
     }
 
@@ -915,6 +1129,240 @@ mod platform {
         }
     }
 
+    /// Fixed redacted contained vhost-user broker failure.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum VhostUserBrokerConnectError {
+        /// The launcher reached the exact grant but could not connect it.
+        Endpoint,
+        /// The authenticated private broker violated its closed contract.
+        Protocol,
+    }
+
+    impl std::fmt::Display for VhostUserBrokerConnectError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Endpoint => {
+                    formatter.write_str("contained vhost-user socket connection failed")
+                }
+                Self::Protocol => formatter.write_str("contained vhost-user broker failed"),
+            }
+        }
+    }
+
+    impl std::error::Error for VhostUserBrokerConnectError {}
+
+    struct VhostUserBrokerState {
+        socket: UnixDatagram,
+        session: SessionId,
+        launcher_pid: libc::pid_t,
+        next_sequence: u64,
+    }
+
+    /// Shared serial authority for exact launcher-brokered vhost connections.
+    #[derive(Clone)]
+    pub(crate) struct VhostUserBrokerAuthority {
+        state: Arc<Mutex<Option<VhostUserBrokerState>>>,
+    }
+
+    impl std::fmt::Debug for VhostUserBrokerAuthority {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("VhostUserBrokerAuthority")
+                .field("state", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl VhostUserBrokerAuthority {
+        fn new(socket: UnixDatagram, session: SessionId, launcher_pid: libc::pid_t) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(Some(VhostUserBrokerState {
+                    socket,
+                    session,
+                    launcher_pid,
+                    next_sequence: 1,
+                }))),
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn for_test(
+            socket: UnixDatagram,
+            session: SessionId,
+            launcher_pid: libc::pid_t,
+        ) -> Self {
+            Self::new(socket, session, launcher_pid)
+        }
+
+        pub(crate) fn preflight(&self) -> Result<(), VhostUserBrokerConnectError> {
+            let mut locked = self
+                .state
+                .lock()
+                .map_err(|_| VhostUserBrokerConnectError::Protocol)?;
+            if locked.as_ref().is_some_and(|state| {
+                verify_peer_pid(state.socket.as_raw_fd(), state.launcher_pid).is_ok()
+            }) {
+                return Ok(());
+            }
+            if let Some(state) = locked.take() {
+                let _ = state.socket.shutdown(std::net::Shutdown::Both);
+            }
+            Err(VhostUserBrokerConnectError::Protocol)
+        }
+
+        pub(crate) fn connect(
+            &self,
+            grant_id: &GrantId,
+            child: &SocketChild,
+        ) -> Result<UnixStream, VhostUserBrokerConnectError> {
+            let mut locked = self
+                .state
+                .lock()
+                .map_err(|_| VhostUserBrokerConnectError::Protocol)?;
+            let Some(mut state) = locked.take() else {
+                return Err(VhostUserBrokerConnectError::Protocol);
+            };
+            let Some(deadline) = Instant::now().checked_add(VHOST_USER_BROKER_TIMEOUT) else {
+                return Err(poison_vhost_user_broker_state(state));
+            };
+            if verify_peer_pid(state.socket.as_raw_fd(), state.launcher_pid).is_err() {
+                return Err(poison_vhost_user_broker_state(state));
+            }
+            let request = VhostUserBrokerMessage::Connect {
+                session: state.session,
+                sequence: state.next_sequence,
+                grant_id: grant_id.clone(),
+                child: child.clone(),
+            };
+            loop {
+                let Some(remaining) = broker_remaining(deadline) else {
+                    return Err(poison_vhost_user_broker_state(state));
+                };
+                if state.socket.set_write_timeout(Some(remaining)).is_err() {
+                    return Err(poison_vhost_user_broker_state(state));
+                }
+                match send_vhost_user_broker_message(&state.socket, &request, None) {
+                    Ok(()) => break,
+                    Err(VhostUserBrokerError::Io(io::ErrorKind::Interrupted)) => continue,
+                    Err(_) => return Err(poison_vhost_user_broker_state(state)),
+                }
+            }
+
+            let received = loop {
+                let Some(remaining) = broker_remaining(deadline) else {
+                    return Err(poison_vhost_user_broker_state(state));
+                };
+                if state.socket.set_read_timeout(Some(remaining)).is_err() {
+                    return Err(poison_vhost_user_broker_state(state));
+                }
+                match receive_vhost_user_broker_message(&state.socket) {
+                    Ok(received) => break received,
+                    Err(VhostUserBrokerError::Io(io::ErrorKind::Interrupted)) => continue,
+                    Err(_) => return Err(poison_vhost_user_broker_state(state)),
+                }
+            };
+            if verify_peer_pid(state.socket.as_raw_fd(), state.launcher_pid).is_err()
+                || received.message.session() != state.session
+                || received.message.sequence() != state.next_sequence
+                || received.message.grant_id() != grant_id
+                || received.message.child() != child
+            {
+                return Err(poison_vhost_user_broker_state(state));
+            }
+            let Some(next_sequence) = state.next_sequence.checked_add(1) else {
+                return Err(poison_vhost_user_broker_state(state));
+            };
+            match (received.message, received.descriptor) {
+                (VhostUserBrokerMessage::Connected { .. }, Some(descriptor)) => {
+                    if validate_vhost_user_stream(descriptor.as_raw_fd()).is_err() {
+                        return Err(poison_vhost_user_broker_state(state));
+                    }
+                    state.next_sequence = next_sequence;
+                    *locked = Some(state);
+                    Ok(UnixStream::from(descriptor))
+                }
+                (VhostUserBrokerMessage::Failed { .. }, None) => {
+                    state.next_sequence = next_sequence;
+                    *locked = Some(state);
+                    Err(VhostUserBrokerConnectError::Endpoint)
+                }
+                _ => Err(poison_vhost_user_broker_state(state)),
+            }
+        }
+
+        fn invalidate(&self) {
+            let mut locked = match self.state.lock() {
+                Ok(locked) => locked,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(state) = locked.take() {
+                let _ = state.socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    fn poison_vhost_user_broker_state(state: VhostUserBrokerState) -> VhostUserBrokerConnectError {
+        let _ = state.socket.shutdown(std::net::Shutdown::Both);
+        VhostUserBrokerConnectError::Protocol
+    }
+
+    fn broker_remaining(deadline: Instant) -> Option<Duration> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    fn validate_vhost_user_stream(descriptor: RawFd) -> Result<(), ()> {
+        // SAFETY: These fcntl calls inspect one live received descriptor.
+        let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        // SAFETY: F_GETFL inspects status flags on the same live descriptor.
+        let status_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if descriptor_flags < 0
+            || status_flags < 0
+            || descriptor_flags & libc::FD_CLOEXEC == 0
+            || status_flags & libc::O_NONBLOCK == 0
+            || socket_int_option(descriptor, libc::SO_TYPE)? != libc::SOCK_STREAM
+            || socket_int_option(descriptor, libc::SO_ERROR)? != 0
+        {
+            return Err(());
+        }
+        let mut address = MaybeUninit::<libc::sockaddr_un>::zeroed();
+        let mut length =
+            libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_un>()).map_err(|_| ())?;
+        // SAFETY: Address storage and length are writable for the live stream.
+        if unsafe { libc::getpeername(descriptor, address.as_mut_ptr().cast(), &raw mut length) }
+            != 0
+        {
+            return Err(());
+        }
+        // SAFETY: Successful getpeername initialized the returned address prefix.
+        let address = unsafe { address.assume_init() };
+        if address.sun_family != libc::AF_UNIX as libc::sa_family_t {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn socket_int_option(descriptor: RawFd, option: libc::c_int) -> Result<i32, ()> {
+        let mut value = 0_i32;
+        let mut length = libc::socklen_t::try_from(std::mem::size_of::<i32>()).map_err(|_| ())?;
+        // SAFETY: Value and length are writable for this live socket descriptor.
+        if unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_SOCKET,
+                option,
+                (&raw mut value).cast(),
+                &raw mut length,
+            )
+        } != 0
+            || usize::try_from(length).ok() != Some(std::mem::size_of::<i32>())
+        {
+            return Err(());
+        }
+        Ok(value)
+    }
+
     pub(crate) struct ContainedSession {
         stream: UnixStream,
         lifecycle: Arc<Mutex<WorkerLifecycle>>,
@@ -926,6 +1374,7 @@ mod platform {
         grants: GrantAuthority,
         directory_grants: DirectoryGrantAuthority,
         socket_broker: SocketBrokerAuthority,
+        vhost_user_broker: VhostUserBrokerAuthority,
         socket_namespace: WorkerSocketNamespace,
         policy: WorkerPolicy,
         started: bool,
@@ -959,6 +1408,7 @@ mod platform {
             set_cloexec(SESSION_FD).map_err(|_| ContainedSessionError)?;
             set_cloexec(GRANT_FD).map_err(|_| ContainedSessionError)?;
             set_cloexec(SOCKET_BROKER_FD).map_err(|_| ContainedSessionError)?;
+            set_cloexec(VHOST_USER_BROKER_FD).map_err(|_| ContainedSessionError)?;
             // SAFETY: The validated private bootstrap contract transfers the
             // fixed descriptor exactly once into this process object.
             let owned = unsafe { OwnedFd::from_raw_fd(SESSION_FD) };
@@ -970,6 +1420,9 @@ mod platform {
             // SAFETY: The private bootstrap contract transfers fixed broker fd 5 once.
             let broker_owned = unsafe { OwnedFd::from_raw_fd(SOCKET_BROKER_FD) };
             let broker_socket = UnixDatagram::from(broker_owned);
+            // SAFETY: The private bootstrap contract transfers fixed vhost broker fd 6 once.
+            let vhost_broker_owned = unsafe { OwnedFd::from_raw_fd(VHOST_USER_BROKER_FD) };
+            let vhost_broker_socket = UnixDatagram::from(vhost_broker_owned);
             stream
                 .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
                 .map_err(|_| ContainedSessionError)?;
@@ -978,6 +1431,8 @@ mod platform {
             verify_peer(stream.as_raw_fd(), parent).map_err(|_| ContainedSessionError)?;
             verify_peer_pid(grant_socket.as_raw_fd(), parent).map_err(|_| ContainedSessionError)?;
             verify_peer_pid(broker_socket.as_raw_fd(), parent)
+                .map_err(|_| ContainedSessionError)?;
+            verify_peer_pid(vhost_broker_socket.as_raw_fd(), parent)
                 .map_err(|_| ContainedSessionError)?;
 
             let mut decoder = FrameDecoder::default();
@@ -1075,6 +1530,8 @@ mod platform {
             let file_grants = GrantAuthority::new(grants.take_file_registry());
             let directory_grants = DirectoryGrantAuthority::new(grants.take_directory_registry());
             let socket_broker = SocketBrokerAuthority::new(broker_socket, session, parent);
+            let vhost_user_broker =
+                VhostUserBrokerAuthority::new(vhost_broker_socket, session, parent);
             let lifecycle = Arc::new(Mutex::new(lifecycle));
             let namespace = Arc::new(Mutex::new(Some(namespace)));
             let (wakeup_reader, mut wakeup_writer) =
@@ -1090,7 +1547,10 @@ mod platform {
                     Arc::clone(&lifecycle),
                     Arc::clone(&namespace),
                     Arc::clone(&control),
-                    file_grants.clone(),
+                    ReaderRevocationAuthorities {
+                        grants: file_grants.clone(),
+                        vhost_user_broker: vhost_user_broker.clone(),
+                    },
                     reader_wakeup,
                 )?)
             } else {
@@ -1110,6 +1570,7 @@ mod platform {
                 grants: file_grants,
                 directory_grants,
                 socket_broker,
+                vhost_user_broker,
                 socket_namespace,
                 policy,
                 started,
@@ -1154,6 +1615,10 @@ mod platform {
 
         pub(crate) fn socket_broker_authority(&self) -> Option<SocketBrokerAuthority> {
             self.started.then(|| self.socket_broker.clone())
+        }
+
+        pub(crate) fn vhost_user_broker_authority(&self) -> Option<VhostUserBrokerAuthority> {
+            self.started.then(|| self.vhost_user_broker.clone())
         }
 
         pub(crate) fn socket_namespace(
@@ -1261,6 +1726,7 @@ mod platform {
             self.grants.invalidate();
             self.directory_grants.invalidate();
             self.socket_broker.invalidate();
+            self.vhost_user_broker.invalidate();
             let _ = self.stream.shutdown(std::net::Shutdown::Both);
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
@@ -1491,13 +1957,18 @@ mod platform {
         }
     }
 
+    struct ReaderRevocationAuthorities {
+        grants: GrantAuthority,
+        vhost_user_broker: VhostUserBrokerAuthority,
+    }
+
     fn spawn_reader(
         mut stream: UnixStream,
         mut decoder: FrameDecoder,
         lifecycle: Arc<Mutex<WorkerLifecycle>>,
         namespace: Arc<Mutex<Option<WorkerNamespace>>>,
         control: Arc<SharedControl>,
-        grants: GrantAuthority,
+        authorities: ReaderRevocationAuthorities,
         mut wakeup: UnixStream,
     ) -> Result<JoinHandle<()>, ContainedSessionError> {
         thread::Builder::new()
@@ -1505,7 +1976,8 @@ mod platform {
             .spawn(move || {
                 let state = reader_loop(&mut stream, &mut decoder, &lifecycle);
                 if !control.closing.load(Ordering::Acquire) {
-                    grants.invalidate();
+                    authorities.grants.invalidate();
+                    authorities.vhost_user_broker.invalidate();
                     if state == ControlState::Disconnected {
                         cleanup_namespace(&namespace);
                     }
@@ -1613,23 +2085,70 @@ mod platform {
     }
 
     #[cfg(test)]
+    pub(crate) use tests::{
+        TestDirectory as TestVhostDirectory, empty_grant_authority_for_vhost_test,
+        vhost_directory_authority_for_test,
+    };
+
+    #[cfg(test)]
     mod tests {
-        use std::fs::OpenOptions;
+        use std::fs::{self, OpenOptions};
         use std::io::Read as _;
         use std::mem::MaybeUninit;
         use std::os::fd::{AsRawFd, OwnedFd};
-        use std::path::Path;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::net::{UnixDatagram, UnixStream};
+        use std::path::{Path, PathBuf};
+        use std::rc::Rc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Barrier};
         use std::thread;
 
+        use bangbang_session::macos::bookmark::create_implicit_bookmark;
         use bangbang_session::macos::grant_registry::{GrantRegistry, StagedGrantBatch};
         use bangbang_session::macos::grant_transport::ReceivedGrant;
+        use bangbang_session::macos::vhost_user_broker::{
+            VhostUserBrokerMessage, receive_vhost_user_broker_message,
+            send_vhost_user_broker_message,
+        };
         use bangbang_session::{
             BatchId, GrantAccess, GrantFrame, GrantId, GrantObjectKind, GrantRecord,
             ObjectIdentity, ResourceRole, SessionId,
         };
 
-        use super::{GrantAuthority, GrantClaimError, exact_resource_limit};
+        use super::{
+            DirectoryGrantAuthority, GrantAuthority, GrantClaimError, VhostUserBrokerAuthority,
+            VhostUserBrokerConnectError, exact_resource_limit,
+        };
+
+        static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        pub(crate) struct TestDirectory(PathBuf);
+
+        impl TestDirectory {
+            fn new() -> Self {
+                loop {
+                    let id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                    let path =
+                        PathBuf::from("/tmp").join(format!("bb-cv-{}-{id}", std::process::id()));
+                    match fs::create_dir(&path) {
+                        Ok(()) => return Self(path),
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => panic!("test directory should create: {error}"),
+                    }
+                }
+            }
+
+            pub(crate) fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).expect("test directory should clean up");
+            }
+        }
 
         #[test]
         fn exact_limit_never_raises_the_inherited_hard_limit() {
@@ -1671,7 +2190,9 @@ mod platform {
         ) -> (GrantRecord, OwnedFd) {
             let mut options = OpenOptions::new();
             match access {
-                GrantAccess::ReadOnly | GrantAccess::CreateChildren => {
+                GrantAccess::ReadOnly
+                | GrantAccess::CreateChildren
+                | GrantAccess::ConnectChildren => {
                     options.read(true);
                 }
                 GrantAccess::WriteOnly => {
@@ -1803,6 +2324,106 @@ mod platform {
                 .expect("commit should validate")
                 .expect("commit should return registry")
                 .registry
+        }
+
+        fn vhost_directory_registry() -> (GrantRegistry, TestDirectory) {
+            let directory = TestDirectory::new();
+            let bookmark = create_implicit_bookmark(directory.path(), true)
+                .expect("directory bookmark should create");
+            let descriptor = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(directory.path())
+                .expect("directory anchor should open");
+            let descriptor: OwnedFd = descriptor.into();
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(
+                // SAFETY: stat is writable and the directory descriptor is live.
+                unsafe { libc::fstat(descriptor.as_raw_fd(), stat.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: Successful fstat initialized the complete structure.
+            let stat = unsafe { stat.assume_init() };
+            let identity = ObjectIdentity {
+                device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
+                inode: stat.st_ino,
+            };
+            let session = SessionId::from_bytes([41; 32]);
+            let batch = BatchId::from_bytes([42; 16]);
+            let grant_id = GrantId::parse("vhost-directory").expect("grant ID should parse");
+            let bookmark_bytes = u32::try_from(bookmark.len()).expect("bookmark should fit");
+            let mut staged = StagedGrantBatch::new(session);
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    0,
+                    GrantRecord::Begin {
+                        grant_count: 1,
+                        record_count: 4,
+                        bookmark_bytes,
+                    },
+                    None,
+                ))
+                .expect("begin should stage");
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    1,
+                    GrantRecord::ScopedDirectory {
+                        id: grant_id.clone(),
+                        role: ResourceRole::VhostUserSocketDirectory,
+                        access: GrantAccess::ConnectChildren,
+                        identity,
+                        bookmark_bytes,
+                        fragment_count: 1,
+                    },
+                    Some(descriptor),
+                ))
+                .expect("directory should stage");
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    2,
+                    GrantRecord::BookmarkFragment {
+                        id: grant_id,
+                        offset: 0,
+                        bytes: bookmark,
+                    },
+                    None,
+                ))
+                .expect("bookmark should stage");
+            let registry = staged
+                .accept(received(
+                    session,
+                    batch,
+                    3,
+                    GrantRecord::Commit {
+                        grant_count: 1,
+                        record_count: 4,
+                        bookmark_bytes,
+                    },
+                    None,
+                ))
+                .expect("commit should validate")
+                .expect("commit should return registry")
+                .registry;
+            (registry, directory)
+        }
+
+        pub(crate) fn empty_grant_authority_for_vhost_test() -> GrantAuthority {
+            GrantAuthority::new(Default::default())
+        }
+
+        pub(crate) fn vhost_directory_authority_for_test()
+        -> (DirectoryGrantAuthority, TestDirectory) {
+            let (mut registry, directory) = vhost_directory_registry();
+            (
+                DirectoryGrantAuthority::new(registry.take_directory_registry()),
+                directory,
+            )
         }
 
         #[test]
@@ -2070,6 +2691,149 @@ mod platform {
         }
 
         #[test]
+        fn vhost_directory_first_adoption_rolls_back_then_retains_multiple_child_leases() {
+            let (mut registry, _directory) = vhost_directory_registry();
+            let authority = DirectoryGrantAuthority::new(registry.take_directory_registry());
+            let first = authority
+                .prepare_vhost_user_socket(Path::new("bangbang-grant:vhost-directory/first.sock"))
+                .expect("fresh directory should prepare")
+                .expect("explicit reference should reserve authority");
+            assert_eq!(first.grant_id().as_bytes(), b"vhost-directory");
+            assert_eq!(first.child().as_bytes(), b"first.sock");
+            drop(first);
+
+            let first = authority
+                .prepare_vhost_user_socket(Path::new("bangbang-grant:vhost-directory/first.sock"))
+                .expect("aborted reservation should restore")
+                .expect("restored reference should prepare")
+                .commit();
+            let second = authority
+                .prepare_vhost_user_socket(Path::new("bangbang-grant:vhost-directory/second.sock"))
+                .expect("retained directory should be reusable")
+                .expect("second child should prepare")
+                .commit();
+            assert!(Rc::ptr_eq(&first._directory, &second._directory));
+            assert_eq!(second.child().as_bytes(), b"second.sock");
+            let debug = format!("{first:?} {second:?}");
+            assert!(!debug.contains("vhost-directory"));
+            assert!(!debug.contains("first.sock"));
+            assert!(!debug.contains("second.sock"));
+
+            drop(first);
+            drop(second);
+            assert!(
+                authority
+                    .prepare_vhost_user_socket(Path::new(
+                        "bangbang-grant:vhost-directory/first.sock",
+                    ))
+                    .expect("DELETE-like lease release should retain the directory")
+                    .is_some()
+            );
+            assert!(
+                authority
+                    .prepare_vhost_user_socket(Path::new("bangbang-grant:missing/first.sock",))
+                    .is_err()
+            );
+            authority.invalidate();
+            assert!(
+                authority
+                    .prepare_vhost_user_socket(Path::new(
+                        "bangbang-grant:vhost-directory/first.sock",
+                    ))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn vhost_broker_retries_normal_failure_and_returns_exact_stream() {
+            let session = SessionId::from_bytes([51; 32]);
+            let (worker, launcher) = UnixDatagram::pair().expect("broker pair should open");
+            // SAFETY: Both connected datagram peers belong to this test process.
+            let pid = unsafe { libc::getpid() };
+            let authority = VhostUserBrokerAuthority::new(worker, session, pid);
+            let grant_id = GrantId::parse("vhost-directory").expect("grant should parse");
+            let child = super::SocketChild::parse("backend.sock").expect("child should parse");
+            let launcher_grant = grant_id.clone();
+            let launcher_child = child.clone();
+            let (release, hold) = std::sync::mpsc::channel();
+            let peer = thread::spawn(move || {
+                for sequence in 1..=2 {
+                    let received = receive_vhost_user_broker_message(&launcher)
+                        .expect("request should receive");
+                    assert_eq!(
+                        received.message,
+                        VhostUserBrokerMessage::Connect {
+                            session,
+                            sequence,
+                            grant_id: launcher_grant.clone(),
+                            child: launcher_child.clone(),
+                        }
+                    );
+                    assert!(received.descriptor.is_none());
+                    if sequence == 1 {
+                        send_vhost_user_broker_message(
+                            &launcher,
+                            &VhostUserBrokerMessage::Failed {
+                                session,
+                                sequence,
+                                grant_id: launcher_grant.clone(),
+                                child: launcher_child.clone(),
+                                kind: std::io::ErrorKind::ConnectionRefused,
+                            },
+                            None,
+                        )
+                        .expect("normal failure should send");
+                    } else {
+                        let (stream, peer) = UnixStream::pair().expect("stream pair should open");
+                        stream
+                            .set_nonblocking(true)
+                            .expect("brokered stream should be nonblocking");
+                        send_vhost_user_broker_message(
+                            &launcher,
+                            &VhostUserBrokerMessage::Connected {
+                                session,
+                                sequence,
+                                grant_id: launcher_grant.clone(),
+                                child: launcher_child.clone(),
+                            },
+                            Some(stream.as_raw_fd()),
+                        )
+                        .expect("connected stream should send");
+                        hold.recv()
+                            .expect("launcher facet should remain live through peer validation");
+                        return peer;
+                    }
+                }
+                panic!("second request must return a peer")
+            });
+
+            authority
+                .preflight()
+                .expect("healthy broker preflight should preserve the facet");
+
+            assert_eq!(
+                authority
+                    .connect(&grant_id, &child)
+                    .expect_err("first request should report endpoint failure"),
+                VhostUserBrokerConnectError::Endpoint
+            );
+            let stream = authority
+                .connect(&grant_id, &child)
+                .expect("second request should return the exact stream");
+            // SAFETY: F_GETFD/F_GETFL inspect the live received stream.
+            let descriptor_flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
+            // SAFETY: F_GETFL inspects status flags on the same stream.
+            let status_flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+            assert_ne!(status_flags & libc::O_NONBLOCK, 0);
+            release
+                .send(())
+                .expect("launcher facet should release after validation");
+            drop(stream);
+            drop(peer.join().expect("broker peer should join"));
+        }
+
+        #[test]
         fn file_authority_invalidation_serializes_with_a_claim() {
             let mut registry = file_registry();
             let authority = GrantAuthority::new(registry.take_file_registry());
@@ -2264,5 +3028,10 @@ pub(crate) use platform::{
 };
 #[cfg(target_os = "macos")]
 pub(crate) use platform::{
-    SnapshotStagingRecordTracker, SocketBrokerAuthority, SocketBrokerEndpoint,
+    ClaimedVhostUserSocket, PreparedVhostUserSocketClaim, SnapshotStagingRecordTracker,
+    SocketBrokerAuthority, SocketBrokerEndpoint, VhostUserBrokerAuthority,
+};
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use platform::{
+    TestVhostDirectory, empty_grant_authority_for_vhost_test, vhost_directory_authority_for_test,
 };

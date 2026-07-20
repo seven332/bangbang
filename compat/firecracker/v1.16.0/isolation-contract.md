@@ -64,7 +64,8 @@ timing once and rejects conflicting forwarded singletons. The Darwin wrapper in
 `POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_START_SUSPENDED`, explicitly retains
 each open standard stream, and duplicates only an unnamed lifecycle stream
 endpoint to descriptor 3, an unnamed startup-grant datagram endpoint to
-descriptor 4, and one dormant socket-broker datagram endpoint to descriptor 5.
+descriptor 4, one dormant vsock-broker datagram endpoint to descriptor 5, and
+one dedicated vhost-user-broker datagram endpoint to descriptor 6.
 It constructs the exec environment from only the private lifecycle marker;
 ambient parent, loader, and debug variables are not forwarded. Darwin may add
 runtime-owned entries, but none carries caller authority.
@@ -75,7 +76,7 @@ revalidates live code, and only then sends a random session identity plus one
 fixed redacted `WorkerPolicy` in `Start`.
 
 [`bangbang-session`](../../../crates/session/src/lib.rs) defines the closed
-lifecycle-v4 binary contract. Frames have fixed magic/version/reserved fields, a 256-bit
+lifecycle-v5 binary contract. Frames have fixed magic/version/reserved fields, a 256-bit
 identity, exact per-direction sequence numbers, fixed payload shapes, and a
 4096-byte cap. Replay, sequence gaps, cross-session or wrong-role messages,
 malformed/unknown/oversized/truncated data, and invalid lifecycle transitions
@@ -93,7 +94,7 @@ its peer; this asymmetry is part of the contract.
 `Hello`, `Start`, the grant transaction, and `Proceed` have absolute five-second
 deadlines, and `Terminal` or EOF starts a five-second owned-process exit grace.
 
-The v4 `Start` payload also binds one canonical immutable `VmnetAuthority` to
+The v5 `Start` payload also binds one canonical immutable `VmnetAuthority` to
 the same session, sender, sequence, fixed worker, and daemon reparse. It defaults
 to deny and can contain independent host/shared bits, at most four exact
 1–15-byte `[A-Za-z0-9._-]` bridge names, and a separate active maximum from 1
@@ -170,8 +171,9 @@ out of diagnostics.
 
 The closed roles cover read-only startup config/metadata, kernel/initrd and
 snapshot inputs; repeatable read-only/read-write drive and pmem backing;
-write-only logger/metrics/serial sinks; and create-children API/vsock/snapshot
-output directories. Regular-file authority is descriptor-only. Each mutable
+write-only logger/metrics/serial sinks; create-children API/vsock/snapshot
+output directories; and repeatable connect-only vhost-user socket directories.
+Regular-file authority is descriptor-only. Each mutable
 directory combines an anchor descriptor with a bounded freshly minted ordinary
 implicit bookmark. The worker explicitly starts scope, requires exact resolved
 anchor identity and access, and balances scope on every exit. The platform stale
@@ -208,6 +210,25 @@ adopted descriptor references remain cooperatively owned rather than
 hard-revocable. Operators may still use the direct uncontained executable for
 the broader existing host-path surface, but that mode is not evidence for the
 production containment records.
+
+Contained vhost-user block recognizes only
+`bangbang-grant:<GrantId>/<SocketChild>`, with one bounded ASCII child and an
+exact repeatable `VhostUserSocketDirectory + ConnectChildren` grant. The worker
+retains directory scope and anchor authority by grant ID, while each configured
+drive retains only its exact child lease. Descriptor 6 carries a fixed 256-byte
+`BBU1` request/reply protocol bound to lifecycle SessionId, nonzero monotonic
+sequence, grant ID, and child. The launcher enters the retained anchor by
+descriptor, rejects symlinks and non-current-user, non-socket, or multi-link
+targets, performs one bounded nonblocking relative connect, rechecks the vnode
+and peer, restores its original cwd, and returns exactly one connected stream
+or a stable redacted failure. Startup validates all contained dependencies and
+broker health before the first request; runtime owner preflight happens before
+grant reservation or broker I/O. A failed connection is retryable, ID-only
+PATCH reuses the existing stream, duplicate PUT makes no broker request, and
+DELETE releases the child lease while retaining directory authority for later
+same-ID reinsertion. Malformed framing, stale correlation, unexpected rights,
+peer replacement, lifecycle cancellation, or cwd-integrity failure poisons the
+facet. There is no ambient path fallback or steady-state helper.
 
 Drive and pmem roles are repeatable, so their explicit grant ID is the only
 selection key; no role-based or device-name lookup exists. A contained

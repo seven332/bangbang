@@ -8,6 +8,7 @@ pub mod grant_registry;
 pub mod grant_transport;
 pub mod runtime;
 pub mod socket_broker;
+pub mod vhost_user_broker;
 
 /// Kernel-authenticated identity of a connected local-socket peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
