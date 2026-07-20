@@ -1202,7 +1202,9 @@ impl fmt::Display for DriveUpdateError {
             }
             Self::MismatchedDriveId { .. } => f.write_str("path drive_id must match body drive_id"),
             Self::EmptyPathOnHost => f.write_str("drive path_on_host must not be empty"),
-            Self::UnsupportedBackend => f.write_str("vhost-user drive updates are not supported"),
+            Self::UnsupportedBackend => {
+                f.write_str("path and rate limiter updates are unsupported for vhost-user drives")
+            }
             Self::UnknownDrive { drive_id } => {
                 write!(f, "drive {drive_id} is not configured")
             }
@@ -5270,19 +5272,6 @@ impl RuntimeBlockDeviceResource {
     pub const fn is_vhost_user(&self) -> bool {
         matches!(self, Self::VhostUser { .. })
     }
-
-    /// Materializes the closed resource against the owner's exact live memory.
-    pub fn materialize(
-        self,
-        memory: &GuestMemory,
-    ) -> Result<PreparedBlockDevice, PreparedBlockDeviceError> {
-        match self {
-            Self::Prepared(device) => Ok(device),
-            Self::VhostUser { config, frontend } => {
-                PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, memory)
-            }
-        }
-    }
 }
 
 impl fmt::Debug for RuntimeBlockDeviceResource {
@@ -8953,6 +8942,10 @@ mod tests {
                 ),
             ),
             Err(DriveUpdateError::UnsupportedBackend)
+        );
+        assert_eq!(
+            DriveUpdateError::UnsupportedBackend.to_string(),
+            "path and rate limiter updates are unsupported for vhost-user drives"
         );
     }
 
