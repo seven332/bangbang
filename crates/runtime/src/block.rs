@@ -4098,9 +4098,190 @@ impl std::error::Error for VirtioBlockRequestError {
 pub struct BlockFileBacking {
     file: File,
     len: u64,
+    kind: BlockFileBackingKind,
+    descriptor_identity: BlockFileDescriptorIdentity,
+    descriptor_status: BlockFileDescriptorStatus,
+    block_control: Option<Arc<dyn BlockDeviceControl>>,
     device_id: VirtioBlockDeviceId,
     is_read_only: bool,
     origin: BlockFileBackingOrigin,
+}
+
+/// Checked logical geometry for one block-special backing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BlockDeviceGeometry {
+    logical_block_size: u32,
+    block_count: u64,
+    len: u64,
+}
+
+impl BlockDeviceGeometry {
+    /// Validates logical geometry against the virtio-block and host-I/O bounds.
+    pub fn new(logical_block_size: u32, block_count: u64) -> Option<Self> {
+        let block_size = u64::from(logical_block_size);
+        if block_size == 0 || block_count == 0 || block_size % VIRTIO_BLOCK_SECTOR_SIZE != 0 {
+            return None;
+        }
+        let len = block_size.checked_mul(block_count)?;
+        if len == 0 || len % VIRTIO_BLOCK_SECTOR_SIZE != 0 || i64::try_from(len).is_err() {
+            return None;
+        }
+        Some(Self {
+            logical_block_size,
+            block_count,
+            len,
+        })
+    }
+
+    fn from_len(logical_block_size: u32, len: u64) -> Option<Self> {
+        let block_size = u64::from(logical_block_size);
+        if block_size == 0 || len == 0 || !len.is_multiple_of(block_size) {
+            return None;
+        }
+        Self::new(logical_block_size, len / block_size)
+    }
+
+    /// Returns the logical media block size.
+    pub const fn logical_block_size(self) -> u32 {
+        self.logical_block_size
+    }
+
+    /// Returns the logical media block count.
+    pub const fn block_count(self) -> u64 {
+        self.block_count
+    }
+
+    /// Returns the checked byte capacity.
+    pub const fn len(self) -> u64 {
+        self.len
+    }
+
+    /// Returns whether the byte capacity is empty (always false for validated geometry).
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+impl fmt::Debug for BlockDeviceGeometry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BlockDeviceGeometry(<redacted>)")
+    }
+}
+
+/// Stable redacted failure from one exact block-device control capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockDeviceControlError {
+    kind: io::ErrorKind,
+}
+
+impl BlockDeviceControlError {
+    /// Creates a failure from a bounded I/O category.
+    pub const fn new(kind: io::ErrorKind) -> Self {
+        Self { kind }
+    }
+
+    /// Returns the bounded I/O category without private operation details.
+    pub const fn kind(self) -> io::ErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for BlockDeviceControlError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("block-device control failed")
+    }
+}
+
+impl std::error::Error for BlockDeviceControlError {}
+
+/// Exact block-special operations whose implementation follows backing ownership.
+pub trait BlockDeviceControl: fmt::Debug + Send + Sync {
+    /// Reads fresh logical geometry from the borrowed exact backing descriptor.
+    fn inspect(&self, file: &File) -> Result<BlockDeviceGeometry, BlockDeviceControlError>;
+
+    /// Persists prior writes through the borrowed exact backing descriptor.
+    fn synchronize_cache(&self, file: &File) -> Result<(), BlockDeviceControlError>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BlockFileBackingKind {
+    value: BlockFileBackingKindValue,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockFileBackingKindValue {
+    RegularFile,
+    BlockDevice { geometry: BlockDeviceGeometry },
+}
+
+impl BlockFileBackingKind {
+    const REGULAR_FILE: Self = Self {
+        value: BlockFileBackingKindValue::RegularFile,
+    };
+
+    const fn block_device(geometry: BlockDeviceGeometry) -> Self {
+        Self {
+            value: BlockFileBackingKindValue::BlockDevice { geometry },
+        }
+    }
+
+    pub const fn is_regular_file(self) -> bool {
+        matches!(self.value, BlockFileBackingKindValue::RegularFile)
+    }
+
+    pub const fn is_block_device(self) -> bool {
+        matches!(self.value, BlockFileBackingKindValue::BlockDevice { .. })
+    }
+
+    pub const fn logical_block_size(self) -> Option<u32> {
+        match self.value {
+            BlockFileBackingKindValue::RegularFile => None,
+            BlockFileBackingKindValue::BlockDevice { geometry } => {
+                Some(geometry.logical_block_size())
+            }
+        }
+    }
+
+    /// Returns the checked logical geometry for block-special media.
+    pub const fn block_geometry(self) -> Option<BlockDeviceGeometry> {
+        match self.value {
+            BlockFileBackingKindValue::RegularFile => None,
+            BlockFileBackingKindValue::BlockDevice { geometry } => Some(geometry),
+        }
+    }
+}
+
+impl fmt::Debug for BlockFileBackingKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.value {
+            BlockFileBackingKindValue::RegularFile => formatter.write_str("RegularFile"),
+            BlockFileBackingKindValue::BlockDevice { .. } => formatter
+                .debug_struct("BlockDevice")
+                .field("logical_block_size", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockFileDescriptorIdentity {
+    device: u64,
+    inode: u64,
+    target_device: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockFileDescriptorStatus {
+    normalized_flags: u32,
+}
+
+struct InspectedBlockFileDescriptor {
+    metadata: std::fs::Metadata,
+    len: u64,
+    kind: BlockFileBackingKind,
+    identity: BlockFileDescriptorIdentity,
+    status: BlockFileDescriptorStatus,
+    device_id: VirtioBlockDeviceId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4111,10 +4292,14 @@ enum BlockFileBackingOrigin {
 
 impl fmt::Debug for BlockFileBacking {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BlockFileBacking")
-            .field("file", &"<owned>")
-            .field("len", &self.len)
+        let mut debug = formatter.debug_struct("BlockFileBacking");
+        debug.field("file", &"<owned>");
+        match self.kind.value {
+            BlockFileBackingKindValue::RegularFile => debug.field("len", &self.len),
+            BlockFileBackingKindValue::BlockDevice { .. } => debug.field("len", &"<redacted>"),
+        };
+        debug
+            .field("kind", &self.kind)
             .field("is_read_only", &self.is_read_only)
             .finish()
     }
@@ -4125,6 +4310,8 @@ pub struct BlockFileBackingIdentity {
     device: u64,
     inode: u64,
     len: u64,
+    kind: BlockFileBackingKind,
+    target_device: u64,
     mode: u32,
     modified_seconds: i64,
     modified_nanos: u32,
@@ -4134,6 +4321,43 @@ pub struct BlockFileBackingIdentity {
 
 impl BlockFileBackingIdentity {
     pub fn new(file: [u64; 3], mode: u32, modified: [i64; 2], changed: [i64; 2]) -> Option<Self> {
+        if mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG) {
+            return None;
+        }
+        Self::new_with_kind(
+            file,
+            BlockFileBackingKind::REGULAR_FILE,
+            0,
+            mode,
+            modified,
+            changed,
+        )
+    }
+
+    pub fn new_block_device(
+        file: [u64; 3],
+        target_device: u64,
+        logical_block_size: u32,
+        mode: u32,
+        modified: [i64; 2],
+        changed: [i64; 2],
+    ) -> Option<Self> {
+        let geometry = BlockDeviceGeometry::from_len(logical_block_size, file[2])?;
+        let kind = BlockFileBackingKind::block_device(geometry);
+        if target_device == 0 || mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFBLK) {
+            return None;
+        }
+        Self::new_with_kind(file, kind, target_device, mode, modified, changed)
+    }
+
+    fn new_with_kind(
+        file: [u64; 3],
+        kind: BlockFileBackingKind,
+        target_device: u64,
+        mode: u32,
+        modified: [i64; 2],
+        changed: [i64; 2],
+    ) -> Option<Self> {
         let Ok(modified_nanos) = u32::try_from(modified[1]) else {
             return None;
         };
@@ -4148,6 +4372,8 @@ impl BlockFileBackingIdentity {
             device: file[0],
             inode: file[1],
             len: file[2],
+            kind,
+            target_device,
             mode,
             modified_seconds: modified[0],
             modified_nanos,
@@ -4166,6 +4392,25 @@ impl BlockFileBackingIdentity {
 
     pub const fn len(self) -> u64 {
         self.len
+    }
+
+    pub const fn kind(self) -> BlockFileBackingKind {
+        self.kind
+    }
+
+    pub const fn target_device(self) -> Option<u64> {
+        if self.kind.is_block_device() {
+            Some(self.target_device)
+        } else {
+            None
+        }
+    }
+
+    pub const fn block_count(self) -> Option<u64> {
+        match self.kind.block_geometry() {
+            Some(geometry) => Some(geometry.block_count()),
+            None => None,
+        }
     }
 
     pub const fn is_empty(self) -> bool {
@@ -4245,23 +4490,78 @@ impl BlockFileBacking {
         Self::from_file_with_origin(file, is_read_only, BlockFileBackingOrigin::SuppliedFile)
     }
 
+    /// Adopts an authenticated block-special fd with its exact host control.
+    ///
+    /// Runtime still derives and validates descriptor kind, identity, access,
+    /// status, and byte capacity. The control supplies only live geometry and
+    /// cache synchronization for the same borrowed fd.
+    pub fn from_file_with_block_device_control(
+        file: File,
+        is_read_only: bool,
+        control: Arc<dyn BlockDeviceControl>,
+    ) -> Result<Self, BlockFileBackingError> {
+        if !cfg!(target_os = "macos") {
+            return Err(BlockFileBackingError::UnsupportedFileType);
+        }
+        Self::from_file_with_origin_and_control(
+            file,
+            is_read_only,
+            BlockFileBackingOrigin::SuppliedFile,
+            Some(BlockDeviceControlCandidate::Supplied(control)),
+            true,
+        )
+    }
+
     fn from_file_with_origin(
         file: File,
         is_read_only: bool,
         origin: BlockFileBackingOrigin,
     ) -> Result<Self, BlockFileBackingError> {
-        let metadata = file
-            .metadata()
-            .map_err(|source| BlockFileBackingError::ReadMetadata { source })?;
+        Self::from_file_with_origin_and_control(
+            file,
+            is_read_only,
+            origin,
+            direct_block_device_control(),
+            false,
+        )
+    }
 
-        if !metadata.file_type().is_file() {
-            return Err(BlockFileBackingError::NonRegularFile);
+    fn from_file_with_origin_and_control(
+        file: File,
+        is_read_only: bool,
+        origin: BlockFileBackingOrigin,
+        candidate_control: Option<BlockDeviceControlCandidate>,
+        require_block_device: bool,
+    ) -> Result<Self, BlockFileBackingError> {
+        let inspected = inspect_block_file_descriptor(
+            &file,
+            is_read_only,
+            candidate_control
+                .as_ref()
+                .map(BlockDeviceControlCandidate::as_control),
+            DescriptorCloexecPolicy::SetIfMissing,
+        )?;
+        if require_block_device && !inspected.kind.is_block_device() {
+            return Err(BlockFileBackingError::UnsupportedFileType);
         }
+        let block_control = if inspected.kind.is_block_device() {
+            Some(
+                candidate_control
+                    .ok_or(BlockFileBackingError::UnsupportedFileType)?
+                    .into_control(),
+            )
+        } else {
+            None
+        };
 
         Ok(Self {
             file,
-            len: metadata.len(),
-            device_id: virtio_block_device_id_from_metadata(&metadata),
+            len: inspected.len,
+            kind: inspected.kind,
+            descriptor_identity: inspected.identity,
+            descriptor_status: inspected.status,
+            block_control,
+            device_id: inspected.device_id,
             is_read_only,
             origin,
         })
@@ -4285,10 +4585,22 @@ impl BlockFileBacking {
             if !metadata.file_type().is_file() {
                 return Err(SnapshotBlockFileBackingError::NonRegularFile);
             }
-            let identity = snapshot_block_file_identity(&metadata)?;
+            let descriptor_status = validate_block_file_descriptor_status(
+                &file,
+                true,
+                DescriptorCloexecPolicy::SetIfMissing,
+            )
+            .map_err(|_| SnapshotBlockFileBackingError::InvalidMetadata)?;
+            let kind = BlockFileBackingKind::REGULAR_FILE;
+            let descriptor_identity = block_file_descriptor_identity(&metadata, kind);
+            let identity = snapshot_block_file_identity(&metadata, kind, metadata.len())?;
             let backing = Self {
                 file,
                 len: metadata.len(),
+                kind,
+                descriptor_identity,
+                descriptor_status,
+                block_control: None,
                 device_id: virtio_block_device_id_from_metadata(&metadata),
                 is_read_only: true,
                 origin: BlockFileBackingOrigin::Path,
@@ -4309,21 +4621,28 @@ impl BlockFileBacking {
     ) -> Result<(Self, BlockFileBackingIdentity), SnapshotBlockFileBackingError> {
         #[cfg(unix)]
         {
-            // SAFETY: F_GETFL only inspects the live owned descriptor.
-            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-            if flags < 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
-                return Err(SnapshotBlockFileBackingError::InvalidMetadata);
-            }
+            let descriptor_status = validate_block_file_descriptor_status(
+                &file,
+                true,
+                DescriptorCloexecPolicy::SetIfMissing,
+            )
+            .map_err(|_| SnapshotBlockFileBackingError::InvalidMetadata)?;
             let metadata = file
                 .metadata()
                 .map_err(|_| SnapshotBlockFileBackingError::ReadMetadata)?;
             if !metadata.file_type().is_file() {
                 return Err(SnapshotBlockFileBackingError::NonRegularFile);
             }
-            let identity = snapshot_block_file_identity(&metadata)?;
+            let kind = BlockFileBackingKind::REGULAR_FILE;
+            let descriptor_identity = block_file_descriptor_identity(&metadata, kind);
+            let identity = snapshot_block_file_identity(&metadata, kind, metadata.len())?;
             let backing = Self {
                 file,
                 len: metadata.len(),
+                kind,
+                descriptor_identity,
+                descriptor_status,
+                block_control: None,
                 device_id: virtio_block_device_id_from_metadata(&metadata),
                 is_read_only: true,
                 origin: BlockFileBackingOrigin::SuppliedFile,
@@ -4343,14 +4662,10 @@ impl BlockFileBacking {
     ) -> Result<BlockFileBackingIdentity, SnapshotBlockFileBackingError> {
         #[cfg(unix)]
         {
-            let metadata = self
-                .file
-                .metadata()
-                .map_err(|_| SnapshotBlockFileBackingError::ReadMetadata)?;
-            if !metadata.file_type().is_file() {
-                return Err(SnapshotBlockFileBackingError::NonRegularFile);
-            }
-            snapshot_block_file_identity(&metadata)
+            let inspected = self
+                .validated_current_inspection()
+                .map_err(|_| SnapshotBlockFileBackingError::InvalidMetadata)?;
+            snapshot_block_file_identity(&inspected.metadata, inspected.kind, inspected.len)
         }
 
         #[cfg(not(unix))]
@@ -4365,6 +4680,10 @@ impl BlockFileBacking {
 
     pub const fn len(&self) -> u64 {
         self.len
+    }
+
+    pub const fn kind(&self) -> BlockFileBackingKind {
+        self.kind
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -4415,9 +4734,291 @@ impl BlockFileBacking {
     }
 
     pub fn flush(&self) -> Result<(), BlockFileBackingError> {
-        self.file
-            .sync_all()
-            .map_err(|source| BlockFileBackingError::FlushFile { source })
+        match self.kind.value {
+            BlockFileBackingKindValue::RegularFile => self
+                .file
+                .sync_all()
+                .map_err(|source| BlockFileBackingError::FlushFile { source }),
+            BlockFileBackingKindValue::BlockDevice { .. } => {
+                self.validated_current_inspection()?;
+                self.block_control
+                    .as_ref()
+                    .ok_or(BlockFileBackingError::BackingChanged)?
+                    .synchronize_cache(&self.file)
+                    .map_err(|source| BlockFileBackingError::FlushBlockDevice { source })?;
+                self.validated_current_inspection()?;
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn flush_for_async(&self) -> Result<(), io::ErrorKind> {
+        self.flush().map_err(|source| source.io_error_kind())
+    }
+
+    fn validated_current_inspection(
+        &self,
+    ) -> Result<InspectedBlockFileDescriptor, BlockFileBackingError> {
+        let inspected = inspect_block_file_descriptor(
+            &self.file,
+            self.is_read_only,
+            self.block_control.as_deref(),
+            DescriptorCloexecPolicy::Require,
+        )?;
+        if inspected.kind != self.kind
+            || inspected.len != self.len
+            || inspected.identity != self.descriptor_identity
+            || inspected.status != self.descriptor_status
+            || inspected.device_id != self.device_id
+        {
+            return Err(BlockFileBackingError::BackingChanged);
+        }
+        Ok(inspected)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescriptorCloexecPolicy {
+    SetIfMissing,
+    Require,
+}
+
+enum BlockDeviceControlCandidate {
+    #[cfg(target_os = "macos")]
+    DirectMacos(DirectMacosBlockDeviceControl),
+    Supplied(Arc<dyn BlockDeviceControl>),
+}
+
+impl BlockDeviceControlCandidate {
+    fn as_control(&self) -> &dyn BlockDeviceControl {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::DirectMacos(control) => control,
+            Self::Supplied(control) => control.as_ref(),
+        }
+    }
+
+    fn into_control(self) -> Arc<dyn BlockDeviceControl> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::DirectMacos(control) => Arc::new(control),
+            Self::Supplied(control) => control,
+        }
+    }
+}
+
+fn direct_block_device_control() -> Option<BlockDeviceControlCandidate> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(BlockDeviceControlCandidate::DirectMacos(
+            DirectMacosBlockDeviceControl,
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn inspect_block_file_descriptor(
+    file: &File,
+    is_read_only: bool,
+    block_control: Option<&dyn BlockDeviceControl>,
+    cloexec_policy: DescriptorCloexecPolicy,
+) -> Result<InspectedBlockFileDescriptor, BlockFileBackingError> {
+    let status = validate_block_file_descriptor_status(file, is_read_only, cloexec_policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| BlockFileBackingError::ReadMetadata { source })?;
+
+    let (kind, len) = if metadata.file_type().is_file() {
+        (BlockFileBackingKind::REGULAR_FILE, metadata.len())
+    } else {
+        if metadata.mode() & u32::from(libc::S_IFMT) != u32::from(libc::S_IFBLK)
+            || metadata.rdev() == 0
+        {
+            return Err(BlockFileBackingError::UnsupportedFileType);
+        }
+        let geometry = block_control
+            .ok_or(BlockFileBackingError::UnsupportedFileType)?
+            .inspect(file)
+            .map_err(|source| BlockFileBackingError::ReadBlockGeometry { source })?;
+        (BlockFileBackingKind::block_device(geometry), geometry.len())
+    };
+    let identity = block_file_descriptor_identity(&metadata, kind);
+    let device_id = virtio_block_device_id_from_metadata(&metadata);
+
+    Ok(InspectedBlockFileDescriptor {
+        metadata,
+        len,
+        kind,
+        identity,
+        status,
+        device_id,
+    })
+}
+
+#[cfg(not(unix))]
+fn inspect_block_file_descriptor(
+    _file: &File,
+    _is_read_only: bool,
+    _block_control: Option<&dyn BlockDeviceControl>,
+    _cloexec_policy: DescriptorCloexecPolicy,
+) -> Result<InspectedBlockFileDescriptor, BlockFileBackingError> {
+    Err(BlockFileBackingError::UnsupportedFileType)
+}
+
+#[cfg(unix)]
+fn validate_block_file_descriptor_status(
+    file: &File,
+    is_read_only: bool,
+    cloexec_policy: DescriptorCloexecPolicy,
+) -> Result<BlockFileDescriptorStatus, BlockFileBackingError> {
+    // SAFETY: F_GETFD only reads per-descriptor flags from the live owned fd.
+    let mut descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(BlockFileBackingError::ReadDescriptorFlags {
+            source: io::Error::last_os_error(),
+        });
+    }
+    if descriptor_flags & libc::FD_CLOEXEC == 0
+        && cloexec_policy == DescriptorCloexecPolicy::SetIfMissing
+    {
+        // SAFETY: F_SETFD changes only per-descriptor flags on the live owned fd.
+        if unsafe {
+            libc::fcntl(
+                file.as_raw_fd(),
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+        {
+            return Err(BlockFileBackingError::SetDescriptorFlags {
+                source: io::Error::last_os_error(),
+            });
+        }
+        // SAFETY: F_GETFD verifies the same live descriptor after F_SETFD.
+        descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        if descriptor_flags < 0 {
+            return Err(BlockFileBackingError::ReadDescriptorFlags {
+                source: io::Error::last_os_error(),
+            });
+        }
+    }
+    if descriptor_flags & libc::FD_CLOEXEC == 0 {
+        return Err(BlockFileBackingError::InvalidDescriptorFlags);
+    }
+
+    // SAFETY: F_GETFL only reads status flags from the live owned descriptor.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(BlockFileBackingError::ReadDescriptorFlags {
+            source: io::Error::last_os_error(),
+        });
+    }
+    let expected = if is_read_only {
+        libc::O_RDONLY
+    } else {
+        libc::O_RDWR
+    };
+    if flags & libc::O_ACCMODE != expected {
+        return Err(BlockFileBackingError::AccessModeMismatch);
+    }
+    if flags & libc::O_APPEND != 0 {
+        return Err(BlockFileBackingError::InvalidDescriptorFlags);
+    }
+    let normalized_flags =
+        u32::try_from(flags & (libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK))
+            .map_err(|_| BlockFileBackingError::InvalidDescriptorFlags)?;
+    Ok(BlockFileDescriptorStatus { normalized_flags })
+}
+
+#[cfg(unix)]
+fn block_file_descriptor_identity(
+    metadata: &std::fs::Metadata,
+    kind: BlockFileBackingKind,
+) -> BlockFileDescriptorIdentity {
+    BlockFileDescriptorIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        target_device: if kind.is_block_device() {
+            metadata.rdev()
+        } else {
+            0
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+const DARWIN_IOC_OUT: libc::c_ulong = 0x4000_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_IOC_VOID: libc::c_ulong = 0x2000_0000;
+#[cfg(target_os = "macos")]
+const DARWIN_IOCPARM_MASK: libc::c_ulong = 0x1fff;
+
+#[cfg(target_os = "macos")]
+const fn darwin_ioctl_request(
+    direction: libc::c_ulong,
+    group: u8,
+    number: u8,
+    len: usize,
+) -> libc::c_ulong {
+    direction
+        | (((len as libc::c_ulong) & DARWIN_IOCPARM_MASK) << 16)
+        | ((group as libc::c_ulong) << 8)
+        | number as libc::c_ulong
+}
+
+#[cfg(target_os = "macos")]
+const DKIOCGETBLOCKSIZE: libc::c_ulong =
+    darwin_ioctl_request(DARWIN_IOC_OUT, b'd', 24, std::mem::size_of::<u32>());
+#[cfg(target_os = "macos")]
+const DKIOCGETBLOCKCOUNT: libc::c_ulong =
+    darwin_ioctl_request(DARWIN_IOC_OUT, b'd', 25, std::mem::size_of::<u64>());
+#[cfg(target_os = "macos")]
+const DKIOCSYNCHRONIZECACHE: libc::c_ulong = darwin_ioctl_request(DARWIN_IOC_VOID, b'd', 22, 0);
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct DirectMacosBlockDeviceControl;
+
+#[cfg(target_os = "macos")]
+impl BlockDeviceControl for DirectMacosBlockDeviceControl {
+    fn inspect(&self, file: &File) -> Result<BlockDeviceGeometry, BlockDeviceControlError> {
+        let mut logical_block_size = 0_u32;
+        // SAFETY: DKIOCGETBLOCKSIZE writes one u32 to the valid out pointer for
+        // this call and only inspects the live borrowed disk descriptor.
+        if unsafe { libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKSIZE, &mut logical_block_size) } < 0
+        {
+            return Err(BlockDeviceControlError::new(
+                io::Error::last_os_error().kind(),
+            ));
+        }
+
+        let mut block_count = 0_u64;
+        // SAFETY: DKIOCGETBLOCKCOUNT writes one u64 to the valid out pointer for
+        // this call and only inspects the live borrowed disk descriptor.
+        if unsafe { libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKCOUNT, &mut block_count) } < 0 {
+            return Err(BlockDeviceControlError::new(
+                io::Error::last_os_error().kind(),
+            ));
+        }
+        BlockDeviceGeometry::new(logical_block_size, block_count)
+            .ok_or(BlockDeviceControlError::new(io::ErrorKind::InvalidData))
+    }
+
+    fn synchronize_cache(&self, file: &File) -> Result<(), BlockDeviceControlError> {
+        // SAFETY: DKIOCSYNCHRONIZECACHE has no pointer payload and operates only
+        // on the live borrowed disk descriptor for this call.
+        if unsafe { libc::ioctl(file.as_raw_fd(), DKIOCSYNCHRONIZECACHE) } < 0 {
+            Err(BlockDeviceControlError::new(
+                io::Error::last_os_error().kind(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -4430,13 +5031,25 @@ fn virtio_block_device_id_from_metadata(metadata: &std::fs::Metadata) -> VirtioB
 #[cfg(unix)]
 fn snapshot_block_file_identity(
     metadata: &std::fs::Metadata,
+    kind: BlockFileBackingKind,
+    len: u64,
 ) -> Result<BlockFileBackingIdentity, SnapshotBlockFileBackingError> {
-    BlockFileBackingIdentity::new(
-        [metadata.dev(), metadata.ino(), metadata.len()],
-        metadata.mode(),
-        [metadata.mtime(), metadata.mtime_nsec()],
-        [metadata.ctime(), metadata.ctime_nsec()],
-    )
+    let file = [metadata.dev(), metadata.ino(), len];
+    let modified = [metadata.mtime(), metadata.mtime_nsec()];
+    let changed = [metadata.ctime(), metadata.ctime_nsec()];
+    if kind.is_block_device() {
+        BlockFileBackingIdentity::new_block_device(
+            file,
+            metadata.rdev(),
+            kind.logical_block_size()
+                .ok_or(SnapshotBlockFileBackingError::InvalidMetadata)?,
+            metadata.mode(),
+            modified,
+            changed,
+        )
+    } else {
+        BlockFileBackingIdentity::new(file, metadata.mode(), modified, changed)
+    }
     .ok_or(SnapshotBlockFileBackingError::InvalidMetadata)
 }
 
@@ -4446,7 +5059,7 @@ fn open_block_file(path: &Path, is_read_only: bool) -> Result<File, BlockFileBac
 
     #[cfg(unix)]
     {
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
 
     options
@@ -4485,7 +5098,19 @@ pub enum BlockFileBackingError {
     ReadMetadata {
         source: io::Error,
     },
-    NonRegularFile,
+    ReadDescriptorFlags {
+        source: io::Error,
+    },
+    SetDescriptorFlags {
+        source: io::Error,
+    },
+    InvalidDescriptorFlags,
+    AccessModeMismatch,
+    UnsupportedFileType,
+    ReadBlockGeometry {
+        source: BlockDeviceControlError,
+    },
+    BackingChanged,
     AccessLengthTooLarge {
         len: usize,
     },
@@ -4508,6 +5133,30 @@ pub enum BlockFileBackingError {
     FlushFile {
         source: io::Error,
     },
+    FlushBlockDevice {
+        source: BlockDeviceControlError,
+    },
+}
+
+impl BlockFileBackingError {
+    fn io_error_kind(&self) -> io::ErrorKind {
+        match self {
+            Self::OpenFile { source }
+            | Self::ReadMetadata { source }
+            | Self::ReadDescriptorFlags { source }
+            | Self::SetDescriptorFlags { source }
+            | Self::ReadFile { source }
+            | Self::WriteFile { source }
+            | Self::FlushFile { source } => source.kind(),
+            Self::ReadBlockGeometry { source } | Self::FlushBlockDevice { source } => source.kind(),
+            Self::UnsupportedBackend | Self::UnsupportedFileType => io::ErrorKind::Unsupported,
+            Self::AccessModeMismatch | Self::ReadOnlyWrite => io::ErrorKind::PermissionDenied,
+            Self::InvalidDescriptorFlags | Self::BackingChanged => io::ErrorKind::InvalidData,
+            Self::AccessLengthTooLarge { .. }
+            | Self::AccessOverflow { .. }
+            | Self::AccessOutOfBounds { .. } => io::ErrorKind::InvalidInput,
+        }
+    }
 }
 
 impl fmt::Display for BlockFileBackingError {
@@ -4520,9 +5169,25 @@ impl fmt::Display for BlockFileBackingError {
             Self::ReadMetadata { source } => {
                 write!(f, "failed to read block backing file metadata: {source}")
             }
-            Self::NonRegularFile => {
-                f.write_str("block backing path does not reference a regular file")
+            Self::ReadDescriptorFlags { source } => {
+                write!(f, "failed to read block backing descriptor flags: {source}")
             }
+            Self::SetDescriptorFlags { source } => {
+                write!(f, "failed to set block backing descriptor flags: {source}")
+            }
+            Self::InvalidDescriptorFlags => {
+                f.write_str("block backing descriptor flags are invalid")
+            }
+            Self::AccessModeMismatch => {
+                f.write_str("block backing descriptor access mode does not match the drive")
+            }
+            Self::UnsupportedFileType => f.write_str(
+                "block backing descriptor is neither a regular file nor a supported block device",
+            ),
+            Self::ReadBlockGeometry { source } => {
+                write!(f, "failed to read block backing geometry: {source}")
+            }
+            Self::BackingChanged => f.write_str("block backing descriptor changed"),
             Self::AccessLengthTooLarge { len } => {
                 write!(f, "block backing access length {len} is too large")
             }
@@ -4544,6 +5209,9 @@ impl fmt::Display for BlockFileBackingError {
             Self::FlushFile { source } => {
                 write!(f, "failed to flush block backing file: {source}")
             }
+            Self::FlushBlockDevice { source } => {
+                write!(f, "failed to synchronize block backing cache: {source}")
+            }
         }
     }
 }
@@ -4553,11 +5221,17 @@ impl std::error::Error for BlockFileBackingError {
         match self {
             Self::OpenFile { source }
             | Self::ReadMetadata { source }
+            | Self::ReadDescriptorFlags { source }
+            | Self::SetDescriptorFlags { source }
             | Self::ReadFile { source }
             | Self::WriteFile { source }
             | Self::FlushFile { source } => Some(source),
+            Self::ReadBlockGeometry { source } | Self::FlushBlockDevice { source } => Some(source),
             Self::UnsupportedBackend
-            | Self::NonRegularFile
+            | Self::InvalidDescriptorFlags
+            | Self::AccessModeMismatch
+            | Self::UnsupportedFileType
+            | Self::BackingChanged
             | Self::AccessLengthTooLarge { .. }
             | Self::AccessOverflow { .. }
             | Self::AccessOutOfBounds { .. }
@@ -7830,7 +8504,8 @@ mod tests {
     };
 
     use super::{
-        BlockCaptureIoEngine, BlockFileBacking, BlockFileBackingError, BlockMmioDevices,
+        BlockCaptureIoEngine, BlockDeviceControl, BlockDeviceControlError, BlockDeviceGeometry,
+        BlockFileBacking, BlockFileBackingError, BlockFileBackingIdentity, BlockMmioDevices,
         BlockMmioLayout, BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
         DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveLiveUpdateMode,
         DriveRateLimiterConfig, DriveReplacementIdentityField, DriveRuntimeMutationError,
@@ -10903,7 +11578,8 @@ mod tests {
                 assert_eq!(drive_id, "rootfs");
                 assert!(matches!(
                     source,
-                    BlockFileBackingError::OpenFile { .. } | BlockFileBackingError::NonRegularFile
+                    BlockFileBackingError::OpenFile { .. }
+                        | BlockFileBackingError::UnsupportedFileType
                 ));
             }
             PreparedBlockDeviceError::AllocateDevices { .. } => {
@@ -10941,7 +11617,8 @@ mod tests {
                 assert_eq!(drive_id, "rootfs");
                 assert!(matches!(
                     source,
-                    BlockFileBackingError::OpenFile { .. } | BlockFileBackingError::NonRegularFile
+                    BlockFileBackingError::OpenFile { .. }
+                        | BlockFileBackingError::UnsupportedFileType
                 ));
             }
             PreparedBlockDeviceError::AllocateDevices { .. } => {
@@ -15563,7 +16240,7 @@ mod tests {
         let err = BlockFileBacking::from_file(provided_dir, true)
             .expect_err("provided directory should fail");
 
-        assert!(matches!(err, BlockFileBackingError::NonRegularFile));
+        assert!(matches!(err, BlockFileBackingError::UnsupportedFileType));
     }
 
     #[test]
@@ -15725,16 +16402,256 @@ mod tests {
     }
 
     #[test]
-    fn rejects_directory_backing_as_non_regular() {
+    fn rejects_directory_backing_as_unsupported_type() {
         let dir = temp_dir("dir.img");
         let err = open_backing(dir.as_path(), true).expect_err("directory backing should fail");
 
-        assert!(matches!(err, BlockFileBackingError::NonRegularFile));
+        assert!(matches!(err, BlockFileBackingError::UnsupportedFileType));
         assert_eq!(
             err.to_string(),
-            "block backing path does not reference a regular file"
+            "block backing descriptor is neither a regular file nor a supported block device"
         );
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn direct_backing_open_rejects_final_symlink_and_character_device() {
+        let file = temp_file("direct-nofollow-source.img", b"source");
+        let link = TempPath {
+            path: temp_path("direct-nofollow-link.img"),
+        };
+        std::os::unix::fs::symlink(file.as_path(), link.as_path())
+            .expect("test symlink should be created");
+
+        let symlink_error =
+            open_backing(link.as_path(), true).expect_err("final symlink should fail");
+        let character_error =
+            open_backing("/dev/null", true).expect_err("character device should fail");
+
+        assert!(matches!(
+            symlink_error,
+            BlockFileBackingError::OpenFile { .. }
+        ));
+        assert!(matches!(
+            character_error,
+            BlockFileBackingError::UnsupportedFileType
+        ));
+        assert!(!symlink_error.to_string().contains("direct-nofollow"));
+        assert!(!character_error.to_string().contains("/dev/null"));
+    }
+
+    #[test]
+    fn supplied_backing_requires_exact_descriptor_access_mode() {
+        let file = temp_file("descriptor-access.img", b"access");
+        let read_write = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.as_path())
+            .expect("read-write descriptor should open");
+        let read_only = OpenOptions::new()
+            .read(true)
+            .open(file.as_path())
+            .expect("read-only descriptor should open");
+        let write_only = OpenOptions::new()
+            .write(true)
+            .open(file.as_path())
+            .expect("write-only descriptor should open");
+
+        for error in [
+            BlockFileBacking::from_file(read_write, true)
+                .expect_err("read-write descriptor should not satisfy read-only"),
+            BlockFileBacking::from_file(read_only, false)
+                .expect_err("read-only descriptor should not satisfy read-write"),
+            BlockFileBacking::from_file(write_only, false)
+                .expect_err("write-only descriptor should not satisfy read-write"),
+        ] {
+            assert!(matches!(error, BlockFileBackingError::AccessModeMismatch));
+            assert_eq!(
+                error.to_string(),
+                "block backing descriptor access mode does not match the drive"
+            );
+            assert!(!error.to_string().contains("descriptor-access"));
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnexpectedBlockControl;
+
+    impl BlockDeviceControl for UnexpectedBlockControl {
+        fn inspect(&self, _file: &File) -> Result<BlockDeviceGeometry, BlockDeviceControlError> {
+            panic!("regular descriptors must not invoke block control")
+        }
+
+        fn synchronize_cache(&self, _file: &File) -> Result<(), BlockDeviceControlError> {
+            panic!("regular descriptors must not invoke block control")
+        }
+    }
+
+    #[test]
+    fn supplied_block_control_cannot_forge_regular_descriptor_kind() {
+        let file = temp_file("control-regular.img", b"regular");
+        let descriptor = File::open(file.as_path()).expect("regular descriptor should open");
+        let error = BlockFileBacking::from_file_with_block_device_control(
+            descriptor,
+            true,
+            Arc::new(UnexpectedBlockControl),
+        )
+        .expect_err("block-only construction must reject a regular descriptor");
+
+        assert!(matches!(error, BlockFileBackingError::UnsupportedFileType));
+        let control_error = BlockDeviceControlError::new(io::ErrorKind::PermissionDenied);
+        assert_eq!(control_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(control_error.to_string(), "block-device control failed");
+        assert!(!format!("{control_error:?}").contains("control-regular"));
+        assert_eq!(
+            BlockFileBackingError::ReadBlockGeometry {
+                source: control_error,
+            }
+            .io_error_kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            BlockFileBackingError::FlushBlockDevice {
+                source: control_error,
+            }
+            .io_error_kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn supplied_backing_rejects_append_and_normalizes_cloexec() {
+        let file = temp_file("descriptor-status.img", b"status");
+        let append = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(file.as_path())
+            .expect("append descriptor should open");
+        assert!(matches!(
+            BlockFileBacking::from_file(append, false),
+            Err(BlockFileBackingError::InvalidDescriptorFlags)
+        ));
+
+        let descriptor = File::open(file.as_path()).expect("read-only descriptor should open");
+        // SAFETY: F_SETFD clears only per-descriptor flags on this owned test fd.
+        let clear_result = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, 0) };
+        assert_eq!(clear_result, 0);
+        let backing = BlockFileBacking::from_file(descriptor, true)
+            .expect("adoption should restore descriptor-local CLOEXEC");
+        // SAFETY: F_GETFD only reads per-descriptor flags from the retained fd.
+        let descriptor_flags = unsafe { libc::fcntl(backing.file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+
+        // SAFETY: This deliberately violates the retained descriptor invariant.
+        let clear_result = unsafe { libc::fcntl(backing.file.as_raw_fd(), libc::F_SETFD, 0) };
+        assert_eq!(clear_result, 0);
+        assert_eq!(
+            backing.snapshot_identity(),
+            Err(SnapshotBlockFileBackingError::InvalidMetadata)
+        );
+    }
+
+    #[test]
+    fn capture_rejects_changed_semantic_status_flags() {
+        let file = temp_file("descriptor-status-change.img", b"status");
+        let descriptor = File::open(file.as_path()).expect("read-only descriptor should open");
+        let backing =
+            BlockFileBacking::from_file(descriptor, true).expect("regular descriptor should adopt");
+        // SAFETY: F_GETFL inspects the retained live descriptor.
+        let flags = unsafe { libc::fcntl(backing.file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        // SAFETY: F_SETFL changes only status flags on the retained test descriptor.
+        let set_result = unsafe {
+            libc::fcntl(
+                backing.file.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        };
+        assert_eq!(set_result, 0);
+        assert_eq!(
+            backing.snapshot_identity(),
+            Err(SnapshotBlockFileBackingError::InvalidMetadata)
+        );
+    }
+
+    #[test]
+    fn block_geometry_validation_is_exact_bounded_and_sector_aligned() {
+        let geometry = BlockDeviceGeometry::new(512, 8).expect("valid geometry should pass");
+        assert_eq!(geometry.logical_block_size(), 512);
+        assert_eq!(geometry.block_count(), 8);
+        assert_eq!(geometry.len(), 4096);
+        assert!(!geometry.is_empty());
+        assert!(format!("{geometry:?}").contains("<redacted>"));
+        assert!(!format!("{geometry:?}").contains("512"));
+
+        assert!(BlockDeviceGeometry::new(0, 8).is_none());
+        assert!(BlockDeviceGeometry::new(512, 0).is_none());
+        assert!(BlockDeviceGeometry::new(768, 8).is_none());
+        assert!(BlockDeviceGeometry::new(4096, u64::MAX).is_none());
+        assert!(BlockDeviceGeometry::new(512, i64::MAX as u64 / 512 + 1).is_none());
+    }
+
+    #[test]
+    fn block_capture_identity_binds_target_and_logical_geometry() {
+        let identity = BlockFileBackingIdentity::new_block_device(
+            [11, 12, 4096],
+            13,
+            512,
+            u32::from(libc::S_IFBLK),
+            [14, 15],
+            [16, 17],
+        )
+        .expect("valid block identity should build");
+
+        assert!(identity.kind().is_block_device());
+        assert_eq!(identity.kind().logical_block_size(), Some(512));
+        assert_eq!(identity.target_device(), Some(13));
+        assert_eq!(identity.block_count(), Some(8));
+        assert!(format!("{identity:?}").contains("<redacted>"));
+        assert!(!format!("{identity:?}").contains("13"));
+        assert!(
+            BlockFileBackingIdentity::new_block_device(
+                [11, 12, 4096],
+                0,
+                512,
+                u32::from(libc::S_IFBLK),
+                [14, 15],
+                [16, 17],
+            )
+            .is_none()
+        );
+        assert!(
+            BlockFileBackingIdentity::new_block_device(
+                [11, 12, 4097],
+                13,
+                512,
+                u32::from(libc::S_IFBLK),
+                [14, 15],
+                [16, 17],
+            )
+            .is_none()
+        );
+        assert!(
+            BlockFileBackingIdentity::new_block_device(
+                [11, 12, 4096],
+                13,
+                512,
+                u32::from(libc::S_IFREG),
+                [14, 15],
+                [16, 17],
+            )
+            .is_none()
+        );
+        assert!(
+            BlockFileBackingIdentity::new(
+                [11, 12, 4096],
+                u32::from(libc::S_IFBLK),
+                [14, 15],
+                [16, 17],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -15742,7 +16659,7 @@ mod tests {
         let fifo = temp_fifo("fifo.img");
         let err = open_backing(fifo.as_path(), true).expect_err("FIFO backing should fail");
 
-        assert!(matches!(err, BlockFileBackingError::NonRegularFile));
+        assert!(matches!(err, BlockFileBackingError::UnsupportedFileType));
     }
 
     #[test]
@@ -15753,7 +16670,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            BlockFileBackingError::OpenFile { .. } | BlockFileBackingError::NonRegularFile
+            BlockFileBackingError::OpenFile { .. } | BlockFileBackingError::UnsupportedFileType
         ));
         assert!(!err.to_string().contains("socket.img"));
     }

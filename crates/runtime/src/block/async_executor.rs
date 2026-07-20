@@ -601,7 +601,7 @@ impl BlockAsyncHostIo for SystemBlockAsyncHostIo {
     }
 
     fn flush(&self, backing: &BlockFileBacking) -> Result<(), io::ErrorKind> {
-        backing.file.sync_all().map_err(|source| source.kind())
+        backing.flush_for_async()
     }
 }
 

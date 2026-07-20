@@ -418,7 +418,7 @@ pub fn capture_snapshot_v1_device_state(
     let live_backing = live_device
         .backing()
         .ok_or(SnapshotV1DeviceCaptureError::UnsupportedDriveProfile)?;
-    if !live_backing.is_read_only() {
+    if !live_backing.is_read_only() || !live_backing.kind().is_regular_file() {
         return Err(SnapshotV1DeviceCaptureError::UnsupportedDriveProfile);
     }
     let live_identity = live_backing
@@ -652,6 +652,9 @@ pub fn encode_snapshot_v1_device_state(
             SnapshotV1DeviceEncodeError::EmptyPartuuid,
             SnapshotV1DeviceEncodeError::PartuuidTooLong,
         )?;
+    }
+    if !root.backing_identity().kind().is_regular_file() {
+        return Err(SnapshotV1DeviceEncodeError::InvalidState);
     }
 
     validate_encode_transport(root.runtime())?;
@@ -1658,12 +1661,39 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(decoded, state);
+        assert!(
+            decoded
+                .root_block()
+                .backing_identity()
+                .kind()
+                .is_regular_file()
+        );
         assert_eq!(&first[..8], &SNAPSHOT_V1_DEVICE_MAGIC);
         assert_eq!(first.len(), 566);
         assert_eq!(
             u32::from_le_bytes(first[20..24].try_into().expect("body length should exist")),
             u32::try_from(first.len() - SNAPSHOT_V1_DEVICE_HEADER_SIZE)
                 .expect("fixture length should fit")
+        );
+    }
+
+    #[test]
+    fn native_v1_device_encoder_rejects_in_memory_block_backing_identity() {
+        let block_identity = BlockFileBackingIdentity::new_block_device(
+            [1, 2, 512],
+            3,
+            512,
+            u32::from(libc::S_IFBLK | 0o444),
+            [4, 5],
+            [6, 7],
+        )
+        .expect("synthetic block identity should validate");
+        let state = fixture_with_path(PathBuf::from("/tmp/block-device"), block_identity);
+
+        assert_eq!(
+            encode_snapshot_v1_device_state(&state)
+                .expect_err("native-v1 must remain regular-file-only"),
+            SnapshotV1DeviceEncodeError::InvalidState
         );
     }
 
