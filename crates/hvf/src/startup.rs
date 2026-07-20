@@ -18,11 +18,13 @@ use bangbang_runtime::balloon::{
     VirtioBalloonConfigSpace, VirtioBalloonDevice, VirtioBalloonDeviceNotificationError,
     VirtioBalloonQueueLayout,
 };
+use bangbang_runtime::block::async_executor::{BlockAsyncRuntimeError, SharedBlockAsyncRuntime};
 use bangbang_runtime::block::{
-    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveRateLimiterConfig,
+    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveLiveUpdateMode, DriveRateLimiterConfig,
     DriveRuntimeMutationError, DriveUpdateError, PreparedBlockDevice, RuntimeBlockDeviceResource,
     VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_QUEUE_SIZES, VhostUserBlockConfigSignalError,
     VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceNotificationError,
+    VirtioBlockLiveUpdateError,
 };
 use bangbang_runtime::boot::BootSourceFiles;
 use bangbang_runtime::boot_timer::{
@@ -90,9 +92,10 @@ use bangbang_runtime::startup::{
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig, Arm64BootVmGenIdDevice,
     Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
     Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
-    Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, VmStartupResources,
-    memory_hotplug_status_for_device, refresh_vhost_user_block_config_for_devices_with_signal,
-    replace_arm64_boot_vmgenid, update_memory_hotplug_config_for_device,
+    Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, OpenedBlockDeviceLiveUpdate,
+    VmStartupResources, memory_hotplug_status_for_device,
+    refresh_vhost_user_block_config_for_devices_with_signal, replace_arm64_boot_vmgenid,
+    update_live_block_device_for_devices_with_opened, update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::virtio::{
     UnsupportedVirtioDeviceConfig, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioDeviceActivation,
@@ -778,8 +781,9 @@ impl HvfArm64BootPciDataDevices {
 
     fn insert_runtime_block(
         &mut self,
-        prepared: PreparedBlockDevice,
+        mut prepared: PreparedBlockDevice,
         metrics: &SharedBlockDeviceMetricsRegistry,
+        async_runtime: &SharedBlockAsyncRuntime,
     ) -> Result<(), DriveRuntimeMutationError> {
         if !self.runtime_hotplug {
             return Err(DriveRuntimeMutationError::PciNotEnabled);
@@ -824,33 +828,54 @@ impl HvfArm64BootPciDataDevices {
                 message: source.to_string(),
             }
         })?;
+        let mut dispatcher =
+            self.dispatcher
+                .lock()
+                .map_err(|_| DriveRuntimeMutationError::TerminalInsertion {
+                    message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                })?;
+        let region_id = Self::available_region_id(&dispatcher).map_err(|source| {
+            DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        prepared
+            .bind_async_runtime(async_runtime.clone())
+            .map_err(|source| DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            })?;
+        let async_binding = prepared.device().async_binding();
         let (published_drive_id, is_root_device, config_space, device) = prepared.into_parts();
         debug_assert_eq!(published_drive_id, drive_id);
         debug_assert!(!is_root_device);
-        let published = {
-            let mut dispatcher = self.dispatcher.lock().map_err(|_| {
-                DriveRuntimeMutationError::TerminalInsertion {
-                    message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+        let publication = PublishedVirtioPciEndpoint::publish(
+            VirtioPciIdentity::new(block_type, config_space.available_features()),
+            &VIRTIO_BLOCK_QUEUE_SIZES,
+            config_space,
+            device,
+            false,
+            self.validation.bar_allocator_mut(),
+            segment,
+            &mut dispatcher,
+            region_id,
+            interrupts,
+        )
+        .map_err(runtime_block_publication_error);
+        drop(dispatcher);
+        let published = match publication {
+            Ok(published) => published,
+            Err(source) => {
+                if let Some((runtime, generation)) = async_binding
+                    && runtime
+                        .discard_generation_without_guest_memory(generation)
+                        .is_err()
+                {
+                    return Err(DriveRuntimeMutationError::TerminalInsertion {
+                        message: "runtime Async block publication rollback failed".to_string(),
+                    });
                 }
-            })?;
-            let region_id = Self::available_region_id(&dispatcher).map_err(|source| {
-                DriveRuntimeMutationError::PrepareDevice {
-                    message: source.to_string(),
-                }
-            })?;
-            PublishedVirtioPciEndpoint::publish(
-                VirtioPciIdentity::new(block_type, config_space.available_features()),
-                &VIRTIO_BLOCK_QUEUE_SIZES,
-                config_space,
-                device,
-                false,
-                self.validation.bar_allocator_mut(),
-                segment,
-                &mut dispatcher,
-                region_id,
-                interrupts,
-            )
-            .map_err(runtime_block_publication_error)?
+                return Err(source);
+            }
         };
         let metrics_lease = prepared_metrics.publish();
         debug_assert!(self.block.len() < self.block.capacity());
@@ -985,7 +1010,66 @@ impl HvfArm64BootPciDataDevices {
             })
     }
 
-    fn remove_runtime_block(&mut self, drive_id: &str) -> Result<(), DriveRuntimeMutationError> {
+    fn update_runtime_file_block(
+        &self,
+        memory: &mut GuestMemory,
+        update: HvfLiveBlockUpdate<'_>,
+        async_runtime: &SharedBlockAsyncRuntime,
+        metrics: &SharedBlockDeviceMetricsRegistry,
+    ) -> Result<(), DriveUpdateError> {
+        let HvfLiveBlockUpdate {
+            config,
+            backing,
+            rate_limiter_update,
+            mode,
+        } = update;
+        let device = self
+            .block
+            .iter()
+            .find(|device| device.drive_id == config.drive_id())
+            .ok_or_else(|| DriveUpdateError::UnknownDrive {
+                drive_id: config.drive_id().to_string(),
+            })?;
+        let result = device
+            .published
+            .endpoint()
+            .update_live_block_device_with_opened(
+                memory,
+                config,
+                backing,
+                rate_limiter_update,
+                mode,
+                async_runtime,
+            );
+        match result {
+            Ok(dispatch) => {
+                metrics.record_queue_dispatch_for_drive(config.drive_id(), &dispatch);
+                Ok(())
+            }
+            Err(source) => {
+                if let Some(dispatch) = source.completed_device_operation() {
+                    metrics.record_queue_dispatch_for_drive(config.drive_id(), dispatch);
+                }
+                let terminal = source.endpoint_error().is_some()
+                    || source
+                        .device_error()
+                        .is_some_and(VirtioBlockLiveUpdateError::terminal);
+                let message = source.to_string();
+                if terminal {
+                    Err(DriveUpdateError::TerminalActiveSessionCommand { message })
+                } else {
+                    Err(DriveUpdateError::ActiveSessionCommand { message })
+                }
+            }
+        }
+    }
+
+    fn remove_runtime_block(
+        &mut self,
+        drive_id: &str,
+        memory: &mut GuestMemory,
+        metrics: &SharedBlockDeviceMetricsRegistry,
+    ) -> Result<(), DriveRuntimeMutationError> {
         if !self.runtime_hotplug {
             return Err(DriveRuntimeMutationError::PciNotEnabled);
         }
@@ -1032,12 +1116,27 @@ impl HvfArm64BootPciDataDevices {
                     },
                 );
             }
+            let retire = device.published.endpoint().retire_quiesced_async(memory);
+            match &retire {
+                Ok(dispatch) => metrics.record_queue_dispatch_for_drive(drive_id, dispatch),
+                Err(source) => {
+                    if let Some(dispatch) = source.completed_device_operation() {
+                        metrics.record_queue_dispatch_for_drive(drive_id, dispatch);
+                    }
+                }
+            }
             device
                 .published
                 .commit_prepared_teardown(&mut dispatcher, self.validation.bar_allocator_mut())
                 .map_err(|source| DriveRuntimeMutationError::TerminalRemoval {
                     message: source.to_string(),
                 })?;
+            if let Err(source) = retire {
+                self.block.remove(index);
+                return Err(DriveRuntimeMutationError::TerminalRemoval {
+                    message: format!("failed to retire Async block work: {source}"),
+                });
+            }
         }
         self.block.remove(index);
         Ok(())
@@ -2289,6 +2388,104 @@ fn refresh_mmio_vhost_user_block_config(
             })
         },
     )
+}
+
+#[derive(Debug)]
+struct HvfLiveBlockUpdate<'a> {
+    config: &'a DriveConfig,
+    backing: Option<BlockFileBacking>,
+    rate_limiter_update: Option<DriveRateLimiterConfig>,
+    mode: DriveLiveUpdateMode,
+}
+
+impl<'a> HvfLiveBlockUpdate<'a> {
+    const fn new(
+        config: &'a DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+        mode: DriveLiveUpdateMode,
+    ) -> Self {
+        Self {
+            config,
+            backing,
+            rate_limiter_update,
+            mode,
+        }
+    }
+}
+
+fn update_mmio_live_block_device(
+    backend: &mut HvfBackend,
+    runtime_resources: &Arm64BootRuntimeResources,
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    gic: &HvfGicMetadata,
+    metrics: &SharedBlockDeviceMetricsRegistry,
+    update: HvfLiveBlockUpdate<'_>,
+) -> Result<(), DriveUpdateError> {
+    let HvfLiveBlockUpdate {
+        config,
+        backing,
+        rate_limiter_update,
+        mode,
+    } = update;
+    let device = runtime_resources
+        .block_devices
+        .iter()
+        .find(|device| device.registration.drive_id() == config.drive_id())
+        .ok_or_else(|| DriveUpdateError::UnknownDrive {
+            drive_id: config.drive_id().to_string(),
+        })?;
+    let interrupt_line = device.fdt_device.interrupt_line;
+    let config_changed = backing.is_some() || mode == DriveLiveUpdateMode::Replacement;
+    let dispatch = {
+        let memory = backend.mapped_guest_memory_mut().map_err(|source| {
+            DriveUpdateError::ActiveSessionCommand {
+                message: format!("guest memory is unavailable: {source}"),
+            }
+        })?;
+        let mut dispatcher = lock_boot_mmio_dispatcher(mmio_dispatcher).map_err(|source| {
+            DriveUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            }
+        })?;
+        update_live_block_device_for_devices_with_opened(
+            &runtime_resources.block_devices,
+            &mut dispatcher,
+            memory,
+            OpenedBlockDeviceLiveUpdate::new(
+                config,
+                backing,
+                rate_limiter_update,
+                mode,
+                &runtime_resources.block_async_runtime,
+            ),
+        )?
+    };
+    metrics.record_queue_dispatch_for_drive(config.drive_id(), &dispatch);
+    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+        DriveUpdateError::TerminalActiveSessionCommand {
+            message: source.to_string(),
+        }
+    })?;
+    if dispatch.needs_queue_interrupt()
+        && let Err(source) =
+            signal_device_interrupt(interrupt_line, DeviceInterruptKind::Queue, &signaler)
+    {
+        metrics.record_event_failure_for_drive(config.drive_id());
+        return Err(DriveUpdateError::TerminalActiveSessionCommand {
+            message: source.to_string(),
+        });
+    }
+    if config_changed
+        && let Err(source) =
+            signal_device_interrupt(interrupt_line, DeviceInterruptKind::Config, &signaler)
+    {
+        metrics.record_event_failure_for_drive(config.drive_id());
+        return Err(DriveUpdateError::TerminalActiveSessionCommand {
+            message: source.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Cloneable live-update handle for production PCI network endpoints.
@@ -4051,6 +4248,24 @@ impl std::error::Error for HvfArm64BootRunLoopWakeupMonitorError {
     }
 }
 
+fn shutdown_block_async_before_guest_memory_teardown(
+    backend: &mut HvfBackend,
+    runtime_resources: &Arm64BootRuntimeResources,
+) -> Result<(), HvfArm64BootSessionShutdownError> {
+    if runtime_resources
+        .shutdown_block_async_if_idle()
+        .map_err(|source| HvfArm64BootSessionShutdownError::BlockAsync { source })?
+    {
+        return Ok(());
+    }
+    let memory = backend
+        .mapped_guest_memory_mut()
+        .map_err(|source| HvfArm64BootSessionShutdownError::BlockAsyncGuestMemory { source })?;
+    runtime_resources
+        .shutdown_block_async(memory)
+        .map_err(|source| HvfArm64BootSessionShutdownError::BlockAsync { source })
+}
+
 impl HvfArm64BootSession<'_> {
     /// Quiesce block, pmem, network, and entropy limiter retry wakeup publication.
     pub fn quiesce_limiter_retry_wakeups(
@@ -4179,12 +4394,18 @@ impl HvfArm64BootSession<'_> {
         self.pmem_retry_wakeup_scheduler.stop();
         self.network_retry_wakeup_scheduler.stop();
         self.entropy_retry_wakeup_scheduler.stop();
+        let runner_result = self.runner.shutdown();
+        let block_async_result = if runner_result.is_ok() {
+            shutdown_block_async_before_guest_memory_teardown(self.backend, &self.runtime_resources)
+        } else {
+            Ok(())
+        };
         let pci_data_result = self.teardown_pci_data_devices();
         let pci_result = self.teardown_pci_validation_endpoint();
-        let runner_result = self.runner.shutdown();
         if let Err(source) = runner_result {
             return Err(HvfArm64BootSessionShutdownError::Vcpu { source });
         }
+        block_async_result?;
         if let Err(source) = pci_data_result {
             return Err(HvfArm64BootSessionShutdownError::PciData { source });
         }
@@ -4360,10 +4581,11 @@ impl HvfArm64BootSession<'_> {
         prepared: PreparedBlockDevice,
     ) -> Result<(), DriveRuntimeMutationError> {
         let metrics = self.block_device_metrics.clone();
+        let async_runtime = self.runtime_resources.block_async_runtime.clone();
         self.pci_data_devices
             .as_mut()
             .ok_or(DriveRuntimeMutationError::PciNotEnabled)?
-            .insert_runtime_block(prepared, &metrics)
+            .insert_runtime_block(prepared, &metrics, &async_runtime)
     }
 
     /// Updates one entry by resolving it from the current owner-thread inventory.
@@ -4377,6 +4599,40 @@ impl HvfArm64BootSession<'_> {
             .as_ref()
             .ok_or(DriveUpdateError::ActiveSessionUnavailable)?
             .update_runtime_block(config, backing, rate_limiter_update)
+    }
+
+    pub fn update_live_block_device_with_opened(
+        &mut self,
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+        mode: DriveLiveUpdateMode,
+    ) -> Result<(), DriveUpdateError> {
+        if config.is_vhost_user() {
+            return self.refresh_vhost_user_block_config(config);
+        }
+        let update = HvfLiveBlockUpdate::new(config, backing, rate_limiter_update, mode);
+        if let Some(devices) = self.pci_data_devices.as_ref() {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                DriveUpdateError::ActiveSessionCommand {
+                    message: format!("guest memory is unavailable: {source}"),
+                }
+            })?;
+            return devices.update_runtime_file_block(
+                memory,
+                update,
+                &self.runtime_resources.block_async_runtime,
+                &self.block_device_metrics,
+            );
+        }
+        update_mmio_live_block_device(
+            self.backend,
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            &self.gic,
+            &self.block_device_metrics,
+            update,
+        )
     }
 
     /// Refreshes one active direct vhost-user block configuration through its
@@ -4404,10 +4660,17 @@ impl HvfArm64BootSession<'_> {
         &mut self,
         drive_id: &str,
     ) -> Result<(), DriveRuntimeMutationError> {
+        let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+            DriveRuntimeMutationError::ActiveSessionCommand {
+                message: format!("guest memory is unavailable: {source}"),
+            }
+        })?;
         remove_runtime_pci_block_device_and_refresh_retry(
             &mut self.pci_data_devices,
             &self.block_retry_wakeup,
             &self.block_retry_wakeup_scheduler,
+            memory,
+            &self.block_device_metrics,
             drive_id,
         )
     }
@@ -6231,12 +6494,21 @@ impl OwnedHvfArm64BootSession {
         self.pmem_retry_wakeup_scheduler.stop();
         self.network_retry_wakeup_scheduler.stop();
         self.entropy_retry_wakeup_scheduler.stop();
+        let runner_result = self.runner.shutdown();
+        let block_async_result = if runner_result.is_ok() {
+            shutdown_block_async_before_guest_memory_teardown(
+                &mut self.backend,
+                &self.runtime_resources,
+            )
+        } else {
+            Ok(())
+        };
         let pci_data_result = self.teardown_pci_data_devices();
         let pci_result = self.teardown_pci_validation_endpoint();
-        let runner_result = self.runner.shutdown();
         if let Err(source) = runner_result {
             return Err(HvfArm64BootSessionShutdownError::Vcpu { source });
         }
+        block_async_result?;
         if let Err(source) = pci_data_result {
             return Err(HvfArm64BootSessionShutdownError::PciData { source });
         }
@@ -6435,10 +6707,11 @@ impl OwnedHvfArm64BootSession {
         prepared: PreparedBlockDevice,
     ) -> Result<(), DriveRuntimeMutationError> {
         let metrics = self.block_device_metrics.clone();
+        let async_runtime = self.runtime_resources.block_async_runtime.clone();
         self.pci_data_devices
             .as_mut()
             .ok_or(DriveRuntimeMutationError::PciNotEnabled)?
-            .insert_runtime_block(prepared, &metrics)
+            .insert_runtime_block(prepared, &metrics, &async_runtime)
     }
 
     /// Updates one entry by resolving it from the current owner-thread inventory.
@@ -6452,6 +6725,40 @@ impl OwnedHvfArm64BootSession {
             .as_ref()
             .ok_or(DriveUpdateError::ActiveSessionUnavailable)?
             .update_runtime_block(config, backing, rate_limiter_update)
+    }
+
+    pub fn update_live_block_device_with_opened(
+        &mut self,
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+        mode: DriveLiveUpdateMode,
+    ) -> Result<(), DriveUpdateError> {
+        if config.is_vhost_user() {
+            return self.refresh_vhost_user_block_config(config);
+        }
+        let update = HvfLiveBlockUpdate::new(config, backing, rate_limiter_update, mode);
+        if let Some(devices) = self.pci_data_devices.as_ref() {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                DriveUpdateError::ActiveSessionCommand {
+                    message: format!("guest memory is unavailable: {source}"),
+                }
+            })?;
+            return devices.update_runtime_file_block(
+                memory,
+                update,
+                &self.runtime_resources.block_async_runtime,
+                &self.block_device_metrics,
+            );
+        }
+        update_mmio_live_block_device(
+            &mut self.backend,
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            &self.gic,
+            &self.block_device_metrics,
+            update,
+        )
     }
 
     /// Refreshes one active direct vhost-user block configuration through its
@@ -6479,10 +6786,17 @@ impl OwnedHvfArm64BootSession {
         &mut self,
         drive_id: &str,
     ) -> Result<(), DriveRuntimeMutationError> {
+        let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+            DriveRuntimeMutationError::ActiveSessionCommand {
+                message: format!("guest memory is unavailable: {source}"),
+            }
+        })?;
         remove_runtime_pci_block_device_and_refresh_retry(
             &mut self.pci_data_devices,
             &self.block_retry_wakeup,
             &self.block_retry_wakeup_scheduler,
+            memory,
+            &self.block_device_metrics,
             drive_id,
         )
     }
@@ -9176,10 +9490,18 @@ fn start_run_loop_vsock_wakeup_monitor(
     let pci_vsock = pci_data_devices.filter(|devices| devices.vsock.is_some());
     let has_mmio_block = !runtime_resources.block_devices.is_empty();
     let has_pci_block = pci_data_devices.is_some_and(|devices| !devices.block.is_empty());
+    let async_block_fd = runtime_resources
+        .block_async_completion_fd()
+        .map_err(
+            |source| HvfArm64BootRunLoopWakeupMonitorError::PciBlockWakeup {
+                message: source.to_string(),
+            },
+        )?;
     if runtime_resources.vsock_device.is_none()
         && pci_vsock.is_none()
         && !has_mmio_block
         && !has_pci_block
+        && async_block_fd.is_none()
     {
         return Ok(HvfArm64BootRunLoopWakeupMonitor::inactive());
     }
@@ -9187,18 +9509,37 @@ fn start_run_loop_vsock_wakeup_monitor(
     let mut read_fds = Vec::new();
     let mut write_fds = Vec::new();
     let mut deadline = None;
-    let mut has_block_wakeup_fds = false;
+    let mut has_block_wakeup_fds = async_block_fd.is_some();
+    if let Some(descriptor) = async_block_fd {
+        read_fds
+            .try_reserve_exact(1)
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
+        read_fds.push(descriptor);
+    }
     if runtime_resources.vsock_device.is_some() || has_mmio_block {
         let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(dispatcher)
             .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
         if runtime_resources.vsock_device.is_some() {
-            (read_fds, write_fds, deadline) =
+            let (vsock_read_fds, vsock_write_fds, vsock_deadline) =
                 runtime_resources
                     .vsock_wakeup(&mut mmio_dispatcher)
                     .map_err(|source| {
                         HvfArm64BootRunLoopWakeupMonitorError::CollectVsockWakeupFds { source }
                     })?
                     .into_parts();
+            read_fds
+                .try_reserve_exact(vsock_read_fds.len())
+                .map_err(
+                    |source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source },
+                )?;
+            write_fds
+                .try_reserve_exact(vsock_write_fds.len())
+                .map_err(
+                    |source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source },
+                )?;
+            read_fds.extend(vsock_read_fds);
+            write_fds.extend(vsock_write_fds);
+            deadline = earliest_deadline(deadline, vsock_deadline);
         }
         if has_mmio_block {
             let block_fds =
@@ -10488,12 +10829,14 @@ fn remove_runtime_pci_block_device_and_refresh_retry(
     pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
     retry_wakeup: &HvfArm64BootLimiterRetryWakeupToken,
     retry_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    memory: &mut GuestMemory,
+    metrics: &SharedBlockDeviceMetricsRegistry,
     drive_id: &str,
 ) -> Result<(), DriveRuntimeMutationError> {
     let devices = pci_data_devices
         .as_mut()
         .ok_or(DriveRuntimeMutationError::PciNotEnabled)?;
-    devices.remove_runtime_block(drive_id)?;
+    devices.remove_runtime_block(drive_id, memory, metrics)?;
 
     refresh_block_retry_wakeup_after_inventory_change(
         retry_wakeup,
@@ -11753,10 +12096,16 @@ impl std::error::Error for HvfArm64BootVmGenIdRestoreError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum HvfArm64BootSessionShutdownError {
     Vcpu {
         source: HvfVcpuRunCoordinatorError,
+    },
+    BlockAsyncGuestMemory {
+        source: HvfGuestMemoryMappingError,
+    },
+    BlockAsync {
+        source: BlockAsyncRuntimeError,
     },
     PciValidation {
         source: HvfArm64BootPciValidationTeardownError,
@@ -11778,6 +12127,15 @@ impl fmt::Display for HvfArm64BootSessionShutdownError {
                     "failed to shut down HVF boot-session vCPU topology: {source}"
                 )
             }
+            Self::BlockAsyncGuestMemory { source } => {
+                write!(
+                    f,
+                    "failed to map guest memory for Async block shutdown: {source}"
+                )
+            }
+            Self::BlockAsync { source } => {
+                write!(f, "failed to shut down Async block I/O: {source}")
+            }
             Self::PciValidation { source } => {
                 write!(f, "failed to tear down PCI validation endpoint: {source}")
             }
@@ -11795,6 +12153,8 @@ impl std::error::Error for HvfArm64BootSessionShutdownError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Vcpu { source } => Some(source),
+            Self::BlockAsyncGuestMemory { source } => Some(source),
+            Self::BlockAsync { source } => Some(source),
             Self::PciValidation { source } => Some(source),
             Self::PciData { source } => Some(source),
             Self::DestroyVm { source } => Some(source),

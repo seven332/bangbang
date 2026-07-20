@@ -2886,7 +2886,7 @@ fn normal_bundle_boots_read_only_pmem_root_from_exact_granted_descriptor() {
 }
 
 #[test]
-fn normal_bundle_live_block_grant_swap_uses_preauthorized_open_file() {
+fn normal_bundle_live_async_block_grant_swap_uses_preauthorized_open_file() {
     let bundle = production_bundle();
     let fixture = GuestDeviceGrantFixture::new("live-block");
     let mut running = spawn_ready_device_grant_api_launcher(&bundle, &fixture, "live-block");
@@ -2932,6 +2932,7 @@ fn normal_bundle_live_block_grant_swap_uses_preauthorized_open_file() {
                 "path_on_host": GUEST_ROOTFS_REF,
                 "is_root_device": true,
                 "is_read_only": true,
+                "io_engine": "Async",
             }),
             "PUT live-block rootfs",
         ),
@@ -2975,16 +2976,18 @@ fn normal_bundle_live_block_grant_swap_uses_preauthorized_open_file() {
     let replacement = serde_json::json!({
         "drive_id": "data",
         "path_on_host": GUEST_REPLACEMENT_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+        "io_engine": "Async",
     });
     assert_http_status(
-        &http_request(
+        &http_put(
             &running.socket,
-            "PATCH",
             "/drives/data",
             &serde_json::to_string(&replacement).expect("replacement should serialize"),
         ),
         204,
-        "PATCH live block grant replacement",
+        "same-ID PUT live block grant Sync to Async replacement",
     );
     assert_http_status(
         &http_request(
@@ -3004,6 +3007,7 @@ fn normal_bundle_live_block_grant_swap_uses_preauthorized_open_file() {
     );
     assert!(config.contains(GUEST_REPLACEMENT_REF));
     assert!(!config.contains(GUEST_DATA_REF));
+    assert!(config.contains(r#""io_engine":"Async""#));
 
     assert_http_status(
         &http_request(
@@ -3047,7 +3051,7 @@ fn normal_bundle_live_block_grant_swap_uses_preauthorized_open_file() {
 }
 
 #[test]
-fn normal_bundle_hotplugs_runtime_block_from_exact_unused_grants() {
+fn normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants() {
     let bundle = production_bundle();
     let fixture = GuestDeviceGrantFixture::new("runtime-block-hotplug");
     resize_and_write_file_marker_at(&fixture.data, 1024, 0, &[]);
@@ -3097,6 +3101,7 @@ fn normal_bundle_hotplugs_runtime_block_from_exact_unused_grants() {
                 "path_on_host": GUEST_ROOTFS_REF,
                 "is_root_device": true,
                 "is_read_only": true,
+                "io_engine": "Async",
             }),
             "PUT contained block-hotplug rootfs",
         ),
@@ -3108,6 +3113,7 @@ fn normal_bundle_hotplugs_runtime_block_from_exact_unused_grants() {
                 "is_root_device": false,
                 "is_read_only": false,
                 "cache_type": "Writeback",
+                "io_engine": "Async",
             }),
             "PUT contained block-hotplug control drive",
         ),
@@ -3164,6 +3170,7 @@ fn normal_bundle_hotplugs_runtime_block_from_exact_unused_grants() {
         "is_root_device": false,
         "is_read_only": false,
         "cache_type": "Writeback",
+        "io_engine": "Async",
     });
     assert_http_status(
         &http_put(
@@ -3211,6 +3218,7 @@ fn normal_bundle_hotplugs_runtime_block_from_exact_unused_grants() {
         "is_root_device": false,
         "is_read_only": false,
         "cache_type": "Writeback",
+        "io_engine": "Async",
     });
     assert_http_status(
         &http_put(
@@ -3229,6 +3237,7 @@ fn normal_bundle_hotplugs_runtime_block_from_exact_unused_grants() {
     );
     assert!(reused.contains(GUEST_HOTPLUG_REUSE_REF));
     assert!(!reused.contains(GUEST_REPLACEMENT_REF));
+    assert!(reused.contains(r#""io_engine":"Async""#));
     resize_and_write_file_marker_at(
         &fixture.opened_data,
         1024,

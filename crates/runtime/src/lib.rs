@@ -751,6 +751,22 @@ impl VmmController {
             .map_err(VmmActionError::DriveRuntimeMutation)
     }
 
+    pub fn prepare_runtime_drive_replacement(
+        &self,
+        input: block::DriveConfigInput,
+    ) -> Result<block::DriveConfig, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "PutDrive",
+                state: self.instance_info.state,
+            });
+        }
+        let replacement = input.validate().map_err(VmmActionError::DriveConfig)?;
+        self.drive_configs
+            .validate_runtime_replacement(replacement)
+            .map_err(VmmActionError::DriveUpdate)
+    }
+
     pub fn commit_runtime_drive_insert(&mut self, prepared: block::PreparedDriveConfigInsert) {
         self.drive_configs.commit_runtime_insert(prepared);
         self.snapshot_load_history_fresh = false;
@@ -1280,7 +1296,11 @@ impl VmmController {
             && self.custom_cpu_template.is_none()
             && machine_config.huge_pages() == machine::MachineConfigHugePages::None;
         let drive_supported = match self.drive_configs.as_slice() {
-            [drive] => drive.is_root_device() && drive.is_read_only() == Some(true),
+            [drive] => {
+                drive.is_root_device()
+                    && drive.is_read_only() == Some(true)
+                    && drive.io_engine() == Some(block::DriveIoEngine::Sync)
+            }
             _ => false,
         };
         let mmds_configured = self.snapshot_mmds_configured()?;
@@ -2027,7 +2047,7 @@ mod tests {
             BalloonHintingStartInput, BalloonHintingStatusError, BalloonStatsError,
             BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
         },
-        block::{DriveConfigError, DriveConfigInput, DriveUpdateInput},
+        block::{DriveConfigError, DriveConfigInput, DriveIoEngine, DriveUpdateInput},
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
@@ -3242,6 +3262,15 @@ mod tests {
                     drive_input("root", "/tmp/rootfs", true).with_is_read_only(false),
                 ))
                 .expect("writable root should be stored");
+        });
+        assert_snapshot_profile_rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    drive_input("root", "/tmp/rootfs", true)
+                        .with_is_read_only(true)
+                        .with_io_engine(DriveIoEngine::Async),
+                ))
+                .expect("Async root should be stored before snapshot preflight");
         });
         assert_snapshot_profile_rejected(|controller| {
             controller

@@ -61,6 +61,17 @@ certification, and Firecracker's KVM ITS identity remain explicit limits.
 Native-v1 create/load rejects PCI profiles before artifact or VM mutation,
 while the default MMIO snapshot profile is unchanged.
 
+File-backed drives accept omitted/default `Sync` or explicit `Async` over MMIO
+and PCI. `Async` uses one lazy bounded portable worker pool per VM session and
+one completion wakeup watched by the owner thread; completion, not submission,
+publishes descriptor status, used entries, dirty ranges, interrupts, and
+metrics. Multiple drives use generation-bound routing so live path PATCH,
+same-ID backing/engine/limiter PUT, PCI hotplug/DELETE/reuse, reset, and shutdown
+quiesce only the intended work. Direct paths and contained preopened grants use
+the same transaction. This is the Firecracker-shaped public engine behavior,
+not a claim that macOS supplies Linux io_uring. Native-v1 remains Sync-only and
+rejects Async drives before artifact creation.
+
 Pre-boot drives may instead select Firecracker's vhost-user block `socket`
 shape. Direct mode accepts an operator path; production contained mode accepts
 only `bangbang-grant:<GrantId>/<SocketChild>` backed by a repeatable
@@ -84,8 +95,8 @@ insertion, and exhausted capacity reject before any broker request or direct
 socket connection. DELETE releases the frontend, shared-memory descriptor
 clones, metrics generation, BAR, MSI-X, and PCI slot for deterministic reuse.
 Ambient contained socket paths, dynamic-memory coexistence, automatic guest PCI
-notification, same-ID replacement without DELETE, Async/io_uring, and vhost
-snapshot state remain explicit limits.
+notification, same-ID vhost replacement without DELETE, and vhost snapshot
+state remain explicit limits.
 
 ## Layout
 
@@ -1055,7 +1066,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 84 implemented-and-verified, 314 audit-required, three
+delivery overlay with 86 implemented-and-verified, 312 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1145,6 +1156,12 @@ second exact child, and exact stream closure. They likewise leave no helper or
 entitlement change. Abrupt launcher-first and worker-first cases replace the
 granted API pathname before death and prove both surviving cleanup owners
 preserve the replacement while clearing the matching private namespace record.
+Signed file-backed Async cases separately cover direct MMIO live path PATCH,
+config-file startup, two concurrent Async root/data drives, first-use PCI
+hotplug, DELETE/reuse, and paused same-ID Sync-to-Async replacement. Normal
+production cases repeat contained Async root/control startup, preauthorized
+same-ID backing/engine replacement, limiter PATCH, and runtime
+hotplug/DELETE/reuse without reopening grant tags.
 
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
 validation work:

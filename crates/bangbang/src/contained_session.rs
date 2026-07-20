@@ -2087,7 +2087,7 @@ mod platform {
     #[cfg(test)]
     pub(crate) use tests::{
         TestDirectory as TestVhostDirectory, empty_grant_authority_for_vhost_test,
-        vhost_directory_authority_for_test,
+        file_grant_authority_for_test, vhost_directory_authority_for_test,
     };
 
     #[cfg(test)]
@@ -2415,6 +2415,11 @@ mod platform {
 
         pub(crate) fn empty_grant_authority_for_vhost_test() -> GrantAuthority {
             GrantAuthority::new(Default::default())
+        }
+
+        pub(crate) fn file_grant_authority_for_test() -> GrantAuthority {
+            let mut registry = file_registry();
+            GrantAuthority::new(registry.take_file_registry())
         }
 
         pub(crate) fn vhost_directory_authority_for_test()
@@ -3033,5 +3038,6 @@ pub(crate) use platform::{
 };
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{
-    TestVhostDirectory, empty_grant_authority_for_vhost_test, vhost_directory_authority_for_test,
+    TestVhostDirectory, empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
+    vhost_directory_authority_for_test,
 };

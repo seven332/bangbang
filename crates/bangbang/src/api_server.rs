@@ -2276,7 +2276,7 @@ mod tests {
         VIRTIO_BALLOON_FREE_PAGE_HINT_STOP, VIRTIO_BALLOON_S_MEMFREE, VIRTIO_BALLOON_S_SWAP_OUT,
         VirtioBalloonStat,
     };
-    use bangbang_runtime::block::DriveUpdateError;
+    use bangbang_runtime::block::{DriveLiveUpdateMode, DriveUpdateError};
     use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
     use bangbang_runtime::memory::{
@@ -2465,6 +2465,7 @@ mod tests {
             _config: &DriveConfig,
             _backing_update: BlockBackingUpdate,
             _rate_limiter_update: Option<DriveRateLimiterConfig>,
+            _mode: DriveLiveUpdateMode,
         ) -> Result<(), DriveUpdateError> {
             match self.drive_update_result.clone() {
                 Some(err) => Err(err),
@@ -10558,7 +10559,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_unsupported_drive_io_engine_without_storing() {
+    fn accepts_async_drive_io_engine_and_stores_exact_config() {
         let path = unique_socket_path("drive-io");
         let server = ApiServer::bind(&path).expect("server should bind");
         let mut client = UnixStream::connect(&path).expect("client should connect");
@@ -10586,9 +10587,13 @@ mod tests {
             .read_to_string(&mut response)
             .expect("client should read response");
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(r#"{"fault_message":"drive io_engine Async is not supported"}"#));
-        assert!(vmm.drive_configs().is_empty());
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(
+            vmm.drive_configs()[0].io_engine(),
+            Some(DriveIoEngine::Async)
+        );
     }
 
     #[test]

@@ -575,6 +575,23 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
         Ok(())
     }
 
+    /// Runs one transport-owned operation after guest paths and ordinary work
+    /// admission have been quiesced for teardown.
+    pub(crate) fn with_quiesced_core_mut<R>(
+        &self,
+        operation: impl FnOnce(&mut VirtioDeviceCore<C, A>) -> R,
+    ) -> Result<R, VirtioPciEndpointError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| VirtioPciEndpointError::StatePoisoned)?;
+        if state.phase != VirtioPciEndpointPhase::Quiescing {
+            return Err(VirtioPciEndpointError::NotActive { phase: state.phase });
+        }
+        Ok(operation(&mut state.core))
+    }
+
     fn lock_active(
         &self,
     ) -> Result<MutexGuard<'_, VirtioPciEndpointState<C, A>>, VirtioPciEndpointError> {

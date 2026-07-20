@@ -257,7 +257,7 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_starts_instance_and_guest_writes_block_marker() {
+    fn signed_executable_runs_async_block_over_mmio_with_live_patch() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let backing_path = test_dir.path().join("data.img");
@@ -319,7 +319,8 @@ mod macos_arm64 {
                 "drive_id":"data",
                 "path_on_host":{backing_path_json},
                 "is_root_device":false,
-                "is_read_only":false
+                "is_read_only":false,
+                "io_engine":"Async"
             }}"#
         );
         let drive_response = http_put_json(&socket_path, "/drives/data", &drive_body);
@@ -331,7 +332,8 @@ mod macos_arm64 {
                 "drive_id":"scratch",
                 "path_on_host":{scratch_backing_path_json},
                 "is_root_device":false,
-                "is_read_only":false
+                "is_read_only":false,
+                "io_engine":"Async"
             }}"#
         );
         let scratch_drive_response =
@@ -861,6 +863,11 @@ mod macos_arm64 {
             2,
             "drive update must keep only the configured data and scratch drives; response:\n{vm_config}"
         );
+        assert_eq!(
+            vm_config.matches(r#""io_engine":"Async""#).count(),
+            2,
+            "both live MMIO drives must retain Async through PATCH; response:\n{vm_config}"
+        );
         assert!(
             !vm_config.contains(r#""drive_id":"replacement""#),
             "rejected drive PUT must not add replacement drive; response:\n{vm_config}"
@@ -1245,7 +1252,7 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_starts_from_config_file() {
+    fn signed_executable_starts_async_block_from_config_file() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let config_path = test_dir.path().join("vm-config.json");
@@ -1281,7 +1288,8 @@ mod macos_arm64 {
                     "drive_id": "data",
                     "path_on_host": {backing_path_json},
                     "is_root_device": false,
-                    "is_read_only": false
+                    "is_read_only": false,
+                    "io_engine": "Async"
                 }}],
                 "vsock": {{"guest_cid": 3, "uds_path": {uds_path_json}}},
                 "metrics": {{"metrics_path": {metrics_path_json}}},
@@ -1533,7 +1541,7 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_boots_direct_rootfs_when_data_drive_configured_before_root() {
+    fn signed_executable_boots_async_block_root_and_data_when_data_configured_first() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let data_backing_path = test_dir.path().join("data.img");
@@ -1569,7 +1577,8 @@ mod macos_arm64 {
                 "drive_id":"data",
                 "path_on_host":{data_backing_path_json},
                 "is_root_device":false,
-                "is_read_only":false
+                "is_read_only":false,
+                "io_engine":"Async"
             }}"#
         );
         let data_drive_response = http_put_json(&socket_path, "/drives/data", &data_drive_body);
@@ -1584,7 +1593,8 @@ mod macos_arm64 {
                 "drive_id":"rootfs",
                 "path_on_host":{rootfs_path_json},
                 "is_root_device":true,
-                "is_read_only":true
+                "is_read_only":true,
+                "io_engine":"Async"
             }}"#
         );
         let rootfs_response = http_put_json(&socket_path, "/drives/rootfs", &rootfs_body);
@@ -3753,12 +3763,13 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_hotplugs_and_reuses_runtime_block_over_product_pci() {
+    fn signed_executable_hotplugs_replaces_and_reuses_async_block_over_product_pci() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let control_backing_path = test_dir.path().join("hotplug-control.img");
         let first_backing_path = test_dir.path().join("hotplug-first.img");
         let second_backing_path = test_dir.path().join("hotplug-second.img");
+        let replacement_backing_path = test_dir.path().join("hotplug-replacement.img");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -3766,6 +3777,11 @@ mod macos_arm64 {
         create_block_backing_with_prefix(&control_backing_path, 2, &[]);
         create_block_backing_with_prefix(&first_backing_path, 1, BLOCK_HOTPLUG_HOST_ONE_MARKER);
         create_block_backing_with_prefix(&second_backing_path, 1, BLOCK_HOTPLUG_HOST_TWO_MARKER);
+        create_block_backing_with_prefix(
+            &replacement_backing_path,
+            1,
+            BLOCK_HOTPLUG_HOST_TWO_MARKER,
+        );
 
         let mut bangbang =
             BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
@@ -3861,29 +3877,13 @@ mod macos_arm64 {
         );
 
         let first_body = format!(
-            r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+            r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Async"}}"#,
             json_string(path_text(&first_backing_path)),
         );
         assert_no_content_response(
             &http_put_json(&socket_path, "/drives/hotdata", &first_body),
             "runtime PUT /drives/hotdata first block",
         );
-        let duplicate_body = format!(
-            r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false}}"#,
-            json_string(path_text(&second_backing_path)),
-        );
-        let duplicate = http_put_json(&socket_path, "/drives/hotdata", &duplicate_body);
-        assert_bad_request_response(&duplicate, "duplicate runtime PUT /drives/hotdata");
-        assert_response_contains(
-            &duplicate,
-            r#"{"fault_message":"drive is already configured"}"#,
-            "duplicate runtime PUT /drives/hotdata",
-        );
-        assert!(
-            !duplicate.contains(path_text(&second_backing_path)),
-            "duplicate runtime response must not echo the rejected backing path: {duplicate}"
-        );
-
         if let Err(err) = wait_for_file_prefix_marker(
             &first_backing_path,
             BLOCK_HOTPLUG_GUEST_ONE_MARKER,
@@ -3922,16 +3922,37 @@ mod macos_arm64 {
             "successful DELETE must remove the live configuration projection: {removed_config}"
         );
 
+        let second_body = format!(
+            r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}}"#,
+            json_string(path_text(&second_backing_path)),
+        );
         assert_no_content_response(
-            &http_put_json(&socket_path, "/drives/hotdata", &duplicate_body),
-            "paused runtime PUT /drives/hotdata reused block",
+            &http_put_json(&socket_path, "/drives/hotdata", &second_body),
+            "paused runtime PUT /drives/hotdata reused Sync block",
+        );
+        let replacement_body = format!(
+            r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Async","rate_limiter":{{"ops":{{"size":2,"one_time_burst":1,"refill_time":100}}}}}}"#,
+            json_string(path_text(&replacement_backing_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/hotdata", &replacement_body),
+            "paused same-ID PUT /drives/hotdata Sync to Async replacement",
         );
         let reused_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&reused_config, "GET /vm/config after paused block reuse");
         assert_response_contains(
             &reused_config,
-            path_text(&second_backing_path),
+            path_text(&replacement_backing_path),
             "GET /vm/config after paused block reuse",
+        );
+        assert_response_contains(
+            &reused_config,
+            r#""io_engine":"Async""#,
+            "GET /vm/config after paused Async replacement",
+        );
+        assert!(
+            !reused_config.contains(path_text(&second_backing_path)),
+            "same-ID replacement must remove the intermediate backing projection: {reused_config}"
         );
         write_block_marker_at(
             &control_backing_path,
@@ -3944,7 +3965,7 @@ mod macos_arm64 {
         );
 
         if let Err(err) = wait_for_file_prefix_marker(
-            &second_backing_path,
+            &replacement_backing_path,
             BLOCK_HOTPLUG_GUEST_TWO_MARKER,
             PCI_ALL_VIRTIO_GUEST_TIMEOUT,
         ) {
@@ -3954,6 +3975,11 @@ mod macos_arm64 {
                 output.status, output.stdout, output.stderr
             );
         }
+        assert_eq!(
+            file_bytes_at(&second_backing_path, 0, BLOCK_HOTPLUG_HOST_TWO_MARKER.len(),),
+            BLOCK_HOTPLUG_HOST_TWO_MARKER,
+            "the replaced intermediate Sync backing must not receive resumed guest I/O"
+        );
         if let Err(err) = wait_for_file_prefix_marker(
             &control_backing_path,
             BLOCK_HOTPLUG_SUCCESS_MARKER,
