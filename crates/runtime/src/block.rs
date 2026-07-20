@@ -4098,6 +4098,7 @@ impl std::error::Error for VirtioBlockRequestError {
 pub struct BlockFileBacking {
     file: File,
     len: u64,
+    device_id: VirtioBlockDeviceId,
     is_read_only: bool,
     origin: BlockFileBackingOrigin,
 }
@@ -4260,6 +4261,7 @@ impl BlockFileBacking {
         Ok(Self {
             file,
             len: metadata.len(),
+            device_id: virtio_block_device_id_from_metadata(&metadata),
             is_read_only,
             origin,
         })
@@ -4287,6 +4289,7 @@ impl BlockFileBacking {
             let backing = Self {
                 file,
                 len: metadata.len(),
+                device_id: virtio_block_device_id_from_metadata(&metadata),
                 is_read_only: true,
                 origin: BlockFileBackingOrigin::Path,
             };
@@ -4321,6 +4324,7 @@ impl BlockFileBacking {
             let backing = Self {
                 file,
                 len: metadata.len(),
+                device_id: virtio_block_device_id_from_metadata(&metadata),
                 is_read_only: true,
                 origin: BlockFileBackingOrigin::SuppliedFile,
             };
@@ -4367,6 +4371,19 @@ impl BlockFileBacking {
         self.len == 0
     }
 
+    pub const fn device_id(&self) -> VirtioBlockDeviceId {
+        self.device_id
+    }
+
+    pub(crate) fn snapshot_device_id_is_compatible(
+        &self,
+        drive_id: &str,
+        device_id: VirtioBlockDeviceId,
+    ) -> bool {
+        device_id == self.device_id
+            || device_id == VirtioBlockDeviceId::from_bytes(drive_id.as_bytes())
+    }
+
     pub const fn is_read_only(&self) -> bool {
         self.is_read_only
     }
@@ -4402,6 +4419,12 @@ impl BlockFileBacking {
             .sync_all()
             .map_err(|source| BlockFileBackingError::FlushFile { source })
     }
+}
+
+#[cfg(unix)]
+fn virtio_block_device_id_from_metadata(metadata: &std::fs::Metadata) -> VirtioBlockDeviceId {
+    let id = format!("{}{}{}", metadata.dev(), metadata.rdev(), metadata.ino());
+    VirtioBlockDeviceId::from_bytes(id.as_bytes())
 }
 
 #[cfg(unix)]
@@ -5206,7 +5229,7 @@ impl VirtioBlockDevice {
         else {
             return Err(VirtioBlockDeviceCaptureError::UnsupportedBackend);
         };
-        if VirtioBlockDeviceId::from_bytes(config.drive_id().as_bytes()) != self.device_id
+        if !backing.snapshot_device_id_is_compatible(config.drive_id(), self.device_id)
             || config.is_read_only() != Some(backing.is_read_only())
             || config_space != VirtioBlockConfigSpace::from_backing(backing, config.cache_type())
         {
@@ -5286,6 +5309,7 @@ impl VirtioBlockDevice {
         &mut self,
         backing: BlockFileBacking,
     ) -> Result<(), VirtioBlockBackendOperationError> {
+        let device_id = backing.device_id();
         match &mut self.backend {
             VirtioBlockBackend::File {
                 backing: current,
@@ -5293,6 +5317,7 @@ impl VirtioBlockDevice {
                 ..
             } => {
                 *current = Arc::new(backing);
+                self.device_id = device_id;
                 Ok(())
             }
             VirtioBlockBackend::File {
@@ -5354,6 +5379,7 @@ impl VirtioBlockDevice {
         if config.is_read_only() != Some(replacement_backing.is_read_only()) {
             return Err(VirtioBlockLiveUpdateError::UnsupportedBackend);
         }
+        let replacement_device_id = replacement_backing.device_id();
         let replacement_backing = Arc::new(replacement_backing);
         let prospective_async = if desired_engine == DriveIoEngine::Async {
             Some((
@@ -5423,6 +5449,7 @@ impl VirtioBlockDevice {
         }
 
         *backing = replacement_backing;
+        self.device_id = replacement_device_id;
         *io_engine = match prospective_async {
             Some((runtime, generation)) => VirtioBlockFileIoEngine::Async {
                 runtime,
@@ -6173,7 +6200,7 @@ impl PreparedBlockDevice {
             })?,
         };
         let config_space = VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
-        let device_id = VirtioBlockDeviceId::from_bytes(config.drive_id().as_bytes());
+        let device_id = backing.device_id();
         let mut device = VirtioBlockDevice::new(backing, device_id);
         if let Some(rate_limiter) = config.rate_limiter().and_then(VirtioBlockRateLimiter::new) {
             device = device.with_rate_limiter(rate_limiter);
@@ -7749,6 +7776,7 @@ mod tests {
     use std::mem::{MaybeUninit, size_of};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7822,10 +7850,10 @@ mod tests {
         VhostUserBlockConfigSignalError, VhostUserBlockNotificationError, VhostUserBlockState,
         VirtioBlockBackend, VirtioBlockBackendKind, VirtioBlockConfigSpace, VirtioBlockDevice,
         VirtioBlockDeviceActivationError, VirtioBlockDeviceCaptureError, VirtioBlockDeviceId,
-        VirtioBlockDeviceNotificationError, VirtioBlockQueue, VirtioBlockQueueBuildError,
-        VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError, VirtioBlockQueueSnapshotError,
-        VirtioBlockRateLimiter, VirtioBlockRequest, VirtioBlockRequestCompletion,
-        VirtioBlockRequestError, VirtioBlockRequestExecutionError,
+        VirtioBlockDeviceNotificationError, VirtioBlockLiveUpdateError, VirtioBlockQueue,
+        VirtioBlockQueueBuildError, VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError,
+        VirtioBlockQueueSnapshotError, VirtioBlockRateLimiter, VirtioBlockRequest,
+        VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
         VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
     };
 
@@ -8725,6 +8753,12 @@ mod tests {
         is_read_only: bool,
     ) -> Result<BlockFileBacking, BlockFileBackingError> {
         BlockFileBacking::open(&config_for_path(path, is_read_only))
+    }
+
+    fn expected_backing_device_id(path: &Path) -> VirtioBlockDeviceId {
+        let metadata = fs::metadata(path).expect("backing metadata should be readable");
+        let id = format!("{}{}{}", metadata.dev(), metadata.rdev(), metadata.ino());
+        VirtioBlockDeviceId::from_bytes(id.as_bytes())
     }
 
     fn virtio_mmio_access(offset: u64, len: u64) -> MmioAccess {
@@ -10385,7 +10419,7 @@ mod tests {
         assert!(device.config_space().is_read_only());
         assert_eq!(
             device.device().device_id(),
-            VirtioBlockDeviceId::from_bytes(b"rootfs")
+            expected_backing_device_id(file.as_path())
         );
         let backing = device
             .device()
@@ -10500,12 +10534,27 @@ mod tests {
             .capture_state_at(sync.config_space(), &sync_config, Instant::now())
             .expect("Sync block state should capture");
         assert_eq!(sync_state.config_space(), sync.config_space());
+        assert_eq!(
+            sync_state.device_id(),
+            expected_backing_device_id(sync_file.as_path())
+        );
         assert_eq!(sync_state.backing().len(), 512);
         assert_eq!(sync_state.io_engine(), BlockCaptureIoEngine::Sync);
         assert_eq!(
             format!("{sync_state:?}"),
             "VirtioBlockDeviceCaptureState { state: \"<redacted>\" }"
         );
+
+        let legacy_backing =
+            open_backing(sync_file.as_path(), true).expect("legacy snapshot backing should reopen");
+        let legacy_config_space =
+            VirtioBlockConfigSpace::from_backing(&legacy_backing, sync_config.cache_type());
+        let legacy_device_id = VirtioBlockDeviceId::from_bytes(sync_config.drive_id().as_bytes());
+        let legacy_device = VirtioBlockDevice::new(legacy_backing, legacy_device_id);
+        let legacy_state = legacy_device
+            .capture_state_at(legacy_config_space, &sync_config, Instant::now())
+            .expect("loaded legacy block identity should remain captureable");
+        assert_eq!(legacy_state.device_id(), legacy_device_id);
 
         let async_file = temp_file("capture-async.img", &[0; 512]);
         let async_config = DriveConfigInput::new("async", "async", async_file.as_path(), false)
@@ -10593,6 +10642,59 @@ mod tests {
         let runtime = SharedBlockAsyncRuntime::new();
         let mut memory = request_memory();
 
+        assert_eq!(
+            device.device_id(),
+            expected_backing_device_id(original_file.as_path())
+        );
+
+        device
+            .update_file_backend_with_opened(
+                &mut memory,
+                &original,
+                None,
+                Some(DriveRateLimiterConfig::new(
+                    None,
+                    Some(DriveTokenBucketConfig::new(5, None, 100)),
+                )),
+                DriveLiveUpdateMode::Patch,
+                &runtime,
+            )
+            .expect("limiter-only update should succeed without replacing identity");
+        assert_eq!(
+            device.device_id(),
+            expected_backing_device_id(original_file.as_path())
+        );
+
+        let mismatched_config = DriveConfigInput::new("data", "data", async_file.as_path(), false)
+            .with_is_read_only(true)
+            .validate()
+            .expect("mismatched replacement config should validate");
+        assert!(matches!(
+            device.update_file_backend_with_opened(
+                &mut memory,
+                &mismatched_config,
+                Some(
+                    BlockFileBacking::open(&async_config)
+                        .expect("writable candidate backing should open")
+                ),
+                None,
+                DriveLiveUpdateMode::Replacement,
+                &runtime,
+            ),
+            Err(VirtioBlockLiveUpdateError::UnsupportedBackend)
+        ));
+        assert_eq!(
+            device.device_id(),
+            expected_backing_device_id(original_file.as_path())
+        );
+        assert_eq!(
+            device
+                .backing()
+                .expect("original backing should remain")
+                .len(),
+            512
+        );
+
         let async_dispatch = device
             .update_file_backend_with_opened(
                 &mut memory,
@@ -10608,6 +10710,10 @@ mod tests {
         assert_eq!(
             device.backing().expect("backing should remain file").len(),
             1024
+        );
+        assert_eq!(
+            device.device_id(),
+            expected_backing_device_id(async_file.as_path())
         );
         assert!(device.rate_limiter().is_some());
         assert_eq!(runtime.generation_count().expect("runtime should lock"), 1);
@@ -10626,6 +10732,10 @@ mod tests {
         assert_eq!(
             device.backing().expect("backing should remain file").len(),
             1536
+        );
+        assert_eq!(
+            device.device_id(),
+            expected_backing_device_id(sync_file.as_path())
         );
         assert!(device.rate_limiter().is_none());
         assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
@@ -10664,39 +10774,54 @@ mod tests {
     }
 
     #[test]
-    fn prepared_block_devices_derive_device_id_from_drive_id() {
-        let short_file = temp_file("prepared-short-id.img", &[0; 512]);
-        let long_file = temp_file("prepared-long-id.img", &[0; 512]);
+    fn prepared_block_devices_derive_device_id_from_backing_metadata() {
+        let first_file = temp_file("prepared-first-id.img", &[0; 512]);
+        let second_file = temp_file("prepared-second-id.img", &[0; 512]);
         let mut configs = DriveConfigs::new();
         configs
             .insert(DriveConfigInput::new(
                 "id",
                 "id",
-                short_file.as_path(),
+                first_file.as_path(),
                 false,
             ))
-            .expect("short drive config should insert");
+            .expect("first drive config should insert");
         configs
             .insert(DriveConfigInput::new(
                 "01234567890123456789extra",
                 "01234567890123456789extra",
-                long_file.as_path(),
+                second_file.as_path(),
                 false,
             ))
-            .expect("long drive config should insert");
+            .expect("second drive config should insert");
 
         let prepared =
             PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
 
-        let short_id = prepared.as_slice()[0].device().device_id();
-        let mut expected_short = [0; VIRTIO_BLOCK_ID_BYTES as usize];
-        expected_short[0] = b'i';
-        expected_short[1] = b'd';
-        assert_eq!(short_id.as_bytes(), &expected_short);
         assert_eq!(
-            prepared.as_slice()[1].device().device_id().as_bytes(),
-            b"01234567890123456789",
+            prepared.as_slice()[0].device().device_id(),
+            expected_backing_device_id(first_file.as_path())
         );
+        assert_eq!(
+            prepared.as_slice()[1].device().device_id(),
+            expected_backing_device_id(second_file.as_path())
+        );
+    }
+
+    #[test]
+    fn snapshot_device_id_compatibility_accepts_current_and_legacy_only() {
+        let file = temp_file("snapshot-compatible-id.img", &[0; 512]);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+
+        assert!(backing.snapshot_device_id_is_compatible("rootfs", backing.device_id()));
+        assert!(backing.snapshot_device_id_is_compatible(
+            "rootfs",
+            VirtioBlockDeviceId::from_bytes(b"rootfs")
+        ));
+        assert!(!backing.snapshot_device_id_is_compatible(
+            "rootfs",
+            VirtioBlockDeviceId::new([0xff; VIRTIO_BLOCK_ID_BYTES as usize])
+        ));
     }
 
     #[test]
@@ -11416,6 +11541,7 @@ mod tests {
             handler.read_register(VirtioMmioRegister::ConfigGeneration),
             Ok(0)
         );
+        assert_eq!(handler.activation_handler().device_id(), TEST_DEVICE_ID);
 
         handler
             .refresh_block_backing(&replacement_config)
@@ -11429,6 +11555,10 @@ mod tests {
                 .expect("file device should retain backing")
                 .len(),
             1024
+        );
+        assert_eq!(
+            handler.activation_handler().device_id(),
+            expected_backing_device_id(second.as_path())
         );
         assert_eq!(
             handler.read_register(VirtioMmioRegister::ConfigGeneration),
@@ -11456,6 +11586,7 @@ mod tests {
         assert!(matches!(err, DriveUpdateError::OpenBacking { .. }));
         assert!(!err.to_string().contains("secret-refresh-missing"));
         assert_eq!(handler.device_config_handler().capacity_sectors(), 1);
+        assert_eq!(handler.activation_handler().device_id(), TEST_DEVICE_ID);
         assert_eq!(
             handler
                 .activation_handler()

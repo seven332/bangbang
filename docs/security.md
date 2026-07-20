@@ -943,6 +943,16 @@ is resource-specific:
   publication cleanup closes admission and makes the worker terminal. A
   successful insertion consumes the grant once.
 
+  File-backed `GET_ID` is derived from metadata on the exact opened descriptor,
+  never from a second pathname lookup: decimal `st_dev`, `st_rdev`, and
+  `st_ino`, truncated or NUL-padded to 20 bytes. A successful backing
+  replacement commits this guest-visible identity with the backing, while a
+  limiter-only update retains it. The value intentionally follows Firecracker,
+  but it can disclose host filesystem identity components, may be truncated or
+  ambiguous, and is not an authentication or authorization token. Native-v1
+  load accepts only the exact current metadata-derived value or the exact
+  legacy drive-ID-derived value from older bangbang artifacts.
+
   Bodyless PCI-mode DELETE first removes MMIO and ECAM visibility, closes work
   and message admission, and drains admitted operations while retaining exact
   generation-bound leases. Recoverable failure republishes the same usable

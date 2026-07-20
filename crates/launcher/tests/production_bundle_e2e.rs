@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+use std::os::unix::fs::{FileTypeExt, MetadataExt as _, PermissionsExt, symlink};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -170,6 +170,8 @@ const DIRECT_ROOTFS_PMEM_ROOT_RO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic
 const DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER: &[u8] = b"BANGBANG_PMEM_ROOT_RO_OK";
 const DIRECT_ROOTFS_MEMORY_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.memory-hotplug-check=1";
 const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
+const BLOCK_SERIAL_BEGIN_MARKER: &[u8] = b"BANGBANG_BLOCK_SERIAL_BEGIN";
+const BLOCK_SERIAL_END_MARKER: &[u8] = b"BANGBANG_BLOCK_SERIAL_END";
 const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
 const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
 const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
@@ -3069,6 +3071,15 @@ fn normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants() {
         &["--enable-pci"],
     );
     fixture.replace_source_pathnames();
+    let expected_rootfs_device_id = expected_block_device_id(&fixture.opened_rootfs);
+    let serial_file = TestFilePath::new(container_tmp_dir().join(format!(
+        "bb-block-id-{:x}-{}.serial",
+        std::process::id(),
+        NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst)
+    )));
+    running
+        .sensitive
+        .push(path_text(serial_file.path()).to_owned());
 
     assert_http_status(
         &http_put(
@@ -3082,7 +3093,9 @@ fn normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants() {
     let sealed_kernel = worker_bundle(&bundle).join("Contents/Resources/guest-kernel");
     let boot_source = serde_json::json!({
         "kernel_image_path": path_text(&sealed_kernel),
-        "boot_args": DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS,
+        "boot_args": format!(
+            "{DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS} bangbang.block-serial=vda"
+        ),
     });
     assert_http_status(
         &http_put(
@@ -3128,6 +3141,16 @@ fn normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants() {
             context,
         );
     }
+    let serial = serde_json::json!({"serial_out_path": path_text(serial_file.path())});
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/serial",
+            &serde_json::to_string(&serial).expect("serial config should serialize"),
+        ),
+        204,
+        "PUT contained PCI Async block identity serial output",
+    );
     assert_http_status(
         &http_put(
             &running.socket,
@@ -3136,6 +3159,15 @@ fn normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants() {
         ),
         204,
         "start contained block-hotplug guest",
+    );
+    wait_for_file_contains(serial_file.path(), BLOCK_SERIAL_END_MARKER, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| {
+            panic!("contained guest should report rootfs block identity: {error}")
+        });
+    assert_block_serial_report(
+        serial_file.path(),
+        &expected_rootfs_device_id,
+        "contained PCI Async rootfs",
     );
     wait_for_file_prefix(
         &fixture.opened_data,
@@ -7019,6 +7051,28 @@ fn wait_for_file_contains(path: &Path, marker: &[u8], timeout: Duration) -> Resu
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn expected_block_device_id(path: &Path) -> String {
+    let metadata = fs::metadata(path).expect("block backing metadata should be readable");
+    format!("{}{}{}", metadata.dev(), metadata.rdev(), metadata.ino())
+        .chars()
+        .take(20)
+        .collect()
+}
+
+fn assert_block_serial_report(path: &Path, expected: &str, context: &str) {
+    let output = fs::read(path).expect("block serial output should be readable");
+    let normalized = String::from_utf8_lossy(&output).replace('\r', "");
+    let expected_report = format!(
+        "{}\n{expected}\n{}",
+        String::from_utf8_lossy(BLOCK_SERIAL_BEGIN_MARKER),
+        String::from_utf8_lossy(BLOCK_SERIAL_END_MARKER),
+    );
+    assert!(
+        normalized.contains(&expected_report),
+        "{context} guest block serial must equal the exact launcher-opened backing metadata identity"
+    );
 }
 
 fn wait_for_unix_listener_accept(
