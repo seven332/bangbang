@@ -2915,6 +2915,8 @@ mod tests {
             applied.dirty_range(),
             GuestMemoryRange::new(GuestAddress::new(0x200), 4).ok()
         );
+        assert!(applied.queue_latency_us() >= applied.host_latency_us());
+        assert!(applied.total_latency_us() >= applied.queue_latency_us());
         executor.shutdown().expect("executor should stop");
     }
 
