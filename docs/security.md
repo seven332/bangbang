@@ -922,13 +922,21 @@ is resource-specific:
   sleeping, busy-waiting, writing request status, publishing a used-ring entry,
   or mutating the backing file. Active HVF boot sessions schedule block retry
   wakeups with per-session state so one VM cannot wake or share limiter state
-  with another VM. Configured vhost-user sockets remain rejected. A future
-  vhost-user frontend would grant an external backend access to guest-memory
-  mappings and queue notifications. The runtime now has an unlinked
-  descriptor-backed shared-RAM owner and exact export metadata, but public
-  activation still needs separate socket authorization, backend trust and
-  containment, protocol lifecycle, cleanup, and failure policy rather than
-  only accepting a socket path.
+  with another VM. Configured vhost-user sockets remain rejected. The internal
+  vhost-user frontend foundation accepts only an already connected stream and
+  a closed Firecracker v1.16 request set. It explicitly zero-encodes native
+  endian frames, attaches borrowed rights only until the first header byte is
+  transferred, owns/CLOEXECs every received right before rejecting it, bounds
+  one operation by one absolute deadline, and terminally closes a stream after
+  synchronization loss. Directional nonblocking pipe types prevent swapping
+  backend call writers with kick readers; Darwin descriptors suppress SIGPIPE,
+  and errors/debug output omit paths, raw descriptors, addresses, and peer
+  payload. The test control peer is not shipped. The runtime has an unlinked
+  descriptor-backed shared-RAM owner and exact export metadata, but no external
+  backend receives it in this foundation. Public activation still needs
+  separate socket authorization, backend trust and containment, guest queue
+  construction, cleanup, and failure policy rather than only accepting a
+  socket path.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. In contained mode an exact pmem grant tag is claimed during

@@ -7,6 +7,8 @@ This is a Rust workspace for `bangbang`, a macOS-oriented VMM scaffold intended 
 - `crates/bangbang` -> package `bangbang`: executable VMM process entrypoint.
 - `crates/api` -> package `bangbang-api`: Firecracker-compatible API endpoint names.
 - `crates/runtime` -> package `bangbang-runtime`: backend-neutral VM trait and error type.
+- `crates/vhost-user` -> package `bangbang-vhost-user`: strict portable
+  Firecracker-shaped vhost-user frontend protocol and pipe notifier foundation.
 - `crates/hvf` -> package `bangbang-hvf`: Apple Hypervisor.framework backend skeleton.
 - `crates/launcher` -> package `bangbang-launcher`: production macOS bundle assembly,
   static-code validation, and the outer worker supervisor.

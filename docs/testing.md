@@ -1758,6 +1758,23 @@ snapshot state remain outside this subset. The hidden static and product
 all-virtio startup cases remain complementary coverage for the same canonical
 block device before runtime mutation.
 
+The internal `bangbang-vhost-user` foundation has a separate, deliberately
+non-public test boundary. Native-endian golden tests cover the exact pinned
+owner/features/protocol/config/memory/vring request IDs, flags, lengths, zero
+padding, and CONFIG/REPLY_ACK replies. A deterministic sender injects
+interruption, would-block, zero/oversized results, and partial progress while
+recording that SCM_RIGHTS is present only until the first positive byte count.
+Real Unix-stream tests cover ordered FD transfer and CLOEXEC, fragmented and
+coalesced header/body reads, short EOF, timeout, wrong replies, explicit
+backend failure, unexpected and over-limit FD cleanup, and terminal poisoning.
+A bounded test-only control peer completes both pinned CONFIG-only and optional
+REPLY_ACK transcripts, verifies all queue sizes precede address setup, and
+exercises call/kick directions. Pipe tests cover exact eight-byte units,
+saturation coalescing, malformed units, EOF/EPIPE without process termination,
+independent ownership, and Darwin kqueue readability. None of these tests opens
+a configured drive socket, exports live guest RAM, ships a backend, executes a
+vhost-user data plane, or changes the stable public unsupported response.
+
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.
 Root drives with `partuuid` append `root=PARTUUID=<partuuid>`; other root

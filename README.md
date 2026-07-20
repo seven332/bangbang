@@ -70,6 +70,8 @@ crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
 crates/launcher   Production app bundle, nested-worker validation, and supervision
 crates/session    Private launcher-worker protocol and runtime namespace ownership
+crates/vhost-user Strict internal vhost-user frontend protocol, SCM_RIGHTS framing,
+                  and portable pipe queue notifiers; no public device activation
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
 tools/seccompiler Firecracker v1.16-compatible offline seccompiler CLI and
