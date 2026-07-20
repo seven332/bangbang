@@ -1136,10 +1136,13 @@ outside-container client can use a granted API socket, and that a real guest
 can complete deterministic bidirectional and half-close/EOF vsock traffic in
 both initiation directions through the supplied granted listener and fixed
 launcher broker, without changing the exact entitlements or leaving a helper
-in steady state. A second signed case boots two vhost-user block children from
-one connect-only directory grant, preserves an active frontend through ID-only
-PATCH, closes both streams, and likewise leaves no helper or entitlement
-change. Abrupt launcher-first and worker-first cases replace the
+in steady state. Signed contained-vhost cases boot a vhost root plus scratch
+child alongside vsock from one connect-only directory grant, prove scratch
+read/write/flush and guest-observed ID-only capacity refresh on the existing
+stream, and exercise all-PCI runtime target rejection, negotiation rollback,
+new-ID attach, manual guest removal, DELETE, Paused same-ID reuse through a
+second exact child, and exact stream closure. They likewise leave no helper or
+entitlement change. Abrupt launcher-first and worker-first cases replace the
 granted API pathname before death and prove both surviving cleanup owners
 preserve the replacement while clearing the matching private namespace record.
 

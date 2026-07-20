@@ -263,8 +263,12 @@ and eligible all-PCI runtime PUT obtain only authenticated connected streams,
 normal broker failure is retryable, owner/startup preflight makes zero requests,
 ID-only PATCH reuses the active stream, and DELETE releases a child lease while
 retaining directory authority for later same-ID reinsertion. Signed production
-evidence boots two strict children from one grant without a steady-state helper
-or entitlement change and observes active refresh plus both stream closures.
+evidence boots an exact vhost root and scratch child alongside vsock from one
+grant, proves scratch read/write/flush and guest-observed active resize, and
+uses an all-PCI shared-memory guest to cover invalid-target and negotiation
+rollback, new-ID attach, duplicate zero-connect rejection, manual removal,
+DELETE, Paused same-ID reuse through another child, resumed I/O, and exact
+closure without a steady-state helper or entitlement change.
 Snapshot state, Async/io_uring, dynamic-memory coexistence, and the broad
 vhost/storage aggregates remain nonterminal, so the inventory counts are
 unchanged.

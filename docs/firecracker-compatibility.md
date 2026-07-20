@@ -2221,10 +2221,13 @@ read/write/flush, and prove redacted backend-death metrics while the API remains
 responsive. A signed product-PCI lifecycle also proves live capacity refresh,
 new-ID direct runtime attach, guest I/O, manual removal, Paused DELETE/PUT,
 duplicate and anonymous-profile zero-connect rejection, complete closure, and
-same-ID/slot reuse. A signed production-bundle case boots two vhost-user block
-children from one contained connect-only directory grant without a surviving
-helper, refreshes one active CONFIG over its existing stream, and proves both
-streams close. Linux io_uring `Async`, same-ID replacement without DELETE, and
+same-ID/slot reuse. Signed production-bundle cases boot an exact contained
+vhost root and scratch child alongside vsock, prove scratch read/write/flush
+and guest-observed CONFIG resize on the existing stream, then use an all-PCI
+shared-memory guest to prove invalid-target and negotiation rollback, new-ID
+runtime attach, duplicate zero-connect rejection, manual removal, DELETE,
+Paused same-ID reuse through another exact child, resumed I/O, and complete
+closure without a surviving helper. Linux io_uring `Async`, same-ID replacement without DELETE, and
 automatic PCI notification remain unavailable. Native-v1
 retains the separate file-backed one-read-only-root profile and rejects vhost
 before artifact creation rather than claiming optional-device snapshot state.

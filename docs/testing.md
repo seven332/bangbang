@@ -1121,10 +1121,15 @@ may skip execution. On supported Apple Silicon it proves:
 - a real host initiating through the supplied granted main listener and
   completing deterministic 1-MiB transfers in both directions plus both peers'
   write-half-close/EOF sequence before identity-owned socket cleanup;
-- two contained vhost-user block children sharing one connect-only directory
-  grant, booting a real guest without a steady-state helper, preserving the
-  existing stream through active ID-only PATCH, and closing both exact child
-  streams during shutdown; and
+- a contained vhost root and writable scratch child sharing one connect-only
+  directory grant alongside vsock, booting a real guest without a steady-state
+  helper, proving scratch read/write/flush plus guest-observed ID-only capacity
+  refresh on the existing stream, and closing both exact child streams; and
+- a contained all-PCI vhost lifecycle that rejects an invalid endpoint without
+  killing the live VM, rolls back failed negotiation, attaches a new device,
+  rejects duplicate same-ID PUT before a second connection, then performs
+  manual guest removal, DELETE, Paused same-ID reuse through another child,
+  resumed guest I/O, final DELETE, and exact closure; and
 - launcher-first and worker-first abrupt death after replacing the granted API
   pathname, proving both surviving cleanup owners preserve the replacement,
   clear only the matching private record, and remove the session namespace.
@@ -1783,15 +1788,21 @@ vhost listener sees zero connections and no public mutation; duplicate IDs
 likewise reject before connection.
 
 The signed production-bundle gate separately supplies one repeatable
-connect-only vhost-user directory grant and starts two strict child backends.
-The normal sandboxed worker boots a real guest with both children, retains no
-steady-state helper, refreshes an active device over its existing stream, and
-closes both streams during shutdown. Unit and process tests cover exact grant
-and child parsing, lifecycle/session/sequence correlation, malformed or extra
-SCM_RIGHTS rejection, anchored no-symlink/current-user/socket/single-link
-validation, cwd restoration, retry after a normal broker failure, startup
-zero-request preflight, runtime zero-request owner preflight, multiple children,
-ID-only PATCH, duplicate PUT, DELETE lease release, and same-ID reinsertion.
+connect-only vhost-user directory grant. One normal sandboxed worker boots from
+an exact vhost root, performs real I/O and flush through a scratch child,
+coexists with the independent vsock authority, refreshes guest-visible capacity
+over the existing stream, retains no steady-state helper, and closes both
+streams. A second all-PCI guest starts with a contained vhost control device so
+shared memory is established, then proves invalid-target and negotiation
+rollback, runtime attach and guest I/O, duplicate zero-connect rejection,
+manual removal, DELETE, Paused same-ID reuse through another exact child,
+resumed I/O, final DELETE, and complete control/runtime closure. Unit and
+process tests additionally cover exact grant and child parsing,
+lifecycle/session/sequence correlation, malformed or extra SCM_RIGHTS
+rejection, anchored no-symlink/current-user/socket/single-link validation, cwd
+restoration, retry after a normal broker failure, startup zero-request
+preflight, runtime zero-request owner preflight, multiple children, ID-only
+PATCH, duplicate PUT, DELETE lease release, and same-ID reinsertion.
 Dynamic-memory coexistence, same-ID replacement without DELETE, async/io_uring,
 automatic guest PCI notification, and vhost snapshot state remain outside the
 combined direct and contained subset.

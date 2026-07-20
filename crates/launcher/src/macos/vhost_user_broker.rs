@@ -109,6 +109,17 @@ impl LauncherVhostUserBroker {
                     },
                     None,
                 )?,
+                Err(ScopedConnectError::Rejected) => send(
+                    socket,
+                    &VhostUserBrokerMessage::Failed {
+                        session: self.session,
+                        sequence,
+                        grant_id,
+                        child,
+                        kind: io::ErrorKind::Other,
+                    },
+                    None,
+                )?,
                 Err(ScopedConnectError::Invalid) => {
                     return Err(LauncherError::VhostUserBroker);
                 }
@@ -188,6 +199,7 @@ impl Drop for CwdGuard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScopedConnectError {
     Failure(io::ErrorKind),
+    Rejected,
     Invalid,
 }
 
@@ -255,7 +267,7 @@ fn connect_relative_child(
 
     let after = relative_connect_target_identity(&name)?;
     if after != before {
-        return Err(ScopedConnectError::Invalid);
+        return Err(ScopedConnectError::Rejected);
     }
     validate_connected_peer(descriptor.as_raw_fd(), &name)?;
     Ok(UnixStream::from(descriptor))
@@ -325,7 +337,7 @@ fn relative_connect_target_identity(name: &CStr) -> Result<ObjectIdentity, Scope
         || stat.st_nlink != 1
         || stat.st_uid != expected_uid
     {
-        return Err(ScopedConnectError::Invalid);
+        return Err(ScopedConnectError::Rejected);
     }
     Ok(stat_identity(&stat))
 }
@@ -428,7 +440,7 @@ fn validate_connected_peer(descriptor: RawFd, expected: &CStr) -> Result<(), Sco
     if socket_int_option(descriptor, libc::SO_TYPE)? != libc::SOCK_STREAM
         || socket_int_option(descriptor, libc::SO_ERROR)? != 0
     {
-        return Err(ScopedConnectError::Invalid);
+        return Err(ScopedConnectError::Rejected);
     }
     let mut address = MaybeUninit::<libc::sockaddr_un>::zeroed();
     let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_un>())
@@ -444,14 +456,14 @@ fn validate_connected_peer(descriptor: RawFd, expected: &CStr) -> Result<(), Sco
     if address.sun_family
         != libc::sa_family_t::try_from(libc::AF_UNIX).map_err(|_| ScopedConnectError::Invalid)?
     {
-        return Err(ScopedConnectError::Invalid);
+        return Err(ScopedConnectError::Rejected);
     }
     let returned = usize::try_from(length).map_err(|_| ScopedConnectError::Invalid)?;
     let path_length = returned
         .checked_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path))
-        .ok_or(ScopedConnectError::Invalid)?;
+        .ok_or(ScopedConnectError::Rejected)?;
     if path_length > address.sun_path.len() {
-        return Err(ScopedConnectError::Invalid);
+        return Err(ScopedConnectError::Rejected);
     }
     // SAFETY: The kernel-returned length bounds this read within address.
     let path =
@@ -464,7 +476,7 @@ fn validate_connected_peer(descriptor: RawFd, expected: &CStr) -> Result<(), Sco
     {
         Ok(())
     } else {
-        Err(ScopedConnectError::Invalid)
+        Err(ScopedConnectError::Rejected)
     }
 }
 
@@ -482,11 +494,13 @@ fn socket_int_option(descriptor: RawFd, option: libc::c_int) -> Result<i32, Scop
             &raw mut length,
         )
     } != 0
-        || usize::try_from(length).ok() != Some(size_of::<i32>())
     {
         return Err(ScopedConnectError::Failure(
             io::Error::last_os_error().kind(),
         ));
+    }
+    if usize::try_from(length).ok() != Some(size_of::<i32>()) {
+        return Err(ScopedConnectError::Rejected);
     }
     Ok(value)
 }
@@ -713,13 +727,26 @@ mod tests {
             bangbang_session::SocketChild::parse("link.sock").expect("symlink child should parse");
         assert_eq!(
             connect_scoped(anchor, &link).expect_err("socket symlink should fail closed"),
-            ScopedConnectError::Invalid
+            ScopedConnectError::Rejected
         );
         assert_eq!(
             current_directory_identity().expect("cwd after symlink should inspect"),
             unrelated_identity
         );
         drop(outside_listener);
+
+        fs::write(anchor_path.join("regular.sock"), b"not a socket")
+            .expect("regular target fixture should create");
+        let regular = bangbang_session::SocketChild::parse("regular.sock")
+            .expect("regular child should parse");
+        assert_eq!(
+            connect_scoped(anchor, &regular).expect_err("regular target should fail closed"),
+            ScopedConnectError::Rejected
+        );
+        assert_eq!(
+            current_directory_identity().expect("cwd after regular target should inspect"),
+            unrelated_identity
+        );
 
         std::env::set_current_dir(&original).expect("original cwd should restore for cleanup");
     }
