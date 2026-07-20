@@ -131,6 +131,115 @@ pub struct VirtioPciDiagnostics {
     pub pending_transition_observed: bool,
 }
 
+/// Complete detached modern virtio-pci transport state.
+///
+/// The value intentionally keeps guest-programmed registers private and uses a
+/// redacted `Debug` implementation. It is an internal persistence handoff, not
+/// a diagnostic surface.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioPciTransportState {
+    phase: VirtioPciEndpointPhase,
+    configuration: PciType0Configuration,
+    pci_cfg_cap_offset: u16,
+    msix_cap_offset: u16,
+    pci_cfg_bar: u8,
+    pci_cfg_offset: u32,
+    pci_cfg_length: u32,
+    device_feature_select: u32,
+    driver_feature_select: u32,
+    queue_select: u16,
+    device: VirtioMmioDeviceRegisters,
+    queues: VirtioQueues,
+    queue_notifications: VirtioQueueNotificationState,
+    device_activated: bool,
+    requires_device_config_write_status: bool,
+    interrupt_intents: Vec<VirtioInterruptIntent>,
+    msix: VirtioPciMsixState,
+}
+
+impl VirtioPciTransportState {
+    pub const fn phase(&self) -> VirtioPciEndpointPhase {
+        self.phase
+    }
+
+    pub const fn configuration(&self) -> &PciType0Configuration {
+        &self.configuration
+    }
+
+    pub const fn pci_cfg_cap_offset(&self) -> u16 {
+        self.pci_cfg_cap_offset
+    }
+
+    pub const fn msix_cap_offset(&self) -> u16 {
+        self.msix_cap_offset
+    }
+
+    pub const fn pci_cfg_bar(&self) -> u8 {
+        self.pci_cfg_bar
+    }
+
+    pub const fn pci_cfg_offset(&self) -> u32 {
+        self.pci_cfg_offset
+    }
+
+    pub const fn pci_cfg_length(&self) -> u32 {
+        self.pci_cfg_length
+    }
+
+    pub const fn device_feature_select(&self) -> u32 {
+        self.device_feature_select
+    }
+
+    pub const fn driver_feature_select(&self) -> u32 {
+        self.driver_feature_select
+    }
+
+    pub const fn queue_select(&self) -> u16 {
+        self.queue_select
+    }
+
+    pub const fn device_registers(&self) -> &VirtioMmioDeviceRegisters {
+        &self.device
+    }
+
+    pub const fn queues(&self) -> &VirtioQueues {
+        &self.queues
+    }
+
+    pub const fn queue_notifications(&self) -> &VirtioQueueNotificationState {
+        &self.queue_notifications
+    }
+
+    pub const fn is_device_activated(&self) -> bool {
+        self.device_activated
+    }
+
+    pub const fn requires_device_config_write_status(&self) -> bool {
+        self.requires_device_config_write_status
+    }
+
+    pub fn interrupt_intents(&self) -> &[VirtioInterruptIntent] {
+        &self.interrupt_intents
+    }
+
+    pub fn msix_vector_count(&self) -> usize {
+        self.msix.vector_count()
+    }
+
+    pub const fn msix_state(&self) -> &VirtioPciMsixState {
+        &self.msix
+    }
+}
+
+impl fmt::Debug for VirtioPciTransportState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioPciTransportState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
 impl VirtioPciIdentity {
     pub const fn new(device_type: VirtioDeviceType, device_features: u64) -> Self {
         Self {
@@ -413,6 +522,30 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             config_vector,
             queue_vectors,
             pending_transition_observed: state.msix.pending_transition_observed,
+        })
+    }
+
+    /// Clones the complete canonical transport state under the endpoint lock.
+    pub fn transport_state(&self) -> Result<VirtioPciTransportState, VirtioPciEndpointError> {
+        let state = self.lock_active()?;
+        Ok(VirtioPciTransportState {
+            phase: state.phase,
+            configuration: state.configuration.clone(),
+            pci_cfg_cap_offset: state.pci_cfg_cap_offset,
+            msix_cap_offset: state.msix_cap_offset,
+            pci_cfg_bar: state.pci_cfg_bar,
+            pci_cfg_offset: state.pci_cfg_offset,
+            pci_cfg_length: state.pci_cfg_length,
+            device_feature_select: state.device_feature_select,
+            driver_feature_select: state.driver_feature_select,
+            queue_select: state.queue_select,
+            device: state.core.device,
+            queues: state.core.queues.clone(),
+            queue_notifications: state.core.queue_notifications.clone(),
+            device_activated: state.core.device_activated,
+            requires_device_config_write_status: state.core.requires_device_config_write_status,
+            interrupt_intents: state.core.interrupt_intents.clone(),
+            msix: state.msix.clone(),
         })
     }
 
@@ -888,12 +1021,21 @@ fn virtio_capability_body(total_size: u8, kind: u8, offset: u64, length: u64) ->
     body
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct VirtioPciMsixTableEntry {
     message_address_low: u32,
     message_address_high: u32,
     message_data: u32,
     vector_control: u32,
+}
+
+impl fmt::Debug for VirtioPciMsixTableEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioPciMsixTableEntry")
+            .field("state", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Default for VirtioPciMsixTableEntry {
@@ -908,6 +1050,22 @@ impl Default for VirtioPciMsixTableEntry {
 }
 
 impl VirtioPciMsixTableEntry {
+    pub const fn message_address_low(self) -> u32 {
+        self.message_address_low
+    }
+
+    pub const fn message_address_high(self) -> u32 {
+        self.message_address_high
+    }
+
+    pub const fn message_data(self) -> u32 {
+        self.message_data
+    }
+
+    pub const fn vector_control(self) -> u32 {
+        self.vector_control
+    }
+
     pub const fn is_masked(self) -> bool {
         (self.vector_control & 1) != 0
     }
@@ -920,8 +1078,8 @@ impl VirtioPciMsixTableEntry {
     }
 }
 
-#[derive(Debug)]
-struct VirtioPciMsixState {
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioPciMsixState {
     entries: Vec<VirtioPciMsixTableEntry>,
     pending: Vec<u64>,
     enabled: bool,
@@ -929,6 +1087,15 @@ struct VirtioPciMsixState {
     config_vector: u16,
     queue_vectors: Vec<u16>,
     pending_transition_observed: bool,
+}
+
+impl fmt::Debug for VirtioPciMsixState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioPciMsixState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
 }
 
 impl VirtioPciMsixState {
@@ -944,12 +1111,36 @@ impl VirtioPciMsixState {
         }
     }
 
-    fn vector_count(&self) -> usize {
+    pub fn vector_count(&self) -> usize {
         self.entries.len()
     }
 
-    fn config_vector(&self) -> u16 {
+    pub fn entries(&self) -> &[VirtioPciMsixTableEntry] {
+        &self.entries
+    }
+
+    pub fn pending_words(&self) -> &[u64] {
+        &self.pending
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub const fn function_masked(&self) -> bool {
+        self.function_masked
+    }
+
+    pub const fn config_vector(&self) -> u16 {
         self.config_vector
+    }
+
+    pub fn queue_vectors(&self) -> &[u16] {
+        &self.queue_vectors
+    }
+
+    pub const fn pending_transition_observed(&self) -> bool {
+        self.pending_transition_observed
     }
 
     fn set_config_vector(&mut self, vector: u16) {
@@ -2092,6 +2283,10 @@ where
         self.bar_lease.as_ref().map(PciBarLease::range)
     }
 
+    pub fn sbdf(&self) -> Option<crate::pci::PciSbdf> {
+        self.function_lease.as_ref().map(PciFunctionLease::sbdf)
+    }
+
     pub const fn is_released(&self) -> bool {
         self.released
     }
@@ -3226,6 +3421,97 @@ mod tests {
         assert!(!fixture.endpoint.diagnostics().unwrap().device_activated);
         bar_write(&mut bar, &bus, base, 0x14, &[1]).unwrap();
         assert_eq!(bar_read(&mut bar, &bus, base, 0x14, 1), [1]);
+    }
+
+    #[test]
+    fn transport_capture_clones_complete_common_queue_interrupt_and_msix_state_redacted() {
+        let fixture = fixture_for_identity(&[8], 4, 0b0101);
+        let initial = fixture
+            .endpoint
+            .transport_state()
+            .expect("initial PCI transport should capture");
+        let bus = bar_bus(&fixture);
+        let base = fixture.bar.range().start();
+        let mut bar = fixture.endpoint.bar_handler();
+
+        bar_write(&mut bar, &bus, base, 0x14, &[1]).unwrap();
+        bar_write(&mut bar, &bus, base, 0x14, &[3]).unwrap();
+        bar_write(&mut bar, &bus, base, 0x08, &0_u32.to_le_bytes()).unwrap();
+        bar_write(&mut bar, &bus, base, 0x0c, &0b0101_u32.to_le_bytes()).unwrap();
+        bar_write(&mut bar, &bus, base, 0x14, &[11]).unwrap();
+        bar_write(&mut bar, &bus, base, 0x16, &0_u16.to_le_bytes()).unwrap();
+        bar_write(&mut bar, &bus, base, 0x18, &8_u16.to_le_bytes()).unwrap();
+        bar_write(&mut bar, &bus, base, 0x20, &0x1000_u32.to_le_bytes()).unwrap();
+        bar_write(&mut bar, &bus, base, 0x28, &0x2000_u32.to_le_bytes()).unwrap();
+        bar_write(&mut bar, &bus, base, 0x30, &0x3000_u32.to_le_bytes()).unwrap();
+        bar_write(&mut bar, &bus, base, 0x1c, &1_u16.to_le_bytes()).unwrap();
+        bar_write(&mut bar, &bus, base, 0x14, &[15]).unwrap();
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &0xdead_beef_u32.to_le_bytes(),
+        )
+        .expect("MSI-X table address should write");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_NOTIFICATION_OFFSET,
+            &0_u16.to_le_bytes(),
+        )
+        .expect("queue notification should write");
+        {
+            let work = fixture
+                .endpoint
+                .admit_device_work()
+                .expect("device work should admit");
+            work.with_core_mut(|core| {
+                core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
+            })
+            .expect("interrupt intent should record");
+        }
+
+        let captured = fixture
+            .endpoint
+            .transport_state()
+            .expect("programmed PCI transport should capture");
+        assert_ne!(captured, initial);
+        assert_eq!(captured.phase(), VirtioPciEndpointPhase::Active);
+        assert_eq!(captured.driver_feature_select(), 0);
+        assert_eq!(captured.queue_select(), 0);
+        assert!(captured.is_device_activated());
+        assert_eq!(captured.msix_vector_count(), 2);
+        assert!(captured.msix_state().enabled());
+        assert!(!captured.msix_state().function_masked());
+        assert_eq!(captured.msix_state().config_vector(), VIRTIO_PCI_NO_VECTOR);
+        assert_eq!(
+            captured.msix_state().queue_vectors(),
+            [VIRTIO_PCI_NO_VECTOR]
+        );
+        assert_eq!(captured.msix_state().pending_words(), [0]);
+        assert!(!captured.msix_state().pending_transition_observed());
+        assert_eq!(
+            captured.msix_state().entries()[0].message_address_low(),
+            0xdead_beef
+        );
+        assert_eq!(captured.msix_state().entries()[0].message_address_high(), 0);
+        assert_eq!(captured.msix_state().entries()[0].message_data(), 0);
+        assert_eq!(captured.msix_state().entries()[0].vector_control(), 1);
+        assert_eq!(
+            captured.interrupt_intents(),
+            [VirtioInterruptIntent::Queue { queue_index: 0 }]
+        );
+        assert_eq!(
+            captured.queue_notifications().pending_queue_notifications(),
+            [0]
+        );
+        assert_eq!(captured.clone(), captured);
+        let debug = format!("{captured:?}");
+        assert_eq!(debug, "VirtioPciTransportState { state: \"<redacted>\" }");
+        assert!(!debug.contains("dead_beef"));
+        assert!(!debug.contains("3735928559"));
     }
 
     #[test]

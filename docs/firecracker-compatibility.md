@@ -2258,9 +2258,16 @@ same-ID Sync-to-Async replacement. Signed production cases repeat contained
 Async root/control startup, preauthorized backing/engine replacement, limiter
 PATCH, and runtime hotplug/delete/reuse. The implementation uses a portable
 bounded executor rather than Linux io_uring. Automatic PCI notification remains
-unavailable. Native-v1 retains the separate file-backed one-read-only-root
-profile and rejects Async or vhost before artifact creation rather than claiming
-optional-device snapshot state.
+unavailable. Paused create now first traverses the live startup/runtime MMIO/PCI
+storage owners. File-backed Async closes all generation admissions, drains and
+publishes every entered operation, retains exact generation/counter/pressure,
+queue, limiter, backing, transport, and interrupt state, then reopens the same
+generations. Pmem similarly retains exact config/range/protection, backing and
+authoritative direct-mapping identity, limiter/retry, queue, and transport
+state. A live vhost endpoint returns one typed redacted unsupported result
+before those mutations or any grant/staging activity. Native-v1 retains the
+separate file-backed one-read-only-root profile: this capture-ready handoff adds
+no serialized variant, restore promise, or vhost snapshot state.
 Internal HVF boot sessions can signal block SPI or MSI interrupts after
 boot-runtime block notification dispatch.
 

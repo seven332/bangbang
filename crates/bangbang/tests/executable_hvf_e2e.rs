@@ -422,6 +422,11 @@ mod macos_arm64 {
             r#""state":"Paused""#,
             "GET / after idempotent duplicate PATCH /vm Paused",
         );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused MMIO Async storage preflight",
+        );
 
         let resume_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
         assert_no_content_response(&resume_response, "PATCH /vm Resumed after pause");
@@ -2106,11 +2111,19 @@ mod macos_arm64 {
         assert_bad_request_response(&snapshot_create, "vhost-user snapshot create");
         assert_response_contains(
             &snapshot_create,
-            "Snapshot and restore are not supported.",
+            "native-v1 storage preflight failed: vhost-user block capture is unsupported",
             "vhost-user snapshot create",
         );
-        assert!(!snapshot_create.contains(path_text(&snapshot_state)));
-        assert!(!snapshot_create.contains(path_text(&snapshot_memory)));
+        for private_path in [
+            &snapshot_state,
+            &snapshot_memory,
+            &root_backend_socket,
+            &scratch_backend_socket,
+            &rootfs_path,
+            &scratch_path,
+        ] {
+            assert!(!snapshot_create.contains(path_text(private_path)));
+        }
         assert!(!snapshot_state.exists());
         assert!(!snapshot_memory.exists());
         assert_no_snapshot_staging(test_dir.path());
@@ -3954,6 +3967,11 @@ mod macos_arm64 {
             !reused_config.contains(path_text(&second_backing_path)),
             "same-ID replacement must remove the intermediate backing projection: {reused_config}"
         );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused dynamic PCI Async storage preflight",
+        );
         write_block_marker_at(
             &control_backing_path,
             bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
@@ -4673,6 +4691,11 @@ mod macos_arm64 {
             path_text(&second_backing_path),
             "GET /vm/config after pmem reuse",
         );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused dynamic PCI pmem storage preflight",
+        );
         write_block_marker_at(
             &control_backing_path,
             bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
@@ -4886,6 +4909,19 @@ mod macos_arm64 {
             ),
             PMEM_GUEST_FLUSH_MARKER,
             "guest pmem flush should persist the guest marker to the host backing file"
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause before direct pmem storage preflight",
+        );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused direct pmem storage preflight",
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume after direct pmem storage preflight",
         );
 
         assert_clean_shutdown(
@@ -7778,6 +7814,38 @@ mod macos_arm64 {
             staging.is_empty(),
             "snapshot staging entries remain: {staging:?}"
         );
+    }
+
+    fn assert_capture_ready_snapshot_rejected_without_artifacts(
+        socket_path: &Path,
+        directory: &Path,
+        context: &str,
+    ) {
+        let state_path = directory.join("capture-ready-rejected.state");
+        let memory_path = directory.join("capture-ready-rejected.memory");
+        let response = http_json_with_io_timeout(
+            socket_path,
+            "PUT",
+            "/snapshot/create",
+            &format!(
+                r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                json_string(path_text(&state_path)),
+                json_string(path_text(&memory_path))
+            ),
+            GUEST_EXECUTION_TIMEOUT,
+        );
+
+        assert_bad_request_response(&response, context);
+        assert_response_contains(
+            &response,
+            "Snapshot and restore are not supported.",
+            context,
+        );
+        assert!(!response.contains(path_text(&state_path)));
+        assert!(!response.contains(path_text(&memory_path)));
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
+        assert_no_snapshot_staging(directory);
     }
 
     fn snapshot_continuity_guest_image() -> Vec<u8> {

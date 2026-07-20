@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 #[cfg(test)]
@@ -24,7 +24,7 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
-use crate::token_bucket::{TokenBucket, TokenBucketConfig};
+use crate::token_bucket::{PersistedTokenBucketState, TokenBucket, TokenBucketConfig};
 use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
@@ -32,7 +32,10 @@ use crate::virtio_mmio::{
     VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
-use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
+use crate::virtio_pci::{
+    VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError,
+    VirtioPciTransportState,
+};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
@@ -408,6 +411,38 @@ pub struct VirtioPmemQueue {
     used: VirtqueueUsedRing,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioPmemQueueState {
+    next_available: u16,
+    next_used: u16,
+}
+
+impl VirtioPmemQueueState {
+    pub const fn new(next_available: u16, next_used: u16) -> Self {
+        Self {
+            next_available,
+            next_used,
+        }
+    }
+
+    pub const fn next_available(self) -> u16 {
+        self.next_available
+    }
+
+    pub const fn next_used(self) -> u16 {
+        self.next_used
+    }
+}
+
+impl fmt::Debug for VirtioPmemQueueState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioPmemQueueState")
+            .field("cursors", &"<redacted>")
+            .finish()
+    }
+}
+
 impl VirtioPmemQueue {
     pub const fn new(available: VirtqueueAvailableRing, used: VirtqueueUsedRing) -> Self {
         Self { available, used }
@@ -438,6 +473,10 @@ impl VirtioPmemQueue {
 
     pub const fn used_ring(&self) -> &VirtqueueUsedRing {
         &self.used
+    }
+
+    pub const fn snapshot_state(&self) -> VirtioPmemQueueState {
+        VirtioPmemQueueState::new(self.available.next_avail(), self.used.next_used())
     }
 
     fn has_available_work(
@@ -815,6 +854,190 @@ impl VirtioPmemRateLimiter {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioPmemTokenBucketState {
+    config: PmemTokenBucketConfig,
+    budget: u64,
+    remaining_burst: u64,
+    age_nanos: u64,
+}
+
+impl VirtioPmemTokenBucketState {
+    const fn from_persisted(
+        config: PmemTokenBucketConfig,
+        state: PersistedTokenBucketState,
+    ) -> Self {
+        Self {
+            config,
+            budget: state.budget(),
+            remaining_burst: state.one_time_burst(),
+            age_nanos: state.age_nanos(),
+        }
+    }
+
+    pub const fn config(self) -> PmemTokenBucketConfig {
+        self.config
+    }
+
+    pub const fn budget(self) -> u64 {
+        self.budget
+    }
+
+    pub const fn remaining_burst(self) -> u64 {
+        self.remaining_burst
+    }
+
+    pub const fn age_nanos(self) -> u64 {
+        self.age_nanos
+    }
+}
+
+impl fmt::Debug for VirtioPmemTokenBucketState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioPmemTokenBucketState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioPmemRateLimiterState {
+    bandwidth: Option<VirtioPmemTokenBucketState>,
+    ops: Option<VirtioPmemTokenBucketState>,
+}
+
+impl VirtioPmemRateLimiterState {
+    pub const fn bandwidth(self) -> Option<VirtioPmemTokenBucketState> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<VirtioPmemTokenBucketState> {
+        self.ops
+    }
+}
+
+impl fmt::Debug for VirtioPmemRateLimiterState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioPmemRateLimiterState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioPmemDeviceCaptureState {
+    config_space: VirtioPmemConfigSpace,
+    active_queue: Option<VirtioPmemQueueState>,
+    rate_limiter: VirtioPmemRateLimiterState,
+    pending_rate_limited_queue: bool,
+    file_len: u64,
+}
+
+impl VirtioPmemDeviceCaptureState {
+    pub const fn config_space(&self) -> VirtioPmemConfigSpace {
+        self.config_space
+    }
+
+    pub const fn active_queue(&self) -> Option<VirtioPmemQueueState> {
+        self.active_queue
+    }
+
+    pub const fn rate_limiter(&self) -> VirtioPmemRateLimiterState {
+        self.rate_limiter
+    }
+
+    pub const fn pending_rate_limited_queue(&self) -> bool {
+        self.pending_rate_limited_queue
+    }
+
+    pub const fn file_len(&self) -> u64 {
+        self.file_len
+    }
+}
+
+impl fmt::Debug for VirtioPmemDeviceCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioPmemDeviceCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioPmemDeviceCaptureError {
+    ConfigurationMismatch,
+    MissingBandwidthBucket,
+    UnexpectedBandwidthBucket,
+    InvalidBandwidthBucket,
+    MissingOpsBucket,
+    UnexpectedOpsBucket,
+    InvalidOpsBucket,
+}
+
+impl fmt::Display for VirtioPmemDeviceCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ConfigurationMismatch => {
+                "live pmem device state does not match its configuration"
+            }
+            Self::MissingBandwidthBucket => "live pmem bandwidth bucket is missing",
+            Self::UnexpectedBandwidthBucket => "live pmem bandwidth bucket is unexpected",
+            Self::InvalidBandwidthBucket => "live pmem bandwidth bucket is invalid",
+            Self::MissingOpsBucket => "live pmem ops bucket is missing",
+            Self::UnexpectedOpsBucket => "live pmem ops bucket is unexpected",
+            Self::InvalidOpsBucket => "live pmem ops bucket is invalid",
+        })
+    }
+}
+
+impl std::error::Error for VirtioPmemDeviceCaptureError {}
+
+#[derive(Debug)]
+pub enum VirtioPmemPciCaptureError {
+    Device(VirtioPmemDeviceCaptureError),
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Display for VirtioPmemPciCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Device(_) => formatter.write_str("PCI pmem device capture failed"),
+            Self::Endpoint(_) => formatter.write_str("PCI pmem transport capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioPmemPciCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Device(source) => Some(source),
+            Self::Endpoint(source) => Some(source),
+        }
+    }
+}
+
+fn capture_pmem_bucket_state(
+    config: Option<PmemTokenBucketConfig>,
+    bucket: Option<&TokenBucket>,
+    now: Instant,
+    missing: VirtioPmemDeviceCaptureError,
+    unexpected: VirtioPmemDeviceCaptureError,
+    invalid: VirtioPmemDeviceCaptureError,
+) -> Result<Option<VirtioPmemTokenBucketState>, VirtioPmemDeviceCaptureError> {
+    match (config, bucket) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(missing),
+        (None, Some(_)) => Err(unexpected),
+        (Some(config), Some(bucket)) => bucket
+            .persisted_state_at(config.token_bucket_config(), now)
+            .map(|state| Some(VirtioPmemTokenBucketState::from_persisted(config, state)))
+            .map_err(|_| invalid),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct VirtioPmemDevice {
     active_queue: Option<VirtioPmemQueue>,
@@ -865,6 +1088,48 @@ impl VirtioPmemDevice {
 
     pub const fn has_pending_rate_limited_queue(&self) -> bool {
         self.pending_rate_limited_queue
+    }
+
+    pub fn capture_state_at(
+        &self,
+        config_space: VirtioPmemConfigSpace,
+        expected_file_len: u64,
+        rate_limiter_config: Option<PmemRateLimiterConfig>,
+        now: Instant,
+    ) -> Result<VirtioPmemDeviceCaptureState, VirtioPmemDeviceCaptureError> {
+        if self.file_len != expected_file_len {
+            return Err(VirtioPmemDeviceCaptureError::ConfigurationMismatch);
+        }
+        let bandwidth = capture_pmem_bucket_state(
+            rate_limiter_config.and_then(PmemRateLimiterConfig::bandwidth),
+            self.rate_limiter
+                .as_ref()
+                .and_then(|limiter| limiter.bandwidth.as_ref()),
+            now,
+            VirtioPmemDeviceCaptureError::MissingBandwidthBucket,
+            VirtioPmemDeviceCaptureError::UnexpectedBandwidthBucket,
+            VirtioPmemDeviceCaptureError::InvalidBandwidthBucket,
+        )?;
+        let ops = capture_pmem_bucket_state(
+            rate_limiter_config.and_then(PmemRateLimiterConfig::ops),
+            self.rate_limiter
+                .as_ref()
+                .and_then(|limiter| limiter.ops.as_ref()),
+            now,
+            VirtioPmemDeviceCaptureError::MissingOpsBucket,
+            VirtioPmemDeviceCaptureError::UnexpectedOpsBucket,
+            VirtioPmemDeviceCaptureError::InvalidOpsBucket,
+        )?;
+        Ok(VirtioPmemDeviceCaptureState {
+            config_space,
+            active_queue: self
+                .active_queue
+                .as_ref()
+                .map(VirtioPmemQueue::snapshot_state),
+            rate_limiter: VirtioPmemRateLimiterState { bandwidth, ops },
+            pending_rate_limited_queue: self.pending_rate_limited_queue,
+            file_len: self.file_len,
+        })
     }
 
     fn update_rate_limiter_at(&mut self, update: &PmemUpdate, now: Instant) -> bool {
@@ -1051,7 +1316,51 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioPmemDe
     }
 }
 
+impl VirtioPmemMmioHandler {
+    pub fn capture_pmem_device_state_at(
+        &self,
+        expected_file_len: u64,
+        rate_limiter_config: Option<PmemRateLimiterConfig>,
+        now: Instant,
+    ) -> Result<VirtioPmemDeviceCaptureState, VirtioPmemDeviceCaptureError> {
+        self.activation_handler().capture_state_at(
+            *self.device_config_handler(),
+            expected_file_len,
+            rate_limiter_config,
+            now,
+        )
+    }
+}
+
 impl VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice> {
+    pub fn capture_pmem_device_state_at(
+        &self,
+        expected_file_len: u64,
+        rate_limiter_config: Option<PmemRateLimiterConfig>,
+        now: Instant,
+    ) -> Result<(VirtioPmemDeviceCaptureState, VirtioPciTransportState), VirtioPmemPciCaptureError>
+    {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPmemPciCaptureError::Endpoint)?;
+        let device = work
+            .with_core_mut(|core| {
+                core.activation.capture_state_at(
+                    core.device_config,
+                    expected_file_len,
+                    rate_limiter_config,
+                    now,
+                )
+            })
+            .map_err(VirtioPmemPciCaptureError::Endpoint)?
+            .map_err(VirtioPmemPciCaptureError::Device)?;
+        drop(work);
+        let transport = self
+            .transport_state()
+            .map_err(VirtioPmemPciCaptureError::Endpoint)?;
+        Ok((device, transport))
+    }
+
     pub fn update_pmem_rate_limiter(
         &self,
         update: &PmemUpdate,
@@ -1908,6 +2217,86 @@ impl PmemConfigs {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PmemFileBackingIdentity {
+    device: u64,
+    inode: u64,
+    len: u64,
+    mode: u32,
+    modified_seconds: i64,
+    modified_nanos: u32,
+    changed_seconds: i64,
+    changed_nanos: u32,
+}
+
+impl PmemFileBackingIdentity {
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+
+    pub const fn len(self) -> u64 {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn mode(self) -> u32 {
+        self.mode
+    }
+
+    pub const fn modified_seconds(self) -> i64 {
+        self.modified_seconds
+    }
+
+    pub const fn modified_nanos(self) -> u32 {
+        self.modified_nanos
+    }
+
+    pub const fn changed_seconds(self) -> i64 {
+        self.changed_seconds
+    }
+
+    pub const fn changed_nanos(self) -> u32 {
+        self.changed_nanos
+    }
+}
+
+impl fmt::Debug for PmemFileBackingIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmemFileBackingIdentity")
+            .field("identity", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmemFileBackingIdentityError {
+    UnsupportedPlatform,
+    ReadMetadata,
+    NonRegularFile,
+    InvalidMetadata,
+}
+
+impl fmt::Display for PmemFileBackingIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedPlatform => "pmem backing identity is unsupported on this platform",
+            Self::ReadMetadata => "failed to read pmem backing identity",
+            Self::NonRegularFile => "pmem backing identity is not a regular file",
+            Self::InvalidMetadata => "pmem backing identity metadata is invalid",
+        })
+    }
+}
+
+impl std::error::Error for PmemFileBackingIdentityError {}
+
 pub struct PmemFileBacking {
     file: File,
     len: u64,
@@ -1966,6 +2355,43 @@ impl PmemFileBacking {
 
     pub const fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    pub fn capture_identity(
+        &self,
+    ) -> Result<PmemFileBackingIdentity, PmemFileBackingIdentityError> {
+        #[cfg(unix)]
+        {
+            let metadata = self
+                .file
+                .metadata()
+                .map_err(|_| PmemFileBackingIdentityError::ReadMetadata)?;
+            if !metadata.file_type().is_file() {
+                return Err(PmemFileBackingIdentityError::NonRegularFile);
+            }
+            let modified_nanos = u32::try_from(metadata.mtime_nsec())
+                .map_err(|_| PmemFileBackingIdentityError::InvalidMetadata)?;
+            let changed_nanos = u32::try_from(metadata.ctime_nsec())
+                .map_err(|_| PmemFileBackingIdentityError::InvalidMetadata)?;
+            if modified_nanos >= 1_000_000_000 || changed_nanos >= 1_000_000_000 {
+                return Err(PmemFileBackingIdentityError::InvalidMetadata);
+            }
+            Ok(PmemFileBackingIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                len: metadata.len(),
+                mode: metadata.mode(),
+                modified_seconds: metadata.mtime(),
+                modified_nanos,
+                changed_seconds: metadata.ctime(),
+                changed_nanos,
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            Err(PmemFileBackingIdentityError::UnsupportedPlatform)
+        }
     }
 }
 
@@ -2126,6 +2552,12 @@ impl PmemBackingMapping {
         self.inner.read_only
     }
 
+    pub fn capture_identity(&self) -> PmemBackingMappingIdentity {
+        PmemBackingMappingIdentity {
+            mapping: self.clone(),
+        }
+    }
+
     /// Synchronizes exactly the persistent file-backed prefix of this mapping.
     ///
     /// The private alignment tail is intentionally excluded. This matches the
@@ -2187,6 +2619,47 @@ impl fmt::Debug for PmemBackingMapping {
             .field("read_only", &self.inner.read_only)
             .field("kind", &self.inner.kind)
             .finish_non_exhaustive()
+    }
+}
+
+/// Opaque lease retaining the exact authoritative pmem mapping owner.
+#[derive(Clone)]
+pub struct PmemBackingMappingIdentity {
+    mapping: PmemBackingMapping,
+}
+
+impl PmemBackingMappingIdentity {
+    pub fn same_mapping(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.mapping.inner, &other.mapping.inner)
+    }
+
+    pub fn file_len(&self) -> u64 {
+        self.mapping.file_len()
+    }
+
+    pub fn mapped_len(&self) -> u64 {
+        self.mapping.mapped_len()
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.mapping.is_read_only()
+    }
+}
+
+impl PartialEq for PmemBackingMappingIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_mapping(other)
+    }
+}
+
+impl Eq for PmemBackingMappingIdentity {}
+
+impl fmt::Debug for PmemBackingMappingIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmemBackingMappingIdentity")
+            .field("identity", &"<redacted>")
+            .finish()
     }
 }
 
@@ -4680,6 +5153,72 @@ mod tests {
     }
 
     #[test]
+    fn pmem_capture_retains_queue_limiter_file_and_pending_retry_state() {
+        let now = Instant::now();
+        let rate_limiter = PmemRateLimiterConfig::new(
+            Some(PmemTokenBucketConfig::new(100, Some(20), 100)),
+            Some(PmemTokenBucketConfig::new(2, None, 100)),
+        );
+        let mut device =
+            VirtioPmemDevice::with_rate_limiter_at(VIRTIO_PMEM_ALIGNMENT, Some(rate_limiter), now);
+        device.active_queue = Some(pmem_queue());
+        device.pending_rate_limited_queue = true;
+        let config_space = VirtioPmemConfigSpace::new(TEST_PMEM_START, VIRTIO_PMEM_ALIGNMENT);
+
+        let captured = device
+            .capture_state_at(
+                config_space,
+                VIRTIO_PMEM_ALIGNMENT,
+                Some(rate_limiter),
+                now + Duration::from_millis(5),
+            )
+            .expect("pmem state should capture");
+
+        assert_eq!(captured.config_space(), config_space);
+        assert_eq!(captured.file_len(), VIRTIO_PMEM_ALIGNMENT);
+        assert_eq!(
+            captured.active_queue(),
+            Some(VirtioPmemQueueState::new(0, 0))
+        );
+        assert!(captured.pending_rate_limited_queue());
+        assert_eq!(
+            captured
+                .rate_limiter()
+                .bandwidth()
+                .expect("bandwidth bucket should capture")
+                .config(),
+            rate_limiter
+                .bandwidth()
+                .expect("bandwidth configuration should exist")
+        );
+        assert_eq!(
+            captured
+                .rate_limiter()
+                .ops()
+                .expect("ops bucket should capture")
+                .config(),
+            rate_limiter.ops().expect("ops configuration should exist")
+        );
+        assert_eq!(
+            format!("{captured:?}"),
+            "VirtioPmemDeviceCaptureState { state: \"<redacted>\" }"
+        );
+        assert_eq!(
+            device.capture_state_at(
+                config_space,
+                VIRTIO_PMEM_ALIGNMENT + 1,
+                Some(rate_limiter),
+                now,
+            ),
+            Err(VirtioPmemDeviceCaptureError::ConfigurationMismatch)
+        );
+        assert_eq!(
+            device.capture_state_at(config_space, VIRTIO_PMEM_ALIGNMENT, None, now),
+            Err(VirtioPmemDeviceCaptureError::UnexpectedBandwidthBucket)
+        );
+    }
+
+    #[test]
     fn pmem_device_rate_limiter_charges_exact_file_len_and_rolls_back_ops_on_byte_throttle() {
         let now = Instant::now();
         let mut memory = request_memory();
@@ -5832,6 +6371,71 @@ mod tests {
 
         drop(lease);
         assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn captured_mapping_identity_retains_and_compares_the_exact_mapping_owner() {
+        let first_drop_count = Arc::new(AtomicUsize::new(0));
+        let second_drop_count = Arc::new(AtomicUsize::new(0));
+        let first = PmemBackingMapping::test_mapping(
+            4,
+            VIRTIO_PMEM_ALIGNMENT,
+            true,
+            Arc::clone(&first_drop_count),
+        );
+        let second = PmemBackingMapping::test_mapping(
+            4,
+            VIRTIO_PMEM_ALIGNMENT,
+            true,
+            Arc::clone(&second_drop_count),
+        );
+        let identity = first.capture_identity();
+        let same_identity = first.capture_identity();
+        let other_identity = second.capture_identity();
+
+        assert!(identity.same_mapping(&same_identity));
+        assert_eq!(identity, same_identity);
+        assert!(!identity.same_mapping(&other_identity));
+        assert_ne!(identity, other_identity);
+        assert_eq!(identity.file_len(), 4);
+        assert_eq!(identity.mapped_len(), VIRTIO_PMEM_ALIGNMENT);
+        assert!(identity.is_read_only());
+        assert_eq!(
+            format!("{identity:?}"),
+            "PmemBackingMappingIdentity { identity: \"<redacted>\" }"
+        );
+
+        drop(first);
+        assert_eq!(first_drop_count.load(Ordering::Relaxed), 0);
+        drop(identity);
+        drop(same_identity);
+        assert_eq!(first_drop_count.load(Ordering::Relaxed), 1);
+        drop(second);
+        drop(other_identity);
+        assert_eq!(second_drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn captured_pmem_backing_identity_is_descriptor_based_and_redacted() {
+        let file = temp_sized_file("capture-secret-pmem.img", VIRTIO_PMEM_ALIGNMENT);
+        let config = config_for_path(file.as_path(), true);
+        let backing = PmemFileBacking::open(&config).expect("pmem backing should open");
+        let first = backing
+            .capture_identity()
+            .expect("backing identity should capture");
+        let second = backing
+            .capture_identity()
+            .expect("backing identity should remain stable");
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), VIRTIO_PMEM_ALIGNMENT);
+        assert_ne!(first.inode(), 0);
+        let debug = format!("{first:?}");
+        assert_eq!(
+            debug,
+            "PmemFileBackingIdentity { identity: \"<redacted>\" }"
+        );
+        assert!(!debug.contains("capture-secret-pmem"));
     }
 
     #[test]

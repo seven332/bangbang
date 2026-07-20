@@ -69,8 +69,13 @@ metrics. Multiple drives use generation-bound routing so live path PATCH,
 same-ID backing/engine/limiter PUT, PCI hotplug/DELETE/reuse, reset, and shutdown
 quiesce only the intended work. Direct paths and contained preopened grants use
 the same transaction. This is the Firecracker-shaped public engine behavior,
-not a claim that macOS supplies Linux io_uring. Native-v1 remains Sync-only and
-rejects Async drives before artifact creation.
+not a claim that macOS supplies Linux io_uring. A paused snapshot-create
+preflight now asks the live boot owner to traverse every startup or runtime
+block and pmem endpoint across MMIO and PCI. It closes all Async admissions,
+drains and publishes all entered work, captures exact continuation and
+transport state, and reopens the same generations before returning. Native-v1
+serialization remains Sync-only, so broader profiles still reject before
+artifact creation after this non-persisting preflight.
 
 Pre-boot drives may instead select Firecracker's vhost-user block `socket`
 shape. Direct mode accepts an operator path; production contained mode accepts
@@ -96,7 +101,9 @@ socket connection. DELETE releases the frontend, shared-memory descriptor
 clones, metrics generation, BAR, MSI-X, and PCI slot for deterministic reuse.
 Ambient contained socket paths, dynamic-memory coexistence, automatic guest PCI
 notification, same-ID vhost replacement without DELETE, and vhost snapshot
-state remain explicit limits.
+state remain explicit limits. Snapshot preflight scans the complete live vhost
+inventory first and returns one typed, path-redacted unsupported result before
+Async mutation, contained grant claims, or artifact staging.
 
 ## Layout
 

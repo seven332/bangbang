@@ -43,7 +43,10 @@ use crate::virtio_mmio::{
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError, VirtioMmioTransportState,
     VirtioMmioTransportStateError,
 };
-use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
+use crate::virtio_pci::{
+    VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError,
+    VirtioPciTransportState,
+};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
@@ -51,9 +54,10 @@ use crate::virtio_queue::{
 };
 
 use self::async_executor::{
-    BlockAsyncAdmissionError, BlockAsyncDriveGeneration, BlockAsyncOperation,
-    BlockAsyncOperationBuildError, BlockAsyncOperationKind, BlockAsyncOperationStatus,
-    BlockAsyncRequestIdentity, BlockAsyncRuntimeError, SharedBlockAsyncRuntime,
+    BlockAsyncAdmissionError, BlockAsyncDriveGeneration, BlockAsyncGenerationCaptureState,
+    BlockAsyncOperation, BlockAsyncOperationBuildError, BlockAsyncOperationKind,
+    BlockAsyncOperationStatus, BlockAsyncRequestIdentity, BlockAsyncRuntimeError,
+    SharedBlockAsyncRuntime,
 };
 
 pub const VIRTIO_BLOCK_DEVICE_ID: u32 = 2;
@@ -2480,6 +2484,130 @@ pub struct VirtioBlockRuntimeState {
     transport: VirtioMmioTransportState,
     active_queue: Option<VirtioBlockQueueState>,
     rate_limiter: VirtioBlockRateLimiterState,
+}
+
+/// Live backend kind, including terminal vhost-user frontends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioBlockBackendKind {
+    File,
+    VhostUser,
+}
+
+/// Exact file-engine continuation state at a capture boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockCaptureIoEngine {
+    Sync,
+    Async(BlockAsyncGenerationCaptureState),
+}
+
+/// Detached, value-redacted block state retained for later persistence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBlockDeviceCaptureState {
+    config_space: VirtioBlockConfigSpace,
+    device_id: VirtioBlockDeviceId,
+    backing: BlockFileBackingIdentity,
+    active_queue: Option<VirtioBlockQueueState>,
+    rate_limiter: VirtioBlockRateLimiterState,
+    io_engine: BlockCaptureIoEngine,
+}
+
+impl VirtioBlockDeviceCaptureState {
+    pub const fn config_space(self) -> VirtioBlockConfigSpace {
+        self.config_space
+    }
+
+    pub const fn device_id(self) -> VirtioBlockDeviceId {
+        self.device_id
+    }
+
+    pub const fn backing(self) -> BlockFileBackingIdentity {
+        self.backing
+    }
+
+    pub const fn active_queue(self) -> Option<VirtioBlockQueueState> {
+        self.active_queue
+    }
+
+    pub const fn rate_limiter(self) -> VirtioBlockRateLimiterState {
+        self.rate_limiter
+    }
+
+    pub const fn io_engine(self) -> BlockCaptureIoEngine {
+        self.io_engine
+    }
+}
+
+impl fmt::Debug for VirtioBlockDeviceCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioBlockDeviceCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Value-redacted failure while detaching live block state.
+#[derive(Debug)]
+pub enum VirtioBlockDeviceCaptureError {
+    UnsupportedBackend,
+    ConfigurationMismatch,
+    BackingIdentity,
+    RateLimiter,
+    Async(BlockAsyncRuntimeError),
+}
+
+impl fmt::Display for VirtioBlockDeviceCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedBackend => {
+                formatter.write_str("vhost-user block capture is unsupported")
+            }
+            Self::ConfigurationMismatch => {
+                formatter.write_str("live block state does not match its configuration")
+            }
+            Self::BackingIdentity => {
+                formatter.write_str("live block backing identity is unavailable")
+            }
+            Self::RateLimiter => formatter.write_str("live block rate limiter state is invalid"),
+            Self::Async(_) => formatter.write_str("live Async block state is not capture-ready"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockDeviceCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Async(source) => Some(source),
+            Self::UnsupportedBackend
+            | Self::ConfigurationMismatch
+            | Self::BackingIdentity
+            | Self::RateLimiter => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBlockPciCaptureError {
+    Device(VirtioBlockDeviceCaptureError),
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Display for VirtioBlockPciCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Device(_) => formatter.write_str("PCI block device capture failed"),
+            Self::Endpoint(_) => formatter.write_str("PCI block transport capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockPciCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Device(source) => Some(source),
+            Self::Endpoint(source) => Some(source),
+        }
+    }
 }
 
 pub(crate) struct VirtioBlockRuntimeRestoreInput<'a> {
@@ -5005,6 +5133,13 @@ impl VirtioBlockDevice {
         }
     }
 
+    pub const fn backend_kind(&self) -> VirtioBlockBackendKind {
+        match self.backend {
+            VirtioBlockBackend::File { .. } => VirtioBlockBackendKind::File,
+            VirtioBlockBackend::VhostUser(_) => VirtioBlockBackendKind::VhostUser,
+        }
+    }
+
     pub fn io_engine(&self) -> Option<DriveIoEngine> {
         match &self.backend {
             VirtioBlockBackend::File { io_engine, .. } => Some(match io_engine {
@@ -5053,6 +5188,98 @@ impl VirtioBlockDevice {
             } => Some((runtime.clone(), *generation)),
             VirtioBlockBackend::File { .. } | VirtioBlockBackend::VhostUser(_) => None,
         }
+    }
+
+    /// Captures a regular-file device after any Async generation is drained.
+    pub fn capture_state_at(
+        &self,
+        config_space: VirtioBlockConfigSpace,
+        config: &DriveConfig,
+        now: Instant,
+    ) -> Result<VirtioBlockDeviceCaptureState, VirtioBlockDeviceCaptureError> {
+        let VirtioBlockBackend::File {
+            backing,
+            active_queue,
+            rate_limiter,
+            io_engine,
+        } = &self.backend
+        else {
+            return Err(VirtioBlockDeviceCaptureError::UnsupportedBackend);
+        };
+        if VirtioBlockDeviceId::from_bytes(config.drive_id().as_bytes()) != self.device_id
+            || config.is_read_only() != Some(backing.is_read_only())
+            || config_space != VirtioBlockConfigSpace::from_backing(backing, config.cache_type())
+        {
+            return Err(VirtioBlockDeviceCaptureError::ConfigurationMismatch);
+        }
+        let backing = backing
+            .snapshot_identity()
+            .map_err(|_| VirtioBlockDeviceCaptureError::BackingIdentity)?;
+        let rate_limiter = VirtioBlockRateLimiter::persisted_state_at(
+            config.rate_limiter(),
+            rate_limiter.as_ref(),
+            now,
+        )
+        .map_err(|_| VirtioBlockDeviceCaptureError::RateLimiter)?;
+        let io_engine = match io_engine {
+            VirtioBlockFileIoEngine::Sync if config.io_engine() == Some(DriveIoEngine::Sync) => {
+                BlockCaptureIoEngine::Sync
+            }
+            VirtioBlockFileIoEngine::Async {
+                runtime,
+                generation,
+                cache_type,
+                terminal: false,
+            } if config.io_engine() == Some(DriveIoEngine::Async)
+                && *cache_type == config.cache_type() =>
+            {
+                BlockCaptureIoEngine::Async(
+                    runtime
+                        .capture_quiesced_generation(*generation)
+                        .map_err(VirtioBlockDeviceCaptureError::Async)?,
+                )
+            }
+            VirtioBlockFileIoEngine::Sync | VirtioBlockFileIoEngine::Async { .. } => {
+                return Err(VirtioBlockDeviceCaptureError::ConfigurationMismatch);
+            }
+        };
+        Ok(VirtioBlockDeviceCaptureState {
+            config_space,
+            device_id: self.device_id,
+            backing,
+            active_queue: active_queue.as_ref().map(VirtioBlockQueue::snapshot_state),
+            rate_limiter,
+            io_engine,
+        })
+    }
+
+    /// Publishes only already-drained Async completions without consuming pressure.
+    pub fn publish_quiesced_async_completions(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError> {
+        let VirtioBlockBackend::File {
+            active_queue,
+            io_engine:
+                VirtioBlockFileIoEngine::Async {
+                    runtime,
+                    generation,
+                    terminal: false,
+                    ..
+                },
+            ..
+        } = &mut self.backend
+        else {
+            return Err(VirtioBlockQueueDispatchError::AsyncRuntime {
+                completed_dispatch: Box::default(),
+                source: BlockAsyncRuntimeError::ExecutorInvariant,
+            });
+        };
+        let mut dispatch = VirtioBlockQueueDispatch::default();
+        if let Some(queue) = active_queue.as_mut() {
+            queue.publish_async_completions(memory, runtime, *generation, &mut dispatch)?;
+        }
+        Ok(dispatch)
     }
 
     pub fn refresh_backing(
@@ -6790,9 +7017,110 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockD
 
         dispatch
     }
+
+    pub fn publish_quiesced_async_completions(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError> {
+        let dispatch = self
+            .activation_handler_mut()
+            .publish_quiesced_async_completions(memory);
+        let needs_queue_interrupt = match &dispatch {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) => error.completed_dispatch().needs_queue_interrupt(),
+        };
+        if needs_queue_interrupt {
+            self.mark_queue_interrupt_pending(0);
+        }
+        dispatch
+    }
+}
+
+impl VirtioBlockMmioHandler {
+    pub fn block_backend_kind(&self) -> VirtioBlockBackendKind {
+        self.activation_handler().backend_kind()
+    }
+
+    pub fn block_async_binding(
+        &self,
+    ) -> Option<(SharedBlockAsyncRuntime, BlockAsyncDriveGeneration)> {
+        self.activation_handler().async_binding()
+    }
+
+    pub fn capture_block_device_state_at(
+        &self,
+        config: &DriveConfig,
+        now: Instant,
+    ) -> Result<VirtioBlockDeviceCaptureState, VirtioBlockDeviceCaptureError> {
+        self.activation_handler()
+            .capture_state_at(*self.device_config_handler(), config, now)
+    }
 }
 
 impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
+    pub fn block_backend_kind(&self) -> Result<VirtioBlockBackendKind, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| core.activation.backend_kind())
+    }
+
+    pub fn block_async_binding(
+        &self,
+    ) -> Result<Option<(SharedBlockAsyncRuntime, BlockAsyncDriveGeneration)>, VirtioPciEndpointError>
+    {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| core.activation.async_binding())
+    }
+
+    pub fn capture_block_device_state_at(
+        &self,
+        config: &DriveConfig,
+        now: Instant,
+    ) -> Result<(VirtioBlockDeviceCaptureState, VirtioPciTransportState), VirtioBlockPciCaptureError>
+    {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioBlockPciCaptureError::Endpoint)?;
+        let device = work
+            .with_core_mut(|core| {
+                core.activation
+                    .capture_state_at(core.device_config, config, now)
+            })
+            .map_err(VirtioBlockPciCaptureError::Endpoint)?
+            .map_err(VirtioBlockPciCaptureError::Device)?;
+        drop(work);
+        let transport = self
+            .transport_state()
+            .map_err(VirtioBlockPciCaptureError::Endpoint)?;
+        Ok((device, transport))
+    }
+
+    pub fn publish_quiesced_async_completions(
+        &self,
+        memory: &mut GuestMemory,
+    ) -> Result<
+        VirtioBlockQueueDispatch,
+        VirtioPciDeviceOperationError<VirtioBlockQueueDispatchError, VirtioBlockQueueDispatch>,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let dispatch = work
+            .with_core_mut(|core| {
+                let dispatch = core.activation.publish_quiesced_async_completions(memory);
+                let needs_queue_interrupt = match &dispatch {
+                    Ok(dispatch) => dispatch.needs_queue_interrupt(),
+                    Err(error) => error.completed_dispatch().needs_queue_interrupt(),
+                };
+                if needs_queue_interrupt {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
+                }
+                dispatch
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let endpoint = work.drain_interrupt_intents();
+        VirtioPciDeviceOperationError::combine(dispatch, endpoint)
+    }
+
     pub fn vhost_user_call_fd(&self) -> Result<Option<i32>, VirtioPciEndpointError> {
         let work = self.admit_device_work()?;
         work.with_core_mut(|core| core.activation.vhost_user_call_fd())
@@ -7434,8 +7762,8 @@ mod tests {
     };
 
     use super::async_executor::{
-        BlockAsyncExecutorConfig, BlockAsyncHostIo, BlockAsyncTransferResult,
-        SharedBlockAsyncRuntime,
+        BlockAsyncExecutorConfig, BlockAsyncHostIo, BlockAsyncRuntimeError,
+        BlockAsyncTransferResult, SharedBlockAsyncRuntime,
     };
 
     use crate::interrupt::DeviceInterruptKind;
@@ -7474,8 +7802,8 @@ mod tests {
     };
 
     use super::{
-        BlockFileBacking, BlockFileBackingError, BlockMmioDevices, BlockMmioLayout,
-        BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
+        BlockCaptureIoEngine, BlockFileBacking, BlockFileBackingError, BlockMmioDevices,
+        BlockMmioLayout, BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
         DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveLiveUpdateMode,
         DriveRateLimiterConfig, DriveReplacementIdentityField, DriveRuntimeMutationError,
         DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput, PreparedBlockDevice,
@@ -7492,13 +7820,13 @@ mod tests {
         VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
         VIRTIO_RING_FEATURE_INDIRECT_DESC, VhostUserBlockConfigRefreshError,
         VhostUserBlockConfigSignalError, VhostUserBlockNotificationError, VhostUserBlockState,
-        VirtioBlockBackend, VirtioBlockConfigSpace, VirtioBlockDevice,
-        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
-        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatch,
-        VirtioBlockQueueDispatchError, VirtioBlockQueueSnapshotError, VirtioBlockRateLimiter,
-        VirtioBlockRequest, VirtioBlockRequestCompletion, VirtioBlockRequestError,
-        VirtioBlockRequestExecutionError, VirtioBlockRequestExecutionOutcome,
-        VirtioBlockRequestType, normalize_completion_status,
+        VirtioBlockBackend, VirtioBlockBackendKind, VirtioBlockConfigSpace, VirtioBlockDevice,
+        VirtioBlockDeviceActivationError, VirtioBlockDeviceCaptureError, VirtioBlockDeviceId,
+        VirtioBlockDeviceNotificationError, VirtioBlockQueue, VirtioBlockQueueBuildError,
+        VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError, VirtioBlockQueueSnapshotError,
+        VirtioBlockRateLimiter, VirtioBlockRequest, VirtioBlockRequestCompletion,
+        VirtioBlockRequestError, VirtioBlockRequestExecutionError,
+        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -10158,6 +10486,87 @@ mod tests {
     }
 
     #[test]
+    fn block_capture_retains_sync_and_reopenable_async_engine_state() {
+        let sync_file = temp_file("capture-sync.img", &[0; 512]);
+        let sync_config = DriveConfigInput::new("sync", "sync", sync_file.as_path(), true)
+            .with_is_read_only(true)
+            .with_io_engine(DriveIoEngine::Sync)
+            .validate()
+            .expect("Sync capture config should validate");
+        let sync = PreparedBlockDevice::from_config_with_backing(&sync_config, None)
+            .expect("Sync block device should prepare");
+        let sync_state = sync
+            .device()
+            .capture_state_at(sync.config_space(), &sync_config, Instant::now())
+            .expect("Sync block state should capture");
+        assert_eq!(sync_state.config_space(), sync.config_space());
+        assert_eq!(sync_state.backing().len(), 512);
+        assert_eq!(sync_state.io_engine(), BlockCaptureIoEngine::Sync);
+        assert_eq!(
+            format!("{sync_state:?}"),
+            "VirtioBlockDeviceCaptureState { state: \"<redacted>\" }"
+        );
+
+        let async_file = temp_file("capture-async.img", &[0; 512]);
+        let async_config = DriveConfigInput::new("async", "async", async_file.as_path(), false)
+            .with_io_engine(DriveIoEngine::Async)
+            .validate()
+            .expect("Async capture config should validate");
+        let mut asynchronous = PreparedBlockDevice::from_config_with_backing(&async_config, None)
+            .expect("Async block device should prepare");
+        let runtime = SharedBlockAsyncRuntime::new();
+        let generation = asynchronous
+            .bind_async_runtime(runtime.clone())
+            .expect("Async runtime should bind")
+            .expect("Async configuration should own a generation");
+        let mut memory = request_memory();
+        runtime
+            .stop_generations(&[generation])
+            .expect("Async admission should stop");
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("idle Async generation should quiesce");
+        let captured = asynchronous
+            .device()
+            .capture_state_at(asynchronous.config_space(), &async_config, Instant::now())
+            .expect("quiesced Async state should capture");
+        let BlockCaptureIoEngine::Async(async_state) = captured.io_engine() else {
+            panic!("Async configuration should capture an Async engine");
+        };
+        assert_eq!(async_state.generation(), generation);
+        assert!(async_state.admission_stopped());
+        assert_eq!(async_state.owned_operations(), 0);
+        assert_eq!(async_state.final_completions(), 0);
+        runtime
+            .resume_quiesced_generation(generation)
+            .expect("captured Async generation should reopen");
+        assert!(matches!(
+            asynchronous.device().capture_state_at(
+                asynchronous.config_space(),
+                &async_config,
+                Instant::now(),
+            ),
+            Err(VirtioBlockDeviceCaptureError::Async(
+                BlockAsyncRuntimeError::AdmissionNotStopped
+            ))
+        ));
+        runtime
+            .stop_generations(&[generation])
+            .expect("reopened Async generation should stop");
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("reopened Async generation should quiesce");
+        runtime
+            .unbind_quiesced(generation)
+            .expect("Async generation should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("idle Async runtime should stop")
+        );
+    }
+
+    #[test]
     fn live_file_replacement_switches_engines_and_replaces_exact_limiter() {
         let original_file = temp_file("live-engine-original.img", &[0; 512]);
         let async_file = temp_file("live-engine-async.img", &[1; 1024]);
@@ -11082,7 +11491,19 @@ mod tests {
         refreshed[20..24].copy_from_slice(&512_u32.to_le_bytes());
         let (mut handler, _memory, peer) =
             vhost_user_refresh_handler(TestVhostUserConfigReply::Exact(refreshed));
+        let config = DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+            .with_socket("/private/redacted-vhost.sock")
+            .validate()
+            .expect("vhost-user capture config should validate");
 
+        assert_eq!(
+            handler.block_backend_kind(),
+            VirtioBlockBackendKind::VhostUser
+        );
+        assert!(matches!(
+            handler.capture_block_device_state_at(&config, Instant::now()),
+            Err(VirtioBlockDeviceCaptureError::UnsupportedBackend)
+        ));
         assert_eq!(handler.device_config_handler().capacity_sectors(), 1);
         assert_eq!(
             handler.read_register(VirtioMmioRegister::ConfigGeneration),
@@ -13791,6 +14212,125 @@ mod tests {
         runtime
             .shutdown(&mut memory)
             .expect("Async runtime should shut down");
+    }
+
+    #[test]
+    fn quiesced_async_partial_publication_exposes_uncertain_guest_completion() {
+        let mut memory = request_memory();
+        memory
+            .write_slice(&[0xff], STATUS_ADDR)
+            .expect("partial-publication status sentinel should initialize");
+        let file = temp_file(
+            "queue-async-partial-publication.img",
+            &vec![0; VIRTIO_BLOCK_SECTOR_SIZE as usize],
+        );
+        let backing = Arc::new(open_backing(file.as_path(), true).expect("backing should open"));
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            BlockAsyncExecutorConfig::new(1, 1, 1, 512, 512),
+            Arc::new(QueueAsyncReadGateHost {
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+                byte: 0x3c,
+                result: None,
+            }),
+        );
+        let generation = runtime
+            .bind_drive(Arc::clone(&backing), DriveCacheType::Unsafe)
+            .expect("partial-publication generation should bind");
+        let available = VirtqueueAvailableRing::new(
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("partial-publication available ring should build");
+        let used = VirtqueueUsedRing::new(GuestAddress::new(TEST_MEMORY_SIZE - 4), TEST_QUEUE_SIZE)
+            .expect("out-of-memory used ring geometry should remain arithmetically valid");
+        let mut queue = VirtioBlockQueue::new(available, used);
+
+        queue
+            .dispatch_with_async_runtime(
+                &mut memory,
+                backing.as_ref(),
+                TEST_DEVICE_ID,
+                None,
+                &runtime,
+                generation,
+            )
+            .expect("partial-publication request should enter the host");
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("partial-publication host read should enter");
+        runtime
+            .stop_generations(&[generation])
+            .expect("partial-publication admission should stop");
+        release_sender
+            .send(())
+            .expect("partial-publication host read should release");
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("partial-publication generation should drain");
+
+        let error = queue
+            .publish_async_completions(
+                &mut memory,
+                &runtime,
+                generation,
+                &mut VirtioBlockQueueDispatch::default(),
+            )
+            .expect_err("invalid used ring should fail after writing request status");
+        let VirtioBlockQueueDispatchError::UsedRing {
+            completed_dispatch,
+            descriptor_head,
+            bytes_written_to_guest,
+            ..
+        } = error
+        else {
+            panic!("partial publication should report an uncertain used-ring write");
+        };
+        assert_eq!(*completed_dispatch, VirtioBlockQueueDispatch::default());
+        assert_eq!(descriptor_head, 0);
+        assert_eq!(
+            bytes_written_to_guest,
+            VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE
+        );
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+        assert_eq!(queue.used_ring().next_used(), 0);
+        assert_eq!(
+            runtime
+                .pop_completion(generation)
+                .expect("uncertain completion lookup should succeed"),
+            None,
+            "the owner consumed the compact completion before the ambiguous guest write"
+        );
+        runtime
+            .resume_quiesced_generation(generation)
+            .expect("runtime ownership alone can reopen after the completion is consumed");
+        runtime
+            .stop_generations(&[generation])
+            .expect("cleanup generation should stop again");
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("cleanup generation should remain drained");
+        runtime
+            .unbind_quiesced(generation)
+            .expect("cleanup generation should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("partial-publication executor should stop")
+        );
     }
 
     #[test]

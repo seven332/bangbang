@@ -21,7 +21,9 @@ path.
   action policy. Paths and override contents are never logged or echoed.
 - Create is paused-state-only and supports only `Full` for one vCPU, exactly
   one regular read-only root drive, default serial, and no optional devices or
-  MMDS. Unsupported modes and profiles fail before artifact or capture work.
+  MMDS. Unsupported modes fail before storage work. Unsupported broad storage
+  profiles run the live non-persisting preflight described below, then fail
+  before contained grant claims, artifact staging, or native state capture.
 - The GICv2m foundation selected by `--enable-pci` is outside native-v1. The
   immutable process profile rejects PCI create before pause/capture/artifact
   work and rejects PCI load before file/grant/controller/VM mutation. The
@@ -38,6 +40,13 @@ path.
   #1423 aggregate certification covers only the live shared runtime manager,
   mixed identity/capacity semantics, and owner-thread serialization; it neither
   changes this rejection nor promotes PCI persistence.
+- Before applying those native-v1 profile exclusions, paused create now asks
+  the boot owner for one complete capture-ready storage traversal. It reconciles
+  every configured startup or runtime block/pmem device with its authoritative
+  live MMIO or PCI owner, rejects any live vhost-user block backend first, and
+  returns a redacted in-memory state aggregate. A successful broad traversal is
+  still followed by the existing profile rejection, so it publishes no new
+  bytes and creates no load contract.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
   network, and entropy retry schedulers, preflights both final namespaces,
@@ -327,6 +336,34 @@ compatibility and are not a cross-host portability claim. The opaque GIC blob
 is bounded before allocation and can still be rejected by Hypervisor.framework
 after a host update. PL031 is deliberately reconstructed fresh: no mutable RTC
 register or alarm continuity is encoded.
+
+### Capture-Ready Storage Handoff (not native-v1)
+
+The paused boot owner exposes one internal, value-redacted storage boundary for
+the later Wave 6 serializer. It is intentionally not included in the five
+`BANGHVF\0` components above. The handoff contains:
+
+| State | Exact retained boundary |
+| --- | --- |
+| Aggregate | Config-order block and pmem values plus the shared block/pmem retry state observed at one `Instant`. |
+| Regular block | Complete `DriveConfig`, startup/runtime origin, MMIO region or PCI SBDF/BAR placement, stable opened-backing identity and capacity, cache/engine state, queues, device registers, limiter, retry, notifications, activation, and pending interrupt effects. |
+| Async block | The regular-block state plus the same generation token, cache policy, next operation and sequence counters, stopped admission and pressure state, and checked zero counts for owned operations, parked host completions, and compact final completions. |
+| Pmem | Complete `PmemConfig`, guest range/protection, stable backing identity, an opaque clone retaining the exact authoritative direct mapping owner, queue/token/limiter/retry state, startup/runtime origin, and complete MMIO or PCI transport state. |
+| PCI transport | Full type-0 configuration image, common/device registers, queue selectors and cursors, notifications, activation, pending interrupt intents, and MSI-X table, PBA, vectors, enable/mask, and transition state. |
+
+The owner first reserves and reconciles the complete inventory and scans every
+live block backend for vhost-user. Vhost returns a typed redacted unsupported
+error before admission or guest-memory mutation. Otherwise it closes every
+Async generation before draining any generation, routes foreign completions,
+performs the cache-sensitive persistence barrier, publishes each compact
+completion through its exact MMIO/PCI owner with normal metrics and interrupt
+effects, captures every device, and reopens all generations in reverse order.
+Cancellation and recoverable errors drain entered work and attempt the same
+reopen; uncertain completion publication or failed reopen is terminal.
+
+This boundary deliberately adds no native-v1 variant, serialized storage
+aggregate, load/restore path, migration promise, PCI persistence promise, or
+vhost snapshot support. Wave 6 owns those versioned decisions.
 
 ### Composite Capture Boundary
 
