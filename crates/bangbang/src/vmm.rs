@@ -16667,6 +16667,43 @@ mod tests {
     }
 
     #[test]
+    fn vhost_user_runtime_removal_rejects_before_touching_the_active_session() {
+        let mut vmm = configured_vmm(FakeStarter::success(32));
+        vmm.pci_enabled = true;
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("/private/vhost.sock"),
+        ))
+        .expect("vhost-user drive should configure");
+        vmm.controller
+            .commit_instance_start()
+            .expect("test controller should enter running state");
+        vmm.started_session = Some(FakeSession::new(32));
+
+        let error = vmm
+            .handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                HotUnplugDeviceKind::Drive,
+                "vhost",
+            )))
+            .expect_err("vhost-user runtime removal should reject");
+
+        assert_eq!(
+            error,
+            VmmActionError::DriveRuntimeMutation(DriveRuntimeMutationError::UnsupportedBackend)
+        );
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(
+            vmm.drive_configs()[0].socket(),
+            Some(Path::new("/private/vhost.sock"))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.block_remove_count, 0);
+    }
+
+    #[test]
     fn vhost_user_snapshot_rejects_before_session_barrier_or_artifact_staging() {
         let state_path = missing_temp_child_path("vhost.state");
         let memory_path = state_path.with_file_name("vhost.memory");

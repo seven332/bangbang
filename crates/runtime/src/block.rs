@@ -919,6 +919,9 @@ impl DriveConfigs {
                 drive_id: drive_id.to_string(),
             });
         }
+        if config.is_vhost_user() {
+            return Err(DriveRuntimeMutationError::UnsupportedBackend);
+        }
         Ok(PreparedDriveConfigRemoval {
             drive_id: drive_id.to_string(),
             index,
@@ -8077,6 +8080,24 @@ mod tests {
         configs.commit_runtime_removal(prepared);
         assert_eq!(configs.as_slice().len(), 1);
         assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+    }
+
+    #[test]
+    fn runtime_drive_removal_rejects_vhost_user_backend() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(
+                DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                    .with_socket("/private/vhost.sock"),
+            )
+            .expect("vhost-user drive should configure");
+
+        assert!(matches!(
+            configs.prepare_runtime_removal("vhost"),
+            Err(DriveRuntimeMutationError::UnsupportedBackend)
+        ));
+        assert_eq!(configs.as_slice().len(), 1);
+        assert!(configs.as_slice()[0].is_vhost_user());
     }
 
     #[test]
