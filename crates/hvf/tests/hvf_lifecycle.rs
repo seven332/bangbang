@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+#[path = "../../../tests/support/macos_virtual_block.rs"]
+mod macos_virtual_block;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static HVF_LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -32,6 +36,636 @@ struct MachTimebaseInfo {
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_app_sandbox_hvf_lifecycle_replay() -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|executable| is_app_sandbox_hvf_lifecycle_executable(&executable))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_app_sandbox_hvf_lifecycle_executable(executable: &std::path::Path) -> bool {
+    let Some(macos) = executable.parent() else {
+        return false;
+    };
+    let Some(contents) = macos.parent() else {
+        return false;
+    };
+    let Some(bundle) = contents.parent() else {
+        return false;
+    };
+    executable.file_name() == Some(std::ffi::OsStr::new("hvf_lifecycle"))
+        && macos.file_name() == Some(std::ffi::OsStr::new("MacOS"))
+        && contents.file_name() == Some(std::ffi::OsStr::new("Contents"))
+        && bundle.file_name() == Some(std::ffi::OsStr::new("BangbangHvfLifecycleSandbox.app"))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn app_sandbox_hvf_lifecycle_replay_requires_exact_bundle_layout() {
+    use std::path::Path;
+
+    assert!(is_app_sandbox_hvf_lifecycle_executable(Path::new(
+        "/tmp/BangbangHvfLifecycleSandbox.app/Contents/MacOS/hvf_lifecycle"
+    )));
+    assert!(!is_app_sandbox_hvf_lifecycle_executable(Path::new(
+        "/tmp/BangbangHvfLifecycleSandbox.app/target/hvf_lifecycle"
+    )));
+    assert!(!is_app_sandbox_hvf_lifecycle_executable(Path::new(
+        "/tmp/BangbangHvfLifecycleSandbox.app/Contents/MacOS/hvf_lifecycle-deadbeef"
+    )));
+    assert!(!is_app_sandbox_hvf_lifecycle_executable(Path::new(
+        "/tmp/Other.app/Contents/MacOS/hvf_lifecycle"
+    )));
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn temporary_virtual_block_fixture_preserves_rw_ro_bytes_and_exact_cleanup() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use crate::macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess};
+    use bangbang_runtime::block::{
+        BlockDeviceControl, BlockDeviceControlError, BlockDeviceGeometry, BlockFileBacking,
+        BlockFileBackingError, SnapshotBlockFileBackingError, VirtioBlockDeviceId,
+    };
+
+    #[derive(Debug)]
+    struct RejectInspectControl;
+
+    impl BlockDeviceControl for RejectInspectControl {
+        fn inspect(
+            &self,
+            _file: &std::fs::File,
+        ) -> Result<BlockDeviceGeometry, BlockDeviceControlError> {
+            Err(BlockDeviceControlError::new(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+        }
+
+        fn synchronize_cache(&self, _file: &std::fs::File) -> Result<(), BlockDeviceControlError> {
+            panic!("failed inspection must not publish a backing")
+        }
+    }
+
+    #[derive(Debug)]
+    struct RejectSyncControl {
+        geometry: BlockDeviceGeometry,
+    }
+
+    impl BlockDeviceControl for RejectSyncControl {
+        fn inspect(
+            &self,
+            _file: &std::fs::File,
+        ) -> Result<BlockDeviceGeometry, BlockDeviceControlError> {
+            Ok(self.geometry)
+        }
+
+        fn synchronize_cache(&self, _file: &std::fs::File) -> Result<(), BlockDeviceControlError> {
+            Err(BlockDeviceControlError::new(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ChangingGeometryControl {
+        initial: BlockDeviceGeometry,
+        changed: BlockDeviceGeometry,
+        inspections: AtomicUsize,
+    }
+
+    impl BlockDeviceControl for ChangingGeometryControl {
+        fn inspect(
+            &self,
+            _file: &std::fs::File,
+        ) -> Result<BlockDeviceGeometry, BlockDeviceControlError> {
+            if self.inspections.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                Ok(self.initial)
+            } else {
+                Ok(self.changed)
+            }
+        }
+
+        fn synchronize_cache(&self, _file: &std::fs::File) -> Result<(), BlockDeviceControlError> {
+            Ok(())
+        }
+    }
+
+    // The wrapper already runs this test as a directly signed binary. Its App Sandbox replay
+    // cannot launch the test-only `hdiutil` fixture process and is covered by #1465 instead.
+    if is_app_sandbox_hvf_lifecycle_replay() {
+        return;
+    }
+    let _guard = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut media = MacosVirtualBlock::create(MacosVirtualBlockAccess::ReadWrite)
+        .expect("temporary virtual block media should create");
+    let marker = b"bangbang-virtual-block";
+    let device = media
+        .device_path()
+        .expect("attached device path should exist")
+        .to_path_buf();
+    let identity = media
+        .identity()
+        .expect("attached identity should be available");
+
+    assert_eq!(
+        media.len().expect("media length should read"),
+        4 * 1024 * 1024
+    );
+    assert_ne!(identity.target_device(), 0);
+    assert_eq!(
+        u64::from(
+            media
+                .logical_block_size()
+                .expect("logical block size should read")
+        ) * media.block_count().expect("block count should read"),
+        media.len().expect("media length should read")
+    );
+    assert!(format!("{media:?}").contains("<redacted>"));
+    assert!(!format!("{media:?}").contains(device.to_string_lossy().as_ref()));
+    assert!(!format!("{identity:?}").contains(&identity.target_device().to_string()));
+
+    let logical_block_size = media
+        .logical_block_size()
+        .expect("logical block size should read");
+    let block_count = media.block_count().expect("block count should read");
+    let geometry = BlockDeviceGeometry::new(logical_block_size, block_count)
+        .expect("fixture geometry should validate");
+    let inspect_error = BlockFileBacking::from_file_with_block_device_control(
+        media
+            .open_descriptor()
+            .expect("inspect-failure block descriptor should open"),
+        false,
+        Arc::new(RejectInspectControl),
+    )
+    .expect_err("control inspection failure should reject adoption");
+    assert!(matches!(
+        inspect_error,
+        BlockFileBackingError::ReadBlockGeometry { source }
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+
+    let rejecting_sync = BlockFileBacking::from_file_with_block_device_control(
+        media
+            .open_descriptor()
+            .expect("sync-failure block descriptor should open"),
+        false,
+        Arc::new(RejectSyncControl { geometry }),
+    )
+    .expect("valid injected inspection should adopt the real block descriptor");
+    assert!(matches!(
+        rejecting_sync.flush(),
+        Err(BlockFileBackingError::FlushBlockDevice { source })
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    drop(rejecting_sync);
+
+    let changed_geometry = BlockDeviceGeometry::new(
+        logical_block_size,
+        block_count
+            .checked_sub(1)
+            .expect("fixture should have more than one logical block"),
+    )
+    .expect("changed fixture geometry should remain structurally valid");
+    let changing = BlockFileBacking::from_file_with_block_device_control(
+        media
+            .open_descriptor()
+            .expect("geometry-change block descriptor should open"),
+        false,
+        Arc::new(ChangingGeometryControl {
+            initial: geometry,
+            changed: changed_geometry,
+            inspections: AtomicUsize::new(0),
+        }),
+    )
+    .expect("initial injected geometry should adopt the real block descriptor");
+    assert_eq!(
+        changing.snapshot_identity(),
+        Err(SnapshotBlockFileBackingError::InvalidMetadata)
+    );
+    drop(changing);
+
+    {
+        let backing = BlockFileBacking::from_file(
+            media
+                .open_descriptor()
+                .expect("read-write block descriptor should open"),
+            false,
+        )
+        .expect("runtime should adopt read-write block descriptor");
+        assert!(backing.kind().is_block_device());
+        assert_eq!(
+            backing.kind().logical_block_size(),
+            Some(
+                media
+                    .logical_block_size()
+                    .expect("logical block size should read")
+            )
+        );
+        assert_eq!(
+            backing.len(),
+            media.len().expect("media length should read")
+        );
+        assert_eq!(
+            backing.device_id(),
+            VirtioBlockDeviceId::from_bytes(
+                format!(
+                    "{}{}{}",
+                    identity.device(),
+                    identity.target_device(),
+                    identity.inode()
+                )
+                .as_bytes()
+            )
+        );
+        let backing_debug = format!("{backing:?}");
+        assert!(backing_debug.contains("<redacted>"));
+        assert!(!backing_debug.contains(&backing.len().to_string()));
+        assert!(!backing_debug.contains(&identity.target_device().to_string()));
+        backing
+            .write_at(4096, marker)
+            .expect("runtime block write should succeed");
+        backing
+            .flush()
+            .expect("runtime block cache synchronization should succeed");
+        let mut readback = vec![0_u8; marker.len()];
+        backing
+            .read_at(4096, &mut readback)
+            .expect("runtime block read should succeed");
+        assert_eq!(readback, marker);
+        let capture_identity = backing
+            .snapshot_identity()
+            .expect("runtime block capture identity should revalidate");
+        assert!(capture_identity.kind().is_block_device());
+        assert_eq!(
+            capture_identity.target_device(),
+            Some(identity.target_device())
+        );
+        assert_eq!(
+            capture_identity.block_count(),
+            Some(media.block_count().expect("block count should read"))
+        );
+    }
+    assert_eq!(
+        media
+            .read_at(4096, marker.len())
+            .expect("read-write attachment should read marker"),
+        marker
+    );
+    media
+        .reattach(MacosVirtualBlockAccess::ReadOnly)
+        .expect("media should reattach read-only");
+    assert_eq!(
+        media
+            .read_at(4096, marker.len())
+            .expect("read-only attachment should read persisted marker"),
+        marker
+    );
+    let read_only_backing = BlockFileBacking::from_file(
+        media
+            .open_descriptor()
+            .expect("read-only block descriptor should open"),
+        true,
+    )
+    .expect("runtime should adopt read-only block descriptor");
+    let mut readback = vec![0_u8; marker.len()];
+    read_only_backing
+        .read_at(4096, &mut readback)
+        .expect("runtime read-only block read should succeed");
+    assert_eq!(readback, marker);
+    assert!(matches!(
+        read_only_backing.write_at(4096, b"rejected"),
+        Err(BlockFileBackingError::ReadOnlyWrite)
+    ));
+    drop(read_only_backing);
+    assert!(media.write_at(4096, b"rejected").is_err());
+    media
+        .cleanup()
+        .expect("temporary virtual block media should detach and clean up");
+    assert!(!device.exists());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn temporary_virtual_block_traverses_async_flush_and_capture_ready_owner() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use crate::macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess};
+    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::async_executor::{
+        BlockAsyncApplyOutcome, BlockAsyncCompletionDisposition, BlockAsyncDrive,
+        BlockAsyncDriveGeneration, BlockAsyncExecutor, BlockAsyncOperation,
+        BlockAsyncOperationKind, BlockAsyncOperationStatus, BlockAsyncRequestIdentity,
+        BlockAsyncScheduleOutcome,
+    };
+    use bangbang_runtime::block::{
+        BlockCaptureIoEngine, BlockDeviceControl, BlockDeviceControlError, BlockDeviceGeometry,
+        BlockFileBacking, BlockFileBackingError, BlockMmioLayout, DriveCacheType, DriveConfigInput,
+        DriveIoEngine, DriveLiveUpdateMode,
+    };
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::{
+        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
+    };
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::storage_capture::{CaptureReadyStorageConfigs, StorageTransportState};
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    #[derive(Debug)]
+    struct RejectReplacementInspectControl;
+
+    impl BlockDeviceControl for RejectReplacementInspectControl {
+        fn inspect(
+            &self,
+            _file: &std::fs::File,
+        ) -> Result<BlockDeviceGeometry, BlockDeviceControlError> {
+            Err(BlockDeviceControlError::new(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+        }
+
+        fn synchronize_cache(&self, _file: &std::fs::File) -> Result<(), BlockDeviceControlError> {
+            panic!("failed replacement inspection must not publish a backing")
+        }
+    }
+
+    // The wrapper already runs this test as a directly signed binary. Its App Sandbox replay
+    // cannot launch the test-only `hdiutil` fixture process and is covered by #1465 instead.
+    if is_app_sandbox_hvf_lifecycle_replay() {
+        return;
+    }
+    let _guard = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let media = MacosVirtualBlock::create(MacosVirtualBlockAccess::ReadWrite)
+        .expect("temporary virtual block media should create");
+    let device = media
+        .device_path()
+        .expect("attached device path should exist")
+        .to_path_buf();
+    let media_identity = media
+        .identity()
+        .expect("attached identity should be available");
+    let media_len = media.len().expect("media length should read");
+    let logical_block_size = media
+        .logical_block_size()
+        .expect("logical block size should read");
+    let block_count = media.block_count().expect("block count should read");
+
+    let backing = Arc::new(
+        BlockFileBacking::from_file(
+            media
+                .open_descriptor()
+                .expect("async block descriptor should open"),
+            false,
+        )
+        .expect("runtime should adopt the async block descriptor"),
+    );
+    let expected_device_id = backing.device_id();
+    let mut executor = BlockAsyncExecutor::new().expect("production async executor should start");
+    let completion_fd = executor
+        .completion_fd()
+        .expect("production async executor should expose a completion descriptor");
+    let mut drive = BlockAsyncDrive::new(
+        BlockAsyncDriveGeneration::new(1),
+        Arc::clone(&backing),
+        DriveCacheType::Writeback,
+        executor.handle(),
+    )
+    .expect("block drive should bind to the production async executor");
+    let layout = GuestMemoryLayout::new(vec![
+        GuestMemoryRange::new(GuestAddress::new(0), 16 * 1024)
+            .expect("async flush guest range should validate"),
+    ])
+    .expect("async flush guest layout should validate");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("async flush guest memory should allocate");
+    let operation = drive
+        .admit(BlockAsyncOperation::flush(BlockAsyncRequestIdentity::new(
+            0,
+            0,
+            GuestAddress::new(0),
+        )))
+        .expect("real block flush should admit");
+    assert!(matches!(
+        drive
+            .schedule_one(&memory)
+            .expect("real block flush should schedule"),
+        BlockAsyncScheduleOutcome::Submitted {
+            operation: submitted,
+            chunk_offset: 0,
+            chunk_len: 0,
+        } if submitted == operation
+    ));
+    let mut readiness = libc::pollfd {
+        fd: completion_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: One initialized pollfd is writable for the bounded wait.
+    let ready = unsafe { libc::poll(&raw mut readiness, 1, 5_000) };
+    assert_eq!(
+        ready, 1,
+        "real block flush should complete before the deadline"
+    );
+    assert_ne!(readiness.revents & libc::POLLIN, 0);
+    let completion = executor
+        .try_recv_completion()
+        .expect("production completion queue should remain connected")
+        .expect("readiness should publish the real block flush completion");
+    let BlockAsyncApplyOutcome::Completed(applied) = drive
+        .apply_completion(
+            &mut memory,
+            completion,
+            BlockAsyncCompletionDisposition::Apply,
+        )
+        .expect("real block flush completion should apply")
+    else {
+        panic!("real block flush should complete in one host operation");
+    };
+    assert_eq!(applied.kind(), BlockAsyncOperationKind::Flush);
+    assert_eq!(applied.status(), BlockAsyncOperationStatus::Success);
+    assert_eq!(applied.bytes_transferred(), 0);
+    drop(drive);
+    executor
+        .shutdown()
+        .expect("production async executor should stop");
+    drop(executor);
+    drop(backing);
+
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("block-capture-ready-kernel", &image)
+        .expect("block capture kernel should create");
+    let root = TempFile::new_len("block-capture-ready-root", 4096)
+        .expect("regular block capture root should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("block capture boot source should configure");
+    controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("regular capture root should configure");
+    controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("blockdata", "blockdata", device.as_path(), false)
+                .with_is_read_only(false)
+                .with_cache_type(DriveCacheType::Writeback)
+                .with_io_engine(DriveIoEngine::Async),
+        ))
+        .expect("real block data drive should configure");
+    let session_config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    );
+    let mut session = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed block capture session should prepare");
+    let configs = CaptureReadyStorageConfigs::new(controller.drive_configs().to_vec(), Vec::new());
+    let retry_guard = session
+        .quiesce_limiter_retry_wakeups()
+        .expect("block capture retry publishers should quiesce");
+    let first = session
+        .capture_ready_storage_state_at(&configs, &retry_guard, Instant::now())
+        .expect("real block drive should become capture-ready");
+    let second = session
+        .capture_ready_storage_state_at(&configs, &retry_guard, Instant::now())
+        .expect("real block Async admission should reopen for a second capture");
+    assert_eq!(first.block_devices().len(), 2);
+    assert_eq!(
+        first.block_devices()[1].config(),
+        &controller.drive_configs()[1]
+    );
+    assert!(
+        first.block_devices()[0]
+            .device()
+            .backing()
+            .kind()
+            .is_regular_file()
+    );
+    assert!(matches!(
+        first.block_devices()[1].transport(),
+        StorageTransportState::Mmio(_)
+    ));
+    let first_device = first.block_devices()[1].device();
+    let second_device = second.block_devices()[1].device();
+    let captured_backing = first_device.backing();
+    assert!(captured_backing.kind().is_block_device());
+    assert_eq!(
+        captured_backing.target_device(),
+        Some(media_identity.target_device())
+    );
+    assert_eq!(captured_backing.len(), media_len);
+    assert_eq!(
+        captured_backing.kind().logical_block_size(),
+        Some(logical_block_size)
+    );
+    assert_eq!(captured_backing.block_count(), Some(block_count));
+    assert_eq!(
+        first_device.config_space().capacity_sectors(),
+        media_len / 512
+    );
+    assert_eq!(first_device.device_id(), expected_device_id);
+    assert_eq!(second_device.backing(), captured_backing);
+    assert_eq!(second_device.device_id(), first_device.device_id());
+    let BlockCaptureIoEngine::Async(first_async) = first_device.io_engine() else {
+        panic!("real block drive should retain Async continuation state");
+    };
+    let BlockCaptureIoEngine::Async(second_async) = second_device.io_engine() else {
+        panic!("second real block capture should retain Async continuation state");
+    };
+    assert_eq!(second_async.generation(), first_async.generation());
+    assert!(first_async.admission_stopped());
+    assert_eq!(first_async.owned_operations(), 0);
+    assert_eq!(first_async.parked_host_completions(), 0);
+    assert_eq!(first_async.final_completions(), 0);
+
+    let failed_replacement = BlockFileBacking::from_file_with_block_device_control(
+        media
+            .open_descriptor()
+            .expect("failed replacement block descriptor should open"),
+        false,
+        Arc::new(RejectReplacementInspectControl),
+    )
+    .expect_err("failed replacement inspection should reject before publication");
+    assert!(matches!(
+        failed_replacement,
+        BlockFileBackingError::ReadBlockGeometry { source }
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    let after_failed_replacement = session
+        .capture_ready_storage_state_at(&configs, &retry_guard, Instant::now())
+        .expect("failed replacement preparation must leave the prior owner capture-ready");
+    let failed_device = after_failed_replacement.block_devices()[1].device();
+    assert_eq!(failed_device.backing(), captured_backing);
+    assert_eq!(failed_device.device_id(), expected_device_id);
+    let BlockCaptureIoEngine::Async(failed_async) = failed_device.io_engine() else {
+        panic!("failed replacement must retain the prior Async engine");
+    };
+    assert_eq!(failed_async.generation(), second_async.generation());
+
+    drop(retry_guard);
+    let replacement_config = controller.drive_configs()[1].clone();
+    let replacement_backing = BlockFileBacking::from_file(
+        media
+            .open_descriptor()
+            .expect("successful replacement block descriptor should open"),
+        false,
+    )
+    .expect("successful replacement block backing should prepare");
+    session
+        .update_live_block_device_with_opened(
+            &replacement_config,
+            Some(replacement_backing),
+            None,
+            DriveLiveUpdateMode::Replacement,
+        )
+        .expect("real block replacement should commit through the MMIO owner");
+    let replacement_guard = session
+        .quiesce_limiter_retry_wakeups()
+        .expect("replacement capture retry publishers should quiesce");
+    let after_successful_replacement = session
+        .capture_ready_storage_state_at(&configs, &replacement_guard, Instant::now())
+        .expect("successfully replaced real block drive should become capture-ready");
+    let replacement_device = after_successful_replacement.block_devices()[1].device();
+    assert_eq!(replacement_device.backing(), captured_backing);
+    assert_eq!(replacement_device.device_id(), expected_device_id);
+    assert_eq!(
+        replacement_device.config_space().capacity_sectors(),
+        media_len / 512
+    );
+    let BlockCaptureIoEngine::Async(replacement_async) = replacement_device.io_engine() else {
+        panic!("successful block replacement should retain the configured Async engine");
+    };
+    assert_ne!(replacement_async.generation(), second_async.generation());
+    assert!(replacement_async.admission_stopped());
+    assert_eq!(replacement_async.owned_operations(), 0);
+    drop(replacement_guard);
+    session
+        .shutdown()
+        .expect("signed block capture session should shut down");
+    drop(session);
+    media
+        .cleanup()
+        .expect("temporary virtual block media should detach and clean up");
+    assert!(!device.exists());
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
