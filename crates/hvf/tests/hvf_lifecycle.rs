@@ -40,11 +40,45 @@ unsafe extern "C" {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn is_app_sandbox_hvf_lifecycle_replay() -> bool {
-    std::env::current_exe().ok().is_some_and(|executable| {
-        executable.ancestors().any(|ancestor| {
-            ancestor.file_name() == Some(std::ffi::OsStr::new("BangbangHvfLifecycleSandbox.app"))
-        })
-    })
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|executable| is_app_sandbox_hvf_lifecycle_executable(&executable))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_app_sandbox_hvf_lifecycle_executable(executable: &std::path::Path) -> bool {
+    let Some(macos) = executable.parent() else {
+        return false;
+    };
+    let Some(contents) = macos.parent() else {
+        return false;
+    };
+    let Some(bundle) = contents.parent() else {
+        return false;
+    };
+    executable.file_name() == Some(std::ffi::OsStr::new("hvf_lifecycle"))
+        && macos.file_name() == Some(std::ffi::OsStr::new("MacOS"))
+        && contents.file_name() == Some(std::ffi::OsStr::new("Contents"))
+        && bundle.file_name() == Some(std::ffi::OsStr::new("BangbangHvfLifecycleSandbox.app"))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn app_sandbox_hvf_lifecycle_replay_requires_exact_bundle_layout() {
+    use std::path::Path;
+
+    assert!(is_app_sandbox_hvf_lifecycle_executable(Path::new(
+        "/tmp/BangbangHvfLifecycleSandbox.app/Contents/MacOS/hvf_lifecycle"
+    )));
+    assert!(!is_app_sandbox_hvf_lifecycle_executable(Path::new(
+        "/tmp/BangbangHvfLifecycleSandbox.app/target/hvf_lifecycle"
+    )));
+    assert!(!is_app_sandbox_hvf_lifecycle_executable(Path::new(
+        "/tmp/BangbangHvfLifecycleSandbox.app/Contents/MacOS/hvf_lifecycle-deadbeef"
+    )));
+    assert!(!is_app_sandbox_hvf_lifecycle_executable(Path::new(
+        "/tmp/Other.app/Contents/MacOS/hvf_lifecycle"
+    )));
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
