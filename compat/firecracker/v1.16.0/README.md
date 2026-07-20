@@ -269,9 +269,22 @@ uses an all-PCI shared-memory guest to cover invalid-target and negotiation
 rollback, new-ID attach, duplicate zero-connect rejection, manual removal,
 DELETE, Paused same-ID reuse through another child, resumed I/O, and exact
 closure without a steady-state helper or entitlement change.
-Snapshot state, Async/io_uring, dynamic-memory coexistence, and the broad
-vhost/storage aggregates remain nonterminal, so the inventory counts are
-unchanged.
+At that checkpoint snapshot state, Async/io_uring, dynamic-memory coexistence,
+and the broad vhost/storage aggregates remained nonterminal, so the inventory
+counts were unchanged.
+
+#1446 promotes exactly `api-property:Drive.io_engine` and
+`corpus:block-io-engine`. File-backed drives now accept default `Sync` or
+explicit `Async` over MMIO/PCI with direct paths or contained opened grants.
+One lazy bounded portable executor per VM session supplies generation-safe
+owner-thread completion, limiter/dirty/status/used/interrupt/metrics
+publication, live path and same-ID backing/engine replacement, PCI
+hotplug/DELETE/reuse, and orderly reset/shutdown. Four signed executable and two
+signed production scenarios cover concurrent devices and the complete public
+lifecycle. This is not a claim of Linux io_uring identity; native-v1 Async state
+remains excluded before artifact creation. The overlay therefore contains 86
+`implemented-and-verified`, 312 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` records.
 
 ## Commands
 

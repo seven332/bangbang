@@ -15,13 +15,15 @@ use crate::balloon::{
     VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError,
     VirtioBalloonMmioHandler,
 };
+use crate::block::async_executor::{BlockAsyncRuntimeError, SharedBlockAsyncRuntime};
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
-    DriveConfig, DriveConfigInput, DriveIoEngine, DriveRateLimiterConfig, DriveUpdateError,
-    PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
+    DriveConfig, DriveConfigInput, DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig,
+    DriveUpdateError, PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
     PreparedVhostUserBlockFrontend, VhostUserBlockConfigSignalError, VirtioBlockConfigSpace,
     VirtioBlockDeviceId, VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
-    VirtioBlockMmioHandler, VirtioBlockRuntimeRestoreInput,
+    VirtioBlockLiveUpdateError, VirtioBlockMmioHandler, VirtioBlockQueueDispatch,
+    VirtioBlockRuntimeRestoreInput,
 };
 use crate::boot::{
     BootCommandLineError, BootSource, BootSourceConfig, BootSourceFiles, BootSourceLoadError,
@@ -468,6 +470,7 @@ pub struct Arm64BootResources {
     pub vmgenid_device: Arm64BootVmGenIdDevice,
     pub vmclock_device: Arm64BootVmClockDevice,
     pub block_devices: Vec<Arm64BootBlockDevice>,
+    pub block_async_runtime: SharedBlockAsyncRuntime,
     #[doc(hidden)]
     pub pci_block_devices: Vec<PreparedBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
@@ -544,6 +547,7 @@ pub struct Arm64BootRuntimeResources {
     pub vmgenid_device: Arm64BootVmGenIdDevice,
     pub vmclock_device: Arm64BootVmClockDevice,
     pub block_devices: Vec<Arm64BootBlockDevice>,
+    pub block_async_runtime: SharedBlockAsyncRuntime,
     #[doc(hidden)]
     pub pci_block_devices: Vec<PreparedBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
@@ -1162,6 +1166,7 @@ pub fn install_snapshot_v1_runtime(
         vmgenid_device,
         vmclock_device,
         block_devices,
+        block_async_runtime: SharedBlockAsyncRuntime::new(),
         pci_block_devices: Vec::new(),
         pmem_devices: Vec::new(),
         pmem_mmio_devices: Vec::new(),
@@ -2561,6 +2566,22 @@ impl fmt::Display for Arm64BootSnapshotV1DeviceCaptureError {
 impl std::error::Error for Arm64BootSnapshotV1DeviceCaptureError {}
 
 impl Arm64BootRuntimeResources {
+    pub fn block_async_completion_fd(&self) -> Result<Option<RawFd>, BlockAsyncRuntimeError> {
+        self.block_async_runtime.completion_fd()
+    }
+
+    pub fn shutdown_block_async(
+        &self,
+        memory: &mut GuestMemory,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.block_async_runtime.shutdown(memory)
+    }
+
+    /// Stops an idle or already-stopped Async runtime without borrowing memory.
+    pub fn shutdown_block_async_if_idle(&self) -> Result<bool, BlockAsyncRuntimeError> {
+        self.block_async_runtime.shutdown_if_idle()
+    }
+
     pub fn capture_snapshot_v1_device_state_at(
         &self,
         memory: &GuestMemory,
@@ -3168,6 +3189,77 @@ pub fn update_block_device_for_devices_with_opened(
     )
 }
 
+/// One prepared live file-backed block-device update.
+#[derive(Debug)]
+pub struct OpenedBlockDeviceLiveUpdate<'a> {
+    config: &'a DriveConfig,
+    backing: Option<BlockFileBacking>,
+    rate_limiter_update: Option<DriveRateLimiterConfig>,
+    mode: DriveLiveUpdateMode,
+    shared_runtime: &'a SharedBlockAsyncRuntime,
+}
+
+impl<'a> OpenedBlockDeviceLiveUpdate<'a> {
+    pub fn new(
+        config: &'a DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+        mode: DriveLiveUpdateMode,
+        shared_runtime: &'a SharedBlockAsyncRuntime,
+    ) -> Self {
+        Self {
+            config,
+            backing,
+            rate_limiter_update,
+            mode,
+            shared_runtime,
+        }
+    }
+}
+
+pub fn update_live_block_device_for_devices_with_opened(
+    block_devices: &[Arm64BootBlockDevice],
+    mmio_dispatcher: &mut MmioDispatcher,
+    memory: &mut GuestMemory,
+    update: OpenedBlockDeviceLiveUpdate<'_>,
+) -> Result<VirtioBlockQueueDispatch, DriveUpdateError> {
+    let OpenedBlockDeviceLiveUpdate {
+        config,
+        backing,
+        rate_limiter_update,
+        mode,
+        shared_runtime,
+    } = update;
+    let region_id = block_device_region_id(block_devices, config)?;
+    let handler = mmio_dispatcher
+        .handler_mut::<VirtioBlockMmioHandler>(region_id)
+        .map_err(|source| DriveUpdateError::HandlerLookup {
+            drive_id: config.drive_id().to_string(),
+            region_id,
+            message: source.to_string(),
+        })?;
+    handler
+        .update_live_block_device_with_opened(
+            memory,
+            config,
+            backing,
+            rate_limiter_update,
+            mode,
+            shared_runtime,
+        )
+        .map_err(live_block_update_error)
+}
+
+fn live_block_update_error(source: VirtioBlockLiveUpdateError) -> DriveUpdateError {
+    let terminal = source.terminal();
+    let message = source.to_string();
+    if terminal {
+        DriveUpdateError::TerminalActiveSessionCommand { message }
+    } else {
+        DriveUpdateError::ActiveSessionCommand { message }
+    }
+}
+
 /// Refreshes one configured MMIO vhost-user block device and signals the guest.
 ///
 /// Device lookup and typed-handler lookup complete before the backend protocol
@@ -3383,6 +3475,9 @@ pub enum Arm64BootResourceError {
     PrepareBlockDevices {
         source: PreparedBlockDeviceError,
     },
+    PrepareBlockAsyncRuntime {
+        source: BlockAsyncRuntimeError,
+    },
     PreparePmemDevices {
         source: PreparedPmemDeviceError,
     },
@@ -3550,6 +3645,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::PrepareBlockDevices { source } => {
                 write!(f, "failed to prepare block devices: {source}")
             }
+            Self::PrepareBlockAsyncRuntime { source } => {
+                write!(f, "failed to prepare asynchronous block runtime: {source}")
+            }
             Self::PreparePmemDevices { source } => {
                 write!(f, "failed to prepare pmem devices: {source}")
             }
@@ -3698,6 +3796,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::PciCommandLine { source } => Some(source),
             Self::RootDriveCommandLine { source } => Some(source),
             Self::PrepareBlockDevices { source } => Some(source),
+            Self::PrepareBlockAsyncRuntime { source } => Some(source),
             Self::PreparePmemDevices { source } => Some(source),
             Self::PrepareNetworkDevices { source } => Some(source),
             Self::PrepareVsockDevice { source } => Some(source),
@@ -3984,13 +4083,17 @@ impl Arm64BootResources {
         )
         .map_err(|source| Arm64BootResourceError::PreparePmemDevices { source })?;
 
-        let prepared_blocks = PreparedBlockDevices::from_config_slice_with_resources(
+        let block_async_runtime = SharedBlockAsyncRuntime::new();
+        let mut prepared_blocks = PreparedBlockDevices::from_config_slice_with_resources(
             controller.drive_configs(),
             &memory,
             block_backings,
             vhost_user_block_frontends,
         )
         .map_err(|source| Arm64BootResourceError::PrepareBlockDevices { source })?;
+        prepared_blocks
+            .bind_async_runtime(&block_async_runtime)
+            .map_err(|source| Arm64BootResourceError::PrepareBlockAsyncRuntime { source })?;
         let prepared_networks =
             PreparedNetworkDevices::from_config_slice(controller.network_interface_configs())
                 .map_err(|source| Arm64BootResourceError::PrepareNetworkDevices { source })?;
@@ -4308,6 +4411,7 @@ impl Arm64BootResources {
             vmgenid_device,
             vmclock_device,
             block_devices,
+            block_async_runtime,
             pci_block_devices,
             pmem_devices,
             pmem_mmio_devices,
@@ -4341,6 +4445,7 @@ impl Arm64BootResources {
                 vmgenid_device: self.vmgenid_device,
                 vmclock_device: self.vmclock_device,
                 block_devices: self.block_devices,
+                block_async_runtime: self.block_async_runtime,
                 pci_block_devices: self.pci_block_devices,
                 pmem_devices: self.pmem_devices,
                 pmem_mmio_devices: self.pmem_mmio_devices,

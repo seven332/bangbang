@@ -1774,13 +1774,21 @@ multi-chunk progress, write snapshots, read staging and dirty publication,
 partial/error byte counts, same-drive conflict and flush barriers, cross-drive
 parallelism, stale generations, discard and cache-sensitive final flush,
 worker-panic recovery, non-owning handle cleanup, pipe saturation, and Darwin
-`kqueue` readiness clearing. The focused
+`kqueue` readiness clearing. Shared-runtime tests additionally cover lazy
+single-pool construction, multiple generation routing, foreign-completion
+parking without retaining global leases, selected-generation quiescence, and
+readiness re-arming when another device becomes publishable during the same
+monitor pass. The focused
 `boot_run_loop_supervisor_stays_responsive_while_async_block_host_call_blocks`
 test additionally holds a host call inside the block pool and requires a
-second owner command to finish before that call is released. These are engine
-and wakeup-boundary proofs only: public `DriveIoEngine::Async` remains rejected,
-and #1446 owns API activation, queue integration, capability-inventory changes,
-and signed guest evidence.
+second owner command to finish before that call is released. Public
+`DriveIoEngine::Async` is also covered end to end: process tests prove API and
+configuration projection; signed executable cases prove MMIO live path PATCH,
+config-file startup, concurrent Async root/data drives, first-use PCI hotplug,
+DELETE/reuse, and paused same-ID Sync-to-Async replacement; signed production
+cases prove contained Async root/control startup, preauthorized same-ID backing
+and engine replacement, limiter PATCH, and runtime hotplug/delete/reuse. Native-v1
+Async rejection before artifact creation remains an explicit state-format gate.
 
 Direct pre-boot vhost-user block has its own signed executable gate. The MMIO
 case first connects an intentionally incompatible backend and proves that
@@ -1818,9 +1826,10 @@ rejection, anchored no-symlink/current-user/socket/single-link validation, cwd
 restoration, retry after a normal broker failure, startup zero-request
 preflight, runtime zero-request owner preflight, multiple children, ID-only
 PATCH, duplicate PUT, DELETE lease release, and same-ID reinsertion.
-Dynamic-memory coexistence, same-ID replacement without DELETE, async/io_uring,
+Dynamic-memory coexistence, same-ID vhost replacement without DELETE,
 automatic guest PCI notification, and vhost snapshot state remain outside the
-combined direct and contained subset.
+combined direct and contained vhost subset. File-backed Async uses the portable
+session executor described above rather than Linux io_uring.
 
 The `bangbang-vhost-user` crate retains a portable protocol boundary.
 Native-endian golden tests cover the exact pinned

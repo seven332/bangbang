@@ -164,8 +164,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 84);
-    assert_eq!(count(Disposition::AuditRequired), 314);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 86);
+    assert_eq!(count(Disposition::AuditRequired), 312);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 

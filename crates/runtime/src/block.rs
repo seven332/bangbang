@@ -12,6 +12,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bangbang_vhost_user::{
@@ -47,6 +48,12 @@ use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
     VirtqueueUsedRing, VirtqueueUsedRingError, VirtqueueUsedRingPublication,
+};
+
+use self::async_executor::{
+    BlockAsyncAdmissionError, BlockAsyncDriveGeneration, BlockAsyncOperation,
+    BlockAsyncOperationBuildError, BlockAsyncOperationKind, BlockAsyncOperationStatus,
+    BlockAsyncRequestIdentity, BlockAsyncRuntimeError, SharedBlockAsyncRuntime,
 };
 
 pub const VIRTIO_BLOCK_DEVICE_ID: u32 = 2;
@@ -834,6 +841,41 @@ impl DriveConfigs {
         existing.updated(&update)
     }
 
+    /// Validates a same-ID live replacement without mutating the configured set.
+    pub fn validate_runtime_replacement(
+        &self,
+        replacement: DriveConfig,
+    ) -> Result<DriveConfig, DriveUpdateError> {
+        let drive_id = replacement.drive_id().to_string();
+        let Some(existing) = self
+            .configs
+            .iter()
+            .find(|config| config.drive_id() == drive_id)
+        else {
+            return Err(DriveUpdateError::UnknownDrive { drive_id });
+        };
+
+        if existing.is_vhost_user() || replacement.is_vhost_user() {
+            return Err(DriveUpdateError::UnsupportedBackend);
+        }
+        let mismatched_field = if existing.is_root_device() != replacement.is_root_device() {
+            Some(DriveReplacementIdentityField::RootDevice)
+        } else if existing.is_read_only() != replacement.is_read_only() {
+            Some(DriveReplacementIdentityField::ReadOnly)
+        } else if existing.partuuid() != replacement.partuuid() {
+            Some(DriveReplacementIdentityField::Partuuid)
+        } else if existing.cache_type() != replacement.cache_type() {
+            Some(DriveReplacementIdentityField::CacheType)
+        } else {
+            None
+        };
+        if let Some(field) = mismatched_field {
+            return Err(DriveUpdateError::ReplacementIdentityMismatch { drive_id, field });
+        }
+
+        Ok(replacement)
+    }
+
     pub fn commit_update(&mut self, config: DriveConfig) -> Result<(), DriveUpdateError> {
         let drive_id = config.drive_id().to_string();
         let Some(existing) = self
@@ -959,9 +1001,6 @@ impl TryFrom<DriveConfigInput> for DriveConfig {
                     return Err(DriveConfigError::EmptyPathOnHost);
                 }
                 let io_engine = input.io_engine.unwrap_or_default();
-                if io_engine != DriveIoEngine::Sync {
-                    return Err(DriveConfigError::UnsupportedIoEngine { io_engine });
-                }
                 DriveBackendConfig::File {
                     path_on_host,
                     is_read_only: input.is_read_only.unwrap_or(false),
@@ -1093,9 +1132,6 @@ pub enum DriveConfigError {
     EmptySocket,
     InvalidVhostUserConfiguration,
     IncompatibleMemoryHotplug,
-    UnsupportedIoEngine {
-        io_engine: DriveIoEngine,
-    },
     RootDeviceAlreadyConfigured,
 }
 
@@ -1114,6 +1150,10 @@ pub enum DriveUpdateError {
     },
     EmptyPathOnHost,
     UnsupportedBackend,
+    ReplacementIdentityMismatch {
+        drive_id: String,
+        field: DriveReplacementIdentityField,
+    },
     UnknownDrive {
         drive_id: String,
     },
@@ -1134,6 +1174,26 @@ pub enum DriveUpdateError {
     },
     ActiveSessionUnavailable,
     MmioDispatcherUnavailable,
+}
+
+/// A guest-visible drive identity field that same-ID live replacement cannot change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveReplacementIdentityField {
+    RootDevice,
+    ReadOnly,
+    Partuuid,
+    CacheType,
+}
+
+impl fmt::Display for DriveReplacementIdentityField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::RootDevice => "is_root_device",
+            Self::ReadOnly => "is_read_only",
+            Self::Partuuid => "partuuid",
+            Self::CacheType => "cache_type",
+        })
+    }
 }
 
 /// Redacted failure while preparing or committing a post-start block-device
@@ -1177,9 +1237,6 @@ impl fmt::Display for DriveConfigError {
             Self::IncompatibleMemoryHotplug => {
                 f.write_str("vhost-user drive is incompatible with dynamic memory hotplug")
             }
-            Self::UnsupportedIoEngine { io_engine } => {
-                write!(f, "drive io_engine {io_engine} is not supported")
-            }
             Self::RootDeviceAlreadyConfigured => f.write_str("a root drive is already configured"),
         }
     }
@@ -1200,7 +1257,13 @@ impl fmt::Display for DriveUpdateError {
             Self::MismatchedDriveId { .. } => f.write_str("path drive_id must match body drive_id"),
             Self::EmptyPathOnHost => f.write_str("drive path_on_host must not be empty"),
             Self::UnsupportedBackend => {
-                f.write_str("path and rate limiter updates are unsupported for vhost-user drives")
+                f.write_str("file-backed drive updates are unsupported for vhost-user drives")
+            }
+            Self::ReplacementIdentityMismatch { drive_id, field } => {
+                write!(
+                    f,
+                    "live replacement for drive {drive_id} cannot change {field}"
+                )
             }
             Self::UnknownDrive { drive_id } => {
                 write!(f, "drive {drive_id} is not configured")
@@ -1838,6 +1901,59 @@ impl VirtioBlockRequest {
         )
     }
 
+    fn async_operation(
+        &self,
+    ) -> Result<Option<BlockAsyncOperation>, BlockAsyncOperationBuildError> {
+        let identity =
+            BlockAsyncRequestIdentity::new(0, self.descriptor_head, self.status.address());
+        match self.request_type {
+            VirtioBlockRequestType::In | VirtioBlockRequestType::Out => {
+                let Some(data) = self.data else {
+                    return Err(BlockAsyncOperationBuildError::RangeOverflow);
+                };
+                if data.is_empty() {
+                    return Ok(None);
+                }
+                let host_offset = self
+                    .sector
+                    .checked_mul(VIRTIO_BLOCK_SECTOR_SIZE)
+                    .ok_or(BlockAsyncOperationBuildError::RangeOverflow)?;
+                if self.request_type == VirtioBlockRequestType::In {
+                    BlockAsyncOperation::read(identity, data.address(), host_offset, data.len())
+                        .map(Some)
+                } else {
+                    BlockAsyncOperation::write(identity, data.address(), host_offset, data.len())
+                        .map(Some)
+                }
+            }
+            VirtioBlockRequestType::Flush => Ok(Some(BlockAsyncOperation::flush(identity))),
+            VirtioBlockRequestType::GetDeviceId | VirtioBlockRequestType::Unsupported(_) => {
+                Ok(None)
+            }
+        }
+    }
+
+    fn finish_async_operation_error(
+        &self,
+        memory: &mut GuestMemory,
+        source: BlockAsyncOperationBuildError,
+    ) -> VirtioBlockRequestExecution {
+        let latency_sample = matches!(
+            self.request_type,
+            VirtioBlockRequestType::In | VirtioBlockRequestType::Out
+        )
+        .then(|| VirtioBlockRequestLatencySample::new(self.request_type, 0));
+        self.finish_execution(
+            memory,
+            VIRTIO_BLOCK_STATUS_IOERR,
+            0,
+            VirtioBlockRequestExecutionOutcome::IoError {
+                error: VirtioBlockRequestExecutionError::AsyncOperation { source },
+            },
+            latency_sample,
+        )
+    }
+
     fn finish_execution(
         &self,
         memory: &mut GuestMemory,
@@ -2127,6 +2243,9 @@ fn elapsed_microseconds_since(started_at: Instant) -> u64 {
 
 #[derive(Debug)]
 pub enum VirtioBlockRequestExecutionError {
+    AsyncOperation {
+        source: BlockAsyncOperationBuildError,
+    },
     MissingDataDescriptor {
         request_type: VirtioBlockRequestType,
     },
@@ -2164,6 +2283,12 @@ pub enum VirtioBlockRequestExecutionError {
 impl fmt::Display for VirtioBlockRequestExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AsyncOperation { source } => {
+                write!(
+                    f,
+                    "failed to prepare asynchronous virtio-block request: {source}"
+                )
+            }
             Self::MissingDataDescriptor { request_type } => {
                 write!(
                     f,
@@ -2231,6 +2356,7 @@ impl fmt::Display for VirtioBlockRequestExecutionError {
 impl std::error::Error for VirtioBlockRequestExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::AsyncOperation { source } => Some(source),
             Self::BufferAllocationFailed { source, .. } => Some(source),
             Self::GuestMemoryRead { source, .. } | Self::GuestMemoryWrite { source, .. } => {
                 Some(source)
@@ -2806,6 +2932,284 @@ impl VirtioBlockQueue {
         Ok(dispatch)
     }
 
+    fn dispatch_with_async_runtime(
+        &mut self,
+        memory: &mut GuestMemory,
+        backing: &BlockFileBacking,
+        device_id: VirtioBlockDeviceId,
+        rate_limiter: Option<&mut VirtioBlockRateLimiter>,
+        runtime: &SharedBlockAsyncRuntime,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError> {
+        let now = Instant::now();
+        let mut dispatch = VirtioBlockQueueDispatch::default();
+        runtime
+            .service_available_for(generation, memory)
+            .map_err(|source| VirtioBlockQueueDispatchError::AsyncRuntime {
+                completed_dispatch: Box::new(dispatch.clone()),
+                source,
+            })?;
+        self.publish_async_completions(memory, runtime, generation, &mut dispatch)?;
+        if runtime.take_pressure(generation).map_err(|source| {
+            VirtioBlockQueueDispatchError::AsyncRuntime {
+                completed_dispatch: Box::new(dispatch.clone()),
+                source,
+            }
+        })? {
+            dispatch.record_io_engine_throttled_event();
+            return Ok(dispatch);
+        }
+
+        let capacity_sectors = backing.len() >> VIRTIO_BLOCK_SECTOR_SHIFT;
+        let mut rate_limiter = rate_limiter;
+        while let Some(chain) = self
+            .available
+            .pop_descriptor_chain(memory)
+            .map_err(|source| VirtioBlockQueueDispatchError::AvailableRing {
+                completed_dispatch: Box::new(dispatch.clone()),
+                source,
+            })?
+        {
+            let descriptor_head = descriptor_chain_head(&chain).ok_or_else(|| {
+                VirtioBlockQueueDispatchError::EmptyDescriptorChain {
+                    completed_dispatch: Box::new(dispatch.clone()),
+                }
+            })?;
+            let parsed = VirtioBlockRequest::parse(memory, &chain, capacity_sectors);
+            if let Ok(request) = &parsed {
+                let operation = match request.async_operation() {
+                    Ok(operation) => operation,
+                    Err(source) => {
+                        let execution = request.finish_async_operation_error(memory, source);
+                        self.publish_completion(
+                            memory,
+                            execution.completion(),
+                            VirtioBlockQueueDispatchOutcome::from_request_execution(
+                                request, &execution,
+                            ),
+                            &mut dispatch,
+                        )?;
+                        continue;
+                    }
+                };
+                if let Some(operation) = operation {
+                    match runtime.preflight_operation(generation, operation) {
+                        Ok(()) => {}
+                        Err(BlockAsyncRuntimeError::Admission(
+                            BlockAsyncAdmissionError::DriveFull,
+                        )) => {
+                            self.available
+                                .undo_pop_descriptor_chain()
+                                .map_err(|source| VirtioBlockQueueDispatchError::AvailableRing {
+                                    completed_dispatch: Box::new(dispatch.clone()),
+                                    source,
+                                })?;
+                            let _ = runtime.take_pressure(generation);
+                            dispatch.record_io_engine_throttled_event();
+                            break;
+                        }
+                        Err(source) => {
+                            return Err(VirtioBlockQueueDispatchError::AsyncRuntime {
+                                completed_dispatch: Box::new(dispatch),
+                                source,
+                            });
+                        }
+                    }
+                    if let Some(limiter) = rate_limiter.as_deref_mut() {
+                        match limiter.reduce_request_at(request, now) {
+                            VirtioBlockRateLimiterReduction::Allowed => {}
+                            VirtioBlockRateLimiterReduction::Throttled { retry_after } => {
+                                self.available
+                                    .undo_pop_descriptor_chain()
+                                    .map_err(|source| {
+                                        VirtioBlockQueueDispatchError::AvailableRing {
+                                            completed_dispatch: Box::new(dispatch.clone()),
+                                            source,
+                                        }
+                                    })?;
+                                dispatch.record_rate_limited_request(retry_after);
+                                break;
+                            }
+                        }
+                    }
+                    runtime
+                        .admit_preflighted(generation, operation)
+                        .map_err(|source| VirtioBlockQueueDispatchError::AsyncRuntime {
+                            completed_dispatch: Box::new(dispatch.clone()),
+                            source,
+                        })?;
+                    runtime
+                        .service_available_for(generation, memory)
+                        .map_err(|source| VirtioBlockQueueDispatchError::AsyncRuntime {
+                            completed_dispatch: Box::new(dispatch.clone()),
+                            source,
+                        })?;
+                    self.publish_async_completions(memory, runtime, generation, &mut dispatch)?;
+                    if runtime.take_pressure(generation).map_err(|source| {
+                        VirtioBlockQueueDispatchError::AsyncRuntime {
+                            completed_dispatch: Box::new(dispatch.clone()),
+                            source,
+                        }
+                    })? {
+                        dispatch.record_io_engine_throttled_event();
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            let (completion, outcome) = match parsed {
+                Ok(request) => {
+                    let execution = request.execute(memory, backing, device_id);
+                    (
+                        execution.completion(),
+                        VirtioBlockQueueDispatchOutcome::from_request_execution(
+                            &request, &execution,
+                        ),
+                    )
+                }
+                Err(source) => (
+                    VirtioBlockRequestCompletion::new(descriptor_head, 0),
+                    VirtioBlockQueueDispatchOutcome::ParseError(source),
+                ),
+            };
+            self.publish_completion(memory, completion, outcome, &mut dispatch)?;
+        }
+        Ok(dispatch)
+    }
+
+    fn publish_async_completions(
+        &mut self,
+        memory: &mut GuestMemory,
+        runtime: &SharedBlockAsyncRuntime,
+        generation: BlockAsyncDriveGeneration,
+        dispatch: &mut VirtioBlockQueueDispatch,
+    ) -> Result<(), VirtioBlockQueueDispatchError> {
+        while let Some(completion) = runtime.pop_completion(generation).map_err(|source| {
+            VirtioBlockQueueDispatchError::AsyncRuntime {
+                completed_dispatch: Box::new(dispatch.clone()),
+                source,
+            }
+        })? {
+            let identity = completion.identity();
+            if identity.queue_index() != 0 {
+                return Err(VirtioBlockQueueDispatchError::AsyncRuntime {
+                    completed_dispatch: Box::new(dispatch.clone()),
+                    source: BlockAsyncRuntimeError::ExecutorInvariant,
+                });
+            }
+            let request_type = match completion.kind() {
+                BlockAsyncOperationKind::Read => VirtioBlockRequestType::In,
+                BlockAsyncOperationKind::Write => VirtioBlockRequestType::Out,
+                BlockAsyncOperationKind::Flush => VirtioBlockRequestType::Flush,
+            };
+            let latency_sample = matches!(
+                completion.kind(),
+                BlockAsyncOperationKind::Read | BlockAsyncOperationKind::Write
+            )
+            .then(|| {
+                VirtioBlockRequestLatencySample::new(request_type, completion.total_latency_us())
+            });
+            let (status_code, bytes_written_to_guest, outcome) = match completion.status() {
+                BlockAsyncOperationStatus::Success => {
+                    let data_len = u32::try_from(completion.bytes_transferred()).map_err(|_| {
+                        VirtioBlockQueueDispatchError::AsyncRuntime {
+                            completed_dispatch: Box::new(dispatch.clone()),
+                            source: BlockAsyncRuntimeError::ExecutorInvariant,
+                        }
+                    })?;
+                    let bytes_written_to_guest =
+                        if completion.kind() == BlockAsyncOperationKind::Read {
+                            data_len
+                        } else {
+                            0
+                        };
+                    (
+                        VIRTIO_BLOCK_STATUS_OK,
+                        bytes_written_to_guest,
+                        VirtioBlockQueueDispatchOutcome::Ok {
+                            request_type,
+                            data_len,
+                            latency_sample,
+                        },
+                    )
+                }
+                BlockAsyncOperationStatus::Failed(_) => (
+                    VIRTIO_BLOCK_STATUS_IOERR,
+                    0,
+                    VirtioBlockQueueDispatchOutcome::IoError { latency_sample },
+                ),
+            };
+            let (status_code, bytes_written_to_guest, outcome) = if bytes_written_to_guest
+                .checked_add(VIRTIO_BLOCK_STATUS_SIZE)
+                .is_some()
+            {
+                (status_code, bytes_written_to_guest, outcome)
+            } else {
+                (
+                    VIRTIO_BLOCK_STATUS_IOERR,
+                    0,
+                    VirtioBlockQueueDispatchOutcome::IoError { latency_sample },
+                )
+            };
+            let status = VirtioBlockStatusDescriptor {
+                index: u16::MAX,
+                address: identity.status_address(),
+                len: VIRTIO_BLOCK_STATUS_SIZE,
+            };
+            let completion = match write_request_status(memory, status, status_code) {
+                Ok(()) => VirtioBlockRequestCompletion::new(
+                    identity.descriptor_head(),
+                    bytes_written_to_guest + VIRTIO_BLOCK_STATUS_SIZE,
+                ),
+                Err(_) => {
+                    let outcome =
+                        VirtioBlockQueueDispatchOutcome::StatusWriteFailed { latency_sample };
+                    self.publish_completion(
+                        memory,
+                        VirtioBlockRequestCompletion::new(identity.descriptor_head(), 0),
+                        outcome,
+                        dispatch,
+                    )?;
+                    continue;
+                }
+            };
+            self.publish_completion(memory, completion, outcome, dispatch)?;
+        }
+        Ok(())
+    }
+
+    fn publish_completion(
+        &mut self,
+        memory: &mut GuestMemory,
+        completion: VirtioBlockRequestCompletion,
+        outcome: VirtioBlockQueueDispatchOutcome,
+        dispatch: &mut VirtioBlockQueueDispatch,
+    ) -> Result<(), VirtioBlockQueueDispatchError> {
+        let notification_suppression = self.notification_suppression(memory).map_err(|source| {
+            VirtioBlockQueueDispatchError::AvailableRing {
+                completed_dispatch: Box::new(dispatch.clone()),
+                source,
+            }
+        })?;
+        let publication = self
+            .used
+            .publish_used_element_with_notification(
+                memory,
+                completion.descriptor_head(),
+                completion.bytes_written_to_guest(),
+                notification_suppression,
+            )
+            .map_err(|source| VirtioBlockQueueDispatchError::UsedRing {
+                completed_dispatch: Box::new(dispatch.clone()),
+                descriptor_head: completion.descriptor_head(),
+                bytes_written_to_guest: completion.bytes_written_to_guest(),
+                source,
+            })?;
+        dispatch.record(outcome, publication);
+        Ok(())
+    }
+
     fn notification_suppression(
         &self,
         memory: &GuestMemory,
@@ -2837,6 +3241,7 @@ pub struct VirtioBlockQueueDispatch {
     unsupported_requests: usize,
     status_write_failures: usize,
     rate_limiter_throttled_requests: usize,
+    io_engine_throttled_events: usize,
     rate_limiter_retry_after: Option<Duration>,
     first_parse_failure: Option<VirtioBlockRequestError>,
     needs_queue_interrupt: bool,
@@ -2901,6 +3306,10 @@ impl VirtioBlockQueueDispatch {
 
     pub const fn rate_limiter_throttled_requests(&self) -> usize {
         self.rate_limiter_throttled_requests
+    }
+
+    pub const fn io_engine_throttled_events(&self) -> usize {
+        self.io_engine_throttled_events
     }
 
     pub const fn rate_limiter_retry_after(&self) -> Option<Duration> {
@@ -2968,6 +3377,10 @@ impl VirtioBlockQueueDispatch {
             Some(existing) => existing.min(retry_after),
             None => retry_after,
         });
+    }
+
+    fn record_io_engine_throttled_event(&mut self) {
+        self.io_engine_throttled_events = self.io_engine_throttled_events.saturating_add(1);
     }
 
     fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {
@@ -3061,6 +3474,10 @@ pub enum VirtioBlockQueueDispatchError {
         bytes_written_to_guest: u32,
         source: VirtqueueUsedRingError,
     },
+    AsyncRuntime {
+        completed_dispatch: Box<VirtioBlockQueueDispatch>,
+        source: BlockAsyncRuntimeError,
+    },
 }
 
 impl fmt::Display for VirtioBlockQueueDispatchError {
@@ -3086,6 +3503,7 @@ impl fmt::Display for VirtioBlockQueueDispatchError {
                     "failed to publish virtio-block used descriptor head {descriptor_head} with length {bytes_written_to_guest}: {source}"
                 )
             }
+            Self::AsyncRuntime { .. } => f.write_str("asynchronous virtio-block runtime failed"),
         }
     }
 }
@@ -3096,6 +3514,7 @@ impl std::error::Error for VirtioBlockQueueDispatchError {
             Self::AvailableRing { source, .. } => Some(source),
             Self::UsedRing { source, .. } => Some(source),
             Self::EmptyDescriptorChain { .. } => None,
+            Self::AsyncRuntime { source, .. } => Some(source),
         }
     }
 }
@@ -3110,6 +3529,9 @@ impl VirtioBlockQueueDispatchError {
                 completed_dispatch, ..
             }
             | Self::UsedRing {
+                completed_dispatch, ..
+            }
+            | Self::AsyncRuntime {
                 completed_dispatch, ..
             } => completed_dispatch,
         }
@@ -4461,11 +4883,23 @@ impl std::error::Error for PreparedVhostUserBlockMemoryError {
 #[derive(Debug)]
 enum VirtioBlockBackend {
     File {
-        backing: BlockFileBacking,
+        backing: Arc<BlockFileBacking>,
         active_queue: Option<VirtioBlockQueue>,
         rate_limiter: Option<VirtioBlockRateLimiter>,
+        io_engine: VirtioBlockFileIoEngine,
     },
     VhostUser(VhostUserBlockBackend),
+}
+
+#[derive(Debug)]
+enum VirtioBlockFileIoEngine {
+    Sync,
+    Async {
+        runtime: SharedBlockAsyncRuntime,
+        generation: BlockAsyncDriveGeneration,
+        cache_type: DriveCacheType,
+        terminal: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -4503,9 +4937,10 @@ impl VirtioBlockDevice {
     pub fn new(backing: BlockFileBacking, device_id: VirtioBlockDeviceId) -> Self {
         Self {
             backend: VirtioBlockBackend::File {
-                backing,
+                backing: Arc::new(backing),
                 active_queue: None,
                 rate_limiter: None,
+                io_engine: VirtioBlockFileIoEngine::Sync,
             },
             device_id,
         }
@@ -4554,9 +4989,10 @@ impl VirtioBlockDevice {
     ) -> Self {
         Self {
             backend: VirtioBlockBackend::File {
-                backing,
+                backing: Arc::new(backing),
                 active_queue,
                 rate_limiter,
+                io_engine: VirtioBlockFileIoEngine::Sync,
             },
             device_id,
         }
@@ -4564,8 +5000,58 @@ impl VirtioBlockDevice {
 
     pub fn backing(&self) -> Option<&BlockFileBacking> {
         match &self.backend {
-            VirtioBlockBackend::File { backing, .. } => Some(backing),
+            VirtioBlockBackend::File { backing, .. } => Some(backing.as_ref()),
             VirtioBlockBackend::VhostUser(_) => None,
+        }
+    }
+
+    pub fn io_engine(&self) -> Option<DriveIoEngine> {
+        match &self.backend {
+            VirtioBlockBackend::File { io_engine, .. } => Some(match io_engine {
+                VirtioBlockFileIoEngine::Sync => DriveIoEngine::Sync,
+                VirtioBlockFileIoEngine::Async { .. } => DriveIoEngine::Async,
+            }),
+            VirtioBlockBackend::VhostUser(_) => None,
+        }
+    }
+
+    pub fn bind_async_runtime(
+        &mut self,
+        cache_type: DriveCacheType,
+        runtime: SharedBlockAsyncRuntime,
+    ) -> Result<BlockAsyncDriveGeneration, BlockAsyncRuntimeError> {
+        let VirtioBlockBackend::File {
+            backing, io_engine, ..
+        } = &mut self.backend
+        else {
+            return Err(BlockAsyncRuntimeError::ExecutorInvariant);
+        };
+        if matches!(io_engine, VirtioBlockFileIoEngine::Async { .. }) {
+            return Err(BlockAsyncRuntimeError::ExecutorInvariant);
+        }
+        let generation = runtime.bind_drive(Arc::clone(backing), cache_type)?;
+        *io_engine = VirtioBlockFileIoEngine::Async {
+            runtime,
+            generation,
+            cache_type,
+            terminal: false,
+        };
+        Ok(generation)
+    }
+
+    pub fn async_binding(&self) -> Option<(SharedBlockAsyncRuntime, BlockAsyncDriveGeneration)> {
+        match &self.backend {
+            VirtioBlockBackend::File {
+                io_engine:
+                    VirtioBlockFileIoEngine::Async {
+                        runtime,
+                        generation,
+                        terminal: false,
+                        ..
+                    },
+                ..
+            } => Some((runtime.clone(), *generation)),
+            VirtioBlockBackend::File { .. } | VirtioBlockBackend::VhostUser(_) => None,
         }
     }
 
@@ -4575,12 +5061,18 @@ impl VirtioBlockDevice {
     ) -> Result<(), VirtioBlockBackendOperationError> {
         match &mut self.backend {
             VirtioBlockBackend::File {
-                backing: current, ..
+                backing: current,
+                io_engine: VirtioBlockFileIoEngine::Sync,
+                ..
             } => {
-                *current = backing;
+                *current = Arc::new(backing);
                 Ok(())
             }
-            VirtioBlockBackend::VhostUser(_) => {
+            VirtioBlockBackend::File {
+                io_engine: VirtioBlockFileIoEngine::Async { .. },
+                ..
+            }
+            | VirtioBlockBackend::VhostUser(_) => {
                 Err(VirtioBlockBackendOperationError::UnsupportedBackend)
             }
         }
@@ -4602,6 +5094,182 @@ impl VirtioBlockDevice {
             *rate_limiter = VirtioBlockRateLimiter::new(update);
         }
         Ok(())
+    }
+
+    pub fn update_file_backend_with_opened(
+        &mut self,
+        memory: &mut GuestMemory,
+        config: &DriveConfig,
+        replacement_backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+        mode: DriveLiveUpdateMode,
+        shared_runtime: &SharedBlockAsyncRuntime,
+    ) -> Result<VirtioBlockQueueDispatch, VirtioBlockLiveUpdateError> {
+        let desired_engine = config
+            .io_engine()
+            .ok_or(VirtioBlockLiveUpdateError::UnsupportedBackend)?;
+        let current_engine = self
+            .io_engine()
+            .ok_or(VirtioBlockLiveUpdateError::UnsupportedBackend)?;
+        let replace_file_state = replacement_backing.is_some()
+            || desired_engine != current_engine
+            || mode == DriveLiveUpdateMode::Replacement;
+        if !replace_file_state {
+            if let Some(update) = rate_limiter_update {
+                self.update_rate_limiter(update)
+                    .map_err(|_| VirtioBlockLiveUpdateError::UnsupportedBackend)?;
+            }
+            return Ok(VirtioBlockQueueDispatch::default());
+        }
+
+        let replacement_backing =
+            replacement_backing.ok_or(VirtioBlockLiveUpdateError::MissingReplacementBacking)?;
+        if config.is_read_only() != Some(replacement_backing.is_read_only()) {
+            return Err(VirtioBlockLiveUpdateError::UnsupportedBackend);
+        }
+        let replacement_backing = Arc::new(replacement_backing);
+        let prospective_async = if desired_engine == DriveIoEngine::Async {
+            Some((
+                shared_runtime.clone(),
+                shared_runtime
+                    .bind_drive(Arc::clone(&replacement_backing), config.cache_type())
+                    .map_err(VirtioBlockLiveUpdateError::AsyncPreparation)?,
+            ))
+        } else {
+            None
+        };
+
+        let VirtioBlockBackend::File {
+            backing,
+            active_queue,
+            rate_limiter,
+            io_engine,
+        } = &mut self.backend
+        else {
+            if let Some((runtime, generation)) = prospective_async {
+                let _ = runtime.discard_generation_without_guest_memory(generation);
+            }
+            return Err(VirtioBlockLiveUpdateError::UnsupportedBackend);
+        };
+        let old_async = match io_engine {
+            VirtioBlockFileIoEngine::Async {
+                runtime,
+                generation,
+                terminal: false,
+                ..
+            } => Some((runtime.clone(), *generation)),
+            VirtioBlockFileIoEngine::Async { terminal: true, .. } => {
+                if let Some((runtime, generation)) = prospective_async {
+                    let _ = runtime.discard_generation_without_guest_memory(generation);
+                }
+                return Err(VirtioBlockLiveUpdateError::AsyncTerminal(
+                    BlockAsyncRuntimeError::ExecutorInvariant,
+                ));
+            }
+            VirtioBlockFileIoEngine::Sync => None,
+        };
+
+        let mut completed_dispatch = VirtioBlockQueueDispatch::default();
+        if let Some((runtime, generation)) = old_async {
+            if let Err(source) = runtime.quiesce_generation(generation, memory) {
+                mark_async_engine_terminal(io_engine);
+                cancel_prospective_async(prospective_async);
+                return Err(VirtioBlockLiveUpdateError::AsyncTerminal(source));
+            }
+            if let Some(queue) = active_queue.as_mut()
+                && let Err(source) = queue.publish_async_completions(
+                    memory,
+                    &runtime,
+                    generation,
+                    &mut completed_dispatch,
+                )
+            {
+                mark_async_engine_terminal(io_engine);
+                cancel_prospective_async(prospective_async);
+                return Err(VirtioBlockLiveUpdateError::Queue(source));
+            }
+            if let Err(source) = runtime.unbind_quiesced(generation) {
+                mark_async_engine_terminal(io_engine);
+                cancel_prospective_async(prospective_async);
+                return Err(VirtioBlockLiveUpdateError::AsyncTerminal(source));
+            }
+        }
+
+        *backing = replacement_backing;
+        *io_engine = match prospective_async {
+            Some((runtime, generation)) => VirtioBlockFileIoEngine::Async {
+                runtime,
+                generation,
+                cache_type: config.cache_type(),
+                terminal: false,
+            },
+            None => VirtioBlockFileIoEngine::Sync,
+        };
+        match mode {
+            DriveLiveUpdateMode::Patch => {
+                if let Some(update) = rate_limiter_update {
+                    if let Some(configured) = rate_limiter.as_mut() {
+                        configured.apply_update(update);
+                        if configured.is_empty() {
+                            *rate_limiter = None;
+                        }
+                    } else {
+                        *rate_limiter = VirtioBlockRateLimiter::new(update);
+                    }
+                }
+            }
+            DriveLiveUpdateMode::Replacement => {
+                *rate_limiter = config.rate_limiter().and_then(VirtioBlockRateLimiter::new);
+            }
+        }
+        Ok(completed_dispatch)
+    }
+
+    fn retire_async(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<VirtioBlockQueueDispatch, VirtioBlockLiveUpdateError> {
+        let VirtioBlockBackend::File {
+            active_queue,
+            io_engine,
+            ..
+        } = &mut self.backend
+        else {
+            return Ok(VirtioBlockQueueDispatch::default());
+        };
+        let (runtime, generation) = match io_engine {
+            VirtioBlockFileIoEngine::Sync => return Ok(VirtioBlockQueueDispatch::default()),
+            VirtioBlockFileIoEngine::Async { terminal: true, .. } => {
+                return Err(VirtioBlockLiveUpdateError::AsyncTerminal(
+                    BlockAsyncRuntimeError::ExecutorInvariant,
+                ));
+            }
+            VirtioBlockFileIoEngine::Async {
+                runtime,
+                generation,
+                terminal: false,
+                ..
+            } => (runtime.clone(), *generation),
+        };
+
+        if let Err(source) = runtime.quiesce_generation(generation, memory) {
+            mark_async_engine_terminal(io_engine);
+            return Err(VirtioBlockLiveUpdateError::AsyncTerminal(source));
+        }
+        let mut dispatch = VirtioBlockQueueDispatch::default();
+        if let Some(queue) = active_queue.as_mut()
+            && let Err(source) =
+                queue.publish_async_completions(memory, &runtime, generation, &mut dispatch)
+        {
+            mark_async_engine_terminal(io_engine);
+            return Err(VirtioBlockLiveUpdateError::Queue(source));
+        }
+        if let Err(source) = runtime.unbind_quiesced(generation) {
+            mark_async_engine_terminal(io_engine);
+            return Err(VirtioBlockLiveUpdateError::AsyncTerminal(source));
+        }
+        mark_async_engine_terminal(io_engine);
+        Ok(dispatch)
     }
 
     pub fn device_id(&self) -> VirtioBlockDeviceId {
@@ -4727,8 +5395,11 @@ impl VirtioBlockDevice {
                 backing,
                 active_queue,
                 rate_limiter,
+                io_engine,
             } => {
-                if drained_notifications.is_empty() {
+                if drained_notifications.is_empty()
+                    && matches!(io_engine, VirtioBlockFileIoEngine::Sync)
+                {
                     return Ok(VirtioBlockDeviceNotificationDispatch::new(
                         drained_notifications,
                         None,
@@ -4741,12 +5412,37 @@ impl VirtioBlockDevice {
                         drained_notifications,
                     });
                 };
-                match queue.dispatch_with_rate_limiter(
-                    memory,
-                    backing,
-                    self.device_id,
-                    rate_limiter.as_mut(),
-                ) {
+                let dispatch = match io_engine {
+                    VirtioBlockFileIoEngine::Sync => queue.dispatch_with_rate_limiter(
+                        memory,
+                        backing.as_ref(),
+                        self.device_id,
+                        rate_limiter.as_mut(),
+                    ),
+                    VirtioBlockFileIoEngine::Async {
+                        runtime,
+                        generation,
+                        terminal,
+                        ..
+                    } => {
+                        if *terminal {
+                            Err(VirtioBlockQueueDispatchError::AsyncRuntime {
+                                completed_dispatch: Box::default(),
+                                source: BlockAsyncRuntimeError::ExecutorInvariant,
+                            })
+                        } else {
+                            queue.dispatch_with_async_runtime(
+                                memory,
+                                backing.as_ref(),
+                                self.device_id,
+                                rate_limiter.as_mut(),
+                                runtime,
+                                *generation,
+                            )
+                        }
+                    }
+                };
+                match dispatch {
                     Ok(dispatch) => Ok(VirtioBlockDeviceNotificationDispatch::new(
                         drained_notifications,
                         Some(dispatch),
@@ -4794,9 +5490,18 @@ impl VirtioBlockDevice {
                 })
             })?;
         match &mut self.backend {
-            VirtioBlockBackend::File { active_queue, .. } => {
+            VirtioBlockBackend::File {
+                active_queue,
+                io_engine,
+                ..
+            } => {
                 if active_queue.is_some() {
                     return Err(VirtioBlockDeviceActivationError::AlreadyActive);
+                }
+                if let VirtioBlockFileIoEngine::Async { terminal, .. } = io_engine
+                    && *terminal
+                {
+                    return Err(VirtioBlockDeviceActivationError::Terminal);
                 }
                 *active_queue = Some(queue);
                 Ok(())
@@ -4809,7 +5514,29 @@ impl VirtioBlockDevice {
 
     pub fn reset(&mut self) {
         match &mut self.backend {
-            VirtioBlockBackend::File { active_queue, .. } => *active_queue = None,
+            VirtioBlockBackend::File {
+                backing,
+                active_queue,
+                io_engine,
+                ..
+            } => {
+                *active_queue = None;
+                if let VirtioBlockFileIoEngine::Async {
+                    runtime,
+                    generation,
+                    cache_type,
+                    terminal,
+                } = io_engine
+                {
+                    let rebound = runtime
+                        .discard_generation_without_guest_memory(*generation)
+                        .and_then(|()| runtime.bind_drive(Arc::clone(backing), *cache_type));
+                    match rebound {
+                        Ok(rebound) => *generation = rebound,
+                        Err(_) => *terminal = true,
+                    }
+                }
+            }
             VirtioBlockBackend::VhostUser(backend) => {
                 if matches!(&backend.state, VhostUserBlockState::Active { .. }) {
                     backend.frontend = None;
@@ -4817,6 +5544,20 @@ impl VirtioBlockDevice {
                 }
             }
         }
+    }
+}
+
+fn mark_async_engine_terminal(io_engine: &mut VirtioBlockFileIoEngine) {
+    if let VirtioBlockFileIoEngine::Async { terminal, .. } = io_engine {
+        *terminal = true;
+    }
+}
+
+fn cancel_prospective_async(
+    prospective: Option<(SharedBlockAsyncRuntime, BlockAsyncDriveGeneration)>,
+) {
+    if let Some((runtime, generation)) = prospective {
+        let _ = runtime.discard_generation_without_guest_memory(generation);
     }
 }
 
@@ -5103,10 +5844,65 @@ impl fmt::Display for VirtioBlockBackendOperationError {
 
 impl std::error::Error for VirtioBlockBackendOperationError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveLiveUpdateMode {
+    Patch,
+    Replacement,
+}
+
+#[derive(Debug)]
+pub enum VirtioBlockLiveUpdateError {
+    UnsupportedBackend,
+    MissingReplacementBacking,
+    AsyncPreparation(BlockAsyncRuntimeError),
+    AsyncTerminal(BlockAsyncRuntimeError),
+    Queue(VirtioBlockQueueDispatchError),
+}
+
+impl VirtioBlockLiveUpdateError {
+    pub const fn terminal(&self) -> bool {
+        matches!(self, Self::AsyncTerminal(_) | Self::Queue(_))
+    }
+}
+
+impl fmt::Display for VirtioBlockLiveUpdateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedBackend => {
+                formatter.write_str("live block update requires a regular-file backend")
+            }
+            Self::MissingReplacementBacking => {
+                formatter.write_str("live block replacement is missing its prepared backing")
+            }
+            Self::AsyncPreparation(_) => {
+                formatter.write_str("live block update failed to prepare Async I/O")
+            }
+            Self::AsyncTerminal(_) => {
+                formatter.write_str("live block update entered terminal Async quiescence")
+            }
+            Self::Queue(_) => {
+                formatter.write_str("live block update failed to publish completed requests")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockLiveUpdateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AsyncPreparation(source) | Self::AsyncTerminal(source) => Some(source),
+            Self::Queue(source) => Some(source),
+            Self::UnsupportedBackend | Self::MissingReplacementBacking => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedBlockDevice {
     drive_id: String,
     is_root_device: bool,
+    io_engine: Option<DriveIoEngine>,
+    cache_type: DriveCacheType,
     config_space: VirtioBlockConfigSpace,
     device: VirtioBlockDevice,
 }
@@ -5123,7 +5919,12 @@ impl PreparedBlockDevice {
         config: &DriveConfig,
         backing: Option<BlockFileBacking>,
     ) -> Result<Self, PreparedBlockDeviceError> {
-        let DriveBackendConfig::File { is_read_only, .. } = config.backend() else {
+        let DriveBackendConfig::File {
+            is_read_only,
+            io_engine,
+            ..
+        } = config.backend()
+        else {
             return Err(PreparedBlockDeviceError::UnsupportedBackend {
                 drive_id: config.drive_id().to_string(),
             });
@@ -5154,6 +5955,8 @@ impl PreparedBlockDevice {
         Ok(Self {
             drive_id: config.drive_id().to_string(),
             is_root_device: config.is_root_device(),
+            io_engine: Some(*io_engine),
+            cache_type: config.cache_type(),
             config_space,
             device,
         })
@@ -5196,6 +5999,8 @@ impl PreparedBlockDevice {
         Ok(Self {
             drive_id: config.drive_id().to_string(),
             is_root_device: config.is_root_device(),
+            io_engine: None,
+            cache_type: config.cache_type(),
             config_space,
             device,
         })
@@ -5219,6 +6024,18 @@ impl PreparedBlockDevice {
 
     pub fn device_mut(&mut self) -> &mut VirtioBlockDevice {
         &mut self.device
+    }
+
+    pub fn bind_async_runtime(
+        &mut self,
+        runtime: SharedBlockAsyncRuntime,
+    ) -> Result<Option<BlockAsyncDriveGeneration>, BlockAsyncRuntimeError> {
+        if self.io_engine != Some(DriveIoEngine::Async) {
+            return Ok(None);
+        }
+        self.device
+            .bind_async_runtime(self.cache_type, runtime)
+            .map(Some)
     }
 
     pub fn into_parts(self) -> (String, bool, VirtioBlockConfigSpace, VirtioBlockDevice) {
@@ -5378,6 +6195,16 @@ impl PreparedBlockDevices {
 
     pub fn as_slice(&self) -> &[PreparedBlockDevice] {
         &self.devices
+    }
+
+    pub fn bind_async_runtime(
+        &mut self,
+        runtime: &SharedBlockAsyncRuntime,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        for device in &mut self.devices {
+            let _ = device.bind_async_runtime(runtime.clone())?;
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -6047,6 +6874,69 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         Ok(())
     }
 
+    pub fn update_live_block_device_with_opened(
+        &self,
+        memory: &mut GuestMemory,
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+        mode: DriveLiveUpdateMode,
+        shared_runtime: &SharedBlockAsyncRuntime,
+    ) -> Result<
+        VirtioBlockQueueDispatch,
+        VirtioPciDeviceOperationError<VirtioBlockLiveUpdateError, VirtioBlockQueueDispatch>,
+    > {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let config_space = backing
+            .as_ref()
+            .map(|backing| VirtioBlockConfigSpace::from_backing(backing, config.cache_type()));
+        let file_state_changed = config_space.is_some() || mode == DriveLiveUpdateMode::Replacement;
+        let update = work
+            .with_core_mut(|core| {
+                let dispatch = core.activation.update_file_backend_with_opened(
+                    memory,
+                    config,
+                    backing,
+                    rate_limiter_update,
+                    mode,
+                    shared_runtime,
+                )?;
+                if dispatch.needs_queue_interrupt() {
+                    core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
+                }
+                if let Some(config_space) = config_space {
+                    core.device_config = config_space;
+                    core.device.increment_config_generation();
+                    core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
+                }
+                Ok::<_, VirtioBlockLiveUpdateError>(dispatch)
+            })
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?;
+        let endpoint =
+            if file_state_changed || update.as_ref().is_ok_and(|d| d.needs_queue_interrupt()) {
+                work.drain_interrupt_intents()
+            } else {
+                Ok(())
+            };
+        VirtioPciDeviceOperationError::combine(update, endpoint)
+    }
+
+    /// Drains and detaches Async work after PCI teardown has suspended all
+    /// guest-visible paths and ordinary endpoint work admission.
+    pub fn retire_quiesced_async(
+        &self,
+        memory: &mut GuestMemory,
+    ) -> Result<
+        VirtioBlockQueueDispatch,
+        VirtioPciDeviceOperationError<VirtioBlockLiveUpdateError, VirtioBlockQueueDispatch>,
+    > {
+        self.with_quiesced_core_mut(|core| core.activation.retire_async(memory))
+            .map_err(VirtioPciDeviceOperationError::Endpoint)?
+            .map_err(|source| VirtioPciDeviceOperationError::Device(Box::new(source)))
+    }
+
     pub fn refresh_vhost_user_block_config(
         &self,
         cache_type: DriveCacheType,
@@ -6189,6 +7079,39 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
         self.activation_handler_mut()
             .update_rate_limiter(rate_limiter)
             .map_err(|_| DriveUpdateError::UnsupportedBackend)
+    }
+
+    pub fn update_live_block_device_with_opened(
+        &mut self,
+        memory: &mut GuestMemory,
+        config: &DriveConfig,
+        backing: Option<BlockFileBacking>,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+        mode: DriveLiveUpdateMode,
+        shared_runtime: &SharedBlockAsyncRuntime,
+    ) -> Result<VirtioBlockQueueDispatch, VirtioBlockLiveUpdateError> {
+        let config_space = backing
+            .as_ref()
+            .map(|backing| VirtioBlockConfigSpace::from_backing(backing, config.cache_type()));
+        let dispatch = self
+            .activation_handler_mut()
+            .update_file_backend_with_opened(
+                memory,
+                config,
+                backing,
+                rate_limiter_update,
+                mode,
+                shared_runtime,
+            )?;
+        if dispatch.needs_queue_interrupt() {
+            self.mark_queue_interrupt_pending(0);
+        }
+        if let Some(config_space) = config_space {
+            *self.device_config_handler_mut() = config_space;
+            self.increment_config_generation();
+            self.mark_config_interrupt_pending();
+        }
+        Ok(dispatch)
     }
 }
 
@@ -6501,13 +7424,18 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_vhost_user::{
         SUPPORTED_VIRTIO_FEATURES, VHOST_USER_F_PROTOCOL_FEATURES, VHOST_USER_PROTOCOL_F_CONFIG,
         VHOST_USER_PROTOCOL_F_REPLY_ACK, VIRTIO_BLK_F_FLUSH, VIRTIO_F_VERSION_1,
+    };
+
+    use super::async_executor::{
+        BlockAsyncExecutorConfig, BlockAsyncHostIo, BlockAsyncTransferResult,
+        SharedBlockAsyncRuntime,
     };
 
     use crate::interrupt::DeviceInterruptKind;
@@ -6548,28 +7476,29 @@ mod tests {
     use super::{
         BlockFileBacking, BlockFileBackingError, BlockMmioDevices, BlockMmioLayout,
         BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
-        DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveRateLimiterConfig,
-        DriveRuntimeMutationError, DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput,
-        PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
-        PreparedVhostUserBlockFrontend, PreparedVhostUserBlockFrontendError,
-        PreparedVhostUserBlockMemoryError, RuntimeBlockDeviceResource,
-        SnapshotBlockFileBackingError, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_CONFIG_SIZE,
-        VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY,
-        VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE,
-        VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
-        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
-        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
-        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
-        VIRTIO_BLOCK_STATUS_SIZE, VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC,
-        VhostUserBlockConfigRefreshError, VhostUserBlockConfigSignalError,
-        VhostUserBlockNotificationError, VhostUserBlockState, VirtioBlockBackend,
-        VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceActivationError,
-        VirtioBlockDeviceId, VirtioBlockDeviceNotificationError, VirtioBlockQueue,
-        VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError, VirtioBlockQueueSnapshotError,
-        VirtioBlockRateLimiter, VirtioBlockRequest, VirtioBlockRequestCompletion,
-        VirtioBlockRequestError, VirtioBlockRequestExecutionError,
-        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
+        DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveLiveUpdateMode,
+        DriveRateLimiterConfig, DriveReplacementIdentityField, DriveRuntimeMutationError,
+        DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput, PreparedBlockDevice,
+        PreparedBlockDeviceError, PreparedBlockDevices, PreparedVhostUserBlockFrontend,
+        PreparedVhostUserBlockFrontendError, PreparedVhostUserBlockMemoryError,
+        RuntimeBlockDeviceResource, SnapshotBlockFileBackingError,
+        VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_CONFIG_SIZE, VIRTIO_BLOCK_DEVICE_ID,
+        VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
+        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
+        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
+        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
+        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
+        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC, VhostUserBlockConfigRefreshError,
+        VhostUserBlockConfigSignalError, VhostUserBlockNotificationError, VhostUserBlockState,
+        VirtioBlockBackend, VirtioBlockConfigSpace, VirtioBlockDevice,
+        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
+        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatch,
+        VirtioBlockQueueDispatchError, VirtioBlockQueueSnapshotError, VirtioBlockRateLimiter,
+        VirtioBlockRequest, VirtioBlockRequestCompletion, VirtioBlockRequestError,
+        VirtioBlockRequestExecutionError, VirtioBlockRequestExecutionOutcome,
+        VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -8257,17 +9186,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_io_engine() {
-        let err = validate(input().with_io_engine(DriveIoEngine::Async))
-            .expect_err("Async I/O engine should be unsupported");
+    fn accepts_async_io_engine() {
+        let config = validate(input().with_io_engine(DriveIoEngine::Async))
+            .expect("Async I/O engine should be supported");
 
-        assert_eq!(
-            err,
-            DriveConfigError::UnsupportedIoEngine {
-                io_engine: DriveIoEngine::Async,
-            }
-        );
-        assert_eq!(err.to_string(), "drive io_engine Async is not supported");
+        assert_eq!(config.io_engine(), Some(DriveIoEngine::Async));
     }
 
     #[test]
@@ -8683,6 +9606,78 @@ mod tests {
     }
 
     #[test]
+    fn runtime_drive_replacement_preserves_identity_and_allows_engine_change() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(
+                DriveConfigInput::new("data", "data", "/tmp/data.ext4", false)
+                    .with_is_read_only(false)
+                    .with_partuuid("part-a")
+                    .with_cache_type(DriveCacheType::Writeback),
+            )
+            .expect("initial drive should configure");
+        let replacement = DriveConfigInput::new("data", "data", "/tmp/replacement.ext4", false)
+            .with_is_read_only(false)
+            .with_partuuid("part-a")
+            .with_cache_type(DriveCacheType::Writeback)
+            .with_io_engine(DriveIoEngine::Async)
+            .with_rate_limiter_configured()
+            .validate()
+            .expect("replacement should validate");
+
+        let replacement = configs
+            .validate_runtime_replacement(replacement)
+            .expect("stable identity replacement should prepare");
+        assert_eq!(replacement.io_engine(), Some(DriveIoEngine::Async));
+        assert!(replacement.rate_limiter().is_some());
+        assert_eq!(
+            configs.as_slice()[0].path_on_host(),
+            Some(Path::new("/tmp/data.ext4"))
+        );
+
+        for (input, field) in [
+            (
+                DriveConfigInput::new("data", "data", "/tmp/new.ext4", true)
+                    .with_is_read_only(false)
+                    .with_partuuid("part-a")
+                    .with_cache_type(DriveCacheType::Writeback),
+                DriveReplacementIdentityField::RootDevice,
+            ),
+            (
+                DriveConfigInput::new("data", "data", "/tmp/new.ext4", false)
+                    .with_is_read_only(true)
+                    .with_partuuid("part-a")
+                    .with_cache_type(DriveCacheType::Writeback),
+                DriveReplacementIdentityField::ReadOnly,
+            ),
+            (
+                DriveConfigInput::new("data", "data", "/tmp/new.ext4", false)
+                    .with_is_read_only(false)
+                    .with_partuuid("part-b")
+                    .with_cache_type(DriveCacheType::Writeback),
+                DriveReplacementIdentityField::Partuuid,
+            ),
+            (
+                DriveConfigInput::new("data", "data", "/tmp/new.ext4", false)
+                    .with_is_read_only(false)
+                    .with_partuuid("part-a")
+                    .with_cache_type(DriveCacheType::Unsafe),
+                DriveReplacementIdentityField::CacheType,
+            ),
+        ] {
+            assert_eq!(
+                configs.validate_runtime_replacement(
+                    input.validate().expect("candidate should validate")
+                ),
+                Err(DriveUpdateError::ReplacementIdentityMismatch {
+                    drive_id: "data".to_string(),
+                    field,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn runtime_drive_removal_rejects_root_and_missing_then_commits_exact_data_drive() {
         let mut configs = DriveConfigs::new();
         configs
@@ -8938,7 +9933,7 @@ mod tests {
         );
         assert_eq!(
             DriveUpdateError::UnsupportedBackend.to_string(),
-            "path and rate limiter updates are unsupported for vhost-user drives"
+            "file-backed drive updates are unsupported for vhost-user drives"
         );
     }
 
@@ -9122,6 +10117,112 @@ mod tests {
             config_space.available_features() & (1_u64 << VIRTIO_BLOCK_FEATURE_FLUSH),
             0
         );
+    }
+
+    #[test]
+    fn prepared_async_device_binds_and_reset_replaces_its_generation() {
+        let file = temp_file("prepared-async-reset.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(
+                DriveConfigInput::new("data", "data", file.as_path(), false)
+                    .with_io_engine(DriveIoEngine::Async),
+            )
+            .expect("Async drive config should insert");
+        let mut prepared = PreparedBlockDevices::from_configs(&configs)
+            .expect("Async device should prepare without starting workers");
+        let runtime = SharedBlockAsyncRuntime::new();
+        assert_eq!(runtime.completion_fd().expect("runtime should lock"), None);
+
+        prepared
+            .bind_async_runtime(&runtime)
+            .expect("Async device should bind shared runtime");
+        let first = prepared.as_slice()[0]
+            .device()
+            .async_binding()
+            .expect("Async binding should be visible")
+            .1;
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 1);
+        prepared.devices[0].device_mut().reset();
+        let second = prepared.as_slice()[0]
+            .device()
+            .async_binding()
+            .expect("reset should retain a live Async binding")
+            .1;
+
+        assert!(second.value() > first.value());
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 1);
+        runtime
+            .shutdown(&mut request_memory())
+            .expect("Async runtime should shut down");
+    }
+
+    #[test]
+    fn live_file_replacement_switches_engines_and_replaces_exact_limiter() {
+        let original_file = temp_file("live-engine-original.img", &[0; 512]);
+        let async_file = temp_file("live-engine-async.img", &[1; 1024]);
+        let sync_file = temp_file("live-engine-sync.img", &[2; 1536]);
+        let original = DriveConfigInput::new("data", "data", original_file.as_path(), false)
+            .validate()
+            .expect("original config should validate");
+        let limiter = DriveRateLimiterConfig::new(
+            Some(DriveTokenBucketConfig::new(512, Some(1024), 100)),
+            None,
+        );
+        let async_config = DriveConfigInput::new("data", "data", async_file.as_path(), false)
+            .with_io_engine(DriveIoEngine::Async)
+            .with_rate_limiter(limiter)
+            .validate()
+            .expect("Async replacement should validate");
+        let sync_config = DriveConfigInput::new("data", "data", sync_file.as_path(), false)
+            .with_io_engine(DriveIoEngine::Sync)
+            .validate()
+            .expect("Sync replacement should validate");
+        let mut device = PreparedBlockDevice::from_config_with_backing(&original, None)
+            .expect("original device should prepare")
+            .device;
+        let runtime = SharedBlockAsyncRuntime::new();
+        let mut memory = request_memory();
+
+        let async_dispatch = device
+            .update_file_backend_with_opened(
+                &mut memory,
+                &async_config,
+                Some(BlockFileBacking::open(&async_config).expect("Async backing should open")),
+                None,
+                DriveLiveUpdateMode::Replacement,
+                &runtime,
+            )
+            .expect("Sync-to-Async replacement should succeed");
+        assert_eq!(async_dispatch.processed_requests(), 0);
+        assert_eq!(device.io_engine(), Some(DriveIoEngine::Async));
+        assert_eq!(
+            device.backing().expect("backing should remain file").len(),
+            1024
+        );
+        assert!(device.rate_limiter().is_some());
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 1);
+
+        device
+            .update_file_backend_with_opened(
+                &mut memory,
+                &sync_config,
+                Some(BlockFileBacking::open(&sync_config).expect("Sync backing should open")),
+                None,
+                DriveLiveUpdateMode::Replacement,
+                &runtime,
+            )
+            .expect("Async-to-Sync replacement should succeed");
+        assert_eq!(device.io_engine(), Some(DriveIoEngine::Sync));
+        assert_eq!(
+            device.backing().expect("backing should remain file").len(),
+            1536
+        );
+        assert!(device.rate_limiter().is_none());
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
+        runtime
+            .shutdown(&mut memory)
+            .expect("idle runtime should shut down");
     }
 
     #[test]
@@ -12552,6 +13653,431 @@ mod tests {
                 VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
             )
         );
+    }
+
+    #[derive(Debug)]
+    struct QueueAsyncReadGateHost {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        byte: u8,
+        result: Option<BlockAsyncTransferResult>,
+    }
+
+    impl BlockAsyncHostIo for QueueAsyncReadGateHost {
+        fn read_at(
+            &self,
+            _backing: &BlockFileBacking,
+            _offset: u64,
+            destination: &mut [u8],
+        ) -> BlockAsyncTransferResult {
+            self.entered
+                .send(())
+                .expect("queue test observer should remain live");
+            self.release
+                .lock()
+                .expect("queue test release gate should lock")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("queue test should release host read");
+            destination.fill(self.byte);
+            self.result
+                .unwrap_or_else(|| BlockAsyncTransferResult::complete(destination.len()))
+        }
+
+        fn write_at(
+            &self,
+            _backing: &BlockFileBacking,
+            _offset: u64,
+            source: &[u8],
+        ) -> BlockAsyncTransferResult {
+            BlockAsyncTransferResult::complete(source.len())
+        }
+
+        fn flush(&self, _backing: &BlockFileBacking) -> Result<(), io::ErrorKind> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn async_block_queue_defers_status_used_and_metrics_until_host_completion() {
+        let mut memory = request_memory();
+        memory
+            .write_slice(&[0xff], STATUS_ADDR)
+            .expect("status sentinel should initialize");
+        let file = temp_file(
+            "queue-async-read.img",
+            &vec![0; VIRTIO_BLOCK_SECTOR_SIZE as usize],
+        );
+        let backing = Arc::new(open_backing(file.as_path(), true).expect("backing should open"));
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            BlockAsyncExecutorConfig::new(1, 1, 1, 512, 512),
+            Arc::new(QueueAsyncReadGateHost {
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+                byte: 0x6d,
+                result: None,
+            }),
+        );
+        let generation = runtime
+            .bind_drive(Arc::clone(&backing), DriveCacheType::Unsafe)
+            .expect("Async generation should bind");
+        let mut queue = block_queue();
+
+        let submitted = queue
+            .dispatch_with_async_runtime(
+                &mut memory,
+                backing.as_ref(),
+                TEST_DEVICE_ID,
+                None,
+                &runtime,
+                generation,
+            )
+            .expect("Async request should submit");
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("host read should enter");
+        assert_eq!(submitted.processed_requests(), 0);
+        assert_eq!(read_status(&memory), 0xff);
+        assert_eq!(read_used_index(&memory), 0);
+        assert_eq!(queue.available_ring().next_avail(), 1);
+
+        release_sender.send(()).expect("host read should release");
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("Async generation should finish");
+        let completed = queue
+            .dispatch_with_async_runtime(
+                &mut memory,
+                backing.as_ref(),
+                TEST_DEVICE_ID,
+                None,
+                &runtime,
+                generation,
+            )
+            .expect("completion-only dispatch should publish");
+
+        assert_eq!(completed.processed_requests(), 1);
+        assert_eq!(completed.successful_requests(), 1);
+        assert_eq!(completed.read_count(), 1);
+        assert_eq!(completed.read_bytes(), VIRTIO_BLOCK_SECTOR_SIZE);
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(
+            read_used_element(&memory, 0),
+            (
+                0,
+                VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
+            )
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            vec![0x6d; VIRTIO_BLOCK_SECTOR_SIZE as usize]
+        );
+        runtime
+            .unbind_quiesced(generation)
+            .expect("published generation should unbind");
+        runtime
+            .shutdown(&mut memory)
+            .expect("Async runtime should shut down");
+    }
+
+    #[test]
+    fn async_block_queue_partial_read_failure_publishes_only_ioerr_status() {
+        let mut memory = request_memory();
+        memory
+            .write_slice(&[0xff], STATUS_ADDR)
+            .expect("status sentinel should initialize");
+        let file = temp_file(
+            "queue-async-partial-read.img",
+            &vec![0; VIRTIO_BLOCK_SECTOR_SIZE as usize],
+        );
+        let backing = Arc::new(open_backing(file.as_path(), true).expect("backing should open"));
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            BlockAsyncExecutorConfig::new(1, 1, 1, 512, 512),
+            Arc::new(QueueAsyncReadGateHost {
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+                byte: 0x4c,
+                result: Some(BlockAsyncTransferResult::failed(128, io::ErrorKind::Other)),
+            }),
+        );
+        let generation = runtime
+            .bind_drive(Arc::clone(&backing), DriveCacheType::Unsafe)
+            .expect("Async generation should bind");
+        let mut queue = block_queue();
+
+        let submitted = queue
+            .dispatch_with_async_runtime(
+                &mut memory,
+                backing.as_ref(),
+                TEST_DEVICE_ID,
+                None,
+                &runtime,
+                generation,
+            )
+            .expect("Async request should submit");
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("host read should enter");
+        assert_eq!(submitted.processed_requests(), 0);
+        assert_eq!(read_status(&memory), 0xff);
+        assert_eq!(read_used_index(&memory), 0);
+
+        release_sender.send(()).expect("host read should release");
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("Async generation should finish");
+        let completed = queue
+            .dispatch_with_async_runtime(
+                &mut memory,
+                backing.as_ref(),
+                TEST_DEVICE_ID,
+                None,
+                &runtime,
+                generation,
+            )
+            .expect("failed completion should publish");
+
+        assert_eq!(completed.processed_requests(), 1);
+        assert_eq!(completed.successful_requests(), 0);
+        assert_eq!(completed.read_count(), 0);
+        assert_eq!(completed.read_bytes(), 0);
+        assert_eq!(completed.io_errors(), 1);
+        assert!(completed.read_latency_aggregate().is_some());
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_IOERR);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
+        let data = read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize);
+        assert_eq!(&data[..128], &[0x4c; 128]);
+        assert_eq!(&data[128..], &[0; VIRTIO_BLOCK_SECTOR_SIZE as usize - 128]);
+
+        runtime
+            .unbind_quiesced(generation)
+            .expect("published generation should unbind");
+        runtime
+            .shutdown(&mut memory)
+            .expect("Async runtime should shut down");
+    }
+
+    #[test]
+    fn async_block_queue_guest_range_overflow_is_request_ioerr_not_runtime_failure() {
+        let mut memory = request_memory();
+        memory
+            .write_slice(&[0xff], STATUS_ADDR)
+            .expect("status sentinel should initialize");
+        let file = temp_file(
+            "queue-async-guest-overflow.img",
+            &vec![0; VIRTIO_BLOCK_SECTOR_SIZE as usize],
+        );
+        let backing = Arc::new(open_backing(file.as_path(), true).expect("backing should open"));
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((
+                GuestAddress::new(u64::MAX - 255),
+                VIRTIO_BLOCK_SECTOR_SIZE as u32,
+                true,
+            )),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (_release_sender, release_receiver) = mpsc::channel();
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            BlockAsyncExecutorConfig::new(1, 1, 1, 512, 512),
+            Arc::new(QueueAsyncReadGateHost {
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+                byte: 0,
+                result: None,
+            }),
+        );
+        let generation = runtime
+            .bind_drive(Arc::clone(&backing), DriveCacheType::Unsafe)
+            .expect("Async generation should bind");
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch_with_async_runtime(
+                &mut memory,
+                backing.as_ref(),
+                TEST_DEVICE_ID,
+                None,
+                &runtime,
+                generation,
+            )
+            .expect("guest range failure should complete without failing the runtime");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.io_errors(), 1);
+        assert!(dispatch.read_latency_aggregate().is_some());
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_IOERR);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
+        assert!(matches!(
+            entered_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(runtime.outstanding_tasks().expect("runtime should lock"), 0);
+
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("empty generation should quiesce");
+        runtime
+            .unbind_quiesced(generation)
+            .expect("empty generation should unbind");
+        runtime
+            .shutdown(&mut memory)
+            .expect("Async runtime should shut down");
+    }
+
+    #[test]
+    fn async_block_queue_capacity_pressure_preflights_before_limiter_consumption() {
+        let mut memory = request_memory();
+        let second_header = HEADER_ADDR
+            .checked_add(0x100)
+            .expect("second header address should not overflow");
+        let second_data = DATA_ADDR
+            .checked_add(VIRTIO_BLOCK_SECTOR_SIZE)
+            .expect("second data address should not overflow");
+        let second_status = STATUS_ADDR
+            .checked_add(0x100)
+            .expect("second status address should not overflow");
+        memory
+            .write_slice(&[0xaa], second_status)
+            .expect("second status sentinel should initialize");
+        let file = temp_file(
+            "queue-async-capacity-pressure.img",
+            &vec![0; (VIRTIO_BLOCK_SECTOR_SIZE * 2) as usize],
+        );
+        let backing = Arc::new(open_backing(file.as_path(), true).expect("backing should open"));
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            STATUS_ADDR,
+        );
+        write_queued_request(
+            &mut memory,
+            3,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            1,
+            second_header,
+            Some((second_data, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            second_status,
+        );
+        write_available_heads(&mut memory, &[0, 3]);
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            BlockAsyncExecutorConfig::new(1, 1, 1, 512, 512),
+            Arc::new(QueueAsyncReadGateHost {
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+                byte: 0x5e,
+                result: None,
+            }),
+        );
+        let generation = runtime
+            .bind_drive(Arc::clone(&backing), DriveCacheType::Unsafe)
+            .expect("Async generation should bind");
+        let limiter_config =
+            DriveRateLimiterConfig::new(None, Some(DriveTokenBucketConfig::new(2, None, 60_000)));
+        let mut limiter =
+            VirtioBlockRateLimiter::new(limiter_config).expect("rate limiter should be enabled");
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch_with_async_runtime(
+                &mut memory,
+                backing.as_ref(),
+                TEST_DEVICE_ID,
+                Some(&mut limiter),
+                &runtime,
+                generation,
+            )
+            .expect("capacity pressure should leave the second request pending");
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first host read should enter");
+
+        assert_eq!(dispatch.processed_requests(), 0);
+        assert_eq!(dispatch.io_engine_throttled_events(), 1);
+        assert_eq!(dispatch.rate_limiter_throttled_requests(), 0);
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(read_guest_bytes(&memory, second_status, 1), [0xaa]);
+        let limiter_state = VirtioBlockRateLimiter::persisted_state_at(
+            Some(limiter_config),
+            Some(&limiter),
+            Instant::now(),
+        )
+        .expect("limiter state should capture");
+        assert_eq!(
+            limiter_state
+                .ops()
+                .expect("ops limiter state should exist")
+                .budget(),
+            1,
+            "only the admitted first request may consume an ops token"
+        );
+        let metrics = SharedBlockDeviceMetrics::default();
+        metrics.record_queue_dispatch(&dispatch);
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default().with_io_engine_throttled_events(1)
+        );
+
+        release_sender
+            .send(())
+            .expect("first host read should release");
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("entered request should quiesce");
+        let mut completion_dispatch = VirtioBlockQueueDispatch::default();
+        queue
+            .publish_async_completions(&mut memory, &runtime, generation, &mut completion_dispatch)
+            .expect("entered request should publish");
+        assert_eq!(completion_dispatch.processed_requests(), 1);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_guest_bytes(&memory, second_status, 1), [0xaa]);
+        runtime
+            .unbind_quiesced(generation)
+            .expect("published generation should unbind");
+        runtime
+            .shutdown(&mut memory)
+            .expect("Async runtime should shut down");
     }
 
     #[test]

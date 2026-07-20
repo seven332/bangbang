@@ -712,6 +712,49 @@ impl BlockAsyncHostCompletion {
     pub const fn chunk_len(&self) -> u32 {
         self.key.len
     }
+
+    fn detach(self) -> DetachedBlockAsyncHostCompletion {
+        let Self {
+            key,
+            result,
+            payload,
+            queue_latency_us,
+            host_latency_us,
+            _task_lease: _,
+        } = self;
+        let payload = match payload {
+            HostTaskPayload::Read(StagedBuffer { bytes, _lease: _ }) => {
+                DetachedHostTaskPayload::Read(bytes)
+            }
+            HostTaskPayload::Write(StagedBuffer { bytes, _lease: _ }) => {
+                DetachedHostTaskPayload::Write(bytes.len())
+            }
+            HostTaskPayload::Flush => DetachedHostTaskPayload::Flush,
+        };
+        DetachedBlockAsyncHostCompletion {
+            key,
+            result,
+            payload,
+            queue_latency_us,
+            host_latency_us,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DetachedBlockAsyncHostCompletion {
+    key: BlockAsyncChunkKey,
+    result: HostCompletionResult,
+    payload: DetachedHostTaskPayload,
+    queue_latency_us: u64,
+    host_latency_us: u64,
+}
+
+#[derive(Debug)]
+enum DetachedHostTaskPayload {
+    Read(Vec<u8>),
+    Write(usize),
+    Flush,
 }
 
 impl fmt::Debug for BlockAsyncHostCompletion {
@@ -1205,6 +1248,15 @@ impl BlockAsyncExecutor {
             .map_err(BlockAsyncExecutorError::Notification)
     }
 
+    fn rearm_notification(&self) -> Result<BlockAsyncSignalOutcome, BlockAsyncExecutorError> {
+        self.shared
+            .as_ref()
+            .ok_or(BlockAsyncExecutorError::Stopped)?
+            .signal
+            .signal()
+            .map_err(BlockAsyncExecutorError::Notification)
+    }
+
     pub fn try_recv_completion(
         &self,
     ) -> Result<Option<BlockAsyncHostCompletion>, BlockAsyncExecutorError> {
@@ -1590,6 +1642,7 @@ pub enum BlockAsyncApplyOutcome {
 pub enum BlockAsyncApplyError {
     UnknownOperation,
     UnexpectedChunk,
+    GuestMemoryRequired,
 }
 
 impl fmt::Display for BlockAsyncApplyError {
@@ -1600,6 +1653,9 @@ impl fmt::Display for BlockAsyncApplyError {
             }
             Self::UnexpectedChunk => {
                 formatter.write_str("asynchronous block completion does not match the active chunk")
+            }
+            Self::GuestMemoryRequired => {
+                formatter.write_str("asynchronous block completion requires guest memory")
             }
         }
     }
@@ -1686,7 +1742,45 @@ impl BlockAsyncDrive {
         self.accepting
     }
 
+    pub fn preflight_admission(
+        &mut self,
+        operation: BlockAsyncOperation,
+    ) -> Result<(), BlockAsyncAdmissionError> {
+        if !self.accepting || !self.executor.is_accepting() {
+            return Err(BlockAsyncAdmissionError::Stopped);
+        }
+        if self.operations.len() >= self.config.per_drive_operation_limit() {
+            return Err(BlockAsyncAdmissionError::DriveFull);
+        }
+        if operation.kind() != BlockAsyncOperationKind::Flush
+            && operation
+                .host_offset()
+                .checked_add(u64::from(operation.len()))
+                .is_none_or(|end| end > self.backing.len())
+        {
+            return Err(BlockAsyncAdmissionError::BackingRangeOutOfBounds);
+        }
+        self.next_operation_id
+            .checked_add(1)
+            .ok_or(BlockAsyncAdmissionError::OperationIdExhausted)?;
+        self.next_sequence
+            .checked_add(1)
+            .ok_or(BlockAsyncAdmissionError::SequenceExhausted)?;
+        self.operations
+            .try_reserve(1)
+            .map_err(|_| BlockAsyncAdmissionError::MetadataAllocation)?;
+        Ok(())
+    }
+
     pub fn admit(
+        &mut self,
+        operation: BlockAsyncOperation,
+    ) -> Result<BlockAsyncOperationKey, BlockAsyncAdmissionError> {
+        self.preflight_admission(operation)?;
+        self.admit_preflighted(operation)
+    }
+
+    pub fn admit_preflighted(
         &mut self,
         operation: BlockAsyncOperation,
     ) -> Result<BlockAsyncOperationKey, BlockAsyncAdmissionError> {
@@ -1712,9 +1806,6 @@ impl BlockAsyncDrive {
             .next_sequence
             .checked_add(1)
             .ok_or(BlockAsyncAdmissionError::SequenceExhausted)?;
-        self.operations
-            .try_reserve(1)
-            .map_err(|_| BlockAsyncAdmissionError::MetadataAllocation)?;
         let key = BlockAsyncOperationKey {
             generation: self.generation,
             operation_id: self.next_operation_id,
@@ -1983,13 +2074,29 @@ impl BlockAsyncDrive {
         completion: BlockAsyncHostCompletion,
         disposition: BlockAsyncCompletionDisposition,
     ) -> Result<BlockAsyncApplyOutcome, BlockAsyncApplyError> {
-        let BlockAsyncHostCompletion {
+        self.apply_detached_completion(Some(memory), completion.detach(), disposition)
+    }
+
+    fn apply_completion_without_guest_memory(
+        &mut self,
+        completion: BlockAsyncHostCompletion,
+        disposition: BlockAsyncCompletionDisposition,
+    ) -> Result<BlockAsyncApplyOutcome, BlockAsyncApplyError> {
+        self.apply_detached_completion(None, completion.detach(), disposition)
+    }
+
+    fn apply_detached_completion(
+        &mut self,
+        memory: Option<&mut GuestMemory>,
+        completion: DetachedBlockAsyncHostCompletion,
+        disposition: BlockAsyncCompletionDisposition,
+    ) -> Result<BlockAsyncApplyOutcome, BlockAsyncApplyError> {
+        let DetachedBlockAsyncHostCompletion {
             key: chunk_key,
             result,
             payload,
             queue_latency_us,
             host_latency_us,
-            _task_lease,
         } = completion;
         let operation_key = chunk_key.operation;
         if operation_key.generation() != self.generation {
@@ -2030,32 +2137,35 @@ impl BlockAsyncDrive {
             (
                 BlockAsyncOperationKind::Read,
                 HostCompletionResult::Transfer(transfer),
-                HostTaskPayload::Read(buffer),
-            ) => evaluate_read_completion(
-                request,
-                chunk_key,
-                prior_bytes,
-                expected,
-                transfer,
-                &buffer.bytes,
-                memory,
-            ),
+                DetachedHostTaskPayload::Read(buffer),
+            ) => {
+                let memory = memory.ok_or(BlockAsyncApplyError::GuestMemoryRequired)?;
+                evaluate_read_completion(
+                    request,
+                    chunk_key,
+                    prior_bytes,
+                    expected,
+                    transfer,
+                    &buffer,
+                    memory,
+                )
+            }
             (
                 BlockAsyncOperationKind::Write,
                 HostCompletionResult::Transfer(transfer),
-                HostTaskPayload::Write(buffer),
+                DetachedHostTaskPayload::Write(buffer_len),
             ) => evaluate_write_completion(
                 request,
                 chunk_key,
                 prior_bytes,
                 expected,
                 transfer,
-                buffer.bytes.len(),
+                buffer_len,
             ),
             (
                 BlockAsyncOperationKind::Flush,
                 HostCompletionResult::Flush(result),
-                HostTaskPayload::Flush,
+                DetachedHostTaskPayload::Flush,
             ) => match result {
                 Ok(()) => OwnerCompletionDecision::Finish {
                     status: BlockAsyncOperationStatus::Success,
@@ -2516,6 +2626,825 @@ fn record_drain_completion(
     }
 }
 
+/// Session-owned, lazily initialized asynchronous block runtime.
+///
+/// The runtime centralizes generation coordinators so host completions can
+/// release their bounded executor leases before the matching transport is
+/// entered to publish status and used-ring state.
+#[derive(Clone)]
+pub struct SharedBlockAsyncRuntime {
+    inner: Arc<Mutex<BlockAsyncRuntime>>,
+}
+
+impl fmt::Debug for SharedBlockAsyncRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.inner.lock() {
+            Ok(runtime) => formatter
+                .debug_struct("SharedBlockAsyncRuntime")
+                .field("active", &runtime.executor.is_some())
+                .field("generations", &runtime.drives.len())
+                .field("parked_host_completions", &runtime.parked.len())
+                .finish(),
+            Err(_) => formatter
+                .debug_struct("SharedBlockAsyncRuntime")
+                .field("state", &"<unavailable>")
+                .finish(),
+        }
+    }
+}
+
+impl Default for SharedBlockAsyncRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedBlockAsyncRuntime {
+    pub fn new() -> Self {
+        Self::with_config_and_host(
+            BlockAsyncExecutorConfig::default(),
+            Arc::new(SystemBlockAsyncHostIo),
+        )
+    }
+
+    pub fn with_config_and_host(
+        config: BlockAsyncExecutorConfig,
+        host: Arc<dyn BlockAsyncHostIo>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(BlockAsyncRuntime {
+                config,
+                host,
+                executor: None,
+                drives: Vec::new(),
+                parked: VecDeque::new(),
+                next_generation: 1,
+            })),
+        }
+    }
+
+    /// Binds a new backing lifetime and returns its strictly monotonic token.
+    pub fn bind_drive(
+        &self,
+        backing: Arc<BlockFileBacking>,
+        cache_type: DriveCacheType,
+    ) -> Result<BlockAsyncDriveGeneration, BlockAsyncRuntimeError> {
+        let mut runtime = self.lock()?;
+        runtime.bind_drive(backing, cache_type)
+    }
+
+    /// Preflights owner admission without consuming a request slot or ID.
+    pub fn preflight_operation(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+        operation: BlockAsyncOperation,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let mut runtime = self.lock()?;
+        let drive = runtime.drive_mut(generation)?;
+        match drive.coordinator.preflight_admission(operation) {
+            Ok(()) => Ok(()),
+            Err(source) => {
+                if source == BlockAsyncAdmissionError::DriveFull {
+                    drive.pressure_pending = true;
+                }
+                Err(BlockAsyncRuntimeError::Admission(source))
+            }
+        }
+    }
+
+    /// Commits an operation whose metadata capacity was already preflighted.
+    pub fn admit_preflighted(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+        operation: BlockAsyncOperation,
+    ) -> Result<BlockAsyncOperationKey, BlockAsyncRuntimeError> {
+        self.lock()?
+            .drive_mut(generation)?
+            .coordinator
+            .admit_preflighted(operation)
+            .map_err(BlockAsyncRuntimeError::Admission)
+    }
+
+    /// Applies all available host results and schedules every ready generation.
+    pub fn service_available(
+        &self,
+        memory: &mut GuestMemory,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.lock()?.service_available(memory)
+    }
+
+    /// Services shared work for one transport owner and preserves readiness
+    /// when another generation gains a publishable completion later in the
+    /// same device-broadcast pass.
+    pub fn service_available_for(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+        memory: &mut GuestMemory,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let mut runtime = self.lock()?;
+        runtime.service_available(memory)?;
+        runtime.rearm_foreign_ready_completions(generation)
+    }
+
+    /// Pops one compact final result for publication by the owning transport.
+    pub fn pop_completion(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<Option<BlockAsyncOperationCompletion>, BlockAsyncRuntimeError> {
+        Ok(self
+            .lock()?
+            .drive_mut(generation)?
+            .final_completions
+            .pop_front())
+    }
+
+    /// Returns and clears whether executor/admission pressure stopped progress.
+    pub fn take_pressure(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<bool, BlockAsyncRuntimeError> {
+        let mut runtime = self.lock()?;
+        let drive = runtime.drive_mut(generation)?;
+        Ok(std::mem::take(&mut drive.pressure_pending))
+    }
+
+    /// Stops one generation and finishes its admitted work and persistence.
+    pub fn quiesce_generation(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+        memory: &mut GuestMemory,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.lock()?.quiesce_generation(generation, memory)
+    }
+
+    /// Removes a fully quiesced generation after its final results were used.
+    pub fn unbind_quiesced(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.lock()?.unbind_quiesced(generation)
+    }
+
+    /// Discards one reset generation without applying returned guest data.
+    pub fn discard_generation_without_guest_memory(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.lock()?
+            .discard_generation_without_guest_memory(generation)
+    }
+
+    /// Completion descriptor monitored once by the owning VMM session.
+    pub fn completion_fd(&self) -> Result<Option<RawFd>, BlockAsyncRuntimeError> {
+        Ok(self
+            .lock()?
+            .executor
+            .as_ref()
+            .and_then(BlockAsyncExecutor::completion_fd))
+    }
+
+    pub fn generation_count(&self) -> Result<usize, BlockAsyncRuntimeError> {
+        Ok(self.lock()?.drives.len())
+    }
+
+    pub fn outstanding_tasks(&self) -> Result<usize, BlockAsyncRuntimeError> {
+        Ok(self
+            .lock()?
+            .executor
+            .as_ref()
+            .map_or(0, BlockAsyncExecutor::outstanding_tasks))
+    }
+
+    /// Stops an executor that has no bound drive generations.
+    ///
+    /// Returns `false` when guest memory is still required to drain at least
+    /// one generation. An idle or previously stopped runtime returns `true`.
+    pub fn shutdown_if_idle(&self) -> Result<bool, BlockAsyncRuntimeError> {
+        let mut runtime = self.lock()?;
+        if !runtime.drives.is_empty() {
+            return Ok(false);
+        }
+        runtime.shutdown_executor()?;
+        Ok(true)
+    }
+
+    /// Drains all generations while guest memory still belongs to the owner.
+    pub fn shutdown(&self, memory: &mut GuestMemory) -> Result<(), BlockAsyncRuntimeError> {
+        let mut runtime = self.lock()?;
+        while let Some(generation) = runtime
+            .drives
+            .first()
+            .map(|drive| drive.coordinator.generation())
+        {
+            runtime.quiesce_generation(generation, memory)?;
+            let drive = runtime.drive_mut(generation)?;
+            drive.final_completions.clear();
+            runtime.unbind_quiesced(generation)?;
+        }
+        runtime.shutdown_executor()
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, BlockAsyncRuntime>, BlockAsyncRuntimeError> {
+        self.inner
+            .lock()
+            .map_err(|_| BlockAsyncRuntimeError::Poisoned)
+    }
+}
+
+struct BlockAsyncRuntime {
+    config: BlockAsyncExecutorConfig,
+    host: Arc<dyn BlockAsyncHostIo>,
+    executor: Option<BlockAsyncExecutor>,
+    drives: Vec<BlockAsyncRuntimeDrive>,
+    parked: VecDeque<DetachedBlockAsyncHostCompletion>,
+    next_generation: u64,
+}
+
+impl fmt::Debug for BlockAsyncRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockAsyncRuntime")
+            .field("config", &self.config)
+            .field("active", &self.executor.is_some())
+            .field("generations", &self.drives.len())
+            .field("parked", &self.parked.len())
+            .finish()
+    }
+}
+
+impl Drop for BlockAsyncRuntime {
+    fn drop(&mut self) {
+        if let Some(executor) = self.executor.as_mut() {
+            let _ = executor.shutdown();
+        }
+    }
+}
+
+struct BlockAsyncRuntimeDrive {
+    coordinator: BlockAsyncDrive,
+    backing: Arc<BlockFileBacking>,
+    final_completions: VecDeque<BlockAsyncOperationCompletion>,
+    pressure_pending: bool,
+}
+
+impl BlockAsyncRuntime {
+    fn shutdown_executor(&mut self) -> Result<(), BlockAsyncRuntimeError> {
+        if !self.parked.is_empty() {
+            return Err(BlockAsyncRuntimeError::ParkedCompletionInvariant);
+        }
+        if let Some(mut executor) = self.executor.take() {
+            executor
+                .shutdown()
+                .map_err(BlockAsyncRuntimeError::Executor)?;
+        }
+        Ok(())
+    }
+
+    fn bind_drive(
+        &mut self,
+        backing: Arc<BlockFileBacking>,
+        cache_type: DriveCacheType,
+    ) -> Result<BlockAsyncDriveGeneration, BlockAsyncRuntimeError> {
+        let next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or(BlockAsyncRuntimeError::GenerationExhausted)?;
+        self.drives
+            .try_reserve(1)
+            .map_err(|_| BlockAsyncRuntimeError::MetadataAllocation)?;
+        self.ensure_executor()?;
+        let generation = BlockAsyncDriveGeneration::new(self.next_generation);
+        let executor = self
+            .executor
+            .as_ref()
+            .ok_or(BlockAsyncRuntimeError::ExecutorInvariant)?;
+        let coordinator = BlockAsyncDrive::new(
+            generation,
+            Arc::clone(&backing),
+            cache_type,
+            executor.handle(),
+        )
+        .map_err(BlockAsyncRuntimeError::DriveBuild)?;
+        let mut final_completions = VecDeque::new();
+        final_completions
+            .try_reserve_exact(self.config.per_drive_operation_limit())
+            .map_err(|_| BlockAsyncRuntimeError::MetadataAllocation)?;
+        self.next_generation = next_generation;
+        self.drives.push(BlockAsyncRuntimeDrive {
+            coordinator,
+            backing,
+            final_completions,
+            pressure_pending: false,
+        });
+        Ok(generation)
+    }
+
+    fn ensure_executor(&mut self) -> Result<(), BlockAsyncRuntimeError> {
+        if self.executor.is_some() {
+            return Ok(());
+        }
+        self.parked
+            .try_reserve_exact(self.config.global_task_limit())
+            .map_err(|_| BlockAsyncRuntimeError::MetadataAllocation)?;
+        self.executor = Some(
+            BlockAsyncExecutor::with_config_and_host(self.config, Arc::clone(&self.host))
+                .map_err(BlockAsyncRuntimeError::BuildExecutor)?,
+        );
+        Ok(())
+    }
+
+    fn drive_index(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<usize, BlockAsyncRuntimeError> {
+        self.drives
+            .iter()
+            .position(|drive| drive.coordinator.generation() == generation)
+            .ok_or(BlockAsyncRuntimeError::UnknownGeneration)
+    }
+
+    fn drive_mut(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<&mut BlockAsyncRuntimeDrive, BlockAsyncRuntimeError> {
+        let index = self.drive_index(generation)?;
+        self.drives
+            .get_mut(index)
+            .ok_or(BlockAsyncRuntimeError::UnknownGeneration)
+    }
+
+    fn service_available(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        if self.executor.is_none() {
+            return Ok(());
+        }
+        if let Some(executor) = self.executor.as_ref() {
+            executor
+                .drain_notification()
+                .map_err(BlockAsyncRuntimeError::Executor)?;
+        }
+        while let Some(completion) = self.parked.pop_front() {
+            self.route_detached_completion(
+                memory,
+                completion,
+                BlockAsyncCompletionDisposition::Apply,
+            )?;
+        }
+
+        loop {
+            let mut made_progress = false;
+            while let Some(completion) = self.try_recv_completion()? {
+                self.route_completion(memory, completion, BlockAsyncCompletionDisposition::Apply)?;
+                made_progress = true;
+            }
+            for index in 0..self.drives.len() {
+                let outcome = self
+                    .drives
+                    .get_mut(index)
+                    .ok_or(BlockAsyncRuntimeError::ExecutorInvariant)?
+                    .coordinator
+                    .schedule_one(memory)
+                    .map_err(BlockAsyncRuntimeError::Schedule)?;
+                match outcome {
+                    BlockAsyncScheduleOutcome::Idle => {}
+                    BlockAsyncScheduleOutcome::Pressure(_) => {
+                        if let Some(drive) = self.drives.get_mut(index) {
+                            drive.pressure_pending = true;
+                        }
+                    }
+                    BlockAsyncScheduleOutcome::Submitted { .. } => made_progress = true,
+                    BlockAsyncScheduleOutcome::Completed(completion) => {
+                        self.record_final(index, completion)?;
+                        made_progress = true;
+                    }
+                }
+            }
+            if !made_progress {
+                break;
+            }
+        }
+        if let Some(executor) = self.executor.as_ref() {
+            executor
+                .notification_health()
+                .map_err(BlockAsyncRuntimeError::Executor)?;
+        }
+        Ok(())
+    }
+
+    fn rearm_foreign_ready_completions(
+        &self,
+        owner: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        if self.drives.iter().any(|drive| {
+            drive.coordinator.generation() != owner && !drive.final_completions.is_empty()
+        }) {
+            self.executor
+                .as_ref()
+                .ok_or(BlockAsyncRuntimeError::ExecutorInvariant)?
+                .rearm_notification()
+                .map_err(BlockAsyncRuntimeError::Executor)?;
+        }
+        Ok(())
+    }
+
+    fn try_recv_completion(
+        &self,
+    ) -> Result<Option<BlockAsyncHostCompletion>, BlockAsyncRuntimeError> {
+        self.executor
+            .as_ref()
+            .ok_or(BlockAsyncRuntimeError::ExecutorInvariant)?
+            .try_recv_completion()
+            .map_err(BlockAsyncRuntimeError::Executor)
+    }
+
+    fn recv_completion(&self) -> Result<BlockAsyncHostCompletion, BlockAsyncRuntimeError> {
+        self.executor
+            .as_ref()
+            .ok_or(BlockAsyncRuntimeError::ExecutorInvariant)?
+            .recv_completion()
+            .map_err(BlockAsyncRuntimeError::Executor)
+    }
+
+    fn route_completion(
+        &mut self,
+        memory: &mut GuestMemory,
+        completion: BlockAsyncHostCompletion,
+        disposition: BlockAsyncCompletionDisposition,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.route_detached_completion(memory, completion.detach(), disposition)
+    }
+
+    fn route_detached_completion(
+        &mut self,
+        memory: &mut GuestMemory,
+        completion: DetachedBlockAsyncHostCompletion,
+        disposition: BlockAsyncCompletionDisposition,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let generation = completion.key.operation.generation();
+        let index = self.drive_index(generation)?;
+        let outcome = self
+            .drives
+            .get_mut(index)
+            .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+            .coordinator
+            .apply_detached_completion(Some(memory), completion, disposition)
+            .map_err(BlockAsyncRuntimeError::Apply)?;
+        match outcome {
+            BlockAsyncApplyOutcome::Completed(completion) => {
+                self.record_final(index, completion)?;
+            }
+            BlockAsyncApplyOutcome::Advanced(_) | BlockAsyncApplyOutcome::Discarded(_) => {}
+            BlockAsyncApplyOutcome::Stale(_) => {
+                return Err(BlockAsyncRuntimeError::StaleCompletion);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_final(
+        &mut self,
+        index: usize,
+        completion: BlockAsyncOperationCompletion,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        if completion.internal {
+            return match completion.status() {
+                BlockAsyncOperationStatus::Success => Ok(()),
+                BlockAsyncOperationStatus::Failed(source) => {
+                    Err(BlockAsyncRuntimeError::PersistenceFailure {
+                        generation: completion.key().generation(),
+                        source,
+                    })
+                }
+            };
+        }
+        let drive = self
+            .drives
+            .get_mut(index)
+            .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?;
+        if drive.final_completions.len() >= self.config.per_drive_operation_limit() {
+            return Err(BlockAsyncRuntimeError::CompletionCapacity);
+        }
+        drive.final_completions.push_back(completion);
+        Ok(())
+    }
+
+    fn quiesce_generation(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+        memory: &mut GuestMemory,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let index = self.drive_index(generation)?;
+        let needs_final_flush = self
+            .drives
+            .get(index)
+            .is_some_and(|drive| drive.coordinator.cache_type() == DriveCacheType::Writeback);
+        self.drives
+            .get_mut(index)
+            .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+            .coordinator
+            .stop_admission();
+        let mut final_flush_started = false;
+        loop {
+            let mut made_progress = self.route_parked_completions(memory)?;
+            while let Some(completion) = self.try_recv_completion()? {
+                self.route_completion(memory, completion, BlockAsyncCompletionDisposition::Apply)?;
+                made_progress = true;
+            }
+            let index = self.drive_index(generation)?;
+            let drained = self
+                .drives
+                .get(index)
+                .is_some_and(|drive| drive.coordinator.is_drained());
+            if drained {
+                if needs_final_flush && !final_flush_started {
+                    self.drives
+                        .get_mut(index)
+                        .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+                        .coordinator
+                        .enqueue_internal_flush()
+                        .map_err(BlockAsyncRuntimeError::Admission)?;
+                    final_flush_started = true;
+                    continue;
+                }
+                break;
+            }
+
+            let outcome = self
+                .drives
+                .get_mut(index)
+                .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+                .coordinator
+                .schedule_one(memory)
+                .map_err(BlockAsyncRuntimeError::Schedule)?;
+            match outcome {
+                BlockAsyncScheduleOutcome::Idle => {}
+                BlockAsyncScheduleOutcome::Pressure(_) => {
+                    self.drives
+                        .get_mut(index)
+                        .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+                        .pressure_pending = true;
+                }
+                BlockAsyncScheduleOutcome::Submitted { .. } => made_progress = true,
+                BlockAsyncScheduleOutcome::Completed(completion) => {
+                    self.record_final(index, completion)?;
+                    made_progress = true;
+                }
+            }
+            if !made_progress {
+                let completion = self.recv_completion()?;
+                self.route_completion(memory, completion, BlockAsyncCompletionDisposition::Apply)?;
+            }
+        }
+
+        self.reconcile_quiesced_notification(generation, memory)
+    }
+
+    fn route_parked_completions(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<bool, BlockAsyncRuntimeError> {
+        let parked_count = self.parked.len();
+        let mut routed = false;
+        for _ in 0..parked_count {
+            let completion = self
+                .parked
+                .pop_front()
+                .ok_or(BlockAsyncRuntimeError::ExecutorInvariant)?;
+            self.route_detached_completion(
+                memory,
+                completion,
+                BlockAsyncCompletionDisposition::Apply,
+            )?;
+            routed = true;
+        }
+        Ok(routed)
+    }
+
+    fn discard_parked_generation(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let parked_count = self.parked.len();
+        for _ in 0..parked_count {
+            let completion = self
+                .parked
+                .pop_front()
+                .ok_or(BlockAsyncRuntimeError::ExecutorInvariant)?;
+            if completion.key.operation.generation() != generation {
+                self.parked.push_back(completion);
+                continue;
+            }
+            let index = self.drive_index(generation)?;
+            let outcome = self
+                .drives
+                .get_mut(index)
+                .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+                .coordinator
+                .apply_detached_completion(
+                    None,
+                    completion,
+                    BlockAsyncCompletionDisposition::Discard,
+                )
+                .map_err(BlockAsyncRuntimeError::Apply)?;
+            if !matches!(outcome, BlockAsyncApplyOutcome::Discarded(_)) {
+                return Err(BlockAsyncRuntimeError::StaleCompletion);
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_quiesced_notification(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+        memory: &mut GuestMemory,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.executor
+            .as_ref()
+            .ok_or(BlockAsyncRuntimeError::ExecutorInvariant)?
+            .drain_notification()
+            .map_err(BlockAsyncRuntimeError::Executor)?;
+        while let Some(completion) = self.try_recv_completion()? {
+            self.route_completion(memory, completion, BlockAsyncCompletionDisposition::Apply)?;
+        }
+        let foreign_work_pending = !self.parked.is_empty()
+            || self.drives.iter().any(|drive| {
+                drive.coordinator.generation() != generation
+                    && (!drive.coordinator.is_drained() || !drive.final_completions.is_empty())
+            });
+        let executor = self
+            .executor
+            .as_ref()
+            .ok_or(BlockAsyncRuntimeError::ExecutorInvariant)?;
+        if foreign_work_pending {
+            executor
+                .rearm_notification()
+                .map_err(BlockAsyncRuntimeError::Executor)?;
+        }
+        executor
+            .notification_health()
+            .map_err(BlockAsyncRuntimeError::Executor)
+    }
+
+    fn unbind_quiesced(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let index = self.drive_index(generation)?;
+        let drive = self
+            .drives
+            .get(index)
+            .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?;
+        if !drive.coordinator.is_drained() {
+            return Err(BlockAsyncRuntimeError::OutstandingOperations);
+        }
+        if !drive.final_completions.is_empty() {
+            return Err(BlockAsyncRuntimeError::OutstandingCompletions);
+        }
+        self.drives.remove(index);
+        Ok(())
+    }
+
+    fn discard_generation_without_guest_memory(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let index = self.drive_index(generation)?;
+        let needs_final_flush = self
+            .drives
+            .get(index)
+            .is_some_and(|drive| drive.coordinator.cache_type() == DriveCacheType::Writeback);
+        {
+            let drive = self
+                .drives
+                .get_mut(index)
+                .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?;
+            drive.coordinator.stop_admission();
+            drive.coordinator.discard_unsubmitted();
+            drive.final_completions.clear();
+        }
+        loop {
+            self.discard_parked_generation(generation)?;
+            let index = self.drive_index(generation)?;
+            if self
+                .drives
+                .get(index)
+                .is_some_and(|drive| drive.coordinator.is_drained())
+            {
+                break;
+            }
+            let completion = self.recv_completion()?;
+            if completion.operation_key().generation() == generation {
+                let outcome = self
+                    .drives
+                    .get_mut(index)
+                    .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+                    .coordinator
+                    .apply_completion_without_guest_memory(
+                        completion,
+                        BlockAsyncCompletionDisposition::Discard,
+                    )
+                    .map_err(BlockAsyncRuntimeError::Apply)?;
+                if !matches!(outcome, BlockAsyncApplyOutcome::Discarded(_)) {
+                    return Err(BlockAsyncRuntimeError::StaleCompletion);
+                }
+            } else {
+                if self.parked.len() >= self.config.global_task_limit() {
+                    return Err(BlockAsyncRuntimeError::CompletionCapacity);
+                }
+                self.parked.push_back(completion.detach());
+            }
+        }
+        if needs_final_flush {
+            self.drives
+                .get(index)
+                .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+                .backing
+                .flush()
+                .map_err(|_| BlockAsyncRuntimeError::BackingPersistence { generation })?;
+        }
+        self.drives.remove(index);
+        Ok(())
+    }
+}
+
+/// Structural failure at the shared asynchronous block owner boundary.
+#[derive(Debug)]
+pub enum BlockAsyncRuntimeError {
+    Poisoned,
+    GenerationExhausted,
+    MetadataAllocation,
+    BuildExecutor(BlockAsyncExecutorBuildError),
+    DriveBuild(BlockAsyncDriveBuildError),
+    UnknownGeneration,
+    Admission(BlockAsyncAdmissionError),
+    Schedule(BlockAsyncScheduleError),
+    Apply(BlockAsyncApplyError),
+    Executor(BlockAsyncExecutorError),
+    ExecutorInvariant,
+    StaleCompletion,
+    CompletionCapacity,
+    OutstandingOperations,
+    OutstandingCompletions,
+    ParkedCompletionInvariant,
+    PersistenceFailure {
+        generation: BlockAsyncDriveGeneration,
+        source: BlockAsyncOperationFailure,
+    },
+    BackingPersistence {
+        generation: BlockAsyncDriveGeneration,
+    },
+}
+
+impl fmt::Display for BlockAsyncRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Poisoned => formatter.write_str("asynchronous block runtime is unavailable"),
+            Self::GenerationExhausted => {
+                formatter.write_str("asynchronous block generations are exhausted")
+            }
+            Self::MetadataAllocation => {
+                formatter.write_str("asynchronous block runtime metadata allocation failed")
+            }
+            Self::BuildExecutor(_) => {
+                formatter.write_str("failed to build asynchronous block runtime")
+            }
+            Self::DriveBuild(_) => {
+                formatter.write_str("failed to bind asynchronous block generation")
+            }
+            Self::UnknownGeneration => {
+                formatter.write_str("asynchronous block generation is unknown")
+            }
+            Self::Admission(_) => formatter.write_str("asynchronous block admission failed"),
+            Self::Schedule(_) => formatter.write_str("asynchronous block scheduling failed"),
+            Self::Apply(_) => formatter.write_str("asynchronous block completion apply failed"),
+            Self::Executor(_) => formatter.write_str("asynchronous block executor failed"),
+            Self::ExecutorInvariant => {
+                formatter.write_str("asynchronous block executor invariant was violated")
+            }
+            Self::StaleCompletion => formatter.write_str("asynchronous block completion is stale"),
+            Self::CompletionCapacity => {
+                formatter.write_str("asynchronous block completion capacity is exhausted")
+            }
+            Self::OutstandingOperations => {
+                formatter.write_str("asynchronous block generation still owns operations")
+            }
+            Self::OutstandingCompletions => {
+                formatter.write_str("asynchronous block generation still owns completions")
+            }
+            Self::ParkedCompletionInvariant => {
+                formatter.write_str("asynchronous block runtime retained host completions")
+            }
+            Self::PersistenceFailure { .. } | Self::BackingPersistence { .. } => {
+                formatter.write_str("asynchronous block persistence barrier failed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlockAsyncRuntimeError {}
+
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
@@ -2697,6 +3626,523 @@ mod tests {
                 std::mem::discriminant(&expected)
             );
         }
+    }
+
+    #[test]
+    fn shared_runtime_is_lazy_and_routes_compact_generation_results() {
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 2, 2, 4, 8),
+            Arc::new(ImmediateHost),
+        );
+        assert_eq!(runtime.completion_fd().expect("runtime should lock"), None);
+        let (_temporary_a, backing_a) = temporary_backing(&[]);
+        let (_temporary_b, backing_b) = temporary_backing(&[]);
+        let first = runtime
+            .bind_drive(backing_a, DriveCacheType::Unsafe)
+            .expect("first drive should bind");
+        let second = runtime
+            .bind_drive(backing_b, DriveCacheType::Unsafe)
+            .expect("second drive should bind");
+        assert!(second.value() > first.value());
+        assert!(
+            runtime
+                .completion_fd()
+                .expect("runtime should lock")
+                .is_some()
+        );
+
+        runtime
+            .admit_preflighted(
+                first,
+                BlockAsyncOperation::read(identity(31), GuestAddress::new(0x100), 0x2a, 4)
+                    .expect("read should validate"),
+            )
+            .expect("read should admit");
+        let mut memory = guest_memory();
+        runtime
+            .quiesce_generation(first, &mut memory)
+            .expect("first generation should drain");
+        let completion = runtime
+            .pop_completion(first)
+            .expect("completion lookup should succeed")
+            .expect("read should produce one compact completion");
+        assert_eq!(completion.identity(), identity(31));
+        assert_eq!(completion.status(), BlockAsyncOperationStatus::Success);
+        let mut bytes = [0_u8; 4];
+        memory
+            .read_slice(&mut bytes, GuestAddress::new(0x100))
+            .expect("read result should be owner-applied");
+        assert_eq!(bytes, [0x2a; 4]);
+        runtime
+            .unbind_quiesced(first)
+            .expect("consumed generation should unbind");
+        runtime
+            .shutdown(&mut memory)
+            .expect("remaining idle generation should shut down");
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
+        assert_eq!(runtime.completion_fd().expect("runtime should lock"), None);
+    }
+
+    #[test]
+    fn shared_runtime_idle_shutdown_needs_no_guest_memory_and_is_idempotent() {
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 1, 1, 1, 1),
+            Arc::new(ImmediateHost),
+        );
+        let (_temporary, backing) = temporary_backing(&[]);
+        let generation = runtime
+            .bind_drive(backing, DriveCacheType::Unsafe)
+            .expect("drive should bind");
+        let mut memory = guest_memory();
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("idle generation should quiesce");
+        runtime
+            .unbind_quiesced(generation)
+            .expect("idle generation should unbind");
+        assert!(
+            runtime
+                .completion_fd()
+                .expect("runtime should lock")
+                .is_some()
+        );
+
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("idle runtime should stop")
+        );
+        assert_eq!(runtime.completion_fd().expect("runtime should lock"), None);
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("stopped runtime should remain stopped")
+        );
+    }
+
+    #[test]
+    fn selected_quiesce_releases_saturated_foreign_reads_before_multichunk_target() {
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 2, 3, 4, 8),
+            Arc::new(ImmediateHost),
+        );
+        let (_foreign_temporary, foreign_backing) = temporary_backing(&[]);
+        let (_target_temporary, target_backing) = temporary_backing(&[]);
+        let foreign = runtime
+            .bind_drive(foreign_backing, DriveCacheType::Unsafe)
+            .expect("foreign drive should bind");
+        let target = runtime
+            .bind_drive(target_backing, DriveCacheType::Unsafe)
+            .expect("target drive should bind");
+        for (head, guest_address, host_offset) in [
+            (71, GuestAddress::new(0x100), 7),
+            (72, GuestAddress::new(0x200), 11),
+        ] {
+            runtime
+                .admit_preflighted(
+                    foreign,
+                    BlockAsyncOperation::read(identity(head), guest_address, host_offset, 4)
+                        .expect("foreign read should validate"),
+                )
+                .expect("foreign read should admit");
+        }
+        runtime
+            .admit_preflighted(
+                target,
+                BlockAsyncOperation::write(identity(73), GuestAddress::new(0x300), 0, 8)
+                    .expect("target write should validate"),
+            )
+            .expect("target write should admit");
+
+        let mut memory = guest_memory();
+        memory
+            .write_slice(&[1, 2, 3, 4, 5, 6, 7, 8], GuestAddress::new(0x300))
+            .expect("target write payload should initialize");
+        {
+            let mut state = runtime.inner.lock().expect("runtime should lock");
+            for _ in 0..2 {
+                assert!(matches!(
+                    state
+                        .drive_mut(foreign)
+                        .expect("foreign generation should exist")
+                        .coordinator
+                        .schedule_one(&memory)
+                        .expect("foreign read should schedule"),
+                    BlockAsyncScheduleOutcome::Submitted { .. }
+                ));
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut notifications = 0;
+            while notifications < 2 {
+                match state
+                    .executor
+                    .as_ref()
+                    .expect("executor should exist")
+                    .drain_notification()
+                    .expect("notification should drain")
+                {
+                    BlockAsyncNotificationDrain::WouldBlock => {}
+                    BlockAsyncNotificationDrain::Drained {
+                        notifications: drained,
+                    } => notifications += drained,
+                    BlockAsyncNotificationDrain::Closed { .. } => {
+                        panic!("completion notifier should remain open")
+                    }
+                }
+                assert!(
+                    notifications >= 2 || Instant::now() < deadline,
+                    "foreign reads should complete before the bounded deadline"
+                );
+                std::thread::yield_now();
+            }
+            let executor = state.executor.as_ref().expect("executor should exist");
+            assert_eq!(executor.outstanding_tasks(), 2);
+            assert_eq!(executor.reserved_buffer_bytes(), 8);
+        }
+
+        runtime
+            .quiesce_generation(target, &mut memory)
+            .expect("target should drain after saturated foreign completions");
+        assert_eq!(runtime.outstanding_tasks().expect("runtime should lock"), 0);
+        {
+            let state = runtime.inner.lock().expect("runtime should lock");
+            assert!(state.parked.is_empty());
+            assert_eq!(
+                state
+                    .executor
+                    .as_ref()
+                    .expect("executor should exist")
+                    .reserved_buffer_bytes(),
+                0
+            );
+        }
+
+        let target_completion = runtime
+            .pop_completion(target)
+            .expect("target completion lookup should succeed")
+            .expect("target should produce one compact completion");
+        assert_eq!(
+            target_completion.status(),
+            BlockAsyncOperationStatus::Success
+        );
+        assert_eq!(target_completion.bytes_transferred(), 8);
+        for _ in 0..2 {
+            let completion = runtime
+                .pop_completion(foreign)
+                .expect("foreign completion lookup should succeed")
+                .expect("foreign completion should remain publishable");
+            assert_eq!(completion.status(), BlockAsyncOperationStatus::Success);
+            assert_eq!(completion.bytes_transferred(), 4);
+        }
+        let mut first = [0_u8; 4];
+        let mut second = [0_u8; 4];
+        memory
+            .read_slice(&mut first, GuestAddress::new(0x100))
+            .expect("first foreign read should apply");
+        memory
+            .read_slice(&mut second, GuestAddress::new(0x200))
+            .expect("second foreign read should apply");
+        assert_eq!(first, [7; 4]);
+        assert_eq!(second, [11; 4]);
+        assert_eq!(
+            runtime
+                .pop_completion(foreign)
+                .expect("foreign completion lookup should succeed"),
+            None
+        );
+
+        runtime
+            .quiesce_generation(foreign, &mut memory)
+            .expect("foreign generation should quiesce");
+        runtime
+            .unbind_quiesced(target)
+            .expect("target generation should unbind");
+        runtime
+            .unbind_quiesced(foreign)
+            .expect("foreign generation should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("idle executor should stop")
+        );
+    }
+
+    #[test]
+    fn reset_detaches_foreign_completions_before_waiting_for_target() {
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 2, 2, 4, 8),
+            Arc::new(ImmediateHost),
+        );
+        let (_foreign_temporary, foreign_backing) = temporary_backing(&[]);
+        let (_target_temporary, target_backing) = temporary_backing(&[]);
+        let foreign = runtime
+            .bind_drive(foreign_backing, DriveCacheType::Unsafe)
+            .expect("foreign drive should bind");
+        let target = runtime
+            .bind_drive(target_backing, DriveCacheType::Unsafe)
+            .expect("target drive should bind");
+        runtime
+            .admit_preflighted(
+                foreign,
+                BlockAsyncOperation::read(identity(41), GuestAddress::new(0x200), 7, 4)
+                    .expect("foreign read should validate"),
+            )
+            .expect("foreign read should admit");
+        runtime
+            .admit_preflighted(
+                target,
+                BlockAsyncOperation::write(identity(42), GuestAddress::new(0x100), 0, 4)
+                    .expect("target write should validate"),
+            )
+            .expect("target write should admit");
+        let mut memory = guest_memory();
+        memory
+            .write_slice(&[1, 2, 3, 4], GuestAddress::new(0x100))
+            .expect("target write payload should initialize");
+        runtime
+            .service_available(&mut memory)
+            .expect("both generations should schedule");
+        runtime
+            .discard_generation_without_guest_memory(target)
+            .expect("target reset should finish without guest memory");
+        assert_eq!(runtime.outstanding_tasks().expect("runtime should lock"), 0);
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 1);
+
+        runtime
+            .service_available(&mut memory)
+            .expect("foreign detached completion should apply later");
+        let completion = runtime
+            .pop_completion(foreign)
+            .expect("foreign completion lookup should succeed")
+            .expect("foreign result should remain publishable");
+        assert_eq!(completion.status(), BlockAsyncOperationStatus::Success);
+        let mut bytes = [0_u8; 4];
+        memory
+            .read_slice(&mut bytes, GuestAddress::new(0x200))
+            .expect("foreign read should apply to guest memory");
+        assert_eq!(bytes, [7; 4]);
+        runtime
+            .quiesce_generation(foreign, &mut memory)
+            .expect("foreign generation should already be drained");
+        runtime
+            .unbind_quiesced(foreign)
+            .expect("foreign generation should unbind");
+        runtime
+            .shutdown(&mut memory)
+            .expect("executor should shut down");
+    }
+
+    #[test]
+    fn reset_consumes_parked_target_while_later_quiesce_applies_parked_foreign_read() {
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 2, 2, 4, 8),
+            Arc::new(ImmediateHost),
+        );
+        let (_foreign_temporary, foreign_backing) = temporary_backing(&[]);
+        let (_target_temporary, target_backing) = temporary_backing(&[]);
+        let foreign = runtime
+            .bind_drive(foreign_backing, DriveCacheType::Unsafe)
+            .expect("foreign drive should bind");
+        let target = runtime
+            .bind_drive(target_backing, DriveCacheType::Unsafe)
+            .expect("target drive should bind");
+        runtime
+            .admit_preflighted(
+                foreign,
+                BlockAsyncOperation::read(identity(45), GuestAddress::new(0x200), 7, 4)
+                    .expect("foreign read should validate"),
+            )
+            .expect("foreign read should admit");
+        runtime
+            .admit_preflighted(
+                target,
+                BlockAsyncOperation::read(identity(46), GuestAddress::new(0x100), 5, 4)
+                    .expect("target read should validate"),
+            )
+            .expect("target read should admit");
+        let mut memory = guest_memory();
+        {
+            let mut state = runtime.inner.lock().expect("runtime should lock");
+            for generation in [foreign, target] {
+                let outcome = state
+                    .drive_mut(generation)
+                    .expect("generation should exist")
+                    .coordinator
+                    .schedule_one(&memory)
+                    .expect("read should schedule");
+                assert!(matches!(
+                    outcome,
+                    BlockAsyncScheduleOutcome::Submitted { .. }
+                ));
+            }
+            for _ in 0..2 {
+                let completion = state
+                    .recv_completion()
+                    .expect("scheduled read should complete");
+                state.parked.push_back(completion.detach());
+            }
+        }
+        assert_eq!(runtime.outstanding_tasks().expect("runtime should lock"), 0);
+
+        runtime
+            .discard_generation_without_guest_memory(target)
+            .expect("reset should consume its already-parked completion");
+        let mut target_bytes = [0_u8; 4];
+        memory
+            .read_slice(&mut target_bytes, GuestAddress::new(0x100))
+            .expect("target guest range should remain readable");
+        assert_eq!(target_bytes, [0; 4]);
+
+        runtime
+            .quiesce_generation(foreign, &mut memory)
+            .expect("quiesce should apply the foreign parked read");
+        assert!(
+            runtime
+                .inner
+                .lock()
+                .expect("runtime should lock")
+                .parked
+                .is_empty()
+        );
+        let completion = runtime
+            .pop_completion(foreign)
+            .expect("foreign completion lookup should succeed")
+            .expect("foreign completion should remain publishable");
+        assert_eq!(completion.status(), BlockAsyncOperationStatus::Success);
+        let mut foreign_bytes = [0_u8; 4];
+        memory
+            .read_slice(&mut foreign_bytes, GuestAddress::new(0x200))
+            .expect("foreign read should publish to guest memory");
+        assert_eq!(foreign_bytes, [7; 4]);
+        runtime
+            .unbind_quiesced(foreign)
+            .expect("foreign generation should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("idle executor should stop")
+        );
+    }
+
+    #[test]
+    fn quiescing_one_generation_rearms_a_foreign_ready_completion() {
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 2, 2, 4, 8),
+            Arc::new(ImmediateHost),
+        );
+        let (_foreign_temporary, foreign_backing) = temporary_backing(&[]);
+        let (_target_temporary, target_backing) = temporary_backing(&[]);
+        let foreign = runtime
+            .bind_drive(foreign_backing, DriveCacheType::Unsafe)
+            .expect("foreign drive should bind");
+        let target = runtime
+            .bind_drive(target_backing, DriveCacheType::Unsafe)
+            .expect("target drive should bind");
+        runtime
+            .admit_preflighted(
+                foreign,
+                BlockAsyncOperation::read(identity(51), GuestAddress::new(0x200), 9, 4)
+                    .expect("foreign read should validate"),
+            )
+            .expect("foreign read should admit");
+        let mut memory = guest_memory();
+        runtime
+            .quiesce_generation(foreign, &mut memory)
+            .expect("foreign generation should drain into its owner mailbox");
+        runtime
+            .quiesce_generation(target, &mut memory)
+            .expect("idle target generation should quiesce");
+
+        let notification = runtime
+            .inner
+            .lock()
+            .expect("runtime should lock")
+            .executor
+            .as_ref()
+            .expect("executor should exist")
+            .drain_notification()
+            .expect("notification should drain");
+        assert!(matches!(
+            notification,
+            BlockAsyncNotificationDrain::Drained { notifications } if notifications > 0
+        ));
+        assert_eq!(
+            runtime
+                .pop_completion(foreign)
+                .expect("foreign completion lookup should succeed")
+                .expect("foreign completion should remain publishable")
+                .status(),
+            BlockAsyncOperationStatus::Success
+        );
+        runtime
+            .unbind_quiesced(foreign)
+            .expect("foreign generation should unbind");
+        runtime
+            .unbind_quiesced(target)
+            .expect("target generation should unbind");
+        runtime
+            .shutdown(&mut memory)
+            .expect("executor should shut down");
+    }
+
+    #[test]
+    fn servicing_one_generation_rearms_a_foreign_ready_completion() {
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 2, 2, 4, 8),
+            Arc::new(ImmediateHost),
+        );
+        let (_foreign_temporary, foreign_backing) = temporary_backing(&[]);
+        let (_owner_temporary, owner_backing) = temporary_backing(&[]);
+        let foreign = runtime
+            .bind_drive(foreign_backing, DriveCacheType::Unsafe)
+            .expect("foreign drive should bind");
+        let owner = runtime
+            .bind_drive(owner_backing, DriveCacheType::Unsafe)
+            .expect("owner drive should bind");
+        runtime
+            .admit_preflighted(
+                foreign,
+                BlockAsyncOperation::read(identity(61), GuestAddress::new(0x200), 11, 4)
+                    .expect("foreign read should validate"),
+            )
+            .expect("foreign read should admit");
+        let mut memory = guest_memory();
+        runtime
+            .quiesce_generation(foreign, &mut memory)
+            .expect("foreign generation should drain into its owner mailbox");
+        runtime
+            .service_available_for(owner, &mut memory)
+            .expect("owner service should preserve foreign readiness");
+
+        let notification = runtime
+            .inner
+            .lock()
+            .expect("runtime should lock")
+            .executor
+            .as_ref()
+            .expect("executor should exist")
+            .drain_notification()
+            .expect("notification should drain");
+        assert!(matches!(
+            notification,
+            BlockAsyncNotificationDrain::Drained { notifications } if notifications > 0
+        ));
+        runtime
+            .pop_completion(foreign)
+            .expect("foreign completion lookup should succeed")
+            .expect("foreign completion should remain publishable");
+        runtime
+            .unbind_quiesced(foreign)
+            .expect("foreign generation should unbind");
+        runtime
+            .quiesce_generation(owner, &mut memory)
+            .expect("owner generation should quiesce");
+        runtime
+            .unbind_quiesced(owner)
+            .expect("owner generation should unbind");
+        runtime
+            .shutdown(&mut memory)
+            .expect("executor should shut down");
     }
 
     #[test]
