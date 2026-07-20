@@ -18,8 +18,9 @@ use crate::balloon::{
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
     DriveConfig, DriveConfigInput, DriveIoEngine, DriveRateLimiterConfig, DriveUpdateError,
-    PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices, VirtioBlockConfigSpace,
-    VirtioBlockDeviceId, VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
+    PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
+    PreparedVhostUserBlockFrontend, VirtioBlockConfigSpace, VirtioBlockDeviceId,
+    VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
     VirtioBlockMmioHandler, VirtioBlockRuntimeRestoreInput,
 };
 use crate::boot::{
@@ -108,6 +109,7 @@ const ARM64_BOOT_PCI_ECAM_REGION_ID: MmioRegionId = MmioRegionId::new(u64::MAX);
 pub struct VmStartupResources {
     boot_files: BootSourceFiles,
     block_backings: BTreeMap<String, BlockFileBacking>,
+    vhost_user_block_frontends: BTreeMap<String, PreparedVhostUserBlockFrontend>,
     pmem_backings: BTreeMap<String, PmemFileBacking>,
     serial_output: Option<SerialOutputFile>,
     supplied_vsock_listener: Option<SuppliedVsockListener>,
@@ -117,6 +119,7 @@ pub struct VmStartupResources {
 struct VmStartupResourceParts {
     boot_files: BootSourceFiles,
     block_backings: BTreeMap<String, BlockFileBacking>,
+    vhost_user_block_frontends: BTreeMap<String, PreparedVhostUserBlockFrontend>,
     pmem_backings: BTreeMap<String, PmemFileBacking>,
     supplied_vsock_listener: Option<SuppliedVsockListener>,
     guest_memory_backing: GuestMemoryBacking,
@@ -130,6 +133,10 @@ impl fmt::Debug for VmStartupResources {
             .field(
                 "block_backings",
                 &(!self.block_backings.is_empty()).then_some("<owned>"),
+            )
+            .field(
+                "vhost_user_block_frontends",
+                &(!self.vhost_user_block_frontends.is_empty()).then_some("<owned>"),
             )
             .field(
                 "pmem_backings",
@@ -158,6 +165,7 @@ impl VmStartupResources {
         Self {
             boot_files,
             block_backings,
+            vhost_user_block_frontends: BTreeMap::new(),
             pmem_backings,
             serial_output: None,
             supplied_vsock_listener: None,
@@ -189,6 +197,20 @@ impl VmStartupResources {
         self
     }
 
+    /// Adds the exact already-connected vhost-user block frontends for this
+    /// startup attempt and selects descriptor-backed shared guest memory.
+    #[must_use]
+    pub fn with_vhost_user_block_frontends(
+        mut self,
+        frontends: BTreeMap<String, PreparedVhostUserBlockFrontend>,
+    ) -> Self {
+        if !frontends.is_empty() {
+            self.guest_memory_backing = GuestMemoryBacking::Shared;
+        }
+        self.vhost_user_block_frontends = frontends;
+        self
+    }
+
     /// Selects the backing profile used for every guest-memory region.
     #[must_use]
     pub fn with_guest_memory_backing(mut self, backing: GuestMemoryBacking) -> Self {
@@ -201,6 +223,7 @@ impl VmStartupResources {
     pub fn is_empty(&self) -> bool {
         self.boot_files.is_empty()
             && self.block_backings.is_empty()
+            && self.vhost_user_block_frontends.is_empty()
             && self.pmem_backings.is_empty()
             && self.serial_output.is_none()
             && self.supplied_vsock_listener.is_none()
@@ -212,6 +235,7 @@ impl VmStartupResources {
         VmStartupResourceParts {
             boot_files: self.boot_files,
             block_backings: self.block_backings,
+            vhost_user_block_frontends: self.vhost_user_block_frontends,
             pmem_backings: self.pmem_backings,
             supplied_vsock_listener: self.supplied_vsock_listener,
             guest_memory_backing: self.guest_memory_backing,
@@ -544,6 +568,12 @@ pub struct Arm64BootRuntimeResources {
 
 #[derive(Debug)]
 pub enum Arm64BootVsockWakeupFdsError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    ResultAllocation { source: TryReserveError },
+}
+
+#[derive(Debug)]
+pub enum Arm64BootBlockWakeupFdsError {
     HandlerLookup { source: MmioHandlerLookupError },
     ResultAllocation { source: TryReserveError },
 }
@@ -1248,6 +1278,34 @@ impl std::error::Error for Arm64BootVsockWakeupFdsError {
     }
 }
 
+impl fmt::Display for Arm64BootBlockWakeupFdsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HandlerLookup { source } => {
+                write!(
+                    formatter,
+                    "failed to find boot block MMIO handler: {source}"
+                )
+            }
+            Self::ResultAllocation { source } => {
+                write!(
+                    formatter,
+                    "failed to allocate block wakeup fd list: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootBlockWakeupFdsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Arm64BootBlockNotificationDispatches {
     devices: Vec<Arm64BootBlockNotificationDispatch>,
@@ -1327,9 +1385,7 @@ impl Arm64BootBlockNotificationOutcome {
     pub fn needs_queue_interrupt(&self) -> bool {
         match self {
             Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
-            Self::DispatchFailed(source) => source
-                .completed_dispatch()
-                .is_some_and(crate::block::VirtioBlockQueueDispatch::needs_queue_interrupt),
+            Self::DispatchFailed(source) => source.needs_queue_interrupt(),
             Self::HandlerLookupFailed(_) => false,
         }
     }
@@ -2621,6 +2677,25 @@ impl Arm64BootRuntimeResources {
             .map(|wakeup| wakeup.into_parts().0)
     }
 
+    pub fn vhost_user_block_call_fds(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Result<Vec<RawFd>, Arm64BootBlockWakeupFdsError> {
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(self.block_devices.len())
+            .map_err(|source| Arm64BootBlockWakeupFdsError::ResultAllocation { source })?;
+        for device in &self.block_devices {
+            let handler = mmio_dispatcher
+                .handler_mut::<VirtioBlockMmioHandler>(device.registration.region_id())
+                .map_err(|source| Arm64BootBlockWakeupFdsError::HandlerLookup { source })?;
+            if let Some(descriptor) = handler.activation_handler().vhost_user_call_fd() {
+                descriptors.push(descriptor);
+            }
+        }
+        Ok(descriptors)
+    }
+
     pub fn vsock_wakeup(
         &self,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -3140,10 +3215,10 @@ fn update_block_device_for_region_with_opened(
         })?;
 
     if let Some(backing) = backing {
-        handler.refresh_block_backing_with_opened(config, backing);
+        handler.refresh_block_backing_with_opened(config, backing)?;
     }
     if let Some(rate_limiter) = rate_limiter_update {
-        handler.update_block_rate_limiter(rate_limiter);
+        handler.update_block_rate_limiter(rate_limiter)?;
     }
 
     Ok(())
@@ -3771,6 +3846,7 @@ impl Arm64BootResources {
         let VmStartupResourceParts {
             boot_files,
             block_backings,
+            vhost_user_block_frontends,
             pmem_backings,
             supplied_vsock_listener,
             guest_memory_backing,
@@ -3868,6 +3944,7 @@ impl Arm64BootResources {
             &mut loaded_boot_source,
             controller.drive_configs(),
             controller.pmem_configs(),
+            &vhost_user_block_frontends,
         )?;
         let prepared_pmems = PreparedPmemDevices::from_config_slice_with_layout_and_backings(
             controller.pmem_configs(),
@@ -3876,9 +3953,11 @@ impl Arm64BootResources {
         )
         .map_err(|source| Arm64BootResourceError::PreparePmemDevices { source })?;
 
-        let prepared_blocks = PreparedBlockDevices::from_config_slice_with_backings(
+        let prepared_blocks = PreparedBlockDevices::from_config_slice_with_resources(
             controller.drive_configs(),
+            &memory,
             block_backings,
+            vhost_user_block_frontends,
         )
         .map_err(|source| Arm64BootResourceError::PrepareBlockDevices { source })?;
         let prepared_networks =
@@ -4443,6 +4522,7 @@ fn append_root_device_command_line(
     loaded_boot_source: &mut LoadedBootSource,
     drive_configs: &[DriveConfig],
     pmem_configs: &[PmemConfig],
+    vhost_user_frontends: &BTreeMap<String, PreparedVhostUserBlockFrontend>,
 ) -> Result<(), Arm64BootResourceError> {
     let mut root_drives = drive_configs
         .iter()
@@ -4466,7 +4546,12 @@ fn append_root_device_command_line(
                 .partuuid()
                 .map(|partuuid| format!("root=PARTUUID={partuuid}"))
                 .unwrap_or_else(|| "root=/dev/vda".to_string());
-            (root_arg, root_drive.is_read_only())
+            let read_only = root_drive.is_read_only().unwrap_or_else(|| {
+                vhost_user_frontends
+                    .get(root_drive.drive_id())
+                    .is_some_and(PreparedVhostUserBlockFrontend::is_read_only)
+            });
+            (root_arg, read_only)
         })
         .or_else(|| {
             root_pmem
@@ -12806,7 +12891,14 @@ mod tests {
             .handler_mut::<VirtioBlockMmioHandler>(first_region)
             .expect("first block handler should exist");
         assert_eq!(first.device_config_handler().capacity_sectors(), 1);
-        assert_eq!(first.activation_handler().backing().len(), 512);
+        assert_eq!(
+            first
+                .activation_handler()
+                .backing()
+                .expect("file device should retain backing")
+                .len(),
+            512
+        );
         assert_eq!(
             first.read_register(VirtioMmioRegister::ConfigGeneration),
             Ok(0)
@@ -12821,7 +12913,14 @@ mod tests {
             .handler_mut::<VirtioBlockMmioHandler>(second_region)
             .expect("second block handler should exist");
         assert_eq!(second.device_config_handler().capacity_sectors(), 2);
-        assert_eq!(second.activation_handler().backing().len(), 1024);
+        assert_eq!(
+            second
+                .activation_handler()
+                .backing()
+                .expect("file device should retain backing")
+                .len(),
+            1024
+        );
         assert_eq!(
             second.read_register(VirtioMmioRegister::ConfigGeneration),
             Ok(1)
@@ -12870,7 +12969,14 @@ mod tests {
             .handler_mut::<VirtioBlockMmioHandler>(first_region)
             .expect("first block handler should exist");
         assert_eq!(first.device_config_handler().capacity_sectors(), 1);
-        assert_eq!(first.activation_handler().backing().len(), 512);
+        assert_eq!(
+            first
+                .activation_handler()
+                .backing()
+                .expect("file device should retain backing")
+                .len(),
+            512
+        );
         assert!(first.activation_handler().rate_limiter().is_none());
         assert_eq!(
             first.read_register(VirtioMmioRegister::ConfigGeneration),
@@ -12886,7 +12992,14 @@ mod tests {
             .handler_mut::<VirtioBlockMmioHandler>(second_region)
             .expect("second block handler should exist");
         assert_eq!(second.device_config_handler().capacity_sectors(), 1);
-        assert_eq!(second.activation_handler().backing().len(), 512);
+        assert_eq!(
+            second
+                .activation_handler()
+                .backing()
+                .expect("file device should retain backing")
+                .len(),
+            512
+        );
         assert!(second.activation_handler().rate_limiter().is_some());
         assert_eq!(
             second.read_register(VirtioMmioRegister::ConfigGeneration),
@@ -12930,7 +13043,14 @@ mod tests {
             .handler_mut::<VirtioBlockMmioHandler>(region)
             .expect("block handler should exist");
         assert_eq!(handler.device_config_handler().capacity_sectors(), 1);
-        assert_eq!(handler.activation_handler().backing().len(), 512);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .backing()
+                .expect("file device should retain backing")
+                .len(),
+            512
+        );
         assert_eq!(
             handler.read_register(VirtioMmioRegister::ConfigGeneration),
             Ok(0)

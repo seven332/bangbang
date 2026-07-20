@@ -2482,6 +2482,7 @@ pub enum VirtioPciEndpointError {
     DeviceConfigNotWritable {
         status: u32,
     },
+    UnsupportedDeviceOperation,
     DeviceReset {
         source: VirtioDeviceResetError,
     },
@@ -2571,6 +2572,9 @@ impl fmt::Display for VirtioPciEndpointError {
                 f,
                 "virtio-pci device configuration is not writable while status is 0x{status:x}"
             ),
+            Self::UnsupportedDeviceOperation => {
+                f.write_str("virtio-pci device operation is unsupported")
+            }
             Self::DeviceReset { source } => write!(f, "virtio-pci device reset failed: {source}"),
             Self::Queue { source } => write!(f, "virtio-pci queue update failed: {source}"),
             Self::QueueNotification { source } => {
@@ -2610,7 +2614,8 @@ impl std::error::Error for VirtioPciEndpointError {
             | Self::OutsideCapabilityBar { .. }
             | Self::InvalidBarAccessWidth { .. }
             | Self::DeviceConfigReadLength { .. }
-            | Self::DeviceConfigNotWritable { .. } => None,
+            | Self::DeviceConfigNotWritable { .. }
+            | Self::UnsupportedDeviceOperation => None,
         }
     }
 }

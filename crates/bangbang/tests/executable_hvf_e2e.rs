@@ -8,6 +8,8 @@
 )]
 
 mod support;
+#[path = "support/vhost_user_block.rs"]
+mod vhost_user_block;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos_arm64 {
@@ -23,6 +25,9 @@ mod macos_arm64 {
         assert_clean_shutdown, assert_no_content_response, assert_ok_response,
         assert_response_contains, http_get, http_json, http_json_with_io_timeout, http_no_body,
         http_put_json, json_string, path_text,
+    };
+    use crate::vhost_user_block::{
+        VhostUserBlockBackend, VhostUserBlockBackendOptions, VhostUserBlockBackendReport,
     };
 
     const BANGBANG_GUEST_KERNEL_PATH_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
@@ -44,6 +49,10 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_VMCLOCK_MARKER: &[u8] = b"BANGBANG_VMCLOCK_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
     const DIRECT_ROOTFS_WRITEBACK_FLUSH_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITEBACK_FLUSH_OK";
+    const VHOST_USER_BLOCK_HOST_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_HOST";
+    const VHOST_USER_BLOCK_RO_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_ro_OK";
+    const VHOST_USER_BLOCK_RW_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_rw_OK";
+    const VHOST_USER_BLOCK_PARTUUID: &str = "0eaa91a0-01";
     const DIRECT_ROOTFS_ENTROPY_MARKER: &[u8] = b"BANGBANG_ENTROPY_GUEST_READ_OK";
     const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
     const DIRECT_ROOTFS_PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
@@ -209,6 +218,16 @@ mod macos_arm64 {
         mmds_config_body: &'a str,
         boot_args: &'a str,
         success_marker: &'a [u8],
+    }
+
+    #[derive(Clone, Copy)]
+    struct VhostUserBlockGuestCase {
+        mode: &'static str,
+        root_read_only: bool,
+        enable_pci: bool,
+        partitioned_root: bool,
+        retry_rejected_discovery: bool,
+        success_marker: &'static [u8],
     }
 
     #[derive(Clone, Copy)]
@@ -1694,6 +1713,562 @@ mod macos_arm64 {
             &socket_path,
             "bangbang direct rootfs serial",
         );
+    }
+
+    #[test]
+    fn signed_executable_runs_vhost_user_block_over_mmio_and_recovers_discovery() {
+        run_signed_vhost_user_block_guest(VhostUserBlockGuestCase {
+            mode: "ro",
+            root_read_only: true,
+            enable_pci: false,
+            partitioned_root: false,
+            retry_rejected_discovery: true,
+            success_marker: VHOST_USER_BLOCK_RO_MARKER,
+        });
+    }
+
+    #[test]
+    fn signed_executable_runs_vhost_user_block_pci_partuuid_writable_root() {
+        run_signed_vhost_user_block_guest(VhostUserBlockGuestCase {
+            mode: "rw",
+            root_read_only: false,
+            enable_pci: true,
+            partitioned_root: true,
+            retry_rejected_discovery: false,
+            success_marker: VHOST_USER_BLOCK_RW_MARKER,
+        });
+    }
+
+    fn run_signed_vhost_user_block_guest(case: VhostUserBlockGuestCase) {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let root_backend_socket = test_dir.path().join("root-vhost.sock");
+        let scratch_backend_socket = test_dir.path().join("scratch-vhost.sock");
+        let scratch_path = test_dir.path().join("scratch.img");
+        let metrics_path = test_dir.path().join("metrics.out");
+        let serial_path = test_dir.path().join("serial.out");
+        let snapshot_state = test_dir.path().join("rejected-vhost.state");
+        let snapshot_memory = test_dir.path().join("rejected-vhost.memory");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let source_rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let rootfs_path = if case.partitioned_root {
+            let path = test_dir.path().join("root-partitioned.img");
+            create_mbr_partitioned_rootfs(&source_rootfs_path, &path);
+            path
+        } else if case.root_read_only {
+            source_rootfs_path
+        } else {
+            let path = test_dir.path().join("root-writable.ext4");
+            fs::copy(&source_rootfs_path, &path)
+                .expect("writable vhost-user root fixture should copy");
+            path
+        };
+        create_block_backing_with_prefix(&scratch_path, 8, VHOST_USER_BLOCK_HOST_MARKER);
+        create_empty_file(&serial_path);
+
+        let scratch_backend = VhostUserBlockBackend::start(
+            &scratch_backend_socket,
+            &scratch_path,
+            VhostUserBlockBackendOptions::regular(false),
+        )
+        .expect("test scratch vhost-user backend should start");
+        let mut root_backend = if case.retry_rejected_discovery {
+            None
+        } else {
+            Some(
+                VhostUserBlockBackend::start(
+                    &root_backend_socket,
+                    &rootfs_path,
+                    VhostUserBlockBackendOptions::regular(case.root_read_only),
+                )
+                .expect("test root vhost-user backend should start"),
+            )
+        };
+        let rejected_backend = case.retry_rejected_discovery.then(|| {
+            VhostUserBlockBackend::start(
+                &root_backend_socket,
+                &rootfs_path,
+                VhostUserBlockBackendOptions::missing_version_one(case.root_read_only),
+            )
+            .expect("rejecting root vhost-user backend should start")
+        });
+
+        let instance_id = test_dir.instance_id();
+        let mut bangbang = if case.enable_pci {
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"])
+        } else {
+            BangbangProcess::start(&socket_path, &instance_id)
+        };
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT /machine-config vhost-user block",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/metrics",
+                &format!(
+                    r#"{{"metrics_path":{}}}"#,
+                    json_string(path_text(&metrics_path))
+                ),
+            ),
+            "PUT /metrics vhost-user block",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/serial",
+                &format!(
+                    r#"{{"serial_out_path":{}}}"#,
+                    json_string(path_text(&serial_path))
+                ),
+            ),
+            "PUT /serial vhost-user block",
+        );
+        let mut boot_args = format!(
+            "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.vhost-user-block={}",
+            case.mode
+        );
+        if case.enable_pci {
+            boot_args.push_str(" bangbang.expect-pci-data=1");
+        }
+        if case.partitioned_root {
+            boot_args.push_str(" bangbang.expect-partuuid=");
+            boot_args.push_str(VHOST_USER_BLOCK_PARTUUID);
+        }
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/boot-source",
+                &format!(
+                    r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+                    json_string(path_text(&kernel_path)),
+                    json_string(&boot_args)
+                ),
+            ),
+            "PUT /boot-source vhost-user block",
+        );
+
+        let partuuid_field = if case.partitioned_root {
+            format!(r#", "partuuid":"{VHOST_USER_BLOCK_PARTUUID}""#)
+        } else {
+            String::new()
+        };
+        let root_cache_field = if case.root_read_only {
+            ""
+        } else {
+            r#", "cache_type":"Writeback""#
+        };
+        let root_body = format!(
+            r#"{{"drive_id":"rootfs","is_root_device":true,"socket":{}{}{} }}"#,
+            json_string(path_text(&root_backend_socket)),
+            partuuid_field,
+            root_cache_field,
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/rootfs", &root_body),
+            "PUT /drives/rootfs vhost-user block",
+        );
+        let scratch_body = format!(
+            r#"{{"drive_id":"scratch","is_root_device":false,"cache_type":"Writeback","socket":{}}}"#,
+            json_string(path_text(&scratch_backend_socket)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/scratch", &scratch_body),
+            "PUT /drives/scratch vhost-user block",
+        );
+
+        let before_start = http_get(&socket_path, "/vm/config");
+        assert_exact_vhost_user_vm_config(
+            &before_start,
+            &root_backend_socket,
+            &scratch_backend_socket,
+            case.partitioned_root.then_some(VHOST_USER_BLOCK_PARTUUID),
+            case.root_read_only,
+            "GET /vm/config before vhost-user start",
+        );
+
+        if let Some(rejected_backend) = rejected_backend {
+            let rejected_start = http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            );
+            assert_bad_request_response(&rejected_start, "rejected vhost-user InstanceStart");
+            assert_response_contains(
+                &rejected_start,
+                "vhost-user backend lacks required virtio features",
+                "rejected vhost-user InstanceStart",
+            );
+            assert!(
+                !rejected_start.contains(path_text(&root_backend_socket)),
+                "rejected discovery response must redact the socket path"
+            );
+            let not_started = http_get(&socket_path, "/");
+            assert_response_contains(
+                &not_started,
+                r#""state":"Not started""#,
+                "GET / after rejected vhost-user InstanceStart",
+            );
+            let rejected_report = rejected_backend
+                .finish()
+                .expect("rejecting vhost-user backend should finish");
+            assert_eq!(rejected_report.owner_requests, 1);
+            assert_eq!(rejected_report.config_requests, 0);
+            assert!(rejected_report.discovery_rejected);
+            assert!(!rejected_report.activated);
+
+            root_backend = Some(
+                VhostUserBlockBackend::start(
+                    &root_backend_socket,
+                    &rootfs_path,
+                    VhostUserBlockBackendOptions::regular(case.root_read_only),
+                )
+                .expect("replacement root vhost-user backend should start"),
+            );
+        }
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        if !start_response.starts_with("HTTP/1.1 204 No Content\r\n") {
+            let root_report = root_backend.as_ref().map(VhostUserBlockBackend::report);
+            let scratch_report = scratch_backend.report();
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "vhost-user InstanceStart failed; response:\n{start_response}\nroot report: {root_report:?}; scratch report: {scratch_report:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_no_content_response(
+            &start_response,
+            "PUT /actions InstanceStart vhost-user block",
+        );
+        let root_backend = root_backend.expect("root vhost-user backend should be installed");
+        if let Err(error) = root_backend.wait_for_activation(GUEST_EXECUTION_TIMEOUT) {
+            let root_report = root_backend.report();
+            let scratch_report = scratch_backend.report();
+            let serial_tail = file_tail_lossy(&serial_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "root vhost-user backend did not activate: {error}; root report: {root_report:?}; scratch report: {scratch_report:?}; serial tail:\n{serial_tail}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        if let Err(error) = scratch_backend.wait_for_activation(GUEST_EXECUTION_TIMEOUT) {
+            let root_report = root_backend.report();
+            let scratch_report = scratch_backend.report();
+            let serial_tail = file_tail_lossy(&serial_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "scratch vhost-user backend did not activate: {error}; root report: {root_report:?}; scratch report: {scratch_report:?}; serial tail:\n{serial_tail}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        let running = http_get(&socket_path, "/");
+        assert_response_contains(
+            &running,
+            r#""state":"Running""#,
+            "GET / after vhost-user InstanceStart",
+        );
+        let running_config = http_get(&socket_path, "/vm/config");
+        assert_exact_vhost_user_vm_config(
+            &running_config,
+            &root_backend_socket,
+            &scratch_backend_socket,
+            case.partitioned_root.then_some(VHOST_USER_BLOCK_PARTUUID),
+            case.root_read_only,
+            "GET /vm/config after vhost-user start",
+        );
+
+        if let Err(error) = wait_for_file_prefix_marker(
+            &scratch_path,
+            case.success_marker,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let root_report = root_backend.report();
+            let scratch_report = scratch_backend.report();
+            let serial_tail = file_tail_lossy(&serial_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{} vhost-user guest did not complete block I/O: {error}; root report: {root_report:?}; scratch report: {scratch_report:?}; serial tail:\n{serial_tail}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                case.mode, output.status, output.stdout, output.stderr
+            );
+        }
+        scratch_backend
+            .wait_for_flush(GUEST_EXECUTION_TIMEOUT)
+            .expect("scratch vhost-user backend should observe the direct synchronous write flush");
+        if !case.root_read_only {
+            root_backend
+                .wait_for_flush(GUEST_EXECUTION_TIMEOUT)
+                .expect("writable root vhost-user backend should observe a filesystem flush");
+        }
+        assert_active_vhost_user_report(&root_backend.report(), case.root_read_only, "root");
+        let scratch_report = scratch_backend.report();
+        assert_active_vhost_user_report(&scratch_report, false, "scratch");
+        assert!(
+            scratch_report.reads > 0,
+            "scratch backend should serve reads"
+        );
+        assert!(
+            scratch_report.writes > 0,
+            "scratch backend should serve writes"
+        );
+        assert!(
+            scratch_report.flushes > 0,
+            "scratch backend should serve an explicit flush: {scratch_report:?}"
+        );
+        if !case.root_read_only {
+            let root_report = root_backend.report();
+            assert!(root_report.writes > 0, "writable root should serve writes");
+            assert!(
+                root_report.flushes > 0,
+                "writable root should serve flushes: {root_report:?}"
+            );
+        }
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "PATCH /vm Paused vhost-user block",
+        );
+        let snapshot_create = http_json_with_io_timeout(
+            &socket_path,
+            "PUT",
+            "/snapshot/create",
+            &format!(
+                r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+                json_string(path_text(&snapshot_state)),
+                json_string(path_text(&snapshot_memory))
+            ),
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_bad_request_response(&snapshot_create, "vhost-user snapshot create");
+        assert_response_contains(
+            &snapshot_create,
+            "Snapshot and restore are not supported.",
+            "vhost-user snapshot create",
+        );
+        assert!(!snapshot_create.contains(path_text(&snapshot_state)));
+        assert!(!snapshot_create.contains(path_text(&snapshot_memory)));
+        assert!(!snapshot_state.exists());
+        assert!(!snapshot_memory.exists());
+        assert_no_snapshot_staging(test_dir.path());
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "PATCH /vm Resumed vhost-user block",
+        );
+
+        scratch_backend
+            .disconnect()
+            .expect("scratch vhost-user backend should disconnect");
+        let terminal_scratch_report = scratch_backend
+            .finish()
+            .expect("scratch vhost-user backend should stop after disconnect");
+        assert!(terminal_scratch_report.activated);
+        wait_for_block_event_failure(
+            &socket_path,
+            &metrics_path,
+            "scratch",
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .expect("scratch backend closure should be reflected in block metrics");
+        let after_disconnect = http_get(&socket_path, "/");
+        assert_response_contains(
+            &after_disconnect,
+            r#""state":"Running""#,
+            "GET / after vhost-user backend disconnect",
+        );
+        let config_after_disconnect = http_get(&socket_path, "/vm/config");
+        assert_exact_vhost_user_vm_config(
+            &config_after_disconnect,
+            &root_backend_socket,
+            &scratch_backend_socket,
+            case.partitioned_root.then_some(VHOST_USER_BLOCK_PARTUUID),
+            case.root_read_only,
+            "GET /vm/config after vhost-user backend disconnect",
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            &format!("bangbang {} vhost-user block", case.mode),
+        );
+        root_backend
+            .wait_for_frontend_close(GUEST_EXECUTION_TIMEOUT)
+            .expect("root vhost-user backend should observe process shutdown");
+        let terminal_root_report = root_backend
+            .finish()
+            .expect("root vhost-user backend should finish after process shutdown");
+        assert!(terminal_root_report.frontend_closed);
+        assert!(
+            !root_backend_socket.exists(),
+            "root backend socket should be cleaned up"
+        );
+        assert!(
+            !scratch_backend_socket.exists(),
+            "scratch backend socket should be cleaned up"
+        );
+    }
+
+    fn assert_exact_vhost_user_vm_config(
+        response: &str,
+        root_socket: &Path,
+        scratch_socket: &Path,
+        partuuid: Option<&str>,
+        root_read_only: bool,
+        context: &str,
+    ) {
+        assert_ok_response(response, context);
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("VM config response should contain a body separator");
+        let config: serde_json::Value =
+            serde_json::from_str(body).expect("VM config response should contain JSON");
+        let mut expected_root = serde_json::json!({
+            "cache_type": if root_read_only { "Unsafe" } else { "Writeback" },
+            "drive_id": "rootfs",
+            "is_root_device": true,
+            "socket": path_text(root_socket),
+        });
+        if let Some(partuuid) = partuuid {
+            expected_root
+                .as_object_mut()
+                .expect("expected root config should be an object")
+                .insert(
+                    "partuuid".to_string(),
+                    serde_json::Value::String(partuuid.to_string()),
+                );
+        }
+        assert_eq!(
+            config["drives"],
+            serde_json::json!([
+                expected_root,
+                {
+                    "cache_type": "Writeback",
+                    "drive_id": "scratch",
+                    "is_root_device": false,
+                    "socket": path_text(scratch_socket),
+                }
+            ]),
+            "{context} should return exact vhost-user-only drive fields; response:\n{response}"
+        );
+    }
+
+    fn assert_active_vhost_user_report(
+        report: &VhostUserBlockBackendReport,
+        read_only: bool,
+        context: &str,
+    ) {
+        const REQUIRED_FEATURES: u64 = (1 << 30) | (1 << 32);
+        const READ_ONLY_FEATURE: u64 = 1 << 5;
+        let features = report
+            .guest_features
+            .unwrap_or_else(|| panic!("{context} backend should observe guest features"));
+        assert_eq!(features & REQUIRED_FEATURES, REQUIRED_FEATURES);
+        assert_eq!(features & READ_ONLY_FEATURE != 0, read_only);
+        assert_eq!(report.owner_requests, 1);
+        assert_eq!(report.config_requests, 1);
+        assert!(report.memory_regions > 0);
+        assert_eq!(report.queue_size, Some(256));
+        assert!(report.activated);
+        assert!(report.kicks > 0, "{context} backend should receive kicks");
+        assert!(report.calls > 0, "{context} backend should send calls");
+        assert!(
+            report.requests > 0,
+            "{context} backend should serve requests"
+        );
+    }
+
+    fn wait_for_block_event_failure(
+        socket_path: &Path,
+        metrics_path: &Path,
+        drive_id: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let started = Instant::now();
+        let metrics_key = format!("block_{drive_id}");
+        loop {
+            let response =
+                http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
+            if !response.starts_with("HTTP/1.1 204 No Content\r\n") {
+                return Err(format!(
+                    "FlushMetrics failed after backend death:\n{response}"
+                ));
+            }
+            let event_fails = fs::read_to_string(metrics_path).ok().and_then(|output| {
+                output.lines().rev().find_map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .ok()?
+                        .get(&metrics_key)?
+                        .get("event_fails")?
+                        .as_u64()
+                })
+            });
+            if event_fails.is_some_and(|count| count > 0) {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {metrics_key}.event_fails; latest={event_fails:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn create_mbr_partitioned_rootfs(source: &Path, destination: &Path) {
+        const PARTITION_START_SECTORS: u32 = 2048;
+        const PARTITION_START_BYTES: u64 =
+            PARTITION_START_SECTORS as u64 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+        let source_size = fs::metadata(source)
+            .expect("source rootfs metadata should be readable")
+            .len();
+        assert_eq!(
+            source_size % bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+            0,
+            "rootfs fixture should contain complete sectors"
+        );
+        let partition_sectors =
+            u32::try_from(source_size / bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE)
+                .expect("rootfs fixture sector count should fit an MBR partition");
+        let mut source_file = fs::File::open(source).expect("source rootfs should open");
+        let mut destination_file = fs::File::create(destination)
+            .expect("partitioned vhost-user root fixture should create");
+        destination_file
+            .set_len(PARTITION_START_BYTES + source_size)
+            .expect("partitioned root fixture should be sized");
+        destination_file
+            .seek(SeekFrom::Start(PARTITION_START_BYTES))
+            .expect("partitioned root fixture should seek to its partition");
+        std::io::copy(&mut source_file, &mut destination_file)
+            .expect("rootfs should copy into its MBR partition");
+
+        let mut mbr = [0_u8; 512];
+        mbr[440..444].copy_from_slice(&0x0eaa_91a0_u32.to_le_bytes());
+        let partition = &mut mbr[446..462];
+        partition[0] = 0x80;
+        partition[1..4].copy_from_slice(&[0xfe, 0xff, 0xff]);
+        partition[4] = 0x83;
+        partition[5..8].copy_from_slice(&[0xfe, 0xff, 0xff]);
+        partition[8..12].copy_from_slice(&PARTITION_START_SECTORS.to_le_bytes());
+        partition[12..16].copy_from_slice(&partition_sectors.to_le_bytes());
+        mbr[510..512].copy_from_slice(&[0x55, 0xaa]);
+        destination_file
+            .seek(SeekFrom::Start(0))
+            .expect("partitioned root fixture should seek to its MBR");
+        destination_file
+            .write_all(&mbr)
+            .expect("partitioned root fixture MBR should write");
+        destination_file
+            .sync_all()
+            .expect("partitioned root fixture should be durable before startup");
     }
 
     #[test]

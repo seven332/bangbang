@@ -199,10 +199,16 @@ retain one close-on-exec descriptor per region, and reserve all descriptors
 before any mapping. `RLIMIT_FSIZE` and `RLIMIT_NOFILE` failures are typed and
 value-bounded. Exports clone only descriptor/offset/length metadata and redact
 the descriptor number, host address, and transient name. Darwin has no Linux
-`memfd` seal parity: any future external process that receives such a writable
-descriptor is therefore an operator-trusted capability and availability
-boundary. The current foundation sends no descriptor outside the VMM and keeps
-public vhost-user sockets rejected.
+`memfd` seal parity. Direct startup therefore treats an operator-selected
+vhost-user block backend as a trusted confidentiality, integrity, and
+availability boundary: after bounded negotiation, activation transfers a
+descriptor for every current guest-RAM region plus only the queue call/kick
+descriptors required by the protocol. The backend can read or write all guest
+RAM, and descriptor close is lifetime cleanup rather than hard revocation.
+Ordinary-only VMs keep anonymous RAM. Contained workers still reject ambient
+socket paths pending an authorized connected-stream handoff, and vhost
+configuration cannot coexist with dynamic memory hotplug or native-v1 capture
+in the current profile.
 
 ## Isolation Compatibility Checklist
 
@@ -922,21 +928,25 @@ is resource-specific:
   sleeping, busy-waiting, writing request status, publishing a used-ring entry,
   or mutating the backing file. Active HVF boot sessions schedule block retry
   wakeups with per-session state so one VM cannot wake or share limiter state
-  with another VM. Configured vhost-user sockets remain rejected. The internal
-  vhost-user frontend foundation accepts only an already connected stream and
-  a closed Firecracker v1.16 request set. It explicitly zero-encodes native
+  with another VM. Direct pre-boot vhost-user sockets use a bounded redacted
+  connector and the closed Firecracker v1.16 frontend request set. The frontend
+  explicitly zero-encodes native
   endian frames, attaches borrowed rights only until the first header byte is
   transferred, owns/CLOEXECs every received right before rejecting it, bounds
   one operation by one absolute deadline, and terminally closes a stream after
   synchronization loss. Directional nonblocking pipe types prevent swapping
   backend call writers with kick readers; Darwin descriptors suppress SIGPIPE,
   and errors/debug output omit paths, raw descriptors, addresses, and peer
-  payload. The test control peer is not shipped. The runtime has an unlinked
-  descriptor-backed shared-RAM owner and exact export metadata, but no external
-  backend receives it in this foundation. Public activation still needs
-  separate socket authorization, backend trust and containment, guest queue
-  construction, cleanup, and failure policy rather than only accepting a
-  socket path.
+  payload. Before VM construction, discovery validates mandatory virtio and
+  CONFIG support and exact config length; failure drops every prepared stream
+  without publishing a VM. Guest activation validates complete ring extents
+  inside exported mappings before transferring memory/queue descriptors.
+  Backend notification failure terminalizes that device, drops its pollable
+  endpoint, increments redacted per-drive failure metrics, and leaves the API
+  process responsive; it never falls back to local storage. The strict
+  regular-file backend used for signed MMIO/PCI evidence is test-only and is
+  not shipped. Runtime vhost mutation and contained authorization remain
+  separate lifecycle/authority work.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. In contained mode an exact pmem grant tag is claimed during

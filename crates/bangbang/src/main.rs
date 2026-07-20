@@ -14,6 +14,7 @@ use std::time::Instant;
 mod anchored_socket;
 mod api_server;
 mod contained_session;
+mod direct_vhost_user;
 #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
 mod grant_integration_probe;
 #[doc(hidden)]
@@ -5735,7 +5736,7 @@ mod tests {
         assert_eq!(config.drive_configs().len(), 1);
         assert_eq!(
             config.drive_configs()[0].path_on_host(),
-            "/tmp/rootfs-new.ext4"
+            Some(std::path::Path::new("/tmp/rootfs-new.ext4"))
         );
         let rate_limiter = config.drive_configs()[0]
             .rate_limiter()

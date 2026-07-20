@@ -1280,7 +1280,7 @@ impl VmmController {
             && self.custom_cpu_template.is_none()
             && machine_config.huge_pages() == machine::MachineConfigHugePages::None;
         let drive_supported = match self.drive_configs.as_slice() {
-            [drive] => drive.is_root_device() && drive.is_read_only(),
+            [drive] => drive.is_root_device() && drive.is_read_only() == Some(true),
             _ => false,
         };
         let mmds_configured = self.snapshot_mmds_configured()?;
@@ -2244,7 +2244,7 @@ mod tests {
         assert_eq!(controller.drive_configs()[0].drive_id(), "rootfs");
         assert_eq!(
             controller.drive_configs()[0].path_on_host(),
-            Path::new("/tmp/rootfs.ext4")
+            Some(Path::new("/tmp/rootfs.ext4"))
         );
         assert_eq!(controller.network_interface_configs().len(), 1);
         assert_eq!(controller.network_interface_configs()[0].iface_id(), "eth0");
@@ -2491,7 +2491,7 @@ mod tests {
         assert_eq!(config.drive_configs()[0].drive_id(), "rootfs");
         assert_eq!(
             config.drive_configs()[0].path_on_host(),
-            Path::new("/tmp/rootfs.ext4")
+            Some(Path::new("/tmp/rootfs.ext4"))
         );
         assert_eq!(config.network_interface_configs().len(), 1);
         assert_eq!(config.network_interface_configs()[0].iface_id(), "eth0");
@@ -4295,7 +4295,7 @@ mod tests {
         assert_eq!(controller.drive_configs().len(), 1);
         assert_eq!(
             controller.drive_configs()[0].path_on_host(),
-            PathBuf::from("/tmp/original-data.ext4")
+            Some(Path::new("/tmp/original-data.ext4"))
         );
         assert!(!controller.drive_configs()[0].is_root_device());
         assert_eq!(controller.pmem_configs().len(), 1);
@@ -6791,7 +6791,7 @@ mod tests {
         assert_eq!(controller.drive_configs().len(), 1);
         let config = &controller.drive_configs()[0];
         assert_eq!(config.drive_id(), "rootfs");
-        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/rootfs.ext4"));
+        assert_eq!(config.path_on_host(), Some(Path::new("/tmp/rootfs.ext4")));
         assert!(config.is_root_device());
     }
 
@@ -6817,7 +6817,7 @@ mod tests {
         assert_eq!(controller.drive_configs().len(), 1);
         let config = &controller.drive_configs()[0];
         assert_eq!(config.drive_id(), "rootfs");
-        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/replaced.ext4"));
+        assert_eq!(config.path_on_host(), Some(Path::new("/tmp/replaced.ext4")));
         assert!(!config.is_root_device());
     }
 
@@ -6922,7 +6922,7 @@ mod tests {
         assert_eq!(controller.drive_configs().len(), 1);
         assert_eq!(
             controller.drive_configs()[0].path_on_host(),
-            Path::new("/tmp/rootfs.ext4")
+            Some(Path::new("/tmp/rootfs.ext4"))
         );
     }
 
@@ -6950,7 +6950,7 @@ mod tests {
         assert_eq!(controller.drive_configs().len(), 1);
         assert_eq!(
             controller.drive_configs()[0].path_on_host(),
-            Path::new("/tmp/rootfs.ext4")
+            Some(Path::new("/tmp/rootfs.ext4"))
         );
     }
 

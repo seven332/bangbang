@@ -298,6 +298,7 @@ impl MemoryHotplugSizeUpdate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryHotplugConfigError {
+    IncompatibleVhostUserBlock,
     BlockSizeTooSmall { min_mib: u64 },
     BlockSizeNotPowerOfTwo,
     SlotSizeTooSmall { min_mib: u64 },
@@ -309,6 +310,9 @@ pub enum MemoryHotplugConfigError {
 impl fmt::Display for MemoryHotplugConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IncompatibleVhostUserBlock => {
+                f.write_str("dynamic memory hotplug is incompatible with vhost-user block")
+            }
             Self::BlockSizeTooSmall { min_mib } => {
                 write!(f, "Block size must not be lower than {min_mib} MiB")
             }

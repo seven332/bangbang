@@ -35,8 +35,9 @@ use bangbang_runtime::balloon::{
     BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
 };
 use bangbang_runtime::block::{
-    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveRateLimiterConfig,
-    DriveRuntimeMutationError, DriveUpdateError, DriveUpdateInput, PreparedBlockDevice,
+    BlockFileBacking, BlockMmioLayout, DriveBackendConfig, DriveConfig, DriveConfigError,
+    DriveConfigInput, DriveRateLimiterConfig, DriveRuntimeMutationError, DriveUpdateError,
+    DriveUpdateInput, PreparedBlockDevice, PreparedVhostUserBlockFrontend,
 };
 use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
 use bangbang_runtime::boot_timer::BootTimerMmioLayout;
@@ -128,6 +129,7 @@ use crate::contained_session::{
 use crate::contained_session::{
     GrantAuthority, GrantClaimError, PreparedFileGrantClaim, grant_reference_id,
 };
+use crate::direct_vhost_user;
 use crate::host_network::virtio_vmnet::{
     MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour,
     MmdsResponseQueue, VmnetVirtioNetworkPacketIo, VmnetVirtioNetworkPacketIoBuildError,
@@ -174,6 +176,7 @@ const DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(50
 const DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT: usize = 1024;
 const BOOT_RUN_LOOP_COMMAND_QUEUE_CAPACITY: usize = 32;
 const HVF_BOOT_RUN_LOOP_THREAD_NAME: &str = "bangbang-hvf-boot-loop";
+const DIRECT_VHOST_USER_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) trait InstanceStartExecutor {
     type Session: ProcessSessionDiagnostics;
@@ -1749,6 +1752,7 @@ where
             VmmAction::InstanceStart => self.start_instance(),
             VmmAction::PutBootSource(input) => self.put_boot_source(input),
             VmmAction::PutDrive(input) => self.put_drive(input),
+            VmmAction::PutMemoryHotplug(input) => self.put_memory_hotplug(input),
             VmmAction::PutLogger(input) => self.put_logger(input),
             VmmAction::PutMetrics(input) => self.put_metrics(input),
             VmmAction::PutNetworkInterface(input) => self.put_network_interface(input),
@@ -1875,6 +1879,54 @@ where
         self.controller.preflight_instance_start()?;
         validate_process_vmnet_authority(&self.controller, self.vmnet_authority)
             .map_err(process_vmnet_authority_action_error)?;
+        let has_vhost_user_drives = self
+            .controller
+            .drive_configs()
+            .iter()
+            .any(DriveConfig::is_vhost_user);
+        if has_vhost_user_drives && self.grant_authority.is_some() {
+            return Err(VmmActionError::DriveConfig(
+                DriveConfigError::ContainedVhostUserUnsupported,
+            ));
+        }
+        if has_vhost_user_drives && self.controller.memory_hotplug_config().is_some() {
+            return Err(VmmActionError::DriveConfig(
+                DriveConfigError::IncompatibleMemoryHotplug,
+            ));
+        }
+        let mut vhost_user_block_frontends = BTreeMap::new();
+        for config in self
+            .controller
+            .drive_configs()
+            .iter()
+            .filter(|config| config.is_vhost_user())
+        {
+            let socket = config.socket().ok_or({
+                VmmActionError::InstanceStart(BackendError::InvalidState(
+                    "vhost-user drive has no socket",
+                ))
+            })?;
+            let stream = direct_vhost_user::connect(socket, DIRECT_VHOST_USER_OPERATION_TIMEOUT)
+                .map_err(|source| {
+                    VmmActionError::InstanceStart(BackendError::Hypervisor(source.to_string()))
+                })?;
+            let frontend = PreparedVhostUserBlockFrontend::discover(
+                stream,
+                config.cache_type(),
+                DIRECT_VHOST_USER_OPERATION_TIMEOUT,
+            )
+            .map_err(|source| {
+                VmmActionError::InstanceStart(BackendError::Hypervisor(source.to_string()))
+            })?;
+            if vhost_user_block_frontends
+                .insert(config.drive_id().to_string(), frontend)
+                .is_some()
+            {
+                return Err(VmmActionError::InstanceStart(BackendError::InvalidState(
+                    "duplicate vhost-user drive resource",
+                )));
+            }
+        }
         #[cfg(target_os = "macos")]
         let vsock_grant_consumed = matches!(self.vsock_grant_state, VsockGrantState::Consumed);
         #[cfg(not(target_os = "macos"))]
@@ -1943,7 +1995,8 @@ where
                 }
             };
         let mut startup_resources =
-            VmStartupResources::new(boot_files, block_backings, pmem_backings);
+            VmStartupResources::new(boot_files, block_backings, pmem_backings)
+                .with_vhost_user_block_frontends(vhost_user_block_frontends);
         if let Some(serial_output) = serial_output {
             startup_resources = startup_resources.with_serial_output(serial_output);
         }
@@ -2030,18 +2083,35 @@ where
             return self.insert_runtime_drive(input);
         }
         let config = self.controller.prepare_drive_config(input)?;
-        let backing = match &self.grant_authority {
-            Some(authority) => authority
+        if config.is_vhost_user() && self.grant_authority.is_some() {
+            return Err(VmmActionError::DriveConfig(
+                DriveConfigError::ContainedVhostUserUnsupported,
+            ));
+        }
+        if config.is_vhost_user() && self.controller.memory_hotplug_config().is_some() {
+            return Err(VmmActionError::DriveConfig(
+                DriveConfigError::IncompatibleMemoryHotplug,
+            ));
+        }
+        let backing = match (&self.grant_authority, config.backend()) {
+            (
+                Some(authority),
+                DriveBackendConfig::File {
+                    path_on_host,
+                    is_read_only,
+                    ..
+                },
+            ) => authority
                 .claim_file(
-                    config.path_on_host(),
+                    path_on_host,
                     ResourceRole::DriveBacking,
-                    grant_access_for_read_only(config.is_read_only()),
+                    grant_access_for_read_only(*is_read_only),
                 )
                 .map_err(|_| VmmActionError::ResourceGrant)?
-                .map(|file| BlockFileBacking::from_file(file, config.is_read_only()))
+                .map(|file| BlockFileBacking::from_file(file, *is_read_only))
                 .transpose()
                 .map_err(|_| VmmActionError::ResourceGrant)?,
-            None => None,
+            (None, _) | (Some(_), DriveBackendConfig::VhostUser { .. }) => None,
         };
         let drive_id = config.drive_id().to_string();
 
@@ -2058,6 +2128,24 @@ where
         Ok(VmmData::Empty)
     }
 
+    fn put_memory_hotplug(
+        &mut self,
+        input: bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput,
+    ) -> Result<VmmData, VmmActionError> {
+        if self
+            .controller
+            .drive_configs()
+            .iter()
+            .any(DriveConfig::is_vhost_user)
+        {
+            return Err(VmmActionError::MemoryHotplugConfig(
+                bangbang_runtime::memory_hotplug::MemoryHotplugConfigError::IncompatibleVhostUserBlock,
+            ));
+        }
+        self.controller
+            .handle_action(VmmAction::PutMemoryHotplug(input))
+    }
+
     fn insert_runtime_drive(&mut self, input: DriveConfigInput) -> Result<VmmData, VmmActionError> {
         if !self.pci_enabled {
             return Err(VmmActionError::DriveRuntimeMutation(
@@ -2066,13 +2154,23 @@ where
         }
         let prepared_config = self.controller.prepare_runtime_drive_insert(input)?;
         let config = prepared_config.config();
+        let DriveBackendConfig::File {
+            path_on_host,
+            is_read_only,
+            ..
+        } = config.backend()
+        else {
+            return Err(VmmActionError::DriveRuntimeMutation(
+                DriveRuntimeMutationError::UnsupportedBackend,
+            ));
+        };
         let mut grant_claim: Option<PreparedFileGrantClaim> = match &self.grant_authority {
             Some(authority) => Some(
                 authority
                     .prepare_file_claim(
-                        config.path_on_host(),
+                        path_on_host,
                         ResourceRole::DriveBacking,
-                        grant_access_for_read_only(config.is_read_only()),
+                        grant_access_for_read_only(*is_read_only),
                     )
                     .map_err(|_| VmmActionError::ResourceGrant)?
                     .ok_or(VmmActionError::ResourceGrant)?,
@@ -2085,7 +2183,7 @@ where
                     claim
                         .take_file()
                         .map_err(|_| VmmActionError::ResourceGrant)?,
-                    config.is_read_only(),
+                    *is_read_only,
                 )
                 .map_err(|_| VmmActionError::ResourceGrant)?,
             ),
@@ -2467,6 +2565,16 @@ where
         let refresh_backing = input.path_on_host().is_some();
         let rate_limiter_update = input.rate_limiter();
         let updated_config = self.controller.updated_drive_config(input)?;
+        let DriveBackendConfig::File {
+            path_on_host,
+            is_read_only,
+            ..
+        } = updated_config.backend()
+        else {
+            return Err(VmmActionError::DriveUpdate(
+                DriveUpdateError::UnsupportedBackend,
+            ));
+        };
         if refresh_backing || rate_limiter_update.is_some() {
             let Some(session) = self.started_session.as_mut() else {
                 return Err(VmmActionError::DriveUpdate(
@@ -2478,14 +2586,14 @@ where
                 match &self.grant_authority {
                     Some(authority) => match authority
                         .claim_file(
-                            updated_config.path_on_host(),
+                            path_on_host,
                             ResourceRole::DriveBacking,
-                            grant_access_for_read_only(updated_config.is_read_only()),
+                            grant_access_for_read_only(*is_read_only),
                         )
                         .map_err(|_| VmmActionError::ResourceGrant)?
                     {
                         Some(file) => BlockBackingUpdate::Provided(
-                            BlockFileBacking::from_file(file, updated_config.is_read_only())
+                            BlockFileBacking::from_file(file, *is_read_only)
                                 .map_err(|_| VmmActionError::ResourceGrant)?,
                         ),
                         None => BlockBackingUpdate::ConfiguredPath,
@@ -8081,8 +8189,8 @@ mod tests {
         BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
     };
     use bangbang_runtime::block::{
-        BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveConfigs,
-        DriveRateLimiterConfig, DriveRuntimeMutationError, DriveTokenBucketConfig,
+        BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigError, DriveConfigInput,
+        DriveConfigs, DriveRateLimiterConfig, DriveRuntimeMutationError, DriveTokenBucketConfig,
         DriveUpdateError, DriveUpdateInput, PreparedBlockDevice, PreparedBlockDevices,
     };
     use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
@@ -8096,9 +8204,9 @@ mod tests {
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
     use bangbang_runtime::memory_hotplug::{
-        MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdate,
-        MemoryHotplugSizeUpdateInput, MemoryHotplugStatus, MemoryHotplugStatusError,
-        MemoryHotplugUpdateError,
+        MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugConfigInput,
+        MemoryHotplugSizeUpdate, MemoryHotplugSizeUpdateInput, MemoryHotplugStatus,
+        MemoryHotplugStatusError, MemoryHotplugUpdateError,
     };
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
@@ -16455,6 +16563,190 @@ mod tests {
     }
 
     #[test]
+    fn vhost_user_drive_and_memory_hotplug_reject_both_configuration_orders() {
+        let mut vmm = configured_vmm(FakeStarter::success(28));
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("/private/vhost.sock"),
+        ))
+        .expect("vhost-user drive should configure before memory hotplug");
+
+        let error = vmm
+            .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect_err("memory hotplug should reject an existing vhost-user drive");
+
+        assert_eq!(
+            error,
+            VmmActionError::MemoryHotplugConfig(
+                MemoryHotplugConfigError::IncompatibleVhostUserBlock
+            )
+        );
+        assert!(vmm.controller.memory_hotplug_config().is_none());
+        assert_eq!(vmm.drive_configs().len(), 1);
+
+        let mut vmm = configured_vmm(FakeStarter::success(29));
+        vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("memory hotplug should configure first");
+
+        let error = vmm
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                    .with_socket("/private/vhost.sock"),
+            ))
+            .expect_err("vhost-user drive should reject existing memory hotplug");
+
+        assert_eq!(
+            error,
+            VmmActionError::DriveConfig(DriveConfigError::IncompatibleMemoryHotplug)
+        );
+        assert!(vmm.drive_configs().is_empty());
+        assert!(vmm.controller.memory_hotplug_config().is_some());
+    }
+
+    #[test]
+    fn vhost_user_connection_failure_preserves_preboot_configuration_and_starter() {
+        let socket = missing_temp_child_path("vhost.sock");
+        let mut vmm = configured_vmm(FakeStarter::success(30));
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket(&socket),
+        ))
+        .expect("vhost-user drive should configure");
+
+        let error = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("missing vhost-user backend should fail before starter");
+
+        assert_eq!(
+            error,
+            VmmActionError::InstanceStart(BackendError::Hypervisor(
+                "vhost-user socket connection was refused".to_string()
+            ))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.starter.calls, 0);
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(vmm.drive_configs()[0].socket(), Some(socket.as_path()));
+    }
+
+    #[test]
+    fn vhost_user_runtime_update_rejects_before_touching_the_active_session() {
+        let mut vmm = configured_vmm(FakeStarter::success(31));
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("/private/vhost.sock"),
+        ))
+        .expect("vhost-user drive should configure");
+        vmm.controller
+            .commit_instance_start()
+            .expect("test controller should enter running state");
+        vmm.started_session = Some(FakeSession::new(31));
+
+        let error = vmm
+            .handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+                "vhost",
+                "vhost",
+                Some(PathBuf::from("/private/replacement.img")),
+            )))
+            .expect_err("vhost-user runtime update should reject");
+
+        assert_eq!(
+            error,
+            VmmActionError::DriveUpdate(DriveUpdateError::UnsupportedBackend)
+        );
+        assert_eq!(
+            vmm.drive_configs()[0].socket(),
+            Some(Path::new("/private/vhost.sock"))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.block_update_count, 0);
+    }
+
+    #[test]
+    fn vhost_user_runtime_removal_rejects_before_touching_the_active_session() {
+        let mut vmm = configured_vmm(FakeStarter::success(32));
+        vmm.pci_enabled = true;
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("/private/vhost.sock"),
+        ))
+        .expect("vhost-user drive should configure");
+        vmm.controller
+            .commit_instance_start()
+            .expect("test controller should enter running state");
+        vmm.started_session = Some(FakeSession::new(32));
+
+        let error = vmm
+            .handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                HotUnplugDeviceKind::Drive,
+                "vhost",
+            )))
+            .expect_err("vhost-user runtime removal should reject");
+
+        assert_eq!(
+            error,
+            VmmActionError::DriveRuntimeMutation(DriveRuntimeMutationError::UnsupportedBackend)
+        );
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(
+            vmm.drive_configs()[0].socket(),
+            Some(Path::new("/private/vhost.sock"))
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.block_remove_count, 0);
+    }
+
+    #[test]
+    fn vhost_user_snapshot_rejects_before_session_barrier_or_artifact_staging() {
+        let state_path = missing_temp_child_path("vhost.state");
+        let memory_path = state_path.with_file_name("vhost.memory");
+        let parent = state_path
+            .parent()
+            .expect("missing snapshot path should have a parent");
+        let mut vmm = configured_vmm(FakeStarter::success(32));
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new_without_path_on_host("root", "root", true)
+                .with_socket("/private/vhost-root.sock"),
+        ))
+        .expect("vhost-user root should configure");
+        vmm.controller
+            .commit_instance_start()
+            .expect("test controller should enter running state");
+        vmm.controller
+            .pause_instance()
+            .expect("test controller should enter paused state");
+        vmm.started_session = Some(FakeSession::new(32));
+
+        let error = vmm
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                &state_path,
+                &memory_path,
+            )))
+            .expect_err("vhost-user snapshot should reject during preflight");
+
+        assert_eq!(error, VmmActionError::SnapshotUnsupported);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.snapshot_create_barrier_count, 0);
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
+        assert!(!parent.exists());
+    }
+
+    #[test]
     fn runtime_memory_hotplug_update_failure_does_not_commit_status() {
         let expected_error = MemoryHotplugUpdateError::ActiveSessionUnavailable;
         let mut vmm = configured_vmm(FakeStarter::success_with_session(
@@ -17661,7 +17953,10 @@ mod tests {
 
         assert_eq!(data, bangbang_runtime::VmmData::Empty);
         assert_eq!(vmm.drive_configs().len(), 1);
-        assert_eq!(vmm.drive_configs()[0].path_on_host(), replacement.path());
+        assert_eq!(
+            vmm.drive_configs()[0].path_on_host(),
+            Some(replacement.path())
+        );
         let session = vmm
             .started_session
             .as_ref()
@@ -17694,7 +17989,7 @@ mod tests {
 
         assert_eq!(data, bangbang_runtime::VmmData::Empty);
         assert_eq!(vmm.drive_configs().len(), 1);
-        assert_eq!(vmm.drive_configs()[0].path_on_host(), original.path());
+        assert_eq!(vmm.drive_configs()[0].path_on_host(), Some(original.path()));
         let session = vmm
             .started_session
             .as_ref()
@@ -17729,7 +18024,7 @@ mod tests {
 
         assert_eq!(data, bangbang_runtime::VmmData::Empty);
         assert_eq!(vmm.drive_configs().len(), 1);
-        assert_eq!(vmm.drive_configs()[0].path_on_host(), original.path());
+        assert_eq!(vmm.drive_configs()[0].path_on_host(), Some(original.path()));
         assert_eq!(
             vmm.drive_configs()[0].rate_limiter(),
             Some(DriveRateLimiterConfig::new(Some(bandwidth), None))
@@ -17777,7 +18072,7 @@ mod tests {
             VmmActionError::DriveUpdate(DriveUpdateError::ActiveSessionUnavailable)
         );
         assert_eq!(vmm.drive_configs().len(), 1);
-        assert_eq!(vmm.drive_configs()[0].path_on_host(), original.path());
+        assert_eq!(vmm.drive_configs()[0].path_on_host(), Some(original.path()));
         let session = vmm
             .started_session
             .as_ref()
@@ -18873,7 +19168,7 @@ mod tests {
         ));
         assert_eq!(
             vmm.drive_configs()[0].path_on_host(),
-            Path::new("bangbang-grant:drive")
+            Some(Path::new("bangbang-grant:drive"))
         );
 
         vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::block::{
-    BlockFileBacking, BlockFileBackingIdentity, DriveCacheType, DriveConfig, DriveIoEngine,
-    DriveRateLimiterConfig, DriveTokenBucketConfig, VIRTIO_BLOCK_ID_BYTES,
+    BlockFileBacking, BlockFileBackingIdentity, DriveBackendConfig, DriveCacheType, DriveConfig,
+    DriveIoEngine, DriveRateLimiterConfig, DriveTokenBucketConfig, VIRTIO_BLOCK_ID_BYTES,
     VIRTIO_BLOCK_SECTOR_SHIFT, VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockMmioHandler,
     VirtioBlockRateLimiterState, VirtioBlockRuntimeState, VirtioBlockTokenBucketState,
 };
@@ -382,10 +382,16 @@ pub fn capture_snapshot_v1_device_state(
     input: SnapshotV1DeviceCaptureInput<'_>,
 ) -> Result<SnapshotV1DeviceState, SnapshotV1DeviceCaptureError> {
     let config = input.drive_config;
-    if !config.is_root_device()
-        || !config.is_read_only()
-        || config.io_engine() != DriveIoEngine::Sync
-    {
+    let DriveBackendConfig::File {
+        path_on_host,
+        is_read_only: true,
+        io_engine: DriveIoEngine::Sync,
+        ..
+    } = config.backend()
+    else {
+        return Err(SnapshotV1DeviceCaptureError::UnsupportedDriveProfile);
+    };
+    if !config.is_root_device() {
         return Err(SnapshotV1DeviceCaptureError::UnsupportedDriveProfile);
     }
     validate_capture_text(config)?;
@@ -409,7 +415,9 @@ pub fn capture_snapshot_v1_device_state(
     }
 
     let live_device = input.block_handler.activation_handler();
-    let live_backing = live_device.backing();
+    let live_backing = live_device
+        .backing()
+        .ok_or(SnapshotV1DeviceCaptureError::UnsupportedDriveProfile)?;
     if !live_backing.is_read_only() {
         return Err(SnapshotV1DeviceCaptureError::UnsupportedDriveProfile);
     }
@@ -417,9 +425,8 @@ pub fn capture_snapshot_v1_device_state(
         .snapshot_identity()
         .map_err(|_| SnapshotV1DeviceCaptureError::BlockBacking)?;
     if !live_backing.uses_supplied_file() {
-        let (path_backing, path_identity) =
-            BlockFileBacking::open_snapshot_read_only(config.path_on_host())
-                .map_err(|_| SnapshotV1DeviceCaptureError::BlockBacking)?;
+        let (path_backing, path_identity) = BlockFileBacking::open_snapshot_read_only(path_on_host)
+            .map_err(|_| SnapshotV1DeviceCaptureError::BlockBacking)?;
         if path_identity != live_identity || path_backing.len() != live_backing.len() {
             return Err(SnapshotV1DeviceCaptureError::BlockBackingMismatch);
         }
@@ -444,7 +451,7 @@ pub fn capture_snapshot_v1_device_state(
 
     let root_block = SnapshotV1RootBlockState::from_parts(SnapshotV1RootBlockStateParts {
         drive_id: config.drive_id().to_string(),
-        path: config.path_on_host().to_path_buf(),
+        path: path_on_host.to_path_buf(),
         partuuid: config.partuuid().map(ToString::to_string),
         cache_type: config.cache_type(),
         rate_limiter_config: config.rate_limiter(),
@@ -468,6 +475,7 @@ fn validate_capture_text(config: &DriveConfig) -> Result<(), SnapshotV1DeviceCap
     let drive_id = config.drive_id().as_bytes();
     let path = config
         .path_on_host()
+        .ok_or(SnapshotV1DeviceCaptureError::UnsupportedDriveProfile)?
         .to_str()
         .ok_or(SnapshotV1DeviceCaptureError::InvalidTextField)?
         .as_bytes();
@@ -1826,12 +1834,13 @@ mod tests {
         let prepared = prepare_snapshot_v1_device_profile(&state, &memory, Instant::now())
             .expect("supported device state should prepare");
 
-        assert_eq!(prepared.drive_config().path_on_host(), file.path());
+        assert_eq!(prepared.drive_config().path_on_host(), Some(file.path()));
         assert_eq!(
             prepared
                 .block_handler()
                 .activation_handler()
                 .backing()
+                .expect("snapshot file device should retain backing")
                 .len(),
             512
         );
@@ -1924,7 +1933,7 @@ mod tests {
         assert_eq!(installed.runtime_resources.block_devices.len(), 1);
         assert!(installed.runtime_resources.serial_device.is_some());
         assert!(installed.runtime_resources.rtc_device.is_some());
-        assert_eq!(installed.drive_config.path_on_host(), file.path());
+        assert_eq!(installed.drive_config.path_on_host(), Some(file.path()));
         assert_eq!(installed.block_retry, SnapshotV1BlockRetryState::None);
         assert_eq!(installed.mmio_dispatcher.regions().len(), 3);
         assert_eq!(
@@ -1977,13 +1986,14 @@ mod tests {
 
         assert_eq!(
             prepared.drive_config().path_on_host(),
-            Path::new("bangbang-grant:root")
+            Some(Path::new("bangbang-grant:root"))
         );
         assert!(
             prepared
                 .block_handler()
                 .activation_handler()
                 .backing()
+                .expect("snapshot file device should retain backing")
                 .uses_supplied_file()
         );
         assert_eq!(
@@ -1991,6 +2001,7 @@ mod tests {
                 .block_handler()
                 .activation_handler()
                 .backing()
+                .expect("snapshot file device should retain backing")
                 .snapshot_identity()
                 .expect("prepared backing identity should read"),
             identity

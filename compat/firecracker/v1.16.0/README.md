@@ -227,6 +227,24 @@ configuration. It terminalizes exactly `corpus:device-hotplug`,
 Native-v1 PCI persistence and external vmnet evidence remain respectively
 later-snapshot and #1351/#1378-owned.
 
+#1444 subsequently promotes exactly three pmem API properties:
+`Pmem.path_on_host`, `Pmem.read_only`, and `Pmem.root_device`. Direct MMIO/PCI
+and normal contained signed gates prove one authoritative file/private-tail
+mapping, exact descriptor identity, read-only guest protection, writable
+coherence, deterministic root command lines, and exact-prefix persistence.
+The overlay therefore contains 84 `implemented-and-verified`, 314
+`audit-required`, three `missing-platform-feasible`, and 17
+`proven-platform-impossible` records.
+
+#1445 records direct pre-boot vhost-user block startup in the nonterminal
+`Drive.socket`, `corpus:block-vhost-user`, and aggregate storage summaries.
+Strict direct configuration, bounded discovery, shared-memory/vring transfer,
+MMIO/PCI root and scratch I/O, flush, metrics, cleanup, backend death, and
+pre-artifact snapshot rejection are implemented and signed. No disposition is
+promoted yet: runtime vhost lifecycle, contained authorized stream delivery,
+snapshot state, and complete broad-corpus semantics remain owned by later
+slices, so the inventory counts are unchanged.
+
 ## Commands
 
 Validate checked-in delivery state without an upstream checkout:

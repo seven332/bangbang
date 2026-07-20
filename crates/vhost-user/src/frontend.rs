@@ -18,6 +18,8 @@ use crate::transport::{Transport, TransportError};
 pub const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 /// Virtio block flush feature bit.
 pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
+/// Virtio indirect-descriptor feature bit.
+pub const VIRTIO_RING_F_INDIRECT_DESC: u64 = 1 << 28;
 /// Virtio event-index feature bit.
 pub const VIRTIO_F_EVENT_IDX: u64 = 1 << 29;
 /// Vhost-user protocol-feature negotiation bit in the virtio feature mask.
@@ -33,6 +35,7 @@ pub const VHOST_USER_PROTOCOL_F_CONFIG: u64 = 1 << 9;
 /// Complete reviewed Firecracker v1.16 block virtio feature subset.
 pub const SUPPORTED_VIRTIO_FEATURES: u64 = VIRTIO_BLK_F_RO
     | VIRTIO_BLK_F_FLUSH
+    | VIRTIO_RING_F_INDIRECT_DESC
     | VIRTIO_F_EVENT_IDX
     | VHOST_USER_F_PROTOCOL_FEATURES
     | VIRTIO_F_VERSION_1;
