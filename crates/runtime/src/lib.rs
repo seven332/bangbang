@@ -32,6 +32,7 @@ pub mod snapshot_device;
 pub mod snapshot_format;
 pub mod snapshot_memory;
 pub mod startup;
+pub mod storage_capture;
 pub(crate) mod token_bucket;
 pub mod virtio;
 pub mod virtio_mmio;
@@ -1340,6 +1341,14 @@ impl VmmController {
         &self,
         input: &snapshot::SnapshotCreateInput,
     ) -> Result<(), VmmActionError> {
+        self.preflight_create_snapshot_request(input)?;
+        self.preflight_create_snapshot_profile()
+    }
+
+    pub fn preflight_create_snapshot_request(
+        &self,
+        input: &snapshot::SnapshotCreateInput,
+    ) -> Result<(), VmmActionError> {
         if self.instance_info.state != InstanceState::Paused {
             return Err(VmmActionError::UnsupportedState {
                 action: "CreateSnapshot",
@@ -1347,8 +1356,10 @@ impl VmmController {
             });
         }
 
-        snapshot::classify_v1_create_request(input)
-            .map_err(|_| VmmActionError::SnapshotUnsupported)?;
+        snapshot::classify_v1_create_request(input).map_err(|_| VmmActionError::SnapshotUnsupported)
+    }
+
+    pub fn preflight_create_snapshot_profile(&self) -> Result<(), VmmActionError> {
         snapshot::classify_v1_create_profile(self.snapshot_v1_vm_profile()?)
             .map_err(|_| VmmActionError::SnapshotUnsupported)
     }
@@ -2166,9 +2177,15 @@ mod tests {
         let mut controller = supported_snapshot_controller();
         configure(&mut controller);
         controller.instance_info.state = InstanceState::Paused;
+        let input = snapshot_create_input(SnapshotType::Full);
 
+        assert_eq!(controller.preflight_create_snapshot_request(&input), Ok(()));
         assert_eq!(
-            controller.preflight_create_snapshot(&snapshot_create_input(SnapshotType::Full)),
+            controller.preflight_create_snapshot_profile(),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        assert_eq!(
+            controller.preflight_create_snapshot(&input),
             Err(VmmActionError::SnapshotUnsupported)
         );
     }
@@ -3233,14 +3250,26 @@ mod tests {
         let input = snapshot_create_input(SnapshotType::Full);
         let mut supported = supported_snapshot_controller();
         supported.instance_info.state = InstanceState::Paused;
+        assert_eq!(supported.preflight_create_snapshot_request(&input), Ok(()));
+        assert_eq!(supported.preflight_create_snapshot_profile(), Ok(()));
         assert_eq!(supported.preflight_create_snapshot(&input), Ok(()));
+        let diff = snapshot_create_input(SnapshotType::Diff);
         assert_eq!(
-            supported.preflight_create_snapshot(&snapshot_create_input(SnapshotType::Diff)),
+            supported.preflight_create_snapshot_request(&diff),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        assert_eq!(
+            supported.preflight_create_snapshot(&diff),
             Err(VmmActionError::SnapshotUnsupported)
         );
 
         let mut no_drive = VmmController::new("demo-1", "0.1.0", "bangbang");
         no_drive.instance_info.state = InstanceState::Paused;
+        assert_eq!(no_drive.preflight_create_snapshot_request(&input), Ok(()));
+        assert_eq!(
+            no_drive.preflight_create_snapshot_profile(),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
         assert_eq!(
             no_drive.preflight_create_snapshot(&input),
             Err(VmmActionError::SnapshotUnsupported)

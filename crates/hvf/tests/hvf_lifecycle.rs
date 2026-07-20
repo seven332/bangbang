@@ -4337,6 +4337,326 @@ fn prepares_internal_hvf_arm64_boot_session() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
+    use std::time::Instant;
+
+    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::{
+        BlockCaptureIoEngine, BlockMmioLayout, DriveCacheType, DriveConfigInput, DriveIoEngine,
+        PreparedBlockDevice,
+    };
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::{
+        PmemConfig, PmemConfigInput, PmemFileBacking, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT,
+    };
+    use bangbang_runtime::storage_capture::{
+        CaptureReadyStorageConfigs, StorageDeviceOrigin, StorageTransportState,
+    };
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+
+    let mmio_kernel = TempFile::new("capture-ready-mmio-kernel", &image)
+        .expect("MMIO capture kernel should create");
+    let mmio_root = TempFile::new_len("capture-ready-mmio-root", 4096)
+        .expect("MMIO Sync backing should create");
+    let mmio_async = TempFile::new_len("capture-ready-mmio-async", 4096)
+        .expect("MMIO Async backing should create");
+    let mmio_pmem = TempFile::new_len("capture-ready-mmio-pmem", VIRTIO_PMEM_ALIGNMENT)
+        .expect("MMIO pmem backing should create");
+    let mut mmio_controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    mmio_controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            mmio_kernel.path(),
+        )))
+        .expect("MMIO capture boot source should configure");
+    mmio_controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", mmio_root.path(), true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("MMIO Sync root should configure");
+    mmio_controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("async", "async", mmio_async.path(), false)
+                .with_is_read_only(false)
+                .with_cache_type(DriveCacheType::Writeback)
+                .with_io_engine(DriveIoEngine::Async),
+        ))
+        .expect("MMIO Async data drive should configure");
+    mmio_controller
+        .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            path_text(mmio_pmem.path()),
+        )))
+        .expect("MMIO pmem should configure");
+    let mmio_session_config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    );
+    let mut mmio_session = OwnedHvfArm64BootSession::new(&mmio_controller, mmio_session_config)
+        .expect("signed MMIO storage session should prepare");
+    let mmio_configs = CaptureReadyStorageConfigs::new(
+        mmio_controller.drive_configs().to_vec(),
+        mmio_controller.pmem_configs().to_vec(),
+    );
+    let mmio_guard = mmio_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("MMIO retry publishers should quiesce");
+    let mmio_first = mmio_session
+        .capture_ready_storage_state_at(&mmio_configs, &mmio_guard, Instant::now())
+        .expect("signed MMIO storage should become capture-ready");
+    let mmio_second = mmio_session
+        .capture_ready_storage_state_at(&mmio_configs, &mmio_guard, Instant::now())
+        .expect("MMIO Async admission should reopen for a second capture");
+
+    assert_eq!(mmio_first.block_devices().len(), 2);
+    assert_eq!(mmio_first.pmem_devices().len(), 1);
+    for (captured, configured) in mmio_first
+        .block_devices()
+        .iter()
+        .zip(mmio_controller.drive_configs())
+    {
+        assert_eq!(captured.config(), configured);
+        assert!(matches!(
+            captured.transport(),
+            StorageTransportState::Mmio(_)
+        ));
+    }
+    assert_eq!(
+        mmio_first.block_devices()[0].device().io_engine(),
+        BlockCaptureIoEngine::Sync
+    );
+    let BlockCaptureIoEngine::Async(mmio_async_first) =
+        mmio_first.block_devices()[1].device().io_engine()
+    else {
+        panic!("second MMIO drive should retain Async continuation state");
+    };
+    let BlockCaptureIoEngine::Async(mmio_async_second) =
+        mmio_second.block_devices()[1].device().io_engine()
+    else {
+        panic!("second MMIO capture should retain Async continuation state");
+    };
+    assert_eq!(
+        mmio_async_second.generation(),
+        mmio_async_first.generation()
+    );
+    assert!(mmio_async_first.admission_stopped());
+    assert_eq!(mmio_async_first.owned_operations(), 0);
+    assert_eq!(mmio_async_first.parked_host_completions(), 0);
+    assert_eq!(mmio_async_first.final_completions(), 0);
+    assert_eq!(
+        mmio_first.pmem_devices()[0].config(),
+        &mmio_controller.pmem_configs()[0]
+    );
+    assert!(matches!(
+        mmio_first.pmem_devices()[0].transport(),
+        StorageTransportState::Mmio(_)
+    ));
+    assert!(
+        mmio_first.pmem_devices()[0]
+            .mapping()
+            .same_mapping(mmio_second.pmem_devices()[0].mapping())
+    );
+    let mmio_debug = format!(
+        "{:?} {:?}",
+        mmio_first.block_devices(),
+        mmio_first.pmem_devices()
+    );
+    for private_path in [
+        path_text(mmio_root.path()),
+        path_text(mmio_async.path()),
+        path_text(mmio_pmem.path()),
+    ] {
+        assert!(!mmio_debug.contains(&private_path));
+    }
+    drop(mmio_guard);
+    mmio_session
+        .shutdown()
+        .expect("signed MMIO storage session should shut down");
+
+    let pci_kernel = TempFile::new("capture-ready-pci-kernel", &image)
+        .expect("PCI capture kernel should create");
+    let pci_root = TempFile::new_len("capture-ready-pci-root", 4096)
+        .expect("startup PCI Sync backing should create");
+    let pci_startup_pmem =
+        TempFile::new_len("capture-ready-pci-startup-pmem", VIRTIO_PMEM_ALIGNMENT)
+            .expect("startup PCI pmem backing should create");
+    let pci_dynamic_async = TempFile::new_len("capture-ready-pci-dynamic-async", 4096)
+        .expect("runtime PCI Async backing should create");
+    let pci_dynamic_pmem =
+        TempFile::new_len("capture-ready-pci-dynamic-pmem", VIRTIO_PMEM_ALIGNMENT)
+            .expect("runtime PCI pmem backing should create");
+    let mut pci_controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    pci_controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            pci_kernel.path(),
+        )))
+        .expect("PCI capture boot source should configure");
+    pci_controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", pci_root.path(), true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("startup PCI Sync root should configure");
+    pci_controller
+        .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "startup_pmem",
+            path_text(pci_startup_pmem.path()),
+        )))
+        .expect("startup PCI pmem should configure");
+    let pci_session_config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    )
+    .with_pci_enabled();
+    let mut pci_session = OwnedHvfArm64BootSession::new(&pci_controller, pci_session_config)
+        .expect("signed startup PCI storage session should prepare");
+
+    let dynamic_drive_input =
+        DriveConfigInput::new("hotdata", "hotdata", pci_dynamic_async.path(), false)
+            .with_is_read_only(false)
+            .with_cache_type(DriveCacheType::Writeback)
+            .with_io_engine(DriveIoEngine::Async);
+    let dynamic_drive = dynamic_drive_input
+        .clone()
+        .validate()
+        .expect("runtime PCI Async config should validate");
+    pci_controller
+        .handle_action(VmmAction::PutDrive(dynamic_drive_input))
+        .expect("runtime PCI Async config should join current inventory");
+    pci_session
+        .insert_runtime_block_device(
+            PreparedBlockDevice::from_config_with_backing(&dynamic_drive, None)
+                .expect("runtime PCI Async device should prepare"),
+        )
+        .expect("runtime PCI Async device should publish");
+
+    let dynamic_pmem_input = PmemConfigInput::new("hotpmem", path_text(pci_dynamic_pmem.path()));
+    let dynamic_pmem = PmemConfig::try_from(dynamic_pmem_input.clone())
+        .expect("runtime PCI pmem config should validate");
+    pci_controller
+        .handle_action(VmmAction::PutPmem(dynamic_pmem_input))
+        .expect("runtime PCI pmem config should join current inventory");
+    pci_session
+        .insert_runtime_pmem_device(
+            &dynamic_pmem,
+            PmemFileBacking::open(&dynamic_pmem).expect("runtime PCI pmem backing should open"),
+        )
+        .expect("runtime PCI pmem device should publish");
+
+    let pci_configs = CaptureReadyStorageConfigs::new(
+        pci_controller.drive_configs().to_vec(),
+        pci_controller.pmem_configs().to_vec(),
+    );
+    let pci_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI retry publishers should quiesce");
+    let pci_first = pci_session
+        .capture_ready_storage_state_at(&pci_configs, &pci_guard, Instant::now())
+        .expect("signed startup/runtime PCI storage should become capture-ready");
+    let pci_second = pci_session
+        .capture_ready_storage_state_at(&pci_configs, &pci_guard, Instant::now())
+        .expect("runtime PCI Async admission should reopen for a second capture");
+
+    assert_eq!(pci_first.block_devices().len(), 2);
+    assert_eq!(pci_first.pmem_devices().len(), 2);
+    for (captured, configured) in pci_first
+        .block_devices()
+        .iter()
+        .zip(pci_controller.drive_configs())
+    {
+        assert_eq!(captured.config(), configured);
+    }
+    for (captured, configured) in pci_first
+        .pmem_devices()
+        .iter()
+        .zip(pci_controller.pmem_configs())
+    {
+        assert_eq!(captured.config(), configured);
+    }
+    let block_origins = pci_first
+        .block_devices()
+        .iter()
+        .map(|device| match device.transport() {
+            StorageTransportState::Pci(transport) => transport.origin(),
+            StorageTransportState::Mmio(_) => panic!("PCI block should not capture as MMIO"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        block_origins,
+        vec![StorageDeviceOrigin::Startup, StorageDeviceOrigin::Runtime]
+    );
+    let pmem_origins = pci_first
+        .pmem_devices()
+        .iter()
+        .map(|device| match device.transport() {
+            StorageTransportState::Pci(transport) => transport.origin(),
+            StorageTransportState::Mmio(_) => panic!("PCI pmem should not capture as MMIO"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pmem_origins,
+        vec![StorageDeviceOrigin::Startup, StorageDeviceOrigin::Runtime]
+    );
+    let BlockCaptureIoEngine::Async(pci_async_first) =
+        pci_first.block_devices()[1].device().io_engine()
+    else {
+        panic!("runtime PCI drive should retain Async continuation state");
+    };
+    let BlockCaptureIoEngine::Async(pci_async_second) =
+        pci_second.block_devices()[1].device().io_engine()
+    else {
+        panic!("second runtime PCI capture should retain Async continuation state");
+    };
+    assert_eq!(pci_async_second.generation(), pci_async_first.generation());
+    assert!(pci_async_first.admission_stopped());
+    assert_eq!(pci_async_first.owned_operations(), 0);
+    assert_eq!(pci_async_first.parked_host_completions(), 0);
+    assert_eq!(pci_async_first.final_completions(), 0);
+    for (first, second) in pci_first
+        .pmem_devices()
+        .iter()
+        .zip(pci_second.pmem_devices())
+    {
+        assert!(first.mapping().same_mapping(second.mapping()));
+    }
+    let pci_debug = format!(
+        "{:?} {:?}",
+        pci_first.block_devices(),
+        pci_first.pmem_devices()
+    );
+    for private_path in [
+        path_text(pci_root.path()),
+        path_text(pci_startup_pmem.path()),
+        path_text(pci_dynamic_async.path()),
+        path_text(pci_dynamic_pmem.path()),
+    ] {
+        assert!(!pci_debug.contains(&private_path));
+    }
+    drop(pci_guard);
+    pci_session
+        .shutdown()
+        .expect("signed PCI storage session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn guest_write_to_writable_pmem_is_visible_before_any_pmem_flush() {
     use std::os::unix::fs::FileExt;
 

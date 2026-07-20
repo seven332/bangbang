@@ -4786,7 +4786,7 @@
     {
       "id": "corpus:block-vhost-user",
       "family": "storage",
-      "summary": "Direct and contained startup implement the pinned one-queue vhost-user block path over MMIO or PCI: strict socket-only configuration, bounded feature/protocol/config discovery, descriptor-backed complete guest-memory transfer, translated vring setup, kick/call notification, root/partuuid/cache behavior, redacted terminal disconnect handling, metrics, cleanup, and pre-artifact snapshot rejection. Contained mode uses an exact repeatable connect-only directory grant, per-drive child leases, and a dedicated session/sequence/grant/child-bound stream broker with anchored target/peer validation and no ambient fallback or steady-state helper. Pinned runtime behavior adds repeated exact CONFIG refresh on the existing stream, preconnection-validated new-ID non-root direct or contained PCI attach in an already-shared VM, caller-coordinated removal, and complete endpoint/descriptor/metrics/slot reuse while preserving same-ID duplicate rejection. Continue auditing snapshot state, Async, broader backend outcomes, and complete corpus semantics before promotion.",
+      "summary": "Direct and contained startup implement the pinned one-queue vhost-user block path over MMIO or PCI: strict socket-only configuration, bounded feature/protocol/config discovery, descriptor-backed complete guest-memory transfer, translated vring setup, kick/call notification, root/partuuid/cache behavior, redacted terminal disconnect handling, metrics, cleanup, and pre-artifact snapshot rejection. Contained mode uses an exact repeatable connect-only directory grant, per-drive child leases, and a dedicated session/sequence/grant/child-bound stream broker with anchored target/peer validation and no ambient fallback or steady-state helper. Pinned runtime behavior adds repeated exact CONFIG refresh on the existing stream, preconnection-validated new-ID non-root direct or contained PCI attach in an already-shared VM, caller-coordinated removal, and complete endpoint/descriptor/metrics/slot reuse while preserving same-ID duplicate rejection. Paused capture preflight scans every startup or dynamic live owner before mutation and returns one typed path-redacted unsupported result. Continue auditing snapshot serialization/restore, Async interaction, broader backend outcomes, and complete corpus semantics before promotion.",
       "source_refs": [
         "corpus:block-vhost-user"
       ],
@@ -5156,7 +5156,7 @@
     {
       "id": "corpus:pmem",
       "family": "storage",
-      "summary": "Startup and non-root runtime PCI pmem now include deterministic root boot, transactional PUT/PATCH/DELETE, exact direct and contained descriptor ownership, one authoritative file/private-tail mapping registered directly with HVF, exact-prefix MS_SYNC, aligned first-fit guest ranges, rollback, metrics, cleanup, and signed direct/contained root and same-ID/slot/range reuse. Continue auditing the broad pmem corpus for dirty policy, sharing/huge-page guidance, performance, snapshot state, and aggregate completeness.",
+      "summary": "Startup and non-root runtime PCI pmem now include deterministic root boot, transactional PUT/PATCH/DELETE, exact direct and contained descriptor ownership, one authoritative file/private-tail mapping registered directly with HVF, exact-prefix MS_SYNC, aligned first-fit guest ranges, rollback, metrics, cleanup, and signed direct/contained root and same-ID/slot/range reuse. Capture-ready traversal retains exact config, range/protection, stable backing and authoritative mapping identity, queue/limiter/retry, origin, and complete MMIO/PCI transport state without changing native-v1. Continue auditing the broad pmem corpus for dirty policy, sharing/huge-page guidance, performance, serialization/restore, and aggregate completeness.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -6890,7 +6890,7 @@
     {
       "id": "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
       "family": "snapshots",
-      "summary": "Audit snapshot state and restore for multiple vCPUs, writable/multiple drives, optional devices, MMDS, interrupts, timers, and serial.",
+      "summary": "A complete internal live-owner handoff now captures startup/runtime MMIO/PCI regular and Async block plus pmem state, while vhost-user returns a typed pre-artifact unsupported result. Native-v1 serialization and restore remain unchanged. Continue auditing snapshot state and restore for multiple vCPUs, writable/multiple drives, optional devices, MMDS, interrupts, timers, and serial.",
       "source_refs": [
         "corpus:snapshot-support"
       ],
@@ -6931,7 +6931,7 @@
     {
       "id": "semantic.storage:block-sync-async-vhost-and-limits",
       "family": "storage",
-      "summary": "File-backed Sync and portable Async startup/runtime behavior plus direct or contained vhost-user block cover selected MMIO/PCI transports, root/partuuid/cache/flush semantics, bounded session-level asynchronous execution, limiter/dirty/status/used/interrupt publication, metrics, cleanup, failure-atomic live backing or engine replacement, PCI hotplug/delete/reuse, shared-memory vring transfer, exact active vhost config refresh, and explicit snapshot rejection. Vhost same-ID runtime PUT remains duplicate rejection as in pinned v1.16; file-backed same-ID PUT quiesces the old generation and commits a validated replacement. Contained mode uses exact file grants or connect-only directory authority without ambient access or a steady-state helper. Continue auditing complete caching, limiter, backend, snapshot, performance, and remaining aggregate storage outcomes before promotion.",
+      "summary": "File-backed Sync and portable Async startup/runtime behavior plus direct or contained vhost-user block cover selected MMIO/PCI transports, root/partuuid/cache/flush semantics, bounded session-level asynchronous execution, limiter/dirty/status/used/interrupt publication, metrics, cleanup, failure-atomic live backing or engine replacement, PCI hotplug/delete/reuse, shared-memory vring transfer, exact active vhost config refresh, and explicit snapshot rejection. Capture-ready traversal now retains exact config/backing/queue/limiter/retry/MMIO-or-PCI state and runs one stop-all/drain-all/publish-all/capture-all/resume-all Async transaction with continuation counters, pressure, zero-work proof, metrics, and interrupt effects; live vhost owners reject first without mutation. Vhost same-ID runtime PUT remains duplicate rejection as in pinned v1.16; file-backed same-ID PUT quiesces the old generation and commits a validated replacement. Contained mode uses exact file grants or connect-only directory authority without ambient access or a steady-state helper. Continue auditing complete caching, limiter, backend, snapshot serialization/restore, performance, and remaining aggregate storage outcomes before promotion.",
       "source_refs": [
         "corpus:block-caching",
         "corpus:block-io-engine",
@@ -6943,7 +6943,7 @@
     {
       "id": "semantic.storage:pmem-root-mapping-flush-and-state",
       "family": "storage",
-      "summary": "Startup and non-root runtime pmem now provide selected MMIO-or-PCI activation, deterministic root boot, runtime PCI attach/update/delete, one direct authoritative file/private-tail mapping, exact-prefix persistence flush, limiting/retry, exact cleanup, contained descriptor authority, metrics, and signed root/protection/coherence/range-reuse evidence. Continue auditing dirty policy, sharing/performance outcomes, snapshot state, and every remaining pmem leaf before promoting this aggregate storage record.",
+      "summary": "Startup and non-root runtime pmem now provide selected MMIO-or-PCI activation, deterministic root boot, runtime PCI attach/update/delete, one direct authoritative file/private-tail mapping, exact-prefix persistence flush, limiting/retry, exact cleanup, contained descriptor authority, metrics, and signed root/protection/coherence/range-reuse evidence. Capture-ready traversal retains exact config, guest range/protection, stable backing identity, an opaque owner-retaining mapping identity, queue/limiter/retry, origin, and complete MMIO/PCI transport state. Continue auditing dirty policy, sharing/performance outcomes, snapshot serialization/restore, and every remaining pmem leaf before promoting this aggregate storage record.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -6964,7 +6964,7 @@
     {
       "id": "semantic.transport:pci-msi-and-coexistence",
       "family": "device-transport",
-      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and native-v1 rejects PCI before mutation rather than omitting transport state.",
+      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and native-v1 create completes its live-storage handoff before rejecting PCI ahead of native-state capture and artifact mutation rather than omitting transport state; load retains its pre-VM-mutation rejection.",
       "source_refs": [
         "corpus:device-api",
         "corpus:device-hotplug"

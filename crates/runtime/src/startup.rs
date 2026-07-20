@@ -15,15 +15,17 @@ use crate::balloon::{
     VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError,
     VirtioBalloonMmioHandler,
 };
-use crate::block::async_executor::{BlockAsyncRuntimeError, SharedBlockAsyncRuntime};
+use crate::block::async_executor::{
+    BlockAsyncDriveGeneration, BlockAsyncRuntimeError, SharedBlockAsyncRuntime,
+};
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
     DriveConfig, DriveConfigInput, DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig,
     DriveUpdateError, PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
-    PreparedVhostUserBlockFrontend, VhostUserBlockConfigSignalError, VirtioBlockConfigSpace,
-    VirtioBlockDeviceId, VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
-    VirtioBlockLiveUpdateError, VirtioBlockMmioHandler, VirtioBlockQueueDispatch,
-    VirtioBlockRuntimeRestoreInput,
+    PreparedVhostUserBlockFrontend, VhostUserBlockConfigSignalError, VirtioBlockBackendKind,
+    VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockDeviceNotificationDispatch,
+    VirtioBlockDeviceNotificationError, VirtioBlockLiveUpdateError, VirtioBlockMmioHandler,
+    VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError, VirtioBlockRuntimeRestoreInput,
 };
 use crate::boot::{
     BootCommandLineError, BootSource, BootSourceConfig, BootSourceFiles, BootSourceLoadError,
@@ -87,6 +89,10 @@ use crate::snapshot_device::{
     SnapshotV1BlockRetryState, SnapshotV1DeviceCaptureInput, SnapshotV1DeviceState,
     SnapshotV1MmioDeviceMetadata, SnapshotV1PlatformDeviceMetadata,
     capture_snapshot_v1_device_state, validate_mmio_metadata, validate_platform_metadata,
+};
+use crate::storage_capture::{
+    CaptureReadyBlockDeviceState, CaptureReadyPmemDeviceState, StorageMmioTransportState,
+    StorageRetryState, StorageTransportState,
 };
 use crate::vsock::{
     PreparedVsockDevice, PreparedVsockDeviceError, SuppliedVsockListener,
@@ -2565,6 +2571,141 @@ impl fmt::Display for Arm64BootSnapshotV1DeviceCaptureError {
 
 impl std::error::Error for Arm64BootSnapshotV1DeviceCaptureError {}
 
+/// Value-redacted failure while inspecting or detaching one live MMIO storage endpoint.
+pub enum Arm64BootStorageCaptureError {
+    BlockInventory,
+    BlockMetadata,
+    BlockHandler,
+    BlockCapture,
+    BlockCompletion(VirtioBlockQueueDispatchError),
+    PmemInventory,
+    PmemMetadata,
+    PmemHandler,
+    PmemBacking,
+    PmemCapture,
+}
+
+impl fmt::Debug for Arm64BootStorageCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::BlockInventory => "BlockInventory",
+            Self::BlockMetadata => "BlockMetadata",
+            Self::BlockHandler => "BlockHandler",
+            Self::BlockCapture => "BlockCapture",
+            Self::BlockCompletion(_) => "BlockCompletion",
+            Self::PmemInventory => "PmemInventory",
+            Self::PmemMetadata => "PmemMetadata",
+            Self::PmemHandler => "PmemHandler",
+            Self::PmemBacking => "PmemBacking",
+            Self::PmemCapture => "PmemCapture",
+        };
+        formatter
+            .debug_struct("Arm64BootStorageCaptureError")
+            .field("kind", &kind)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Arm64BootStorageCaptureError {
+    pub const fn completed_block_dispatch(&self) -> Option<&VirtioBlockQueueDispatch> {
+        match self {
+            Self::BlockCompletion(source) => Some(source.completed_dispatch()),
+            Self::BlockInventory
+            | Self::BlockMetadata
+            | Self::BlockHandler
+            | Self::BlockCapture
+            | Self::PmemInventory
+            | Self::PmemMetadata
+            | Self::PmemHandler
+            | Self::PmemBacking
+            | Self::PmemCapture => None,
+        }
+    }
+}
+
+impl fmt::Display for Arm64BootStorageCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlockInventory => {
+                formatter.write_str("live MMIO block inventory is inconsistent")
+            }
+            Self::BlockMetadata => formatter.write_str("live MMIO block metadata is inconsistent"),
+            Self::BlockHandler => formatter.write_str("live MMIO block handler is unavailable"),
+            Self::BlockCapture => formatter.write_str("live MMIO block capture failed"),
+            Self::BlockCompletion(_) => {
+                formatter.write_str("live MMIO block completion publication failed")
+            }
+            Self::PmemInventory => formatter.write_str("live MMIO pmem inventory is inconsistent"),
+            Self::PmemMetadata => formatter.write_str("live MMIO pmem metadata is inconsistent"),
+            Self::PmemHandler => formatter.write_str("live MMIO pmem handler is unavailable"),
+            Self::PmemBacking => formatter.write_str("live pmem backing identity is unavailable"),
+            Self::PmemCapture => formatter.write_str("live MMIO pmem capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootStorageCaptureError {}
+
+fn unique_mmio_block_device<'a>(
+    devices: &'a [Arm64BootBlockDevice],
+    drive_id: &str,
+) -> Result<&'a Arm64BootBlockDevice, Arm64BootStorageCaptureError> {
+    let mut matches = devices
+        .iter()
+        .filter(|device| device.registration.drive_id() == drive_id);
+    let Some(device) = matches.next() else {
+        return Err(Arm64BootStorageCaptureError::BlockInventory);
+    };
+    if matches.next().is_some() {
+        return Err(Arm64BootStorageCaptureError::BlockInventory);
+    }
+    Ok(device)
+}
+
+fn unique_mmio_pmem_device<'a>(
+    devices: &'a [Arm64BootPmemDevice],
+    pmem_id: &str,
+) -> Result<&'a Arm64BootPmemDevice, Arm64BootStorageCaptureError> {
+    let mut matches = devices
+        .iter()
+        .filter(|device| device.registration.pmem_id() == pmem_id);
+    let Some(device) = matches.next() else {
+        return Err(Arm64BootStorageCaptureError::PmemInventory);
+    };
+    if matches.next().is_some() {
+        return Err(Arm64BootStorageCaptureError::PmemInventory);
+    }
+    Ok(device)
+}
+
+fn unique_prepared_pmem_device<'a>(
+    devices: &'a [PreparedPmemDevice],
+    pmem_id: &str,
+) -> Result<&'a PreparedPmemDevice, Arm64BootStorageCaptureError> {
+    let mut matches = devices.iter().filter(|device| device.id() == pmem_id);
+    let Some(device) = matches.next() else {
+        return Err(Arm64BootStorageCaptureError::PmemInventory);
+    };
+    if matches.next().is_some() {
+        return Err(Arm64BootStorageCaptureError::PmemInventory);
+    }
+    Ok(device)
+}
+
+fn validate_mmio_storage_metadata(
+    region: MmioRegion,
+    fdt_device: Arm64FdtVirtioMmioDevice,
+    error: Arm64BootStorageCaptureError,
+) -> Result<(), Arm64BootStorageCaptureError> {
+    if fdt_device.region.base != region.range().start().raw_value()
+        || fdt_device.region.size != region.range().size()
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
 impl Arm64BootRuntimeResources {
     pub fn block_async_completion_fd(&self) -> Result<Option<RawFd>, BlockAsyncRuntimeError> {
         self.block_async_runtime.completion_fd()
@@ -2580,6 +2721,137 @@ impl Arm64BootRuntimeResources {
     /// Stops an idle or already-stopped Async runtime without borrowing memory.
     pub fn shutdown_block_async_if_idle(&self) -> Result<bool, BlockAsyncRuntimeError> {
         self.block_async_runtime.shutdown_if_idle()
+    }
+
+    pub fn capture_ready_mmio_block_backend_kind(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        drive_id: &str,
+    ) -> Result<VirtioBlockBackendKind, Arm64BootStorageCaptureError> {
+        let device = unique_mmio_block_device(&self.block_devices, drive_id)?;
+        validate_mmio_storage_metadata(
+            device.registration.region(),
+            device.fdt_device,
+            Arm64BootStorageCaptureError::BlockMetadata,
+        )?;
+        mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(device.registration.region_id())
+            .map_err(|_| Arm64BootStorageCaptureError::BlockHandler)
+            .map(|handler| handler.block_backend_kind())
+    }
+
+    pub fn capture_ready_mmio_block_async_binding(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        drive_id: &str,
+    ) -> Result<
+        Option<(SharedBlockAsyncRuntime, BlockAsyncDriveGeneration)>,
+        Arm64BootStorageCaptureError,
+    > {
+        let device = unique_mmio_block_device(&self.block_devices, drive_id)?;
+        mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(device.registration.region_id())
+            .map_err(|_| Arm64BootStorageCaptureError::BlockHandler)
+            .map(|handler| handler.block_async_binding())
+    }
+
+    pub fn publish_capture_ready_mmio_block_completions(
+        &self,
+        memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+        drive_id: &str,
+    ) -> Result<VirtioBlockQueueDispatch, Arm64BootStorageCaptureError> {
+        let device = unique_mmio_block_device(&self.block_devices, drive_id)?;
+        mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(device.registration.region_id())
+            .map_err(|_| Arm64BootStorageCaptureError::BlockHandler)?
+            .publish_quiesced_async_completions(memory)
+            .map_err(Arm64BootStorageCaptureError::BlockCompletion)
+    }
+
+    pub fn capture_ready_mmio_block_state_at(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        config: &DriveConfig,
+        retry: StorageRetryState,
+        now: Instant,
+    ) -> Result<CaptureReadyBlockDeviceState, Arm64BootStorageCaptureError> {
+        let device = unique_mmio_block_device(&self.block_devices, config.drive_id())?;
+        let region = device.registration.region();
+        validate_mmio_storage_metadata(
+            region,
+            device.fdt_device,
+            Arm64BootStorageCaptureError::BlockMetadata,
+        )?;
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(device.registration.region_id())
+            .map_err(|_| Arm64BootStorageCaptureError::BlockHandler)?;
+        let captured = handler
+            .capture_block_device_state_at(config, now)
+            .map_err(|_| Arm64BootStorageCaptureError::BlockCapture)?;
+        let transport = StorageTransportState::Mmio(StorageMmioTransportState::new(
+            region,
+            device.fdt_device.interrupt_line,
+            handler.transport_state(),
+        ));
+        Ok(CaptureReadyBlockDeviceState::new(
+            config.clone(),
+            transport,
+            retry,
+            captured,
+        ))
+    }
+
+    pub fn capture_ready_mmio_pmem_state_at(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        config: &PmemConfig,
+        retry: StorageRetryState,
+        now: Instant,
+    ) -> Result<CaptureReadyPmemDeviceState, Arm64BootStorageCaptureError> {
+        let device = unique_mmio_pmem_device(&self.pmem_mmio_devices, config.id())?;
+        let prepared = unique_prepared_pmem_device(&self.pmem_devices, config.id())?;
+        let region = device.registration.region();
+        validate_mmio_storage_metadata(
+            region,
+            device.fdt_device,
+            Arm64BootStorageCaptureError::PmemMetadata,
+        )?;
+        if device.registration.guest_range() != prepared.guest_range()
+            || device.registration.file_len() != prepared.mapping().file_len()
+            || device.registration.config_space() != prepared.config_space()
+            || prepared.backing().len() != prepared.mapping().file_len()
+            || prepared.mapping().mapped_len() != prepared.guest_range().size()
+            || prepared.backing().is_read_only() != config.read_only()
+            || prepared.mapping().is_read_only() != config.read_only()
+        {
+            return Err(Arm64BootStorageCaptureError::PmemMetadata);
+        }
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioPmemMmioHandler>(device.registration.region_id())
+            .map_err(|_| Arm64BootStorageCaptureError::PmemHandler)?;
+        let captured = handler
+            .capture_pmem_device_state_at(prepared.mapping().file_len(), config.rate_limiter(), now)
+            .map_err(|_| Arm64BootStorageCaptureError::PmemCapture)?;
+        let backing = prepared
+            .backing()
+            .capture_identity()
+            .map_err(|_| Arm64BootStorageCaptureError::PmemBacking)?;
+        let mapping = prepared.mapping().capture_identity();
+        let transport = StorageTransportState::Mmio(StorageMmioTransportState::new(
+            region,
+            device.fdt_device.interrupt_line,
+            handler.transport_state(),
+        ));
+        Ok(CaptureReadyPmemDeviceState::new(
+            config.clone(),
+            prepared.guest_range(),
+            backing,
+            mapping,
+            transport,
+            retry,
+            captured,
+        ))
     }
 
     pub fn capture_snapshot_v1_device_state_at(

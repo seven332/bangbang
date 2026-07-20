@@ -25,9 +25,9 @@ VMClock discovery. Pmem now registers its retained file-backed mapping directly
 with HVF, supports deterministic read-only or writable root boot, and retains
 exact dynamic PCI flush, teardown, and range reuse; PCI network attach/delete
 owns per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime,
-pmem snapshot state, and mutable VMClock restore remain explicit limits. Host
-discard never promises
-synchronous RSS or footprint reduction. See the
+serialized/restorable pmem snapshot state, and mutable VMClock restore remain
+explicit limits. Host discard never promises synchronous RSS or footprint
+reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
 
@@ -53,13 +53,15 @@ PCI-mode block and non-root pmem PUT/DELETE use failure-atomic owner-thread
 transactions in Running or Paused state, with explicit guest rescan/removal and
 exact capacity reuse. Pmem additionally owns a shared direct-mapping lease,
 exact-prefix synchronous flush/unmap, and reusable aligned guest range.
-PCI-mode network PUT/DELETE uses
-the same owner-thread boundary with independent MMDS-only or vmnet packet I/O,
+PCI-mode network PUT/DELETE uses the same owner-thread boundary with independent
+MMDS-only or vmnet packet I/O,
 generation-safe metrics, and exact cleanup. Automatic guest hotplug
 notification, PCI snapshot persistence, external vmnet connectivity
 certification, and Firecracker's KVM ITS identity remain explicit limits.
-Native-v1 create/load rejects PCI profiles before artifact or VM mutation,
-while the default MMIO snapshot profile is unchanged.
+Native-v1 create runs the complete paused live-storage preflight and then
+rejects PCI before native-state capture or artifact work. Load keeps its
+pre-file/grant/controller/VM-mutation PCI rejection, while the default MMIO
+snapshot profile is unchanged.
 
 File-backed drives accept omitted/default `Sync` or explicit `Async` over MMIO
 and PCI. `Async` uses one lazy bounded portable worker pool per VM session and
@@ -69,8 +71,13 @@ metrics. Multiple drives use generation-bound routing so live path PATCH,
 same-ID backing/engine/limiter PUT, PCI hotplug/DELETE/reuse, reset, and shutdown
 quiesce only the intended work. Direct paths and contained preopened grants use
 the same transaction. This is the Firecracker-shaped public engine behavior,
-not a claim that macOS supplies Linux io_uring. Native-v1 remains Sync-only and
-rejects Async drives before artifact creation.
+not a claim that macOS supplies Linux io_uring. A paused snapshot-create
+preflight now asks the live boot owner to traverse every startup or runtime
+block and pmem endpoint across MMIO and PCI. It closes all Async admissions,
+drains and publishes all entered work, captures exact continuation and
+transport state, and reopens the same generations before returning. Native-v1
+serialization remains Sync-only, so broader profiles still reject before
+artifact creation after this non-persisting preflight.
 
 Pre-boot drives may instead select Firecracker's vhost-user block `socket`
 shape. Direct mode accepts an operator path; production contained mode accepts
@@ -96,7 +103,9 @@ socket connection. DELETE releases the frontend, shared-memory descriptor
 clones, metrics generation, BAR, MSI-X, and PCI slot for deterministic reuse.
 Ambient contained socket paths, dynamic-memory coexistence, automatic guest PCI
 notification, same-ID vhost replacement without DELETE, and vhost snapshot
-state remain explicit limits.
+state remain explicit limits. Snapshot preflight scans the complete live vhost
+inventory first and returns one typed, path-redacted unsupported result before
+Async mutation, contained grant claims, or artifact staging.
 
 ## Layout
 
@@ -300,8 +309,9 @@ re-protects guest-written pages before clearing and advancing the epoch while
 the source is still paused. Complete rollback keeps the old conservative epoch;
 incomplete rollback prevents resume and tears the VM down safely. `Diff`
 artifacts and merging, UFFD, clock adjustment, restore overrides, writable or
-additional drives, optional-device snapshot state, active SVE/SME/debug state,
-EL2 GIC CPU-interface state, and cross-host portability remain unsupported.
+additional drives, serialized/restorable optional-device snapshot state,
+active SVE/SME/debug state, EL2 GIC CPU-interface state, and cross-host
+portability remain unsupported.
 
 ## Process CLI
 

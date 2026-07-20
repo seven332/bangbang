@@ -286,6 +286,18 @@ remains excluded before artifact creation. The overlay therefore contains 86
 `implemented-and-verified`, 312 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` records.
 
+#1448 records a complete, redacted capture-ready storage handoff without
+changing any disposition. The paused HVF owner reconciles every configured
+startup/runtime block and pmem device with one authoritative live MMIO/PCI
+owner, captures exact regular-file backing, pmem mapping, limiter/retry, queue,
+transport, PCI/MSI-X, and origin state, and performs one stop-all/drain-all/
+publish-all/capture-all/resume-all transaction for Async generations. It scans
+vhost-user owners first and returns a typed pre-artifact unsupported result.
+Native-v1 bytes/load, PCI/dynamic persistence, migration, and vhost snapshot
+support remain Wave 6 work, so the overlay remains 86
+`implemented-and-verified`, 312 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` records.
+
 ## Commands
 
 Validate checked-in delivery state without an upstream checkout:

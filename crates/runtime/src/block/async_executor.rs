@@ -216,6 +216,67 @@ impl BlockAsyncDriveGeneration {
     }
 }
 
+/// Exact, value-redacted continuation state for one drained Async generation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BlockAsyncGenerationCaptureState {
+    generation: BlockAsyncDriveGeneration,
+    cache_type: DriveCacheType,
+    next_operation_id: u64,
+    next_sequence: u64,
+    pressure_pending: bool,
+    admission_stopped: bool,
+    owned_operations: usize,
+    parked_host_completions: usize,
+    final_completions: usize,
+}
+
+impl BlockAsyncGenerationCaptureState {
+    pub const fn generation(self) -> BlockAsyncDriveGeneration {
+        self.generation
+    }
+
+    pub const fn cache_type(self) -> DriveCacheType {
+        self.cache_type
+    }
+
+    pub const fn next_operation_id(self) -> u64 {
+        self.next_operation_id
+    }
+
+    pub const fn next_sequence(self) -> u64 {
+        self.next_sequence
+    }
+
+    pub const fn pressure_pending(self) -> bool {
+        self.pressure_pending
+    }
+
+    pub const fn admission_stopped(self) -> bool {
+        self.admission_stopped
+    }
+
+    pub const fn owned_operations(self) -> usize {
+        self.owned_operations
+    }
+
+    pub const fn parked_host_completions(self) -> usize {
+        self.parked_host_completions
+    }
+
+    pub const fn final_completions(self) -> usize {
+        self.final_completions
+    }
+}
+
+impl fmt::Debug for BlockAsyncGenerationCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockAsyncGenerationCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Owner-side identity needed to finish one exact virtio descriptor.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlockAsyncRequestIdentity {
@@ -1831,6 +1892,39 @@ impl BlockAsyncDrive {
         self.accepting = false;
     }
 
+    fn resume_quiesced_admission(&mut self) -> Result<(), BlockAsyncRuntimeError> {
+        if self.accepting {
+            return Err(BlockAsyncRuntimeError::AdmissionNotStopped);
+        }
+        if !self.operations.is_empty() {
+            return Err(BlockAsyncRuntimeError::OutstandingOperations);
+        }
+        if !self.executor.is_accepting() {
+            return Err(BlockAsyncRuntimeError::ExecutorInvariant);
+        }
+        self.accepting = true;
+        Ok(())
+    }
+
+    fn capture_state(
+        &self,
+        pressure_pending: bool,
+        parked_host_completions: usize,
+        final_completions: usize,
+    ) -> BlockAsyncGenerationCaptureState {
+        BlockAsyncGenerationCaptureState {
+            generation: self.generation,
+            cache_type: self.cache_type,
+            next_operation_id: self.next_operation_id,
+            next_sequence: self.next_sequence,
+            pressure_pending,
+            admission_stopped: !self.accepting,
+            owned_operations: self.operations.len(),
+            parked_host_completions,
+            final_completions,
+        }
+    }
+
     pub fn discard_unsubmitted(&mut self) -> usize {
         let before = self.operations.len();
         self.operations
@@ -2683,6 +2777,11 @@ impl SharedBlockAsyncRuntime {
         }
     }
 
+    /// Returns whether both handles name the same session-owned runtime.
+    pub fn same_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Binds a new backing lifetime and returns its strictly monotonic token.
     pub fn bind_drive(
         &self,
@@ -2768,6 +2867,22 @@ impl SharedBlockAsyncRuntime {
         Ok(std::mem::take(&mut drive.pressure_pending))
     }
 
+    /// Observes pressure without consuming its ordinary dispatch evidence.
+    pub fn pressure_pending(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<bool, BlockAsyncRuntimeError> {
+        Ok(self.lock()?.drive_mut(generation)?.pressure_pending)
+    }
+
+    /// Closes admission for a validated aggregate generation set atomically.
+    pub fn stop_generations(
+        &self,
+        generations: &[BlockAsyncDriveGeneration],
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.lock()?.stop_generations(generations)
+    }
+
     /// Stops one generation and finishes its admitted work and persistence.
     pub fn quiesce_generation(
         &self,
@@ -2775,6 +2890,22 @@ impl SharedBlockAsyncRuntime {
         memory: &mut GuestMemory,
     ) -> Result<(), BlockAsyncRuntimeError> {
         self.lock()?.quiesce_generation(generation, memory)
+    }
+
+    /// Captures one stopped generation after host and guest completion queues drain.
+    pub fn capture_quiesced_generation(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<BlockAsyncGenerationCaptureState, BlockAsyncRuntimeError> {
+        self.lock()?.capture_quiesced_generation(generation)
+    }
+
+    /// Reopens one exact drained generation without resetting its counters.
+    pub fn resume_quiesced_generation(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.lock()?.resume_quiesced_generation(generation)
     }
 
     /// Removes a fully quiesced generation after its final results were used.
@@ -2971,6 +3102,82 @@ impl BlockAsyncRuntime {
         self.drives
             .get_mut(index)
             .ok_or(BlockAsyncRuntimeError::UnknownGeneration)
+    }
+
+    fn stop_generations(
+        &mut self,
+        generations: &[BlockAsyncDriveGeneration],
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        for (index, generation) in generations.iter().copied().enumerate() {
+            if generations
+                .iter()
+                .take(index)
+                .any(|candidate| *candidate == generation)
+            {
+                return Err(BlockAsyncRuntimeError::DuplicateGeneration);
+            }
+            let drive_index = self.drive_index(generation)?;
+            let drive = self
+                .drives
+                .get(drive_index)
+                .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?;
+            if !drive.coordinator.is_accepting() {
+                return Err(BlockAsyncRuntimeError::AdmissionNotOpen);
+            }
+        }
+        for generation in generations.iter().copied() {
+            let drive_index = self.drive_index(generation)?;
+            self.drives
+                .get_mut(drive_index)
+                .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+                .coordinator
+                .stop_admission();
+        }
+        Ok(())
+    }
+
+    fn capture_quiesced_generation(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<BlockAsyncGenerationCaptureState, BlockAsyncRuntimeError> {
+        let index = self.drive_index(generation)?;
+        let parked = self
+            .parked
+            .iter()
+            .filter(|completion| completion.key.operation.generation() == generation)
+            .count();
+        let drive = self
+            .drives
+            .get(index)
+            .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?;
+        if drive.coordinator.is_accepting() {
+            return Err(BlockAsyncRuntimeError::AdmissionNotStopped);
+        }
+        if !drive.coordinator.is_drained() {
+            return Err(BlockAsyncRuntimeError::OutstandingOperations);
+        }
+        if parked != 0 {
+            return Err(BlockAsyncRuntimeError::ParkedCompletionInvariant);
+        }
+        if !drive.final_completions.is_empty() {
+            return Err(BlockAsyncRuntimeError::OutstandingCompletions);
+        }
+        Ok(drive.coordinator.capture_state(
+            drive.pressure_pending,
+            parked,
+            drive.final_completions.len(),
+        ))
+    }
+
+    fn resume_quiesced_generation(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let state = self.capture_quiesced_generation(generation)?;
+        debug_assert!(state.admission_stopped());
+        self.drive_mut(generation)?
+            .coordinator
+            .resume_quiesced_admission()
     }
 
     fn service_available(
@@ -3378,6 +3585,9 @@ pub enum BlockAsyncRuntimeError {
     BuildExecutor(BlockAsyncExecutorBuildError),
     DriveBuild(BlockAsyncDriveBuildError),
     UnknownGeneration,
+    DuplicateGeneration,
+    AdmissionNotOpen,
+    AdmissionNotStopped,
     Admission(BlockAsyncAdmissionError),
     Schedule(BlockAsyncScheduleError),
     Apply(BlockAsyncApplyError),
@@ -3415,6 +3625,15 @@ impl fmt::Display for BlockAsyncRuntimeError {
             }
             Self::UnknownGeneration => {
                 formatter.write_str("asynchronous block generation is unknown")
+            }
+            Self::DuplicateGeneration => {
+                formatter.write_str("asynchronous block generation is duplicated")
+            }
+            Self::AdmissionNotOpen => {
+                formatter.write_str("asynchronous block generation admission is not open")
+            }
+            Self::AdmissionNotStopped => {
+                formatter.write_str("asynchronous block generation admission is not stopped")
             }
             Self::Admission(_) => formatter.write_str("asynchronous block admission failed"),
             Self::Schedule(_) => formatter.write_str("asynchronous block scheduling failed"),
@@ -3681,6 +3900,256 @@ mod tests {
             .expect("remaining idle generation should shut down");
         assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
         assert_eq!(runtime.completion_fd().expect("runtime should lock"), None);
+    }
+
+    #[test]
+    fn aggregate_capture_stops_drains_captures_and_reopens_every_generation() {
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 2, 1, 4, 8),
+            Arc::new(ImmediateHost),
+        );
+        let (_temporary_a, backing_a) = temporary_backing(&[]);
+        let (_temporary_b, backing_b) = temporary_backing(&[]);
+        let first = runtime
+            .bind_drive(backing_a, DriveCacheType::Unsafe)
+            .expect("first drive should bind");
+        let second = runtime
+            .bind_drive(backing_b, DriveCacheType::Unsafe)
+            .expect("second drive should bind");
+        runtime
+            .admit_preflighted(
+                first,
+                BlockAsyncOperation::read(identity(91), GuestAddress::new(0x100), 9, 4)
+                    .expect("first read should validate"),
+            )
+            .expect("first read should admit");
+        assert!(matches!(
+            runtime.preflight_operation(
+                first,
+                BlockAsyncOperation::read(identity(92), GuestAddress::new(0x180), 10, 4)
+                    .expect("pressure read should validate"),
+            ),
+            Err(BlockAsyncRuntimeError::Admission(
+                BlockAsyncAdmissionError::DriveFull
+            ))
+        ));
+        runtime
+            .admit_preflighted(
+                second,
+                BlockAsyncOperation::read(identity(93), GuestAddress::new(0x200), 11, 4)
+                    .expect("second read should validate"),
+            )
+            .expect("second read should admit");
+
+        assert!(matches!(
+            runtime.stop_generations(&[first, first]),
+            Err(BlockAsyncRuntimeError::DuplicateGeneration)
+        ));
+        runtime
+            .preflight_operation(
+                second,
+                BlockAsyncOperation::read(identity(94), GuestAddress::new(0x280), 12, 4)
+                    .expect("second preflight should validate"),
+            )
+            .expect_err("the existing second operation should retain its only slot");
+
+        runtime
+            .stop_generations(&[first, second])
+            .expect("aggregate admission stop should succeed");
+        for generation in [first, second] {
+            assert!(matches!(
+                runtime.preflight_operation(
+                    generation,
+                    BlockAsyncOperation::read(identity(95), GuestAddress::new(0x300), 13, 4)
+                        .expect("stopped read should validate"),
+                ),
+                Err(BlockAsyncRuntimeError::Admission(
+                    BlockAsyncAdmissionError::Stopped
+                ))
+            ));
+        }
+
+        let mut memory = guest_memory();
+        runtime
+            .quiesce_generation(first, &mut memory)
+            .expect("first generation should drain and route foreign results");
+        runtime
+            .quiesce_generation(second, &mut memory)
+            .expect("second generation should drain");
+        for generation in [first, second] {
+            let completion = runtime
+                .pop_completion(generation)
+                .expect("completion lookup should succeed")
+                .expect("each generation should retain one compact completion");
+            assert_eq!(completion.status(), BlockAsyncOperationStatus::Success);
+            assert_eq!(completion.bytes_transferred(), 4);
+            assert_eq!(
+                runtime
+                    .pop_completion(generation)
+                    .expect("completion lookup should succeed"),
+                None
+            );
+        }
+
+        let first_state = runtime
+            .capture_quiesced_generation(first)
+            .expect("first generation should be capture-ready");
+        let second_state = runtime
+            .capture_quiesced_generation(second)
+            .expect("second generation should be capture-ready");
+        assert_eq!(first_state.generation(), first);
+        assert_eq!(second_state.generation(), second);
+        assert_eq!(first_state.cache_type(), DriveCacheType::Unsafe);
+        assert_eq!(first_state.next_operation_id(), 2);
+        assert_eq!(first_state.next_sequence(), 2);
+        assert!(first_state.pressure_pending());
+        assert!(first_state.admission_stopped());
+        assert_eq!(first_state.owned_operations(), 0);
+        assert_eq!(first_state.parked_host_completions(), 0);
+        assert_eq!(first_state.final_completions(), 0);
+        assert!(second_state.pressure_pending());
+        assert_eq!(
+            format!("{first_state:?}"),
+            "BlockAsyncGenerationCaptureState { state: \"<redacted>\" }"
+        );
+
+        runtime
+            .resume_quiesced_generation(second)
+            .expect("second generation should reopen");
+        runtime
+            .resume_quiesced_generation(first)
+            .expect("first generation should reopen");
+        assert!(matches!(
+            runtime.capture_quiesced_generation(first),
+            Err(BlockAsyncRuntimeError::AdmissionNotStopped)
+        ));
+        for generation in [first, second] {
+            runtime
+                .preflight_operation(
+                    generation,
+                    BlockAsyncOperation::read(identity(96), GuestAddress::new(0x380), 14, 4)
+                        .expect("reopened read should validate"),
+                )
+                .expect("reopened generation should admit preflight");
+        }
+
+        runtime
+            .stop_generations(&[first, second])
+            .expect("reopened generations should stop again");
+        runtime
+            .quiesce_generation(first, &mut memory)
+            .expect("idle first generation should drain");
+        runtime
+            .quiesce_generation(second, &mut memory)
+            .expect("idle second generation should drain");
+        runtime
+            .unbind_quiesced(second)
+            .expect("second generation should unbind");
+        runtime
+            .unbind_quiesced(first)
+            .expect("first generation should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("idle executor should stop")
+        );
+    }
+
+    #[test]
+    fn aggregate_capture_reopen_failure_is_isolated_and_recoverable_for_cleanup() {
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(2, 2, 2, 4, 8),
+            Arc::new(ImmediateHost),
+        );
+        let (_temporary_a, backing_a) = temporary_backing(&[]);
+        let (_temporary_b, backing_b) = temporary_backing(&[]);
+        let first = runtime
+            .bind_drive(backing_a, DriveCacheType::Unsafe)
+            .expect("first cleanup drive should bind");
+        let second = runtime
+            .bind_drive(backing_b, DriveCacheType::Unsafe)
+            .expect("second cleanup drive should bind");
+        runtime
+            .admit_preflighted(
+                first,
+                BlockAsyncOperation::read(identity(101), GuestAddress::new(0x100), 21, 4)
+                    .expect("first cleanup read should validate"),
+            )
+            .expect("first cleanup read should admit");
+        runtime
+            .admit_preflighted(
+                second,
+                BlockAsyncOperation::read(identity(102), GuestAddress::new(0x200), 22, 4)
+                    .expect("second cleanup read should validate"),
+            )
+            .expect("second cleanup read should admit");
+        runtime
+            .stop_generations(&[first, second])
+            .expect("both cleanup generations should stop atomically");
+        let mut memory = guest_memory();
+        runtime
+            .quiesce_generation(first, &mut memory)
+            .expect("first cleanup generation should drain");
+        runtime
+            .quiesce_generation(second, &mut memory)
+            .expect("second cleanup generation should drain");
+        runtime
+            .pop_completion(first)
+            .expect("first completion lookup should succeed")
+            .expect("first completion should publish");
+
+        assert!(matches!(
+            runtime.resume_quiesced_generation(second),
+            Err(BlockAsyncRuntimeError::OutstandingCompletions)
+        ));
+        runtime
+            .resume_quiesced_generation(first)
+            .expect("a failed peer reopen must not block safe reverse cleanup");
+        runtime
+            .preflight_operation(
+                first,
+                BlockAsyncOperation::read(identity(103), GuestAddress::new(0x300), 23, 4)
+                    .expect("reopened first read should validate"),
+            )
+            .expect("first peer should be open after independent cleanup");
+        assert!(matches!(
+            runtime.preflight_operation(
+                second,
+                BlockAsyncOperation::read(identity(104), GuestAddress::new(0x400), 24, 4)
+                    .expect("stopped second read should validate"),
+            ),
+            Err(BlockAsyncRuntimeError::Admission(
+                BlockAsyncAdmissionError::Stopped
+            ))
+        ));
+
+        runtime
+            .pop_completion(second)
+            .expect("second completion lookup should succeed")
+            .expect("second completion should remain available for explicit cleanup");
+        runtime
+            .resume_quiesced_generation(second)
+            .expect("second peer should reopen after its completion is owned");
+        runtime
+            .stop_generations(&[first, second])
+            .expect("both recovered peers should stop again");
+        runtime
+            .quiesce_generation(first, &mut memory)
+            .expect("recovered first peer should quiesce");
+        runtime
+            .quiesce_generation(second, &mut memory)
+            .expect("recovered second peer should quiesce");
+        runtime
+            .unbind_quiesced(second)
+            .expect("recovered second peer should unbind");
+        runtime
+            .unbind_quiesced(first)
+            .expect("recovered first peer should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("recovered executor should stop")
+        );
     }
 
     #[test]

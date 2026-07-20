@@ -476,6 +476,7 @@ struct PciBarRegister {
     probe_pending: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct PciType0Configuration {
     registers: Vec<u32>,
     writable_masks: Vec<u32>,

@@ -22,10 +22,11 @@ use bangbang_hvf::{
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
     HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
-    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle,
-    HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
-    HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfVcpuRunCoordinatorError,
-    OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError, PreparedHvfArm64BootPciNetworkRemoval,
+    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootStorageCaptureError,
+    HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError,
+    HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition, HvfSnapshotV1RestoreError,
+    HvfSnapshotV1State, HvfVcpuRunCoordinatorError, OwnedHvfArm64BootSession,
+    PrepareHvfSnapshotV1LoadError, PreparedHvfArm64BootPciNetworkRemoval,
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
@@ -109,6 +110,7 @@ use bangbang_runtime::startup::{
     update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
     update_network_interface_rate_limiters_for_devices, update_pmem_rate_limiter_for_devices,
 };
+use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
 #[cfg(target_os = "macos")]
 use bangbang_runtime::vsock::SuppliedVsockListener;
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
@@ -196,6 +198,15 @@ pub(crate) trait InstanceStartExecutor {
             ));
         }
         self.start(controller)
+    }
+
+    fn preflight_snapshot_v1_storage(
+        &mut self,
+        _session: &mut Self::Session,
+        _configs: CaptureReadyStorageConfigs,
+        _cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<(), HvfArm64BootStorageCaptureError> {
+        Ok(())
     }
 
     fn publish_snapshot_v1(
@@ -306,6 +317,7 @@ impl std::error::Error for NativeV1SnapshotPublicationProducerError {
 #[derive(Debug)]
 pub(crate) enum NativeV1SnapshotPublicationError {
     Preflight(VmmActionError),
+    StoragePreflight(HvfArm64BootStorageCaptureError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -317,6 +329,9 @@ impl fmt::Display for NativeV1SnapshotPublicationError {
         match self {
             Self::Preflight(source) => {
                 write!(f, "native-v1 publication preflight failed: {source}")
+            }
+            Self::StoragePreflight(source) => {
+                write!(f, "native-v1 storage preflight failed: {source}")
             }
             Self::Resource(source) => {
                 write!(
@@ -337,6 +352,7 @@ impl std::error::Error for NativeV1SnapshotPublicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Preflight(source) => Some(source),
+            Self::StoragePreflight(source) => Some(source),
             Self::Resource(source) => Some(source),
             Self::Transaction(source) => Some(source),
             Self::SessionUnavailable | Self::ConfigurationUnavailable => None,
@@ -2903,9 +2919,6 @@ where
     }
 
     fn create_snapshot(&mut self, input: SnapshotCreateInput) -> Result<VmmData, VmmActionError> {
-        if self.pci_enabled {
-            return Err(VmmActionError::SnapshotUnsupported);
-        }
         self.publish_native_v1_snapshot(&input)
             .map_err(native_v1_snapshot_publication_action_error)?;
         Ok(VmmData::Empty)
@@ -3575,8 +3588,30 @@ where
         input: &SnapshotCreateInput,
     ) -> Result<SnapshotCommitDurability, NativeV1SnapshotPublicationError> {
         self.controller
-            .preflight_create_snapshot(input)
+            .preflight_create_snapshot_request(input)
             .map_err(NativeV1SnapshotPublicationError::Preflight)?;
+
+        let storage_configs = CaptureReadyStorageConfigs::new(
+            self.controller.drive_configs().to_vec(),
+            self.controller.pmem_configs().to_vec(),
+        );
+        let cancellation = self.snapshot_capture_cancellation.clone();
+        let session = self
+            .started_session
+            .as_mut()
+            .ok_or(NativeV1SnapshotPublicationError::SessionUnavailable)?;
+        self.starter
+            .preflight_snapshot_v1_storage(session, storage_configs, cancellation.clone())
+            .map_err(NativeV1SnapshotPublicationError::StoragePreflight)?;
+
+        self.controller
+            .preflight_create_snapshot_profile()
+            .map_err(NativeV1SnapshotPublicationError::Preflight)?;
+        if self.pci_enabled {
+            return Err(NativeV1SnapshotPublicationError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
 
         let drive_config = match self.controller.drive_configs() {
             [drive_config] => drive_config.clone(),
@@ -3588,7 +3623,6 @@ where
             return Err(NativeV1SnapshotPublicationError::SessionUnavailable);
         }
         let outputs = self.prepare_contained_snapshot_v1_outputs(input)?;
-        let cancellation = self.snapshot_capture_cancellation.clone();
         let session = self
             .started_session
             .as_mut()
@@ -3850,6 +3884,15 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         self.active_serial_output = Some(serial_output);
 
         Ok(supervisor)
+    }
+
+    fn preflight_snapshot_v1_storage(
+        &mut self,
+        session: &mut Self::Session,
+        configs: CaptureReadyStorageConfigs,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<(), HvfArm64BootStorageCaptureError> {
+        session.preflight_capture_ready_storage(configs, cancellation)
     }
 
     fn publish_snapshot_v1(
@@ -4294,6 +4337,20 @@ where
 }
 
 impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
+    fn capture_ready_storage_state_at_with_cancel(
+        &mut self,
+        configs: &CaptureReadyStorageConfigs,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+        cancellation: &NativeV1SnapshotCaptureCancellation,
+    ) -> Result<(), HvfArm64BootStorageCaptureError> {
+        self.session
+            .capture_ready_storage_state_at_with_cancel(configs, guard, now, |_| {
+                cancellation.is_cancelled()
+            })
+            .map(|_| ())
+    }
+
     fn capture_snapshot_v1_device_state_at(
         &self,
         drive_config: &DriveConfig,
@@ -7094,6 +7151,24 @@ where
     }
 }
 
+fn storage_capture_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, HvfArm64BootStorageCaptureError>,
+) -> HvfArm64BootStorageCaptureError {
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::WorkerNotPaused
+        | BootRunLoopCommandError::SnapshotQuiescenceActive
+        | BootRunLoopCommandError::AdmissionClosed
+        | BootRunLoopCommandError::QueueFull
+        | BootRunLoopCommandError::QueueClosed
+        | BootRunLoopCommandError::Wakeup { .. }
+        | BootRunLoopCommandError::ResponseClosed => {
+            HvfArm64BootStorageCaptureError::owner_unavailable()
+        }
+    }
+}
+
 pub(crate) struct BootRunLoopCommandHandle<S>
 where
     S: BootRunLoopSession,
@@ -8019,6 +8094,44 @@ impl
         ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider>,
     >
 {
+    fn preflight_capture_ready_storage(
+        &self,
+        configs: CaptureReadyStorageConfigs,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<(), HvfArm64BootStorageCaptureError> {
+        let active_capture = self
+            .register_snapshot_capture(cancellation.clone())
+            .map_err(|_| HvfArm64BootStorageCaptureError::owner_unavailable())?;
+        if !cancellation.begin_operation() {
+            return Err(HvfArm64BootStorageCaptureError::cancelled());
+        }
+        let result = self.run_snapshot_quiesced(move |session| {
+            let _active_capture = active_capture;
+            let guard = session
+                .quiesce_snapshot_auxiliary_work()
+                .map_err(|_| HvfArm64BootStorageCaptureError::owner_unavailable())?;
+            let result = session.capture_ready_storage_state_at_with_cancel(
+                &configs,
+                &guard,
+                Instant::now(),
+                &cancellation,
+            );
+            drop(guard);
+            result
+        });
+        if let Err(BootRunLoopCommandError::Command { source }) = &result
+            && source.terminal()
+        {
+            self.status.record(BootRunLoopWorkerStatus::Failed(
+                "terminal storage capture failure".to_string(),
+            ));
+            self.admission.shutdown();
+            self.pause_gate.shutdown();
+            let _ = self.control.request_stop();
+        }
+        result.map_err(storage_capture_error_from_boot_run_loop_command)
+    }
+
     #[expect(
         dead_code,
         reason = "standalone device capture remains a focused internal diagnostic seam"
@@ -8782,26 +8895,26 @@ mod tests {
         BootRunLoopCommandAdmission, BootRunLoopCommandAdmissionState, BootRunLoopCommandError,
         BootRunLoopCommandSubmissionError, BootRunLoopControl, BootRunLoopNetworkInterfaceUpdater,
         BootRunLoopPmemDeviceUpdater, BootRunLoopSession, BootRunLoopSupervisor,
-        BootRunLoopWorkerStatus, DEFAULT_BALLOON_MMIO_BASE, DEFAULT_BALLOON_MMIO_REGION_ID,
-        DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID, DEFAULT_BOOT_TIMER_MMIO_BASE,
-        DEFAULT_BOOT_TIMER_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE,
+        BootRunLoopWorkerStatus, CaptureReadyStorageConfigs, DEFAULT_BALLOON_MMIO_BASE,
+        DEFAULT_BALLOON_MMIO_REGION_ID, DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID,
+        DEFAULT_BOOT_TIMER_MMIO_BASE, DEFAULT_BOOT_TIMER_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE,
         DEFAULT_ENTROPY_MMIO_REGION_ID, DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT,
         DEFAULT_MEMORY_HOTPLUG_MMIO_BASE, DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID,
         DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_PMEM_MMIO_BASE,
         DEFAULT_PMEM_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
-        HvfArm64BootSnapshotV1CaptureStage, HvfInstanceStartExecutor, InstanceStartExecutor,
-        NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
-        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
-        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
-        NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
-        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootStorageCaptureError,
+        HvfInstanceStartExecutor, InstanceStartExecutor, NativeV1SnapshotCaptureCancellation,
+        NativeV1SnapshotCaptureError, NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
+        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
+        NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
+        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
+        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
+        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
+        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
+        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
+        ProcessVmm, ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
         require_native_v1_composite_record, snapshot_destination_machine_config,
     };
@@ -9851,6 +9964,9 @@ mod tests {
         calls: usize,
         provided_boot_file_calls: usize,
         provided_serial_output_calls: usize,
+        snapshot_storage_preflight_calls: usize,
+        last_snapshot_storage_configs: Option<CaptureReadyStorageConfigs>,
+        snapshot_storage_preflight_failure: Option<HvfArm64BootStorageCaptureError>,
         snapshot_publication_failure: bool,
     }
 
@@ -9865,8 +9981,19 @@ mod tests {
                 calls: 0,
                 provided_boot_file_calls: 0,
                 provided_serial_output_calls: 0,
+                snapshot_storage_preflight_calls: 0,
+                last_snapshot_storage_configs: None,
+                snapshot_storage_preflight_failure: None,
                 snapshot_publication_failure: false,
             }
+        }
+
+        fn with_snapshot_storage_preflight_failure(
+            mut self,
+            error: HvfArm64BootStorageCaptureError,
+        ) -> Self {
+            self.snapshot_storage_preflight_failure = Some(error);
+            self
         }
 
         fn with_snapshot_publication_failure(mut self) -> Self {
@@ -9880,6 +10007,9 @@ mod tests {
                 calls: 0,
                 provided_boot_file_calls: 0,
                 provided_serial_output_calls: 0,
+                snapshot_storage_preflight_calls: 0,
+                last_snapshot_storage_configs: None,
+                snapshot_storage_preflight_failure: None,
                 snapshot_publication_failure: false,
             }
         }
@@ -9915,6 +10045,20 @@ mod tests {
                     .map_err(|_| BackendError::InvalidState("fake serial output write failed"))?;
             }
             self.start(controller)
+        }
+
+        fn preflight_snapshot_v1_storage(
+            &mut self,
+            _session: &mut Self::Session,
+            configs: CaptureReadyStorageConfigs,
+            _cancellation: NativeV1SnapshotCaptureCancellation,
+        ) -> Result<(), HvfArm64BootStorageCaptureError> {
+            self.snapshot_storage_preflight_calls += 1;
+            self.last_snapshot_storage_configs = Some(configs);
+            match self.snapshot_storage_preflight_failure {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
 
         fn publish_snapshot_v1(
@@ -11758,7 +11902,7 @@ mod tests {
     }
 
     #[test]
-    fn pci_mode_rejects_native_v1_snapshot_actions_before_mutation() {
+    fn pci_mode_runs_create_storage_preflight_before_rejecting_native_v1_pci() {
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
         let calls = starter.calls();
         let mut load_vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
@@ -11774,12 +11918,25 @@ mod tests {
 
         let mut create_vmm = snapshot_profile_vmm(FakeStarter::success(12));
         create_vmm.pci_enabled = true;
+        create_vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect("PCI snapshot source should start");
+        create_vmm
+            .handle_action(VmmAction::Pause)
+            .expect("PCI snapshot source should pause");
         assert_eq!(
             create_vmm.handle_action(snapshot_create_action(SnapshotType::Full)),
             Err(VmmActionError::SnapshotUnsupported)
         );
-        assert_eq!(create_vmm.instance_info().state, InstanceState::NotStarted);
-        assert!(!create_vmm.has_started_session());
+        assert_eq!(create_vmm.starter.snapshot_storage_preflight_calls, 1);
+        let session = create_vmm
+            .started_session
+            .as_ref()
+            .expect("rejected PCI snapshot should retain its paused session");
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert_eq!(create_vmm.instance_info().state, InstanceState::Paused);
+        assert!(create_vmm.has_started_session());
     }
 
     #[test]
@@ -17275,6 +17432,116 @@ mod tests {
                 .snapshot_create_barrier_count,
             0
         );
+    }
+
+    #[test]
+    fn broad_snapshot_profile_runs_complete_storage_preflight_before_profile_rejection() {
+        let state_path = missing_temp_child_path("broad-storage.state");
+        let memory_path = state_path.with_file_name("broad-storage.memory");
+        let parent = state_path
+            .parent()
+            .expect("missing broad snapshot path should have a parent");
+        let mut vmm = configured_vmm(FakeStarter::success(160));
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("root", "root", "/private/root", true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("broad snapshot root should configure");
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("data", "data", "/private/data", false)
+                .with_io_engine(DriveIoEngine::Async),
+        ))
+        .expect("broad snapshot Async drive should configure");
+        vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            "/private/pmem",
+        )))
+        .expect("broad snapshot pmem should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("broad snapshot fake session should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("broad snapshot fake session should pause");
+
+        let error = vmm
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                &state_path,
+                &memory_path,
+            )))
+            .expect_err("broad profile should reject only after live storage preflight");
+
+        assert_eq!(error, VmmActionError::SnapshotUnsupported);
+        assert_eq!(vmm.starter.snapshot_storage_preflight_calls, 1);
+        let captured_configs = vmm
+            .starter
+            .last_snapshot_storage_configs
+            .as_ref()
+            .expect("storage preflight should receive the complete config inventory");
+        assert_eq!(captured_configs.drives(), vmm.controller.drive_configs());
+        assert_eq!(captured_configs.pmem(), vmm.controller.pmem_configs());
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("rejected broad snapshot should retain its paused session");
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
+        assert!(!parent.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn storage_preflight_failure_precedes_contained_claim_and_publication() {
+        let state_path = Path::new("bangbang-grant:vhost-directory/private.state");
+        let memory_path = Path::new("bangbang-grant:vhost-directory/private.memory");
+        let (directory_authority, _directory) = vhost_directory_authority_for_test();
+        let mut vmm = snapshot_profile_vmm(
+            FakeStarter::success(161).with_snapshot_storage_preflight_failure(
+                HvfArm64BootStorageCaptureError::owner_unavailable(),
+            ),
+        )
+        .with_socket_grant_authority(Some(directory_authority), None, None, None);
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("contained preflight fake session should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("contained preflight fake session should pause");
+
+        let error = vmm
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                state_path,
+                memory_path,
+            )))
+            .expect_err("storage failure should stop before a contained directory claim");
+
+        assert_eq!(
+            error,
+            VmmActionError::SnapshotCreate(BackendError::Hypervisor(
+                "native-v1 storage preflight failed: storage capture owner is unavailable"
+                    .to_string()
+            ))
+        );
+        assert_eq!(vmm.starter.snapshot_storage_preflight_calls, 1);
+        let captured_configs = vmm
+            .starter
+            .last_snapshot_storage_configs
+            .as_ref()
+            .expect("failed storage preflight should retain its exact inputs for inspection");
+        assert_eq!(captured_configs.drives(), vmm.controller.drive_configs());
+        assert!(captured_configs.pmem().is_empty());
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("storage preflight failure should retain the paused session");
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("private.state"));
+        assert!(!diagnostic.contains("private.memory"));
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
     }
 
     #[test]
