@@ -1,5 +1,7 @@
 //! Backend-neutral block-device configuration model.
 
+pub mod async_executor;
+
 use std::collections::{BTreeMap, TryReserveError};
 use std::fmt;
 use std::fs::{File, OpenOptions};

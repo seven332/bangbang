@@ -1767,6 +1767,21 @@ direct and contained hotplug cases prove guest PCI rescan, seed read,
 write/readback/fsync, sysfs removal, Paused DELETE/PUT ordering, exact capacity
 reuse, success-only config projection, and clean shutdown.
 
+The internal regular-file asynchronous executor has a separate deterministic
+unsigned gate under `block::async_executor`. Its injected-host tests cover the
+fixed task and staging budgets, completed-but-unapplied lease ownership,
+multi-chunk progress, write snapshots, read staging and dirty publication,
+partial/error byte counts, same-drive conflict and flush barriers, cross-drive
+parallelism, stale generations, discard and cache-sensitive final flush,
+worker-panic recovery, non-owning handle cleanup, pipe saturation, and Darwin
+`kqueue` readiness clearing. The focused
+`boot_run_loop_supervisor_stays_responsive_while_async_block_host_call_blocks`
+test additionally holds a host call inside the block pool and requires a
+second owner command to finish before that call is released. These are engine
+and wakeup-boundary proofs only: public `DriveIoEngine::Async` remains rejected,
+and #1446 owns API activation, queue integration, capability-inventory changes,
+and signed guest evidence.
+
 Direct pre-boot vhost-user block has its own signed executable gate. The MMIO
 case first connects an intentionally incompatible backend and proves that
 discovery failure leaves the instance unstarted, then retries with a valid
