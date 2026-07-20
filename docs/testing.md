@@ -1787,8 +1787,24 @@ configuration projection; signed executable cases prove MMIO live path PATCH,
 config-file startup, concurrent Async root/data drives, first-use PCI hotplug,
 DELETE/reuse, and paused same-ID Sync-to-Async replacement; signed production
 cases prove contained Async root/control startup, preauthorized same-ID backing
-and engine replacement, limiter PATCH, and runtime hotplug/delete/reuse. Native-v1
-Async rejection before artifact creation remains an explicit state-format gate.
+and engine replacement, limiter PATCH, and runtime hotplug/delete/reuse.
+Native-v1 serialization remains Sync-only: a paused Async create completes live
+storage preflight and reopens the same generation before the explicit profile
+gate rejects it without artifact creation.
+
+Capture-ready storage changes additionally require focused block, pmem, Async,
+and virtio-pci tests for exact value equality and redaction; atomic
+stop-all/drain-all/publish-all/capture-all/resume-all ordering; foreign
+completion routing; ordered MMIO SPI and PCI MSI-X completion delivery with
+per-drive failure metrics; pressure/counter retention; partial-publication and
+reopen failure classification; and cancellation recovery. Process tests must
+prove the traversal precedes profile rejection, contained output claims, and
+staging. The signed
+`capture_ready_storage_traverses_signed_mmio_and_pci_owners` case must cover
+startup/runtime MMIO/PCI Sync, Async, and direct pmem ownership and
+same-generation reopen. Signed executable scenarios must retain the public
+preflight gates for Async, direct pmem, dynamic PCI block/pmem, and typed
+path-redacted vhost rejection with no visible artifact or staging entry.
 
 Direct pre-boot vhost-user block has its own signed executable gate. The MMIO
 case first connects an intentionally incompatible backend and proves that

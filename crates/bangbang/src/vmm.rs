@@ -11902,7 +11902,7 @@ mod tests {
     }
 
     #[test]
-    fn pci_mode_rejects_native_v1_snapshot_actions_before_mutation() {
+    fn pci_mode_runs_create_storage_preflight_before_rejecting_native_v1_pci() {
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
         let calls = starter.calls();
         let mut load_vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);

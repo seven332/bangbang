@@ -1045,8 +1045,9 @@ is resource-specific:
   Consumed contained authority is never recreated. Pre-boot configuration
   permits one root across ordinary block and pmem devices; a pmem root boots as
   its stable `/dev/pmem<i>` index with `ro` or `rw`, while runtime root mutation
-  remains rejected. Pmem remains outside ordinary RAM dirty epochs and native-v1
-  optional-device snapshots remain deferred.
+  remains rejected. Pmem remains outside ordinary RAM dirty epochs. Its exact
+  capture-ready live state is retained in memory, while native-v1 serialization
+  and restore remain deferred.
 - `/entropy` accepts Firecracker-shaped bandwidth and ops rate-limiter buckets.
   The limiter is process-local runtime state, is applied before host entropy is
   read or guest memory is written, and must not sleep or busy-wait while budget
@@ -1062,8 +1063,17 @@ is resource-specific:
   preflight or execution. Manual `Debug` implementations redact state/memory paths,
   interface IDs, host device names, and vsock paths even through enclosing
   request/action enums; action names, errors, logs, and metrics remain
-  value-free. Unsupported request/profile dimensions fail before artifact I/O;
-  an admitted paused create opens only preflighted namespaces, temporarily
+  value-free. Unsupported request dimensions fail before storage work. Before
+  applying native-v1 profile exclusions, an admitted paused create traverses
+  every configured startup/runtime block and pmem owner across MMIO/PCI. It
+  rejects live vhost-user first; otherwise it closes and drains every Async
+  generation, publishes all completions, delivers their MMIO SPI or PCI MSI-X
+  interrupts, captures the detached state, and reopens every generation before
+  returning a redacted in-memory handoff. MMIO publication releases the
+  dispatcher before GIC delivery so the normal dispatcher/GIC lock order is
+  preserved. This occurs before contained output claims, staging, or
+  native-state capture. Unsupported profiles then fail before artifact I/O. An
+  accepted create opens only preflighted namespaces, temporarily
   closes ordinary boot-worker command admission, and acknowledges process-local
   block/PMEM/network/entropy retry quiescence through complete capture,
   publication, and the post-publication hook. API/MMDS/controller mutation and
@@ -1728,9 +1738,11 @@ and opens no vmnet resource or extra host authority.
 The hidden selectors and redacted diagnostic views grant no arbitrary host
 resource authority. Public PCI supports the documented block, pmem, and network
 runtime transactions, but guest rescan/removal remains an explicit operator
-step and there is no automatic notification. Native-v1 rejects the immutable
-PCI profile before capture/load work rather than persisting or silently
-dropping its state.
+step and there is no automatic notification. Native-v1 create first captures
+the complete live storage handoff, then rejects the immutable PCI profile before
+native-state capture or artifact work. Load retains its pre-file/grant/
+controller/VM-mutation rejection. Neither path persists or silently drops PCI
+state.
 
 ## HVF Entitlements
 

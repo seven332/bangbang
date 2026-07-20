@@ -3647,6 +3647,7 @@ impl std::error::Error for HvfArm64BootStorageCaptureError {}
 enum CaptureReadyBlockOwner {
     Mmio {
         retry: StorageRetryState,
+        interrupt_line: GuestInterruptLine,
     },
     Pci {
         index: usize,
@@ -3669,6 +3670,34 @@ enum CaptureReadyPmemOwner {
 struct CaptureReadyAsyncOwner {
     config_index: usize,
     owner: CaptureReadyBlockOwner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptureReadyMmioBlockInterrupt {
+    config_index: usize,
+    interrupt_line: GuestInterruptLine,
+}
+
+fn signal_capture_ready_mmio_block_interrupts(
+    interrupts: &[CaptureReadyMmioBlockInterrupt],
+    configs: &CaptureReadyStorageConfigs,
+    metrics: &SharedBlockDeviceMetricsRegistry,
+    signaler: Option<&dyn InterruptSink>,
+) -> bool {
+    let mut failed = false;
+    for interrupt in interrupts {
+        let delivered = signaler.is_some_and(|signaler| {
+            signal_queue_interrupt(interrupt.interrupt_line, signaler).is_ok()
+        });
+        if delivered {
+            continue;
+        }
+        if let Some(config) = configs.drives().get(interrupt.config_index) {
+            metrics.record_event_failure_for_drive(config.drive_id());
+        }
+        failed = true;
+    }
+    failed
 }
 
 const fn storage_retry_state(state: SnapshotV1BlockRetryState) -> StorageRetryState {
@@ -3869,6 +3898,7 @@ fn capture_ready_storage_state_at_with_cancel(
     runtime_resources: &Arm64BootRuntimeResources,
     pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
     block_device_metrics: &SharedBlockDeviceMetricsRegistry,
+    gic: &HvfGicMetadata,
     block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     pmem_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     configs: &CaptureReadyStorageConfigs,
@@ -3894,7 +3924,7 @@ fn capture_ready_storage_state_at_with_cancel(
     let shared_pmem_retry = storage_retry_state(guard.pmem_retry_state_at(now).map_err(|_| {
         HvfArm64BootStorageCaptureError::new(HvfArm64BootStorageCaptureErrorKind::RetryState, false)
     })?);
-    let mut mmio_dispatcher =
+    let mut mmio_dispatcher_guard =
         lock_boot_mmio_dispatcher(mmio_dispatcher).map_err(|error| match error {
             HvfArm64BootMmioDispatcherError::Busy => HvfArm64BootStorageCaptureError::new(
                 HvfArm64BootStorageCaptureErrorKind::MmioDispatcherBusy,
@@ -3918,7 +3948,7 @@ fn capture_ready_storage_state_at_with_cancel(
     for device in &runtime_resources.block_devices {
         let kind = runtime_resources
             .capture_ready_mmio_block_backend_kind(
-                &mut mmio_dispatcher,
+                &mut mmio_dispatcher_guard,
                 device.registration.drive_id(),
             )
             .map_err(|_| {
@@ -3987,6 +4017,10 @@ fn capture_ready_storage_state_at_with_cancel(
     async_owners
         .try_reserve_exact(configs.drives().len())
         .map_err(allocation_error)?;
+    let mut mmio_block_interrupts = Vec::new();
+    mmio_block_interrupts
+        .try_reserve_exact(configs.drives().len())
+        .map_err(allocation_error)?;
     let mut generations = Vec::new();
     generations
         .try_reserve_exact(configs.drives().len())
@@ -4005,7 +4039,9 @@ fn capture_ready_storage_state_at_with_cancel(
             .block_devices
             .iter()
             .filter(|device| device.registration.drive_id() == config.drive_id());
-        let mmio_match = mmio_matches.next().is_some();
+        let mmio_match = mmio_matches
+            .next()
+            .map(|device| device.fdt_device.interrupt_line);
         let duplicate_mmio = mmio_matches.next().is_some();
         let mut pci_matches = pci_data_devices
             .as_ref()
@@ -4015,10 +4051,11 @@ fn capture_ready_storage_state_at_with_cancel(
         let pci_match = pci_matches.next().map(|(index, _)| index);
         let duplicate_pci = pci_matches.next().is_some();
         let owner = match (mmio_match, duplicate_mmio, pci_match, duplicate_pci) {
-            (true, false, None, false) => CaptureReadyBlockOwner::Mmio {
+            (Some(interrupt_line), false, None, false) => CaptureReadyBlockOwner::Mmio {
                 retry: shared_block_retry,
+                interrupt_line,
             },
-            (false, false, Some(index), false) => {
+            (None, false, Some(index), false) => {
                 let device = pci_data_devices
                     .as_ref()
                     .and_then(|devices| devices.block.get(index))
@@ -4100,7 +4137,10 @@ fn capture_ready_storage_state_at_with_cancel(
     {
         let binding = match owner {
             CaptureReadyBlockOwner::Mmio { .. } => runtime_resources
-                .capture_ready_mmio_block_async_binding(&mut mmio_dispatcher, config.drive_id())
+                .capture_ready_mmio_block_async_binding(
+                    &mut mmio_dispatcher_guard,
+                    config.drive_id(),
+                )
                 .map_err(|_| {
                     HvfArm64BootStorageCaptureError::new(
                         HvfArm64BootStorageCaptureErrorKind::AsyncPreparation,
@@ -4214,12 +4254,18 @@ fn capture_ready_storage_state_at_with_cancel(
             continue;
         };
         match async_owner.owner {
-            CaptureReadyBlockOwner::Mmio { .. } => {
+            CaptureReadyBlockOwner::Mmio { interrupt_line, .. } => {
                 let publication = runtime_resources.publish_capture_ready_mmio_block_completions(
                     memory,
-                    &mut mmio_dispatcher,
+                    &mut mmio_dispatcher_guard,
                     config.drive_id(),
                 );
+                let needs_queue_interrupt = match &publication {
+                    Ok(dispatch) => dispatch.needs_queue_interrupt(),
+                    Err(error) => error
+                        .completed_block_dispatch()
+                        .is_some_and(|dispatch| dispatch.needs_queue_interrupt()),
+                };
                 match &publication {
                     Ok(dispatch) => block_device_metrics
                         .record_queue_dispatch_for_drive(config.drive_id(), dispatch),
@@ -4230,6 +4276,12 @@ fn capture_ready_storage_state_at_with_cancel(
                         }
                         block_device_metrics.record_event_failure_for_drive(config.drive_id());
                     }
+                }
+                if needs_queue_interrupt {
+                    mmio_block_interrupts.push(CaptureReadyMmioBlockInterrupt {
+                        config_index: async_owner.config_index,
+                        interrupt_line,
+                    });
                 }
                 if publication.is_err() {
                     retain_storage_capture_error(
@@ -4305,6 +4357,64 @@ fn capture_ready_storage_state_at_with_cancel(
         }
     }
 
+    // MMIO queue publication records the transport interrupt intent but, unlike
+    // PCI MSI-X publication, cannot signal the physical GIC itself. Release the
+    // dispatcher before delivery to preserve the ordinary dispatcher/GIC lock
+    // order, then reacquire it for the detached state clone.
+    let mut mmio_dispatcher_guard = Some(mmio_dispatcher_guard);
+    if !mmio_block_interrupts.is_empty() {
+        drop(mmio_dispatcher_guard.take());
+        let signaler = HvfGicSpiSignaler::from_metadata(gic).ok();
+        if signal_capture_ready_mmio_block_interrupts(
+            &mmio_block_interrupts,
+            configs,
+            block_device_metrics,
+            signaler
+                .as_ref()
+                .map(|signaler| signaler as &dyn InterruptSink),
+        ) {
+            retain_storage_capture_error(
+                &mut primary,
+                HvfArm64BootStorageCaptureError::new(
+                    HvfArm64BootStorageCaptureErrorKind::CompletionPublication,
+                    true,
+                ),
+            );
+        }
+        if is_cancelled(HvfArm64BootStorageCaptureStage::PublishAsync) {
+            retain_storage_capture_error(
+                &mut primary,
+                HvfArm64BootStorageCaptureError::new(
+                    HvfArm64BootStorageCaptureErrorKind::Cancelled,
+                    false,
+                ),
+            );
+        }
+        mmio_dispatcher_guard = match lock_boot_mmio_dispatcher(mmio_dispatcher) {
+            Ok(dispatcher) => Some(dispatcher),
+            Err(HvfArm64BootMmioDispatcherError::Busy) => {
+                retain_storage_capture_error(
+                    &mut primary,
+                    HvfArm64BootStorageCaptureError::new(
+                        HvfArm64BootStorageCaptureErrorKind::MmioDispatcherBusy,
+                        false,
+                    ),
+                );
+                None
+            }
+            Err(HvfArm64BootMmioDispatcherError::Poisoned) => {
+                retain_storage_capture_error(
+                    &mut primary,
+                    HvfArm64BootStorageCaptureError::new(
+                        HvfArm64BootStorageCaptureErrorKind::MmioDispatcherPoisoned,
+                        false,
+                    ),
+                );
+                None
+            }
+        };
+    }
+
     let mut captured = None;
     if primary.is_none() && is_cancelled(HvfArm64BootStorageCaptureStage::Capture) {
         retain_storage_capture_error(
@@ -4315,11 +4425,13 @@ fn capture_ready_storage_state_at_with_cancel(
             ),
         );
     }
-    if primary.is_none() {
+    if primary.is_none()
+        && let Some(mmio_dispatcher) = mmio_dispatcher_guard.as_mut()
+    {
         for (config, owner) in configs.drives().iter().zip(block_owners.iter().copied()) {
             let state = match owner {
-                CaptureReadyBlockOwner::Mmio { retry } => runtime_resources
-                    .capture_ready_mmio_block_state_at(&mut mmio_dispatcher, config, retry, now)
+                CaptureReadyBlockOwner::Mmio { retry, .. } => runtime_resources
+                    .capture_ready_mmio_block_state_at(mmio_dispatcher, config, retry, now)
                     .map_err(|_| {
                         HvfArm64BootStorageCaptureError::new(
                             HvfArm64BootStorageCaptureErrorKind::BlockCapture,
@@ -4349,11 +4461,13 @@ fn capture_ready_storage_state_at_with_cancel(
             }
         }
     }
-    if primary.is_none() {
+    if primary.is_none()
+        && let Some(mmio_dispatcher) = mmio_dispatcher_guard.as_mut()
+    {
         for (config, owner) in configs.pmem().iter().zip(pmem_owners.iter().copied()) {
             let state = match owner {
                 CaptureReadyPmemOwner::Mmio { retry } => runtime_resources
-                    .capture_ready_mmio_pmem_state_at(&mut mmio_dispatcher, config, retry, now)
+                    .capture_ready_mmio_pmem_state_at(mmio_dispatcher, config, retry, now)
                     .map_err(|_| {
                         HvfArm64BootStorageCaptureError::new(
                             HvfArm64BootStorageCaptureErrorKind::PmemCapture,
@@ -5249,6 +5363,7 @@ impl HvfArm64BootSession<'_> {
             &self.runtime_resources,
             &mut self.pci_data_devices,
             &self.block_device_metrics,
+            &self.gic,
             &self.block_retry_wakeup_scheduler,
             &self.pmem_retry_wakeup_scheduler,
             configs,
@@ -7380,6 +7495,7 @@ impl OwnedHvfArm64BootSession {
             &self.runtime_resources,
             &mut self.pci_data_devices,
             &self.block_device_metrics,
+            &self.gic,
             &self.block_retry_wakeup_scheduler,
             &self.pmem_retry_wakeup_scheduler,
             configs,
@@ -14660,7 +14776,7 @@ mod tests {
         VirtioBalloonDeviceNotificationError,
     };
     use bangbang_runtime::block::{
-        BlockMmioLayout, DriveConfigInput, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        BlockMmioLayout, DriveConfig, DriveConfigInput, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
         VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE,
         VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
     };
@@ -14727,6 +14843,7 @@ mod tests {
         Arm64BootRuntimeResources, Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError,
         Arm64BootVsockNotificationDispatches, update_memory_hotplug_config_for_device,
     };
+    use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
@@ -14741,12 +14858,12 @@ mod tests {
     };
 
     use super::{
-        HvfArm64BootBalloonDeviceConfig, HvfArm64BootBalloonNotificationDispatchError,
-        HvfArm64BootBlockNotificationDispatchError, HvfArm64BootEntropyDeviceConfig,
-        HvfArm64BootEntropyNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
-        HvfArm64BootInterruptRequest, HvfArm64BootLimiterRetrySnapshotError,
-        HvfArm64BootLimiterRetryWakeupOwner, HvfArm64BootLimiterRetryWakeupQuiescenceError,
-        HvfArm64BootLimiterRetryWakeupScheduler,
+        CaptureReadyMmioBlockInterrupt, HvfArm64BootBalloonDeviceConfig,
+        HvfArm64BootBalloonNotificationDispatchError, HvfArm64BootBlockNotificationDispatchError,
+        HvfArm64BootEntropyDeviceConfig, HvfArm64BootEntropyNotificationDispatchError,
+        HvfArm64BootInterruptLinePurpose, HvfArm64BootInterruptRequest,
+        HvfArm64BootLimiterRetrySnapshotError, HvfArm64BootLimiterRetryWakeupOwner,
+        HvfArm64BootLimiterRetryWakeupQuiescenceError, HvfArm64BootLimiterRetryWakeupScheduler,
         HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceError,
         HvfArm64BootLimiterRetryWakeupSchedulerStatus, HvfArm64BootLimiterRetryWakeupToken,
         HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootMemoryHotplugNotificationDispatchError,
@@ -14769,9 +14886,10 @@ mod tests {
         record_entropy_dispatch_metrics, record_pmem_dispatch_metrics,
         replace_vmgenid_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
         signal_balloon_queue_interrupts, signal_block_queue_interrupts,
-        signal_entropy_queue_interrupts, signal_memory_hotplug_queue_interrupts,
-        signal_network_queue_interrupts, signal_pmem_queue_interrupts,
-        signal_vsock_queue_interrupts, snapshot_limiter_retry_state_at,
+        signal_capture_ready_mmio_block_interrupts, signal_entropy_queue_interrupts,
+        signal_memory_hotplug_queue_interrupts, signal_network_queue_interrupts,
+        signal_pmem_queue_interrupts, signal_vsock_queue_interrupts,
+        snapshot_limiter_retry_state_at,
     };
     use crate::coordinator::HvfVcpuRunCoordinator;
     use crate::exit::{
@@ -19455,6 +19573,82 @@ mod tests {
         assert_eq!(result.len(), 0);
         assert!(!result.has_signal_failure());
         assert_eq!(result.rate_limiter_retry_after(), None);
+    }
+
+    #[test]
+    fn capture_ready_mmio_block_interrupts_preserve_order_and_failure_metrics() {
+        let configs = CaptureReadyStorageConfigs::new(
+            vec![
+                DriveConfig::try_from(DriveConfigInput::new(
+                    "rootfs",
+                    "rootfs",
+                    "/tmp/rootfs",
+                    true,
+                ))
+                .expect("root drive should validate"),
+                DriveConfig::try_from(DriveConfigInput::new("data", "data", "/tmp/data", false))
+                    .expect("data drive should validate"),
+            ],
+            Vec::new(),
+        );
+        let interrupts = [
+            CaptureReadyMmioBlockInterrupt {
+                config_index: 1,
+                interrupt_line: line(33),
+            },
+            CaptureReadyMmioBlockInterrupt {
+                config_index: 0,
+                interrupt_line: line(32),
+            },
+        ];
+
+        let successful_metrics =
+            SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs", "data"]);
+        let (successful_lines, successful_sink) = RecordingSink::successful();
+        assert!(!signal_capture_ready_mmio_block_interrupts(
+            &interrupts,
+            &configs,
+            &successful_metrics,
+            Some(successful_sink.as_ref()),
+        ));
+        assert_eq!(recorded_lines(&successful_lines), vec![33, 32]);
+        assert_eq!(
+            successful_metrics.aggregate_snapshot(),
+            BlockDeviceMetrics::default()
+        );
+
+        let failing_metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs", "data"]);
+        let (failing_lines, failing_sink) = RecordingSink::failing("injected signal failure");
+        assert!(signal_capture_ready_mmio_block_interrupts(
+            &interrupts,
+            &configs,
+            &failing_metrics,
+            Some(failing_sink.as_ref()),
+        ));
+        assert_eq!(recorded_lines(&failing_lines), vec![33, 32]);
+        assert_eq!(
+            failing_metrics.aggregate_snapshot(),
+            BlockDeviceMetrics::default().with_event_fails(2)
+        );
+        assert_eq!(
+            failing_metrics.per_drive_snapshot(),
+            BlockDeviceMetricsByDrive::new()
+                .with_drive_metrics("rootfs", BlockDeviceMetrics::default().with_event_fails(1),)
+                .with_drive_metrics("data", BlockDeviceMetrics::default().with_event_fails(1),)
+        );
+
+        let unavailable_metrics =
+            SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs", "data"]);
+        assert!(signal_capture_ready_mmio_block_interrupts(
+            &interrupts,
+            &configs,
+            &unavailable_metrics,
+            None,
+        ));
+        assert_eq!(
+            unavailable_metrics.aggregate_snapshot(),
+            BlockDeviceMetrics::default().with_event_fails(2)
+        );
     }
 
     #[test]

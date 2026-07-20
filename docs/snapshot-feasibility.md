@@ -24,9 +24,11 @@ path.
   MMDS. Unsupported modes fail before storage work. Unsupported broad storage
   profiles run the live non-persisting preflight described below, then fail
   before contained grant claims, artifact staging, or native state capture.
-- The GICv2m foundation selected by `--enable-pci` is outside native-v1. The
-  immutable process profile rejects PCI create before pause/capture/artifact
-  work and rejects PCI load before file/grant/controller/VM mutation. The
+- The GICv2m foundation selected by `--enable-pci` is outside native-v1. A
+  paused PCI create first completes the live-storage handoff below, then rejects
+  the immutable profile before contained grant claims, native-state capture, or
+  artifact work. PCI load still rejects before file/grant/controller/VM
+  mutation. The
   frame, reserved range, shared registry/allocator state, and any delivered or
   in-flight message are not persisted or inferred during restore. Default MMIO
   create/load behavior is unchanged.
@@ -44,9 +46,11 @@ path.
   the boot owner for one complete capture-ready storage traversal. It reconciles
   every configured startup or runtime block/pmem device with its authoritative
   live MMIO or PCI owner, rejects any live vhost-user block backend first, and
-  returns a redacted in-memory state aggregate. A successful broad traversal is
-  still followed by the existing profile rejection, so it publishes no new
-  bytes and creates no load contract.
+  returns a redacted in-memory state aggregate. Async generations are stopped
+  together, drained together, and have every completion plus its MMIO SPI or PCI
+  MSI-X interrupt published before state capture and same-generation reopen. A
+  successful broad traversal is still followed by the existing profile
+  rejection, so it publishes no artifact bytes and creates no load contract.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
   network, and entropy retry schedulers, preflights both final namespaces,

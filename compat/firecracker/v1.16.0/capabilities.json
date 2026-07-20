@@ -6964,7 +6964,7 @@
     {
       "id": "semantic.transport:pci-msi-and-coexistence",
       "family": "device-transport",
-      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and native-v1 rejects PCI before mutation rather than omitting transport state.",
+      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and native-v1 create completes its live-storage handoff before rejecting PCI ahead of native-state capture and artifact mutation rather than omitting transport state; load retains its pre-VM-mutation rejection.",
       "source_refs": [
         "corpus:device-api",
         "corpus:device-hotplug"
