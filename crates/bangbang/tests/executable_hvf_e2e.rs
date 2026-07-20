@@ -3363,10 +3363,9 @@ mod macos_arm64 {
             BLOCK_SERIAL_END_MARKER,
             GUEST_EXECUTION_TIMEOUT,
         ) {
-            let serial_tail = file_tail_lossy(&serial_output_path, 512);
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not report the MMIO Sync block identity: {err}; serial tail: {serial_tail:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not report the MMIO Sync block identity: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -9218,8 +9217,7 @@ mod macos_arm64 {
         );
         assert!(
             normalized.contains(&expected_report),
-            "guest block serial must equal the host backing metadata identity {expected:?}; serial tail: {:?}",
-            text_tail_lossy(&normalized, 512)
+            "guest block serial must equal the exact host backing metadata identity"
         );
     }
 

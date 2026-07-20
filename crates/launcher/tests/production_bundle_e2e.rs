@@ -7073,7 +7073,7 @@ fn assert_block_serial_report(path: &Path, expected: &str, context: &str) {
     );
     assert!(
         normalized.contains(&expected_report),
-        "{context} guest block serial must equal the launcher-opened backing metadata identity {expected:?}; output: {normalized:?}"
+        "{context} guest block serial must equal the exact launcher-opened backing metadata identity"
     );
 }
 
