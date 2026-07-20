@@ -5,6 +5,7 @@ members = [
     "crates/launcher",
     "crates/runtime",
     "crates/session",
+    "crates/vhost-user",
     "crates/bangbang",
     "tools/firecracker-capability-audit",
     "tools/seccompiler",

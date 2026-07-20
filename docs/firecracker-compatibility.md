@@ -1215,7 +1215,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; supported when `Writeback` | The internal model accepts omitted/default `Unsafe` and explicit `Writeback`. `Unsafe` does not advertise `VIRTIO_BLK_F_FLUSH`; `Writeback` advertises it and routes guest flush requests through the backing flush path. |
 | `PUT /drives/{drive_id}` | `rate_limiter` | optional bandwidth/ops token buckets | Missing, `null`, empty-object, or all-null `bandwidth`/`ops` values are accepted as unconfigured. Configured Firecracker-shaped buckets are stored before startup, echoed through `GET /vm/config`, and applied to virtio-block queue dispatch without sleeping. |
 | `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
-| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; rejected when configured | The parser accepts Firecracker-shaped socket-backed drive requests, including requests that omit `path_on_host`, then the internal model rejects configured sockets with `drive socket is not supported` without opening host paths, creating sockets, mutating drive state, or echoing the socket path. Real vhost-user-block device support is outside the first tier. |
+| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; rejected when configured | The parser accepts Firecracker-shaped socket-backed drive requests, including requests that omit `path_on_host`, then the internal model rejects configured sockets with `drive socket is not supported` without opening host paths, creating sockets, transferring guest-memory descriptors, mutating drive state, or echoing the socket path. A strict internal frontend protocol/SCM_RIGHTS/pipe-notifier foundation exists, but it cannot open this path or activate a device; real vhost-user-block support remains deferred. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value before building the runtime update action. |
 | `PATCH /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |
@@ -1670,10 +1670,18 @@ reads while deallocating the range. The native image loader has an explicit
 internal shared-profile entry point, while public native-v1 restore remains
 anonymous. macOS provides no `memfd` sealing equivalent, so a future external
 recipient of a writable descriptor is an explicit trusted capability boundary.
-This shared-RAM foundation hands no descriptor to a backend and does not accept
+A separate internal `bangbang-vhost-user` crate now implements the closed
+Firecracker v1.16 block frontend request set over an already connected Unix
+stream: owner/feature negotiation, optional CONFIG and REPLY_ACK, exact
+memory-table and vring setup, native-endian bounded framing, first-header-byte
+SCM_RIGHTS, absolute deadlines, terminal synchronization failure, and
+directional eight-byte nonblocking pipe notifications with Darwin kqueue
+evidence. Its test-only control peer is not a shipped storage backend. This
+shared-RAM and protocol foundation still hands no descriptor to an external
+backend, opens no socket path, constructs no block device, and does not accept
 a public vhost-user socket. Direct pmem is a separate classified host mapping;
 it does not export or reclassify ordinary guest RAM. The runtime does not use
-Firecracker's `vm-memory` crate.
+Firecracker's `vm-memory` or `vhost` crates.
 
 Guest memory byte access validates the whole requested guest address range
 before copying. Overflow, unmapped holes, and the aarch64 MMIO64 gap fail
