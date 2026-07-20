@@ -1140,7 +1140,6 @@ pub enum DriveUpdateError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriveRuntimeMutationError {
     InvalidConfig(DriveConfigError),
-    UnsupportedBackend,
     EmptyDriveId,
     InvalidDriveId { drive_id: String },
     DuplicateDrive { drive_id: String },
@@ -1241,9 +1240,6 @@ impl fmt::Display for DriveRuntimeMutationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(source) => write!(f, "{source}"),
-            Self::UnsupportedBackend => {
-                f.write_str("vhost-user drive runtime mutation is not supported")
-            }
             Self::EmptyDriveId => f.write_str("path drive_id must not be empty"),
             Self::InvalidDriveId { .. } => {
                 f.write_str("path drive_id must contain only alphanumeric characters or '_'")
@@ -1295,8 +1291,7 @@ impl std::error::Error for DriveRuntimeMutationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidConfig(source) => Some(source),
-            Self::UnsupportedBackend
-            | Self::EmptyDriveId
+            Self::EmptyDriveId
             | Self::InvalidDriveId { .. }
             | Self::DuplicateDrive { .. }
             | Self::RootInsertUnsupported
