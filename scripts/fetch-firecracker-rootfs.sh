@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v54"
+direct_boot_variant="direct-boot-v55"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -410,6 +410,31 @@ cmdline_has() {
     *" $1 "*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+report_block_serial() {
+  device=$1
+  serial_path="/sys/block/$device/serial"
+  if [ ! -r "$serial_path" ]; then
+    emit_line BANGBANG_BLOCK_SERIAL_FAIL_NO_SERIAL
+    return
+  fi
+
+  block_serial=$(cat "$serial_path" 2>/dev/null || true)
+  case "$block_serial" in
+    ''|*[!0-9]*)
+      emit_line BANGBANG_BLOCK_SERIAL_FAIL_INVALID
+      return
+      ;;
+  esac
+  if [ "${#block_serial}" -gt 20 ]; then
+    emit_line BANGBANG_BLOCK_SERIAL_FAIL_TOO_LONG
+    return
+  fi
+
+  emit_line BANGBANG_BLOCK_SERIAL_BEGIN
+  emit_line "$block_serial"
+  emit_line BANGBANG_BLOCK_SERIAL_END
 }
 
 write_vdb_marker_at_sector() {
@@ -2860,6 +2885,11 @@ if [ -r /proc/cmdline ]; then
   cmdline=$(cat /proc/cmdline 2>/dev/null || true)
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
+fi
+if cmdline_has bangbang.block-serial=vda; then
+  report_block_serial vda
+elif cmdline_has bangbang.block-serial=vdb; then
+  report_block_serial vdb
 fi
 if cmdline_has bangbang.pmem-root=ro; then
   check_pmem_root_marker ro

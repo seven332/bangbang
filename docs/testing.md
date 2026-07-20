@@ -1767,6 +1767,15 @@ direct and contained hotplug cases prove guest PCI rescan, seed read,
 write/readback/fsync, sysfs removal, Paused DELETE/PUT ordering, exact capacity
 reuse, success-only config projection, and clean shutdown.
 
+Block identity has independent host/guest proof. Unit tests derive the expected
+20 bytes directly from backing metadata, cover Sync-to-Async and path refresh
+commit/rollback behavior, and validate current, legacy, and unrelated
+native-v1 IDs. Signed direct evidence compares a default MMIO/Sync data
+backing's host metadata with Linux `/sys/block/vdb/serial`. Signed production
+evidence repeats the comparison for a PCI/Async rootfs after the launcher has
+opened the grant and its source pathname has been replaced, using
+`/sys/block/vda/serial` to prove the contained descriptor identity.
+
 The internal regular-file asynchronous executor has a separate deterministic
 unsigned gate under `block::async_executor`. Its injected-host tests cover the
 fixed task and staging budgets, completed-but-unapplied lease ownership,

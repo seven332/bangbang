@@ -16,6 +16,7 @@ mod macos_arm64 {
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::Shutdown;
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -49,6 +50,8 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_VMCLOCK_MARKER: &[u8] = b"BANGBANG_VMCLOCK_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-writeback-flush=1";
     const DIRECT_ROOTFS_WRITEBACK_FLUSH_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITEBACK_FLUSH_OK";
+    const BLOCK_SERIAL_BEGIN_MARKER: &[u8] = b"BANGBANG_BLOCK_SERIAL_BEGIN";
+    const BLOCK_SERIAL_END_MARKER: &[u8] = b"BANGBANG_BLOCK_SERIAL_END";
     const VHOST_USER_BLOCK_HOST_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_HOST";
     const VHOST_USER_BLOCK_RO_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_ro_OK";
     const VHOST_USER_BLOCK_RW_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_rw_OK";
@@ -3226,11 +3229,14 @@ mod macos_arm64 {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let data_backing_path = test_dir.path().join("data.img");
+        let serial_output_path = test_dir.path().join("serial.out");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
         let instance_id = test_dir.instance_id();
 
         create_zeroed_block_backing(&data_backing_path);
+        create_empty_file(&serial_output_path);
+        let expected_device_id = expected_block_device_id(&data_backing_path);
 
         let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
 
@@ -3245,7 +3251,9 @@ mod macos_arm64 {
         );
 
         let kernel_path_json = json_string(path_text(&kernel_path));
-        let boot_args_json = json_string(DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS);
+        let boot_args_json = json_string(&format!(
+            "{DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS} bangbang.block-serial=vdb"
+        ));
         let boot_body = format!(
             r#"{{
                 "kernel_image_path":{kernel_path_json},
@@ -3308,6 +3316,14 @@ mod macos_arm64 {
             "GET /vm/config after writeback block drive",
         );
 
+        let serial_output_path_json = json_string(path_text(&serial_output_path));
+        let serial_body = format!(r#"{{"serial_out_path":{serial_output_path_json}}}"#);
+        let serial_response = http_put_json(&socket_path, "/serial", &serial_body);
+        assert_no_content_response(
+            &serial_response,
+            "PUT /serial writeback block device identity",
+        );
+
         let start_response = http_put_json(
             &socket_path,
             "/actions",
@@ -3341,6 +3357,20 @@ mod macos_arm64 {
                 output.status, output.stdout, output.stderr
             );
         }
+
+        if let Err(err) = wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_SERIAL_END_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let serial_tail = file_tail_lossy(&serial_output_path, 512);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not report the MMIO Sync block identity: {err}; serial tail: {serial_tail:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_block_serial_report(&serial_output_path, &expected_device_id);
 
         assert_clean_shutdown(
             bangbang.terminate(),
@@ -9166,6 +9196,31 @@ mod macos_arm64 {
             )
         });
         bytes
+    }
+
+    fn expected_block_device_id(path: &Path) -> String {
+        let metadata = fs::metadata(path)
+            .unwrap_or_else(|err| panic!("failed to read {} metadata: {err}", path.display()));
+        format!("{}{}{}", metadata.dev(), metadata.rdev(), metadata.ino())
+            .chars()
+            .take(20)
+            .collect()
+    }
+
+    fn assert_block_serial_report(path: &Path, expected: &str) {
+        let output =
+            fs::read(path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let normalized = String::from_utf8_lossy(&output).replace('\r', "");
+        let expected_report = format!(
+            "{}\n{expected}\n{}",
+            String::from_utf8_lossy(BLOCK_SERIAL_BEGIN_MARKER),
+            String::from_utf8_lossy(BLOCK_SERIAL_END_MARKER),
+        );
+        assert!(
+            normalized.contains(&expected_report),
+            "guest block serial must equal the host backing metadata identity {expected:?}; serial tail: {:?}",
+            text_tail_lossy(&normalized, 512)
+        );
     }
 
     fn file_prefix_lossy(path: &Path, len: usize) -> String {

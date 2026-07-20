@@ -1602,6 +1602,17 @@ types write the virtio unsupported status. Completion metadata records the head
 descriptor index and the bytes written to guest memory, including the status
 byte when status writing succeeds.
 
+For a file-backed drive, the device ID matches Firecracker v1.16.0: it is the
+decimal concatenation of `st_dev`, `st_rdev`, and `st_ino` from the metadata of
+the same opened backing descriptor, truncated or NUL-padded to 20 bytes.
+Successful path or same-ID backing replacement publishes the replacement ID
+with the replacement backing; limiter-only updates retain the current ID.
+Contained startup and replacement therefore derive identity from the
+launcher-opened file rather than from a later pathname lookup. Native-v1 keeps
+its fixed layout: new captures persist this metadata-derived value, while load
+accepts and preserves either that exact value or the legacy drive-ID-derived
+value written by earlier bangbang artifacts. Any third value fails validation.
+
 The runtime crate can drain an internal virtio-block queue by popping available
 descriptor chains, parsing and executing each request, publishing used-ring
 completion elements, and returning queue-interrupt intent when at least one

@@ -434,9 +434,9 @@ pub fn capture_snapshot_v1_device_state(
 
     let expected_config_space =
         VirtioBlockConfigSpace::from_backing(live_backing, config.cache_type());
-    let expected_device_id = VirtioBlockDeviceId::from_bytes(config.drive_id().as_bytes());
     if input.block_handler.device_config_handler() != &expected_config_space
-        || live_device.device_id() != expected_device_id
+        || !live_backing
+            .snapshot_device_id_is_compatible(config.drive_id(), live_device.device_id())
     {
         return Err(SnapshotV1DeviceCaptureError::BlockConfigurationMismatch);
     }
@@ -1810,8 +1810,9 @@ mod tests {
     #[test]
     fn preparation_reopens_backing_and_builds_fresh_serial_resources_off_side() {
         let file = TempFile::new(&[0x5a; 512]);
-        let (_, identity) = BlockFileBacking::open_snapshot_read_only(file.path())
+        let (observed_backing, identity) = BlockFileBacking::open_snapshot_read_only(file.path())
             .expect("test backing should identify");
+        let backing_device_id = observed_backing.device_id();
         let mut state = fixture_with_path(file.path().to_path_buf(), identity);
         let vmclock_base = aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE - 4096;
         let vmgenid_base = vmclock_base - 16;
@@ -1857,6 +1858,30 @@ mod tests {
         assert_eq!(prepared.vmgenid_device().generation_id, generation_id);
         assert!(format!("{prepared:?}").contains("<redacted>"));
         assert!(!format!("{prepared:?}").contains(file.path().to_string_lossy().as_ref()));
+
+        assert_eq!(
+            prepared.block_handler().activation_handler().device_id(),
+            VirtioBlockDeviceId::from_bytes(b"rootfs"),
+            "legacy native-v1 state should preserve its persisted guest ID"
+        );
+
+        let mut current_identity_state = state.clone();
+        current_identity_state.root_block.device_id = backing_device_id;
+        let current =
+            prepare_snapshot_v1_device_profile(&current_identity_state, &memory, Instant::now())
+                .expect("metadata-derived native-v1 state should prepare");
+        assert_eq!(
+            current.block_handler().activation_handler().device_id(),
+            backing_device_id
+        );
+
+        let mut unrelated_identity_state = state.clone();
+        unrelated_identity_state.root_block.device_id = VirtioBlockDeviceId::new([0xff; 20]);
+        assert_eq!(
+            prepare_snapshot_v1_device_profile(&unrelated_identity_state, &memory, Instant::now(),)
+                .expect_err("unrelated persisted block ID should reject"),
+            PrepareSnapshotV1DeviceProfileError::BlockDeviceIdMismatch
+        );
 
         let mut duplicate_region_id = state.clone();
         duplicate_region_id.serial_mmio = mmio(

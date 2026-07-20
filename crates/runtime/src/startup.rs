@@ -23,7 +23,7 @@ use crate::block::{
     DriveConfig, DriveConfigInput, DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig,
     DriveUpdateError, PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
     PreparedVhostUserBlockFrontend, VhostUserBlockConfigSignalError, VirtioBlockBackendKind,
-    VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockDeviceNotificationDispatch,
+    VirtioBlockConfigSpace, VirtioBlockDeviceNotificationDispatch,
     VirtioBlockDeviceNotificationError, VirtioBlockLiveUpdateError, VirtioBlockMmioHandler,
     VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError, VirtioBlockRuntimeRestoreInput,
 };
@@ -969,8 +969,7 @@ pub fn prepare_snapshot_v1_device_profile_with_root_backing(
     if config_space.capacity_sectors() != root.capacity_sectors() {
         return Err(PrepareSnapshotV1DeviceProfileError::BlockCapacityMismatch);
     }
-    let expected_device_id = VirtioBlockDeviceId::from_bytes(root.drive_id().as_bytes());
-    if expected_device_id != root.device_id() {
+    if !backing.snapshot_device_id_is_compatible(root.drive_id(), root.device_id()) {
         return Err(PrepareSnapshotV1DeviceProfileError::BlockDeviceIdMismatch);
     }
     let block_handler = root
