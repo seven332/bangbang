@@ -251,9 +251,27 @@ preflight; and caller-coordinated DELETE releases the complete endpoint for
 same-ID/slot reuse. Signed evidence covers Linux capacity refresh, guest I/O,
 Paused mutation, invalid negotiation rollback, duplicate and anonymous-profile
 zero-connect rejection, teardown, and reuse. Live same-ID PUT remains a
-duplicate as in pinned v1.16. Contained authorized stream delivery, vhost
-snapshot state, Async, and complete broad-corpus semantics remain owned by
-later slices, so the inventory counts are unchanged.
+duplicate as in pinned v1.16. At that checkpoint contained authorized stream
+delivery, vhost snapshot state, Async, and complete broad-corpus semantics
+remained owned by later slices, so the inventory counts were unchanged.
+
+#1449 extends those same nonterminal records plus the isolation summaries with
+contained vhost-user block authority. Lifecycle v5 retains a dedicated broker
+facet; a repeatable `VhostUserSocketDirectory + ConnectChildren` grant owns one
+exact anchored directory while per-drive leases name bounded children. Startup
+and eligible all-PCI runtime PUT obtain only authenticated connected streams,
+normal broker failure is retryable, owner/startup preflight makes zero requests,
+ID-only PATCH reuses the active stream, and DELETE releases a child lease while
+retaining directory authority for later same-ID reinsertion. Signed production
+evidence boots an exact vhost root and scratch child alongside vsock from one
+grant, proves scratch read/write/flush and guest-observed active resize, and
+uses an all-PCI shared-memory guest to cover invalid-target and negotiation
+rollback, new-ID attach, duplicate zero-connect rejection, manual removal,
+DELETE, Paused same-ID reuse through another child, resumed I/O, and exact
+closure without a steady-state helper or entitlement change.
+Snapshot state, Async/io_uring, dynamic-memory coexistence, and the broad
+vhost/storage aggregates remain nonterminal, so the inventory counts are
+unchanged.
 
 ## Commands
 

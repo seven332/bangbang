@@ -5,6 +5,9 @@
     clippy::unwrap_used
 )]
 
+#[path = "../../../tests/support/vhost_user_block.rs"]
+mod vhost_user_block;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,8 +30,9 @@ use bangbang_launcher::{
 };
 use bangbang_session::{
     Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD,
-    SOCKET_BROKER_FD, SessionId, WorkerPolicy, encode_frame,
+    SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy, encode_frame,
 };
+use vhost_user_block::{VhostUserBlockBackend, VhostUserBlockBackendOptions};
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
 const GRANT_TEST_BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH";
@@ -89,10 +93,23 @@ const OUTPUT_SERIAL_SEED: &[u8] = b"serial-seed\n";
 const OUTPUT_REPLACEMENT: &[u8] = b"replacement-path-must-remain-unused\n";
 const API_SOCKET_DIRECTORY_ID: &str = "grant-api-socket-directory-1365";
 const VSOCK_SOCKET_DIRECTORY_ID: &str = "grant-vsock-socket-directory-1365";
+const VHOST_USER_SOCKET_DIRECTORY_ID: &str = "grant-vhost-user-socket-directory-1449";
 const API_SOCKET_CHILD: &str = "api-1365.sock";
 const VSOCK_SOCKET_CHILD: &str = "vsock-1365.sock";
+const VHOST_USER_SOCKET_CHILD_ONE: &str = "vhost-one.sock";
+const VHOST_USER_SOCKET_CHILD_TWO: &str = "vhost-two.sock";
+const VHOST_USER_SOCKET_CHILD_THREE: &str = "vhost-three.sock";
 const API_SOCKET_REF: &str = "bangbang-grant:grant-api-socket-directory-1365/api-1365.sock";
 const VSOCK_SOCKET_REF: &str = "bangbang-grant:grant-vsock-socket-directory-1365/vsock-1365.sock";
+const VHOST_USER_SOCKET_REF_ONE: &str =
+    "bangbang-grant:grant-vhost-user-socket-directory-1449/vhost-one.sock";
+const VHOST_USER_SOCKET_REF_TWO: &str =
+    "bangbang-grant:grant-vhost-user-socket-directory-1449/vhost-two.sock";
+const VHOST_USER_SOCKET_REF_THREE: &str =
+    "bangbang-grant:grant-vhost-user-socket-directory-1449/vhost-three.sock";
+const CONTAINED_VHOST_USER_HOST_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_HOST";
+const CONTAINED_VHOST_USER_SUCCESS_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_ro_OK";
+const VHOST_CONFIG_RESIZED_MARKER: &[u8] = b"BANGBANG_VHOST_CONFIG_RESIZED";
 const SNAPSHOT_KERNEL_ID: &str = "grant-snapshot-kernel-1368";
 const SNAPSHOT_ROOT_ID: &str = "grant-snapshot-root-1368";
 const SNAPSHOT_METRICS_ID: &str = "grant-snapshot-metrics-1368";
@@ -116,6 +133,7 @@ const SNAPSHOT_STATE_INPUT_REF: &str = "bangbang-grant:grant-snapshot-state-inpu
 const SNAPSHOT_MEMORY_INPUT_REF: &str = "bangbang-grant:grant-snapshot-memory-input-1368";
 const SNAPSHOT_DESCRIBE_INPUT_REF: &str = "bangbang-grant:grant-snapshot-describe-input-1368";
 const SNAPSHOT_STAGING_HOLD_OPTION: &str = "--bangbang-internal-snapshot-staging-hold-v1";
+const SNAPSHOT_STAGING_RECORD_BYTES: u64 = 128;
 const SNAPSHOT_STATE_CHILD: &str = "state-1368.snap";
 const SNAPSHOT_MEMORY_CHILD: &str = "memory-1368.snap";
 const SNAPSHOT_REPEAT_STATE_CHILD: &str = "state-repeat-1368.snap";
@@ -1240,7 +1258,11 @@ fn grant_test_bundle_recovers_recorded_snapshot_staging_after_worker_sigkill() {
             .wait_for_snapshot_staging(PROCESS_TIMEOUT)
             .expect("recorded memory staging file should appear");
         record_watch
-            .wait_for_child(".snapshot-memory-owner", PROCESS_TIMEOUT)
+            .wait_for_child_with_len(
+                ".snapshot-memory-owner",
+                SNAPSHOT_STAGING_RECORD_BYTES,
+                PROCESS_TIMEOUT,
+            )
             .expect("worker must durably record ownership before the test hold");
 
         let mut moved_owned = None;
@@ -1431,6 +1453,510 @@ fn normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers() {
 }
 
 #[test]
+fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers() {
+    let bundle = production_bundle();
+    let fixture = SocketDirectoryGrantFixture::new_with_vhost_user("vhost-user");
+    let root_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_ONE);
+    let scratch_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_TWO);
+    let root_backing = fixture.devices.rootfs.clone();
+    let scratch_backing = fixture.vhost_user_backing("vhost-scratch.img");
+    let backing_len = 8 * 512_u64;
+    create_sized_file(&scratch_backing, backing_len);
+    OpenOptions::new()
+        .write(true)
+        .open(&scratch_backing)
+        .expect("contained vhost scratch backing should open")
+        .write_all(CONTAINED_VHOST_USER_HOST_MARKER)
+        .expect("contained vhost host marker should write");
+    let root_backend = VhostUserBlockBackend::start(
+        &root_socket,
+        &root_backing,
+        VhostUserBlockBackendOptions::regular(true),
+    )
+    .expect("contained vhost root backend should start");
+    let scratch_backend = VhostUserBlockBackend::start(
+        &scratch_socket,
+        &scratch_backing,
+        VhostUserBlockBackendOptions::regular(false),
+    )
+    .expect("contained vhost scratch backend should start");
+
+    let mut running = spawn_ready_socket_grant_api_launcher(&bundle, &fixture, "vhost-user");
+    let worker = only_worker_pid(&running.child);
+    assert!(
+        child_pids(worker).is_empty(),
+        "contained vhost connection must not retain a helper"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT contained-vhost machine config",
+    );
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "boot_args": "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.vhost-user-block=ro bangbang.expect-vhost-resize=1",
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot source should serialize"),
+        ),
+        204,
+        "PUT contained-vhost boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "is_root_device": true,
+                "socket": VHOST_USER_SOCKET_REF_ONE,
+            }),
+            "PUT contained-vhost root device",
+        ),
+        (
+            "/drives/scratch",
+            serde_json::json!({
+                "drive_id": "scratch",
+                "is_root_device": false,
+                "cache_type": "Writeback",
+                "socket": VHOST_USER_SOCKET_REF_TWO,
+            }),
+            "PUT contained-vhost scratch device",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("drive request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/vsock",
+            &serde_json::to_string(&serde_json::json!({
+                "guest_cid": 3,
+                "uds_path": VSOCK_SOCKET_REF,
+            }))
+            .expect("vsock request should serialize"),
+        ),
+        204,
+        "PUT vsock alongside contained vhost children",
+    );
+    let before_start = http_get(&running.socket, "/vm/config");
+    assert!(before_start.contains(VHOST_USER_SOCKET_REF_ONE));
+    assert!(before_start.contains(VHOST_USER_SOCKET_REF_TWO));
+    assert!(before_start.contains(VSOCK_SOCKET_REF));
+    assert!(!fixture.vsock_socket().exists());
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start contained-vhost guest",
+    );
+    root_backend
+        .wait_for_activation(PROCESS_TIMEOUT)
+        .expect("contained vhost root backend should activate");
+    scratch_backend
+        .wait_for_activation(PROCESS_TIMEOUT)
+        .expect("contained vhost scratch backend should activate");
+    assert_socket_mode(
+        &fixture.vsock_socket(),
+        0o600,
+        "coexisting granted vsock socket",
+    );
+    assert!(
+        child_pids(worker).is_empty(),
+        "active contained vhost streams must not retain a helper"
+    );
+    wait_for_file_prefix(
+        &scratch_backing,
+        CONTAINED_VHOST_USER_SUCCESS_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should boot from vhost root and complete scratch I/O");
+    scratch_backend
+        .wait_for_flush(PROCESS_TIMEOUT)
+        .expect("contained vhost scratch should observe the synchronous guest write flush");
+    OpenOptions::new()
+        .write(true)
+        .open(&scratch_backing)
+        .expect("contained vhost scratch should reopen for resize")
+        .set_len(10 * 512)
+        .expect("contained vhost scratch should resize");
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/drives/scratch",
+            r#"{"drive_id":"scratch"}"#,
+        ),
+        204,
+        "PATCH active contained-vhost scratch",
+    );
+    wait_for_file_contains(
+        &scratch_backing,
+        VHOST_CONFIG_RESIZED_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should observe contained vhost scratch capacity refresh");
+    assert_eq!(
+        root_backend.report().config_requests,
+        1,
+        "contained vhost root should use one startup discovery"
+    );
+    let scratch_report = scratch_backend.report();
+    assert_eq!(
+        scratch_report.config_requests, 2,
+        "startup and PATCH should use the existing scratch frontend"
+    );
+    assert!(scratch_report.reads > 0);
+    assert!(scratch_report.writes > 0);
+    assert!(scratch_report.flushes > 0);
+
+    stop_running_launcher(&mut running, "contained-vhost guest shutdown");
+    root_backend
+        .wait_for_frontend_close(PROCESS_TIMEOUT)
+        .expect("contained vhost root frontend should close");
+    scratch_backend
+        .wait_for_frontend_close(PROCESS_TIMEOUT)
+        .expect("contained vhost scratch frontend should close");
+    let root_report = root_backend
+        .finish()
+        .expect("contained vhost root backend should finish");
+    let scratch_report = scratch_backend
+        .finish()
+        .expect("contained vhost scratch backend should finish");
+    assert!(root_report.activated && scratch_report.activated);
+    assert!(root_report.frontend_closed && scratch_report.frontend_closed);
+    assert!(!root_socket.exists() && !scratch_socket.exists());
+    assert!(!fixture.vsock_socket().exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block() {
+    let bundle = production_bundle();
+    let fixture = SocketDirectoryGrantFixture::new_with_vhost_user("vhost-user-runtime");
+    let control_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_ONE);
+    let first_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_TWO);
+    let second_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_THREE);
+    let invalid_child = "not-a-socket.sock";
+    let invalid_socket = fixture.vhost_user_socket(invalid_child);
+    let invalid_ref = format!("bangbang-grant:{VHOST_USER_SOCKET_DIRECTORY_ID}/{invalid_child}");
+    let control_backing = fixture.vhost_user_backing("runtime-control.img");
+    let first_backing = fixture.vhost_user_backing("runtime-first.img");
+    let second_backing = fixture.vhost_user_backing("runtime-second.img");
+    create_sized_file(&control_backing, 1024);
+    create_sized_file(&first_backing, 512);
+    create_sized_file(&second_backing, 512);
+    resize_and_write_file_marker_at(&first_backing, 512, 0, BLOCK_HOTPLUG_HOST_ONE_MARKER);
+    resize_and_write_file_marker_at(&second_backing, 512, 0, BLOCK_HOTPLUG_HOST_TWO_MARKER);
+    fs::write(&invalid_socket, b"not a socket").expect("invalid endpoint fixture should create");
+    let control_backend = VhostUserBlockBackend::start(
+        &control_socket,
+        &control_backing,
+        VhostUserBlockBackendOptions::regular(false),
+    )
+    .expect("contained runtime-vhost control backend should start");
+
+    let mut running = spawn_ready_socket_grant_api_launcher_with_extra_args(
+        &bundle,
+        &fixture,
+        "vhost-user-runtime",
+        &["--enable-pci"],
+    );
+    let worker = only_worker_pid(&running.child);
+    assert!(
+        child_pids(worker).is_empty(),
+        "contained runtime vhost setup must not retain a helper"
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT contained runtime-vhost machine config",
+    );
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "boot_args": DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("boot source should serialize"),
+        ),
+        204,
+        "PUT contained runtime-vhost boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": GUEST_ROOTFS_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT contained runtime-vhost rootfs",
+        ),
+        (
+            "/drives/control",
+            serde_json::json!({
+                "drive_id": "control",
+                "is_root_device": false,
+                "cache_type": "Writeback",
+                "socket": VHOST_USER_SOCKET_REF_ONE,
+            }),
+            "PUT contained runtime-vhost control drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("drive request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start contained runtime-vhost guest",
+    );
+    control_backend
+        .wait_for_activation(PROCESS_TIMEOUT)
+        .expect("contained runtime-vhost control backend should activate");
+    wait_for_file_prefix(
+        &control_backing,
+        BLOCK_HOTPLUG_READY_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained runtime-vhost guest should become ready");
+
+    let invalid = serde_json::json!({
+        "drive_id": "invalid",
+        "is_root_device": false,
+        "socket": invalid_ref,
+    });
+    let invalid_response = http_put(
+        &running.socket,
+        "/drives/invalid",
+        &serde_json::to_string(&invalid).expect("invalid endpoint request should serialize"),
+    );
+    assert_http_status(
+        &invalid_response,
+        400,
+        "runtime PUT rejected contained vhost target",
+    );
+    assert!(
+        invalid_response.contains("contained vhost-user socket connection failed"),
+        "response:\n{invalid_response}"
+    );
+    assert!(!invalid_response.contains(VHOST_USER_SOCKET_DIRECTORY_ID));
+    assert!(!invalid_response.contains(invalid_child));
+    assert!(!http_get(&running.socket, "/vm/config").contains(r#""drive_id":"invalid""#));
+    assert!(http_get(&running.socket, "/").contains(r#""state":"Running""#));
+
+    let rejected_backend = VhostUserBlockBackend::start(
+        &first_socket,
+        &first_backing,
+        VhostUserBlockBackendOptions::regular(false).without_config_protocol(),
+    )
+    .expect("rejecting contained runtime-vhost backend should start");
+    let rejected = serde_json::json!({
+        "drive_id": "rejected",
+        "is_root_device": false,
+        "socket": VHOST_USER_SOCKET_REF_TWO,
+    });
+    let rejected_response = http_put(
+        &running.socket,
+        "/drives/rejected",
+        &serde_json::to_string(&rejected).expect("rejected drive request should serialize"),
+    );
+    assert_http_status(
+        &rejected_response,
+        400,
+        "runtime PUT rejected contained vhost negotiation",
+    );
+    assert!(rejected_response.contains("vhost-user backend lacks configuration protocol support"));
+    assert!(!rejected_response.contains(VHOST_USER_SOCKET_REF_TWO));
+    assert!(!http_get(&running.socket, "/vm/config").contains(r#""drive_id":"rejected""#));
+    let rejected_report = rejected_backend
+        .finish()
+        .expect("rejecting contained runtime-vhost backend should finish");
+    assert!(rejected_report.discovery_rejected);
+
+    let first_backend = VhostUserBlockBackend::start(
+        &first_socket,
+        &first_backing,
+        VhostUserBlockBackendOptions::regular(false),
+    )
+    .expect("first contained runtime-vhost backend should start");
+    let second_backend = VhostUserBlockBackend::start(
+        &second_socket,
+        &second_backing,
+        VhostUserBlockBackendOptions::regular(false),
+    )
+    .expect("second contained runtime-vhost backend should start");
+    let first = serde_json::json!({
+        "drive_id": "hotdata",
+        "is_root_device": false,
+        "cache_type": "Writeback",
+        "socket": VHOST_USER_SOCKET_REF_TWO,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/hotdata",
+            &serde_json::to_string(&first).expect("first runtime drive should serialize"),
+        ),
+        204,
+        "runtime PUT first contained vhost block",
+    );
+    let second = serde_json::json!({
+        "drive_id": "hotdata",
+        "is_root_device": false,
+        "cache_type": "Writeback",
+        "socket": VHOST_USER_SOCKET_REF_THREE,
+    });
+    let duplicate_response = http_put(
+        &running.socket,
+        "/drives/hotdata",
+        &serde_json::to_string(&second).expect("duplicate runtime drive should serialize"),
+    );
+    assert_http_status(
+        &duplicate_response,
+        400,
+        "duplicate runtime PUT contained vhost block",
+    );
+    assert!(duplicate_response.contains("drive is already configured"));
+    assert_eq!(
+        second_backend.report().owner_requests,
+        0,
+        "duplicate same-ID PUT must not request another broker connection"
+    );
+    first_backend
+        .wait_for_activation(PROCESS_TIMEOUT)
+        .expect("first contained runtime-vhost backend should activate");
+    wait_for_file_prefix(
+        &first_backing,
+        BLOCK_HOTPLUG_GUEST_ONE_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("first contained runtime-vhost block should complete guest I/O");
+    wait_for_file_prefix(
+        &control_backing,
+        BLOCK_HOTPLUG_FIRST_REMOVED_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should remove first contained runtime-vhost PCI function");
+
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause before contained runtime-vhost reuse",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/drives/hotdata", ""),
+        204,
+        "DELETE first contained runtime-vhost block",
+    );
+    first_backend
+        .wait_for_frontend_close(PROCESS_TIMEOUT)
+        .expect("first contained runtime-vhost frontend should close after DELETE");
+    assert!(!http_get(&running.socket, "/vm/config").contains(r#""drive_id":"hotdata""#));
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/hotdata",
+            &serde_json::to_string(&second).expect("reused runtime drive should serialize"),
+        ),
+        204,
+        "paused PUT reused contained vhost block",
+    );
+    assert!(http_get(&running.socket, "/vm/config").contains(VHOST_USER_SOCKET_REF_THREE));
+    resize_and_write_file_marker_at(&control_backing, 1024, 512, BLOCK_HOTPLUG_CONTINUE_MARKER);
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume after contained runtime-vhost reuse",
+    );
+    second_backend
+        .wait_for_activation(PROCESS_TIMEOUT)
+        .expect("reused contained runtime-vhost backend should activate");
+    wait_for_file_prefix(
+        &second_backing,
+        BLOCK_HOTPLUG_GUEST_TWO_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("reused contained runtime-vhost block should complete guest I/O");
+    wait_for_file_prefix(
+        &control_backing,
+        BLOCK_HOTPLUG_SUCCESS_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should remove reused contained runtime-vhost PCI function");
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/drives/hotdata", ""),
+        204,
+        "final DELETE contained runtime-vhost block",
+    );
+    second_backend
+        .wait_for_frontend_close(PROCESS_TIMEOUT)
+        .expect("reused contained runtime-vhost frontend should close after DELETE");
+    assert!(
+        child_pids(worker).is_empty(),
+        "contained runtime vhost lifecycle must not retain a helper"
+    );
+
+    stop_running_launcher(&mut running, "contained runtime-vhost guest shutdown");
+    control_backend
+        .wait_for_frontend_close(PROCESS_TIMEOUT)
+        .expect("contained runtime-vhost control frontend should close at shutdown");
+    let control_report = control_backend
+        .finish()
+        .expect("contained runtime-vhost control backend should finish");
+    let first_report = first_backend
+        .finish()
+        .expect("first contained runtime-vhost backend should finish");
+    let second_report = second_backend
+        .finish()
+        .expect("second contained runtime-vhost backend should finish");
+    assert!(control_report.activated && control_report.frontend_closed);
+    assert!(first_report.activated && first_report.frontend_closed);
+    assert!(second_report.activated && second_report.frontend_closed);
+    assert!(!control_socket.exists() && !first_socket.exists() && !second_socket.exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
 fn normal_bundle_routes_host_vsock_through_supplied_granted_listener() {
     let bundle = production_bundle();
     let fixture = SocketDirectoryGrantFixture::new("host-vsock");
@@ -1539,13 +2065,7 @@ fn normal_bundle_routes_host_vsock_through_supplied_granted_listener() {
     );
 
     verify_deterministic_stream(&mut stream, GRANTED_HOST_VSOCK_GUEST_SEED, PROCESS_TIMEOUT)
-        .unwrap_or_else(|error| {
-            let marker = fs::read(&fixture.devices.data).unwrap_or_default();
-            panic!(
-                "guest-to-host deterministic stream should verify: {error}; guest marker: {:?}",
-                String::from_utf8_lossy(&marker)
-            )
-        });
+        .expect("guest-to-host deterministic stream should verify");
     write_deterministic_stream(&mut stream, GRANTED_HOST_VSOCK_HOST_SEED, PROCESS_TIMEOUT)
         .expect("host-to-guest deterministic stream should write");
     stream
@@ -3545,12 +4065,15 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
         UnixDatagram::pair().expect("grant socketpair should open");
     let (_broker_parent, broker_child_endpoint) =
         UnixDatagram::pair().expect("broker socketpair should open");
+    let (_vhost_broker_parent, vhost_broker_child_endpoint) =
+        UnixDatagram::pair().expect("vhost broker socketpair should open");
     parent
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bootstrap read timeout should set");
     let child_fd = child_endpoint.as_raw_fd();
     let grant_child_fd = grant_child_endpoint.as_raw_fd();
     let broker_child_fd = broker_child_endpoint.as_raw_fd();
+    let vhost_broker_child_fd = vhost_broker_child_endpoint.as_raw_fd();
     let mut command = Command::new(worker_executable(&bundle));
     command
         .env_clear()
@@ -3572,6 +4095,9 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
             if libc::dup2(broker_child_fd, SOCKET_BROKER_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if libc::dup2(vhost_broker_child_fd, VHOST_USER_BROKER_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -3581,6 +4107,7 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
     drop(child_endpoint);
     drop(grant_child_endpoint);
     drop(broker_child_endpoint);
+    drop(vhost_broker_child_endpoint);
 
     let mut hello_bytes = vec![0_u8; 56];
     parent
@@ -4478,10 +5005,19 @@ struct SocketDirectoryGrantFixture {
     _socket_root: TestDir,
     api_directory: PathBuf,
     vsock_directory: PathBuf,
+    vhost_user_directory: PathBuf,
 }
 
 impl SocketDirectoryGrantFixture {
     fn new(case: &str) -> Self {
+        Self::build(case, false)
+    }
+
+    fn new_with_vhost_user(case: &str) -> Self {
+        Self::build(case, true)
+    }
+
+    fn build(case: &str, include_vhost_user: bool) -> Self {
         let devices = GuestDeviceGrantFixture::new(case);
         let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
         let socket_root = TestDir(
@@ -4490,8 +5026,11 @@ impl SocketDirectoryGrantFixture {
         fs::create_dir(socket_root.path()).expect("short socket root should be created");
         let api_directory = socket_root.path().join("a");
         let vsock_directory = socket_root.path().join("v");
+        let vhost_user_directory = socket_root.path().join("u");
         fs::create_dir(&api_directory).expect("API socket directory should be created");
         fs::create_dir(&vsock_directory).expect("vsock socket directory should be created");
+        fs::create_dir(&vhost_user_directory)
+            .expect("vhost-user socket directory should be created");
 
         let mut manifest: serde_json::Value = serde_json::from_slice(
             &fs::read(&devices.manifest).expect("device grant manifest should read"),
@@ -4515,6 +5054,14 @@ impl SocketDirectoryGrantFixture {
                 "source": path_text(&vsock_directory),
             }),
         ]);
+        if include_vhost_user {
+            grants.push(serde_json::json!({
+                "id": VHOST_USER_SOCKET_DIRECTORY_ID,
+                "role": "vhost-user-socket-directory",
+                "access": "connect-children",
+                "source": path_text(&vhost_user_directory),
+            }));
+        }
         fs::write(
             &devices.manifest,
             serde_json::to_vec(&manifest).expect("socket grant manifest should serialize"),
@@ -4526,6 +5073,7 @@ impl SocketDirectoryGrantFixture {
             _socket_root: socket_root,
             api_directory,
             vsock_directory,
+            vhost_user_directory,
         }
     }
 
@@ -4543,17 +5091,33 @@ impl SocketDirectoryGrantFixture {
         PathBuf::from(path)
     }
 
+    fn vhost_user_socket(&self, child: &str) -> PathBuf {
+        self.vhost_user_directory.join(child)
+    }
+
+    fn vhost_user_backing(&self, child: &str) -> PathBuf {
+        self.vhost_user_directory.join(child)
+    }
+
     fn sensitive_strings(&self) -> Vec<String> {
         let mut sensitive = self.devices.sensitive_strings();
         sensitive.extend([
             path_text(&self.api_directory).to_owned(),
             path_text(&self.vsock_directory).to_owned(),
+            path_text(&self.vhost_user_directory).to_owned(),
             API_SOCKET_DIRECTORY_ID.to_owned(),
             VSOCK_SOCKET_DIRECTORY_ID.to_owned(),
+            VHOST_USER_SOCKET_DIRECTORY_ID.to_owned(),
             API_SOCKET_REF.to_owned(),
             VSOCK_SOCKET_REF.to_owned(),
+            VHOST_USER_SOCKET_REF_ONE.to_owned(),
+            VHOST_USER_SOCKET_REF_TWO.to_owned(),
+            VHOST_USER_SOCKET_REF_THREE.to_owned(),
             API_SOCKET_CHILD.to_owned(),
             VSOCK_SOCKET_CHILD.to_owned(),
+            VHOST_USER_SOCKET_CHILD_ONE.to_owned(),
+            VHOST_USER_SOCKET_CHILD_TWO.to_owned(),
+            VHOST_USER_SOCKET_CHILD_THREE.to_owned(),
         ]);
         sensitive
     }
@@ -5420,6 +5984,15 @@ fn spawn_ready_socket_grant_api_launcher(
     fixture: &SocketDirectoryGrantFixture,
     name: &str,
 ) -> RunningApiLauncher {
+    spawn_ready_socket_grant_api_launcher_with_extra_args(bundle, fixture, name, &[])
+}
+
+fn spawn_ready_socket_grant_api_launcher_with_extra_args(
+    bundle: &Path,
+    fixture: &SocketDirectoryGrantFixture,
+    name: &str,
+    worker_args: &[&str],
+) -> RunningApiLauncher {
     initialize_worker_container(bundle);
     let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
     let socket = fixture.api_socket();
@@ -5427,6 +6000,7 @@ fn spawn_ready_socket_grant_api_launcher(
         .arg(GRANT_MANIFEST_OPTION)
         .arg(&fixture.devices.manifest)
         .arg("--")
+        .args(worker_args)
         .args(["--api-sock", API_SOCKET_REF])
         .args(["--id", &format!("{name}-{test_id}")])
         .stdout(Stdio::piped())
@@ -5963,23 +6537,32 @@ impl DirectoryChangeWatch {
         }
     }
 
-    fn wait_for_child(&self, child: &str, timeout: Duration) -> Result<PathBuf, String> {
+    fn wait_for_child_with_len(
+        &self,
+        child: &str,
+        expected_len: u64,
+        timeout: Duration,
+    ) -> Result<PathBuf, String> {
         let child = self.path.join(child);
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| "directory child deadline overflowed".to_owned())?;
         loop {
-            if child.is_file() {
+            if child
+                .metadata()
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_len)
+            {
                 return Ok(child);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("timed out waiting for directory child".to_owned());
             }
+            let poll = remaining.min(Duration::from_millis(10));
             let timeout = libc::timespec {
-                tv_sec: libc::time_t::try_from(remaining.as_secs())
+                tv_sec: libc::time_t::try_from(poll.as_secs())
                     .map_err(|_| "directory child timeout did not fit time_t".to_owned())?,
-                tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+                tv_nsec: libc::c_long::from(poll.subsec_nanos()),
             };
             let mut event = MaybeUninit::<libc::kevent>::uninit();
             // SAFETY: The live queue has one writable output event and a live timeout.
@@ -5997,7 +6580,7 @@ impl DirectoryChangeWatch {
                 continue;
             }
             if count == 0 {
-                return Err("timed out waiting for directory child event".to_owned());
+                continue;
             }
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {

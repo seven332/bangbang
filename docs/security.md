@@ -19,13 +19,13 @@ descriptor is non-fatal; failing to close a successfully duplicated descriptor
 is fatal. The setup does not overwrite inherited high-numbered descriptors.
 Production launch instead uses Darwin's default-close spawn mode and explicitly
 retains only open standard streams plus fixed private lifecycle, startup-grant,
-and dormant socket-broker descriptors.
+vsock-broker, and vhost-user-broker descriptors.
 
 Direct mode trusts the host user account and local filesystem permissions around
 configured paths. Production bundle mode additionally trusts its outer launcher,
 fixed metadata, and signed nested worker, while App Sandbox limits that worker
 to container/sealed resources plus an explicitly prepared startup grant batch
-and the fixed launcher-owned vsock connection facet.
+and the fixed launcher-owned vsock and vhost-user connection facets.
 API clients, API request bodies,
 guest-provided MMIO data, guest memory, and configured host paths remain
 untrusted input in both modes.
@@ -56,7 +56,8 @@ launcher/worker boundary plus bounded per-VM lifecycle, startup-grant, daemon
 handoff, and socket-broker channels. Contained startup config, startup metadata, kernel, and initrd inputs
 adopt exact read-only grants; block and pmem devices adopt exact repeatable
 read-only/read-write backing grants; logger, metrics, and serial adopt exact
-singleton write-only sink grants. Arbitrary uid/gid transition, configurable
+singleton write-only sink grants; vhost-user endpoints require repeatable
+connect-only directory grants and launcher-returned streams. Arbitrary uid/gid transition, configurable
 chroot ownership, and complete distribution-signing policy remain absent. The
 exact seccomp, cgroup, network-namespace, and PID-namespace mechanisms are now
 certified public-macOS exclusions rather than unresolved or silently accepted
@@ -205,14 +206,17 @@ availability boundary: after bounded negotiation, activation transfers a
 descriptor for every current guest-RAM region plus only the queue call/kick
 descriptors required by the protocol. The backend can read or write all guest
 RAM, and descriptor close is lifetime cleanup rather than hard revocation.
-Ordinary-only VMs keep anonymous RAM. Contained workers still reject ambient
-socket paths pending an authorized connected-stream handoff, and vhost
-configuration cannot coexist with dynamic memory hotplug or native-v1 capture
-in the current profile. Runtime direct insertion cannot convert an existing VM:
-the owner first requires an already-shared live profile and validates PCI,
-inventory, MMIO-region, interrupt, and metrics capacity without reserving or
-cloning anything; anonymous-profile, duplicate, root, contained, disabled-PCI,
-and exhausted requests fail before the candidate socket is contacted.
+Ordinary-only VMs keep anonymous RAM. Contained workers reject ambient socket
+paths and instead require an exact retained connect-only directory grant plus a
+session/sequence/grant/child-bound stream from the launcher. The launcher
+validates the target relative to the retained anchor without granting the
+worker ambient network authority. Vhost configuration cannot coexist with
+dynamic memory hotplug or native-v1 capture in the current profile. Runtime
+direct or contained insertion cannot convert an existing VM: the owner first
+requires an already-shared live profile and validates PCI, inventory,
+MMIO-region, interrupt, and metrics capacity without reserving or cloning
+anything; anonymous-profile, duplicate, root, disabled-PCI, and exhausted
+requests fail before a direct connection or contained broker request.
 
 ## Isolation Compatibility Checklist
 
@@ -224,9 +228,9 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
-| Network and vmnet | Implemented virtio-MMIO/all-PCI startup plus PCI-only runtime PUT/DELETE; direct vmnet conditional; contained lifecycle-v4 authority and closed networkless/vmnet signing profiles enforced | Keep supported `host_dev_name` forms, exact mode/bridge/actual-live-count admission, per-entry cleanup, MMDS-only behavior, entitlement/profile requirements, and non-goals documented when network behavior changes. |
-| macOS App Sandbox | Production nested worker implemented for container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, API-socket, and vsock-socket resources | Keep the ordinary CLI explicitly uncontained and prove package identity plus real ungranted denial and granted operation behavior without adding ambient network authority. |
-| Launcher and resource broker | Authenticated lifecycle v4 credential/resource-limit/vmnet policy, closed exec environment and descriptor set, bounded atomic startup grants, signed daemon handoff, adopted file and socket-directory consumers, and one fixed session-bound vsock connection facet implemented; general dynamic brokerage missing | Require exact policy/profile/role/access/anchor/identity checks, one-time registry adoption, closed session/sequence/rights framing, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
+| Network and vmnet | Implemented virtio-MMIO/all-PCI startup plus PCI-only runtime PUT/DELETE; direct vmnet conditional; contained lifecycle-v5 authority and closed networkless/vmnet signing profiles enforced | Keep supported `host_dev_name` forms, exact mode/bridge/actual-live-count admission, per-entry cleanup, MMDS-only behavior, entitlement/profile requirements, and non-goals documented when network behavior changes. |
+| macOS App Sandbox | Production nested worker implemented for container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, API-socket, vsock-socket, and connect-only vhost-user-socket resources | Keep the ordinary CLI explicitly uncontained and prove package identity plus real ungranted denial and granted operation behavior without adding ambient network authority. |
+| Launcher and resource broker | Authenticated lifecycle v5 credential/resource-limit/vmnet policy, closed exec environment and descriptor set, bounded atomic startup grants, signed daemon handoff, adopted file and directory consumers, and separate fixed session-bound vsock and vhost-user connection facets implemented; general-purpose brokerage missing | Require exact policy/profile/role/access/anchor/identity checks, retained session authority with per-device leases, closed session/sequence/rights framing, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
 
 ## Native Snapshot Composite and Device Boundary
 
@@ -343,10 +347,10 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 
 | Boundary or option | Current behavior | Future direction |
 | --- | --- | --- |
-| Operator-owned private directories | Required for API sockets, vsock sockets, observability sinks, and other configured paths that should not be shared. Contained API/vsock use requires one exact preauthorized directory and safe child; direct paths remain operator-owned. | Cross-launcher name allocation and sharing policy remain operator responsibilities. |
+| Operator-owned private directories | Required for API sockets, vsock sockets, vhost-user sockets, observability sinks, and other configured paths that should not be shared. Contained API/vsock use requires one exact preauthorized create-children directory and safe child; contained vhost-user use requires one exact preauthorized connect-only directory and safe child; direct paths remain operator-owned. | Cross-launcher name allocation and sharing policy remain operator responsibilities. |
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
-| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, and vsock-socket authority form the current contained mode. Lifecycle v4 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; general dynamic delivery still requires explicit design. |
-| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v4 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports the adopted file/directory consumers, offers signed daemon detach, and exposes one dormant fixed vsock connection facet. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
+| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, and connect-only vhost-user-socket authority form the current contained mode. Lifecycle v5 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; general dynamic delivery still requires explicit design. |
+| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory consumers, offers signed daemon detach, and exposes separate fixed vsock and vhost-user connection facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
 | Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope. | Keep arbitrary uid/gid, configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
@@ -378,11 +382,12 @@ before spawn; any failure drops every opened descriptor. Current hard limits are
 snapshot output child, 4096 source-path bytes, 512 records, 1024 encoded bytes
 per datagram, 64 KiB per bookmark, and 256 KiB aggregate bookmark material.
 
-Lifecycle protocol v4 uses descriptor 3 and carries one fixed reserved-zero
+Lifecycle protocol v5 uses descriptor 3 and carries one fixed reserved-zero
 worker policy only after peer authentication. A separate connected unnamed Darwin
 datagram socket at descriptor 4 carries grant-channel v1 records. A third
 connected unnamed datagram socket at descriptor 5 carries the dormant closed
-vsock broker protocol; it is not a general grant channel. Every grant record
+vsock broker protocol. Descriptor 6 carries the independent closed vhost-user
+connection protocol; neither broker is a general grant channel. Every grant record
 binds the random lifecycle SessionId, an independent random BatchId, exact
 sequence, closed kind, payload length, reserved fields, and declared descriptor
 count. `Begin` declares exact batch bounds; regular-file and directory records
@@ -402,11 +407,13 @@ send an exact redacted `GrantsAccepted`; `Proceed` is invalid before that ack,
 including for an empty batch. Cancellation remains valid throughout staging and
 the acknowledgment wait.
 
-Regular-file grants expose descriptors only. A mutable-directory grant combines
+Regular-file grants expose descriptors only. A scoped-directory grant combines
 a read-only anchor descriptor with a freshly minted ordinary implicit bookmark.
 The worker resolves it without UI or mounting, explicitly starts scope, reopens
 the directory without following symlinks, checks exact anchor identity and
-write/search access, and retains scope plus anchor as one registry value. The
+role-specific access, and retains scope plus anchor as one registry value.
+API/vsock/snapshot output roles require create/search access; the connect-only
+vhost-user role requires search without write authority. The
 platform stale bit is private and is not by itself rejection: concrete
 resolution, scope acquisition, identity, and access must all succeed. Bookmark
 material is never persisted, renewed, logged, or supplied by the operator.
@@ -416,8 +423,9 @@ never falls back to an ambient path. Unadopted values drop on cancellation,
 terminal exit, disconnect, bootstrap failure, or process exit. SCM_RIGHTS creates
 an independent descriptor reference, so closing the launcher's copy is cleanup,
 not revocation. The initial grant batch remains immutable after acknowledgment.
-General dynamic post-Ready delivery and hard revocation require a later broker
-design; the fixed port-only vsock connection facet below does neither.
+General-purpose dynamic grants and hard revocation require a later broker
+design. The fixed vsock and vhost-user facets derive only connected streams
+from authority already fixed in the immutable startup batch.
 
 Contained mode recognizes only the exact, case-sensitive
 `bangbang-grant:<GrantId>` form. The direct CLI treats the same text as an
@@ -558,6 +566,27 @@ timeouts fail closed. The launcher receives no guest payload, grant ID,
 bookmark, resolved path, arbitrary child, or general resource selector, and
 the worker gains no `network.client` entitlement.
 
+Contained vhost-user block uses the separate descriptor-6 facet throughout the
+session. Each fixed 256-byte `BBU1` request binds lifecycle SessionId, nonzero
+monotonic sequence, retained grant ID, and one bounded child. The launcher finds
+only an exact `VhostUserSocketDirectory + ConnectChildren` anchor, saves its
+current cwd by descriptor, enters and verifies that anchor, rejects symlinks and
+non-current-user/non-socket/multi-link targets, performs one bounded
+nonblocking relative connect, rechecks vnode and peer address, and explicitly
+restores/verifies cwd before replying. `Connected` carries exactly one stream;
+`Failed` carries a stable redacted category and permits a later request.
+Malformed frames/rights, stale correlation, peer change, timeout, lifecycle
+cancellation, or cwd-integrity failure poison the facet. One directory is
+adopted and retained by grant ID for the contained session; each drive owns only
+an exact child lease, so startup retry, multiple children, and post-DELETE
+reinsertion do not reopen the manifest tag. Before the first startup request,
+the worker validates every boot/file/pmem/serial/vsock/vhost grant dependency
+and broker health. Runtime owner preflight precedes grant reservation and broker
+I/O; ID-only PATCH uses the existing frontend, duplicate PUT is zero-request,
+and DELETE drops the device lease while retaining session authority. No helper
+proxies backend traffic and the worker receives no ambient path or outgoing
+network entitlement.
+
 The scope, anchor, listener, broker endpoint, ownership record, and cleanup
 guard close through one session. Worker shutdown removes only the still-matching
 socket. After worker exit, the launcher reads at most the two fixed strict
@@ -643,9 +672,9 @@ kernel launch constraints remain deployment work.
 The launcher preserves non-policy worker argument bytes and supplies an exec
 environment containing only one private bootstrap marker. Direct Darwin `posix_spawn` uses
 `CLOEXEC_DEFAULT | START_SUSPENDED`; file actions retain each open standard
-stream and duplicate exactly the lifecycle stream, startup-grant datagram, and
-dormant socket-broker datagram endpoints to fixed internal descriptors 3, 4,
-and 5. Unexpected inheritable
+stream and duplicate exactly the lifecycle stream, startup-grant datagram,
+dormant vsock-broker datagram, and vhost-user-broker datagram endpoints to fixed
+internal descriptors 3, 4, 5, and 6. Unexpected inheritable
 descriptors are closed in the worker image. Before `Start`, worker code can only
 mark those descriptors close-on-exec, require
 peer effective UID/GID to match, require `LOCAL_PEERPID == getppid()`, send one
@@ -660,14 +689,14 @@ is deliberately limited to the inherited endpoint, direct-parent PID,
 credentials, exact sequences, and disconnect behavior; symmetric code-signing
 authentication is not claimed.
 
-Lifecycle protocol v4 uses a fixed endian-stable header, 256-bit session identity, exact
+Lifecycle protocol v5 uses a fixed endian-stable header, 256-bit session identity, exact
 per-direction sequence, zero reserved fields, closed message kinds, fixed
 payload shapes, and a 4096-byte frame cap. Wrong magic/version/reserved fields,
 oversized or truncated input, unknown messages, replay/gap, cross-session data,
 wrong sender, and invalid state fail with one redacted category before public or
 VM work. `Hello`, `Start`, `Prepared`, exact `GrantsAccepted`, `Proceed`, `Starting`, optional committed
 `Ready(Api|NoApi)`, at most one `Cancel(SIGINT|SIGTERM)`, and path-free
-`Terminal(category, exit_code)` form the complete v4 lifecycle. `Start` alone
+`Terminal(category, exit_code)` form the complete v5 lifecycle. `Start` alone
 carries the current credential, exact limit, daemon state, and immutable
 `VmnetAuthority`. The canonical network value is denied; a positive value has
 closed host/shared bits, four zero-padded 15-byte ASCII bridge slots, and an
@@ -726,7 +755,7 @@ contained authority. Granted config, metadata, kernel, initrd, block, pmem,
 logger, metrics, serial, snapshot, API-socket, and vsock-socket resources are
 consumed through their opened identities or exact retained anchors. vmnet is
 not descriptor-brokered: contained acquisition is instead bounded by the
-immutable lifecycle-v4 authority described below. General dynamic resources
+immutable lifecycle-v5 authority described below. General dynamic resources
 remain unbrokered.
 
 ## vmnet Host Policy Boundary
@@ -766,7 +795,7 @@ changing direct mode. The outer jailer accepts repeated exact
 `--vmnet-max-interfaces 1..=4`; the canonical default is deny. Host/shared may
 appear once each, there are at most four unique bridge names, and production
 bridge names are 1–15 ASCII bytes from `[A-Za-z0-9._-]`. This fixed value is
-carried in lifecycle-v4 `Start`, retained immutably by `ContainedSession`, and
+carried in lifecycle-v5 `Start`, retained immutably by `ContainedSession`, and
 cannot be supplied through ordinary worker argv, environment, files,
 descriptors, or a post-Ready message.
 
@@ -932,8 +961,9 @@ is resource-specific:
   sleeping, busy-waiting, writing request status, publishing a used-ring entry,
   or mutating the backing file. Active HVF boot sessions schedule block retry
   wakeups with per-session state so one VM cannot wake or share limiter state
-  with another VM. Direct pre-boot vhost-user sockets use a bounded redacted
-  connector and the closed Firecracker v1.16 frontend request set. The frontend
+  with another VM. Direct or launcher-authorized contained pre-boot vhost-user
+  sockets use a bounded redacted connector and the closed Firecracker v1.16
+  frontend request set. The frontend
   explicitly zero-encodes native
   endian frames, attaches borrowed rights only until the first header byte is
   transferred, owns/CLOEXECs every received right before rejecting it, bounds
@@ -949,17 +979,19 @@ is resource-specific:
   endpoint, increments redacted per-drive failure metrics, and leaves the API
   process responsive; it never falls back to local storage. The strict
   regular-file backend used for signed MMIO/PCI evidence is test-only and is
-  not shipped. For a direct all-PCI VM that already owns shared RAM, a new
-  non-root runtime vhost device is discovered on the API thread only after the
-  owner-side no-effect preflight, then materialized against the exact live
-  memory and published atomically on the owner thread. For any active direct
-  MMIO or PCI device, ID-only PATCH fetches and validates all 60 config bytes
+  not shipped. For a direct or contained all-PCI VM that already owns shared
+  RAM, a new non-root runtime vhost device is discovered on the API thread only
+  after the owner-side no-effect preflight, then materialized against the exact
+  live memory and published atomically on the owner thread. Fresh contained
+  directory adoption remains reversible until publication; committed
+  directories remain session authority across DELETE. For any active MMIO or
+  PCI device, ID-only PATCH fetches and validates all 60 config bytes
   before replacing guest-visible config and delivering one configuration
   interrupt; confirmed pre-delivery failure keeps the old generation, while
   delivery ambiguity is terminal. Caller-coordinated PCI DELETE drops the
   frontend, notifier pipes, cloned RAM descriptors, metrics lease,
   BAR/MMIO/MSI-X state, and PCI slot. Contained authorization remains a separate
-  authority layer and no live same-ID reconnect API is invented.
+  exact grant/broker layer and no live same-ID reconnect API is invented.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. In contained mode an exact pmem grant tag is claimed during
@@ -2115,7 +2147,7 @@ The current scaffold does not implement:
 - a Firecracker-jailer replacement
 - privilege dropping
 - general-purpose host resource brokering beyond the fixed granted-vsock
-  port-only connection facet
+  port-only and contained vhost-user exact-child connection facets
 - broader snapshot profiles or Firecracker artifact compatibility beyond the
   exact contained native-v1 describe/create/load resource boundary
 - full containment for network, guest-visible MMDS, or vsock beyond the exact
@@ -2149,7 +2181,7 @@ The current scaffold does not implement:
   that limit before selecting packet I/O, opens vmnet resources only for
   non-MMDS-only startup when configured interfaces use the supported names,
   keeps no-network startup on an empty hotplug-capable registry, and enforces
-  bounded lifecycle-v4 vmnet authority for contained startup and runtime
+  bounded lifecycle-v5 vmnet authority for contained startup and runtime
   insertion. Public PCI PUT/DELETE coordinates that registry with exact PCI,
   metrics, retry, and live-config ownership; MMDS-only runtime entries require
   no vmnet authority, while actual live vmnet entries are charged to the bound.

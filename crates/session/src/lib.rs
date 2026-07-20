@@ -29,8 +29,11 @@ pub const GRANT_FD: libc::c_int = 4;
 /// Fixed descriptor used only by the private launcher-vsock broker.
 pub const SOCKET_BROKER_FD: libc::c_int = 5;
 
+/// Fixed descriptor used only by the private launcher-vhost-user broker.
+pub const VHOST_USER_BROKER_FD: libc::c_int = 6;
+
 /// Private environment marker installed by the production launcher.
-pub const SESSION_ENV_KEY: &str = "BANGBANG_INTERNAL_SESSION_V4";
+pub const SESSION_ENV_KEY: &str = "BANGBANG_INTERNAL_SESSION_V5";
 
 /// Exact value required for [`SESSION_ENV_KEY`].
-pub const SESSION_ENV_VALUE: &str = "4";
+pub const SESSION_ENV_VALUE: &str = "5";

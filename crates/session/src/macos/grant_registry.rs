@@ -253,6 +253,23 @@ impl DirectoryGrantRegistry {
     ) -> Result<Vec<GrantedDirectory>, GrantRegistryError> {
         take_scoped_directories(&mut self.entries, requests)
     }
+
+    /// Returns one reserved directory grant after an aborted owner transaction.
+    pub fn restore_scoped_directory(
+        &mut self,
+        id: GrantId,
+        directory: GrantedDirectory,
+    ) -> Result<(), GrantRegistryError> {
+        if self.entries.contains_key(&id)
+            || !directory.role.is_scoped_directory()
+            || !directory.role.permits(directory.access)
+        {
+            return Err(GrantRegistryError);
+        }
+        let previous = self.entries.insert(id, directory);
+        debug_assert!(previous.is_none());
+        Ok(())
+    }
 }
 
 fn take_scoped_directory(
@@ -263,7 +280,7 @@ fn take_scoped_directory(
     let matches = matches!(
         entries.get(id),
         Some(directory)
-            if directory.role == role && directory.access == GrantAccess::CreateChildren
+            if directory.role == role && role.permits(directory.access)
     );
     if !matches {
         return Err(GrantRegistryError);
@@ -282,7 +299,7 @@ fn take_scoped_directories(
                 entries.get(id),
                 Some(directory)
                     if directory.role == *role
-                        && directory.access == GrantAccess::CreateChildren
+                        && role.permits(directory.access)
             )
         {
             return Err(GrantRegistryError);
@@ -639,7 +656,7 @@ impl StagedGrantBatch {
             } => {
                 self.require_open_batch()?;
                 if !role.is_scoped_directory()
-                    || access != GrantAccess::CreateChildren
+                    || !role.permits(access)
                     || bookmark_bytes == 0
                     || bookmark_bytes > MAX_BOOKMARK_BYTES
                     || fragment_count == 0
@@ -816,7 +833,7 @@ impl StagedGrantBatch {
                     // A freshly minted usable implicit bookmark may report stale.
                     // Observe the private bit without logging or making it a verdict.
                     let _ = scope.is_stale();
-                    validate_scoped_path(scope.path(), identity)?;
+                    validate_scoped_path(scope.path(), identity, access)?;
                     directories.insert(
                         id,
                         GrantedDirectory {
@@ -911,7 +928,11 @@ fn descriptor_stat(descriptor: RawFd) -> Result<libc::stat, GrantRegistryError> 
     Ok(unsafe { stat.assume_init() })
 }
 
-fn validate_scoped_path(path: &Path, expected: ObjectIdentity) -> Result<(), GrantRegistryError> {
+fn validate_scoped_path(
+    path: &Path,
+    expected: ObjectIdentity,
+    access: GrantAccess,
+) -> Result<(), GrantRegistryError> {
     let mut options = OpenOptions::new();
     options.read(true).custom_flags(
         libc::O_CLOEXEC | libc::O_NOFOLLOW_ANY | libc::O_DIRECTORY | libc::O_NONBLOCK,
@@ -926,13 +947,18 @@ fn validate_scoped_path(path: &Path, expected: ObjectIdentity) -> Result<(), Gra
     {
         return Err(GrantRegistryError);
     }
+    let requested = if access == GrantAccess::ConnectChildren {
+        libc::X_OK
+    } else {
+        libc::W_OK | libc::X_OK
+    };
     // SAFETY: The reopened verified directory remains live, the fixed dot
     // component is NUL-terminated, and faccessat performs no mutation.
     if unsafe {
         libc::faccessat(
             directory.as_raw_fd(),
             c".".as_ptr(),
-            libc::W_OK | libc::X_OK,
+            requested,
             libc::AT_EACCESS,
         )
     } != 0
@@ -941,11 +967,12 @@ fn validate_scoped_path(path: &Path, expected: ObjectIdentity) -> Result<(), Gra
     }
     Ok(())
 }
-
 fn access_matches(flags: libc::c_int, access: GrantAccess) -> bool {
     let actual = flags & libc::O_ACCMODE;
     match access {
-        GrantAccess::ReadOnly | GrantAccess::CreateChildren => actual == libc::O_RDONLY,
+        GrantAccess::ReadOnly | GrantAccess::CreateChildren | GrantAccess::ConnectChildren => {
+            actual == libc::O_RDONLY
+        }
         GrantAccess::WriteOnly => actual == libc::O_WRONLY,
         GrantAccess::ReadWrite => actual == libc::O_RDWR,
     }

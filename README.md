@@ -61,24 +61,31 @@ certification, and Firecracker's KVM ITS identity remain explicit limits.
 Native-v1 create/load rejects PCI profiles before artifact or VM mutation,
 while the default MMIO snapshot profile is unchanged.
 
-Direct pre-boot drives may instead select Firecracker's vhost-user block
-`socket` shape. Startup connects under a bounded deadline, switches guest RAM
-to descriptor-backed shared mappings, negotiates the reviewed CONFIG and
-virtio feature set, and transfers one queue plus the complete current memory
-table to the operator-selected backend. The same device works over default
-MMIO or all-virtio PCI, including root/partuuid/read-only/writeback behavior,
-backend-call interrupts, metrics, and redacted terminal disconnects. This is a
-trusted direct-mode memory capability. An ID-only PATCH may refresh an active
-MMIO or PCI backend's exact 60-byte config plus one guest configuration
-interrupt. In an all-PCI VM whose startup profile is already shared, Running or
-Paused requests may also attach a new non-root socket drive after a
-no-side-effect owner preflight and remove an eligible device after manual
-guest-side PCI removal. Duplicate IDs, anonymous RAM, root insertion, and
-exhausted capacity reject before socket connection; DELETE releases the
-frontend, shared-memory descriptor clones, metrics generation, BAR, MSI-X, and
-PCI slot for deterministic reuse. Contained socket authorization, automatic
-guest PCI notification, live same-ID reconnect, and vhost snapshot state remain
-explicit limits.
+Pre-boot drives may instead select Firecracker's vhost-user block `socket`
+shape. Direct mode accepts an operator path; production contained mode accepts
+only `bangbang-grant:<GrantId>/<SocketChild>` backed by a repeatable
+connect-only directory grant. The launcher connects the exact current-user,
+single-link socket relative to its retained directory descriptor and returns
+only the nonblocking stream over a dedicated authenticated broker facet.
+Startup switches guest RAM to descriptor-backed shared mappings, negotiates the
+reviewed CONFIG and virtio feature set, and transfers one queue plus the
+complete current memory table to the selected backend. The same device works
+over default MMIO or all-virtio PCI, including root/partuuid/read-only/writeback
+behavior, backend-call interrupts, metrics, and redacted terminal disconnects.
+Every external backend is therefore a trusted complete-guest-memory capability.
+An ID-only PATCH refreshes an active MMIO or PCI frontend without reconnecting.
+In an all-PCI VM whose startup profile is already shared, Running or Paused
+requests may also attach a new non-root direct or contained socket drive after
+a no-side-effect owner preflight and remove an eligible device after manual
+guest-side PCI removal. A contained directory is adopted once per session and
+may authorize multiple exact children, retries, and reinsertion after DELETE;
+each drive retains only its child lease. Duplicate IDs, anonymous RAM, root
+insertion, and exhausted capacity reject before any broker request or direct
+socket connection. DELETE releases the frontend, shared-memory descriptor
+clones, metrics generation, BAR, MSI-X, and PCI slot for deterministic reuse.
+Ambient contained socket paths, dynamic-memory coexistence, automatic guest PCI
+notification, same-ID replacement without DELETE, Async/io_uring, and vhost
+snapshot state remain explicit limits.
 
 ## Layout
 
@@ -437,15 +444,17 @@ launch, the outer executable validates
 the fixed bundle layout, nested signatures, identifiers, and required worker
 entitlements. It then starts the fixed worker suspended with a default-close
 descriptor policy: only open standard streams, one private lifecycle endpoint,
-one private startup-grant endpoint, and one dormant private socket-broker
-endpoint survive. The exec environment contains only the private lifecycle
+one private startup-grant endpoint, one dormant private vsock-broker endpoint,
+and one dedicated private vhost-user-broker endpoint survive. The exec
+environment contains only the private lifecycle
 marker; ambient launcher variables, including loader/debug controls, are not
 forwarded. The launcher validates the live worker code before resuming it and
 again after the worker has used the endpoint and sent the bounded pre-session
 greeting.
 
-Each launch uses unnamed lifecycle stream, grant datagram, and socket-broker
-socketpairs plus a random 256-bit session identity. Lifecycle protocol v4 has a
+Each launch uses unnamed lifecycle stream, grant datagram, vsock-broker, and
+vhost-user-broker socketpairs plus a random 256-bit session identity. Lifecycle
+protocol v5 has a
 4-KiB frame limit, exact per-direction sequence numbers, closed message
 variants, a fixed 96-byte reserved-zero `Start(WorkerPolicy)` payload, and monotonic
 `prepared -> grants-accepted -> starting -> ready -> terminal` state. Even an
@@ -875,7 +884,7 @@ routing/NAT, resource, and distribution policy. See the
 [vmnet security boundary](docs/security.md#vmnet-host-policy-boundary), and
 [testing guide](docs/testing.md) for the exact supported subset and exclusions.
 Contained startup and runtime insertion additionally enforce the authenticated
-lifecycle-v4 mode, bridge name, and actual live-vmnet count before backend
+lifecycle-v5 mode, bridge name, and actual live-vmnet count before backend
 construction. The current networkless production profile rejects every positive
 vmnet authority before worker spawn, but supports all-MMDS startup and hotplug
 without that authority. This is not a production-connectivity claim.
@@ -1096,7 +1105,7 @@ scripts/run-integration-tests.sh --test production_bundle
 
 This target verifies exact identifiers, entitlements, Hardened Runtime, strict
 static and live-worker validation, tamper rejection, the descriptor allowlist,
-closed worker environment, lifecycle-v4 launch-policy authentication, canonical
+closed worker environment, lifecycle-v5 launch-policy authentication, canonical
 default-denied vmnet policy and networkless-profile rejection, exact and
 kernel-enforced resource limits, private-root entry, jailer help/version/parser
 rejection, fixed redacted pre-mutation rejection of every exact/attached Linux
@@ -1127,7 +1136,13 @@ outside-container client can use a granted API socket, and that a real guest
 can complete deterministic bidirectional and half-close/EOF vsock traffic in
 both initiation directions through the supplied granted listener and fixed
 launcher broker, without changing the exact entitlements or leaving a helper
-in steady state. Abrupt launcher-first and worker-first cases replace the
+in steady state. Signed contained-vhost cases boot a vhost root plus scratch
+child alongside vsock from one connect-only directory grant, prove scratch
+read/write/flush and guest-observed ID-only capacity refresh on the existing
+stream, and exercise all-PCI runtime target rejection, negotiation rollback,
+new-ID attach, manual guest removal, DELETE, Paused same-ID reuse through a
+second exact child, and exact stream closure. They likewise leave no helper or
+entitlement change. Abrupt launcher-first and worker-first cases replace the
 granted API pathname before death and prove both surviving cleanup owners
 preserve the replacement while clearing the matching private namespace record.
 

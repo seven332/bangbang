@@ -10,6 +10,7 @@ use std::process::ExitStatus;
 
 use bangbang_session::{
     GRANT_FD, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD,
+    VHOST_USER_BROKER_FD,
 };
 
 use crate::LauncherError;
@@ -138,6 +139,7 @@ pub(crate) struct SuspendedWorker {
     pub(crate) session: UnixStream,
     pub(crate) grants: UnixDatagram,
     pub(crate) socket_broker: UnixDatagram,
+    pub(crate) vhost_user_broker: UnixDatagram,
 }
 
 pub(crate) fn spawn_suspended(
@@ -156,6 +158,10 @@ pub(crate) fn spawn_suspended(
         UnixDatagram::pair().map_err(|error| LauncherError::SessionSetup(error.kind()))?;
     let broker_parent = duplicate_datagram_at_or_above(broker_parent, MIN_TRANSPORT_FD)?;
     let broker_child = duplicate_datagram_at_or_above(broker_child, MIN_TRANSPORT_FD)?;
+    let (vhost_parent, vhost_child) =
+        UnixDatagram::pair().map_err(|error| LauncherError::SessionSetup(error.kind()))?;
+    let vhost_parent = duplicate_datagram_at_or_above(vhost_parent, MIN_TRANSPORT_FD)?;
+    let vhost_child = duplicate_datagram_at_or_above(vhost_child, MIN_TRANSPORT_FD)?;
 
     let executable = cstring(executable.as_os_str())
         .map_err(|_| LauncherError::WorkerSpawn(io::ErrorKind::InvalidInput))?;
@@ -184,6 +190,10 @@ pub(crate) fn spawn_suspended(
     if broker_child.as_raw_fd() != SOCKET_BROKER_FD {
         actions.close(broker_child.as_raw_fd())?;
     }
+    actions.duplicate(vhost_child.as_raw_fd(), VHOST_USER_BROKER_FD)?;
+    if vhost_child.as_raw_fd() != VHOST_USER_BROKER_FD {
+        actions.close(vhost_child.as_raw_fd())?;
+    }
 
     let mut pid = 0;
     // SAFETY: All C strings and null-terminated pointer arrays remain live for
@@ -207,6 +217,7 @@ pub(crate) fn spawn_suspended(
     drop(child);
     drop(grant_child);
     drop(broker_child);
+    drop(vhost_child);
     Ok(SuspendedWorker {
         worker: OwnedWorker {
             pid,
@@ -216,6 +227,7 @@ pub(crate) fn spawn_suspended(
         session: parent,
         grants: grant_parent,
         socket_broker: broker_parent,
+        vhost_user_broker: vhost_parent,
     })
 }
 

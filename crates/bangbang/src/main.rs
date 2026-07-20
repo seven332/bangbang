@@ -23,6 +23,9 @@ pub mod host_network;
 mod periodic_metrics;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+#[path = "../../../tests/support/vhost_user_block.rs"]
+mod vhost_user_block;
 mod vmm;
 
 #[cfg(target_os = "macos")]
@@ -180,6 +183,10 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
                 .as_ref()
                 .and_then(ContainedSession::socket_broker_authority);
             #[cfg(target_os = "macos")]
+            let vhost_user_broker_authority = contained
+                .as_ref()
+                .and_then(ContainedSession::vhost_user_broker_authority);
+            #[cfg(target_os = "macos")]
             let socket_namespace = contained
                 .as_ref()
                 .map(ContainedSession::socket_namespace)
@@ -233,6 +240,7 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             let mut vmm = vmm.with_socket_grant_authority(
                 directory_grant_authority.clone(),
                 socket_broker_authority,
+                vhost_user_broker_authority,
                 socket_namespace,
             );
             #[cfg(not(target_os = "macos"))]

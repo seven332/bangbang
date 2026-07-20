@@ -194,6 +194,8 @@ pub enum ResourceRole {
     SnapshotMemoryInput = 14,
     /// Directory receiving snapshot artifacts.
     SnapshotOutputDirectory = 15,
+    /// Parent directory containing connect-only vhost-user sockets.
+    VhostUserSocketDirectory = 16,
 }
 
 impl ResourceRole {
@@ -202,7 +204,10 @@ impl ResourceRole {
     pub const fn is_repeatable(self) -> bool {
         matches!(
             self,
-            Self::DriveBacking | Self::PmemBacking | Self::SnapshotOutputDirectory
+            Self::DriveBacking
+                | Self::PmemBacking
+                | Self::SnapshotOutputDirectory
+                | Self::VhostUserSocketDirectory
         )
     }
 
@@ -211,7 +216,10 @@ impl ResourceRole {
     pub const fn is_scoped_directory(self) -> bool {
         matches!(
             self,
-            Self::ApiSocketDirectory | Self::VsockSocketDirectory | Self::SnapshotOutputDirectory
+            Self::ApiSocketDirectory
+                | Self::VsockSocketDirectory
+                | Self::SnapshotOutputDirectory
+                | Self::VhostUserSocketDirectory
         )
     }
 
@@ -235,6 +243,7 @@ impl ResourceRole {
             Self::ApiSocketDirectory
             | Self::VsockSocketDirectory
             | Self::SnapshotOutputDirectory => matches!(access, GrantAccess::CreateChildren),
+            Self::VhostUserSocketDirectory => matches!(access, GrantAccess::ConnectChildren),
         }
     }
 
@@ -255,6 +264,7 @@ impl ResourceRole {
             13 => Ok(Self::SnapshotStateInput),
             14 => Ok(Self::SnapshotMemoryInput),
             15 => Ok(Self::SnapshotOutputDirectory),
+            16 => Ok(Self::VhostUserSocketDirectory),
             _ => Err(ProtocolError::InvalidFrame),
         }
     }
@@ -272,6 +282,8 @@ pub enum GrantAccess {
     ReadWrite = 3,
     /// Existing directory with process-lifetime child-creation scope.
     CreateChildren = 4,
+    /// Existing directory whose exact children may only be connected.
+    ConnectChildren = 5,
 }
 
 impl GrantAccess {
@@ -281,6 +293,7 @@ impl GrantAccess {
             2 => Ok(Self::WriteOnly),
             3 => Ok(Self::ReadWrite),
             4 => Ok(Self::CreateChildren),
+            5 => Ok(Self::ConnectChildren),
             _ => Err(ProtocolError::InvalidFrame),
         }
     }
@@ -835,6 +848,17 @@ mod tests {
                 bookmark_bytes: 3,
                 fragment_count: 1,
             },
+            GrantRecord::ScopedDirectory {
+                id: id("vhost"),
+                role: ResourceRole::VhostUserSocketDirectory,
+                access: GrantAccess::ConnectChildren,
+                identity: ObjectIdentity {
+                    device: 8,
+                    inode: 9,
+                },
+                bookmark_bytes: 3,
+                fragment_count: 1,
+            },
             GrantRecord::BookmarkFragment {
                 id: id("api"),
                 offset: 0,
@@ -854,7 +878,25 @@ mod tests {
                 expected
             );
             let debug = format!("{expected:?}");
-            assert!(!debug.contains("kernel") && !debug.contains("api"));
+            assert!(
+                !debug.contains("kernel") && !debug.contains("api") && !debug.contains("vhost")
+            );
+        }
+    }
+
+    #[test]
+    fn vhost_user_directories_are_repeatable_scoped_and_connect_only() {
+        let role = ResourceRole::VhostUserSocketDirectory;
+        assert!(role.is_repeatable());
+        assert!(role.is_scoped_directory());
+        assert!(role.permits(GrantAccess::ConnectChildren));
+        for access in [
+            GrantAccess::ReadOnly,
+            GrantAccess::WriteOnly,
+            GrantAccess::ReadWrite,
+            GrantAccess::CreateChildren,
+        ] {
+            assert!(!role.permits(access));
         }
     }
 

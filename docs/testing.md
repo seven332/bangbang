@@ -329,7 +329,8 @@ and only then writes `BANGBANG_SECONDARY_CPU_OK`. Use deadline/marker
 synchronization and the signed wrapper; do not add a fixed sleep. Public process
 startup is covered separately by the signed executable target. Its generated
 `/smp-progress-init` verifies CPU0 and CPU1 affinity, gates progress until both
-are ready, then emits distinct non-ASCII one-byte tokens from each pinned role.
+are ready, then emits distinct non-ASCII one-byte tokens from each pinned role
+with a brief guest nanosleep between tokens to keep the observation fixture bounded.
 The public test pauses one two-vCPU process, uses both token streams from an
 isolated peer as an event-driven observation window, requires the paused serial
 bytes to stay exact, and requires both streams to resume. It also repeats
@@ -1038,8 +1039,9 @@ may skip execution. On supported Apple Silicon it proves:
 - suspended and post-`Hello` live-worker validation, bounded malformed bootstrap
   rejection before public readiness, and stable path/identity/frame redaction;
 - a default-close spawn allowlist that retains standard streams plus only the
-  private lifecycle, grant, and dormant socket-broker endpoints while making a
-  deliberately inheritable unexpected fd unavailable;
+  private lifecycle, grant, dormant vsock-broker, and dedicated vhost-user-
+  broker endpoints while making a deliberately inheritable unexpected fd
+  unavailable;
 - container-only API socket readiness plus path-redacted denial of an outside
   config file;
 - `SIGINT` and `SIGTERM` as one graceful session cancellation with successful
@@ -1048,7 +1050,7 @@ may skip execution. On supported Apple Silicon it proves:
   namespace recovery, and preservation of the concurrent peer namespace;
 - two simultaneous API sessions remaining independent when one worker is
   killed and the other is queried and then gracefully stopped; and
-- mandatory lifecycle-v4 acknowledgment for even an empty batch; exact
+- mandatory lifecycle-v5 acknowledgment for even an empty batch; exact
   SCM_RIGHTS read-only/write-only enforcement; one-session directory bookmark
   scope and outside-parent denial; typed mismatch rollback; path/ID/content
   redaction; signal cancellation during an incomplete batch; one absolute grant
@@ -1118,7 +1120,16 @@ may skip execution. On supported Apple Silicon it proves:
   crossing the private protocol; and
 - a real host initiating through the supplied granted main listener and
   completing deterministic 1-MiB transfers in both directions plus both peers'
-  write-half-close/EOF sequence before identity-owned socket cleanup; and
+  write-half-close/EOF sequence before identity-owned socket cleanup;
+- a contained vhost root and writable scratch child sharing one connect-only
+  directory grant alongside vsock, booting a real guest without a steady-state
+  helper, proving scratch read/write/flush plus guest-observed ID-only capacity
+  refresh on the existing stream, and closing both exact child streams; and
+- a contained all-PCI vhost lifecycle that rejects an invalid endpoint without
+  killing the live VM, rolls back failed negotiation, attaches a new device,
+  rejects duplicate same-ID PUT before a second connection, then performs
+  manual guest removal, DELETE, Paused same-ID reuse through another child,
+  resumed guest I/O, final DELETE, and exact closure; and
 - launcher-first and worker-first abrupt death after replacing the granted API
   pathname, proving both surviving cleanup owners preserve the replacement,
   clear only the matching private record, and remove the session namespace.
@@ -1132,7 +1143,7 @@ expose an overlay, and places no guest resources in a normal product. The
 all-features development binary is not a shippable bundle. Tests use readiness
 events and bounded deadlines rather than fixed sleeps.
 
-Portable `bangbang-session` tests exhaustively split and coalesce every v3
+Portable `bangbang-session` tests exhaustively split and coalesce every v5
 message frame and cover the fixed reserved-zero redacted `WorkerPolicy`, wrong
 magic/version/reserved data, exact frame/buffer
 limits, oversized input, EOF rejection, replay, sequence gaps, cross-session and
@@ -1142,8 +1153,11 @@ tests cover every closed record, limit and descriptor declaration, including
 the 255-byte redacted snapshot child grammar. Socket
 broker codec tests cover every closed kind, exact fixed frame/reserved fields,
 session/sequence/child/port/status encoding, descriptor declarations,
-truncation, malformed ancillary data, and value-redacted formatting. Darwin unit
-tests cover SCM_RIGHTS and FD_CLOEXEC, payload/control truncation, malformed
+truncation, malformed ancillary data, and value-redacted formatting. The
+separate fixed 256-byte `BBU1` vhost-user broker codec covers exact
+session/sequence/grant/child/status correlation, one-stream rights, retryable
+failures, stale or malformed response rejection, and facet poisoning. Darwin
+unit tests cover SCM_RIGHTS and FD_CLOEXEC, payload/control truncation, malformed
 ancillary cleanup, exact descriptor access/type/identity, sequence/session/batch
 poisoning and rollback, fragmented bookmark scope, kernel peer acceptance and
 PID rejection, exact namespace naming/root derivation, bounded independent
@@ -1491,9 +1505,9 @@ integration test. It also contains `/smp-init`, whose raw arm64 syscalls pin PID
 1 to CPU1 and verify the observed CPU before emitting its deterministic marker.
 The separate `/smp-progress-init` clones a shared-VM child, pins and verifies the
 parent on CPU0 and child on CPU1, releases them only after both are ready, and
-emits distinct non-ASCII one-byte progress tokens with a cooperative yield after
-each write. Token counts are safe to observe independently without multi-byte
-UART interleaving or fixed sleeps.
+emits distinct non-ASCII one-byte progress tokens with a brief guest nanosleep
+and cooperative yield after each write. Token counts are safe to observe
+independently without multi-byte UART interleaving or host-side fixed sleeps.
 The baseline test succeeds when the guest emits `BANGBANG_BOOT_OK` on the
 internal serial console. The same signed target also includes a raw
 virtio-block read scenario: the test configures one temporary drive whose first
@@ -1771,9 +1785,27 @@ publication, attaches a new non-root backend, performs guest read/write/fsync,
 manually removes and DELETEs the function, then repeats the same ID and released
 slot while Paused. The ordinary anonymous-memory hotplug case proves a candidate
 vhost listener sees zero connections and no public mutation; duplicate IDs
-likewise reject before connection. Contained socket authority, dynamic-memory
-coexistence, same-ID live reconnect, async/io_uring, automatic guest PCI
-notification, and vhost snapshot state remain outside this subset.
+likewise reject before connection.
+
+The signed production-bundle gate separately supplies one repeatable
+connect-only vhost-user directory grant. One normal sandboxed worker boots from
+an exact vhost root, performs real I/O and flush through a scratch child,
+coexists with the independent vsock authority, refreshes guest-visible capacity
+over the existing stream, retains no steady-state helper, and closes both
+streams. A second all-PCI guest starts with a contained vhost control device so
+shared memory is established, then proves invalid-target and negotiation
+rollback, runtime attach and guest I/O, duplicate zero-connect rejection,
+manual removal, DELETE, Paused same-ID reuse through another exact child,
+resumed I/O, final DELETE, and complete control/runtime closure. Unit and
+process tests additionally cover exact grant and child parsing,
+lifecycle/session/sequence correlation, malformed or extra SCM_RIGHTS
+rejection, anchored no-symlink/current-user/socket/single-link validation, cwd
+restoration, retry after a normal broker failure, startup zero-request
+preflight, runtime zero-request owner preflight, multiple children, ID-only
+PATCH, duplicate PUT, DELETE lease release, and same-ID reinsertion.
+Dynamic-memory coexistence, same-ID replacement without DELETE, async/io_uring,
+automatic guest PCI notification, and vhost snapshot state remain outside the
+combined direct and contained subset.
 
 The `bangbang-vhost-user` crate retains a portable protocol boundary.
 Native-endian golden tests cover the exact pinned

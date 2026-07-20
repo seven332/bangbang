@@ -20,6 +20,7 @@ SMP_PROGRESS_READY_MARKER = b"BBSMPREADY\n"
 SMP_PROGRESS_CPU0_TOKEN = b"\xa5"
 SMP_PROGRESS_CPU1_TOKEN = b"\xd3"
 SMP_PROGRESS_CHILD_STACK_SIZE = 4096
+SMP_PROGRESS_DELAY_NANOSECONDS = 1_000_000
 SMP_HOTPLUG_READY_MARKER = b"BBHOTREADY\n"
 SMP_HOTPLUG_OFF_MARKER = b"BBHOTOFF\n"
 SMP_HOTPLUG_DONE_MARKER = b"BBHOTDONE\n"
@@ -80,6 +81,7 @@ LINUX_AARCH64_SYSCALL_READ = 63
 LINUX_AARCH64_SYSCALL_WRITE = 64
 LINUX_AARCH64_SYSCALL_FSYNC = 82
 LINUX_AARCH64_SYSCALL_EXIT = 93
+LINUX_AARCH64_SYSCALL_NANOSLEEP = 101
 LINUX_AARCH64_SYSCALL_REBOOT = 142
 LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY = 122
 LINUX_AARCH64_SYSCALL_SCHED_YIELD = 124
@@ -953,6 +955,7 @@ def smp_progress_init_data(code_size: int) -> list[tuple[str, bytes]]:
         ("cpu1_observed", bytes(4)),
         ("cpu1_ready", bytes(4)),
         ("start", bytes(4)),
+        ("progress_delay", struct.pack("<QQ", 0, SMP_PROGRESS_DELAY_NANOSECONDS)),
         ("ready_marker", SMP_PROGRESS_READY_MARKER),
         ("cpu0_token", SMP_PROGRESS_CPU0_TOKEN),
         ("cpu1_token", SMP_PROGRESS_CPU1_TOKEN),
@@ -1017,12 +1020,17 @@ def emit_smp_progress_loop(
     *,
     label: str,
     token_address: int,
+    delay_address: int,
 ) -> None:
     code.label(label)
     code.emit(write_syscall(1, token_address, 1))
     code.emit(
         b"".join(
             (
+                mov_imm_64(0, delay_address),
+                movz_64(1, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_NANOSLEEP),
+                svc_0(),
                 movz_64(8, LINUX_AARCH64_SYSCALL_SCHED_YIELD),
                 svc_0(),
             )
@@ -1085,6 +1093,7 @@ def build_smp_progress_init_code(addresses: dict[str, int]) -> bytes:
         code,
         label="cpu0_progress",
         token_address=addresses["cpu0_token"],
+        delay_address=addresses["progress_delay"],
     )
 
     code.label("child")
@@ -1113,6 +1122,7 @@ def build_smp_progress_init_code(addresses: dict[str, int]) -> bytes:
         code,
         label="cpu1_progress",
         token_address=addresses["cpu1_token"],
+        delay_address=addresses["progress_delay"],
     )
 
     code.label("failure")
@@ -1797,8 +1807,11 @@ def validate_smp_progress_init_entry(entries: dict[str, dict[str, object]]) -> N
         raise RuntimeError(
             "guest initrd smp-progress-init payload omits ordered CPU0/CPU1 affinity masks"
         )
+    if struct.pack("<QQ", 0, SMP_PROGRESS_DELAY_NANOSECONDS) not in payload:
+        raise RuntimeError("guest initrd smp-progress-init payload omits the progress delay")
     for syscall, description in (
         (LINUX_AARCH64_SYSCALL_CLONE, "clone"),
+        (LINUX_AARCH64_SYSCALL_NANOSLEEP, "nanosleep"),
         (LINUX_AARCH64_SYSCALL_SCHED_SETAFFINITY, "sched_setaffinity"),
         (LINUX_AARCH64_SYSCALL_SCHED_YIELD, "sched_yield"),
         (LINUX_AARCH64_SYSCALL_GETCPU, "getcpu"),

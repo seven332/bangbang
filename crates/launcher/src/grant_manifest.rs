@@ -201,6 +201,7 @@ fn parse_role(value: &str) -> Result<ResourceRole, LauncherError> {
         "snapshot-state-input" => Ok(ResourceRole::SnapshotStateInput),
         "snapshot-memory-input" => Ok(ResourceRole::SnapshotMemoryInput),
         "snapshot-output-directory" => Ok(ResourceRole::SnapshotOutputDirectory),
+        "vhost-user-socket-directory" => Ok(ResourceRole::VhostUserSocketDirectory),
         _ => Err(LauncherError::InvalidGrantInput),
     }
 }
@@ -211,6 +212,7 @@ fn parse_access(value: &str) -> Result<GrantAccess, LauncherError> {
         "write-only" => Ok(GrantAccess::WriteOnly),
         "read-write" => Ok(GrantAccess::ReadWrite),
         "create-children" => Ok(GrantAccess::CreateChildren),
+        "connect-children" => Ok(GrantAccess::ConnectChildren),
         _ => Err(LauncherError::InvalidGrantInput),
     }
 }
@@ -237,7 +239,7 @@ pub(crate) struct PreparedGrantBatch {
     records: Vec<PreparedRecord>,
 }
 
-/// Borrowed exact anchor metadata for one singleton socket-directory grant.
+/// Borrowed exact anchor metadata for one socket-directory grant.
 #[derive(Clone, Copy)]
 pub(crate) struct SocketDirectoryAnchor {
     descriptor: RawFd,
@@ -262,6 +264,14 @@ impl std::fmt::Debug for SocketDirectoryAnchor {
 }
 
 impl SocketDirectoryAnchor {
+    #[cfg(test)]
+    pub(crate) const fn for_test(descriptor: RawFd, identity: ObjectIdentity) -> Self {
+        Self {
+            descriptor,
+            identity,
+        }
+    }
+
     pub(crate) const fn descriptor(self) -> RawFd {
         self.descriptor
     }
@@ -406,6 +416,11 @@ impl PreparedGrantBatch {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self::prepare(Vec::new()).expect("an empty test grant batch must prepare")
+    }
+
     pub(crate) fn batch(&self) -> BatchId {
         self.batch
     }
@@ -455,6 +470,32 @@ impl PreparedGrantBatch {
                     identity,
                     ..
                 } if *record_role == role => prepared
+                    .descriptor
+                    .as_ref()
+                    .map(AsRawFd::as_raw_fd)
+                    .map(|descriptor| SocketDirectoryAnchor {
+                        descriptor,
+                        identity: *identity,
+                    }),
+                _ => None,
+            })
+    }
+
+    /// Borrows one exact connect-only vhost-user directory anchor by grant ID.
+    pub(crate) fn vhost_user_directory_anchor(
+        &self,
+        requested_id: &GrantId,
+    ) -> Option<SocketDirectoryAnchor> {
+        self.records
+            .iter()
+            .find_map(|prepared| match &prepared.record {
+                GrantRecord::ScopedDirectory {
+                    id,
+                    role: ResourceRole::VhostUserSocketDirectory,
+                    access: GrantAccess::ConnectChildren,
+                    identity,
+                    ..
+                } if id == requested_id => prepared
                     .descriptor
                     .as_ref()
                     .map(AsRawFd::as_raw_fd)
@@ -615,7 +656,9 @@ fn open_root_directory() -> Result<OwnedFd, LauncherError> {
 
 fn resource_open_flags(grant: &ManifestGrant) -> libc::c_int {
     let access = match grant.access {
-        GrantAccess::ReadOnly | GrantAccess::CreateChildren => libc::O_RDONLY,
+        GrantAccess::ReadOnly | GrantAccess::CreateChildren | GrantAccess::ConnectChildren => {
+            libc::O_RDONLY
+        }
         GrantAccess::WriteOnly => libc::O_WRONLY,
         GrantAccess::ReadWrite => libc::O_RDWR,
     };
@@ -644,7 +687,9 @@ fn normalized_device(device: libc::dev_t) -> u64 {
 fn access_matches(flags: libc::c_int, access: GrantAccess) -> bool {
     let actual = flags & libc::O_ACCMODE;
     match access {
-        GrantAccess::ReadOnly | GrantAccess::CreateChildren => actual == libc::O_RDONLY,
+        GrantAccess::ReadOnly | GrantAccess::CreateChildren | GrantAccess::ConnectChildren => {
+            actual == libc::O_RDONLY
+        }
         GrantAccess::WriteOnly => actual == libc::O_WRONLY,
         GrantAccess::ReadWrite => actual == libc::O_RDWR,
     }
@@ -852,6 +897,31 @@ mod tests {
             2
         );
 
+        let vhost_directories = br#"{
+            "version":1,
+            "grants":[
+                {"id":"vhost-one","role":"vhost-user-socket-directory","access":"connect-children","source":"/private/tmp/vhost-one"},
+                {"id":"vhost-two","role":"vhost-user-socket-directory","access":"connect-children","source":"/private/tmp/vhost-two"}
+            ]
+        }"#;
+        assert_eq!(
+            parse_manifest(vhost_directories)
+                .expect("vhost-user directory role should be repeatable")
+                .len(),
+            2
+        );
+
+        let writable_vhost_directory = br#"{
+            "version":1,
+            "grants":[
+                {"id":"vhost","role":"vhost-user-socket-directory","access":"create-children","source":"/private/tmp/vhost"}
+            ]
+        }"#;
+        assert!(matches!(
+            parse_manifest(writable_vhost_directory),
+            Err(LauncherError::InvalidGrantInput)
+        ));
+
         let duplicate_snapshot_input = br#"{
             "version":1,
             "grants":[
@@ -863,6 +933,48 @@ mod tests {
             parse_manifest(duplicate_snapshot_input),
             Err(LauncherError::InvalidGrantInput)
         ));
+    }
+
+    #[test]
+    fn vhost_user_directory_anchor_is_selected_by_exact_grant_id() {
+        let root = TestDir::new();
+        let first_path = root.path().join("vhost-one");
+        let second_path = root.path().join("vhost-two");
+        fs::create_dir(&first_path).expect("first vhost directory should create");
+        fs::create_dir(&second_path).expect("second vhost directory should create");
+        let first_id = GrantId::parse("vhost-one").expect("first ID should parse");
+        let second_id = GrantId::parse("vhost-two").expect("second ID should parse");
+        let batch = PreparedGrantBatch::prepare(vec![
+            manifest_grant(
+                "vhost-one",
+                ResourceRole::VhostUserSocketDirectory,
+                GrantAccess::ConnectChildren,
+                first_path,
+            ),
+            manifest_grant(
+                "vhost-two",
+                ResourceRole::VhostUserSocketDirectory,
+                GrantAccess::ConnectChildren,
+                second_path,
+            ),
+        ])
+        .expect("vhost directory grants should prepare");
+
+        let first = batch
+            .vhost_user_directory_anchor(&first_id)
+            .expect("first exact anchor should exist");
+        let second = batch
+            .vhost_user_directory_anchor(&second_id)
+            .expect("second exact anchor should exist");
+        assert_ne!(first.identity(), second.identity());
+        assert_ne!(first.descriptor(), second.descriptor());
+        assert!(
+            batch
+                .vhost_user_directory_anchor(
+                    &GrantId::parse("missing-vhost").expect("missing ID should parse")
+                )
+                .is_none()
+        );
     }
 
     #[test]

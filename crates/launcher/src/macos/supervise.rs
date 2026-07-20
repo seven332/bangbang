@@ -22,6 +22,7 @@ use signal_hook::{SigId, low_level};
 use super::daemon::{DaemonNotifier, NotifierEvent};
 use super::socket_broker::LauncherSocketBroker;
 use super::spawn::OwnedWorker;
+use super::vhost_user_broker::LauncherVhostUserBroker;
 use crate::LauncherError;
 use crate::grant_manifest::{OutboundGrant, PreparedGrantBatch};
 
@@ -187,6 +188,9 @@ pub(crate) fn wait_session(
         let _ = session.shutdown(std::net::Shutdown::Both);
         shutdown_grants(auxiliary.grant_socket);
         let _ = auxiliary.socket_broker.shutdown(std::net::Shutdown::Both);
+        let _ = auxiliary
+            .vhost_user_broker
+            .shutdown(std::net::Shutdown::Both);
         worker.terminate_and_reap();
     }
 
@@ -349,16 +353,19 @@ struct SessionObservation {
 pub(crate) struct AuxiliaryChannels<'a> {
     grant_socket: &'a mut UnixDatagram,
     socket_broker: &'a mut UnixDatagram,
+    vhost_user_broker: &'a mut UnixDatagram,
 }
 
 impl<'a> AuxiliaryChannels<'a> {
     pub(crate) fn new(
         grant_socket: &'a mut UnixDatagram,
         socket_broker: &'a mut UnixDatagram,
+        vhost_user_broker: &'a mut UnixDatagram,
     ) -> Self {
         Self {
             grant_socket,
             socket_broker,
+            vhost_user_broker,
         }
     }
 }
@@ -379,6 +386,7 @@ fn wait_session_inner(
 ) -> Result<ExitStatus, LauncherError> {
     let grant_socket = &mut *auxiliary.grant_socket;
     let socket_broker = &mut *auxiliary.socket_broker;
+    let vhost_user_broker = &mut *auxiliary.vhost_user_broker;
     let SessionHooks {
         observation,
         mut notifier,
@@ -392,6 +400,9 @@ fn wait_session_inner(
     socket_broker
         .set_nonblocking(true)
         .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
+    vhost_user_broker
+        .set_nonblocking(true)
+        .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
     let kqueue = create_kqueue()?;
     let child_pid = usize::try_from(worker.pid())
         .map_err(|_| LauncherError::WorkerWait(io::ErrorKind::InvalidInput))?;
@@ -400,6 +411,8 @@ fn wait_session_inner(
     let grant_fd = usize::try_from(grant_socket.as_raw_fd())
         .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
     let broker_fd = usize::try_from(socket_broker.as_raw_fd())
+        .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
+    let vhost_broker_fd = usize::try_from(vhost_user_broker.as_raw_fd())
         .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
     let mut changes = vec![
         event(
@@ -440,6 +453,12 @@ fn wait_session_inner(
             libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
             0,
         ),
+        event(
+            vhost_broker_fd,
+            libc::EVFILT_READ,
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            0,
+        ),
     ];
     let notifier_fd = notifier
         .as_ref()
@@ -463,6 +482,7 @@ fn wait_session_inner(
     let mut session_closed = false;
     let mut grant_send = GrantSendState::new(grants, lifecycle.session());
     let mut broker = LauncherSocketBroker::new(lifecycle.session());
+    let mut vhost_broker = LauncherVhostUserBroker::new(lifecycle.session());
     loop {
         let notifier_deadline = notifier.as_ref().and_then(|notifier| notifier.deadline());
         let deadline = [
@@ -561,6 +581,20 @@ fn wait_session_inner(
         {
             broker.drain(
                 socket_broker,
+                worker.pid(),
+                lifecycle.state(),
+                lifecycle.is_cancelled(),
+                grants,
+            )?;
+        }
+
+        if !child_exited
+            && events
+                .iter()
+                .any(|queued| queued.filter == libc::EVFILT_READ && queued.ident == vhost_broker_fd)
+        {
+            vhost_broker.drain(
+                vhost_user_broker,
                 worker.pid(),
                 lifecycle.state(),
                 lifecycle.is_cancelled(),
