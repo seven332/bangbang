@@ -61,6 +61,16 @@ certification, and Firecracker's KVM ITS identity remain explicit limits.
 Native-v1 create/load rejects PCI profiles before artifact or VM mutation,
 while the default MMIO snapshot profile is unchanged.
 
+Direct pre-boot drives may instead select Firecracker's vhost-user block
+`socket` shape. Startup connects under a bounded deadline, switches guest RAM
+to descriptor-backed shared mappings, negotiates the reviewed CONFIG and
+virtio feature set, and transfers one queue plus the complete current memory
+table to the operator-selected backend. The same device works over default
+MMIO or all-virtio PCI, including root/partuuid/read-only/writeback behavior,
+backend-call interrupts, metrics, and redacted terminal disconnects. This is a
+trusted direct-mode memory capability: contained socket authorization, runtime
+vhost replacement/hotplug, and vhost snapshot state remain explicit limits.
+
 ## Layout
 
 ```text
@@ -70,8 +80,8 @@ crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
 crates/launcher   Production app bundle, nested-worker validation, and supervision
 crates/session    Private launcher-worker protocol and runtime namespace ownership
-crates/vhost-user Strict internal vhost-user frontend protocol, SCM_RIGHTS framing,
-                  and portable pipe queue notifiers; no public device activation
+crates/vhost-user Strict vhost-user frontend protocol, SCM_RIGHTS framing,
+                  and portable pipe queue notifiers used by direct block startup
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
 tools/seccompiler Firecracker v1.16-compatible offline seccompiler CLI and

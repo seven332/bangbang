@@ -2177,7 +2177,7 @@
     {
       "id": "api-property:Drive.socket",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Drive.socket.",
+      "summary": "Direct pre-boot configuration now accepts and exactly reports a nonempty vhost-user block socket only under the pinned field matrix. InstanceStart connects with a bounded redacted deadline, selects shared guest RAM, negotiates the reviewed feature/config surface, and activates one queue over MMIO or PCI with signed root and scratch I/O evidence. Runtime vhost replacement/hotplug, contained authorized stream delivery, and the broad vhost/storage audit remain pending before this property is terminally promoted.",
       "source_refs": [
         "api-property:Drive.socket"
       ],
@@ -4683,7 +4683,7 @@
     {
       "id": "corpus:block-vhost-user",
       "family": "storage",
-      "summary": "Audit all applicable capability claims owned by the pinned block-vhost-user source corpus.",
+      "summary": "Direct startup now implements the pinned one-queue vhost-user block path over MMIO or PCI: strict socket-only configuration, bounded feature/protocol/config discovery, descriptor-backed complete guest-memory transfer, translated vring setup, kick/call notification, root/partuuid/cache behavior, redacted terminal disconnect handling, metrics, cleanup, and pre-artifact snapshot rejection. Continue auditing runtime lifecycle, contained socket authority, snapshot state, broader backend/config-change behavior, and complete corpus semantics before promotion.",
       "source_refs": [
         "corpus:block-vhost-user"
       ],
@@ -6823,7 +6823,7 @@
     {
       "id": "semantic.storage:block-sync-async-vhost-and-limits",
       "family": "storage",
-      "summary": "Audit virtio-block Sync/Async behavior, vhost-user, cache/flush/root semantics, limiting, metrics, cleanup, and snapshot state.",
+      "summary": "File-backed startup/runtime behavior and direct startup vhost-user block now cover the selected MMIO/PCI transports, root/partuuid/cache/flush semantics, shared-memory vring transfer, notifications, metrics, redacted backend death, cleanup, and explicit snapshot rejection. Continue auditing Linux io_uring Async, runtime vhost replacement/hotplug, contained authorized streams, complete limiter/config-change parity, snapshot state, and the remaining aggregate storage contract.",
       "source_refs": [
         "corpus:block-caching",
         "corpus:block-io-engine",

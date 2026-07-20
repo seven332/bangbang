@@ -882,10 +882,12 @@ zero-safe-reclaimed byte, skipped-edge byte, requested reporting byte, and
 failed-attempt fields;
 `signals.sigpipe` reports handled non-terminating `SIGPIPE`
 signals. HVF block, PMEM, network, and entropy limiter retry wakeups are wired
-for active queues and share acknowledged native-v1 quiescence. Hotplug/removal,
-vhost-user-block, and other producer classes that do
-not exist in the supported device subset remain absent rather than appearing as
-synthetic zero-filled fields. The startup timing stores match Firecracker's
+for active queues and share acknowledged native-v1 quiescence. Direct
+vhost-user block uses the same per-drive block metric identity: guest kicks and
+interrupts follow the normal counters, while a closed or broken backend call
+path increments `event_fails` without exposing its socket. Producer classes
+that do not exist in the supported device subset remain absent rather than
+appearing as synthetic zero-filled fields. The startup timing stores match Firecracker's
 `ProcessTimeReporter` field names for the implemented process path.
 
 Supported value-taking startup arguments accept both Firecracker-style
@@ -1209,13 +1211,13 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value, and the internal model validates it as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. |
 | `PUT /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |
 | `PUT /drives/{drive_id}` | `is_root_device` | required | Identifies whether this drive is the boot device. |
-| `PUT /drives/{drive_id}` | `path_on_host` | required for virtio-block; omitted for recognized unsupported vhost-user-block | The API/VMM path records this value only after rejecting empty paths. Ordinary pre-boot paths retain deferred startup opening; ordinary runtime PCI paths open on the API thread before owner submission. In contained mode an exact grant tag claims one `DriveBacking` descriptor with access matching `is_read_only`, validates it as the same regular-file backing type, and retains it by drive ID for move-only startup. Runtime PCI insertion may reserve only a still-unused initial tag: it duplicates the already-open file for the candidate while retaining the original grant in a rollback claim until endpoint publication commits. Failure restores authority with no ambient fallback; success consumes it once. Native-v1 capture recognizes a supplied startup origin and derives the snapshot identity from the live descriptor without reopening the persisted tag. A contained restore discovers that tag from bounded decoded state and atomically adopts a matching read-only `DriveBacking` with the state/memory inputs; the complete captured device/inode/length/mode/mtime/ctime identity must still match. Same-ID replacement is failure-atomic; malformed, mismatched, missing, or consumed tags fail without ambient fallback. Socket-backed vhost-user-block requests may omit the field and are rejected through the `socket` unsupported path. Errors and debug output redact paths and tags. |
-| `PUT /drives/{drive_id}` | `is_read_only` | optional | The internal model defaults omitted virtio-block drives to read-write. |
-| `PUT /drives/{drive_id}` | `partuuid` | optional | Only meaningful for root-device boot selection. |
-| `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; supported when `Writeback` | The internal model accepts omitted/default `Unsafe` and explicit `Writeback`. `Unsafe` does not advertise `VIRTIO_BLK_F_FLUSH`; `Writeback` advertises it and routes guest flush requests through the backing flush path. |
-| `PUT /drives/{drive_id}` | `rate_limiter` | optional bandwidth/ops token buckets | Missing, `null`, empty-object, or all-null `bandwidth`/`ops` values are accepted as unconfigured. Configured Firecracker-shaped buckets are stored before startup, echoed through `GET /vm/config`, and applied to virtio-block queue dispatch without sleeping. |
-| `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
-| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; rejected when configured | The parser accepts Firecracker-shaped socket-backed drive requests, including requests that omit `path_on_host`, then the internal model rejects configured sockets with `drive socket is not supported` without opening host paths, creating sockets, transferring guest-memory descriptors, mutating drive state, or echoing the socket path. A strict internal frontend protocol/SCM_RIGHTS/pipe-notifier foundation exists, but it cannot open this path or activate a device; real vhost-user-block support remains deferred. |
+| `PUT /drives/{drive_id}` | `path_on_host` | required for file-backed virtio-block; omitted for vhost-user-block | The API/VMM path records this value only after rejecting empty paths. File-backed pre-boot paths retain deferred startup opening; ordinary runtime PCI paths open on the API thread before owner submission. In contained mode an exact grant tag claims one `DriveBacking` descriptor with access matching `is_read_only`, validates it as the same regular-file backing type, and retains it by drive ID for move-only startup. Runtime PCI insertion may reserve only a still-unused initial tag: it duplicates the already-open file for the candidate while retaining the original grant in a rollback claim until endpoint publication commits. Failure restores authority with no ambient fallback; success consumes it once. Native-v1 capture recognizes a supplied startup origin and derives the snapshot identity from the live descriptor without reopening the persisted tag. A contained restore discovers that tag from bounded decoded state and atomically adopts a matching read-only `DriveBacking` with the state/memory inputs; the complete captured device/inode/length/mode/mtime/ctime identity must still match. Same-ID replacement is failure-atomic; malformed, mismatched, missing, or consumed tags fail without ambient fallback. Direct socket-backed requests must omit this field; mixed file/socket bodies fail before connection or mutation. Errors and debug output redact paths and tags. |
+| `PUT /drives/{drive_id}` | `is_read_only` | optional for file-backed drives; omitted for vhost-user | File-backed drives default to read-write. A socket-backed request must omit this field because read-only capability is negotiated from the backend and then exposed to the guest; an explicit value fails before connection or mutation. |
+| `PUT /drives/{drive_id}` | `partuuid` | optional | Only meaningful for root-device boot selection and supported for either backend; signed PCI vhost evidence boots an MBR partition through the exact PARTUUID argument. |
+| `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; supported when `Writeback` | Both backends accept omitted/default `Unsafe` and explicit `Writeback`. File-backed `Unsafe` suppresses FLUSH and `Writeback` advertises it. Vhost discovery excludes FLUSH from the Unsafe requested intersection and permits it for Writeback only when the backend offers it. |
+| `PUT /drives/{drive_id}` | `rate_limiter` | optional bandwidth/ops token buckets for file-backed drives; omitted for vhost-user | File-backed missing/null/empty/all-null values are unconfigured; valid buckets are stored, reported, and applied without sleeping. A socket-backed request must omit this field because direct vhost limiting is not implemented. |
+| `PUT /drives/{drive_id}` | `io_engine` | optional `Sync` for file-backed drives; omitted for vhost-user; `Async` rejected | File-backed omitted/default `Sync` is accepted and Linux io_uring `Async` is rejected. A socket-backed request must omit the field because I/O execution belongs to the external backend. |
+| `PUT /drives/{drive_id}` | `socket` | optional; direct pre-boot vhost-user block implemented | A nonempty socket selects the vhost backend only when `path_on_host`, explicit `is_read_only`, `io_engine`, and `rate_limiter` are absent; drive ID, root selection, `partuuid`, and cache mode remain valid. Successful pre-boot requests store and exactly report the socket without inventing a path. `InstanceStart` connects with a bounded redacted deadline, performs strict feature/protocol/CONFIG discovery before VM construction, selects shared RAM, and activates one queue over MMIO or PCI. Failure drops prepared streams and preserves the unstarted configuration. Running/Paused vhost PUT/PATCH/DELETE remain rejected pending the runtime lifecycle, and contained mode rejects ambient socket access pending authorized connected-stream delivery. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value before building the runtime update action. |
 | `PATCH /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |
@@ -1670,18 +1672,22 @@ reads while deallocating the range. The native image loader has an explicit
 internal shared-profile entry point, while public native-v1 restore remains
 anonymous. macOS provides no `memfd` sealing equivalent, so a future external
 recipient of a writable descriptor is an explicit trusted capability boundary.
-A separate internal `bangbang-vhost-user` crate now implements the closed
-Firecracker v1.16 block frontend request set over an already connected Unix
-stream: owner/feature negotiation, optional CONFIG and REPLY_ACK, exact
-memory-table and vring setup, native-endian bounded framing, first-header-byte
-SCM_RIGHTS, absolute deadlines, terminal synchronization failure, and
-directional eight-byte nonblocking pipe notifications with Darwin kqueue
-evidence. Its test-only control peer is not a shipped storage backend. This
-shared-RAM and protocol foundation still hands no descriptor to an external
-backend, opens no socket path, constructs no block device, and does not accept
-a public vhost-user socket. Direct pmem is a separate classified host mapping;
-it does not export or reclassify ordinary guest RAM. The runtime does not use
-Firecracker's `vm-memory` or `vhost` crates.
+A separate `bangbang-vhost-user` crate implements the closed Firecracker v1.16
+block frontend request set over an already connected Unix stream:
+owner/feature negotiation, CONFIG and optional REPLY_ACK, exact memory-table
+and vring setup, native-endian bounded framing, first-header-byte SCM_RIGHTS,
+absolute deadlines, terminal synchronization failure, and directional
+eight-byte nonblocking pipe notifications with Darwin kqueue evidence. Direct
+startup owns the path connector, discovers every configured backend before VM
+construction, and selects descriptor-backed shared RAM whenever at least one
+socket drive exists. Guest activation transfers every exact current RAM region
+and one validated queue, then routes backend calls through the same GIC/MSI
+interrupt abstraction as file-backed block. The selected backend is trusted
+with complete guest RAM; the strict regular-file peer used by tests is not a
+shipped storage backend. Ordinary-only VMs remain anonymous, dynamic memory
+hotplug is rejected with vhost, and native-v1 capture rejects before artifact
+staging. Direct pmem remains a separate classified host mapping. The runtime
+does not use Firecracker's `vm-memory` or `vhost` crates.
 
 Guest memory byte access validates the whole requested guest address range
 before copying. Overflow, unmapped holes, and the aarch64 MMIO64 gap fail
@@ -1745,8 +1751,8 @@ configuration accepts the documented drive fields, rejects unknown fields,
 rejects malformed or incomplete JSON bodies, rejects extra path segments, and
 rejects path/body `drive_id` mismatches without echoing host paths. The initial
 parser treats a body with neither `path_on_host` nor `socket` as incomplete, but
-accepts Firecracker-shaped socket-backed vhost-user-block bodies far enough to
-route them to the unsupported socket fault. Drive update
+accepts either a file-backed `path_on_host` body or the strict socket-backed
+vhost-user matrix. Drive update
 requests parse the Firecracker-shaped `drive_id`, `path_on_host`, and
 `rate_limiter` fields, reject invalid or mismatched bodies, and route valid
 runtime updates to the process-owned block-device refresh path. The running API server
@@ -1758,27 +1764,30 @@ ordering slot, while newly configured root drives are still kept first.
 Firecracker v1.16.0's developer-preview runtime drive PUT and DELETE behavior
 requires `--enable-pci` and PCI transport. The operator must rescan the guest PCI
 bus after attach and remove the guest PCI device before host DELETE because the
-feature has no automatic guest notification. bangbang now supports immutable
-all-virtio PCI startup with `--enable-pci`, but it does not yet add functions to
-an active bus: runtime PUT still fails before the proposed backing is opened or
-retained, and bodyless DELETE returns a redacted, nonmutating device-specific
-unsupported fault. Existing drive backing/rate-limiter PATCH operates through
-the selected MMIO or PCI startup handle.
+feature has no automatic guest notification. bangbang supports transactional
+file-backed non-root PUT and bodyless DELETE on the retained all-virtio PCI bus
+in Running or Paused state. Existing drive backing/rate-limiter PATCH operates
+through the selected MMIO or PCI startup handle. The runtime lifecycle does not
+yet replace, insert, remove, or patch a vhost-user backend; those requests fail
+before opening a new socket or mutating live/public state.
 
 The runtime crate has an internal, Firecracker-shaped drive configuration model
 for the initial virtio-block subset. It validates path and body `drive_id`
 values as nonempty alphanumeric strings with `_`, requires the two IDs to
-match, rejects an empty `path_on_host` without opening or statting host files,
-and normalizes omitted `is_read_only` to read-write. A missing `path_on_host`
-without a configured `socket` is rejected; a configured `socket` is rejected as
-unsupported before path validation so socket-only vhost-user-block configs
-produce the stable socket fault.
+match, and uses an exhaustive file/vhost backend enum. File-backed input
+requires one nonempty `path_on_host`, normalizes omitted `is_read_only` to
+read-write, accepts Sync plus optional rate limits, and rejects a socket.
+Vhost-user input requires one nonempty socket, accepts root/partuuid/cache, and
+rejects `path_on_host`, explicit `is_read_only`, `io_engine`, or rate limiting.
+Invalid mixed shapes fail before host access or stored-state mutation.
 
-The internal model accepts omitted/default `cache_type=Unsafe`, explicit
-`cache_type=Writeback`, omitted/default `io_engine=Sync`, and configured
-bandwidth/ops rate limiters. It rejects `Async` and configured sockets as
-unsupported. Displayed errors avoid echoing `path_on_host` or socket paths so
-future API code can preserve host path redaction.
+Both backends accept omitted/default `cache_type=Unsafe` or explicit
+`cache_type=Writeback`. For vhost, startup connects under one bounded deadline,
+requires VERSION_1 plus vhost protocol negotiation and CONFIG, intersects the
+reviewed block/ring features with the backend, and preserves the exact 60-byte
+config. `GET /vm/config` emits only the selected backend fields. Displayed
+errors and debug output avoid echoing paths, sockets, descriptors, guest
+addresses, or backend payloads.
 
 The runtime crate can also open the normalized `path_on_host` as a regular
 host file, preserve the configured read-only mode, report byte length, and
@@ -1789,6 +1798,17 @@ echoing `path_on_host`. Public startup opens configured backing paths during
 `InstanceStart`, and runtime drive updates open replacement backing paths before
 mutating the active virtio-block handler or stored VMM configuration.
 
+When any direct startup drive uses vhost-user, startup selects shared guest RAM
+before allocation, carries every connected frontend as a move-only resource,
+and activates the existing concrete block device over MMIO or PCI. Only after
+guest feature and full ring-range validation does it send the final feature
+mask, every shared-memory region, vring state, call/kick descriptors, and queue
+enable. Backend calls wake a blocked vCPU and raise the normal queue interrupt;
+backend closure terminalizes only that device path, records a per-drive event
+failure, and leaves the process API responsive. Vhost-user and dynamic memory
+hotplug are mutually rejected because the memory table is one-time, and
+native-v1 capture rejects vhost before artifact staging.
+
 Contained mode additionally recognizes only an exact private grant tag during
 successful drive `PUT`/path-changing live `PATCH`. It binds exact ID,
 `DriveBacking` role, and access derived from the immutable read-only mode,
@@ -1798,19 +1818,24 @@ failure-atomic; startup consumes prepared backings through an exact-ID move-only
 bundle. A successfully claimed live replacement remains consumed if a later
 active-session transition fails. Limiter-only updates claim nothing and retain
 the current backing. Direct mode continues treating the tag bytes as a path.
+Contained socket-backed requests fail before grant claim or ambient connection;
+an authorized connected-stream role is not yet part of the launcher protocol.
 
 Virtio-block feature negotiation follows the selected cache mode:
 `cache_type=Unsafe` keeps the flush feature hidden, while
 `cache_type=Writeback` advertises `VIRTIO_BLK_F_FLUSH` and uses the existing
-backing-file flush path for guest flush requests.
+backing-file flush path for guest flush requests. A vhost backend supplies its
+read-only capability and maximum reviewed feature set; Unsafe excludes FLUSH
+from the requested intersection, while Writeback permits it when offered.
 
-Runtime drive updates are limited to replacing an existing active drive's host
-file and updating its per-device rate limiter. They do not create new
-virtio-block devices, remove existing devices, or renegotiate features. A
-successful backing refresh updates the matching MMIO handler's backing, config
-space, config generation, and config interrupt status. A limiter-only update
-does not reopen the backing or raise a config interrupt. Failures preserve the
-previous backing and stored config.
+Runtime PATCH can replace an existing file-backed drive's host file and update
+its per-device rate limiter. Public PCI additionally supports transactional
+Running/Paused insertion and removal of non-root file-backed drives after
+manual guest rescan/removal. A successful backing refresh updates the matching
+MMIO or PCI handler's backing, config space, config generation, and config
+interrupt status. A limiter-only update does not reopen the backing or raise a
+config interrupt. Failures preserve the previous backing and stored config.
+Vhost runtime mutation remains rejected before connection or device mutation.
 
 ## Internal Network Interface Configuration
 
@@ -2162,11 +2187,16 @@ suppresses the flush feature, while `Writeback` advertises it and the signed
 executable guest fsync scenario validates the backing flush path. Block limiter
 retry is backend-neutral and active HVF sessions own their retry wakeups; this
 does not claim Firecracker's exact Linux timerfd/eventfd event-source identity.
-The current device does not provide PCI hotplug, accept Linux io_uring `Async`,
-or execute vhost-user-block sockets. Native-v1 remains the separately accepted
-one-read-only-root profile rather than a general optional-device snapshot claim.
-Internal HVF boot sessions can signal block SPI interrupts after boot-runtime
-block notification dispatch.
+The same concrete device supports file-backed PCI hotplug and direct pre-boot
+vhost-user execution. Signed vhost cases boot an MMIO read-only root and a PCI
+writable MBR/PARTUUID root, verify backend-derived config and scratch
+read/write/flush, and prove redacted backend-death metrics while the API remains
+responsive. Linux io_uring `Async`, runtime vhost lifecycle, contained socket
+authority, and automatic PCI notification remain unavailable. Native-v1
+retains the separate file-backed one-read-only-root profile and rejects vhost
+before artifact creation rather than claiming optional-device snapshot state.
+Internal HVF boot sessions can signal block SPI or MSI interrupts after
+boot-runtime block notification dispatch.
 
 ## Internal arm64 FDT Generation
 
@@ -3113,7 +3143,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Representable invalid values return typed VMM faults. Accepted vCPU/memory state is applied exactly during startup; host vCPU capacity and ordinary memory allocation remain startup checks. |
 | `PATCH /machine-config` | implemented; `204` empty response on successful partial config update | unsupported after start; `400` `fault_message` | Pre-boot-only partial configuration. Omitted/null fields preserve current stored values; empty/null-only candidates use `Empty PATCH request.`; invalid updates leave machine and balloon state unchanged. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config. Direct host paths open during startup preparation; contained grant tags claim exact read-only kernel/initrd descriptors during the successful request and move them into startup without reopening the tags. Host path and grant errors avoid leaking sensitive values. |
-| `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage; recognized unsupported for vhost-user-block `socket` configs | PCI-only non-root runtime attach implemented; `204` on success | Records validated pre-boot virtio-block config, including optional bandwidth/ops rate limiters. Direct paths open during startup; contained grant tags claim and retain exact-ID, exact-access regular-file descriptors during successful requests. Startup moves provided descriptors or opens missing direct paths, attaches initial block devices over the selected startup transport, applies configured limiters in queue dispatch without sleeping, and wires session-owned HVF retry wakeups when a throttled descriptor remains pending. Firecracker-shaped socket-backed vhost-user-block configs are parsed and rejected with `drive socket is not supported` without mutating stored config or consuming a grant. After public PCI startup, Running/Paused requests transactionally attach non-root file-backed drives through the retained owner inventory; direct mode opens before submission and contained mode consumes only an exact unused initial grant with rollback on abort. Publication and stored configuration commit only together. Default MMIO, root, duplicate, invalid backing/grant, and exhausted-capacity requests remain nonmutating. Guest PCI rescan is manual. External vhost-user-block execution remains unsupported. |
+| `PUT /drives/{drive_id}` | implemented; `204` empty response for valid file-backed or direct socket-backed pre-boot config | PCI-only non-root file-backed runtime attach implemented; `204` on success | File-backed requests retain optional limiters, deferred direct opening, exact contained grants, selected-transport startup, and transactional PCI runtime attachment. A direct socket-backed request must use the strict vhost field matrix; startup connects and discovers all backends under bounded deadlines before VM construction, selects shared RAM, exposes exact backend-derived config/features, and activates one queue over MMIO or PCI with backend-call wakeups and normal per-drive metrics. Discovery failure preserves the unstarted config and publishes no VM. Contained socket access, runtime vhost PUT/PATCH/DELETE, and dynamic-memory coexistence remain rejected before connection/mutation. Default MMIO runtime attach, root runtime mutation, duplicate, invalid backing/grant/socket, and exhausted-capacity requests remain nonmutating. File-backed PCI guest rescan is manual. |
 | `PUT /pmem/{id}` | implemented; `204` empty response on successful config storage | implemented in Running/Paused public PCI; `204` after live commit | Pre-boot requests record Firecracker-shaped config and replace prior config for the same ID failure-atomically; empty or all-null limiter objects are unconfigured and valid bandwidth/ops buckets are stored and reported. One pmem or ordinary block root is accepted; pmem order supplies `/dev/pmem<i>` and `ro`/`rw`, and cross-family or second-root failure precedes grant/config mutation. Direct pre-boot paths remain unopened until startup; contained grant tags claim and retain exact-ID, exact-access nonzero regular-file descriptors. Startup moves provided descriptors or opens missing direct paths, maps each file/private-tail range once, registers a cloned lease directly with HVF, attaches the selected transport, and retains every owner. After startup, public PCI accepts only a new non-root ID: direct mode opens before owner submission, contained mode reserves an exact unused grant with rollback, and the owner maps the file, allocates a non-overlapping reusable guest range, registers the exact direct mapping, and publishes the endpoint before configuration and grant-consumption commit. Exact-prefix `MS_SYNC`, read-only guest protection, recoverable rollback, and failed-unmap lease retention preserve the prior projection and authority; incomplete cleanup is terminal. Default MMIO rejects runtime insertion before path use. Dirty-range tracking and optional-device snapshot state remain deferred. |
 | `PATCH /pmem/{id}` | recognized post-boot-only operation; `400` `fault_message` | runtime rate-limiter updates supported; `204` empty response on successful no-op, replacement, or clear | Parses Firecracker-shaped pmem rate-limiter updates, rejects malformed or mismatched bodies first, returns unsupported-state before startup, and validates the exact active pmem ID after startup. Omitted, `null`, empty, or all-null limiters are no-ops; present buckets replace, clear, or preserve individual live and stored buckets under shared update rules. Handler or owner-thread delivery failures do not commit stored configuration, and a replacement that unblocks pending work schedules an immediate bounded retry. |
 | `GET /hotplug/memory`, `PUT /hotplug/memory`, `PATCH /hotplug/memory` | `PUT` stores validated pre-boot config; `GET` reports configured or active status; `PATCH` is unsupported-state before start | Implemented supported runtime subset; post-start `GET` reports exact requested/plugged size and `PATCH` changes requested size | Startup attaches one virtio-mem endpoint over the selected startup transport with the configured block and region shape. Active queue handling validates complete block ranges, applies exact block-owned HVF map/unmap work before ACK, supports split and combined unplug, commits device state only after guest-visible completion, and rolls partial or late failures back in reverse order. Signed Linux coverage proves the public lifecycle `0 -> 128 MiB -> 0`. Runtime device deletion, broader public guest-memory accounting, optional-device snapshots, and Firecracker KVM slot identity remain excluded. |

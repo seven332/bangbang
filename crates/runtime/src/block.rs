@@ -5,14 +5,25 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use bangbang_vhost_user::{
+    BackendCallEndpoint, BackendKickEndpoint, CallDrainOutcome, CallNotifier, KickNotifier,
+    VHOST_USER_F_PROTOCOL_FEATURES, VHOST_USER_PROTOCOL_F_CONFIG, VHOST_USER_PROTOCOL_F_REPLY_ACK,
+    VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_F_EVENT_IDX, VIRTIO_F_VERSION_1,
+    VIRTIO_RING_F_INDIRECT_DESC, VhostUserConfigFlags, VhostUserError, VhostUserFrontend,
+    VhostUserFrontendOptions, VhostUserMemoryRegion, VhostUserNotifierError, VhostUserVringAddress,
+    create_call_notifier, create_kick_notifier,
+};
+
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
+    GuestMemorySharedBacking, GuestMemorySharedBackingError,
 };
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
@@ -43,6 +54,7 @@ pub const VIRTIO_BLOCK_QUEUE_SIZES: [u16; VIRTIO_BLOCK_QUEUE_COUNT] = [VIRTIO_BL
 pub const VIRTIO_BLOCK_SECTOR_SHIFT: u32 = 9;
 pub const VIRTIO_BLOCK_SECTOR_SIZE: u64 = 1 << VIRTIO_BLOCK_SECTOR_SHIFT;
 pub const VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE: usize = 8;
+pub const VIRTIO_BLOCK_CONFIG_SIZE: usize = 60;
 pub const VIRTIO_BLOCK_FEATURE_READ_ONLY: u32 = 5;
 pub const VIRTIO_BLOCK_FEATURE_FLUSH: u32 = 9;
 pub const VIRTIO_RING_FEATURE_INDIRECT_DESC: u32 = 28;
@@ -423,13 +435,178 @@ const fn updated_token_bucket(
 #[derive(Clone, PartialEq, Eq)]
 pub struct DriveConfig {
     drive_id: String,
-    path_on_host: PathBuf,
     is_root_device: bool,
-    is_read_only: bool,
     partuuid: Option<String>,
     cache_type: DriveCacheType,
-    io_engine: DriveIoEngine,
-    rate_limiter: Option<DriveRateLimiterConfig>,
+    backend: DriveBackendConfig,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum DriveBackendConfig {
+    File {
+        path_on_host: PathBuf,
+        is_read_only: bool,
+        io_engine: DriveIoEngine,
+        rate_limiter: Option<DriveRateLimiterConfig>,
+    },
+    VhostUser {
+        socket: PathBuf,
+    },
+}
+
+/// A connected vhost-user block frontend after bounded, pre-VM discovery.
+pub struct PreparedVhostUserBlockFrontend {
+    frontend: VhostUserFrontend,
+    available_features: u64,
+    config_bytes: [u8; VIRTIO_BLOCK_CONFIG_SIZE],
+}
+
+impl fmt::Debug for PreparedVhostUserBlockFrontend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedVhostUserBlockFrontend")
+            .field("frontend", &self.frontend)
+            .field("available_features", &"<redacted>")
+            .field("config_bytes", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PreparedVhostUserBlockFrontend {
+    /// Performs the Firecracker-shaped discovery sequence without committing
+    /// guest-accepted virtio features or transferring guest-memory descriptors.
+    pub fn discover(
+        stream: UnixStream,
+        cache_type: DriveCacheType,
+        operation_timeout: Duration,
+    ) -> Result<Self, PreparedVhostUserBlockFrontendError> {
+        let options = VhostUserFrontendOptions::firecracker_block(operation_timeout)
+            .map_err(PreparedVhostUserBlockFrontendError::Frontend)?;
+        let mut frontend = VhostUserFrontend::new(stream, options)
+            .map_err(PreparedVhostUserBlockFrontendError::Frontend)?;
+        frontend
+            .set_owner()
+            .map_err(PreparedVhostUserBlockFrontendError::Frontend)?;
+        let backend_features = frontend
+            .get_features()
+            .map_err(PreparedVhostUserBlockFrontendError::Frontend)?;
+        let required_features = VIRTIO_F_VERSION_1 | VHOST_USER_F_PROTOCOL_FEATURES;
+        if backend_features & required_features != required_features {
+            return Err(PreparedVhostUserBlockFrontendError::MissingRequiredVirtioFeatures);
+        }
+        let mut requested_features =
+            required_features | VIRTIO_RING_F_INDIRECT_DESC | VIRTIO_F_EVENT_IDX | VIRTIO_BLK_F_RO;
+        if matches!(cache_type, DriveCacheType::Writeback) {
+            requested_features |= VIRTIO_BLK_F_FLUSH;
+        }
+        let available_features = backend_features & requested_features;
+
+        let backend_protocol_features = frontend
+            .get_protocol_features()
+            .map_err(PreparedVhostUserBlockFrontendError::Frontend)?;
+        if backend_protocol_features & VHOST_USER_PROTOCOL_F_CONFIG == 0 {
+            return Err(PreparedVhostUserBlockFrontendError::MissingConfigProtocolFeature);
+        }
+        let negotiated_protocol_features = VHOST_USER_PROTOCOL_F_CONFIG
+            | (backend_protocol_features & VHOST_USER_PROTOCOL_F_REPLY_ACK);
+        frontend
+            .set_protocol_features(negotiated_protocol_features)
+            .map_err(PreparedVhostUserBlockFrontendError::Frontend)?;
+        let config = frontend
+            .get_config(
+                0,
+                u32::try_from(VIRTIO_BLOCK_CONFIG_SIZE)
+                    .map_err(|_| PreparedVhostUserBlockFrontendError::InvalidConfig)?,
+                VhostUserConfigFlags::Writable,
+            )
+            .map_err(PreparedVhostUserBlockFrontendError::Frontend)?;
+        let config_bytes = config
+            .as_bytes()
+            .try_into()
+            .map_err(|_| PreparedVhostUserBlockFrontendError::InvalidConfig)?;
+
+        Ok(Self {
+            frontend,
+            available_features,
+            config_bytes,
+        })
+    }
+
+    pub const fn available_features(&self) -> u64 {
+        self.available_features
+    }
+
+    pub const fn is_read_only(&self) -> bool {
+        self.available_features & VIRTIO_BLK_F_RO != 0
+    }
+
+    pub const fn config_bytes(&self) -> &[u8; VIRTIO_BLOCK_CONFIG_SIZE] {
+        &self.config_bytes
+    }
+
+    fn into_parts(self) -> (VhostUserFrontend, u64, [u8; VIRTIO_BLOCK_CONFIG_SIZE]) {
+        (self.frontend, self.available_features, self.config_bytes)
+    }
+}
+
+/// Redacted pre-VM vhost-user block discovery failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedVhostUserBlockFrontendError {
+    Frontend(VhostUserError),
+    MissingRequiredVirtioFeatures,
+    MissingConfigProtocolFeature,
+    InvalidConfig,
+}
+
+impl fmt::Display for PreparedVhostUserBlockFrontendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Frontend(source) => write!(formatter, "vhost-user discovery failed: {source}"),
+            Self::MissingRequiredVirtioFeatures => {
+                formatter.write_str("vhost-user backend lacks required virtio features")
+            }
+            Self::MissingConfigProtocolFeature => {
+                formatter.write_str("vhost-user backend lacks configuration protocol support")
+            }
+            Self::InvalidConfig => {
+                formatter.write_str("vhost-user backend returned invalid block configuration")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PreparedVhostUserBlockFrontendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Frontend(source) => Some(source),
+            Self::MissingRequiredVirtioFeatures
+            | Self::MissingConfigProtocolFeature
+            | Self::InvalidConfig => None,
+        }
+    }
+}
+
+impl fmt::Debug for DriveBackendConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File {
+                is_read_only,
+                io_engine,
+                rate_limiter,
+                ..
+            } => formatter
+                .debug_struct("File")
+                .field("path_on_host", &"<redacted>")
+                .field("is_read_only", is_read_only)
+                .field("io_engine", io_engine)
+                .field("rate_limiter", rate_limiter)
+                .finish(),
+            Self::VhostUser { .. } => formatter
+                .debug_struct("VhostUser")
+                .field("socket", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Debug for DriveConfig {
@@ -437,13 +614,10 @@ impl fmt::Debug for DriveConfig {
         formatter
             .debug_struct("DriveConfig")
             .field("drive_id", &self.drive_id)
-            .field("path_on_host", &"<redacted>")
             .field("is_root_device", &self.is_root_device)
-            .field("is_read_only", &self.is_read_only)
             .field("partuuid", &self.partuuid)
             .field("cache_type", &self.cache_type)
-            .field("io_engine", &self.io_engine)
-            .field("rate_limiter", &self.rate_limiter)
+            .field("backend", &self.backend)
             .finish()
     }
 }
@@ -453,16 +627,37 @@ impl DriveConfig {
         &self.drive_id
     }
 
-    pub fn path_on_host(&self) -> &Path {
-        &self.path_on_host
+    pub fn backend(&self) -> &DriveBackendConfig {
+        &self.backend
+    }
+
+    pub fn path_on_host(&self) -> Option<&Path> {
+        match &self.backend {
+            DriveBackendConfig::File { path_on_host, .. } => Some(path_on_host),
+            DriveBackendConfig::VhostUser { .. } => None,
+        }
+    }
+
+    pub fn socket(&self) -> Option<&Path> {
+        match &self.backend {
+            DriveBackendConfig::File { .. } => None,
+            DriveBackendConfig::VhostUser { socket } => Some(socket),
+        }
+    }
+
+    pub const fn is_vhost_user(&self) -> bool {
+        matches!(self.backend, DriveBackendConfig::VhostUser { .. })
     }
 
     pub const fn is_root_device(&self) -> bool {
         self.is_root_device
     }
 
-    pub const fn is_read_only(&self) -> bool {
-        self.is_read_only
+    pub const fn is_read_only(&self) -> Option<bool> {
+        match self.backend {
+            DriveBackendConfig::File { is_read_only, .. } => Some(is_read_only),
+            DriveBackendConfig::VhostUser { .. } => None,
+        }
     }
 
     pub fn partuuid(&self) -> Option<&str> {
@@ -473,12 +668,18 @@ impl DriveConfig {
         self.cache_type
     }
 
-    pub const fn io_engine(&self) -> DriveIoEngine {
-        self.io_engine
+    pub const fn io_engine(&self) -> Option<DriveIoEngine> {
+        match self.backend {
+            DriveBackendConfig::File { io_engine, .. } => Some(io_engine),
+            DriveBackendConfig::VhostUser { .. } => None,
+        }
     }
 
     pub const fn rate_limiter(&self) -> Option<DriveRateLimiterConfig> {
-        self.rate_limiter
+        match self.backend {
+            DriveBackendConfig::File { rate_limiter, .. } => rate_limiter,
+            DriveBackendConfig::VhostUser { .. } => None,
+        }
     }
 
     fn updated(&self, update: &DriveUpdate) -> Result<Self, DriveUpdateError> {
@@ -488,20 +689,31 @@ impl DriveConfig {
             });
         }
 
+        let DriveBackendConfig::File {
+            path_on_host,
+            is_read_only,
+            io_engine,
+            rate_limiter,
+        } = &self.backend
+        else {
+            return Err(DriveUpdateError::UnsupportedBackend);
+        };
         Ok(Self {
             drive_id: self.drive_id.clone(),
-            path_on_host: update
-                .path_on_host()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.path_on_host.clone()),
             is_root_device: self.is_root_device,
-            is_read_only: self.is_read_only,
             partuuid: self.partuuid.clone(),
             cache_type: self.cache_type,
-            io_engine: self.io_engine,
-            rate_limiter: match update.rate_limiter() {
-                Some(rate_limiter) => rate_limiter.applied_to(self.rate_limiter),
-                None => self.rate_limiter,
+            backend: DriveBackendConfig::File {
+                path_on_host: update
+                    .path_on_host()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| path_on_host.clone()),
+                is_read_only: *is_read_only,
+                io_engine: *io_engine,
+                rate_limiter: match update.rate_limiter() {
+                    Some(update) => update.applied_to(*rate_limiter),
+                    None => *rate_limiter,
+                },
             },
         })
     }
@@ -640,6 +852,9 @@ impl DriveConfigs {
         let config = input
             .validate()
             .map_err(DriveRuntimeMutationError::InvalidConfig)?;
+        if config.is_vhost_user() {
+            return Err(DriveRuntimeMutationError::UnsupportedBackend);
+        }
         if config.is_root_device() {
             return Err(DriveRuntimeMutationError::RootInsertUnsupported);
         }
@@ -736,34 +951,49 @@ impl TryFrom<DriveConfigInput> for DriveConfig {
         }
 
         let cache_type = input.cache_type.unwrap_or_default();
-        let io_engine = input.io_engine.unwrap_or_default();
-        if io_engine != DriveIoEngine::Sync {
-            return Err(DriveConfigError::UnsupportedIoEngine { io_engine });
-        }
-
-        if input.socket.is_some() {
-            return Err(DriveConfigError::UnsupportedSocket);
-        }
-
-        let Some(path_on_host) = input.path_on_host else {
-            return Err(DriveConfigError::EmptyPathOnHost);
+        let backend = match (input.path_on_host, input.socket) {
+            (Some(path_on_host), None) => {
+                if path_on_host.as_os_str().is_empty() {
+                    return Err(DriveConfigError::EmptyPathOnHost);
+                }
+                let io_engine = input.io_engine.unwrap_or_default();
+                if io_engine != DriveIoEngine::Sync {
+                    return Err(DriveConfigError::UnsupportedIoEngine { io_engine });
+                }
+                DriveBackendConfig::File {
+                    path_on_host,
+                    is_read_only: input.is_read_only.unwrap_or(false),
+                    io_engine,
+                    rate_limiter: match input.rate_limiter {
+                        Some(rate_limiter) if rate_limiter.is_configured() => Some(rate_limiter),
+                        _ => None,
+                    },
+                }
+            }
+            (None, Some(socket)) => {
+                if socket.as_os_str().is_empty() {
+                    return Err(DriveConfigError::EmptySocket);
+                }
+                if input.is_read_only.is_some()
+                    || input.io_engine.is_some()
+                    || input.rate_limiter.is_some()
+                {
+                    return Err(DriveConfigError::InvalidVhostUserConfiguration);
+                }
+                DriveBackendConfig::VhostUser { socket }
+            }
+            (None, None) => return Err(DriveConfigError::EmptyPathOnHost),
+            (Some(_), Some(_)) => {
+                return Err(DriveConfigError::InvalidVhostUserConfiguration);
+            }
         };
-        if path_on_host.as_os_str().is_empty() {
-            return Err(DriveConfigError::EmptyPathOnHost);
-        }
 
         Ok(Self {
             drive_id: input.path_drive_id,
-            path_on_host,
             is_root_device: input.is_root_device,
-            is_read_only: input.is_read_only.unwrap_or(false),
             partuuid: input.partuuid,
             cache_type,
-            io_engine,
-            rate_limiter: match input.rate_limiter {
-                Some(rate_limiter) if rate_limiter.is_configured() => Some(rate_limiter),
-                _ => None,
-            },
+            backend,
         })
     }
 }
@@ -858,10 +1088,13 @@ pub enum DriveConfigError {
         body_drive_id: String,
     },
     EmptyPathOnHost,
+    EmptySocket,
+    InvalidVhostUserConfiguration,
+    ContainedVhostUserUnsupported,
+    IncompatibleMemoryHotplug,
     UnsupportedIoEngine {
         io_engine: DriveIoEngine,
     },
-    UnsupportedSocket,
     RootDeviceAlreadyConfigured,
 }
 
@@ -879,6 +1112,7 @@ pub enum DriveUpdateError {
         body_drive_id: String,
     },
     EmptyPathOnHost,
+    UnsupportedBackend,
     UnknownDrive {
         drive_id: String,
     },
@@ -903,6 +1137,7 @@ pub enum DriveUpdateError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriveRuntimeMutationError {
     InvalidConfig(DriveConfigError),
+    UnsupportedBackend,
     EmptyDriveId,
     InvalidDriveId { drive_id: String },
     DuplicateDrive { drive_id: String },
@@ -932,10 +1167,19 @@ impl fmt::Display for DriveConfigError {
             }
             Self::MismatchedDriveId { .. } => f.write_str("path drive_id must match body drive_id"),
             Self::EmptyPathOnHost => f.write_str("drive path_on_host must not be empty"),
+            Self::EmptySocket => f.write_str("drive socket must not be empty"),
+            Self::InvalidVhostUserConfiguration => {
+                f.write_str("vhost-user drive contains incompatible file-backed fields")
+            }
+            Self::ContainedVhostUserUnsupported => {
+                f.write_str("vhost-user drive is unsupported in contained mode")
+            }
+            Self::IncompatibleMemoryHotplug => {
+                f.write_str("vhost-user drive is incompatible with dynamic memory hotplug")
+            }
             Self::UnsupportedIoEngine { io_engine } => {
                 write!(f, "drive io_engine {io_engine} is not supported")
             }
-            Self::UnsupportedSocket => f.write_str("drive socket is not supported"),
             Self::RootDeviceAlreadyConfigured => f.write_str("a root drive is already configured"),
         }
     }
@@ -955,6 +1199,7 @@ impl fmt::Display for DriveUpdateError {
             }
             Self::MismatchedDriveId { .. } => f.write_str("path drive_id must match body drive_id"),
             Self::EmptyPathOnHost => f.write_str("drive path_on_host must not be empty"),
+            Self::UnsupportedBackend => f.write_str("vhost-user drive updates are not supported"),
             Self::UnknownDrive { drive_id } => {
                 write!(f, "drive {drive_id} is not configured")
             }
@@ -988,6 +1233,9 @@ impl fmt::Display for DriveRuntimeMutationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(source) => write!(f, "{source}"),
+            Self::UnsupportedBackend => {
+                f.write_str("vhost-user drive runtime mutation is not supported")
+            }
             Self::EmptyDriveId => f.write_str("path drive_id must not be empty"),
             Self::InvalidDriveId { .. } => {
                 f.write_str("path drive_id must contain only alphanumeric characters or '_'")
@@ -1039,7 +1287,8 @@ impl std::error::Error for DriveRuntimeMutationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidConfig(source) => Some(source),
-            Self::EmptyDriveId
+            Self::UnsupportedBackend
+            | Self::EmptyDriveId
             | Self::InvalidDriveId { .. }
             | Self::DuplicateDrive { .. }
             | Self::RootInsertUnsupported
@@ -1060,17 +1309,57 @@ impl std::error::Error for DriveRuntimeMutationError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioBlockConfigSpace {
+    bytes: [u8; VIRTIO_BLOCK_CONFIG_SIZE],
+    len: u8,
     capacity_sectors: u64,
     is_read_only: bool,
     cache_type: DriveCacheType,
+    available_features: u64,
 }
 
 impl VirtioBlockConfigSpace {
-    pub const fn new(backing_len: u64, is_read_only: bool, cache_type: DriveCacheType) -> Self {
+    pub fn new(backing_len: u64, is_read_only: bool, cache_type: DriveCacheType) -> Self {
+        let capacity_sectors = backing_len >> VIRTIO_BLOCK_SECTOR_SHIFT;
+        let mut bytes = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        let capacity = capacity_sectors.to_le_bytes();
+        for (destination, source) in bytes.iter_mut().zip(capacity) {
+            *destination = source;
+        }
+        let mut available_features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
+        if matches!(cache_type, DriveCacheType::Writeback) {
+            available_features |= virtio_feature_bit(VIRTIO_BLOCK_FEATURE_FLUSH);
+        }
+        if is_read_only {
+            available_features |= virtio_feature_bit(VIRTIO_BLOCK_FEATURE_READ_ONLY);
+        }
         Self {
-            capacity_sectors: backing_len >> VIRTIO_BLOCK_SECTOR_SHIFT,
+            bytes,
+            len: VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE as u8,
+            capacity_sectors,
             is_read_only,
             cache_type,
+            available_features,
+        }
+    }
+
+    pub const fn from_vhost_user(
+        bytes: [u8; VIRTIO_BLOCK_CONFIG_SIZE],
+        available_features: u64,
+        cache_type: DriveCacheType,
+    ) -> Self {
+        let capacity_sectors = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        Self {
+            bytes,
+            len: VIRTIO_BLOCK_CONFIG_SIZE as u8,
+            capacity_sectors,
+            is_read_only: available_features & virtio_feature_bit(VIRTIO_BLOCK_FEATURE_READ_ONLY)
+                != 0,
+            cache_type,
+            available_features,
         }
     }
 
@@ -1091,20 +1380,11 @@ impl VirtioBlockConfigSpace {
     }
 
     pub const fn available_features(self) -> u64 {
-        let mut features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
-            | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
-            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
-        if matches!(self.cache_type, DriveCacheType::Writeback) {
-            features |= virtio_feature_bit(VIRTIO_BLOCK_FEATURE_FLUSH);
-        }
-        if self.is_read_only {
-            features |= virtio_feature_bit(VIRTIO_BLOCK_FEATURE_READ_ONLY);
-        }
-        features
+        self.available_features
     }
 
-    const fn capacity_bytes(self) -> [u8; VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE] {
-        self.capacity_sectors.to_le_bytes()
+    pub const fn config_len(self) -> usize {
+        self.len as usize
     }
 }
 
@@ -1113,8 +1393,13 @@ impl VirtioMmioDeviceConfigHandler for VirtioBlockConfigSpace {
         &self,
         access: VirtioMmioDeviceConfigAccess,
     ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
-        let capacity = self.capacity_bytes();
-        let bytes = read_virtio_block_capacity_bytes(&capacity, access)?;
+        let config = self.bytes.get(..self.config_len()).ok_or(
+            VirtioMmioDeviceConfigError::UnsupportedRead {
+                offset: access.offset(),
+                len: access.len(),
+            },
+        )?;
+        let bytes = read_virtio_block_config_bytes(config, access)?;
         MmioAccessBytes::new(bytes).map_err(config_bytes_error)
     }
 
@@ -1138,8 +1423,8 @@ fn virtio_feature_enabled(features: u64, feature: u32) -> bool {
     features & virtio_feature_bit(feature) != 0
 }
 
-fn read_virtio_block_capacity_bytes(
-    capacity: &[u8; VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE],
+fn read_virtio_block_config_bytes(
+    config: &[u8],
     access: VirtioMmioDeviceConfigAccess,
 ) -> Result<&[u8], VirtioMmioDeviceConfigError> {
     let offset = usize::try_from(access.offset()).map_err(|_| {
@@ -1155,7 +1440,7 @@ fn read_virtio_block_capacity_bytes(
         });
     };
 
-    capacity
+    config
         .get(offset..end)
         .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
             offset: access.offset(),
@@ -3391,8 +3676,16 @@ impl std::error::Error for SnapshotBlockFileBackingError {}
 
 impl BlockFileBacking {
     pub fn open(config: &DriveConfig) -> Result<Self, BlockFileBackingError> {
-        let file = open_block_file(config.path_on_host(), config.is_read_only())?;
-        Self::from_file_with_origin(file, config.is_read_only(), BlockFileBackingOrigin::Path)
+        let DriveBackendConfig::File {
+            path_on_host,
+            is_read_only,
+            ..
+        } = config.backend()
+        else {
+            return Err(BlockFileBackingError::UnsupportedBackend);
+        };
+        let file = open_block_file(path_on_host, *is_read_only)?;
+        Self::from_file_with_origin(file, *is_read_only, BlockFileBackingOrigin::Path)
     }
 
     /// Adopts an already-opened block backing without resolving its configured path.
@@ -3611,6 +3904,7 @@ fn validate_block_file_access(
 
 #[derive(Debug)]
 pub enum BlockFileBackingError {
+    UnsupportedBackend,
     OpenFile {
         source: io::Error,
     },
@@ -3645,6 +3939,9 @@ pub enum BlockFileBackingError {
 impl fmt::Display for BlockFileBackingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedBackend => {
+                f.write_str("vhost-user drive does not have a local block backing file")
+            }
             Self::OpenFile { source } => write!(f, "failed to open block backing file: {source}"),
             Self::ReadMetadata { source } => {
                 write!(f, "failed to read block backing file metadata: {source}")
@@ -3685,7 +3982,8 @@ impl std::error::Error for BlockFileBackingError {
             | Self::ReadFile { source }
             | Self::WriteFile { source }
             | Self::FlushFile { source } => Some(source),
-            Self::NonRegularFile
+            Self::UnsupportedBackend
+            | Self::NonRegularFile
             | Self::AccessLengthTooLarge { .. }
             | Self::AccessOverflow { .. }
             | Self::AccessOutOfBounds { .. }
@@ -3802,6 +4100,7 @@ impl fmt::Debug for VirtioBlockRateLimiterState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioBlockRateLimiterStateError {
+    UnsupportedBackend,
     MissingBandwidthBucket,
     UnexpectedBandwidthBucket,
     InvalidBandwidthBucket,
@@ -3814,6 +4113,9 @@ pub enum VirtioBlockRateLimiterStateError {
 impl fmt::Display for VirtioBlockRateLimiterStateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedBackend => {
+                f.write_str("vhost-user block has no local rate limiter state")
+            }
             Self::MissingBandwidthBucket => {
                 f.write_str("persisted block bandwidth bucket is missing")
             }
@@ -4017,26 +4319,204 @@ fn update_runtime_token_bucket(
     }
 }
 
+struct VhostUserBlockMemoryRegion {
+    guest_base: u64,
+    len: u64,
+    userspace_base: u64,
+    mmap_offset: u64,
+    backing: GuestMemorySharedBacking,
+}
+
+impl fmt::Debug for VhostUserBlockMemoryRegion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("VhostUserBlockMemoryRegion")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
+impl VhostUserBlockMemoryRegion {
+    fn from_guest_memory(
+        memory: &GuestMemory,
+    ) -> Result<Vec<Self>, PreparedVhostUserBlockMemoryError> {
+        let mut regions = Vec::new();
+        regions
+            .try_reserve_exact(memory.regions().len())
+            .map_err(PreparedVhostUserBlockMemoryError::AllocateRegions)?;
+        for region in memory.regions() {
+            let backing = region
+                .try_clone_shared_backing()
+                .map_err(PreparedVhostUserBlockMemoryError::CloneBacking)?
+                .ok_or(PreparedVhostUserBlockMemoryError::AnonymousMemory)?;
+            let range = region.range();
+            if backing.is_empty()
+                || backing.len() != range.size()
+                || u64::try_from(region.host_size()).ok() != Some(range.size())
+            {
+                return Err(PreparedVhostUserBlockMemoryError::InvalidRegion);
+            }
+            let userspace_base = u64::try_from(region.host_address().as_ptr().addr())
+                .map_err(|_| PreparedVhostUserBlockMemoryError::InvalidRegion)?;
+            regions.push(Self {
+                guest_base: range.start().raw_value(),
+                len: range.size(),
+                userspace_base,
+                mmap_offset: backing.offset(),
+                backing,
+            });
+        }
+        if regions.is_empty() {
+            return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);
+        }
+        Ok(regions)
+    }
+
+    fn protocol_region(&self) -> Result<VhostUserMemoryRegion<'_>, VhostUserError> {
+        VhostUserMemoryRegion::new(
+            self.guest_base,
+            self.len,
+            self.userspace_base,
+            self.mmap_offset,
+            self.backing.as_fd(),
+        )
+    }
+
+    fn translate_range(&self, range: GuestMemoryRange) -> Option<u64> {
+        let range_start = range.start().raw_value();
+        let range_end = range.end_exclusive().raw_value();
+        let region_end = self.guest_base.checked_add(self.len)?;
+        if range_start < self.guest_base || range_end > region_end {
+            return None;
+        }
+        self.userspace_base
+            .checked_add(range_start.checked_sub(self.guest_base)?)
+    }
+}
+
+/// Redacted failure while exporting the complete current guest-memory table.
+#[derive(Debug)]
+pub enum PreparedVhostUserBlockMemoryError {
+    AllocateRegions(TryReserveError),
+    CloneBacking(GuestMemorySharedBackingError),
+    AnonymousMemory,
+    EmptyMemory,
+    InvalidRegion,
+}
+
+impl fmt::Display for PreparedVhostUserBlockMemoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllocateRegions(_) => {
+                formatter.write_str("failed to allocate vhost-user guest-memory exports")
+            }
+            Self::CloneBacking(_) => {
+                formatter.write_str("failed to clone vhost-user guest-memory backing")
+            }
+            Self::AnonymousMemory => {
+                formatter.write_str("vhost-user block requires shared guest memory")
+            }
+            Self::EmptyMemory => formatter.write_str("vhost-user guest memory is empty"),
+            Self::InvalidRegion => formatter.write_str("vhost-user guest-memory export is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for PreparedVhostUserBlockMemoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AllocateRegions(source) => Some(source),
+            Self::CloneBacking(source) => Some(source),
+            Self::AnonymousMemory | Self::EmptyMemory | Self::InvalidRegion => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum VirtioBlockBackend {
+    File {
+        backing: BlockFileBacking,
+        active_queue: Option<VirtioBlockQueue>,
+        rate_limiter: Option<VirtioBlockRateLimiter>,
+    },
+    VhostUser(VhostUserBlockBackend),
+}
+
+#[derive(Debug)]
+struct VhostUserBlockBackend {
+    frontend: Option<VhostUserFrontend>,
+    available_features: u64,
+    memory_regions: Vec<VhostUserBlockMemoryRegion>,
+    state: VhostUserBlockState,
+}
+
+#[derive(Debug)]
+enum VhostUserBlockState {
+    Prepared {
+        kick: KickNotifier,
+        backend_kick: BackendKickEndpoint,
+        call: CallNotifier,
+        backend_call: BackendCallEndpoint,
+    },
+    Active {
+        kick: KickNotifier,
+        call: CallNotifier,
+    },
+    Terminal {
+        was_active: bool,
+    },
+}
+
 #[derive(Debug)]
 pub struct VirtioBlockDevice {
-    backing: BlockFileBacking,
+    backend: VirtioBlockBackend,
     device_id: VirtioBlockDeviceId,
-    active_queue: Option<VirtioBlockQueue>,
-    rate_limiter: Option<VirtioBlockRateLimiter>,
 }
 
 impl VirtioBlockDevice {
     pub fn new(backing: BlockFileBacking, device_id: VirtioBlockDeviceId) -> Self {
         Self {
-            backing,
+            backend: VirtioBlockBackend::File {
+                backing,
+                active_queue: None,
+                rate_limiter: None,
+            },
             device_id,
-            active_queue: None,
-            rate_limiter: None,
         }
     }
 
+    fn new_vhost_user(
+        frontend: VhostUserFrontend,
+        available_features: u64,
+        memory_regions: Vec<VhostUserBlockMemoryRegion>,
+        device_id: VirtioBlockDeviceId,
+    ) -> Result<Self, VhostUserNotifierError> {
+        let (kick, backend_kick) = create_kick_notifier()?;
+        let (call, backend_call) = create_call_notifier()?;
+        Ok(Self {
+            backend: VirtioBlockBackend::VhostUser(VhostUserBlockBackend {
+                frontend: Some(frontend),
+                available_features,
+                memory_regions,
+                state: VhostUserBlockState::Prepared {
+                    kick,
+                    backend_kick,
+                    call,
+                    backend_call,
+                },
+            }),
+            device_id,
+        })
+    }
+
     pub fn with_rate_limiter(mut self, rate_limiter: VirtioBlockRateLimiter) -> Self {
-        self.rate_limiter = Some(rate_limiter);
+        if let VirtioBlockBackend::File {
+            rate_limiter: configured,
+            ..
+        } = &mut self.backend
+        {
+            *configured = Some(rate_limiter);
+        }
         self
     }
 
@@ -4047,30 +4527,55 @@ impl VirtioBlockDevice {
         rate_limiter: Option<VirtioBlockRateLimiter>,
     ) -> Self {
         Self {
-            backing,
+            backend: VirtioBlockBackend::File {
+                backing,
+                active_queue,
+                rate_limiter,
+            },
             device_id,
-            active_queue,
-            rate_limiter,
         }
     }
 
-    pub fn backing(&self) -> &BlockFileBacking {
-        &self.backing
+    pub fn backing(&self) -> Option<&BlockFileBacking> {
+        match &self.backend {
+            VirtioBlockBackend::File { backing, .. } => Some(backing),
+            VirtioBlockBackend::VhostUser(_) => None,
+        }
     }
 
-    pub fn refresh_backing(&mut self, backing: BlockFileBacking) {
-        self.backing = backing;
+    pub fn refresh_backing(
+        &mut self,
+        backing: BlockFileBacking,
+    ) -> Result<(), VirtioBlockBackendOperationError> {
+        match &mut self.backend {
+            VirtioBlockBackend::File {
+                backing: current, ..
+            } => {
+                *current = backing;
+                Ok(())
+            }
+            VirtioBlockBackend::VhostUser(_) => {
+                Err(VirtioBlockBackendOperationError::UnsupportedBackend)
+            }
+        }
     }
 
-    pub fn update_rate_limiter(&mut self, update: DriveRateLimiterConfig) {
-        if let Some(rate_limiter) = self.rate_limiter.as_mut() {
-            rate_limiter.apply_update(update);
-            if rate_limiter.is_empty() {
-                self.rate_limiter = None;
+    pub fn update_rate_limiter(
+        &mut self,
+        update: DriveRateLimiterConfig,
+    ) -> Result<(), VirtioBlockBackendOperationError> {
+        let VirtioBlockBackend::File { rate_limiter, .. } = &mut self.backend else {
+            return Err(VirtioBlockBackendOperationError::UnsupportedBackend);
+        };
+        if let Some(configured) = rate_limiter.as_mut() {
+            configured.apply_update(update);
+            if configured.is_empty() {
+                *rate_limiter = None;
             }
         } else {
-            self.rate_limiter = VirtioBlockRateLimiter::new(update);
+            *rate_limiter = VirtioBlockRateLimiter::new(update);
         }
+        Ok(())
     }
 
     pub fn device_id(&self) -> VirtioBlockDeviceId {
@@ -4078,7 +4583,10 @@ impl VirtioBlockDevice {
     }
 
     pub fn rate_limiter(&self) -> Option<&VirtioBlockRateLimiter> {
-        self.rate_limiter.as_ref()
+        match &self.backend {
+            VirtioBlockBackend::File { rate_limiter, .. } => rate_limiter.as_ref(),
+            VirtioBlockBackend::VhostUser(_) => None,
+        }
     }
 
     pub fn snapshot_rate_limiter_state_at(
@@ -4086,19 +4594,47 @@ impl VirtioBlockDevice {
         config: Option<DriveRateLimiterConfig>,
         now: Instant,
     ) -> Result<VirtioBlockRateLimiterState, VirtioBlockRateLimiterStateError> {
-        VirtioBlockRateLimiter::persisted_state_at(config, self.rate_limiter.as_ref(), now)
+        let VirtioBlockBackend::File { rate_limiter, .. } = &self.backend else {
+            return Err(VirtioBlockRateLimiterStateError::UnsupportedBackend);
+        };
+        VirtioBlockRateLimiter::persisted_state_at(config, rate_limiter.as_ref(), now)
     }
 
     pub fn is_activated(&self) -> bool {
-        self.active_queue.is_some()
+        match &self.backend {
+            VirtioBlockBackend::File { active_queue, .. } => active_queue.is_some(),
+            VirtioBlockBackend::VhostUser(backend) => matches!(
+                backend.state,
+                VhostUserBlockState::Active { .. }
+                    | VhostUserBlockState::Terminal { was_active: true }
+            ),
+        }
     }
 
     pub fn active_queue(&self) -> Option<&VirtioBlockQueue> {
-        self.active_queue.as_ref()
+        match &self.backend {
+            VirtioBlockBackend::File { active_queue, .. } => active_queue.as_ref(),
+            VirtioBlockBackend::VhostUser(_) => None,
+        }
     }
 
     pub fn active_queue_mut(&mut self) -> Option<&mut VirtioBlockQueue> {
-        self.active_queue.as_mut()
+        match &mut self.backend {
+            VirtioBlockBackend::File { active_queue, .. } => active_queue.as_mut(),
+            VirtioBlockBackend::VhostUser(_) => None,
+        }
+    }
+
+    pub fn vhost_user_call_fd(&self) -> Option<i32> {
+        match &self.backend {
+            VirtioBlockBackend::VhostUser(VhostUserBlockBackend {
+                state:
+                    VhostUserBlockState::Prepared { call, .. }
+                    | VhostUserBlockState::Active { call, .. },
+                ..
+            }) => Some(call.as_fd().as_raw_fd()),
+            VirtioBlockBackend::File { .. } | VirtioBlockBackend::VhostUser(_) => None,
+        }
     }
 
     fn dispatch_drained_queue_notifications(
@@ -4106,13 +4642,6 @@ impl VirtioBlockDevice {
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
     ) -> Result<VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError> {
-        if drained_notifications.is_empty() {
-            return Ok(VirtioBlockDeviceNotificationDispatch::new(
-                drained_notifications,
-                None,
-            ));
-        }
-
         if let Some(queue_index) = drained_notifications
             .iter()
             .copied()
@@ -4124,24 +4653,46 @@ impl VirtioBlockDevice {
             });
         }
 
-        let Some(queue) = self.active_queue.as_mut() else {
-            return Err(VirtioBlockDeviceNotificationError::Inactive {
-                drained_notifications,
-            });
-        };
-
-        let backing = &self.backing;
-        let device_id = self.device_id;
-        let rate_limiter = self.rate_limiter.as_mut();
-        match queue.dispatch_with_rate_limiter(memory, backing, device_id, rate_limiter) {
-            Ok(dispatch) => Ok(VirtioBlockDeviceNotificationDispatch::new(
-                drained_notifications,
-                Some(dispatch),
-            )),
-            Err(source) => Err(VirtioBlockDeviceNotificationError::QueueDispatch {
-                drained_notifications,
-                source,
-            }),
+        match &mut self.backend {
+            VirtioBlockBackend::File {
+                backing,
+                active_queue,
+                rate_limiter,
+            } => {
+                if drained_notifications.is_empty() {
+                    return Ok(VirtioBlockDeviceNotificationDispatch::new(
+                        drained_notifications,
+                        None,
+                        0,
+                        0,
+                    ));
+                }
+                let Some(queue) = active_queue.as_mut() else {
+                    return Err(VirtioBlockDeviceNotificationError::Inactive {
+                        drained_notifications,
+                    });
+                };
+                match queue.dispatch_with_rate_limiter(
+                    memory,
+                    backing,
+                    self.device_id,
+                    rate_limiter.as_mut(),
+                ) {
+                    Ok(dispatch) => Ok(VirtioBlockDeviceNotificationDispatch::new(
+                        drained_notifications,
+                        Some(dispatch),
+                        0,
+                        0,
+                    )),
+                    Err(source) => Err(VirtioBlockDeviceNotificationError::QueueDispatch {
+                        drained_notifications,
+                        source,
+                    }),
+                }
+            }
+            VirtioBlockBackend::VhostUser(backend) => {
+                backend.dispatch_notifications(drained_notifications)
+            }
         }
     }
 
@@ -4149,10 +4700,6 @@ impl VirtioBlockDevice {
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioBlockDeviceActivationError> {
-        if self.active_queue.is_some() {
-            return Err(VirtioBlockDeviceActivationError::AlreadyActive);
-        }
-
         let event_idx_enabled =
             virtio_feature_enabled(activation.driver_features(), VIRTIO_RING_FEATURE_EVENT_IDX);
         let indirect_descriptors_enabled = virtio_feature_enabled(
@@ -4177,15 +4724,244 @@ impl VirtioBlockDevice {
                     source,
                 })
             })?;
-        self.active_queue = Some(queue);
-
-        Ok(())
+        match &mut self.backend {
+            VirtioBlockBackend::File { active_queue, .. } => {
+                if active_queue.is_some() {
+                    return Err(VirtioBlockDeviceActivationError::AlreadyActive);
+                }
+                *active_queue = Some(queue);
+                Ok(())
+            }
+            VirtioBlockBackend::VhostUser(backend) => {
+                backend.activate(activation.driver_features(), queue)
+            }
+        }
     }
 
     pub fn reset(&mut self) {
-        self.active_queue = None;
+        match &mut self.backend {
+            VirtioBlockBackend::File { active_queue, .. } => *active_queue = None,
+            VirtioBlockBackend::VhostUser(backend) => {
+                if matches!(&backend.state, VhostUserBlockState::Active { .. }) {
+                    backend.frontend = None;
+                    backend.state = VhostUserBlockState::Terminal { was_active: true };
+                }
+            }
+        }
     }
 }
+
+impl VhostUserBlockBackend {
+    fn activate(
+        &mut self,
+        driver_features: u64,
+        queue: VirtioBlockQueue,
+    ) -> Result<(), VirtioBlockDeviceActivationError> {
+        match &self.state {
+            VhostUserBlockState::Prepared { .. } => {}
+            VhostUserBlockState::Active { .. } => {
+                return Err(VirtioBlockDeviceActivationError::AlreadyActive);
+            }
+            VhostUserBlockState::Terminal { .. } => {
+                return Err(VirtioBlockDeviceActivationError::Terminal);
+            }
+        }
+        if driver_features & VIRTIO_F_VERSION_1 == 0
+            || driver_features & !self.available_features != 0
+        {
+            return Err(VirtioBlockDeviceActivationError::UnsupportedGuestFeatures);
+        }
+
+        let descriptor_range = queue
+            .available
+            .descriptor_table_range()
+            .map_err(|_| VirtioBlockDeviceActivationError::QueueRange)?;
+        let available_range = queue
+            .available
+            .available_ring_range()
+            .map_err(|_| VirtioBlockDeviceActivationError::QueueRange)?;
+        let used_range = queue
+            .used
+            .used_ring_range()
+            .map_err(|_| VirtioBlockDeviceActivationError::QueueRange)?;
+        let descriptor = self.translate_range(descriptor_range)?;
+        let available = self.translate_range(available_range)?;
+        let used = self.translate_range(used_range)?;
+        let address = VhostUserVringAddress::new(descriptor, used, available)
+            .map_err(VirtioBlockDeviceActivationError::Frontend)?;
+        let available_index_address = available
+            .checked_add(2)
+            .ok_or(VirtioBlockDeviceActivationError::QueueRange)?;
+        let available_index_pointer = usize::try_from(available_index_address)
+            .map_err(|_| VirtioBlockDeviceActivationError::QueueRange)?
+            as *const u16;
+        // SAFETY: `available_range` was checked wholly inside one retained live
+        // mapping, the virtqueue constructor checked two-byte alignment, and
+        // the vCPU is stopped at its activation register write.
+        let available_index = u16::from_le(unsafe { available_index_pointer.read_volatile() });
+
+        let mut protocol_regions = Vec::new();
+        protocol_regions
+            .try_reserve_exact(self.memory_regions.len())
+            .map_err(|_| VirtioBlockDeviceActivationError::AllocateMemoryTable)?;
+        for region in &self.memory_regions {
+            protocol_regions.push(
+                region
+                    .protocol_region()
+                    .map_err(VirtioBlockDeviceActivationError::Frontend)?,
+            );
+        }
+        let queue_size = queue.available.queue_size();
+        let Some(frontend) = self.frontend.as_mut() else {
+            return Err(VirtioBlockDeviceActivationError::Terminal);
+        };
+        let previous_state = std::mem::replace(
+            &mut self.state,
+            VhostUserBlockState::Terminal { was_active: false },
+        );
+        let (kick, backend_kick, call, backend_call) = match previous_state {
+            VhostUserBlockState::Prepared {
+                kick,
+                backend_kick,
+                call,
+                backend_call,
+            } => (kick, backend_kick, call, backend_call),
+            VhostUserBlockState::Active { kick, call } => {
+                self.state = VhostUserBlockState::Active { kick, call };
+                return Err(VirtioBlockDeviceActivationError::AlreadyActive);
+            }
+            VhostUserBlockState::Terminal { was_active } => {
+                self.state = VhostUserBlockState::Terminal { was_active };
+                return Err(VirtioBlockDeviceActivationError::Terminal);
+            }
+        };
+        // Firecracker pre-acknowledges this vhost-user-only bit before guest
+        // negotiation. Linux does not know about it, so preserve it when
+        // committing the guest-selected standard virtio features.
+        let backend_features = driver_features | VHOST_USER_F_PROTOCOL_FEATURES;
+        let result = (|| {
+            frontend.set_features(backend_features)?;
+            frontend.set_memory_table(&protocol_regions)?;
+            frontend.set_vring_num(0, queue_size)?;
+            frontend.set_vring_addr(0, address)?;
+            frontend.set_vring_base(0, available_index)?;
+            frontend.set_vring_call(0, &backend_call)?;
+            frontend.set_vring_kick(0, &backend_kick)?;
+            frontend.set_vring_enable(0, true)?;
+            Ok::<(), VhostUserError>(())
+        })();
+        drop(protocol_regions);
+        match result {
+            Ok(()) => {
+                self.state = VhostUserBlockState::Active { kick, call };
+                Ok(())
+            }
+            Err(source) => {
+                self.frontend = None;
+                self.state = VhostUserBlockState::Terminal { was_active: false };
+                Err(VirtioBlockDeviceActivationError::Frontend(source))
+            }
+        }
+    }
+
+    fn translate_range(
+        &self,
+        range: GuestMemoryRange,
+    ) -> Result<u64, VirtioBlockDeviceActivationError> {
+        self.memory_regions
+            .iter()
+            .find_map(|region| region.translate_range(range))
+            .ok_or(VirtioBlockDeviceActivationError::QueueRange)
+    }
+
+    fn dispatch_notifications(
+        &mut self,
+        drained_notifications: Vec<usize>,
+    ) -> Result<VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError> {
+        let (kick, call) = match &self.state {
+            VhostUserBlockState::Prepared { .. } => {
+                if drained_notifications.is_empty() {
+                    return Ok(VirtioBlockDeviceNotificationDispatch::new(
+                        drained_notifications,
+                        None,
+                        0,
+                        0,
+                    ));
+                }
+                return Err(VirtioBlockDeviceNotificationError::Inactive {
+                    drained_notifications,
+                });
+            }
+            VhostUserBlockState::Terminal { .. } => {
+                return Err(VirtioBlockDeviceNotificationError::VhostUser {
+                    drained_notifications,
+                    calls: 0,
+                    source: VhostUserBlockNotificationError::Terminal,
+                });
+            }
+            VhostUserBlockState::Active { kick, call } => (kick, call),
+        };
+        let mut kicks = 0_u64;
+        for _ in &drained_notifications {
+            if let Err(source) = kick.signal() {
+                self.frontend = None;
+                self.state = VhostUserBlockState::Terminal { was_active: true };
+                return Err(VirtioBlockDeviceNotificationError::VhostUser {
+                    drained_notifications,
+                    calls: 0,
+                    source: VhostUserBlockNotificationError::Kick(source),
+                });
+            }
+            kicks = kicks.saturating_add(1);
+        }
+        match call.drain() {
+            Ok(CallDrainOutcome::WouldBlock) => Ok(VirtioBlockDeviceNotificationDispatch::new(
+                drained_notifications,
+                None,
+                kicks,
+                0,
+            )),
+            Ok(CallDrainOutcome::Drained(calls)) => Ok(VirtioBlockDeviceNotificationDispatch::new(
+                drained_notifications,
+                None,
+                kicks,
+                calls,
+            )),
+            Ok(CallDrainOutcome::Closed(calls)) => {
+                self.frontend = None;
+                self.state = VhostUserBlockState::Terminal { was_active: true };
+                Err(VirtioBlockDeviceNotificationError::VhostUser {
+                    drained_notifications,
+                    calls,
+                    source: VhostUserBlockNotificationError::Closed,
+                })
+            }
+            Err(source) => {
+                self.frontend = None;
+                self.state = VhostUserBlockState::Terminal { was_active: true };
+                Err(VirtioBlockDeviceNotificationError::VhostUser {
+                    drained_notifications,
+                    calls: 0,
+                    source: VhostUserBlockNotificationError::Call(source),
+                })
+            }
+        }
+    }
+}
+
+/// Backend-specific operations unavailable for a vhost-user block device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioBlockBackendOperationError {
+    UnsupportedBackend,
+}
+
+impl fmt::Display for VirtioBlockBackendOperationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("operation is unsupported for a vhost-user block device")
+    }
+}
+
+impl std::error::Error for VirtioBlockBackendOperationError {}
 
 #[derive(Debug)]
 pub struct PreparedBlockDevice {
@@ -4200,9 +4976,14 @@ impl PreparedBlockDevice {
         config: &DriveConfig,
         backing: Option<BlockFileBacking>,
     ) -> Result<Self, PreparedBlockDeviceError> {
+        let DriveBackendConfig::File { is_read_only, .. } = config.backend() else {
+            return Err(PreparedBlockDeviceError::UnsupportedBackend {
+                drive_id: config.drive_id().to_string(),
+            });
+        };
         let backing = match backing {
             Some(backing) => {
-                if backing.is_read_only() != config.is_read_only() {
+                if backing.is_read_only() != *is_read_only {
                     return Err(PreparedBlockDeviceError::BackingModeMismatch {
                         drive_id: config.drive_id().to_string(),
                     });
@@ -4223,6 +5004,48 @@ impl PreparedBlockDevice {
             device = device.with_rate_limiter(rate_limiter);
         }
 
+        Ok(Self {
+            drive_id: config.drive_id().to_string(),
+            is_root_device: config.is_root_device(),
+            config_space,
+            device,
+        })
+    }
+
+    pub fn from_config_with_vhost_user(
+        config: &DriveConfig,
+        frontend: PreparedVhostUserBlockFrontend,
+        memory: &GuestMemory,
+    ) -> Result<Self, PreparedBlockDeviceError> {
+        if !matches!(config.backend(), DriveBackendConfig::VhostUser { .. }) {
+            return Err(PreparedBlockDeviceError::ResourceKindMismatch {
+                drive_id: config.drive_id().to_string(),
+            });
+        }
+        let memory_regions =
+            VhostUserBlockMemoryRegion::from_guest_memory(memory).map_err(|source| {
+                PreparedBlockDeviceError::PrepareVhostMemory {
+                    drive_id: config.drive_id().to_string(),
+                    source,
+                }
+            })?;
+        let (frontend, available_features, config_bytes) = frontend.into_parts();
+        let config_space = VirtioBlockConfigSpace::from_vhost_user(
+            config_bytes,
+            available_features,
+            config.cache_type(),
+        );
+        let device_id = VirtioBlockDeviceId::from_bytes(config.drive_id().as_bytes());
+        let device = VirtioBlockDevice::new_vhost_user(
+            frontend,
+            available_features,
+            memory_regions,
+            device_id,
+        )
+        .map_err(|source| PreparedBlockDeviceError::PrepareVhostNotifier {
+            drive_id: config.drive_id().to_string(),
+            source,
+        })?;
         Ok(Self {
             drive_id: config.drive_id().to_string(),
             is_root_device: config.is_root_device(),
@@ -4304,6 +5127,55 @@ impl PreparedBlockDevices {
         Ok(Self { devices })
     }
 
+    pub(crate) fn from_config_slice_with_resources(
+        configs: &[DriveConfig],
+        memory: &GuestMemory,
+        mut backings: BTreeMap<String, BlockFileBacking>,
+        mut frontends: BTreeMap<String, PreparedVhostUserBlockFrontend>,
+    ) -> Result<Self, PreparedBlockDeviceError> {
+        if backings
+            .keys()
+            .chain(frontends.keys())
+            .any(|drive_id| !configs.iter().any(|config| config.drive_id() == drive_id))
+        {
+            return Err(PreparedBlockDeviceError::UnexpectedResource);
+        }
+        let mut devices = Vec::new();
+        devices
+            .try_reserve_exact(configs.len())
+            .map_err(|source| PreparedBlockDeviceError::AllocateDevices { source })?;
+        for config in configs {
+            let backing = backings.remove(config.drive_id());
+            let frontend = frontends.remove(config.drive_id());
+            let prepared = match config.backend() {
+                DriveBackendConfig::File { .. } => {
+                    if frontend.is_some() {
+                        return Err(PreparedBlockDeviceError::ResourceKindMismatch {
+                            drive_id: config.drive_id().to_string(),
+                        });
+                    }
+                    PreparedBlockDevice::from_config_with_backing(config, backing)?
+                }
+                DriveBackendConfig::VhostUser { .. } => {
+                    if backing.is_some() {
+                        return Err(PreparedBlockDeviceError::ResourceKindMismatch {
+                            drive_id: config.drive_id().to_string(),
+                        });
+                    }
+                    let frontend =
+                        frontend.ok_or_else(|| PreparedBlockDeviceError::MissingVhostFrontend {
+                            drive_id: config.drive_id().to_string(),
+                        })?;
+                    PreparedBlockDevice::from_config_with_vhost_user(config, frontend, memory)?
+                }
+            };
+            devices.push(prepared);
+        }
+        debug_assert!(backings.is_empty());
+        debug_assert!(frontends.is_empty());
+        Ok(Self { devices })
+    }
+
     pub fn as_slice(&self) -> &[PreparedBlockDevice] {
         &self.devices
     }
@@ -4340,7 +5212,25 @@ pub enum PreparedBlockDeviceError {
     BackingModeMismatch {
         drive_id: String,
     },
+    PrepareVhostMemory {
+        drive_id: String,
+        source: PreparedVhostUserBlockMemoryError,
+    },
+    PrepareVhostNotifier {
+        drive_id: String,
+        source: VhostUserNotifierError,
+    },
+    MissingVhostFrontend {
+        drive_id: String,
+    },
+    ResourceKindMismatch {
+        drive_id: String,
+    },
+    UnsupportedBackend {
+        drive_id: String,
+    },
     UnexpectedBacking,
+    UnexpectedResource,
 }
 
 impl fmt::Display for PreparedBlockDeviceError {
@@ -4355,8 +5245,26 @@ impl fmt::Display for PreparedBlockDeviceError {
             Self::BackingModeMismatch { .. } => {
                 f.write_str("provided block backing mode does not match drive")
             }
+            Self::PrepareVhostMemory { source, .. } => {
+                write!(f, "failed to prepare vhost-user block memory: {source}")
+            }
+            Self::PrepareVhostNotifier { source, .. } => {
+                write!(f, "failed to prepare vhost-user block notifier: {source}")
+            }
+            Self::MissingVhostFrontend { .. } => {
+                f.write_str("configured vhost-user drive has no prepared frontend")
+            }
+            Self::ResourceKindMismatch { .. } => {
+                f.write_str("provided block startup resource has the wrong backend kind")
+            }
+            Self::UnsupportedBackend { .. } => {
+                f.write_str("vhost-user drive requires a prepared frontend")
+            }
             Self::UnexpectedBacking => {
                 f.write_str("provided block backing does not match a configured drive")
+            }
+            Self::UnexpectedResource => {
+                f.write_str("provided block startup resource does not match a configured drive")
             }
         }
     }
@@ -4367,7 +5275,14 @@ impl std::error::Error for PreparedBlockDeviceError {
         match self {
             Self::AllocateDevices { source } => Some(source),
             Self::OpenBacking { source, .. } => Some(source),
-            Self::BackingModeMismatch { .. } | Self::UnexpectedBacking => None,
+            Self::PrepareVhostMemory { source, .. } => Some(source),
+            Self::PrepareVhostNotifier { source, .. } => Some(source),
+            Self::BackingModeMismatch { .. }
+            | Self::MissingVhostFrontend { .. }
+            | Self::ResourceKindMismatch { .. }
+            | Self::UnsupportedBackend { .. }
+            | Self::UnexpectedBacking
+            | Self::UnexpectedResource => None,
         }
     }
 }
@@ -4840,9 +5755,7 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockD
             .dispatch_drained_queue_notifications(memory, drained_notifications);
         let needs_queue_interrupt = match &dispatch {
             Ok(dispatch) => dispatch.needs_queue_interrupt(),
-            Err(error) => error
-                .completed_dispatch()
-                .is_some_and(VirtioBlockQueueDispatch::needs_queue_interrupt),
+            Err(error) => error.needs_queue_interrupt(),
         };
         if needs_queue_interrupt {
             self.mark_queue_interrupt_pending(0);
@@ -4853,6 +5766,11 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockD
 }
 
 impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
+    pub fn vhost_user_call_fd(&self) -> Result<Option<i32>, VirtioPciEndpointError> {
+        let work = self.admit_device_work()?;
+        work.with_core_mut(|core| core.activation.vhost_user_call_fd())
+    }
+
     pub fn has_pending_block_queue_work(&self) -> Result<bool, VirtioPciEndpointError> {
         let work = self.admit_device_work()?;
         work.with_core_mut(|core| {
@@ -4885,9 +5803,7 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
                     .dispatch_drained_queue_notifications(memory, drained_notifications);
                 let needs_queue_interrupt = match &dispatch {
                     Ok(dispatch) => dispatch.needs_queue_interrupt(),
-                    Err(error) => error
-                        .completed_dispatch()
-                        .is_some_and(VirtioBlockQueueDispatch::needs_queue_interrupt),
+                    Err(error) => error.needs_queue_interrupt(),
                 };
                 if needs_queue_interrupt {
                     core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
@@ -4911,15 +5827,20 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
             if let Some(backing) = backing {
                 let config_space =
                     VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
-                core.activation.refresh_backing(backing);
+                core.activation
+                    .refresh_backing(backing)
+                    .map_err(|_| VirtioPciEndpointError::UnsupportedDeviceOperation)?;
                 core.device_config = config_space;
                 core.device.increment_config_generation();
                 core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
             }
             if let Some(rate_limiter) = rate_limiter_update {
-                core.activation.update_rate_limiter(rate_limiter);
+                core.activation
+                    .update_rate_limiter(rate_limiter)
+                    .map_err(|_| VirtioPciEndpointError::UnsupportedDeviceOperation)?;
             }
-        })?;
+            Ok::<(), VirtioPciEndpointError>(())
+        })??;
         if backing_changed {
             work.drain_interrupt_intents()?;
         }
@@ -4931,7 +5852,11 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         rate_limiter: DriveRateLimiterConfig,
     ) -> Result<(), VirtioPciEndpointError> {
         let work = self.admit_device_work()?;
-        work.with_core_mut(|core| core.activation.update_rate_limiter(rate_limiter))
+        work.with_core_mut(|core| {
+            core.activation
+                .update_rate_limiter(rate_limiter)
+                .map_err(|_| VirtioPciEndpointError::UnsupportedDeviceOperation)
+        })?
     }
 }
 
@@ -4943,7 +5868,7 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
                 message: source.to_string(),
             })?;
 
-        self.refresh_block_backing_with_opened(config, backing);
+        self.refresh_block_backing_with_opened(config, backing)?;
 
         Ok(())
     }
@@ -4952,18 +5877,25 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
         &mut self,
         config: &DriveConfig,
         backing: BlockFileBacking,
-    ) {
+    ) -> Result<(), DriveUpdateError> {
         let config_space = VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
 
-        self.activation_handler_mut().refresh_backing(backing);
+        self.activation_handler_mut()
+            .refresh_backing(backing)
+            .map_err(|_| DriveUpdateError::UnsupportedBackend)?;
         *self.device_config_handler_mut() = config_space;
         self.increment_config_generation();
         self.mark_config_interrupt_pending();
+        Ok(())
     }
 
-    pub fn update_block_rate_limiter(&mut self, rate_limiter: DriveRateLimiterConfig) {
+    pub fn update_block_rate_limiter(
+        &mut self,
+        rate_limiter: DriveRateLimiterConfig,
+    ) -> Result<(), DriveUpdateError> {
         self.activation_handler_mut()
-            .update_rate_limiter(rate_limiter);
+            .update_rate_limiter(rate_limiter)
+            .map_err(|_| DriveUpdateError::UnsupportedBackend)
     }
 }
 
@@ -4984,16 +5916,22 @@ impl VirtioMmioDeviceActivationHandler for VirtioBlockDevice {
 pub struct VirtioBlockDeviceNotificationDispatch {
     drained_notifications: Vec<usize>,
     queue_dispatch: Option<VirtioBlockQueueDispatch>,
+    vhost_user_kicks: u64,
+    vhost_user_calls: u64,
 }
 
 impl VirtioBlockDeviceNotificationDispatch {
     const fn new(
         drained_notifications: Vec<usize>,
         queue_dispatch: Option<VirtioBlockQueueDispatch>,
+        vhost_user_kicks: u64,
+        vhost_user_calls: u64,
     ) -> Self {
         Self {
             drained_notifications,
             queue_dispatch,
+            vhost_user_kicks,
+            vhost_user_calls,
         }
     }
 
@@ -5005,10 +5943,20 @@ impl VirtioBlockDeviceNotificationDispatch {
         self.queue_dispatch.as_ref()
     }
 
+    pub const fn vhost_user_kicks(&self) -> u64 {
+        self.vhost_user_kicks
+    }
+
+    pub const fn vhost_user_calls(&self) -> u64 {
+        self.vhost_user_calls
+    }
+
     pub fn needs_queue_interrupt(&self) -> bool {
-        self.queue_dispatch
-            .as_ref()
-            .is_some_and(VirtioBlockQueueDispatch::needs_queue_interrupt)
+        self.vhost_user_calls != 0
+            || self
+                .queue_dispatch
+                .as_ref()
+                .is_some_and(VirtioBlockQueueDispatch::needs_queue_interrupt)
     }
 }
 
@@ -5025,6 +5973,11 @@ pub enum VirtioBlockDeviceNotificationError {
         drained_notifications: Vec<usize>,
         source: VirtioBlockQueueDispatchError,
     },
+    VhostUser {
+        drained_notifications: Vec<usize>,
+        calls: u64,
+        source: VhostUserBlockNotificationError,
+    },
 }
 
 impl VirtioBlockDeviceNotificationError {
@@ -5040,6 +5993,10 @@ impl VirtioBlockDeviceNotificationError {
             | Self::QueueDispatch {
                 drained_notifications,
                 ..
+            }
+            | Self::VhostUser {
+                drained_notifications,
+                ..
             } => drained_notifications,
         }
     }
@@ -5047,8 +6004,13 @@ impl VirtioBlockDeviceNotificationError {
     pub const fn completed_dispatch(&self) -> Option<&VirtioBlockQueueDispatch> {
         match self {
             Self::QueueDispatch { source, .. } => Some(source.completed_dispatch()),
-            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+            Self::Inactive { .. } | Self::UnsupportedQueue { .. } | Self::VhostUser { .. } => None,
         }
+    }
+
+    pub const fn needs_queue_interrupt(&self) -> bool {
+        matches!(self, Self::VhostUser { calls, .. } if *calls != 0)
+            || matches!(self, Self::QueueDispatch { source, .. } if source.completed_dispatch().needs_queue_interrupt())
     }
 }
 
@@ -5070,6 +6032,12 @@ impl fmt::Display for VirtioBlockDeviceNotificationError {
                     "failed to dispatch virtio-block queue notification: {source}"
                 )
             }
+            Self::VhostUser { source, .. } => {
+                write!(
+                    f,
+                    "failed to dispatch vhost-user block notification: {source}"
+                )
+            }
         }
     }
 }
@@ -5078,7 +6046,36 @@ impl std::error::Error for VirtioBlockDeviceNotificationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::QueueDispatch { source, .. } => Some(source),
+            Self::VhostUser { source, .. } => Some(source),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VhostUserBlockNotificationError {
+    Kick(VhostUserNotifierError),
+    Call(VhostUserNotifierError),
+    Closed,
+    Terminal,
+}
+
+impl fmt::Display for VhostUserBlockNotificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Kick(_) => formatter.write_str("vhost-user block kick failed"),
+            Self::Call(_) => formatter.write_str("vhost-user block call failed"),
+            Self::Closed => formatter.write_str("vhost-user block backend closed"),
+            Self::Terminal => formatter.write_str("vhost-user block device is terminal"),
+        }
+    }
+}
+
+impl std::error::Error for VhostUserBlockNotificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Kick(source) | Self::Call(source) => Some(source),
+            Self::Closed | Self::Terminal => None,
         }
     }
 }
@@ -5086,6 +6083,12 @@ impl std::error::Error for VirtioBlockDeviceNotificationError {
 #[derive(Debug)]
 pub enum VirtioBlockDeviceActivationError {
     AlreadyActive,
+    Terminal,
+    UnsupportedGuestFeatures,
+    QueueRange,
+    AllocateMemoryTable,
+    Frontend(VhostUserError),
+    Notifier(VhostUserNotifierError),
     QueueMetadata {
         queue_index: u32,
         source: VirtioMmioQueueRegisterError,
@@ -5100,6 +6103,18 @@ impl fmt::Display for VirtioBlockDeviceActivationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AlreadyActive => f.write_str("virtio-block device is already active"),
+            Self::Terminal => f.write_str("vhost-user block device is terminal"),
+            Self::UnsupportedGuestFeatures => {
+                f.write_str("guest vhost-user block features are unsupported")
+            }
+            Self::QueueRange => f.write_str("vhost-user block queue range is invalid"),
+            Self::AllocateMemoryTable => {
+                f.write_str("failed to allocate vhost-user block memory table")
+            }
+            Self::Frontend(source) => write!(f, "vhost-user block activation failed: {source}"),
+            Self::Notifier(source) => {
+                write!(f, "vhost-user block notifier creation failed: {source}")
+            }
             Self::QueueMetadata {
                 queue_index,
                 source,
@@ -5127,7 +6142,13 @@ impl std::error::Error for VirtioBlockDeviceActivationError {
         match self {
             Self::QueueMetadata { source, .. } => Some(source),
             Self::QueueBuild { source, .. } => Some(source),
-            Self::AlreadyActive => None,
+            Self::Frontend(source) => Some(source),
+            Self::Notifier(source) => Some(source),
+            Self::AlreadyActive
+            | Self::Terminal
+            | Self::UnsupportedGuestFeatures
+            | Self::QueueRange
+            | Self::AllocateMemoryTable => None,
         }
     }
 }
@@ -5180,15 +6201,25 @@ mod tests {
     use std::error::Error as _;
     use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use bangbang_vhost_user::{
+        SUPPORTED_VIRTIO_FEATURES, VHOST_USER_F_PROTOCOL_FEATURES, VHOST_USER_PROTOCOL_F_CONFIG,
+        VHOST_USER_PROTOCOL_F_REPLY_ACK, VIRTIO_BLK_F_FLUSH, VIRTIO_F_VERSION_1,
+    };
+
     use crate::interrupt::DeviceInterruptKind;
-    use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
+    use crate::memory::{
+        GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange,
+    };
     use crate::metrics::{BlockDeviceMetrics, SharedBlockDeviceMetrics};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioOperation, MmioRegionId,
@@ -5215,7 +6246,9 @@ mod tests {
         DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveRateLimiterConfig,
         DriveRuntimeMutationError, DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput,
         PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
-        SnapshotBlockFileBackingError, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID,
+        PreparedVhostUserBlockFrontend, PreparedVhostUserBlockFrontendError,
+        PreparedVhostUserBlockMemoryError, SnapshotBlockFileBackingError,
+        VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_CONFIG_SIZE, VIRTIO_BLOCK_DEVICE_ID,
         VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
         VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
         VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
@@ -5223,7 +6256,8 @@ mod tests {
         VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
         VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
         VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace, VirtioBlockDevice,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC, VhostUserBlockNotificationError, VhostUserBlockState,
+        VirtioBlockBackend, VirtioBlockConfigSpace, VirtioBlockDevice,
         VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
         VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError,
         VirtioBlockQueueSnapshotError, VirtioBlockRateLimiter, VirtioBlockRequest,
@@ -5255,6 +6289,413 @@ mod tests {
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
     const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+    const VHOST_USER_HEADER_SIZE: usize = 12;
+    const VHOST_USER_VERSION: u32 = 1;
+    const VHOST_USER_REPLY: u32 = 1 << 2;
+    const VHOST_USER_NEED_REPLY: u32 = 1 << 3;
+
+    struct TestVhostUserRequest {
+        code: u32,
+        need_reply: bool,
+        body: Vec<u8>,
+        descriptors: Vec<OwnedFd>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TestVhostUserObservation {
+        guest_features: u64,
+        memory_region_count: u32,
+        queue_size: u32,
+    }
+
+    fn receive_test_vhost_user_request(stream: &mut UnixStream) -> TestVhostUserRequest {
+        let mut header = [0_u8; VHOST_USER_HEADER_SIZE];
+        let mut descriptors = receive_test_vhost_user_exact(stream, &mut header);
+        let code = test_vhost_user_u32(&header, 0);
+        let flags = test_vhost_user_u32(&header, 4);
+        let body_size = usize::try_from(test_vhost_user_u32(&header, 8))
+            .expect("test vhost-user body size should fit usize");
+        assert_eq!(flags & 0x3, VHOST_USER_VERSION);
+        assert_eq!(flags & VHOST_USER_REPLY, 0);
+        assert_eq!(flags & !(0x3 | VHOST_USER_REPLY | VHOST_USER_NEED_REPLY), 0);
+        assert!(body_size <= 0x1000);
+        let mut body = vec![0_u8; body_size];
+        descriptors.extend(receive_test_vhost_user_exact(stream, &mut body));
+        TestVhostUserRequest {
+            code,
+            need_reply: flags & VHOST_USER_NEED_REPLY != 0,
+            body,
+            descriptors,
+        }
+    }
+
+    fn receive_test_vhost_user_exact(stream: &UnixStream, bytes: &mut [u8]) -> Vec<OwnedFd> {
+        let mut received = 0_usize;
+        let mut descriptors = Vec::new();
+        while received < bytes.len() {
+            let (count, mut attempt_descriptors) =
+                receive_test_vhost_user_once(stream.as_raw_fd(), &mut bytes[received..]);
+            assert_ne!(count, 0, "test vhost-user peer reached EOF");
+            received = received
+                .checked_add(count)
+                .expect("test receive count should not overflow");
+            descriptors.append(&mut attempt_descriptors);
+        }
+        descriptors
+    }
+
+    fn receive_test_vhost_user_once(descriptor: i32, bytes: &mut [u8]) -> (usize, Vec<OwnedFd>) {
+        let mut iovec = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut control = [0_usize; 32];
+        // SAFETY: An all-zero message header is valid. It receives into the
+        // live byte slice and aligned control buffer installed immediately below.
+        let mut message: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
+        message.msg_iov = &raw mut iovec;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = (control.len() * size_of::<usize>())
+            .try_into()
+            .expect("test control buffer size should fit platform type");
+        // SAFETY: `message` points only to live writable buffers for this call.
+        let result = unsafe { libc::recvmsg(descriptor, &raw mut message, 0) };
+        assert!(result >= 0, "test vhost-user receive should succeed");
+        assert_eq!(message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC), 0);
+        let received = usize::try_from(result).expect("receive count should fit usize");
+        assert!(received <= bytes.len());
+
+        let mut descriptors = Vec::new();
+        // SAFETY: The kernel initialized the returned control region. Each
+        // header and descriptor lies within the fixed aligned buffer, and every
+        // nonnegative received descriptor is adopted exactly once.
+        unsafe {
+            let mut header = libc::CMSG_FIRSTHDR(&raw const message);
+            while !header.is_null() {
+                assert_eq!((*header).cmsg_level, libc::SOL_SOCKET);
+                assert_eq!((*header).cmsg_type, libc::SCM_RIGHTS);
+                let header_size = usize::try_from(libc::CMSG_LEN(0))
+                    .expect("control header size should fit usize");
+                let declared =
+                    usize::try_from((*header).cmsg_len).expect("control length should fit usize");
+                assert!(declared >= header_size);
+                let data_size = declared - header_size;
+                assert_ne!(data_size, 0);
+                assert_eq!(data_size % size_of::<i32>(), 0);
+                for index in 0..data_size / size_of::<i32>() {
+                    let offset = index * size_of::<i32>();
+                    let raw =
+                        std::ptr::read_unaligned(libc::CMSG_DATA(header).add(offset).cast::<i32>());
+                    assert!(raw >= 0);
+                    descriptors.push(OwnedFd::from_raw_fd(raw));
+                }
+                header = libc::CMSG_NXTHDR(&raw const message, header);
+            }
+        }
+        for descriptor in &descriptors {
+            // SAFETY: F_GETFD/F_SETFD inspect and update only this live owned fd.
+            let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            if flags & libc::FD_CLOEXEC == 0 {
+                // SAFETY: The descriptor remains live and the flags came from F_GETFD.
+                let result = unsafe {
+                    libc::fcntl(
+                        descriptor.as_raw_fd(),
+                        libc::F_SETFD,
+                        flags | libc::FD_CLOEXEC,
+                    )
+                };
+                assert_eq!(result, 0);
+            }
+        }
+        (received, descriptors)
+    }
+
+    fn expect_test_vhost_user_request(
+        stream: &mut UnixStream,
+        code: u32,
+        need_reply: bool,
+        descriptor_count: usize,
+    ) -> TestVhostUserRequest {
+        let request = receive_test_vhost_user_request(stream);
+        assert_eq!(request.code, code);
+        assert_eq!(request.need_reply, need_reply);
+        assert_eq!(request.descriptors.len(), descriptor_count);
+        request
+    }
+
+    fn send_test_vhost_user_reply(stream: &mut UnixStream, code: u32, body: &[u8]) {
+        let mut frame = Vec::with_capacity(VHOST_USER_HEADER_SIZE + body.len());
+        frame.extend_from_slice(&code.to_ne_bytes());
+        frame.extend_from_slice(&(VHOST_USER_VERSION | VHOST_USER_REPLY).to_ne_bytes());
+        frame.extend_from_slice(
+            &u32::try_from(body.len())
+                .expect("test reply size should fit u32")
+                .to_ne_bytes(),
+        );
+        frame.extend_from_slice(body);
+        stream
+            .write_all(&frame)
+            .expect("test vhost-user reply should send");
+    }
+
+    fn acknowledge_test_vhost_user_request(
+        stream: &mut UnixStream,
+        request: &TestVhostUserRequest,
+    ) {
+        assert!(request.need_reply);
+        send_test_vhost_user_reply(stream, request.code, &0_u64.to_ne_bytes());
+    }
+
+    fn test_vhost_user_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_ne_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("test vhost-user u32 should decode"),
+        )
+    }
+
+    fn test_vhost_user_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_ne_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("test vhost-user u64 should decode"),
+        )
+    }
+
+    fn write_test_vhost_user_pipe(descriptor: &OwnedFd) {
+        let notification = [0_u8; 8];
+        // SAFETY: The received call fd is a live pipe writer and the complete
+        // fixed notification buffer is readable for this synchronous write.
+        let written = unsafe {
+            libc::write(
+                descriptor.as_raw_fd(),
+                notification.as_ptr().cast(),
+                notification.len(),
+            )
+        };
+        assert_eq!(written, 8);
+    }
+
+    fn read_test_vhost_user_pipe(descriptor: &OwnedFd) {
+        let mut poll_descriptor = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: One initialized poll entry is writable for this bounded wait.
+        assert_eq!(unsafe { libc::poll(&raw mut poll_descriptor, 1, 2_000) }, 1);
+        let mut notification = [1_u8; 8];
+        // SAFETY: The received kick fd is a live pipe reader and the complete
+        // fixed notification buffer is writable for this synchronous read.
+        let read = unsafe {
+            libc::read(
+                descriptor.as_raw_fd(),
+                notification.as_mut_ptr().cast(),
+                notification.len(),
+            )
+        };
+        assert_eq!(read, 8);
+        assert_eq!(notification, [0; 8]);
+    }
+
+    fn spawn_complete_test_vhost_user_peer(
+        mut stream: UnixStream,
+        features: u64,
+        config: [u8; VIRTIO_BLOCK_CONFIG_SIZE],
+    ) -> thread::JoinHandle<TestVhostUserObservation> {
+        thread::spawn(move || {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("peer read timeout should set");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("peer write timeout should set");
+
+            let owner = expect_test_vhost_user_request(&mut stream, 3, false, 0);
+            assert!(owner.body.is_empty());
+            let get_features = expect_test_vhost_user_request(&mut stream, 1, false, 0);
+            assert!(get_features.body.is_empty());
+            send_test_vhost_user_reply(&mut stream, 1, &features.to_ne_bytes());
+            let get_protocol = expect_test_vhost_user_request(&mut stream, 15, false, 0);
+            assert!(get_protocol.body.is_empty());
+            let protocol_features = VHOST_USER_PROTOCOL_F_CONFIG | VHOST_USER_PROTOCOL_F_REPLY_ACK;
+            send_test_vhost_user_reply(&mut stream, 15, &protocol_features.to_ne_bytes());
+            let set_protocol = expect_test_vhost_user_request(&mut stream, 16, false, 0);
+            assert_eq!(
+                test_vhost_user_u64(&set_protocol.body, 0),
+                protocol_features
+            );
+            let get_config = expect_test_vhost_user_request(&mut stream, 24, false, 0);
+            assert_eq!(get_config.body.len(), 12 + VIRTIO_BLOCK_CONFIG_SIZE);
+            assert_eq!(test_vhost_user_u32(&get_config.body, 0), 0);
+            assert_eq!(
+                test_vhost_user_u32(&get_config.body, 4),
+                VIRTIO_BLOCK_CONFIG_SIZE as u32
+            );
+            assert_eq!(test_vhost_user_u32(&get_config.body, 8), 1);
+            assert!(get_config.body[12..].iter().all(|byte| *byte == 0));
+            let mut config_reply = Vec::with_capacity(12 + VIRTIO_BLOCK_CONFIG_SIZE);
+            config_reply.extend_from_slice(&0_u32.to_ne_bytes());
+            config_reply.extend_from_slice(&(VIRTIO_BLOCK_CONFIG_SIZE as u32).to_ne_bytes());
+            config_reply.extend_from_slice(&1_u32.to_ne_bytes());
+            config_reply.extend_from_slice(&config);
+            send_test_vhost_user_reply(&mut stream, 24, &config_reply);
+
+            let set_features = expect_test_vhost_user_request(&mut stream, 2, true, 0);
+            let guest_features = test_vhost_user_u64(&set_features.body, 0);
+            assert_eq!(guest_features & !features, 0);
+            assert_eq!(
+                guest_features & (VIRTIO_F_VERSION_1 | VHOST_USER_F_PROTOCOL_FEATURES),
+                VIRTIO_F_VERSION_1 | VHOST_USER_F_PROTOCOL_FEATURES
+            );
+            acknowledge_test_vhost_user_request(&mut stream, &set_features);
+
+            let memory = receive_test_vhost_user_request(&mut stream);
+            assert_eq!(memory.code, 5);
+            assert!(memory.need_reply);
+            let memory_region_count = test_vhost_user_u32(&memory.body, 0);
+            assert_ne!(memory_region_count, 0);
+            assert_eq!(test_vhost_user_u32(&memory.body, 4), 0);
+            assert_eq!(memory.descriptors.len(), memory_region_count as usize);
+            assert_eq!(memory.body.len(), 8 + memory.descriptors.len() * 32);
+            acknowledge_test_vhost_user_request(&mut stream, &memory);
+
+            let number = expect_test_vhost_user_request(&mut stream, 8, true, 0);
+            assert_eq!(test_vhost_user_u32(&number.body, 0), 0);
+            let queue_size = test_vhost_user_u32(&number.body, 4);
+            acknowledge_test_vhost_user_request(&mut stream, &number);
+            let address = expect_test_vhost_user_request(&mut stream, 9, true, 0);
+            assert_eq!(address.body.len(), 40);
+            assert_eq!(test_vhost_user_u32(&address.body, 0), 0);
+            assert_eq!(test_vhost_user_u32(&address.body, 4), 0);
+            for offset in [8, 16, 24] {
+                assert_ne!(test_vhost_user_u64(&address.body, offset), 0);
+            }
+            assert_eq!(test_vhost_user_u64(&address.body, 32), 0);
+            acknowledge_test_vhost_user_request(&mut stream, &address);
+            let base = expect_test_vhost_user_request(&mut stream, 10, true, 0);
+            assert_eq!(test_vhost_user_u32(&base.body, 0), 0);
+            assert_eq!(test_vhost_user_u32(&base.body, 4), 0);
+            acknowledge_test_vhost_user_request(&mut stream, &base);
+            let call = expect_test_vhost_user_request(&mut stream, 13, true, 1);
+            assert_eq!(test_vhost_user_u64(&call.body, 0), 0);
+            acknowledge_test_vhost_user_request(&mut stream, &call);
+            let kick = expect_test_vhost_user_request(&mut stream, 12, true, 1);
+            assert_eq!(test_vhost_user_u64(&kick.body, 0), 0);
+            acknowledge_test_vhost_user_request(&mut stream, &kick);
+            let enable = expect_test_vhost_user_request(&mut stream, 18, true, 0);
+            assert_eq!(test_vhost_user_u32(&enable.body, 0), 0);
+            assert_eq!(test_vhost_user_u32(&enable.body, 4), 1);
+            write_test_vhost_user_pipe(&call.descriptors[0]);
+            acknowledge_test_vhost_user_request(&mut stream, &enable);
+            read_test_vhost_user_pipe(&kick.descriptors[0]);
+
+            TestVhostUserObservation {
+                guest_features,
+                memory_region_count,
+                queue_size,
+            }
+        })
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestVhostUserConfigReply {
+        Exact([u8; VIRTIO_BLOCK_CONFIG_SIZE]),
+        BackendFailure,
+        Malformed,
+    }
+
+    fn spawn_test_vhost_user_discovery_peer(
+        mut stream: UnixStream,
+        features: u64,
+        protocol_features: u64,
+        config_reply: TestVhostUserConfigReply,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("peer read timeout should set");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("peer write timeout should set");
+            expect_test_vhost_user_request(&mut stream, 3, false, 0);
+            expect_test_vhost_user_request(&mut stream, 1, false, 0);
+            send_test_vhost_user_reply(&mut stream, 1, &features.to_ne_bytes());
+            if features & (VIRTIO_F_VERSION_1 | VHOST_USER_F_PROTOCOL_FEATURES)
+                != VIRTIO_F_VERSION_1 | VHOST_USER_F_PROTOCOL_FEATURES
+            {
+                return;
+            }
+            expect_test_vhost_user_request(&mut stream, 15, false, 0);
+            send_test_vhost_user_reply(&mut stream, 15, &protocol_features.to_ne_bytes());
+            if protocol_features & VHOST_USER_PROTOCOL_F_CONFIG == 0 {
+                return;
+            }
+            let set_protocol = expect_test_vhost_user_request(&mut stream, 16, false, 0);
+            assert_eq!(
+                test_vhost_user_u64(&set_protocol.body, 0),
+                VHOST_USER_PROTOCOL_F_CONFIG
+                    | (protocol_features & VHOST_USER_PROTOCOL_F_REPLY_ACK)
+            );
+            expect_test_vhost_user_request(&mut stream, 24, false, 0);
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&0_u32.to_ne_bytes());
+            match config_reply {
+                TestVhostUserConfigReply::Exact(bytes) => {
+                    reply.extend_from_slice(&(VIRTIO_BLOCK_CONFIG_SIZE as u32).to_ne_bytes());
+                    reply.extend_from_slice(&1_u32.to_ne_bytes());
+                    reply.extend_from_slice(&bytes);
+                }
+                TestVhostUserConfigReply::BackendFailure => {
+                    reply.extend_from_slice(&0_u32.to_ne_bytes());
+                    reply.extend_from_slice(&1_u32.to_ne_bytes());
+                }
+                TestVhostUserConfigReply::Malformed => {
+                    reply.extend_from_slice(&((VIRTIO_BLOCK_CONFIG_SIZE - 1) as u32).to_ne_bytes());
+                    reply.extend_from_slice(&1_u32.to_ne_bytes());
+                    reply.resize(12 + VIRTIO_BLOCK_CONFIG_SIZE - 1, 0x5a);
+                }
+            }
+            send_test_vhost_user_reply(&mut stream, 24, &reply);
+        })
+    }
+
+    fn prepare_disconnected_test_vhost_user_device()
+    -> (VirtioBlockConfigSpace, VirtioBlockDevice, GuestMemory) {
+        let (frontend_stream, peer_stream) =
+            UnixStream::pair().expect("vhost-user stream pair should open");
+        let peer = spawn_test_vhost_user_discovery_peer(
+            peer_stream,
+            SUPPORTED_VIRTIO_FEATURES,
+            VHOST_USER_PROTOCOL_F_CONFIG,
+            TestVhostUserConfigReply::Exact([0; VIRTIO_BLOCK_CONFIG_SIZE]),
+        );
+        let frontend = PreparedVhostUserBlockFrontend::discover(
+            frontend_stream,
+            DriveCacheType::Writeback,
+            Duration::from_secs(2),
+        )
+        .expect("vhost-user discovery should complete");
+        peer.join().expect("discovery peer should finish");
+        let config = DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+            .with_socket("/private/test-vhost.sock")
+            .with_cache_type(DriveCacheType::Writeback)
+            .validate()
+            .expect("vhost-user drive should validate");
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("test shared memory range should validate"),
+        ])
+        .expect("test shared memory layout should validate");
+        let memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("test shared guest memory should allocate");
+        let prepared = PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
+            .expect("vhost-user block should prepare");
+        let (_, _, config_space, device) = prepared.into_parts();
+        (config_space, device, memory)
+    }
 
     #[derive(Debug)]
     struct TempPath {
@@ -6017,12 +7458,12 @@ mod tests {
         let config = validate(input()).expect("minimal drive config should be valid");
 
         assert_eq!(config.drive_id(), "rootfs");
-        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/rootfs.ext4"));
+        assert_eq!(config.path_on_host(), Some(Path::new("/tmp/rootfs.ext4")));
         assert!(!config.is_root_device());
-        assert!(!config.is_read_only());
+        assert_eq!(config.is_read_only(), Some(false));
         assert_eq!(config.partuuid(), None);
         assert_eq!(config.cache_type(), DriveCacheType::Unsafe);
-        assert_eq!(config.io_engine(), DriveIoEngine::Sync);
+        assert_eq!(config.io_engine(), Some(DriveIoEngine::Sync));
         assert_eq!(config.rate_limiter(), None);
     }
 
@@ -6036,7 +7477,7 @@ mod tests {
         .expect("root drive config should be valid");
 
         assert!(config.is_root_device());
-        assert!(config.is_read_only());
+        assert_eq!(config.is_read_only(), Some(true));
         assert_eq!(config.partuuid(), Some("0eaa91a0-01"));
     }
 
@@ -6212,24 +7653,48 @@ mod tests {
     }
 
     #[test]
-    fn rejects_socket_field() {
+    fn rejects_socket_together_with_path_on_host() {
         assert_eq!(
             validate(input().with_socket("/tmp/vhost-user-block.sock")),
-            Err(DriveConfigError::UnsupportedSocket)
+            Err(DriveConfigError::InvalidVhostUserConfiguration)
         );
     }
 
     #[test]
-    fn rejects_socket_field_without_path_on_host() {
-        let err = validate(
+    fn accepts_socket_field_without_file_backed_fields() {
+        let config = validate(
             DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
                 .with_socket("/tmp/private-vhost.sock"),
         )
-        .expect_err("socket-backed drive should be unsupported");
+        .expect("socket-backed drive should be supported");
 
-        assert_eq!(err, DriveConfigError::UnsupportedSocket);
-        assert_eq!(err.to_string(), "drive socket is not supported");
-        assert!(!err.to_string().contains("private-vhost"));
+        assert_eq!(config.drive_id(), "vhost");
+        assert_eq!(config.path_on_host(), None);
+        assert_eq!(config.socket(), Some(Path::new("/tmp/private-vhost.sock")));
+        assert!(config.is_vhost_user());
+        assert_eq!(config.is_read_only(), None);
+        assert_eq!(config.io_engine(), None);
+        assert_eq!(config.rate_limiter(), None);
+    }
+
+    #[test]
+    fn rejects_vhost_user_with_explicit_file_backed_fields() {
+        for input in [
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("/tmp/private-vhost.sock")
+                .with_is_read_only(false),
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("/tmp/private-vhost.sock")
+                .with_io_engine(DriveIoEngine::Sync),
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("/tmp/private-vhost.sock")
+                .with_rate_limiter(DriveRateLimiterConfig::new(None, None)),
+        ] {
+            let err = validate(input).expect_err("file-backed field should be rejected");
+
+            assert_eq!(err, DriveConfigError::InvalidVhostUserConfiguration);
+            assert!(!err.to_string().contains("private-vhost"));
+        }
     }
 
     #[test]
@@ -6255,9 +7720,12 @@ mod tests {
 
     #[test]
     fn drive_config_errors_display_and_preserve_sources() {
-        let err = DriveConfigError::UnsupportedSocket;
+        let err = DriveConfigError::InvalidVhostUserConfiguration;
 
-        assert_eq!(err.to_string(), "drive socket is not supported");
+        assert_eq!(
+            err.to_string(),
+            "vhost-user drive contains incompatible file-backed fields"
+        );
         assert!(err.source().is_none());
     }
 
@@ -6272,7 +7740,7 @@ mod tests {
         assert_eq!(configs.as_slice().len(), 1);
         let config = &configs.as_slice()[0];
         assert_eq!(config.drive_id(), "rootfs");
-        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/rootfs.ext4"));
+        assert_eq!(config.path_on_host(), Some(Path::new("/tmp/rootfs.ext4")));
     }
 
     #[test]
@@ -6292,9 +7760,9 @@ mod tests {
         assert_eq!(configs.as_slice().len(), 1);
         let config = &configs.as_slice()[0];
         assert_eq!(config.drive_id(), "rootfs");
-        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/replaced.ext4"));
+        assert_eq!(config.path_on_host(), Some(Path::new("/tmp/replaced.ext4")));
         assert!(config.is_root_device());
-        assert!(config.is_read_only());
+        assert_eq!(config.is_read_only(), Some(true));
     }
 
     #[test]
@@ -6339,7 +7807,7 @@ mod tests {
         assert_eq!(configs.as_slice()[1].drive_id(), "data1");
         assert_eq!(
             configs.as_slice()[1].path_on_host(),
-            PathBuf::from("/tmp/data1-replaced.ext4")
+            Some(Path::new("/tmp/data1-replaced.ext4"))
         );
         assert_eq!(configs.as_slice()[2].drive_id(), "data2");
     }
@@ -6375,10 +7843,10 @@ mod tests {
         assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
         assert_eq!(
             configs.as_slice()[0].path_on_host(),
-            PathBuf::from("/tmp/rootfs-new.ext4")
+            Some(Path::new("/tmp/rootfs-new.ext4"))
         );
         assert!(configs.as_slice()[0].is_root_device());
-        assert!(configs.as_slice()[0].is_read_only());
+        assert_eq!(configs.as_slice()[0].is_read_only(), Some(true));
         assert_eq!(configs.as_slice()[1].drive_id(), "data");
     }
 
@@ -6415,7 +7883,7 @@ mod tests {
         assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
         assert_eq!(
             configs.as_slice()[0].path_on_host(),
-            PathBuf::from("/tmp/rootfs-data.ext4")
+            Some(Path::new("/tmp/rootfs-data.ext4"))
         );
         assert!(!configs.as_slice()[0].is_root_device());
         assert_eq!(configs.as_slice()[1].drive_id(), "data");
@@ -6454,7 +7922,7 @@ mod tests {
         assert_eq!(configs.as_slice()[0].drive_id(), "data2");
         assert_eq!(
             configs.as_slice()[0].path_on_host(),
-            PathBuf::from("/tmp/data2-root.ext4")
+            Some(Path::new("/tmp/data2-root.ext4"))
         );
         assert!(configs.as_slice()[0].is_root_device());
         assert_eq!(configs.as_slice()[1].drive_id(), "data1");
@@ -6731,7 +8199,10 @@ mod tests {
             .expect("runtime drive update should build");
 
         assert_eq!(updated.drive_id(), "data");
-        assert_eq!(updated.path_on_host(), Path::new("/tmp/data-updated.ext4"));
+        assert_eq!(
+            updated.path_on_host(),
+            Some(Path::new("/tmp/data-updated.ext4"))
+        );
         assert!(!updated.is_root_device());
         configs
             .commit_update(updated)
@@ -6739,12 +8210,12 @@ mod tests {
         assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
         assert_eq!(
             configs.as_slice()[0].path_on_host(),
-            Path::new("/tmp/rootfs.ext4")
+            Some(Path::new("/tmp/rootfs.ext4"))
         );
         assert_eq!(configs.as_slice()[1].drive_id(), "data");
         assert_eq!(
             configs.as_slice()[1].path_on_host(),
-            Path::new("/tmp/data-updated.ext4")
+            Some(Path::new("/tmp/data-updated.ext4"))
         );
     }
 
@@ -6764,7 +8235,7 @@ mod tests {
             .updated_config(DriveUpdateInput::new("rootfs", "rootfs", None))
             .expect("pathless runtime drive update should build");
 
-        assert_eq!(updated.path_on_host(), Path::new("/tmp/rootfs.ext4"));
+        assert_eq!(updated.path_on_host(), Some(Path::new("/tmp/rootfs.ext4")));
     }
 
     #[test]
@@ -6850,7 +8321,7 @@ mod tests {
         assert_eq!(configs.as_slice().len(), 1);
         assert_eq!(
             configs.as_slice()[0].path_on_host(),
-            Path::new("/tmp/rootfs.ext4")
+            Some(Path::new("/tmp/rootfs.ext4"))
         );
     }
 
@@ -6889,10 +8360,14 @@ mod tests {
             device.device().device_id(),
             VirtioBlockDeviceId::from_bytes(b"rootfs")
         );
-        assert_eq!(device.device().backing().len(), 1024);
-        assert!(device.device().backing().is_read_only());
+        let backing = device
+            .device()
+            .backing()
+            .expect("file device should retain backing");
+        assert_eq!(backing.len(), 1024);
+        assert!(backing.is_read_only());
         assert!(matches!(
-            device.device().backing().write_at(0, b"x"),
+            backing.write_at(0, b"x"),
             Err(BlockFileBackingError::ReadOnlyWrite),
         ));
         assert!(!device.device().is_activated());
@@ -6912,10 +8387,12 @@ mod tests {
         let device = &prepared.as_slice()[0];
         assert_eq!(device.drive_id(), "data");
         assert!(!device.config_space().is_read_only());
-        assert!(!device.device().backing().is_read_only());
-        device
+        let backing = device
             .device()
             .backing()
+            .expect("file device should retain backing");
+        assert!(!backing.is_read_only());
+        backing
             .write_at(1, b"Z")
             .expect("read-write prepared backing should write");
         assert_eq!(fs::read(file.as_path()).expect("file should read"), b"aZc");
@@ -7033,6 +8510,7 @@ mod tests {
             PreparedBlockDeviceError::UnexpectedBacking => {
                 panic!("path-only preparation should not have a provided backing")
             }
+            other => panic!("unexpected preparation error: {other:?}"),
         }
         assert!(err.source().is_some());
         assert!(!err.to_string().contains("secret-prepared-missing"));
@@ -7071,6 +8549,7 @@ mod tests {
             PreparedBlockDeviceError::UnexpectedBacking => {
                 panic!("path-only preparation should not have a provided backing")
             }
+            other => panic!("unexpected preparation error: {other:?}"),
         }
         assert!(!err.to_string().contains("secret-prepared-dir"));
     }
@@ -7108,6 +8587,7 @@ mod tests {
             PreparedBlockDeviceError::UnexpectedBacking => {
                 panic!("path-only preparation should not have a provided backing")
             }
+            other => panic!("unexpected preparation error: {other:?}"),
         }
         assert!(!err.to_string().contains("secret-prepared-fifo"));
     }
@@ -7238,10 +8718,10 @@ mod tests {
             )
             .expect("rate limiter should be enabled"),
         );
-        let rate_limiter = device
-            .rate_limiter
-            .as_mut()
-            .expect("rate limiter should exist");
+        let VirtioBlockBackend::File { rate_limiter, .. } = &mut device.backend else {
+            panic!("test device should use the file backend");
+        };
+        let rate_limiter = rate_limiter.as_mut().expect("rate limiter should exist");
         let bandwidth = rate_limiter
             .bandwidth
             .as_mut()
@@ -7249,10 +8729,12 @@ mod tests {
         assert!(bandwidth.reduce_at(3, now));
         let bandwidth_snapshot = bandwidth.snapshot();
 
-        device.update_rate_limiter(DriveRateLimiterConfig::new(
-            None,
-            Some(DriveTokenBucketConfig::new(2, None, 1000)),
-        ));
+        device
+            .update_rate_limiter(DriveRateLimiterConfig::new(
+                None,
+                Some(DriveTokenBucketConfig::new(2, None, 1000)),
+            ))
+            .expect("file device rate limiter should update");
 
         let rate_limiter = device
             .rate_limiter()
@@ -7284,10 +8766,12 @@ mod tests {
             .expect("rate limiter should be enabled"),
         );
 
-        device.update_rate_limiter(DriveRateLimiterConfig::new(
-            Some(DriveTokenBucketConfig::new(0, None, 1000)),
-            None,
-        ));
+        device
+            .update_rate_limiter(DriveRateLimiterConfig::new(
+                Some(DriveTokenBucketConfig::new(0, None, 1000)),
+                None,
+            ))
+            .expect("file device rate limiter should update");
 
         let rate_limiter = device
             .rate_limiter()
@@ -7295,10 +8779,12 @@ mod tests {
         assert!(rate_limiter.bandwidth.is_none());
         assert!(rate_limiter.ops.is_some());
 
-        device.update_rate_limiter(DriveRateLimiterConfig::new(
-            None,
-            Some(DriveTokenBucketConfig::new(1, None, 0)),
-        ));
+        device
+            .update_rate_limiter(DriveRateLimiterConfig::new(
+                None,
+                Some(DriveTokenBucketConfig::new(1, None, 0)),
+            ))
+            .expect("file device rate limiter should update");
 
         assert!(device.rate_limiter().is_none());
     }
@@ -7677,7 +9163,14 @@ mod tests {
         let replacement_config = config_for_path(second.as_path(), false);
 
         assert_eq!(handler.device_config_handler().capacity_sectors(), 1);
-        assert_eq!(handler.activation_handler().backing().len(), 512);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .backing()
+                .expect("file device should retain backing")
+                .len(),
+            512
+        );
         assert_eq!(
             handler.read_register(VirtioMmioRegister::ConfigGeneration),
             Ok(0)
@@ -7688,7 +9181,14 @@ mod tests {
             .expect("replacement backing should refresh");
 
         assert_eq!(handler.device_config_handler().capacity_sectors(), 2);
-        assert_eq!(handler.activation_handler().backing().len(), 1024);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .backing()
+                .expect("file device should retain backing")
+                .len(),
+            1024
+        );
         assert_eq!(
             handler.read_register(VirtioMmioRegister::ConfigGeneration),
             Ok(1)
@@ -7715,7 +9215,14 @@ mod tests {
         assert!(matches!(err, DriveUpdateError::OpenBacking { .. }));
         assert!(!err.to_string().contains("secret-refresh-missing"));
         assert_eq!(handler.device_config_handler().capacity_sectors(), 1);
-        assert_eq!(handler.activation_handler().backing().len(), 512);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .backing()
+                .expect("file device should retain backing")
+                .len(),
+            512
+        );
         assert_eq!(
             handler.read_register(VirtioMmioRegister::ConfigGeneration),
             Ok(0)
@@ -8735,8 +10242,9 @@ mod tests {
             .expect("active queue should be stored");
         assert!(device.is_activated());
         assert_eq!(device.device_id(), TEST_DEVICE_ID);
-        assert_eq!(device.backing().len(), VIRTIO_BLOCK_SECTOR_SIZE);
-        assert!(!device.backing().is_read_only());
+        let backing = device.backing().expect("file device should retain backing");
+        assert_eq!(backing.len(), VIRTIO_BLOCK_SECTOR_SIZE);
+        assert!(!backing.is_read_only());
         assert_eq!(
             queue.available_ring().descriptor_table(),
             TEST_DESCRIPTOR_TABLE
@@ -8745,6 +10253,416 @@ mod tests {
         assert_eq!(queue.available_ring().queue_size(), 4);
         assert_eq!(queue.used_ring().used_ring(), TEST_USED_RING);
         assert_eq!(queue.used_ring().queue_size(), 4);
+    }
+
+    #[test]
+    fn vhost_user_block_discovers_activates_notifies_and_terminalizes_over_real_descriptors() {
+        let (frontend_stream, peer_stream) =
+            UnixStream::pair().expect("vhost-user stream pair should open");
+        let features = SUPPORTED_VIRTIO_FEATURES;
+        let mut config_bytes = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        config_bytes[..8].copy_from_slice(&2_u64.to_le_bytes());
+        config_bytes[20..24].copy_from_slice(&512_u32.to_le_bytes());
+        let peer = spawn_complete_test_vhost_user_peer(peer_stream, features, config_bytes);
+
+        let frontend = PreparedVhostUserBlockFrontend::discover(
+            frontend_stream,
+            DriveCacheType::Writeback,
+            Duration::from_secs(2),
+        )
+        .expect("vhost-user discovery should complete");
+        assert_eq!(frontend.available_features(), features);
+        assert!(frontend.is_read_only());
+        assert_eq!(frontend.config_bytes(), &config_bytes);
+
+        let config = DriveConfigInput::new_without_path_on_host("vhost", "vhost", true)
+            .with_socket("/private/test-vhost.sock")
+            .with_partuuid("0eaa91a0-01")
+            .with_cache_type(DriveCacheType::Writeback)
+            .validate()
+            .expect("vhost-user drive should validate");
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("test shared memory range should validate"),
+        ])
+        .expect("test shared memory layout should validate");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("test shared guest memory should allocate");
+        let prepared = PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
+            .expect("vhost-user block should prepare with shared memory");
+        assert_eq!(prepared.drive_id(), "vhost");
+        assert!(prepared.is_root_device());
+        assert_eq!(
+            prepared.config_space().config_len(),
+            VIRTIO_BLOCK_CONFIG_SIZE
+        );
+        assert_eq!(prepared.config_space().capacity_sectors(), 2);
+        assert!(prepared.config_space().is_read_only());
+        assert_eq!(prepared.config_space().available_features(), features);
+        assert_eq!(prepared.config_space().bytes, config_bytes);
+
+        let (_, _, config_space, mut device) = prepared.into_parts();
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        let registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BLOCK_DEVICE_ID,
+            config_space.available_features(),
+        )
+        .with_runtime_state(
+            [0, 1],
+            features & !VHOST_USER_F_PROTOCOL_FEATURES,
+            DRIVER_OK_STATUS,
+        );
+        device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect("vhost-user block should activate");
+        assert!(device.is_activated());
+        assert!(device.vhost_user_call_fd().is_some());
+
+        let dispatch = device
+            .dispatch_drained_queue_notifications(&mut memory, vec![0])
+            .expect("guest kick and backend call should dispatch");
+        assert_eq!(dispatch.drained_notifications(), &[0]);
+        assert_eq!(dispatch.vhost_user_kicks(), 1);
+        assert_eq!(dispatch.vhost_user_calls(), 1);
+        assert!(dispatch.needs_queue_interrupt());
+        assert!(dispatch.queue_dispatch().is_none());
+
+        let observation = peer.join().expect("vhost-user peer should finish");
+        assert_eq!(observation.guest_features, features);
+        assert_eq!(observation.memory_region_count, 1);
+        assert_eq!(observation.queue_size, u32::from(TEST_QUEUE_SIZE));
+
+        let error = device
+            .dispatch_drained_queue_notifications(&mut memory, Vec::new())
+            .expect_err("closed backend call endpoint should terminalize the device");
+        assert!(matches!(
+            error,
+            VirtioBlockDeviceNotificationError::VhostUser {
+                calls: 0,
+                source: VhostUserBlockNotificationError::Closed,
+                ..
+            }
+        ));
+        assert!(device.is_activated());
+        assert_eq!(device.vhost_user_call_fd(), None);
+        let terminal = device
+            .dispatch_drained_queue_notifications(&mut memory, Vec::new())
+            .expect_err("terminal device should reject later dispatch");
+        assert!(matches!(
+            terminal,
+            VirtioBlockDeviceNotificationError::VhostUser {
+                source: VhostUserBlockNotificationError::Terminal,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn vhost_user_pre_activation_reset_preserves_the_discovered_frontend() {
+        let (_config_space, mut device, _memory) = prepare_disconnected_test_vhost_user_device();
+
+        device.reset();
+        device.reset();
+
+        let VirtioBlockBackend::VhostUser(backend) = &device.backend else {
+            panic!("test device should retain its vhost-user backend");
+        };
+        assert!(backend.frontend.is_some());
+        assert!(matches!(
+            backend.state,
+            VhostUserBlockState::Prepared { .. }
+        ));
+        assert!(!device.is_activated());
+        assert!(device.vhost_user_call_fd().is_some());
+    }
+
+    #[test]
+    fn vhost_user_discovery_intersects_cache_features_and_preserves_exact_config() {
+        let (frontend_stream, peer_stream) =
+            UnixStream::pair().expect("vhost-user stream pair should open");
+        let mut config_bytes = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        for (index, byte) in config_bytes.iter_mut().enumerate() {
+            *byte = u8::try_from(index).expect("config byte index should fit u8");
+        }
+        let peer = spawn_test_vhost_user_discovery_peer(
+            peer_stream,
+            SUPPORTED_VIRTIO_FEATURES,
+            VHOST_USER_PROTOCOL_F_CONFIG,
+            TestVhostUserConfigReply::Exact(config_bytes),
+        );
+
+        let frontend = PreparedVhostUserBlockFrontend::discover(
+            frontend_stream,
+            DriveCacheType::Unsafe,
+            Duration::from_secs(2),
+        )
+        .expect("unsafe-cache discovery should complete");
+
+        assert_eq!(
+            frontend.available_features(),
+            SUPPORTED_VIRTIO_FEATURES & !VIRTIO_BLK_F_FLUSH
+        );
+        assert_eq!(frontend.config_bytes(), &config_bytes);
+        peer.join().expect("discovery peer should finish");
+    }
+
+    #[test]
+    fn vhost_user_discovery_rejects_missing_mandatory_features_before_later_requests() {
+        for features in [
+            SUPPORTED_VIRTIO_FEATURES & !VIRTIO_F_VERSION_1,
+            SUPPORTED_VIRTIO_FEATURES & !VHOST_USER_F_PROTOCOL_FEATURES,
+        ] {
+            let (frontend_stream, peer_stream) =
+                UnixStream::pair().expect("vhost-user stream pair should open");
+            let peer = spawn_test_vhost_user_discovery_peer(
+                peer_stream,
+                features,
+                VHOST_USER_PROTOCOL_F_CONFIG,
+                TestVhostUserConfigReply::Exact([0; VIRTIO_BLOCK_CONFIG_SIZE]),
+            );
+
+            let error = PreparedVhostUserBlockFrontend::discover(
+                frontend_stream,
+                DriveCacheType::Unsafe,
+                Duration::from_secs(2),
+            )
+            .expect_err("missing mandatory feature should fail discovery");
+
+            assert!(matches!(
+                error,
+                PreparedVhostUserBlockFrontendError::MissingRequiredVirtioFeatures
+            ));
+            peer.join().expect("discovery peer should finish");
+        }
+    }
+
+    #[test]
+    fn vhost_user_discovery_rejects_missing_config_and_invalid_config_replies() {
+        let (frontend_stream, peer_stream) =
+            UnixStream::pair().expect("vhost-user stream pair should open");
+        let peer = spawn_test_vhost_user_discovery_peer(
+            peer_stream,
+            SUPPORTED_VIRTIO_FEATURES,
+            VHOST_USER_PROTOCOL_F_REPLY_ACK,
+            TestVhostUserConfigReply::Exact([0; VIRTIO_BLOCK_CONFIG_SIZE]),
+        );
+        let error = PreparedVhostUserBlockFrontend::discover(
+            frontend_stream,
+            DriveCacheType::Unsafe,
+            Duration::from_secs(2),
+        )
+        .expect_err("missing CONFIG protocol feature should fail discovery");
+        assert!(matches!(
+            error,
+            PreparedVhostUserBlockFrontendError::MissingConfigProtocolFeature
+        ));
+        peer.join().expect("discovery peer should finish");
+
+        for config_reply in [
+            TestVhostUserConfigReply::BackendFailure,
+            TestVhostUserConfigReply::Malformed,
+        ] {
+            let (frontend_stream, peer_stream) =
+                UnixStream::pair().expect("vhost-user stream pair should open");
+            let peer = spawn_test_vhost_user_discovery_peer(
+                peer_stream,
+                SUPPORTED_VIRTIO_FEATURES,
+                VHOST_USER_PROTOCOL_F_CONFIG,
+                config_reply,
+            );
+            let error = PreparedVhostUserBlockFrontend::discover(
+                frontend_stream,
+                DriveCacheType::Unsafe,
+                Duration::from_secs(2),
+            )
+            .expect_err("invalid backend config should fail discovery");
+            assert!(matches!(
+                error,
+                PreparedVhostUserBlockFrontendError::Frontend(_)
+                    | PreparedVhostUserBlockFrontendError::InvalidConfig
+            ));
+            assert!(!error.to_string().contains("0x5a"));
+            peer.join().expect("discovery peer should finish");
+        }
+    }
+
+    #[test]
+    fn vhost_user_block_rejects_anonymous_guest_memory_before_activation() {
+        let (frontend_stream, peer_stream) =
+            UnixStream::pair().expect("vhost-user stream pair should open");
+        let peer = spawn_test_vhost_user_discovery_peer(
+            peer_stream,
+            SUPPORTED_VIRTIO_FEATURES,
+            VHOST_USER_PROTOCOL_F_CONFIG,
+            TestVhostUserConfigReply::Exact([0; VIRTIO_BLOCK_CONFIG_SIZE]),
+        );
+        let frontend = PreparedVhostUserBlockFrontend::discover(
+            frontend_stream,
+            DriveCacheType::Unsafe,
+            Duration::from_secs(2),
+        )
+        .expect("vhost-user discovery should complete");
+        peer.join().expect("discovery peer should finish");
+        let config = DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+            .with_socket("/private/test-vhost.sock")
+            .validate()
+            .expect("vhost-user drive should validate");
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("test memory range should validate"),
+        ])
+        .expect("test memory layout should validate");
+        let memory =
+            GuestMemory::allocate(&layout).expect("anonymous guest memory should allocate");
+
+        let error = PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
+            .expect_err("vhost-user block should reject anonymous memory");
+
+        assert!(matches!(
+            error,
+            PreparedBlockDeviceError::PrepareVhostMemory {
+                source: PreparedVhostUserBlockMemoryError::AnonymousMemory,
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains("private"));
+    }
+
+    #[test]
+    fn vhost_user_block_rejects_guest_feature_and_queue_range_before_protocol_commit() {
+        let (config_space, mut device, _memory) = prepare_disconnected_test_vhost_user_device();
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        let guest_features = config_space.available_features() & !VIRTIO_F_VERSION_1;
+        let registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BLOCK_DEVICE_ID,
+            config_space.available_features(),
+        )
+        .with_runtime_state([0, 1], guest_features, DRIVER_OK_STATUS);
+
+        let error = device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("missing guest VERSION_1 should fail before protocol commit");
+
+        assert!(matches!(
+            error,
+            VirtioBlockDeviceActivationError::UnsupportedGuestFeatures
+        ));
+        assert!(!device.is_activated());
+        assert!(device.vhost_user_call_fd().is_some());
+
+        let (config_space, mut device, _memory) = prepare_disconnected_test_vhost_user_device();
+        let queues = configured_mmio_queue_with_device_ring(
+            TEST_QUEUE_SIZE,
+            u32::try_from(TEST_MEMORY_SIZE - 4).expect("test address should fit u32"),
+            0,
+            true,
+        );
+        let registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BLOCK_DEVICE_ID,
+            config_space.available_features(),
+        )
+        .with_runtime_state([0, 1], config_space.available_features(), DRIVER_OK_STATUS);
+
+        let error = device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("queue outside exported memory should fail before protocol commit");
+
+        assert!(matches!(
+            error,
+            VirtioBlockDeviceActivationError::QueueRange
+        ));
+        assert!(!device.is_activated());
+        assert!(device.vhost_user_call_fd().is_some());
+    }
+
+    #[test]
+    fn vhost_user_block_activation_stops_after_first_backend_rejection() {
+        let (frontend_stream, mut peer_stream) =
+            UnixStream::pair().expect("vhost-user stream pair should open");
+        let peer = thread::spawn(move || {
+            peer_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("peer read timeout should set");
+            peer_stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("peer write timeout should set");
+            expect_test_vhost_user_request(&mut peer_stream, 3, false, 0);
+            expect_test_vhost_user_request(&mut peer_stream, 1, false, 0);
+            send_test_vhost_user_reply(
+                &mut peer_stream,
+                1,
+                &SUPPORTED_VIRTIO_FEATURES.to_ne_bytes(),
+            );
+            expect_test_vhost_user_request(&mut peer_stream, 15, false, 0);
+            let protocols = VHOST_USER_PROTOCOL_F_CONFIG | VHOST_USER_PROTOCOL_F_REPLY_ACK;
+            send_test_vhost_user_reply(&mut peer_stream, 15, &protocols.to_ne_bytes());
+            expect_test_vhost_user_request(&mut peer_stream, 16, false, 0);
+            expect_test_vhost_user_request(&mut peer_stream, 24, false, 0);
+            let mut config_reply = Vec::with_capacity(12 + VIRTIO_BLOCK_CONFIG_SIZE);
+            config_reply.extend_from_slice(&0_u32.to_ne_bytes());
+            config_reply.extend_from_slice(&(VIRTIO_BLOCK_CONFIG_SIZE as u32).to_ne_bytes());
+            config_reply.extend_from_slice(&1_u32.to_ne_bytes());
+            config_reply.resize(12 + VIRTIO_BLOCK_CONFIG_SIZE, 0);
+            send_test_vhost_user_reply(&mut peer_stream, 24, &config_reply);
+
+            let set_features = expect_test_vhost_user_request(&mut peer_stream, 2, true, 0);
+            assert_eq!(
+                test_vhost_user_u64(&set_features.body, 0),
+                SUPPORTED_VIRTIO_FEATURES
+            );
+            send_test_vhost_user_reply(&mut peer_stream, 2, &1_u64.to_ne_bytes());
+            let mut later_byte = [0_u8; 1];
+            assert_eq!(
+                peer_stream
+                    .read(&mut later_byte)
+                    .expect("terminal frontend should close its stream"),
+                0,
+                "frontend must not send a memory table after SET_FEATURES rejection"
+            );
+        });
+        let frontend = PreparedVhostUserBlockFrontend::discover(
+            frontend_stream,
+            DriveCacheType::Writeback,
+            Duration::from_secs(2),
+        )
+        .expect("vhost-user discovery should complete");
+        let config = DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+            .with_socket("/private/test-vhost.sock")
+            .with_cache_type(DriveCacheType::Writeback)
+            .validate()
+            .expect("vhost-user drive should validate");
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("test shared memory range should validate"),
+        ])
+        .expect("test shared memory layout should validate");
+        let memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("test shared guest memory should allocate");
+        let prepared = PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
+            .expect("vhost-user block should prepare");
+        let (_, _, config_space, mut device) = prepared.into_parts();
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        let registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BLOCK_DEVICE_ID,
+            config_space.available_features(),
+        )
+        .with_runtime_state([0, 1], config_space.available_features(), DRIVER_OK_STATUS);
+
+        let error = device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("backend SET_FEATURES rejection should fail activation");
+
+        assert!(matches!(
+            error,
+            VirtioBlockDeviceActivationError::Frontend(_)
+        ));
+        assert!(!device.is_activated());
+        assert_eq!(device.vhost_user_call_fd(), None);
+        assert!(matches!(
+            device.activate_block(VirtioMmioDeviceActivation::new(&registers, &queues)),
+            Err(VirtioBlockDeviceActivationError::Terminal)
+        ));
+        peer.join().expect("rejecting peer should finish");
     }
 
     #[test]
@@ -10536,8 +12454,12 @@ mod tests {
                 .expect("provided backing should prepare without configured path");
         let rendered = format!("{prepared:?}");
 
-        assert_eq!(prepared.as_slice()[0].device().backing().len(), 8);
-        assert!(!prepared.as_slice()[0].device().backing().is_read_only());
+        let backing = prepared.as_slice()[0]
+            .device()
+            .backing()
+            .expect("file device should retain backing");
+        assert_eq!(backing.len(), 8);
+        assert!(!backing.is_read_only());
         assert!(!missing.exists());
         assert!(rendered.contains("<owned>"));
         assert!(!rendered.contains(file.as_path().to_string_lossy().as_ref()));

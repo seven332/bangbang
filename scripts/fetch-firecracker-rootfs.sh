@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v50"
+direct_boot_variant="direct-boot-v52"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -1935,6 +1935,98 @@ PY
   fi
 }
 
+vhost_user_block_fail() {
+  reason=$1
+  marker="BANGBANG_VHOST_USER_BLOCK_FAIL_$reason"
+  emit_line "$marker"
+  write_vdb_marker "$marker"
+  sync /dev/vdb 2>/dev/null || sync
+}
+
+check_vhost_user_block_marker() {
+  expected_mode=$1
+  host_marker=BANGBANG_VHOST_USER_BLOCK_HOST
+  success_marker="BANGBANG_VHOST_USER_BLOCK_${expected_mode}_OK"
+
+  if [ ! -b /dev/vda ] || [ ! -b /dev/vdb ]; then
+    vhost_user_block_fail NO_BLOCK_DEVICE
+    return
+  fi
+  if cmdline_has bangbang.expect-partuuid=0eaa91a0-01; then
+    if ! cmdline_has root=PARTUUID=0eaa91a0-01; then
+      vhost_user_block_fail ROOT_PARTUUID_CMDLINE
+      return
+    fi
+  elif ! cmdline_has root=/dev/vda; then
+    vhost_user_block_fail ROOT_CMDLINE
+    return
+  fi
+  if [ "$(cat /sys/class/block/vdb/size 2>/dev/null || true)" != 8 ]; then
+    vhost_user_block_fail SCRATCH_CAPACITY
+    return
+  fi
+  if [ "$expected_mode" = ro ]; then
+    if [ "$(cat /sys/class/block/vda/ro 2>/dev/null || true)" != 1 ]; then
+      vhost_user_block_fail ROOT_FEATURE_RO
+      return
+    fi
+  elif [ "$(cat /sys/class/block/vda/ro 2>/dev/null || true)" != 0 ]; then
+    vhost_user_block_fail ROOT_FEATURE_RW
+    return
+  fi
+  if cmdline_has bangbang.expect-pci-data=1; then
+    if ! pci_function_has_identity 0000:00:01.0 0x1042 \
+      || ! pci_function_has_identity 0000:00:02.0 0x1042; then
+      vhost_user_block_fail PCI_IDENTITY
+      return
+    fi
+    emit_line BANGBANG_PCI_VHOST_USER_BLOCK_IDENTITIES_OK
+  fi
+
+  root_options=$(awk '$2 == "/" { print $4; exit }' /proc/mounts 2>/dev/null || true)
+  case ",$root_options," in
+    *,"$expected_mode",*) ;;
+    *)
+      vhost_user_block_fail "ROOT_MOUNT_${expected_mode}"
+      return
+      ;;
+  esac
+  if [ "$expected_mode" = ro ]; then
+    if touch /bangbang-vhost-user-root-ro-probe 2>/dev/null; then
+      vhost_user_block_fail ROOT_RO_WRITE
+      return
+    fi
+  else
+    if ! printf '%s' BANGBANG_VHOST_USER_ROOT_RW_PROBE \
+      > /bangbang-vhost-user-root-rw-probe 2>/dev/null; then
+      vhost_user_block_fail ROOT_RW_WRITE
+      return
+    fi
+    sync /bangbang-vhost-user-root-rw-probe 2>/dev/null || sync
+    if [ "$(cat /bangbang-vhost-user-root-rw-probe 2>/dev/null || true)" \
+      != BANGBANG_VHOST_USER_ROOT_RW_PROBE ]; then
+      vhost_user_block_fail ROOT_RW_VERIFY
+      return
+    fi
+  fi
+
+  if ! vdb_starts_with_marker "$host_marker"; then
+    vhost_user_block_fail SCRATCH_READ
+    return
+  fi
+  if ! printf '%-512s' "$success_marker" \
+    | dd of=/dev/vdb bs=512 count=1 conv=notrunc oflag=direct,sync 2>/dev/null; then
+    vhost_user_block_fail SCRATCH_WRITE
+    return
+  fi
+  if ! vdb_starts_with_marker "$success_marker"; then
+    vhost_user_block_fail SCRATCH_VERIFY
+    return
+  fi
+
+  emit_line "$success_marker"
+}
+
 first_pmem_device() {
   for pmem_device_path in /dev/pmem*; do
     if [ -b "$pmem_device_path" ]; then
@@ -2731,6 +2823,10 @@ if cmdline_has bangbang.pmem-root=ro; then
   check_pmem_root_marker ro
 elif cmdline_has bangbang.pmem-root=rw; then
   check_pmem_root_marker rw
+elif cmdline_has bangbang.vhost-user-block=ro; then
+  check_vhost_user_block_marker ro
+elif cmdline_has bangbang.vhost-user-block=rw; then
+  check_vhost_user_block_marker rw
 elif cmdline_has bangbang.network-hotplug=1; then
   check_network_hotplug_marker
 elif cmdline_has bangbang.pmem-hotplug=1; then

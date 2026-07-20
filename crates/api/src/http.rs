@@ -1605,13 +1605,14 @@ impl BootSourceResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveConfigResponse {
     drive_id: String,
-    path_on_host: String,
+    path_on_host: Option<String>,
     is_root_device: bool,
-    is_read_only: bool,
+    is_read_only: Option<bool>,
     partuuid: Option<String>,
     cache_type: String,
-    io_engine: String,
+    io_engine: Option<String>,
     rate_limiter: Option<DriveRateLimiterRequest>,
+    socket: Option<String>,
 }
 
 impl DriveConfigResponse {
@@ -1625,13 +1626,33 @@ impl DriveConfigResponse {
     ) -> Self {
         Self {
             drive_id: drive_id.into(),
-            path_on_host: path_on_host.into(),
+            path_on_host: Some(path_on_host.into()),
             is_root_device,
-            is_read_only,
+            is_read_only: Some(is_read_only),
             partuuid: None,
             cache_type: cache_type.into(),
-            io_engine: io_engine.into(),
+            io_engine: Some(io_engine.into()),
             rate_limiter: None,
+            socket: None,
+        }
+    }
+
+    pub fn vhost_user(
+        drive_id: impl Into<String>,
+        socket: impl Into<String>,
+        is_root_device: bool,
+        cache_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            drive_id: drive_id.into(),
+            path_on_host: None,
+            is_root_device,
+            is_read_only: None,
+            partuuid: None,
+            cache_type: cache_type.into(),
+            io_engine: None,
+            rate_limiter: None,
+            socket: Some(socket.into()),
         }
     }
 
@@ -2822,14 +2843,18 @@ fn drive_config_response_value(drive: &DriveConfigResponse) -> serde_json::Value
         "drive_id".to_string(),
         serde_json::Value::String(drive.drive_id.clone()),
     );
-    body.insert(
-        "io_engine".to_string(),
-        serde_json::Value::String(drive.io_engine.clone()),
-    );
-    body.insert(
-        "is_read_only".to_string(),
-        serde_json::Value::Bool(drive.is_read_only),
-    );
+    if let Some(io_engine) = &drive.io_engine {
+        body.insert(
+            "io_engine".to_string(),
+            serde_json::Value::String(io_engine.clone()),
+        );
+    }
+    if let Some(is_read_only) = drive.is_read_only {
+        body.insert(
+            "is_read_only".to_string(),
+            serde_json::Value::Bool(is_read_only),
+        );
+    }
     body.insert(
         "is_root_device".to_string(),
         serde_json::Value::Bool(drive.is_root_device),
@@ -2840,14 +2865,22 @@ fn drive_config_response_value(drive: &DriveConfigResponse) -> serde_json::Value
             serde_json::Value::String(partuuid.clone()),
         );
     }
-    body.insert(
-        "path_on_host".to_string(),
-        serde_json::Value::String(drive.path_on_host.clone()),
-    );
+    if let Some(path_on_host) = &drive.path_on_host {
+        body.insert(
+            "path_on_host".to_string(),
+            serde_json::Value::String(path_on_host.clone()),
+        );
+    }
     if let Some(rate_limiter) = drive.rate_limiter() {
         body.insert(
             "rate_limiter".to_string(),
             drive_rate_limiter_response_value(rate_limiter),
+        );
+    }
+    if let Some(socket) = &drive.socket {
+        body.insert(
+            "socket".to_string(),
+            serde_json::Value::String(socket.clone()),
         );
     }
 
@@ -9181,6 +9214,46 @@ mod tests {
             })
         );
         assert_eq!(body.get("metrics"), None);
+    }
+
+    #[test]
+    fn response_body_serializes_exact_vhost_user_drive_shape() {
+        let drive = DriveConfigResponse::vhost_user(
+            "rootfs",
+            "/private/vhost-user.sock",
+            true,
+            "Writeback",
+        )
+        .with_partuuid("0eaa91a0-01");
+        let response = HttpResponse::vm_config(&VmConfigResponse::new(
+            MachineConfigResponse::new(1, 128, false, false, "None"),
+            None,
+            vec![drive],
+            Vec::new(),
+            None,
+            None,
+            None,
+        ));
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+        let drives = body["drives"]
+            .as_array()
+            .expect("drives should be an array");
+
+        assert_eq!(
+            drives,
+            &[serde_json::json!({
+                "cache_type": "Writeback",
+                "drive_id": "rootfs",
+                "is_root_device": true,
+                "partuuid": "0eaa91a0-01",
+                "socket": "/private/vhost-user.sock",
+            })]
+        );
+        let drive = drives.first().expect("one drive should be serialized");
+        for file_only_field in ["path_on_host", "is_read_only", "io_engine", "rate_limiter"] {
+            assert_eq!(drive.get(file_only_field), None);
+        }
     }
 
     #[test]

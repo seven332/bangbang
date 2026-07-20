@@ -121,6 +121,7 @@ dependencies = [
 name = "bangbang-runtime"
 version = "0.1.0"
 dependencies = [
+ "bangbang-vhost-user",
  "crc64",
  "device_tree",
  "getrandom",

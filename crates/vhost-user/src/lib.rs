@@ -17,9 +17,9 @@ pub use error::{VhostUserError, VhostUserNotifierError};
 pub use frontend::{
     SUPPORTED_PROTOCOL_FEATURES, SUPPORTED_VIRTIO_FEATURES, VHOST_USER_F_PROTOCOL_FEATURES,
     VHOST_USER_PROTOCOL_F_CONFIG, VHOST_USER_PROTOCOL_F_REPLY_ACK, VIRTIO_BLK_F_FLUSH,
-    VIRTIO_BLK_F_RO, VIRTIO_F_EVENT_IDX, VIRTIO_F_VERSION_1, VhostUserConfig, VhostUserConfigFlags,
-    VhostUserFrontend, VhostUserFrontendOptions, VhostUserFrontendState, VhostUserMemoryRegion,
-    VhostUserVringAddress,
+    VIRTIO_BLK_F_RO, VIRTIO_F_EVENT_IDX, VIRTIO_F_VERSION_1, VIRTIO_RING_F_INDIRECT_DESC,
+    VhostUserConfig, VhostUserConfigFlags, VhostUserFrontend, VhostUserFrontendOptions,
+    VhostUserFrontendState, VhostUserMemoryRegion, VhostUserVringAddress,
 };
 pub use notifier::{
     BackendCallEndpoint, BackendKickEndpoint, CallDrainOutcome, CallNotifier, KickNotifier,

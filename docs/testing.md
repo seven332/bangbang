@@ -1741,39 +1741,46 @@ connectivity, returned MAC/MTU/maximum-packet reconciliation, packet-available
 callbacks, broader MMDS TCP behavior, limiter-specific metrics, automatic PCI
 notification, or network snapshot state.
 
-For block specifically, this evidence validates the supported public file-backed
-subset over MMIO by default or PCI with `--enable-pci`, including initial
-attachment, guest I/O, root/data ordering,
-cache/flush behavior, runtime refresh and limiter updates, PCI-only non-root
-runtime PUT/bodyless DELETE, and stable rejected MMIO-runtime and vhost-user
-paths. Normal production-bundle evidence also validates exact read-only/
-read-write drive-grant adoption, one-time identity, failure-atomic public
-state, preauthorized live refresh, and runtime attach from exact unused initial
-grants without ambient path reopening. The two-round direct and contained
-hotplug cases prove guest PCI rescan, seed read, write/readback/fsync, sysfs
-removal, Paused DELETE/PUT ordering, exact capacity reuse, success-only config
-projection, and clean shutdown. Root runtime mutation, automatic guest
-notification, external vhost-user-block execution, async/io_uring, and PCI
-snapshot state remain outside this subset. The hidden static and product
-all-virtio startup cases remain complementary coverage for the same canonical
-block device before runtime mutation.
+For block specifically, this evidence validates the supported public
+file-backed subset over MMIO by default or PCI with `--enable-pci`, including
+initial attachment, guest I/O, root/data ordering, cache/flush behavior,
+runtime refresh and limiter updates, and PCI-only non-root runtime
+PUT/bodyless DELETE. Normal production-bundle evidence additionally validates
+exact read-only/read-write drive-grant adoption, one-time identity,
+failure-atomic public state, preauthorized live refresh, and runtime attach
+from exact unused initial grants without ambient path reopening. The two-round
+direct and contained hotplug cases prove guest PCI rescan, seed read,
+write/readback/fsync, sysfs removal, Paused DELETE/PUT ordering, exact capacity
+reuse, success-only config projection, and clean shutdown.
 
-The internal `bangbang-vhost-user` foundation has a separate, deliberately
-non-public test boundary. Native-endian golden tests cover the exact pinned
+Direct pre-boot vhost-user block has its own signed executable gate. The MMIO
+case first connects an intentionally incompatible backend and proves that
+discovery failure leaves the instance unstarted, then retries with a valid
+backend and boots a read-only socket root. The PCI case boots a writable
+MBR-partitioned socket root through `PARTUUID` and checks both expected PCI
+identities. Both cases use a second exact-eight-sector scratch device and prove
+host-seed reads, guest direct synchronous write/readback, FLUSH, exact
+socket-only `GET /vm/config`, one complete shared-memory export, one 256-entry
+queue, backend-call interrupts, snapshot rejection before staging, backend
+death metrics, continued API responsiveness, frontend close, and socket
+cleanup. Runtime vhost replacement/hotplug, contained socket authority,
+dynamic-memory coexistence, async/io_uring, and vhost snapshot state remain
+outside this subset.
+
+The `bangbang-vhost-user` crate retains a portable protocol boundary.
+Native-endian golden tests cover the exact pinned
 owner/features/protocol/config/memory/vring request IDs, flags, lengths, zero
-padding, and CONFIG/REPLY_ACK replies. A deterministic sender injects
-interruption, would-block, zero/oversized results, and partial progress while
-recording that SCM_RIGHTS is present only until the first positive byte count.
-Real Unix-stream tests cover ordered FD transfer and CLOEXEC, fragmented and
-coalesced header/body reads, short EOF, timeout, wrong replies, explicit
-backend failure, unexpected and over-limit FD cleanup, and terminal poisoning.
-A bounded test-only control peer completes both pinned CONFIG-only and optional
-REPLY_ACK transcripts, verifies all queue sizes precede address setup, and
-exercises call/kick directions. Pipe tests cover exact eight-byte units,
-saturation coalescing, malformed units, EOF/EPIPE without process termination,
-independent ownership, and Darwin kqueue readability. None of these tests opens
-a configured drive socket, exports live guest RAM, ships a backend, executes a
-vhost-user data plane, or changes the stable public unsupported response.
+padding, and CONFIG/REPLY_ACK replies. Fault-injected senders and real Unix
+streams cover partial progress, SCM_RIGHTS lifetime/CLOEXEC, fragmentation,
+timeouts, wrong replies, cleanup, and terminal poisoning. Pipe tests cover
+exact eight-byte units, saturation coalescing, malformed units, EOF/EPIPE, and
+Darwin kqueue readability. Runtime tests additionally prove feature
+intersection, exact config preservation, shared-memory and ring bounds,
+pre-activation reset, Firecracker's pre-acknowledged protocol bit, activation
+order, calls/kicks, disconnect terminalization, and snapshot/update rejection.
+The signed fixture is a separate strict regular-file backend that maps only
+transferred regions and validates direct/indirect guest descriptors; it is test
+infrastructure, not a shipped storage service.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.

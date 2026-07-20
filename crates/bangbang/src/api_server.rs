@@ -41,8 +41,8 @@ use bangbang_runtime::balloon::{
     BalloonStats, BalloonStatsUpdateInput, BalloonUpdateInput,
 };
 use bangbang_runtime::block::{
-    DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveRateLimiterConfig,
-    DriveTokenBucketConfig, DriveUpdateInput,
+    DriveBackendConfig, DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine,
+    DriveRateLimiterConfig, DriveTokenBucketConfig, DriveUpdateInput,
 };
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
 use bangbang_runtime::cpu::{
@@ -1682,14 +1682,27 @@ fn boot_source_response_from_runtime(config: &BootSourceConfig) -> BootSourceRes
 }
 
 fn drive_config_response_from_runtime(config: &DriveConfig) -> DriveConfigResponse {
-    let mut response = DriveConfigResponse::new(
-        config.drive_id(),
-        path_text(config.path_on_host()),
-        config.is_root_device(),
-        config.is_read_only(),
-        config.cache_type().to_string(),
-        config.io_engine().to_string(),
-    );
+    let mut response = match config.backend() {
+        DriveBackendConfig::File {
+            path_on_host,
+            is_read_only,
+            io_engine,
+            ..
+        } => DriveConfigResponse::new(
+            config.drive_id(),
+            path_text(path_on_host),
+            config.is_root_device(),
+            *is_read_only,
+            config.cache_type().to_string(),
+            io_engine.to_string(),
+        ),
+        DriveBackendConfig::VhostUser { socket } => DriveConfigResponse::vhost_user(
+            config.drive_id(),
+            path_text(socket),
+            config.is_root_device(),
+            config.cache_type().to_string(),
+        ),
+    };
     if let Some(partuuid) = config.partuuid() {
         response = response.with_partuuid(partuuid);
     }
@@ -9904,12 +9917,15 @@ mod tests {
         assert_eq!(vmm.drive_configs().len(), 1);
         let config = &vmm.drive_configs()[0];
         assert_eq!(config.drive_id(), "rootfs");
-        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/rootfs.ext4"));
+        assert_eq!(
+            config.path_on_host(),
+            Some(std::path::Path::new("/tmp/rootfs.ext4"))
+        );
         assert!(config.is_root_device());
-        assert!(config.is_read_only());
+        assert_eq!(config.is_read_only(), Some(true));
         assert_eq!(config.partuuid(), Some("0eaa91a0-01"));
         assert_eq!(config.cache_type(), DriveCacheType::Unsafe);
-        assert_eq!(config.io_engine(), DriveIoEngine::Sync);
+        assert_eq!(config.io_engine(), Some(DriveIoEngine::Sync));
     }
 
     #[test]
@@ -10107,7 +10123,7 @@ mod tests {
         assert_eq!(vmm.drive_configs().len(), 1);
         assert_eq!(
             vmm.drive_configs()[0].path_on_host(),
-            std::path::Path::new("/tmp/rootfs.ext4")
+            Some(std::path::Path::new("/tmp/rootfs.ext4"))
         );
     }
 
@@ -10139,9 +10155,9 @@ mod tests {
         let config = &vmm.drive_configs()[0];
         assert_eq!(
             config.path_on_host(),
-            std::path::Path::new("/tmp/rootfs.ext4")
+            Some(std::path::Path::new("/tmp/rootfs.ext4"))
         );
-        assert!(config.is_read_only());
+        assert_eq!(config.is_read_only(), Some(true));
     }
 
     #[test]
@@ -10189,9 +10205,9 @@ mod tests {
         let config = &vmm.drive_configs()[0];
         assert_eq!(
             config.path_on_host(),
-            std::path::Path::new("/tmp/replaced.ext4")
+            Some(std::path::Path::new("/tmp/replaced.ext4"))
         );
-        assert!(config.is_read_only());
+        assert_eq!(config.is_read_only(), Some(true));
     }
 
     #[test]
@@ -10241,9 +10257,9 @@ mod tests {
         let config = &vmm.drive_configs()[0];
         assert_eq!(
             config.path_on_host(),
-            std::path::Path::new("/tmp/rejected.ext4")
+            Some(std::path::Path::new("/tmp/rejected.ext4"))
         );
-        assert!(config.is_read_only());
+        assert_eq!(config.is_read_only(), Some(true));
         let rate_limiter = config
             .rate_limiter()
             .expect("rate limiter should be stored");
@@ -10400,37 +10416,102 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_unsupported_drive_socket_without_leaking_path() {
-        let path = unique_socket_path("drive-socket");
-        let server = ApiServer::bind(&path).expect("server should bind");
-        let mut client = UnixStream::connect(&path).expect("client should connect");
+    fn configures_and_returns_exact_vhost_user_drive_shape() {
         let body = r#"{
             "drive_id": "rootfs",
             "is_root_device": true,
+            "partuuid": "0eaa91a0-01",
+            "cache_type": "Writeback",
             "socket": "/tmp/private-vhost.sock"
         }"#;
         let request = format!(
             "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
-
-        client
-            .write_all(request.as_bytes())
-            .expect("client should write request");
         let mut vmm = test_controller();
-        server
-            .serve_next(&mut vmm)
-            .expect("server should handle one request");
 
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("client should read response");
+        let response = request_over_socket(&mut vmm, "drive-vhost-put", &request);
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(r#"{"fault_message":"drive socket is not supported"}"#));
-        assert!(!response.contains("/tmp/private-vhost.sock"));
-        assert!(vmm.drive_configs().is_empty());
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(vmm.drive_configs().len(), 1);
+        let config = &vmm.drive_configs()[0];
+        assert_eq!(config.path_on_host(), None);
+        assert_eq!(
+            config.socket(),
+            Some(std::path::Path::new("/tmp/private-vhost.sock"))
+        );
+        assert!(config.is_vhost_user());
+        assert_eq!(config.is_read_only(), None);
+        assert_eq!(config.io_engine(), None);
+
+        let response = request_over_socket(
+            &mut vmm,
+            "drive-vhost-get",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response should contain a body separator");
+        let value: serde_json::Value =
+            serde_json::from_str(body).expect("VM config body should be JSON");
+        assert_eq!(
+            value["drives"],
+            serde_json::json!([{
+                "cache_type": "Writeback",
+                "drive_id": "rootfs",
+                "is_root_device": true,
+                "partuuid": "0eaa91a0-01",
+                "socket": "/tmp/private-vhost.sock",
+            }])
+        );
+    }
+
+    #[test]
+    fn invalid_vhost_user_matrix_does_not_replace_existing_drive() {
+        let mut vmm = test_controller();
+        let initial = r#"{
+            "drive_id":"data",
+            "is_root_device":false,
+            "socket":"/tmp/original-vhost.sock"
+        }"#;
+        let response = request_over_socket(
+            &mut vmm,
+            "drive-vhost-original",
+            &request_with_body("PUT", "/drives/data", initial),
+        );
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        for (request_id, invalid) in [
+            (
+                "drive-vhost-readonly",
+                r#"{"drive_id":"data","is_root_device":false,"socket":"/tmp/rejected-vhost.sock","is_read_only":false}"#,
+            ),
+            (
+                "drive-vhost-path",
+                r#"{"drive_id":"data","is_root_device":false,"socket":"/tmp/rejected-vhost.sock","path_on_host":"/tmp/rejected.img"}"#,
+            ),
+            (
+                "drive-vhost-engine",
+                r#"{"drive_id":"data","is_root_device":false,"socket":"/tmp/rejected-vhost.sock","io_engine":"Sync"}"#,
+            ),
+        ] {
+            let response = request_over_socket(
+                &mut vmm,
+                request_id,
+                &request_with_body("PUT", "/drives/data", invalid),
+            );
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(
+                r#"{"fault_message":"vhost-user drive contains incompatible file-backed fields"}"#
+            ));
+            assert!(!response.contains("rejected-vhost"));
+            assert_eq!(vmm.drive_configs().len(), 1);
+            assert_eq!(
+                vmm.drive_configs()[0].socket(),
+                Some(std::path::Path::new("/tmp/original-vhost.sock"))
+            );
+        }
     }
 
     #[test]
@@ -10468,7 +10549,10 @@ mod tests {
         assert_eq!(vmm.drive_configs().len(), 1);
         let config = &vmm.drive_configs()[0];
         assert_eq!(config.drive_id(), "rootfs");
-        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/rootfs.ext4"));
+        assert_eq!(
+            config.path_on_host(),
+            Some(std::path::Path::new("/tmp/rootfs.ext4"))
+        );
         assert!(config.is_root_device());
         assert_eq!(config.cache_type(), DriveCacheType::Writeback);
     }

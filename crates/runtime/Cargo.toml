@@ -5,6 +5,7 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+bangbang-vhost-user = { path = "../vhost-user" }
 crc64 = "2.0.0"
 getrandom = "0.3"
 libc = "0.2"

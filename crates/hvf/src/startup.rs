@@ -73,6 +73,7 @@ use bangbang_runtime::startup::{
     Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
     Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatch,
     Arm64BootBlockNotificationDispatchError, Arm64BootBlockNotificationDispatches,
+    Arm64BootBlockWakeupFdsError,
     Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
@@ -1569,11 +1570,7 @@ impl HvfArm64BootPciDataDevices {
                                 .completed_dispatch()
                                 .and_then(|dispatch| dispatch.rate_limiter_retry_after()),
                         );
-                        if error.endpoint_error().is_none()
-                            && source
-                                .completed_dispatch()
-                                .is_some_and(|dispatch| dispatch.needs_queue_interrupt())
-                        {
+                        if error.endpoint_error().is_none() && source.needs_queue_interrupt() {
                             device.queue_deliveries = device.queue_deliveries.saturating_add(1);
                         }
                     }
@@ -2016,6 +2013,33 @@ impl HvfArm64BootPciDataDevices {
                 ))
             })?;
         Ok(Some(wakeup))
+    }
+
+    fn vhost_user_block_call_fds(&self) -> Result<Vec<RawFd>, HvfArm64BootPciDataError> {
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(self.block.len())
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to allocate PCI block wakeup descriptors: {source}"
+                ))
+            })?;
+        for device in &self.block {
+            if let Some(descriptor) =
+                device
+                    .published
+                    .endpoint()
+                    .vhost_user_call_fd()
+                    .map_err(|source| {
+                        HvfArm64BootPciDataError::new(format!(
+                            "failed to access PCI block wakeup state: {source}"
+                        ))
+                    })?
+            {
+                descriptors.push(descriptor);
+            }
+        }
+        Ok(descriptors)
     }
 
     fn teardown(&mut self) -> Result<(), HvfArm64BootPciDataError> {
@@ -3791,7 +3815,13 @@ pub enum HvfArm64BootRunLoopWakeupMonitorError {
     CollectVsockWakeupFds {
         source: Arm64BootVsockWakeupFdsError,
     },
+    CollectBlockWakeupFds {
+        source: Arm64BootBlockWakeupFdsError,
+    },
     PciVsockWakeup {
+        message: String,
+    },
+    PciBlockWakeup {
         message: String,
     },
     PollFdAllocation {
@@ -3824,8 +3854,14 @@ impl fmt::Display for HvfArm64BootRunLoopWakeupMonitorError {
             Self::CollectVsockWakeupFds { source } => {
                 write!(f, "failed to collect boot vsock wakeup fds: {source}")
             }
+            Self::CollectBlockWakeupFds { source } => {
+                write!(f, "failed to collect boot block wakeup fds: {source}")
+            }
             Self::PciVsockWakeup { message } => {
                 write!(f, "failed to collect PCI vsock wakeup fds: {message}")
+            }
+            Self::PciBlockWakeup { message } => {
+                write!(f, "failed to collect PCI block wakeup fds: {message}")
             }
             Self::PollFdAllocation { source } => {
                 write!(
@@ -3857,10 +3893,12 @@ impl std::error::Error for HvfArm64BootRunLoopWakeupMonitorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::CollectVsockWakeupFds { source } => Some(source),
+            Self::CollectBlockWakeupFds { source } => Some(source),
             Self::PollFdAllocation { source } => Some(source),
             Self::ThreadSpawn { source } => Some(source),
             Self::MmioDispatcher { .. }
             | Self::PciVsockWakeup { .. }
+            | Self::PciBlockWakeup { .. }
             | Self::TooManyPollFds { .. }
             | Self::CreateStopPipe { .. }
             | Self::StopSignal { .. }
@@ -8844,12 +8882,50 @@ fn start_run_loop_vsock_wakeup_monitor(
     wakeup_token: HvfArm64BootRunLoopWakeupToken,
 ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
     let pci_vsock = pci_data_devices.filter(|devices| devices.vsock.is_some());
-    if runtime_resources.vsock_device.is_none() && pci_vsock.is_none() {
+    let has_mmio_block = !runtime_resources.block_devices.is_empty();
+    let has_pci_block = pci_data_devices.is_some_and(|devices| !devices.block.is_empty());
+    if runtime_resources.vsock_device.is_none()
+        && pci_vsock.is_none()
+        && !has_mmio_block
+        && !has_pci_block
+    {
         return Ok(HvfArm64BootRunLoopWakeupMonitor::inactive());
     }
 
-    let (read_fds, write_fds, deadline) = if let Some(devices) = pci_vsock {
-        devices
+    let mut read_fds = Vec::new();
+    let mut write_fds = Vec::new();
+    let mut deadline = None;
+    let mut has_block_wakeup_fds = false;
+    if runtime_resources.vsock_device.is_some() || has_mmio_block {
+        let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(dispatcher)
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
+        if runtime_resources.vsock_device.is_some() {
+            (read_fds, write_fds, deadline) =
+                runtime_resources
+                    .vsock_wakeup(&mut mmio_dispatcher)
+                    .map_err(|source| {
+                        HvfArm64BootRunLoopWakeupMonitorError::CollectVsockWakeupFds { source }
+                    })?
+                    .into_parts();
+        }
+        if has_mmio_block {
+            let block_fds =
+                runtime_resources
+                    .vhost_user_block_call_fds(&mut mmio_dispatcher)
+                    .map_err(|source| {
+                        HvfArm64BootRunLoopWakeupMonitorError::CollectBlockWakeupFds { source }
+                    })?;
+            read_fds
+                .try_reserve_exact(block_fds.len())
+                .map_err(
+                    |source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source },
+                )?;
+            has_block_wakeup_fds |= !block_fds.is_empty();
+            read_fds.extend(block_fds);
+        }
+    }
+    if let Some(devices) = pci_vsock {
+        let (pci_read_fds, pci_write_fds, pci_deadline) = devices
             .vsock_wakeup()
             .map_err(
                 |source| HvfArm64BootRunLoopWakeupMonitorError::PciVsockWakeup {
@@ -8858,25 +8934,46 @@ fn start_run_loop_vsock_wakeup_monitor(
             )?
             .ok_or_else(|| HvfArm64BootRunLoopWakeupMonitorError::PciVsockWakeup {
                 message: "PCI vsock endpoint disappeared".to_string(),
-            })?
-    } else {
-        let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(dispatcher)
-            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
-        runtime_resources
-            .vsock_wakeup(&mut mmio_dispatcher)
-            .map_err(
-                |source| HvfArm64BootRunLoopWakeupMonitorError::CollectVsockWakeupFds { source },
-            )?
-            .into_parts()
-    };
+            })?;
+        read_fds
+            .try_reserve_exact(pci_read_fds.len())
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
+        write_fds
+            .try_reserve_exact(pci_write_fds.len())
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
+        read_fds.extend(pci_read_fds);
+        write_fds.extend(pci_write_fds);
+        deadline = earliest_deadline(deadline, pci_deadline);
+    }
+    if let Some(devices) = pci_data_devices.filter(|devices| !devices.block.is_empty()) {
+        let block_fds = devices.vhost_user_block_call_fds().map_err(|source| {
+            HvfArm64BootRunLoopWakeupMonitorError::PciBlockWakeup {
+                message: source.to_string(),
+            }
+        })?;
+        read_fds
+            .try_reserve_exact(block_fds.len())
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
+        has_block_wakeup_fds |= !block_fds.is_empty();
+        read_fds.extend(block_fds);
+    }
 
     HvfArm64BootRunLoopWakeupMonitor::start(
         read_fds,
         write_fds,
         deadline,
+        has_block_wakeup_fds,
         vcpu_control,
         wakeup_token,
     )
+}
+
+fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 trait BootSessionRunLoopSession {
@@ -9326,6 +9423,7 @@ fn run_boot_session_loop_with_observer_inner(
                 steps_completed: steps,
                 source: Box::new(source),
             })?;
+        let monitor_has_block_wakeup_fds = monitor.has_block_wakeup_fds();
         let outcome_result = session.run_loop_vcpu_step();
         let finish_result = monitor.finish();
         let monitor_wakeup_requested = match &outcome_result {
@@ -9384,6 +9482,15 @@ fn run_boot_session_loop_with_observer_inner(
                 }
                 if entropy_retry_wakeup_requested {
                     dispatch_run_loop_entropy_notifications_for_step(session, steps)?;
+                    if stop_token.is_stop_requested() {
+                        return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                    }
+                }
+                if monitor_wakeup_requested
+                    && monitor_has_block_wakeup_fds
+                    && !block_retry_wakeup_requested
+                {
+                    dispatch_run_loop_block_notifications_for_step(session, steps)?;
                     if stop_token.is_stop_requested() {
                         return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                     }
@@ -9547,6 +9654,7 @@ struct HvfArm64BootRunLoopWakeupMonitor {
     stop_writer: Option<UnixStream>,
     thread: Option<JoinHandle<bool>>,
     completed_wakeup: bool,
+    has_block_wakeup_fds: bool,
 }
 
 impl HvfArm64BootRunLoopWakeupMonitor {
@@ -9555,6 +9663,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
             stop_writer: None,
             thread: None,
             completed_wakeup: false,
+            has_block_wakeup_fds: false,
         }
     }
 
@@ -9564,6 +9673,17 @@ impl HvfArm64BootRunLoopWakeupMonitor {
             stop_writer: None,
             thread: None,
             completed_wakeup,
+            has_block_wakeup_fds: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn completed_block_for_test(completed_wakeup: bool) -> Self {
+        Self {
+            stop_writer: None,
+            thread: None,
+            completed_wakeup,
+            has_block_wakeup_fds: true,
         }
     }
 
@@ -9571,6 +9691,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
         host_read_fds: Vec<RawFd>,
         host_write_fds: Vec<RawFd>,
         deadline: Option<Instant>,
+        has_block_wakeup_fds: bool,
         vcpu_control: HvfVcpuRunControl,
         wakeup_token: HvfArm64BootRunLoopWakeupToken,
     ) -> Result<Self, HvfArm64BootRunLoopWakeupMonitorError> {
@@ -9605,7 +9726,12 @@ impl HvfArm64BootRunLoopWakeupMonitor {
             stop_writer: Some(stop_writer),
             thread: Some(thread),
             completed_wakeup: false,
+            has_block_wakeup_fds,
         })
+    }
+
+    const fn has_block_wakeup_fds(&self) -> bool {
+        self.has_block_wakeup_fds
     }
 
     fn finish(mut self) -> Result<bool, HvfArm64BootRunLoopWakeupMonitorError> {
@@ -13229,6 +13355,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(Instant::now() + Duration::from_secs(60 * 60)),
+            false,
             coordinator.control(),
             wakeup.clone(),
         )
@@ -14563,7 +14690,7 @@ mod tests {
                 HvfArm64BootPmemNotificationDispatchError,
             >,
         >,
-        monitor_wakeup_results: VecDeque<bool>,
+        monitor_wakeup_results: VecDeque<(bool, bool)>,
         network_dispatch_results: VecDeque<
             Result<
                 super::HvfArm64BootNetworkNotificationDispatches,
@@ -14738,7 +14865,11 @@ mod tests {
         }
 
         fn push_monitor_wakeup(&mut self) {
-            self.monitor_wakeup_results.push_back(true);
+            self.monitor_wakeup_results.push_back((true, false));
+        }
+
+        fn push_block_monitor_wakeup(&mut self) {
+            self.monitor_wakeup_results.push_back((true, true));
         }
 
         fn push_network_dispatch_error(
@@ -14855,14 +14986,17 @@ mod tests {
             super::HvfArm64BootRunLoopWakeupMonitor,
             super::HvfArm64BootRunLoopWakeupMonitorError,
         > {
-            let completed_wakeup = self.monitor_wakeup_results.pop_front().unwrap_or(false);
+            let (completed_wakeup, has_block_wakeup_fds) =
+                self.monitor_wakeup_results.pop_front().unwrap_or_default();
             if completed_wakeup {
                 self.wakeup_request_count = self.wakeup_request_count.saturating_add(1);
             }
 
-            Ok(super::HvfArm64BootRunLoopWakeupMonitor::completed_for_test(
-                completed_wakeup,
-            ))
+            Ok(if has_block_wakeup_fds {
+                super::HvfArm64BootRunLoopWakeupMonitor::completed_block_for_test(completed_wakeup)
+            } else {
+                super::HvfArm64BootRunLoopWakeupMonitor::completed_for_test(completed_wakeup)
+            })
         }
 
         fn take_run_loop_wakeup_request(&mut self) -> bool {
@@ -20454,6 +20588,24 @@ mod tests {
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
         );
         assert_eq!(session.events, ["run", "vsock-dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_dispatches_block_only_for_a_block_capable_monitor_wakeup() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.push_block_monitor_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("block monitor wakeup loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(session.events, ["run", "dispatch", "vsock-dispatch"]);
+        assert_eq!(session.scheduled_block_retry_wakeups, [None]);
     }
 
     #[test]

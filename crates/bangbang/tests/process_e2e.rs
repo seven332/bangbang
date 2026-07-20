@@ -2148,10 +2148,10 @@ fn executable_no_api_metadata_failure_does_not_publish_socket() {
 }
 
 #[test]
-fn executable_config_file_rejected_drive_socket_does_not_publish_socket() {
+fn executable_config_file_unavailable_drive_socket_does_not_publish_api_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
-    let (config_path, private_socket_path) = write_rejected_drive_socket_config(&test_dir);
+    let (config_path, private_socket_path) = write_unavailable_drive_socket_config(&test_dir);
     let instance_id = test_dir.instance_id();
 
     let output = BangbangProcess::start_with_extra_args_expect_failure(
@@ -2160,19 +2160,19 @@ fn executable_config_file_rejected_drive_socket_does_not_publish_socket() {
         &["--config-file", path_text(&config_path)],
     );
 
-    assert_rejected_drive_socket_config_failure(
+    assert_unavailable_drive_socket_config_failure(
         &output,
         &socket_path,
         &private_socket_path,
-        "config-file rejected drive socket",
+        "config-file unavailable drive socket",
     );
 }
 
 #[test]
-fn executable_no_api_config_file_rejected_drive_socket_does_not_publish_socket() {
+fn executable_no_api_config_file_unavailable_drive_socket_does_not_report_readiness() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
-    let (config_path, private_socket_path) = write_rejected_drive_socket_config(&test_dir);
+    let (config_path, private_socket_path) = write_unavailable_drive_socket_config(&test_dir);
     let instance_id = test_dir.instance_id();
 
     let output = BangbangProcess::start_with_extra_args_expect_failure(
@@ -2181,11 +2181,11 @@ fn executable_no_api_config_file_rejected_drive_socket_does_not_publish_socket()
         &["--config-file", path_text(&config_path), "--no-api"],
     );
 
-    assert_rejected_drive_socket_config_failure(
+    assert_unavailable_drive_socket_config_failure(
         &output,
         &socket_path,
         &private_socket_path,
-        "no-api config-file rejected drive socket",
+        "no-api config-file unavailable drive socket",
     );
 }
 
@@ -3008,6 +3008,7 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
         r#"{{
             "drive_id":"socket",
             "is_root_device":false,
+            "is_read_only":false,
             "socket":{private_socket_path_json}
         }}"#
     );
@@ -3015,19 +3016,19 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
     assert_bad_request_response(&socket_response, "PUT /drives/socket");
     assert_response_contains(
         &socket_response,
-        r#"{"fault_message":"drive socket is not supported"}"#,
+        r#"{"fault_message":"vhost-user drive contains incompatible file-backed fields"}"#,
         "PUT /drives/socket",
     );
     assert!(
         !socket_response.contains(private_socket_path_text),
-        "rejected drive socket response must not echo private socket path; response:\n{socket_response}"
+        "rejected vhost-user field combination must not echo private socket path; response:\n{socket_response}"
     );
     assert!(
         !private_socket_path.exists(),
-        "rejected drive socket request must not create the private socket path"
+        "rejected vhost-user field combination must not create the private socket path"
     );
     assert_only_accepted_and_rate_limited_drives(
-        "GET /vm/config after rejected drive socket",
+        "GET /vm/config after rejected vhost-user field combination",
         "socket",
         None,
     );
@@ -4285,7 +4286,7 @@ fn concurrent_executables_keep_api_resources_isolated() {
     );
 }
 
-fn write_rejected_drive_socket_config(
+fn write_unavailable_drive_socket_config(
     test_dir: &TestDir,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     let config_path = test_dir.path().join("vm-config.json");
@@ -4504,7 +4505,7 @@ fn assert_multi_vcpu_backend_failure(
     );
 }
 
-fn assert_rejected_drive_socket_config_failure(
+fn assert_unavailable_drive_socket_config_failure(
     output: &support::CompletedProcess,
     socket_path: &std::path::Path,
     private_socket_path: &std::path::Path,
@@ -4535,8 +4536,8 @@ fn assert_rejected_drive_socket_config_failure(
     assert!(
         output
             .stderr
-            .contains("bangbang: config-file error: failed to apply config-file action: drive socket is not supported"),
-        "{case_name} stderr should describe config-file drive socket rejection; stderr:\n{}",
+            .contains("bangbang: config-file error: failed to apply config-file action: failed to start microVM: hypervisor error: vhost-user socket connection was refused"),
+        "{case_name} stderr should describe the redacted connection failure; stderr:\n{}",
         output.stderr
     );
     let private_socket_path_text = path_text(private_socket_path);
@@ -4552,7 +4553,7 @@ fn assert_rejected_drive_socket_config_failure(
     );
     assert!(
         !private_socket_path.exists(),
-        "{case_name} must not create rejected drive socket path"
+        "{case_name} must not create the unavailable backend socket path"
     );
 }
 
