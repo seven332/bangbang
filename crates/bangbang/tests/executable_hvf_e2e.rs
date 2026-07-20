@@ -61,6 +61,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.pci-all-virtio=1";
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_MARKER: &[u8] = b"BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
+    const DIRECT_ROOTFS_VHOST_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1 bangbang.expect-vhost-resize=1";
     const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
     const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
     const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
@@ -71,6 +72,7 @@ mod macos_arm64 {
     const BLOCK_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_TWO";
     const BLOCK_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_TWO";
     const BLOCK_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_SUCCESS";
+    const VHOST_CONFIG_RESIZED_MARKER: &[u8] = b"BANGBANG_VHOST_CONFIG_RESIZED";
     const PMEM_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_READY";
     const PMEM_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_HOST_ONE";
     const PMEM_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_GUEST_ONE";
@@ -227,6 +229,7 @@ mod macos_arm64 {
         enable_pci: bool,
         partitioned_root: bool,
         retry_rejected_discovery: bool,
+        refresh_scratch_config: bool,
         success_marker: &'static [u8],
     }
 
@@ -1723,6 +1726,7 @@ mod macos_arm64 {
             enable_pci: false,
             partitioned_root: false,
             retry_rejected_discovery: true,
+            refresh_scratch_config: true,
             success_marker: VHOST_USER_BLOCK_RO_MARKER,
         });
     }
@@ -1735,6 +1739,7 @@ mod macos_arm64 {
             enable_pci: true,
             partitioned_root: true,
             retry_rejected_discovery: false,
+            refresh_scratch_config: false,
             success_marker: VHOST_USER_BLOCK_RW_MARKER,
         });
     }
@@ -1839,6 +1844,9 @@ mod macos_arm64 {
         if case.partitioned_root {
             boot_args.push_str(" bangbang.expect-partuuid=");
             boot_args.push_str(VHOST_USER_BLOCK_PARTUUID);
+        }
+        if case.refresh_scratch_config {
+            boot_args.push_str(" bangbang.expect-vhost-resize=1");
         }
         assert_no_content_response(
             &http_put_json(
@@ -2001,6 +2009,38 @@ mod macos_arm64 {
                 case.mode, output.status, output.stdout, output.stderr
             );
         }
+        if case.refresh_scratch_config {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&scratch_path)
+                .expect("scratch backing should reopen for MMIO config refresh")
+                .set_len(10 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE)
+                .expect("scratch backing should resize for MMIO config refresh");
+            assert_no_content_response(
+                &http_json(
+                    &socket_path,
+                    "PATCH",
+                    "/drives/scratch",
+                    r#"{"drive_id":"scratch"}"#,
+                ),
+                "PATCH /drives/scratch MMIO vhost-user config refresh",
+            );
+            wait_for_file_markers_at(
+                &scratch_path,
+                &[(
+                    9 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+                    VHOST_CONFIG_RESIZED_MARKER,
+                    b"BANGBANG_VHOST_USER_BLOCK_FAIL",
+                )],
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            )
+            .expect("guest should observe refreshed MMIO vhost-user capacity");
+            assert_eq!(
+                scratch_backend.report().config_requests,
+                2,
+                "startup and MMIO PATCH should issue two exact config requests"
+            );
+        }
         scratch_backend
             .wait_for_flush(GUEST_EXECUTION_TIMEOUT)
             .expect("scratch vhost-user backend should observe the direct synchronous write flush");
@@ -2009,9 +2049,14 @@ mod macos_arm64 {
                 .wait_for_flush(GUEST_EXECUTION_TIMEOUT)
                 .expect("writable root vhost-user backend should observe a filesystem flush");
         }
-        assert_active_vhost_user_report(&root_backend.report(), case.root_read_only, "root");
+        assert_active_vhost_user_report(&root_backend.report(), case.root_read_only, 1, "root");
         let scratch_report = scratch_backend.report();
-        assert_active_vhost_user_report(&scratch_report, false, "scratch");
+        assert_active_vhost_user_report(
+            &scratch_report,
+            false,
+            if case.refresh_scratch_config { 2 } else { 1 },
+            "scratch",
+        );
         assert!(
             scratch_report.reads > 0,
             "scratch backend should serve reads"
@@ -2164,6 +2209,7 @@ mod macos_arm64 {
     fn assert_active_vhost_user_report(
         report: &VhostUserBlockBackendReport,
         read_only: bool,
+        expected_config_requests: u64,
         context: &str,
     ) {
         const REQUIRED_FEATURES: u64 = (1 << 30) | (1 << 32);
@@ -2174,7 +2220,7 @@ mod macos_arm64 {
         assert_eq!(features & REQUIRED_FEATURES, REQUIRED_FEATURES);
         assert_eq!(features & READ_ONLY_FEATURE != 0, read_only);
         assert_eq!(report.owner_requests, 1);
-        assert_eq!(report.config_requests, 1);
+        assert_eq!(report.config_requests, expected_config_requests);
         assert!(report.memory_regions > 0);
         assert_eq!(report.queue_size, Some(256));
         assert!(report.activated);
@@ -3777,6 +3823,43 @@ mod macos_arm64 {
             );
         }
 
+        let rejected_vhost_socket_path = test_dir.path().join("anonymous-vhost.socket");
+        let rejected_vhost_backend = VhostUserBlockBackend::start(
+            &rejected_vhost_socket_path,
+            &first_backing_path,
+            VhostUserBlockBackendOptions::regular(false),
+        )
+        .expect("anonymous-profile rejection backend should start");
+        let rejected_vhost_body = format!(
+            r#"{{"drive_id":"anonymous_vhost","socket":{},"is_root_device":false}}"#,
+            json_string(path_text(&rejected_vhost_socket_path)),
+        );
+        let rejected_vhost = http_put_json(
+            &socket_path,
+            "/drives/anonymous_vhost",
+            &rejected_vhost_body,
+        );
+        assert_bad_request_response(
+            &rejected_vhost,
+            "anonymous-profile runtime vhost-user insertion",
+        );
+        assert_response_contains(
+            &rejected_vhost,
+            "vhost-user block requires shared guest memory",
+            "anonymous-profile runtime vhost-user insertion",
+        );
+        assert!(
+            !http_get(&socket_path, "/vm/config").contains(r#""drive_id":"anonymous_vhost""#),
+            "anonymous-profile rejection must not publish runtime configuration"
+        );
+        let rejected_vhost_report = rejected_vhost_backend
+            .finish()
+            .expect("anonymous-profile rejection backend should finish");
+        assert_eq!(
+            rejected_vhost_report.owner_requests, 0,
+            "anonymous-profile rejection must happen before socket connection"
+        );
+
         let first_body = format!(
             r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
             json_string(path_text(&first_backing_path)),
@@ -3892,6 +3975,302 @@ mod macos_arm64 {
             &socket_path,
             "bangbang runtime block hotplug product PCI",
         );
+    }
+
+    #[test]
+    fn signed_executable_refreshes_hotplugs_and_reuses_vhost_user_block_over_product_pci() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let control_socket_path = test_dir.path().join("control-vhost.socket");
+        let first_socket_path = test_dir.path().join("first-vhost.socket");
+        let second_socket_path = test_dir.path().join("second-vhost.socket");
+        let control_backing_path = test_dir.path().join("vhost-hotplug-control.img");
+        let first_backing_path = test_dir.path().join("vhost-hotplug-first.img");
+        let second_backing_path = test_dir.path().join("vhost-hotplug-second.img");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_block_backing_with_prefix(&control_backing_path, 2, &[]);
+        create_block_backing_with_prefix(&first_backing_path, 1, BLOCK_HOTPLUG_HOST_ONE_MARKER);
+        create_block_backing_with_prefix(&second_backing_path, 1, BLOCK_HOTPLUG_HOST_TWO_MARKER);
+        let control_backend = VhostUserBlockBackend::start(
+            &control_socket_path,
+            &control_backing_path,
+            VhostUserBlockBackendOptions::regular(false),
+        )
+        .expect("control vhost-user backend should start");
+
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT /machine-config vhost-user block hotplug",
+        );
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(DIRECT_ROOTFS_VHOST_BLOCK_HOTPLUG_BOOT_ARGS),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/boot-source", &boot_body),
+            "PUT /boot-source vhost-user block hotplug",
+        );
+        let rootfs_body = format!(
+            r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+            json_string(path_text(&rootfs_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/rootfs", &rootfs_body),
+            "PUT /drives/rootfs vhost-user block hotplug",
+        );
+        let control_body = format!(
+            r#"{{"drive_id":"control","socket":{},"is_root_device":false,"cache_type":"Writeback"}}"#,
+            json_string(path_text(&control_socket_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/control", &control_body),
+            "PUT /drives/control vhost-user block hotplug",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "PUT /actions InstanceStart vhost-user block hotplug",
+        );
+
+        if let Err(error) = wait_for_file_prefix_marker(
+            &control_backing_path,
+            BLOCK_HOTPLUG_READY_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "vhost-user block hotplug guest did not become ready: {error}; control report: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                control_backend.report(),
+                output.status,
+                output.stdout,
+                output.stderr
+            );
+        }
+        control_backend
+            .wait_for_activation(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("control vhost-user backend should activate");
+
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&control_backing_path)
+            .expect("control backing should reopen for resize")
+            .set_len(4 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE)
+            .expect("control backing should resize");
+        assert_no_content_response(
+            &http_json(
+                &socket_path,
+                "PATCH",
+                "/drives/control",
+                r#"{"drive_id":"control"}"#,
+            ),
+            "PATCH /drives/control vhost-user config refresh",
+        );
+        if let Err(error) = wait_for_file_markers_at(
+            &control_backing_path,
+            &[(
+                3 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+                VHOST_CONFIG_RESIZED_MARKER,
+                b"BANGBANG_BLOCK_HOTPLUG_FAIL",
+            )],
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "guest did not observe refreshed vhost-user capacity: {error}; control report: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                control_backend.report(),
+                output.status,
+                output.stdout,
+                output.stderr
+            );
+        }
+        assert_eq!(
+            control_backend.report().config_requests,
+            2,
+            "startup discovery and ID-only PATCH should issue two exact GET_CONFIG requests"
+        );
+
+        let rejected_socket_path = test_dir.path().join("rejected-vhost.socket");
+        let rejected_backend = VhostUserBlockBackend::start(
+            &rejected_socket_path,
+            &first_backing_path,
+            VhostUserBlockBackendOptions::regular(false).without_config_protocol(),
+        )
+        .expect("rejecting runtime vhost-user backend should start");
+        let rejected_body = format!(
+            r#"{{"drive_id":"rejected","socket":{},"is_root_device":false}}"#,
+            json_string(path_text(&rejected_socket_path)),
+        );
+        let rejected = http_put_json(&socket_path, "/drives/rejected", &rejected_body);
+        assert_bad_request_response(&rejected, "runtime vhost-user negotiation rejection");
+        assert_response_contains(
+            &rejected,
+            "vhost-user backend lacks configuration protocol support",
+            "runtime vhost-user negotiation rejection",
+        );
+        assert!(
+            !http_get(&socket_path, "/vm/config").contains(r#""drive_id":"rejected""#),
+            "failed discovery must not publish runtime configuration"
+        );
+        let rejected_report = rejected_backend
+            .finish()
+            .expect("rejecting runtime vhost-user backend should finish");
+        assert!(rejected_report.discovery_rejected);
+
+        let first_backend = VhostUserBlockBackend::start(
+            &first_socket_path,
+            &first_backing_path,
+            VhostUserBlockBackendOptions::regular(false),
+        )
+        .expect("first runtime vhost-user backend should start");
+        let second_backend = VhostUserBlockBackend::start(
+            &second_socket_path,
+            &second_backing_path,
+            VhostUserBlockBackendOptions::regular(false),
+        )
+        .expect("second runtime vhost-user backend should start");
+        let first_body = format!(
+            r#"{{"drive_id":"hotdata","socket":{},"is_root_device":false,"cache_type":"Writeback"}}"#,
+            json_string(path_text(&first_socket_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/hotdata", &first_body),
+            "runtime PUT /drives/hotdata first vhost-user block",
+        );
+        let duplicate_body = format!(
+            r#"{{"drive_id":"hotdata","socket":{},"is_root_device":false,"cache_type":"Writeback"}}"#,
+            json_string(path_text(&second_socket_path)),
+        );
+        let duplicate = http_put_json(&socket_path, "/drives/hotdata", &duplicate_body);
+        assert_bad_request_response(
+            &duplicate,
+            "duplicate runtime PUT /drives/hotdata vhost-user",
+        );
+        assert_response_contains(
+            &duplicate,
+            r#"{"fault_message":"drive is already configured"}"#,
+            "duplicate runtime PUT /drives/hotdata vhost-user",
+        );
+        assert_eq!(
+            second_backend.report().owner_requests,
+            0,
+            "duplicate same-ID PUT must reject before connecting"
+        );
+
+        first_backend
+            .wait_for_activation(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("first runtime vhost-user backend should activate");
+        if let Err(error) = wait_for_file_prefix_marker(
+            &first_backing_path,
+            BLOCK_HOTPLUG_GUEST_ONE_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "first runtime vhost-user block did not complete guest I/O: {error}; first report: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                first_backend.report(),
+                output.status,
+                output.stdout,
+                output.stderr
+            );
+        }
+        wait_for_file_prefix_marker(
+            &control_backing_path,
+            BLOCK_HOTPLUG_FIRST_REMOVED_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("guest should remove the first runtime vhost-user PCI function");
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause before vhost-user runtime block reuse",
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/drives/hotdata"),
+            "paused DELETE /drives/hotdata vhost-user",
+        );
+        first_backend
+            .wait_for_frontend_close(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("first runtime vhost-user frontend should close after DELETE");
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/hotdata", &duplicate_body),
+            "paused runtime PUT /drives/hotdata reused vhost-user block",
+        );
+        assert_eq!(
+            second_backend.report().config_requests,
+            1,
+            "reused backend should complete discovery while the VM is paused"
+        );
+        write_block_marker_at(
+            &control_backing_path,
+            bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+            BLOCK_HOTPLUG_CONTINUE_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume after vhost-user runtime block reuse",
+        );
+
+        second_backend
+            .wait_for_activation(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("reused runtime vhost-user backend should activate");
+        if let Err(error) = wait_for_file_prefix_marker(
+            &second_backing_path,
+            BLOCK_HOTPLUG_GUEST_TWO_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "reused runtime vhost-user block did not complete guest I/O: {error}; second report: {:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                second_backend.report(),
+                output.status,
+                output.stdout,
+                output.stderr
+            );
+        }
+        wait_for_file_prefix_marker(
+            &control_backing_path,
+            BLOCK_HOTPLUG_SUCCESS_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("guest should remove the reused runtime vhost-user PCI function");
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/drives/hotdata"),
+            "final DELETE /drives/hotdata vhost-user",
+        );
+        second_backend
+            .wait_for_frontend_close(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("reused runtime vhost-user frontend should close after DELETE");
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang runtime vhost-user block hotplug product PCI",
+        );
+        let first_report = first_backend
+            .finish()
+            .expect("first runtime vhost-user backend should finish");
+        let second_report = second_backend
+            .finish()
+            .expect("second runtime vhost-user backend should finish");
+        let control_report = control_backend
+            .finish()
+            .expect("control vhost-user backend should finish");
+        assert!(first_report.activated && first_report.frontend_closed);
+        assert!(second_report.activated && second_report.frontend_closed);
+        assert!(control_report.activated && control_report.frontend_closed);
     }
 
     #[test]

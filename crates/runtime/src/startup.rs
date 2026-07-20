@@ -19,8 +19,8 @@ use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
     DriveConfig, DriveConfigInput, DriveIoEngine, DriveRateLimiterConfig, DriveUpdateError,
     PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
-    PreparedVhostUserBlockFrontend, VirtioBlockConfigSpace, VirtioBlockDeviceId,
-    VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
+    PreparedVhostUserBlockFrontend, VhostUserBlockConfigSignalError, VirtioBlockConfigSpace,
+    VirtioBlockDeviceId, VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
     VirtioBlockMmioHandler, VirtioBlockRuntimeRestoreInput,
 };
 use crate::boot::{
@@ -3168,6 +3168,30 @@ pub fn update_block_device_for_devices_with_opened(
     )
 }
 
+/// Refreshes one configured MMIO vhost-user block device and signals the guest.
+///
+/// Device lookup and typed-handler lookup complete before the backend protocol
+/// request. The handler owns rollback for confirmed signaling failures.
+pub fn refresh_vhost_user_block_config_for_devices_with_signal(
+    block_devices: &[Arm64BootBlockDevice],
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: &DriveConfig,
+    signal: impl FnOnce() -> Result<(), VhostUserBlockConfigSignalError>,
+) -> Result<(), DriveUpdateError> {
+    if !config.is_vhost_user() {
+        return Err(DriveUpdateError::UnsupportedBackend);
+    }
+    let region_id = block_device_region_id(block_devices, config)?;
+    let handler = mmio_dispatcher
+        .handler_mut::<VirtioBlockMmioHandler>(region_id)
+        .map_err(|source| DriveUpdateError::HandlerLookup {
+            drive_id: config.drive_id().to_string(),
+            region_id,
+            message: source.to_string(),
+        })?;
+    handler.refresh_vhost_user_block_config_with_signal(config.cache_type(), signal)
+}
+
 fn block_device_region_id(
     block_devices: &[Arm64BootBlockDevice],
     config: &DriveConfig,
@@ -3213,6 +3237,13 @@ fn update_block_device_for_region_with_opened(
             region_id,
             message: source.to_string(),
         })?;
+
+    if config.is_vhost_user() {
+        if backing.is_some() || rate_limiter_update.is_some() {
+            return Err(DriveUpdateError::UnsupportedBackend);
+        }
+        return handler.refresh_vhost_user_block_config(config.cache_type());
+    }
 
     if let Some(backing) = backing {
         handler.refresh_block_backing_with_opened(config, backing)?;

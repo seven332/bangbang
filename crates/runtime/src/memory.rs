@@ -837,6 +837,14 @@ impl GuestMemoryRegion {
         self.mapping.backing()
     }
 
+    /// Validates shared descriptor metadata without duplicating the descriptor.
+    ///
+    /// Returns `false` for anonymous regions and `true` for a valid shared
+    /// region whose descriptor still has the exact mapping length.
+    pub fn validate_shared_backing(&self) -> Result<bool, GuestMemorySharedBackingError> {
+        self.mapping.validate_shared_backing()
+    }
+
     /// Clone the descriptor-backed export metadata for a shared region.
     ///
     /// Anonymous regions return `Ok(None)`. The cloned descriptor owns the
@@ -2109,6 +2117,25 @@ impl GuestMemoryMapping {
     fn try_clone_shared_backing(
         &self,
     ) -> Result<Option<GuestMemorySharedBacking>, GuestMemorySharedBackingError> {
+        let Some((file, expected)) = self.validated_shared_file()? else {
+            return Ok(None);
+        };
+        let file = file
+            .try_clone()
+            .map_err(|source| GuestMemorySharedBackingError::DuplicateDescriptor { source })?;
+
+        Ok(Some(GuestMemorySharedBacking {
+            file,
+            offset: 0,
+            len: expected,
+        }))
+    }
+
+    fn validate_shared_backing(&self) -> Result<bool, GuestMemorySharedBackingError> {
+        Ok(self.validated_shared_file()?.is_some())
+    }
+
+    fn validated_shared_file(&self) -> Result<Option<(&File, u64)>, GuestMemorySharedBackingError> {
         let GuestMemoryMappingKind::Shared { file } = &self.kind else {
             return Ok(None);
         };
@@ -2121,15 +2148,7 @@ impl GuestMemoryMapping {
         if actual != expected {
             return Err(GuestMemorySharedBackingError::UnexpectedLength { expected, actual });
         }
-        let file = file
-            .try_clone()
-            .map_err(|source| GuestMemorySharedBackingError::DuplicateDescriptor { source })?;
-
-        Ok(Some(GuestMemorySharedBacking {
-            file,
-            offset: 0,
-            len: expected,
-        }))
+        Ok(Some((file, expected)))
     }
 }
 
@@ -3756,6 +3775,11 @@ mod tests {
         assert_eq!(memory.backing(), GuestMemoryBacking::Anonymous);
         assert_eq!(region.backing(), GuestMemoryBacking::Anonymous);
         assert!(
+            !region
+                .validate_shared_backing()
+                .expect("anonymous backing validation should succeed")
+        );
+        assert!(
             region
                 .try_clone_shared_backing()
                 .expect("anonymous export query should succeed")
@@ -3781,6 +3805,11 @@ mod tests {
             .try_clone_shared_backing()
             .expect("shared descriptor should clone")
             .expect("shared region should have an export");
+        assert!(
+            region
+                .validate_shared_backing()
+                .expect("shared backing validation should succeed")
+        );
         let metadata = export
             .file
             .metadata()
@@ -3847,6 +3876,14 @@ mod tests {
             .file
             .set_len(shortened)
             .expect("test descriptor should be resizable");
+
+        assert!(matches!(
+            region
+                .validate_shared_backing()
+                .expect_err("changed descriptor length should fail validation"),
+            GuestMemorySharedBackingError::UnexpectedLength { expected, actual }
+                if expected == page_size && actual == shortened
+        ));
 
         let error = region
             .try_clone_shared_backing()

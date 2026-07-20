@@ -241,9 +241,19 @@ The overlay therefore contains 84 `implemented-and-verified`, 314
 Strict direct configuration, bounded discovery, shared-memory/vring transfer,
 MMIO/PCI root and scratch I/O, flush, metrics, cleanup, backend death, and
 pre-artifact snapshot rejection are implemented and signed. No disposition is
-promoted yet: runtime vhost lifecycle, contained authorized stream delivery,
-snapshot state, and complete broad-corpus semantics remain owned by later
-slices, so the inventory counts are unchanged.
+promoted yet.
+
+#1447 extends those same nonterminal records with pinned runtime behavior:
+ID-only PATCH performs repeated exact CONFIG acquisition and one MMIO/PCI guest
+configuration notification; an already-shared all-PCI VM may attach a new
+non-root direct backend in Running or Paused state after preconnection owner
+preflight; and caller-coordinated DELETE releases the complete endpoint for
+same-ID/slot reuse. Signed evidence covers Linux capacity refresh, guest I/O,
+Paused mutation, invalid negotiation rollback, duplicate and anonymous-profile
+zero-connect rejection, teardown, and reuse. Live same-ID PUT remains a
+duplicate as in pinned v1.16. Contained authorized stream delivery, vhost
+snapshot state, Async, and complete broad-corpus semantics remain owned by
+later slices, so the inventory counts are unchanged.
 
 ## Commands
 

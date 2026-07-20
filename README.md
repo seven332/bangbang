@@ -68,8 +68,17 @@ virtio feature set, and transfers one queue plus the complete current memory
 table to the operator-selected backend. The same device works over default
 MMIO or all-virtio PCI, including root/partuuid/read-only/writeback behavior,
 backend-call interrupts, metrics, and redacted terminal disconnects. This is a
-trusted direct-mode memory capability: contained socket authorization, runtime
-vhost replacement/hotplug, and vhost snapshot state remain explicit limits.
+trusted direct-mode memory capability. An ID-only PATCH may refresh an active
+MMIO or PCI backend's exact 60-byte config plus one guest configuration
+interrupt. In an all-PCI VM whose startup profile is already shared, Running or
+Paused requests may also attach a new non-root socket drive after a
+no-side-effect owner preflight and remove an eligible device after manual
+guest-side PCI removal. Duplicate IDs, anonymous RAM, root insertion, and
+exhausted capacity reject before socket connection; DELETE releases the
+frontend, shared-memory descriptor clones, metrics generation, BAR, MSI-X, and
+PCI slot for deterministic reuse. Contained socket authorization, automatic
+guest PCI notification, live same-ID reconnect, and vhost snapshot state remain
+explicit limits.
 
 ## Layout
 

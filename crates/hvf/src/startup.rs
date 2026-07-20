@@ -20,9 +20,9 @@ use bangbang_runtime::balloon::{
 };
 use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveConfig, DriveRateLimiterConfig,
-    DriveRuntimeMutationError, DriveUpdateError, PreparedBlockDevice, VIRTIO_BLOCK_DEVICE_ID,
-    VIRTIO_BLOCK_QUEUE_SIZES, VirtioBlockConfigSpace, VirtioBlockDevice,
-    VirtioBlockDeviceNotificationError,
+    DriveRuntimeMutationError, DriveUpdateError, PreparedBlockDevice, RuntimeBlockDeviceResource,
+    VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_QUEUE_SIZES, VhostUserBlockConfigSignalError,
+    VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceNotificationError,
 };
 use bangbang_runtime::boot::BootSourceFiles;
 use bangbang_runtime::boot_timer::{
@@ -37,7 +37,7 @@ use bangbang_runtime::fdt::{Arm64FdtCacheHierarchy, Arm64FdtError};
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
-use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
+use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryRange};
 use bangbang_runtime::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
     MemoryHotplugUpdateError, VIRTIO_MEM_DEVICE_ID, VIRTIO_MEM_QUEUE_SIZES, VirtioMemConfigSpace,
@@ -91,8 +91,8 @@ use bangbang_runtime::startup::{
     Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
     Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
     Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, VmStartupResources,
-    memory_hotplug_status_for_device, replace_arm64_boot_vmgenid,
-    update_memory_hotplug_config_for_device,
+    memory_hotplug_status_for_device, refresh_vhost_user_block_config_for_devices_with_signal,
+    replace_arm64_boot_vmgenid, update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::virtio::{
     UnsupportedVirtioDeviceConfig, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioDeviceActivation,
@@ -865,6 +865,95 @@ impl HvfArm64BootPciDataDevices {
         Ok(())
     }
 
+    fn preflight_runtime_block(
+        &self,
+        drive_id: &str,
+        metrics: &SharedBlockDeviceMetricsRegistry,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        if !self.runtime_hotplug {
+            return Err(DriveRuntimeMutationError::PciNotEnabled);
+        }
+        if self.block.iter().any(|device| device.drive_id == drive_id) {
+            return Err(DriveRuntimeMutationError::DuplicateDrive {
+                drive_id: drive_id.to_string(),
+            });
+        }
+        if self.endpoint_count() >= PCI_ENDPOINT_SLOT_COUNT {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI endpoint capacity is exhausted".to_string(),
+            });
+        }
+        if self.block.len() == self.block.capacity() {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime block inventory capacity is exhausted".to_string(),
+            });
+        }
+        let available_slots = self
+            .validation
+            .segment()
+            .with_segment(|segment| segment.available_endpoint_slots())
+            .map_err(|source| DriveRuntimeMutationError::ActiveSessionCommand {
+                message: format!("PCI segment is unavailable: {source}"),
+            })?;
+        if available_slots == 0 {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI function capacity is exhausted".to_string(),
+            });
+        }
+        let available_bars = pci_data_available_bar_count(self.validation.bar_allocator())
+            .map_err(|source| DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            })?;
+        if available_bars == 0 {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI capability BAR capacity is exhausted".to_string(),
+            });
+        }
+        let planned_bar = pci_data_bar_plan(self.validation.bar_allocator(), 1)
+            .map_err(|source| DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI capability BAR capacity is exhausted".to_string(),
+            })?;
+        if self
+            .msi_interrupts
+            .as_ref()
+            .is_none_or(|interrupts| interrupts.lease_count() == 0)
+        {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI interrupt resources are unavailable".to_string(),
+            });
+        }
+        let dispatcher = self.dispatcher.lock().map_err(|_| {
+            DriveRuntimeMutationError::ActiveSessionCommand {
+                message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+            }
+        })?;
+        Self::available_region_id(&dispatcher).map_err(|source| {
+            DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        if dispatcher
+            .regions()
+            .iter()
+            .any(|region| region.range().overlaps(planned_bar))
+        {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI capability BAR overlaps live MMIO state".to_string(),
+            });
+        }
+        metrics.preflight_drive(drive_id).map_err(|source| {
+            DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        Ok(())
+    }
+
     fn update_runtime_block(
         &self,
         config: &DriveConfig,
@@ -878,6 +967,15 @@ impl HvfArm64BootPciDataDevices {
             .ok_or_else(|| DriveUpdateError::UnknownDrive {
                 drive_id: config.drive_id().to_string(),
             })?;
+        if config.is_vhost_user() {
+            if backing.is_some() || rate_limiter_update.is_some() {
+                return Err(DriveUpdateError::UnsupportedBackend);
+            }
+            return device
+                .published
+                .endpoint()
+                .refresh_vhost_user_block_config(config.cache_type());
+        }
         device
             .published
             .endpoint()
@@ -2139,12 +2237,58 @@ impl HvfArm64BootPciBlockDeviceUpdater {
             .ok_or_else(|| DriveUpdateError::UnknownDrive {
                 drive_id: config.drive_id().to_string(),
             })?;
+        if config.is_vhost_user() {
+            if backing.is_some() || rate_limiter_update.is_some() {
+                return Err(DriveUpdateError::UnsupportedBackend);
+            }
+            return endpoint.refresh_vhost_user_block_config(config.cache_type());
+        }
         endpoint
             .update_block_device_with_opened(config, backing, rate_limiter_update)
             .map_err(|source| DriveUpdateError::ActiveSessionCommand {
                 message: source.to_string(),
             })
     }
+}
+
+fn refresh_mmio_vhost_user_block_config(
+    runtime_resources: &Arm64BootRuntimeResources,
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    gic: &HvfGicMetadata,
+    config: &DriveConfig,
+) -> Result<(), DriveUpdateError> {
+    let device = runtime_resources
+        .block_devices
+        .iter()
+        .find(|device| device.registration.drive_id() == config.drive_id())
+        .ok_or_else(|| DriveUpdateError::UnknownDrive {
+            drive_id: config.drive_id().to_string(),
+        })?;
+    let interrupt_line = device.fdt_device.interrupt_line;
+    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+        DriveUpdateError::ActiveSessionCommand {
+            message: source.to_string(),
+        }
+    })?;
+    signaler.validate_line(interrupt_line).map_err(|source| {
+        DriveUpdateError::ActiveSessionCommand {
+            message: source.to_string(),
+        }
+    })?;
+    let mut dispatcher = mmio_dispatcher
+        .lock()
+        .map_err(|_| DriveUpdateError::MmioDispatcherUnavailable)?;
+    refresh_vhost_user_block_config_for_devices_with_signal(
+        &runtime_resources.block_devices,
+        &mut dispatcher,
+        config,
+        || {
+            signaler.set_level(interrupt_line, true).map_err(|source| {
+                let delivery_ambiguous = matches!(&source, HvfGicSpiSignalError::Signal { .. });
+                VhostUserBlockConfigSignalError::new(source.to_string(), delivery_ambiguous)
+            })
+        },
+    )
 }
 
 /// Cloneable live-update handle for production PCI network endpoints.
@@ -4156,6 +4300,60 @@ impl HvfArm64BootSession<'_> {
         self.pci_data_devices.is_some()
     }
 
+    /// Checks every owner-side prerequisite for a vhost-user runtime insert
+    /// without reserving capacity or cloning shared-memory descriptors.
+    pub fn preflight_runtime_vhost_user_block_device(
+        &self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        let memory = self.guest_memory().map_err(|source| {
+            DriveRuntimeMutationError::ActiveSessionCommand {
+                message: format!("guest memory is unavailable: {source}"),
+            }
+        })?;
+        if memory.backing() != GuestMemoryBacking::Shared {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "vhost-user block requires shared guest memory".to_string(),
+            });
+        }
+        PreparedBlockDevice::preflight_vhost_user_memory(memory).map_err(|source| {
+            DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(DriveRuntimeMutationError::PciNotEnabled)?
+            .preflight_runtime_block(drive_id, &self.block_device_metrics)
+    }
+
+    /// Materializes one closed runtime resource on the owner and publishes it
+    /// through the generic PCI transaction.
+    pub fn insert_runtime_block_resource(
+        &mut self,
+        resource: RuntimeBlockDeviceResource,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        let prepared = match resource {
+            RuntimeBlockDeviceResource::Prepared(prepared) => prepared,
+            RuntimeBlockDeviceResource::VhostUser { config, frontend } => {
+                self.preflight_runtime_vhost_user_block_device(config.drive_id())?;
+                PreparedBlockDevice::from_config_with_vhost_user(
+                    &config,
+                    frontend,
+                    self.guest_memory().map_err(|source| {
+                        DriveRuntimeMutationError::ActiveSessionCommand {
+                            message: format!("guest memory is unavailable: {source}"),
+                        }
+                    })?,
+                )
+                .map_err(|source| DriveRuntimeMutationError::PrepareDevice {
+                    message: source.to_string(),
+                })?
+            }
+        };
+        self.insert_runtime_block_device(prepared)
+    }
+
     /// Publishes one fully prepared block endpoint into the owner-thread PCI inventory.
     pub fn insert_runtime_block_device(
         &mut self,
@@ -4179,6 +4377,26 @@ impl HvfArm64BootSession<'_> {
             .as_ref()
             .ok_or(DriveUpdateError::ActiveSessionUnavailable)?
             .update_runtime_block(config, backing, rate_limiter_update)
+    }
+
+    /// Refreshes one active direct vhost-user block configuration through its
+    /// selected MMIO or PCI transport and delivers the guest notification.
+    pub fn refresh_vhost_user_block_config(
+        &mut self,
+        config: &DriveConfig,
+    ) -> Result<(), DriveUpdateError> {
+        if !config.is_vhost_user() {
+            return Err(DriveUpdateError::UnsupportedBackend);
+        }
+        if let Some(devices) = self.pci_data_devices.as_ref() {
+            return devices.update_runtime_block(config, None, None);
+        }
+        refresh_mmio_vhost_user_block_config(
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            &self.gic,
+            config,
+        )
     }
 
     /// Removes one non-root block endpoint from the owner-thread PCI inventory.
@@ -6157,6 +6375,60 @@ impl OwnedHvfArm64BootSession {
         self.pci_data_devices.is_some()
     }
 
+    /// Checks every owner-side prerequisite for a vhost-user runtime insert
+    /// without reserving capacity or cloning shared-memory descriptors.
+    pub fn preflight_runtime_vhost_user_block_device(
+        &self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        let memory = self.guest_memory().map_err(|source| {
+            DriveRuntimeMutationError::ActiveSessionCommand {
+                message: format!("guest memory is unavailable: {source}"),
+            }
+        })?;
+        if memory.backing() != GuestMemoryBacking::Shared {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "vhost-user block requires shared guest memory".to_string(),
+            });
+        }
+        PreparedBlockDevice::preflight_vhost_user_memory(memory).map_err(|source| {
+            DriveRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(DriveRuntimeMutationError::PciNotEnabled)?
+            .preflight_runtime_block(drive_id, &self.block_device_metrics)
+    }
+
+    /// Materializes one closed runtime resource on the owner and publishes it
+    /// through the generic PCI transaction.
+    pub fn insert_runtime_block_resource(
+        &mut self,
+        resource: RuntimeBlockDeviceResource,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        let prepared = match resource {
+            RuntimeBlockDeviceResource::Prepared(prepared) => prepared,
+            RuntimeBlockDeviceResource::VhostUser { config, frontend } => {
+                self.preflight_runtime_vhost_user_block_device(config.drive_id())?;
+                PreparedBlockDevice::from_config_with_vhost_user(
+                    &config,
+                    frontend,
+                    self.guest_memory().map_err(|source| {
+                        DriveRuntimeMutationError::ActiveSessionCommand {
+                            message: format!("guest memory is unavailable: {source}"),
+                        }
+                    })?,
+                )
+                .map_err(|source| DriveRuntimeMutationError::PrepareDevice {
+                    message: source.to_string(),
+                })?
+            }
+        };
+        self.insert_runtime_block_device(prepared)
+    }
+
     /// Publishes one fully prepared block endpoint into the owner-thread PCI inventory.
     pub fn insert_runtime_block_device(
         &mut self,
@@ -6180,6 +6452,26 @@ impl OwnedHvfArm64BootSession {
             .as_ref()
             .ok_or(DriveUpdateError::ActiveSessionUnavailable)?
             .update_runtime_block(config, backing, rate_limiter_update)
+    }
+
+    /// Refreshes one active direct vhost-user block configuration through its
+    /// selected MMIO or PCI transport and delivers the guest notification.
+    pub fn refresh_vhost_user_block_config(
+        &mut self,
+        config: &DriveConfig,
+    ) -> Result<(), DriveUpdateError> {
+        if !config.is_vhost_user() {
+            return Err(DriveUpdateError::UnsupportedBackend);
+        }
+        if let Some(devices) = self.pci_data_devices.as_ref() {
+            return devices.update_runtime_block(config, None, None);
+        }
+        refresh_mmio_vhost_user_block_config(
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            &self.gic,
+            config,
+        )
     }
 
     /// Removes one non-root block endpoint from the owner-thread PCI inventory.

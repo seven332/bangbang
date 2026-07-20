@@ -696,7 +696,10 @@ impl DriveConfig {
             rate_limiter,
         } = &self.backend
         else {
-            return Err(DriveUpdateError::UnsupportedBackend);
+            if update.path_on_host().is_some() || update.rate_limiter().is_some() {
+                return Err(DriveUpdateError::UnsupportedBackend);
+            }
+            return Ok(self.clone());
         };
         Ok(Self {
             drive_id: self.drive_id.clone(),
@@ -852,9 +855,6 @@ impl DriveConfigs {
         let config = input
             .validate()
             .map_err(DriveRuntimeMutationError::InvalidConfig)?;
-        if config.is_vhost_user() {
-            return Err(DriveRuntimeMutationError::UnsupportedBackend);
-        }
         if config.is_root_device() {
             return Err(DriveRuntimeMutationError::RootInsertUnsupported);
         }
@@ -918,9 +918,6 @@ impl DriveConfigs {
             return Err(DriveRuntimeMutationError::RootRemovalUnsupported {
                 drive_id: drive_id.to_string(),
             });
-        }
-        if config.is_vhost_user() {
-            return Err(DriveRuntimeMutationError::UnsupportedBackend);
         }
         Ok(PreparedDriveConfigRemoval {
             drive_id: drive_id.to_string(),
@@ -1131,6 +1128,9 @@ pub enum DriveUpdateError {
     ActiveSessionCommand {
         message: String,
     },
+    TerminalActiveSessionCommand {
+        message: String,
+    },
     ActiveSessionUnavailable,
     MmioDispatcherUnavailable,
 }
@@ -1140,7 +1140,6 @@ pub enum DriveUpdateError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriveRuntimeMutationError {
     InvalidConfig(DriveConfigError),
-    UnsupportedBackend,
     EmptyDriveId,
     InvalidDriveId { drive_id: String },
     DuplicateDrive { drive_id: String },
@@ -1202,7 +1201,9 @@ impl fmt::Display for DriveUpdateError {
             }
             Self::MismatchedDriveId { .. } => f.write_str("path drive_id must match body drive_id"),
             Self::EmptyPathOnHost => f.write_str("drive path_on_host must not be empty"),
-            Self::UnsupportedBackend => f.write_str("vhost-user drive updates are not supported"),
+            Self::UnsupportedBackend => {
+                f.write_str("path and rate limiter updates are unsupported for vhost-user drives")
+            }
             Self::UnknownDrive { drive_id } => {
                 write!(f, "drive {drive_id} is not configured")
             }
@@ -1220,6 +1221,9 @@ impl fmt::Display for DriveUpdateError {
             Self::ActiveSessionCommand { message } => {
                 write!(f, "active drive update command failed: {message}")
             }
+            Self::TerminalActiveSessionCommand { message } => {
+                write!(f, "active drive update entered terminal state: {message}")
+            }
             Self::ActiveSessionUnavailable => {
                 f.write_str("active drive update session is unavailable")
             }
@@ -1236,9 +1240,6 @@ impl fmt::Display for DriveRuntimeMutationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(source) => write!(f, "{source}"),
-            Self::UnsupportedBackend => {
-                f.write_str("vhost-user drive runtime mutation is not supported")
-            }
             Self::EmptyDriveId => f.write_str("path drive_id must not be empty"),
             Self::InvalidDriveId { .. } => {
                 f.write_str("path drive_id must contain only alphanumeric characters or '_'")
@@ -1290,8 +1291,7 @@ impl std::error::Error for DriveRuntimeMutationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidConfig(source) => Some(source),
-            Self::UnsupportedBackend
-            | Self::EmptyDriveId
+            Self::EmptyDriveId
             | Self::InvalidDriveId { .. }
             | Self::DuplicateDrive { .. }
             | Self::RootInsertUnsupported
@@ -4340,9 +4340,30 @@ impl fmt::Debug for VhostUserBlockMemoryRegion {
 }
 
 impl VhostUserBlockMemoryRegion {
+    fn preflight_guest_memory(
+        memory: &GuestMemory,
+    ) -> Result<(), PreparedVhostUserBlockMemoryError> {
+        if memory.regions().is_empty() {
+            return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);
+        }
+        for region in memory.regions() {
+            if !region
+                .validate_shared_backing()
+                .map_err(PreparedVhostUserBlockMemoryError::SharedBacking)?
+            {
+                return Err(PreparedVhostUserBlockMemoryError::AnonymousMemory);
+            }
+            Self::validated_geometry(region)?;
+        }
+        Ok(())
+    }
+
     fn from_guest_memory(
         memory: &GuestMemory,
     ) -> Result<Vec<Self>, PreparedVhostUserBlockMemoryError> {
+        if memory.regions().is_empty() {
+            return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);
+        }
         let mut regions = Vec::new();
         regions
             .try_reserve_exact(memory.regions().len())
@@ -4350,29 +4371,33 @@ impl VhostUserBlockMemoryRegion {
         for region in memory.regions() {
             let backing = region
                 .try_clone_shared_backing()
-                .map_err(PreparedVhostUserBlockMemoryError::CloneBacking)?
+                .map_err(PreparedVhostUserBlockMemoryError::SharedBacking)?
                 .ok_or(PreparedVhostUserBlockMemoryError::AnonymousMemory)?;
-            let range = region.range();
-            if backing.is_empty()
-                || backing.len() != range.size()
-                || u64::try_from(region.host_size()).ok() != Some(range.size())
-            {
+            let (guest_base, len, userspace_base) = Self::validated_geometry(region)?;
+            if backing.is_empty() || backing.len() != len {
                 return Err(PreparedVhostUserBlockMemoryError::InvalidRegion);
             }
-            let userspace_base = u64::try_from(region.host_address().as_ptr().addr())
-                .map_err(|_| PreparedVhostUserBlockMemoryError::InvalidRegion)?;
             regions.push(Self {
-                guest_base: range.start().raw_value(),
-                len: range.size(),
+                guest_base,
+                len,
                 userspace_base,
                 mmap_offset: backing.offset(),
                 backing,
             });
         }
-        if regions.is_empty() {
-            return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);
-        }
         Ok(regions)
+    }
+
+    fn validated_geometry(
+        region: &crate::memory::GuestMemoryRegion,
+    ) -> Result<(u64, u64, u64), PreparedVhostUserBlockMemoryError> {
+        let range = region.range();
+        if range.size() == 0 || u64::try_from(region.host_size()).ok() != Some(range.size()) {
+            return Err(PreparedVhostUserBlockMemoryError::InvalidRegion);
+        }
+        let userspace_base = u64::try_from(region.host_address().as_ptr().addr())
+            .map_err(|_| PreparedVhostUserBlockMemoryError::InvalidRegion)?;
+        Ok((range.start().raw_value(), range.size(), userspace_base))
     }
 
     fn protocol_region(&self) -> Result<VhostUserMemoryRegion<'_>, VhostUserError> {
@@ -4401,7 +4426,7 @@ impl VhostUserBlockMemoryRegion {
 #[derive(Debug)]
 pub enum PreparedVhostUserBlockMemoryError {
     AllocateRegions(TryReserveError),
-    CloneBacking(GuestMemorySharedBackingError),
+    SharedBacking(GuestMemorySharedBackingError),
     AnonymousMemory,
     EmptyMemory,
     InvalidRegion,
@@ -4413,8 +4438,8 @@ impl fmt::Display for PreparedVhostUserBlockMemoryError {
             Self::AllocateRegions(_) => {
                 formatter.write_str("failed to allocate vhost-user guest-memory exports")
             }
-            Self::CloneBacking(_) => {
-                formatter.write_str("failed to clone vhost-user guest-memory backing")
+            Self::SharedBacking(_) => {
+                formatter.write_str("failed to validate vhost-user guest-memory backing")
             }
             Self::AnonymousMemory => {
                 formatter.write_str("vhost-user block requires shared guest memory")
@@ -4429,7 +4454,7 @@ impl std::error::Error for PreparedVhostUserBlockMemoryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::AllocateRegions(source) => Some(source),
-            Self::CloneBacking(source) => Some(source),
+            Self::SharedBacking(source) => Some(source),
             Self::AnonymousMemory | Self::EmptyMemory | Self::InvalidRegion => None,
         }
     }
@@ -4638,6 +4663,49 @@ impl VirtioBlockDevice {
             }) => Some(call.as_fd().as_raw_fd()),
             VirtioBlockBackend::File { .. } | VirtioBlockBackend::VhostUser(_) => None,
         }
+    }
+
+    fn refreshed_vhost_user_config(
+        &mut self,
+        cache_type: DriveCacheType,
+    ) -> Result<VirtioBlockConfigSpace, VhostUserBlockConfigRefreshError> {
+        let VirtioBlockBackend::VhostUser(backend) = &mut self.backend else {
+            return Err(VhostUserBlockConfigRefreshError::UnsupportedBackend);
+        };
+        match backend.state {
+            VhostUserBlockState::Prepared { .. } => {
+                return Err(VhostUserBlockConfigRefreshError::Inactive);
+            }
+            VhostUserBlockState::Terminal { .. } => {
+                return Err(VhostUserBlockConfigRefreshError::Terminal);
+            }
+            VhostUserBlockState::Active { .. } => {}
+        }
+        let Some(frontend) = backend.frontend.as_mut() else {
+            return Err(VhostUserBlockConfigRefreshError::Terminal);
+        };
+        let config = match frontend.get_config(
+            0,
+            u32::try_from(VIRTIO_BLOCK_CONFIG_SIZE)
+                .map_err(|_| VhostUserBlockConfigRefreshError::InvalidConfig)?,
+            VhostUserConfigFlags::Writable,
+        ) {
+            Ok(config) => config,
+            Err(source) => {
+                backend.frontend = None;
+                backend.state = VhostUserBlockState::Terminal { was_active: true };
+                return Err(VhostUserBlockConfigRefreshError::Frontend(source));
+            }
+        };
+        let config_bytes = config
+            .as_bytes()
+            .try_into()
+            .map_err(|_| VhostUserBlockConfigRefreshError::InvalidConfig)?;
+        Ok(VirtioBlockConfigSpace::from_vhost_user(
+            config_bytes,
+            backend.available_features,
+            cache_type,
+        ))
     }
 
     fn dispatch_drained_queue_notifications(
@@ -4952,6 +5020,77 @@ impl VhostUserBlockBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VhostUserBlockConfigRefreshError {
+    UnsupportedBackend,
+    Inactive,
+    Terminal,
+    Frontend(VhostUserError),
+    InvalidConfig,
+}
+
+impl fmt::Display for VhostUserBlockConfigRefreshError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedBackend => {
+                formatter.write_str("block device is not backed by vhost-user")
+            }
+            Self::Inactive => formatter.write_str("vhost-user block frontend is not active"),
+            Self::Terminal => formatter.write_str("vhost-user block frontend is terminal"),
+            Self::Frontend(source) => {
+                write!(formatter, "vhost-user config refresh failed: {source}")
+            }
+            Self::InvalidConfig => {
+                formatter.write_str("vhost-user backend returned invalid block configuration")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VhostUserBlockConfigRefreshError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Frontend(source) => Some(source),
+            Self::UnsupportedBackend | Self::Inactive | Self::Terminal | Self::InvalidConfig => {
+                None
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Failure to publish a refreshed vhost-user block configuration to the guest.
+///
+/// `delivery_ambiguous` distinguishes a confirmed pre-delivery failure, which
+/// can be rolled back, from a failure after interrupt delivery may have begun.
+pub struct VhostUserBlockConfigSignalError {
+    message: String,
+    delivery_ambiguous: bool,
+}
+
+impl VhostUserBlockConfigSignalError {
+    /// Creates a signaling failure with its interrupt-delivery classification.
+    pub fn new(message: impl Into<String>, delivery_ambiguous: bool) -> Self {
+        Self {
+            message: message.into(),
+            delivery_ambiguous,
+        }
+    }
+
+    /// Returns whether the guest may already have observed the interrupt.
+    pub const fn delivery_ambiguous(&self) -> bool {
+        self.delivery_ambiguous
+    }
+}
+
+impl fmt::Display for VhostUserBlockConfigSignalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VhostUserBlockConfigSignalError {}
+
 /// Backend-specific operations unavailable for a vhost-user block device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioBlockBackendOperationError {
@@ -4975,6 +5114,13 @@ pub struct PreparedBlockDevice {
 }
 
 impl PreparedBlockDevice {
+    /// Validates current vhost-user memory exports without cloning descriptors.
+    pub fn preflight_vhost_user_memory(
+        memory: &GuestMemory,
+    ) -> Result<(), PreparedVhostUserBlockMemoryError> {
+        VhostUserBlockMemoryRegion::preflight_guest_memory(memory)
+    }
+
     pub fn from_config_with_backing(
         config: &DriveConfig,
         backing: Option<BlockFileBacking>,
@@ -5084,6 +5230,59 @@ impl PreparedBlockDevice {
             self.config_space,
             self.device,
         )
+    }
+}
+
+/// Move-only runtime block insertion resource consumed by the VM owner.
+pub enum RuntimeBlockDeviceResource {
+    /// A file-backed device fully materialized on the process thread.
+    Prepared(PreparedBlockDevice),
+    /// A discovered vhost-user frontend awaiting live-memory materialization.
+    VhostUser {
+        config: DriveConfig,
+        frontend: PreparedVhostUserBlockFrontend,
+    },
+}
+
+impl RuntimeBlockDeviceResource {
+    /// Wraps one fully prepared file-backed device.
+    pub fn prepared(device: PreparedBlockDevice) -> Self {
+        Self::Prepared(device)
+    }
+
+    /// Wraps one validated vhost-user configuration and discovered frontend.
+    pub fn vhost_user(config: DriveConfig, frontend: PreparedVhostUserBlockFrontend) -> Self {
+        Self::VhostUser { config, frontend }
+    }
+
+    /// Returns the stable drive identity without exposing owned resources.
+    pub fn drive_id(&self) -> &str {
+        match self {
+            Self::Prepared(device) => device.drive_id(),
+            Self::VhostUser { config, .. } => config.drive_id(),
+        }
+    }
+
+    /// Returns whether owner-side live-memory materialization is required.
+    pub const fn is_vhost_user(&self) -> bool {
+        matches!(self, Self::VhostUser { .. })
+    }
+}
+
+impl fmt::Debug for RuntimeBlockDeviceResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeBlockDeviceResource")
+            .field(
+                "kind",
+                &if self.is_vhost_user() {
+                    "vhost-user"
+                } else {
+                    "prepared"
+                },
+            )
+            .field("resources", &"<redacted>")
+            .finish()
     }
 }
 
@@ -5850,6 +6049,52 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
         Ok(())
     }
 
+    pub fn refresh_vhost_user_block_config(
+        &self,
+        cache_type: DriveCacheType,
+    ) -> Result<(), DriveUpdateError> {
+        let work =
+            self.admit_device_work()
+                .map_err(|source| DriveUpdateError::ActiveSessionCommand {
+                    message: source.to_string(),
+                })?;
+        let snapshot = work
+            .with_core_mut(|core| {
+                let config_space = core
+                    .activation
+                    .refreshed_vhost_user_config(cache_type)
+                    .map_err(|source| DriveUpdateError::ActiveSessionCommand {
+                        message: source.to_string(),
+                    })?;
+                let snapshot = (core.device, core.device_config);
+                core.device_config = config_space;
+                core.device.increment_config_generation();
+                core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
+                Ok::<_, DriveUpdateError>(snapshot)
+            })
+            .map_err(|source| DriveUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            })??;
+
+        if let Err(source) = work.drain_interrupt_intents() {
+            let message = source.to_string();
+            if source.delivery_ambiguous() {
+                return Err(DriveUpdateError::TerminalActiveSessionCommand { message });
+            }
+            work.with_core_mut(|core| {
+                core.device = snapshot.0;
+                core.device_config = snapshot.1;
+            })
+            .map_err(|rollback| DriveUpdateError::TerminalActiveSessionCommand {
+                message: format!(
+                    "configuration interrupt failed before delivery ({message}); rollback failed: {rollback}"
+                ),
+            })?;
+            return Err(DriveUpdateError::ActiveSessionCommand { message });
+        }
+        Ok(())
+    }
+
     pub fn update_block_rate_limiter(
         &self,
         rate_limiter: DriveRateLimiterConfig,
@@ -5864,6 +6109,53 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
 }
 
 impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
+    /// Refreshes the vhost-user configuration and records a pending interrupt.
+    pub fn refresh_vhost_user_block_config(
+        &mut self,
+        cache_type: DriveCacheType,
+    ) -> Result<(), DriveUpdateError> {
+        self.refresh_vhost_user_block_config_with_signal(cache_type, || Ok(()))
+    }
+
+    /// Refreshes the vhost-user configuration and atomically signals the guest.
+    ///
+    /// A confirmed signaling failure restores the previous configuration and
+    /// transport state. An ambiguous delivery failure leaves the new state in
+    /// place and returns a terminal session error.
+    pub fn refresh_vhost_user_block_config_with_signal(
+        &mut self,
+        cache_type: DriveCacheType,
+        signal: impl FnOnce() -> Result<(), VhostUserBlockConfigSignalError>,
+    ) -> Result<(), DriveUpdateError> {
+        let config_space = self
+            .activation_handler_mut()
+            .refreshed_vhost_user_config(cache_type)
+            .map_err(|source| DriveUpdateError::ActiveSessionCommand {
+                message: source.to_string(),
+            })?;
+        let transport_snapshot = self.transport_state();
+        let config_snapshot = *self.device_config_handler();
+        *self.device_config_handler_mut() = config_space;
+        self.increment_config_generation();
+        self.mark_config_interrupt_pending();
+        if let Err(source) = signal() {
+            let message = source.to_string();
+            if source.delivery_ambiguous() {
+                return Err(DriveUpdateError::TerminalActiveSessionCommand { message });
+            }
+            *self.device_config_handler_mut() = config_snapshot;
+            let activation_is_active = self.activation_handler().is_activated();
+            self.restore_transport_state(&transport_snapshot, activation_is_active)
+                .map_err(|rollback| DriveUpdateError::TerminalActiveSessionCommand {
+                    message: format!(
+                        "configuration interrupt failed before delivery ({message}); rollback failed: {rollback}"
+                    ),
+                })?;
+            return Err(DriveUpdateError::ActiveSessionCommand { message });
+        }
+        Ok(())
+    }
+
     pub fn refresh_block_backing(&mut self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
         let backing =
             BlockFileBacking::open(config).map_err(|source| DriveUpdateError::OpenBacking {
@@ -6211,6 +6503,7 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -6223,10 +6516,17 @@ mod tests {
     use crate::memory::{
         GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange,
     };
+    use crate::message_interrupt::{
+        GuestMessage, GuestMessageInterrupt, GuestMessageInterruptRegistry,
+        GuestMessageInterruptSignalError,
+    };
     use crate::metrics::{BlockDeviceMetrics, SharedBlockDeviceMetrics};
     use crate::mmio::{
-        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioOperation, MmioRegionId,
+        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioHandler, MmioOperation,
+        MmioRegionId,
     };
+    use crate::pci::{PciBarAddressSpace, PciBarAllocator};
+    use crate::virtio::VirtioDeviceType;
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
@@ -6235,6 +6535,10 @@ mod tests {
         VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
         VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
         VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    };
+    use crate::virtio_pci::{
+        VIRTIO_PCI_CAPABILITY_BAR_SIZE, VIRTIO_PCI_MSIX_TABLE_OFFSET, VirtioPciEndpoint,
+        VirtioPciIdentity,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_INDIRECT, VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE,
@@ -6250,21 +6554,23 @@ mod tests {
         DriveRuntimeMutationError, DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput,
         PreparedBlockDevice, PreparedBlockDeviceError, PreparedBlockDevices,
         PreparedVhostUserBlockFrontend, PreparedVhostUserBlockFrontendError,
-        PreparedVhostUserBlockMemoryError, SnapshotBlockFileBackingError,
-        VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_CONFIG_SIZE, VIRTIO_BLOCK_DEVICE_ID,
-        VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
-        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
-        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
-        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
-        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
-        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
-        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VIRTIO_RING_FEATURE_INDIRECT_DESC, VhostUserBlockNotificationError, VhostUserBlockState,
-        VirtioBlockBackend, VirtioBlockConfigSpace, VirtioBlockDevice,
-        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
-        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError,
-        VirtioBlockQueueSnapshotError, VirtioBlockRateLimiter, VirtioBlockRequest,
-        VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
+        PreparedVhostUserBlockMemoryError, RuntimeBlockDeviceResource,
+        SnapshotBlockFileBackingError, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_CONFIG_SIZE,
+        VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY,
+        VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE,
+        VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
+        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
+        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
+        VIRTIO_BLOCK_STATUS_SIZE, VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC,
+        VhostUserBlockConfigRefreshError, VhostUserBlockConfigSignalError,
+        VhostUserBlockNotificationError, VhostUserBlockState, VirtioBlockBackend,
+        VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceActivationError,
+        VirtioBlockDeviceId, VirtioBlockDeviceNotificationError, VirtioBlockQueue,
+        VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError, VirtioBlockQueueSnapshotError,
+        VirtioBlockRateLimiter, VirtioBlockRequest, VirtioBlockRequestCompletion,
+        VirtioBlockRequestError, VirtioBlockRequestExecutionError,
         VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
     };
 
@@ -6663,6 +6969,340 @@ mod tests {
             }
             send_test_vhost_user_reply(&mut stream, 24, &reply);
         })
+    }
+
+    fn spawn_test_vhost_user_refresh_peer(
+        mut stream: UnixStream,
+        initial_config: [u8; VIRTIO_BLOCK_CONFIG_SIZE],
+        refreshed_config: TestVhostUserConfigReply,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("peer read timeout should set");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("peer write timeout should set");
+            expect_test_vhost_user_request(&mut stream, 3, false, 0);
+            expect_test_vhost_user_request(&mut stream, 1, false, 0);
+            send_test_vhost_user_reply(&mut stream, 1, &SUPPORTED_VIRTIO_FEATURES.to_ne_bytes());
+            expect_test_vhost_user_request(&mut stream, 15, false, 0);
+            let protocol_features = VHOST_USER_PROTOCOL_F_CONFIG | VHOST_USER_PROTOCOL_F_REPLY_ACK;
+            send_test_vhost_user_reply(&mut stream, 15, &protocol_features.to_ne_bytes());
+            let set_protocol = expect_test_vhost_user_request(&mut stream, 16, false, 0);
+            assert_eq!(
+                test_vhost_user_u64(&set_protocol.body, 0),
+                protocol_features
+            );
+            expect_test_vhost_user_request(&mut stream, 24, false, 0);
+            let mut initial_reply = Vec::with_capacity(12 + VIRTIO_BLOCK_CONFIG_SIZE);
+            initial_reply.extend_from_slice(&0_u32.to_ne_bytes());
+            initial_reply.extend_from_slice(&(VIRTIO_BLOCK_CONFIG_SIZE as u32).to_ne_bytes());
+            initial_reply.extend_from_slice(&1_u32.to_ne_bytes());
+            initial_reply.extend_from_slice(&initial_config);
+            send_test_vhost_user_reply(&mut stream, 24, &initial_reply);
+
+            let set_features = expect_test_vhost_user_request(&mut stream, 2, true, 0);
+            assert_eq!(
+                test_vhost_user_u64(&set_features.body, 0) & !SUPPORTED_VIRTIO_FEATURES,
+                0
+            );
+            acknowledge_test_vhost_user_request(&mut stream, &set_features);
+            let memory = receive_test_vhost_user_request(&mut stream);
+            assert_eq!(memory.code, 5);
+            assert!(memory.need_reply);
+            let memory_region_count = test_vhost_user_u32(&memory.body, 0);
+            assert_ne!(memory_region_count, 0);
+            assert_eq!(memory.descriptors.len(), memory_region_count as usize);
+            acknowledge_test_vhost_user_request(&mut stream, &memory);
+            for code in [8, 9, 10] {
+                let request = expect_test_vhost_user_request(&mut stream, code, true, 0);
+                acknowledge_test_vhost_user_request(&mut stream, &request);
+            }
+            for code in [13, 12] {
+                let request = expect_test_vhost_user_request(&mut stream, code, true, 1);
+                acknowledge_test_vhost_user_request(&mut stream, &request);
+            }
+            let enable = expect_test_vhost_user_request(&mut stream, 18, true, 0);
+            assert_eq!(test_vhost_user_u32(&enable.body, 4), 1);
+            acknowledge_test_vhost_user_request(&mut stream, &enable);
+
+            expect_test_vhost_user_request(&mut stream, 24, false, 0);
+            let mut refresh_reply = Vec::new();
+            refresh_reply.extend_from_slice(&0_u32.to_ne_bytes());
+            match refreshed_config {
+                TestVhostUserConfigReply::Exact(bytes) => {
+                    refresh_reply
+                        .extend_from_slice(&(VIRTIO_BLOCK_CONFIG_SIZE as u32).to_ne_bytes());
+                    refresh_reply.extend_from_slice(&1_u32.to_ne_bytes());
+                    refresh_reply.extend_from_slice(&bytes);
+                }
+                TestVhostUserConfigReply::BackendFailure => {
+                    refresh_reply.extend_from_slice(&0_u32.to_ne_bytes());
+                    refresh_reply.extend_from_slice(&1_u32.to_ne_bytes());
+                }
+                TestVhostUserConfigReply::Malformed => {
+                    refresh_reply
+                        .extend_from_slice(&((VIRTIO_BLOCK_CONFIG_SIZE - 1) as u32).to_ne_bytes());
+                    refresh_reply.extend_from_slice(&1_u32.to_ne_bytes());
+                    refresh_reply.resize(12 + VIRTIO_BLOCK_CONFIG_SIZE - 1, 0x5a);
+                }
+            }
+            send_test_vhost_user_reply(&mut stream, 24, &refresh_reply);
+        })
+    }
+
+    fn vhost_user_refresh_device(
+        refreshed_config: TestVhostUserConfigReply,
+    ) -> (
+        VirtioBlockConfigSpace,
+        VirtioBlockDevice,
+        GuestMemory,
+        thread::JoinHandle<()>,
+    ) {
+        let (frontend_stream, peer_stream) =
+            UnixStream::pair().expect("vhost-user stream pair should open");
+        let mut initial_config = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        initial_config[..8].copy_from_slice(&1_u64.to_le_bytes());
+        let peer =
+            spawn_test_vhost_user_refresh_peer(peer_stream, initial_config, refreshed_config);
+        let frontend = PreparedVhostUserBlockFrontend::discover(
+            frontend_stream,
+            DriveCacheType::Unsafe,
+            Duration::from_secs(2),
+        )
+        .expect("vhost-user discovery should complete");
+        let config = DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+            .with_socket("/private/test-vhost.sock")
+            .validate()
+            .expect("vhost-user drive should validate");
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("test shared memory range should validate"),
+        ])
+        .expect("test shared memory layout should validate");
+        let memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("test shared guest memory should allocate");
+        let prepared = PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
+            .expect("vhost-user block should prepare with shared memory");
+        let (_, _, config_space, device) = prepared.into_parts();
+        (config_space, device, memory, peer)
+    }
+
+    fn vhost_user_refresh_handler(
+        refreshed_config: TestVhostUserConfigReply,
+    ) -> (
+        super::VirtioBlockMmioHandler,
+        GuestMemory,
+        thread::JoinHandle<()>,
+    ) {
+        let (config_space, device, memory, peer) = vhost_user_refresh_device(refreshed_config);
+        let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
+            VIRTIO_BLOCK_DEVICE_ID,
+            config_space.available_features(),
+            &VIRTIO_BLOCK_QUEUE_SIZES,
+            config_space,
+            device,
+        )
+        .expect("vhost-user block handler should build");
+        let guest_features = config_space.available_features() & !VHOST_USER_F_PROTOCOL_FEATURES;
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("vhost-user refresh handler should accept ACKNOWLEDGE");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("vhost-user refresh handler should accept DRIVER");
+        for (selector, features) in [
+            (0, guest_features as u32),
+            (
+                1,
+                u32::try_from(guest_features >> 32).expect("high feature word should fit"),
+            ),
+        ] {
+            handler
+                .write_register(VirtioMmioRegister::DriverFeaturesSel, selector)
+                .expect("vhost-user driver feature selector should write");
+            handler
+                .write_register(VirtioMmioRegister::DriverFeatures, features)
+                .expect("vhost-user driver features should write");
+        }
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("vhost-user refresh handler should accept FEATURES_OK");
+        handler
+            .write_register(VirtioMmioRegister::QueueNum, u32::from(TEST_QUEUE_SIZE))
+            .expect("vhost-user queue size should write");
+        for (register, address) in [
+            (VirtioMmioRegister::QueueDescLow, TEST_DESCRIPTOR_TABLE),
+            (VirtioMmioRegister::QueueDriverLow, TEST_AVAILABLE_RING),
+            (VirtioMmioRegister::QueueDeviceLow, TEST_USED_RING),
+        ] {
+            handler
+                .write_register(register, guest_address_low(address))
+                .expect("vhost-user queue address should write");
+        }
+        handler
+            .write_register(VirtioMmioRegister::QueueReady, 1)
+            .expect("vhost-user queue should become ready");
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("vhost-user refresh handler should activate");
+        (handler, memory, peer)
+    }
+
+    #[derive(Debug)]
+    struct TestVhostUserPciRoute {
+        message: GuestMessage,
+        delivery_ambiguity: Option<bool>,
+        signals: Arc<Mutex<usize>>,
+    }
+
+    impl GuestMessageInterrupt for TestVhostUserPciRoute {
+        fn matches(&self, message: GuestMessage) -> bool {
+            self.message == message
+        }
+
+        fn signal(&self, message: GuestMessage) -> Result<(), GuestMessageInterruptSignalError> {
+            if !self.matches(message) {
+                return Err(GuestMessageInterruptSignalError::new(
+                    "test route rejected a mismatched message",
+                    false,
+                ));
+            }
+            if let Some(delivery_ambiguous) = self.delivery_ambiguity {
+                return Err(GuestMessageInterruptSignalError::new(
+                    "injected configuration interrupt failure",
+                    delivery_ambiguous,
+                ));
+            }
+            let mut signals = self
+                .signals
+                .lock()
+                .expect("test signal count should remain available");
+            *signals = signals.saturating_add(1);
+            Ok(())
+        }
+    }
+
+    fn vhost_user_refresh_pci_endpoint(
+        refreshed_config: TestVhostUserConfigReply,
+        delivery_ambiguity: Option<bool>,
+    ) -> (
+        VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice>,
+        GuestMemory,
+        thread::JoinHandle<()>,
+        Arc<Mutex<usize>>,
+    ) {
+        let (config_space, mut device, memory, peer) = vhost_user_refresh_device(refreshed_config);
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        let registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BLOCK_DEVICE_ID,
+            config_space.available_features(),
+        )
+        .with_runtime_state(
+            [0, 1],
+            config_space.available_features() & !VHOST_USER_F_PROTOCOL_FEATURES,
+            DRIVER_OK_STATUS,
+        );
+        device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect("PCI vhost-user refresh device should activate");
+        let range = GuestMemoryRange::new(
+            GuestAddress::new(0x4_0000_0000),
+            VIRTIO_PCI_CAPABILITY_BAR_SIZE * 2,
+        )
+        .expect("test PCI BAR range should validate");
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, range);
+        let bar = allocator
+            .allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+            .expect("test PCI BAR should allocate");
+        let config_message = GuestMessage::new(0x0800_0040, 96);
+        let queue_message = GuestMessage::new(0x0800_0040, 97);
+        let signals = Arc::new(Mutex::new(0));
+        let routes: Vec<Arc<dyn GuestMessageInterrupt>> = vec![
+            Arc::new(TestVhostUserPciRoute {
+                message: config_message,
+                delivery_ambiguity,
+                signals: Arc::clone(&signals),
+            }),
+            Arc::new(TestVhostUserPciRoute {
+                message: queue_message,
+                delivery_ambiguity: None,
+                signals: Arc::new(Mutex::new(0)),
+            }),
+        ];
+        let registry = GuestMessageInterruptRegistry::new(routes)
+            .expect("test PCI message registry should validate");
+        let endpoint = VirtioPciEndpoint::new(
+            VirtioPciIdentity::new(
+                VirtioDeviceType::new(VIRTIO_BLOCK_DEVICE_ID)
+                    .expect("block device type should validate"),
+                config_space.available_features(),
+            ),
+            &VIRTIO_BLOCK_QUEUE_SIZES,
+            config_space,
+            device,
+            false,
+            &bar,
+            registry,
+        )
+        .expect("vhost-user PCI endpoint should initialize");
+        let mut bus = MmioBus::new();
+        bus.insert(
+            MmioRegionId::new(77),
+            bar.range().start(),
+            bar.range().size(),
+        )
+        .expect("test PCI BAR should register");
+        let mut handler = endpoint.bar_handler();
+        let config_entry = VIRTIO_PCI_MSIX_TABLE_OFFSET;
+        let address_access = bus
+            .lookup(bar.range().start().checked_add(config_entry).unwrap(), 8)
+            .expect("test config address write should resolve");
+        handler
+            .write(
+                address_access,
+                MmioAccessBytes::new(&config_message.address().to_le_bytes()).unwrap(),
+            )
+            .expect("test config message address should program");
+        let data_access = bus
+            .lookup(
+                bar.range().start().checked_add(config_entry + 8).unwrap(),
+                8,
+            )
+            .expect("test config data write should resolve");
+        handler
+            .write(
+                data_access,
+                MmioAccessBytes::new(&u64::from(config_message.data()).to_le_bytes()).unwrap(),
+            )
+            .expect("test config message data should program");
+        let vector_access = bus
+            .lookup(bar.range().start().checked_add(0x10).unwrap(), 2)
+            .expect("test config vector write should resolve");
+        handler
+            .write(
+                vector_access,
+                MmioAccessBytes::new(&0_u16.to_le_bytes()).unwrap(),
+            )
+            .expect("test config vector should program");
+        drop(handler);
+        drop(bar);
+        drop(allocator);
+        (endpoint, memory, peer, signals)
+    }
+
+    fn vhost_user_pci_config_snapshot(
+        endpoint: &VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice>,
+    ) -> (u32, VirtioBlockConfigSpace) {
+        endpoint
+            .admit_device_work()
+            .expect("test PCI endpoint work should admit")
+            .with_core_mut(|core| (core.device.config_generation(), core.device_config))
+            .expect("test PCI endpoint state should remain available")
     }
 
     fn prepare_disconnected_test_vhost_user_device()
@@ -8083,21 +8723,25 @@ mod tests {
     }
 
     #[test]
-    fn runtime_drive_removal_rejects_vhost_user_backend() {
+    fn runtime_drive_insert_and_removal_accept_non_root_vhost_user_backend() {
         let mut configs = DriveConfigs::new();
-        configs
-            .insert(
+        let prepared = configs
+            .prepare_runtime_insert(
                 DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
                     .with_socket("/private/vhost.sock"),
             )
-            .expect("vhost-user drive should configure");
+            .expect("vhost-user runtime insertion should prepare");
+        assert!(prepared.config().is_vhost_user());
+        assert!(configs.as_slice().is_empty());
+        configs.commit_runtime_insert(prepared);
 
-        assert!(matches!(
-            configs.prepare_runtime_removal("vhost"),
-            Err(DriveRuntimeMutationError::UnsupportedBackend)
-        ));
+        let removal = configs
+            .prepare_runtime_removal("vhost")
+            .expect("vhost-user runtime removal should prepare");
         assert_eq!(configs.as_slice().len(), 1);
         assert!(configs.as_slice()[0].is_vhost_user());
+        configs.commit_runtime_removal(removal);
+        assert!(configs.as_slice().is_empty());
     }
 
     #[test]
@@ -8257,6 +8901,47 @@ mod tests {
             .expect("pathless runtime drive update should build");
 
         assert_eq!(updated.path_on_host(), Some(Path::new("/tmp/rootfs.ext4")));
+    }
+
+    #[test]
+    fn drive_configs_accept_only_id_only_vhost_user_update() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(
+                DriveConfigInput::new_without_path_on_host("scratch", "scratch", false)
+                    .with_socket("/private/scratch.sock"),
+            )
+            .expect("vhost-user drive config should insert");
+
+        let updated = configs
+            .updated_config(DriveUpdateInput::new("scratch", "scratch", None))
+            .expect("ID-only vhost-user update should build");
+        assert_eq!(updated, configs.as_slice()[0]);
+        assert!(updated.is_vhost_user());
+
+        assert_eq!(
+            configs.updated_config(DriveUpdateInput::new(
+                "scratch",
+                "scratch",
+                Some(PathBuf::from("/tmp/not-a-vhost-update")),
+            )),
+            Err(DriveUpdateError::UnsupportedBackend)
+        );
+        assert_eq!(
+            configs.updated_config(
+                DriveUpdateInput::new("scratch", "scratch", None).with_rate_limiter(
+                    DriveRateLimiterConfig::new(
+                        None,
+                        Some(DriveTokenBucketConfig::new(1, None, 1)),
+                    ),
+                ),
+            ),
+            Err(DriveUpdateError::UnsupportedBackend)
+        );
+        assert_eq!(
+            DriveUpdateError::UnsupportedBackend.to_string(),
+            "path and rate limiter updates are unsupported for vhost-user drives"
+        );
     }
 
     #[test]
@@ -8503,6 +9188,33 @@ mod tests {
         assert_eq!(
             prepared.as_slice()[1].device().device_id().as_bytes(),
             b"01234567890123456789",
+        );
+    }
+
+    #[test]
+    fn runtime_block_resource_preserves_prepared_device_and_redacts_debug() {
+        let file = temp_file("secret-runtime-resource.img", &[0; 512]);
+        let config = config_for_drive("data", file.as_path(), false, false);
+        let prepared = PreparedBlockDevice::from_config_with_backing(&config, None)
+            .expect("runtime block resource should prepare");
+        let expected_config = prepared.config_space();
+        let expected_device_id = *prepared.device().device_id().as_bytes();
+        let resource = RuntimeBlockDeviceResource::prepared(prepared);
+
+        assert_eq!(resource.drive_id(), "data");
+        assert!(!resource.is_vhost_user());
+        let debug = format!("{resource:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("data"));
+        assert!(!debug.contains("secret-runtime-resource"));
+
+        let RuntimeBlockDeviceResource::Prepared(materialized) = resource else {
+            panic!("prepared resource should retain its concrete device")
+        };
+        assert_eq!(materialized.config_space(), expected_config);
+        assert_eq!(
+            materialized.device().device_id().as_bytes(),
+            &expected_device_id
         );
     }
 
@@ -9249,6 +9961,213 @@ mod tests {
             Ok(0)
         );
         assert_eq!(read_interrupt_status(&handler), 0);
+    }
+
+    #[test]
+    fn vhost_user_config_refresh_rejects_pre_activation_without_frontend_io() {
+        let (_config_space, mut device, _memory) = prepare_disconnected_test_vhost_user_device();
+
+        let error = device
+            .refreshed_vhost_user_config(DriveCacheType::Unsafe)
+            .expect_err("pre-activation vhost-user config refresh should reject");
+
+        assert_eq!(error, VhostUserBlockConfigRefreshError::Inactive);
+        assert!(!device.is_activated());
+        assert!(device.vhost_user_call_fd().is_some());
+    }
+
+    #[test]
+    fn vhost_user_block_handler_refreshes_exact_config_generation_and_interrupt() {
+        let mut refreshed = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        refreshed[..8].copy_from_slice(&2_u64.to_le_bytes());
+        refreshed[20..24].copy_from_slice(&512_u32.to_le_bytes());
+        let (mut handler, _memory, peer) =
+            vhost_user_refresh_handler(TestVhostUserConfigReply::Exact(refreshed));
+
+        assert_eq!(handler.device_config_handler().capacity_sectors(), 1);
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(read_interrupt_status(&handler), 0);
+
+        handler
+            .refresh_vhost_user_block_config(DriveCacheType::Unsafe)
+            .expect("vhost-user config refresh should succeed");
+
+        assert_eq!(handler.device_config_handler().bytes, refreshed);
+        assert_eq!(handler.device_config_handler().capacity_sectors(), 2);
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(1)
+        );
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Config.status().bits()
+        );
+        peer.join().expect("refresh peer should finish");
+    }
+
+    #[test]
+    fn vhost_user_block_handler_refresh_failure_preserves_config_and_generation() {
+        let (mut handler, _memory, peer) =
+            vhost_user_refresh_handler(TestVhostUserConfigReply::Malformed);
+        let original = *handler.device_config_handler();
+
+        let error = handler
+            .refresh_vhost_user_block_config(DriveCacheType::Unsafe)
+            .expect_err("malformed config refresh should fail");
+
+        assert!(matches!(
+            error,
+            DriveUpdateError::ActiveSessionCommand { .. }
+        ));
+        assert!(!error.to_string().contains("0x5a"));
+        assert_eq!(*handler.device_config_handler(), original);
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(read_interrupt_status(&handler), 0);
+        peer.join().expect("refresh peer should finish");
+    }
+
+    #[test]
+    fn vhost_user_mmio_refresh_rolls_back_confirmed_interrupt_failure() {
+        let mut refreshed = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        refreshed[..8].copy_from_slice(&2_u64.to_le_bytes());
+        let (mut handler, _memory, peer) =
+            vhost_user_refresh_handler(TestVhostUserConfigReply::Exact(refreshed));
+        let original_transport = handler.transport_state();
+        let original_config = *handler.device_config_handler();
+
+        let error = handler
+            .refresh_vhost_user_block_config_with_signal(DriveCacheType::Unsafe, || {
+                Err(VhostUserBlockConfigSignalError::new(
+                    "injected confirmed SPI failure",
+                    false,
+                ))
+            })
+            .expect_err("confirmed MMIO configuration interrupt failure should roll back");
+
+        assert!(matches!(
+            error,
+            DriveUpdateError::ActiveSessionCommand { .. }
+        ));
+        assert_eq!(handler.transport_state(), original_transport);
+        assert_eq!(*handler.device_config_handler(), original_config);
+        peer.join().expect("refresh peer should finish");
+    }
+
+    #[test]
+    fn vhost_user_mmio_refresh_is_terminal_after_ambiguous_interrupt_failure() {
+        let mut refreshed = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        refreshed[..8].copy_from_slice(&2_u64.to_le_bytes());
+        let (mut handler, _memory, peer) =
+            vhost_user_refresh_handler(TestVhostUserConfigReply::Exact(refreshed));
+
+        let error = handler
+            .refresh_vhost_user_block_config_with_signal(DriveCacheType::Unsafe, || {
+                Err(VhostUserBlockConfigSignalError::new(
+                    "injected ambiguous SPI failure",
+                    true,
+                ))
+            })
+            .expect_err("ambiguous MMIO configuration interrupt failure should be terminal");
+
+        assert!(matches!(
+            error,
+            DriveUpdateError::TerminalActiveSessionCommand { .. }
+        ));
+        assert_eq!(handler.device_config_handler().bytes, refreshed);
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(1)
+        );
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Config.status().bits()
+        );
+        peer.join().expect("refresh peer should finish");
+    }
+
+    #[test]
+    fn vhost_user_pci_refresh_delivers_exact_config_once() {
+        let mut refreshed = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        refreshed[..8].copy_from_slice(&2_u64.to_le_bytes());
+        refreshed[20..24].copy_from_slice(&512_u32.to_le_bytes());
+        let (endpoint, _memory, peer, signals) =
+            vhost_user_refresh_pci_endpoint(TestVhostUserConfigReply::Exact(refreshed), None);
+
+        endpoint
+            .refresh_vhost_user_block_config(DriveCacheType::Unsafe)
+            .expect("PCI vhost-user config refresh should succeed");
+
+        let (generation, config) = vhost_user_pci_config_snapshot(&endpoint);
+        assert_eq!(generation, 1);
+        assert_eq!(config.bytes, refreshed);
+        assert_eq!(
+            *signals
+                .lock()
+                .expect("test signal count should remain available"),
+            1
+        );
+        peer.join().expect("refresh peer should finish");
+    }
+
+    #[test]
+    fn vhost_user_pci_refresh_rolls_back_confirmed_interrupt_failure() {
+        let mut refreshed = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        refreshed[..8].copy_from_slice(&2_u64.to_le_bytes());
+        let (endpoint, _memory, peer, signals) = vhost_user_refresh_pci_endpoint(
+            TestVhostUserConfigReply::Exact(refreshed),
+            Some(false),
+        );
+        let original = vhost_user_pci_config_snapshot(&endpoint);
+
+        let error = endpoint
+            .refresh_vhost_user_block_config(DriveCacheType::Unsafe)
+            .expect_err("confirmed configuration interrupt failure should roll back");
+
+        assert!(matches!(
+            error,
+            DriveUpdateError::ActiveSessionCommand { .. }
+        ));
+        assert_eq!(vhost_user_pci_config_snapshot(&endpoint), original);
+        assert_eq!(
+            *signals
+                .lock()
+                .expect("test signal count should remain available"),
+            0
+        );
+        peer.join().expect("refresh peer should finish");
+    }
+
+    #[test]
+    fn vhost_user_pci_refresh_is_terminal_after_ambiguous_interrupt_failure() {
+        let mut refreshed = [0_u8; VIRTIO_BLOCK_CONFIG_SIZE];
+        refreshed[..8].copy_from_slice(&2_u64.to_le_bytes());
+        let (endpoint, _memory, peer, signals) =
+            vhost_user_refresh_pci_endpoint(TestVhostUserConfigReply::Exact(refreshed), Some(true));
+
+        let error = endpoint
+            .refresh_vhost_user_block_config(DriveCacheType::Unsafe)
+            .expect_err("ambiguous configuration interrupt failure should be terminal");
+
+        assert!(matches!(
+            error,
+            DriveUpdateError::TerminalActiveSessionCommand { .. }
+        ));
+        let (generation, config) = vhost_user_pci_config_snapshot(&endpoint);
+        assert_eq!(generation, 1);
+        assert_eq!(config.bytes, refreshed);
+        assert_eq!(
+            *signals
+                .lock()
+                .expect("test signal count should remain available"),
+            0
+        );
+        peer.join().expect("refresh peer should finish");
     }
 
     #[test]

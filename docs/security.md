@@ -208,7 +208,11 @@ RAM, and descriptor close is lifetime cleanup rather than hard revocation.
 Ordinary-only VMs keep anonymous RAM. Contained workers still reject ambient
 socket paths pending an authorized connected-stream handoff, and vhost
 configuration cannot coexist with dynamic memory hotplug or native-v1 capture
-in the current profile.
+in the current profile. Runtime direct insertion cannot convert an existing VM:
+the owner first requires an already-shared live profile and validates PCI,
+inventory, MMIO-region, interrupt, and metrics capacity without reserving or
+cloning anything; anonymous-profile, duplicate, root, contained, disabled-PCI,
+and exhausted requests fail before the candidate socket is contacted.
 
 ## Isolation Compatibility Checklist
 
@@ -945,8 +949,17 @@ is resource-specific:
   endpoint, increments redacted per-drive failure metrics, and leaves the API
   process responsive; it never falls back to local storage. The strict
   regular-file backend used for signed MMIO/PCI evidence is test-only and is
-  not shipped. Runtime vhost mutation and contained authorization remain
-  separate lifecycle/authority work.
+  not shipped. For a direct all-PCI VM that already owns shared RAM, a new
+  non-root runtime vhost device is discovered on the API thread only after the
+  owner-side no-effect preflight, then materialized against the exact live
+  memory and published atomically on the owner thread. For any active direct
+  MMIO or PCI device, ID-only PATCH fetches and validates all 60 config bytes
+  before replacing guest-visible config and delivering one configuration
+  interrupt; confirmed pre-delivery failure keeps the old generation, while
+  delivery ambiguity is terminal. Caller-coordinated PCI DELETE drops the
+  frontend, notifier pipes, cloned RAM descriptors, metrics lease,
+  BAR/MMIO/MSI-X state, and PCI slot. Contained authorization remains a separate
+  authority layer and no live same-ID reconnect API is invented.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. In contained mode an exact pmem grant tag is claimed during

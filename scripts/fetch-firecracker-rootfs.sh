@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v52"
+direct_boot_variant="direct-boot-v54"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -460,6 +460,14 @@ vdb_sector_starts_with_marker() {
   [ "$actual" = "$marker" ]
 }
 
+write_vdb_sector_marker() {
+  marker=$1
+  sector=$2
+  [ -b /dev/vdb ] || return 1
+  printf '%-512s' "$marker" \
+    | dd of=/dev/vdb bs=512 seek="$sector" count=1 conv=notrunc,fsync 2>/dev/null
+}
+
 vdc_starts_with_marker() {
   marker=$1
   [ -b /dev/vdc ] || return 1
@@ -564,6 +572,23 @@ check_block_hotplug_marker() {
   write_vdb_marker BANGBANG_BLOCK_HOTPLUG_READY
   sync /dev/vdb 2>/dev/null || sync
   emit_line BANGBANG_BLOCK_HOTPLUG_READY
+
+  if cmdline_has bangbang.expect-vhost-resize=1; then
+    attempts=0
+    while [ "$(cat /sys/class/block/vdb/size 2>/dev/null || true)" != 4 ]; do
+      if [ "$attempts" -ge 30 ]; then
+        block_hotplug_fail VHOST_RESIZE
+        return
+      fi
+      sleep 1
+      attempts=$((attempts + 1))
+    done
+    if ! write_vdb_sector_marker BANGBANG_VHOST_CONFIG_RESIZED 3; then
+      block_hotplug_fail VHOST_RESIZE_WRITE
+      return
+    fi
+    emit_line BANGBANG_VHOST_CONFIG_RESIZED
+  fi
 
   if ! run_runtime_block_round \
     BANGBANG_BLOCK_HOTPLUG_HOST_ONE \
@@ -2022,6 +2047,23 @@ check_vhost_user_block_marker() {
   if ! vdb_starts_with_marker "$success_marker"; then
     vhost_user_block_fail SCRATCH_VERIFY
     return
+  fi
+
+  if cmdline_has bangbang.expect-vhost-resize=1; then
+    attempts=0
+    while [ "$(cat /sys/class/block/vdb/size 2>/dev/null || true)" != 10 ]; do
+      if [ "$attempts" -ge 30 ]; then
+        vhost_user_block_fail CONFIG_RESIZE
+        return
+      fi
+      sleep 1
+      attempts=$((attempts + 1))
+    done
+    if ! write_vdb_sector_marker BANGBANG_VHOST_CONFIG_RESIZED 9; then
+      vhost_user_block_fail CONFIG_RESIZE_WRITE
+      return
+    fi
+    emit_line BANGBANG_VHOST_CONFIG_RESIZED
   fi
 
   emit_line "$success_marker"
