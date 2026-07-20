@@ -2596,16 +2596,10 @@ mod tests {
     }
 
     fn wait_for_completion(executor: &BlockAsyncExecutor) -> BlockAsyncHostCompletion {
-        for _ in 0..2_000 {
-            if let Some(completion) = executor
-                .try_recv_completion()
-                .expect("completion queue should remain connected")
-            {
-                return completion;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        panic!("host completion did not arrive");
+        executor
+            .completions
+            .recv_timeout(Duration::from_secs(2))
+            .expect("host completion should arrive before the bounded deadline")
     }
 
     #[derive(Debug, Default)]
@@ -4248,24 +4242,14 @@ mod tests {
                 ..
             })
         ));
-        for _ in 0..2_000 {
-            if executor.notification_health()
-                == Err(BlockAsyncExecutorError::Notification(
-                    io::ErrorKind::BrokenPipe,
-                ))
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
         assert_eq!(
-            executor.notification_health(),
+            executor.shutdown(),
             Err(BlockAsyncExecutorError::Notification(
                 io::ErrorKind::BrokenPipe,
             ))
         );
         assert_eq!(
-            executor.shutdown(),
+            executor.notification_health(),
             Err(BlockAsyncExecutorError::Notification(
                 io::ErrorKind::BrokenPipe,
             ))
