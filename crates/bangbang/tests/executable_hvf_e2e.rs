@@ -3358,14 +3358,16 @@ mod macos_arm64 {
             );
         }
 
-        if let Err(err) = wait_for_file_contains_marker(
+        if wait_for_file_contains_marker(
             &serial_output_path,
             BLOCK_SERIAL_END_MARKER,
             GUEST_EXECUTION_TIMEOUT,
-        ) {
+        )
+        .is_err()
+        {
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not report the MMIO Sync block identity: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not report the MMIO Sync block identity; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -9198,8 +9200,7 @@ mod macos_arm64 {
     }
 
     fn expected_block_device_id(path: &Path) -> String {
-        let metadata = fs::metadata(path)
-            .unwrap_or_else(|err| panic!("failed to read {} metadata: {err}", path.display()));
+        let metadata = fs::metadata(path).expect("block backing metadata should be readable");
         format!("{}{}{}", metadata.dev(), metadata.rdev(), metadata.ino())
             .chars()
             .take(20)
@@ -9207,8 +9208,7 @@ mod macos_arm64 {
     }
 
     fn assert_block_serial_report(path: &Path, expected: &str) {
-        let output =
-            fs::read(path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let output = fs::read(path).expect("block serial output should be readable");
         let normalized = String::from_utf8_lossy(&output).replace('\r', "");
         let expected_report = format!(
             "{}\n{expected}\n{}",

@@ -7054,8 +7054,7 @@ fn wait_for_file_contains(path: &Path, marker: &[u8], timeout: Duration) -> Resu
 }
 
 fn expected_block_device_id(path: &Path) -> String {
-    let metadata = fs::metadata(path)
-        .unwrap_or_else(|error| panic!("failed to read {} metadata: {error}", path.display()));
+    let metadata = fs::metadata(path).expect("block backing metadata should be readable");
     format!("{}{}{}", metadata.dev(), metadata.rdev(), metadata.ino())
         .chars()
         .take(20)
@@ -7063,8 +7062,7 @@ fn expected_block_device_id(path: &Path) -> String {
 }
 
 fn assert_block_serial_report(path: &Path, expected: &str, context: &str) {
-    let output =
-        fs::read(path).unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let output = fs::read(path).expect("block serial output should be readable");
     let normalized = String::from_utf8_lossy(&output).replace('\r', "");
     let expected_report = format!(
         "{}\n{expected}\n{}",
