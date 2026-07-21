@@ -280,7 +280,11 @@ mod macos_arm64 {
     const PCI_ALL_VIRTIO_GUEST_TIMEOUT: Duration = Duration::from_secs(90);
     const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
     const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
+    const SNAPSHOT_GUEST_RTC_ADDRESS: u64 = 0x4000_1000;
     const SNAPSHOT_GUEST_UART_ADDRESS: u64 = 0x4000_2000;
+    const SNAPSHOT_GUEST_VMCLOCK_ADDRESS: u64 = bangbang_runtime::memory::aarch64::SYSTEM_MEM_START
+        + bangbang_runtime::memory::aarch64::SYSTEM_MEM_SIZE
+        - bangbang_runtime::fdt::ARM64_FDT_VMCLOCK_SIZE;
     const SNAPSHOT_GUEST_VMGENID_ADDRESS: u64 = bangbang_runtime::memory::aarch64::SYSTEM_MEM_START
         + bangbang_runtime::memory::aarch64::SYSTEM_MEM_SIZE
         - bangbang_runtime::fdt::ARM64_FDT_VMCLOCK_SIZE
@@ -10174,11 +10178,15 @@ mod macos_arm64 {
             u64::try_from(image.len()).expect("guest image length should fit u64")
         );
         assert_eq!(read_test_u32(&image, 56), SNAPSHOT_GUEST_IMAGE_MAGIC);
-        assert_eq!(read_test_u32(&image, 64 + (9 * 4)), 0x5400_0061);
-        assert_eq!(read_test_u32(&image, 64 + (11 * 4)), 0x54ff_ff80);
-        assert_eq!(read_test_u32(&image, 64 + (16 * 4)), 0xd400_0002);
-        assert_eq!(read_test_u32(&image, 64 + (17 * 4)), 0x1400_0000);
+        assert_eq!(read_test_u32(&image, 64 + (16 * 4)), aarch64_b_cond(-2, 0));
+        assert_eq!(
+            read_test_u32(&image, 64 + (20 * 4)),
+            aarch64_tbnz_w(11, 0, -6)
+        );
+        assert_eq!(read_test_u32(&image, 64 + (39 * 4)), 0xd400_0002);
+        assert_eq!(read_test_u32(&image, 64 + (40 * 4)), 0x1400_0000);
         assert_eq!(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0x801f_eff0);
+        assert_eq!(SNAPSHOT_GUEST_VMCLOCK_ADDRESS, 0x801f_f000);
     }
 
     fn snapshot_load_body(state_path: &Path, memory_path: &Path, resume_vm: bool) -> String {
@@ -10361,20 +10369,45 @@ mod macos_arm64 {
 
     fn snapshot_continuity_guest_image() -> Vec<u8> {
         assert_eq!(SNAPSHOT_GUEST_VMGENID_ADDRESS >> 32, 0);
+        assert_eq!(SNAPSHOT_GUEST_VMCLOCK_ADDRESS >> 32, 0);
+        assert_eq!(SNAPSHOT_GUEST_RTC_ADDRESS >> 32, 0);
         assert_eq!(SNAPSHOT_GUEST_UART_ADDRESS >> 32, 0);
         let instructions = [
             aarch64_movz_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0), 0),
             aarch64_movk_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 16), 16),
             aarch64_ldp_x(2, 3, 1),
+            aarch64_movz_x(8, low_u16(SNAPSHOT_GUEST_VMCLOCK_ADDRESS, 0), 0),
+            aarch64_movk_x(8, low_u16(SNAPSHOT_GUEST_VMCLOCK_ADDRESS, 16), 16),
+            aarch64_ldr_x(9, 8, 16),
+            aarch64_ldr_x(10, 8, 104),
+            aarch64_movz_x(15, low_u16(SNAPSHOT_GUEST_RTC_ADDRESS, 0), 0),
+            aarch64_movk_x(15, low_u16(SNAPSHOT_GUEST_RTC_ADDRESS, 16), 16),
+            aarch64_ldr_w(16, 15, 0),
             aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
             aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
             aarch64_movz_x(7, u16::from(b'R'), 0),
             aarch64_strb_w(7, 4),
             aarch64_ldp_x(5, 6, 1),
             aarch64_cmp_x(5, 2),
-            0x5400_0061, // b.ne changed (three instructions forward)
+            aarch64_b_cond(-2, 0), // b.eq poll
             aarch64_cmp_x(6, 3),
-            0x54ff_ff80, // b.eq compare (four instructions backward)
+            aarch64_b_cond(-4, 0), // b.eq poll
+            aarch64_ldr_w(11, 8, 12),
+            aarch64_tbnz_w(11, 0, -6),
+            0xd503_39bf, // dmb ishld
+            aarch64_ldr_x(12, 8, 16),
+            aarch64_ldr_x(13, 8, 104),
+            0xd503_39bf, // dmb ishld
+            aarch64_ldr_w(14, 8, 12),
+            aarch64_cmp_w(14, 11),
+            aarch64_b_cond(-13, 1), // b.ne poll
+            aarch64_cmp_x(12, 9),
+            aarch64_b_cond(-15, 0), // b.eq poll
+            aarch64_cmp_x(13, 10),
+            aarch64_b_cond(-17, 0), // b.eq poll
+            aarch64_ldr_w(17, 15, 0),
+            aarch64_cmp_w(17, 16),
+            aarch64_b_cond(-20, 3), // b.lo poll
             aarch64_movz_x(7, u16::from(b'C'), 0),
             aarch64_strb_w(7, 4),
             aarch64_movz_x(0, 0x0008, 0),
@@ -10411,9 +10444,40 @@ mod macos_arm64 {
         0xa940_0000 | (second << 10) | (base << 5) | first
     }
 
+    fn aarch64_ldr_x(destination: u32, base: u32, byte_offset: u32) -> u32 {
+        assert!(destination <= 30 && base <= 30);
+        assert!(byte_offset.is_multiple_of(8) && byte_offset / 8 <= 0xfff);
+        0xf940_0000 | ((byte_offset / 8) << 10) | (base << 5) | destination
+    }
+
+    fn aarch64_ldr_w(destination: u32, base: u32, byte_offset: u32) -> u32 {
+        assert!(destination <= 30 && base <= 30);
+        assert!(byte_offset.is_multiple_of(4) && byte_offset / 4 <= 0xfff);
+        0xb940_0000 | ((byte_offset / 4) << 10) | (base << 5) | destination
+    }
+
     fn aarch64_cmp_x(left: u32, right: u32) -> u32 {
         assert!(left <= 30 && right <= 30);
         0xeb00_001f | (right << 16) | (left << 5)
+    }
+
+    fn aarch64_cmp_w(left: u32, right: u32) -> u32 {
+        assert!(left <= 30 && right <= 30);
+        0x6b00_001f | (right << 16) | (left << 5)
+    }
+
+    fn aarch64_b_cond(instruction_offset: i32, condition: u32) -> u32 {
+        assert!((-262_144..262_144).contains(&instruction_offset));
+        assert!(condition <= 0xf);
+        let immediate = instruction_offset.cast_unsigned() & 0x7_ffff;
+        0x5400_0000 | (immediate << 5) | condition
+    }
+
+    fn aarch64_tbnz_w(register: u32, bit: u32, instruction_offset: i32) -> u32 {
+        assert!(register <= 30 && bit <= 31);
+        assert!((-8192..8192).contains(&instruction_offset));
+        let immediate = instruction_offset.cast_unsigned() & 0x3fff;
+        0x3700_0000 | (bit << 19) | (immediate << 5) | register
     }
 
     fn aarch64_strb_w(source: u32, base: u32) -> u32 {

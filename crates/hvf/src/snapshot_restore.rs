@@ -23,7 +23,7 @@ use crate::coordinator::HvfVcpuRunCoordinatorError;
 use crate::gic::HvfGicError;
 use crate::runner::HvfVcpuRunnerError;
 use crate::snapshot_bundle::{HvfSnapshotV1Bundle, HvfSnapshotV1BundleError, HvfSnapshotV1State};
-use crate::startup::HvfArm64BootVmGenIdRestoreError;
+use crate::startup::{HvfArm64BootTimeIdentityRestoreError, HvfArm64BootVmGenIdRestoreError};
 
 const REDACTED: &str = "<redacted>";
 
@@ -285,6 +285,7 @@ pub enum HvfSnapshotV1RestoreStage {
     StartBlockRetryScheduler,
     RestoreRunnerState,
     ReplaceVmGenId,
+    RestoreTimeIdentity,
     AssembleSession,
 }
 
@@ -300,6 +301,7 @@ impl fmt::Display for HvfSnapshotV1RestoreStage {
             Self::StartBlockRetryScheduler => "block retry scheduler startup",
             Self::RestoreRunnerState => "aggregate runner restore",
             Self::ReplaceVmGenId => "VMGenID replacement",
+            Self::RestoreTimeIdentity => "VMClock and VMGenID restore",
             Self::AssembleSession => "restored session assembly",
         };
         f.write_str(name)
@@ -384,6 +386,7 @@ pub enum HvfSnapshotV1RestoreFailure {
     Coordinator(Box<HvfVcpuRunCoordinatorError>),
     Scheduler(std::io::ErrorKind),
     VmGenId(Box<HvfArm64BootVmGenIdRestoreError>),
+    TimeIdentity(Box<HvfArm64BootTimeIdentityRestoreError>),
     InvalidRuntime,
 }
 
@@ -405,6 +408,9 @@ impl fmt::Display for HvfSnapshotV1RestoreFailure {
                 write!(f, "native-v1 scheduler startup failed with {kind:?}")
             }
             Self::VmGenId(source) => write!(f, "native-v1 VMGenID restore failed: {source}"),
+            Self::TimeIdentity(source) => {
+                write!(f, "native-v1 time/identity restore failed: {source}")
+            }
             Self::InvalidRuntime => f.write_str("native-v1 installed runtime is invalid"),
         }
     }
@@ -418,11 +424,30 @@ impl std::error::Error for HvfSnapshotV1RestoreFailure {
             Self::Runner(source) => Some(source.as_ref()),
             Self::Coordinator(source) => Some(source.as_ref()),
             Self::VmGenId(source) => Some(source.as_ref()),
+            Self::TimeIdentity(source) => Some(source.as_ref()),
             Self::GicMetadataMismatch
             | Self::DirtyTracking
             | Self::MemoryMapping
             | Self::Scheduler(_)
             | Self::InvalidRuntime => None,
+        }
+    }
+}
+
+impl HvfSnapshotV1RestoreFailure {
+    const fn destination_committed(&self) -> bool {
+        match self {
+            Self::VmGenId(source) => source.is_committed(),
+            Self::TimeIdentity(source) => source.is_committed(),
+            Self::Backend(_)
+            | Self::Gic(_)
+            | Self::GicMetadataMismatch
+            | Self::DirtyTracking
+            | Self::MemoryMapping
+            | Self::Runner(_)
+            | Self::Coordinator(_)
+            | Self::Scheduler(_)
+            | Self::InvalidRuntime => false,
         }
     }
 }
@@ -433,6 +458,7 @@ pub struct HvfSnapshotV1RestoreError {
     stage: HvfSnapshotV1RestoreStage,
     failure: HvfSnapshotV1RestoreFailure,
     cleanup: HvfSnapshotV1RestoreCleanup,
+    destination_committed: bool,
 }
 
 impl HvfSnapshotV1RestoreError {
@@ -441,10 +467,25 @@ impl HvfSnapshotV1RestoreError {
         failure: HvfSnapshotV1RestoreFailure,
         cleanup: HvfSnapshotV1RestoreCleanup,
     ) -> Self {
+        let destination_committed = failure.destination_committed();
         Self {
             stage,
             failure,
             cleanup,
+            destination_committed,
+        }
+    }
+
+    pub(crate) const fn new_after_destination_commit(
+        stage: HvfSnapshotV1RestoreStage,
+        failure: HvfSnapshotV1RestoreFailure,
+        cleanup: HvfSnapshotV1RestoreCleanup,
+    ) -> Self {
+        Self {
+            stage,
+            failure,
+            cleanup,
+            destination_committed: true,
         }
     }
 
@@ -460,8 +501,12 @@ impl HvfSnapshotV1RestoreError {
         &self.cleanup
     }
 
+    pub const fn destination_committed(&self) -> bool {
+        self.destination_committed
+    }
+
     pub const fn disposition(&self) -> HvfSnapshotV1RestoreDisposition {
-        if self.cleanup.is_complete() {
+        if self.cleanup.is_complete() && !self.destination_committed {
             HvfSnapshotV1RestoreDisposition::Retryable
         } else {
             HvfSnapshotV1RestoreDisposition::Terminal
@@ -473,10 +518,11 @@ impl fmt::Display for HvfSnapshotV1RestoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "native-v1 restore failed during {}: {}; disposition={:?}",
+            "native-v1 restore failed during {}: {}; disposition={:?}; destination_committed={}",
             self.stage,
             self.failure,
-            self.disposition()
+            self.disposition(),
+            self.destination_committed
         )
     }
 }
@@ -593,6 +639,7 @@ mod tests {
     use bangbang_runtime::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange, aarch64};
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::rtc::RtcMmioLayout;
+    use bangbang_runtime::vmclock::VmClockRestoreUpdateError;
 
     use super::{
         HvfSnapshotV1PlatformError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
@@ -602,6 +649,7 @@ mod tests {
     use crate::snapshot_bundle::{
         HvfSnapshotV1CompatibilityState, HvfSnapshotV1State, tests::fixture,
     };
+    use crate::startup::{HvfArm64BootTimeIdentityRestoreError, HvfArm64BootVmClockRestoreError};
 
     fn memory_for(state: &HvfSnapshotV1State) -> bangbang_runtime::memory::GuestMemory {
         let size = state.machine().mem_size_mib() * 1024 * 1024;
@@ -705,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_disposition_depends_only_on_explicit_cleanup_evidence() {
+    fn restore_disposition_uses_cleanup_and_destination_commit_evidence() {
         let retryable = HvfSnapshotV1RestoreError::new(
             HvfSnapshotV1RestoreStage::AssembleSession,
             HvfSnapshotV1RestoreFailure::InvalidRuntime,
@@ -731,6 +779,34 @@ mod tests {
             terminal.disposition(),
             HvfSnapshotV1RestoreDisposition::Terminal
         );
+
+        let committed = HvfSnapshotV1RestoreError::new(
+            HvfSnapshotV1RestoreStage::RestoreTimeIdentity,
+            HvfSnapshotV1RestoreFailure::TimeIdentity(Box::new(
+                HvfArm64BootTimeIdentityRestoreError::VmClock {
+                    source: HvfArm64BootVmClockRestoreError::Update {
+                        source: VmClockRestoreUpdateError::InvalidRange,
+                    },
+                },
+            )),
+            HvfSnapshotV1RestoreCleanup::new(false, None, None),
+        );
+        assert_eq!(
+            committed.disposition(),
+            HvfSnapshotV1RestoreDisposition::Terminal
+        );
+        assert!(committed.destination_committed());
+
+        let later_failure = HvfSnapshotV1RestoreError::new_after_destination_commit(
+            HvfSnapshotV1RestoreStage::AssembleSession,
+            HvfSnapshotV1RestoreFailure::InvalidRuntime,
+            HvfSnapshotV1RestoreCleanup::new(false, None, None),
+        );
+        assert_eq!(
+            later_failure.disposition(),
+            HvfSnapshotV1RestoreDisposition::Terminal
+        );
+        assert!(later_failure.destination_committed());
 
         let mapping = HvfSnapshotV1RestoreError::new(
             HvfSnapshotV1RestoreStage::MapMemory,

@@ -907,6 +907,18 @@ borrowed and owned boot-session coverage must prove the retained value and
 guest buffer change together and that the real edge-rising SPI injection
 succeeds before first run. A signal failure is a post-commit partial result,
 not a rollback assertion.
+VMClock tests must pin all 112 ABI bytes and field offsets, valid enumerations,
+required/unknown flags, padding, even capture sequence, wrapping disruption and
+generation counters, and the odd/release/counters/release/even publication
+order. Failure injection must distinguish a mutation-free first-write failure
+from every committed prefix and from post-update SPI failure. Native-v1 codec
+tests must cover exact `BANGDEV\0` 1.1.0 state, legacy 1.0.0 recovery from guest
+memory, encoded-memory disagreement, malformed ABI, and trailing data. Aggregate
+restore tests must prove VMGenID write/notification precedes VMClock
+update/notification after runner/GIC restore, and that any later fault is
+terminal even after complete cleanup. PL031 load tests must bound the data
+register by destination wall clock and assert every unsupported alarm register
+is clear.
 Pointer-authentication key signed tests must use visibly non-secret sentinels,
 must not enable or execute PAC instructions, and must assert that debug output
 contains no raw key material. Failure assertions must not format actual key
@@ -1308,8 +1320,8 @@ after both captures, the original source continues from its retained PC to the
 next fixed HVC and the runner owner remains usable before shutdown. After source
 shutdown, the already loaded production-published pair constructs a fresh
 destination VM and verifies pre-run vCPU/ICC/pending/device state, normalized
-timer equivalence, VMGenID replacement, absent boot-origin metadata, and
-continuation from the captured PC. Opaque GIC bytes are asserted nonempty and
+timer equivalence, ordered VMGenID/VMClock restore, absent boot-origin metadata,
+and continuation from the captured PC. Opaque GIC bytes are asserted nonempty and
 bounded after recapture rather than byte-equal because Hypervisor.framework's
 stable versioned serialization is not a canonical encoding.
 This one-vCPU artifact transaction combines with the signed executable's exact
@@ -1385,15 +1397,17 @@ API or a Firecracker-shaped config file depending on the scenario, and waits for
 the guest to write deterministic markers to host-observable outputs. The
 native-v1 snapshot scenario uses a test-only arm64 Image with a valid Linux
 header and no rootfs dependency for guest control flow. The guest saves both
-halves of VMGenID, writes one UART readiness byte, and loops at the captured PC.
+halves of VMGenID, the VMClock disruption/generation counters, and PL031 time,
+writes one UART readiness byte, and loops at the captured PC.
 The host polls public `FlushMetrics` until `uart.write_count` changes, pauses and
 creates through `/snapshot/create`, checks public collision/no-clobber
 redaction, and terminates the source. Two fresh signed processes load the same
 immutable pair: one remains paused until public `PATCH /vm`, and one uses
 `resume_vm: true`. Guest PSCI `SYSTEM_OFF` is reachable only after a changed
-VMGenID is observed, so clean process exit proves VMGenID replacement and
-continuation from captured register/memory state without a fixed readiness
-sleep. Run just this proof with:
+VMGenID is observed, the VMClock sequence is stable and even with both counters
+changed, and destination RTC has not regressed. Clean process exit therefore
+proves the ordered time/identity updates and continuation from captured
+register/memory state without a fixed readiness sleep. Run just this proof with:
 
 ```sh
 scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
@@ -1838,8 +1852,9 @@ connection exchange through the signed executable, including sustained
 bidirectional streams and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, that RTC alarm
-interrupts, mutable VMClock restore signaling or guest observation,
-or broader RTC-adjacent time/identity behavior is supported, or that full
+interrupts, ARM PVTime, cross-host clock portability, or broader
+RTC-adjacent behavior beyond the checked PL031/VMGenID/VMClock contract is
+supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 Entropy optional-device encoding, restore, migration/clone, and cross-host
 token-clock portability remain the exact Wave 6 handoff.

@@ -19,6 +19,7 @@ use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioDeviceRegisters,
     VirtioMmioQueueState, VirtioMmioTransportState,
 };
+use crate::vmclock::{VMCLOCK_ABI_SIZE, VmClockAbi};
 
 pub const SNAPSHOT_V1_DEVICE_MAGIC: [u8; 8] = *b"BANGDEV\0";
 pub const SNAPSHOT_V1_DEVICE_MAX_SIZE: usize = 16 * 1024;
@@ -28,8 +29,9 @@ pub const SNAPSHOT_V1_DEVICE_MAX_PARTUUID_BYTES: usize = 255;
 
 const SNAPSHOT_V1_DEVICE_HEADER_SIZE: usize = 32;
 const SNAPSHOT_V1_DEVICE_MAJOR: u16 = 1;
-const SNAPSHOT_V1_DEVICE_MINOR: u16 = 0;
+const SNAPSHOT_V1_DEVICE_MINOR: u16 = 1;
 const SNAPSHOT_V1_DEVICE_PATCH: u16 = 0;
+const SNAPSHOT_V1_DEVICE_LEGACY_MINOR: u16 = 0;
 const SNAPSHOT_V1_DEVICE_PROFILE: u16 = 1;
 const SNAPSHOT_V1_DEVICE_FLAGS: u32 = 0;
 const SNAPSHOT_V1_DEVICE_BLOCK_COUNT: u16 = 1;
@@ -242,6 +244,7 @@ pub struct SnapshotV1DeviceState {
     serial_state: SerialMmioState,
     vmgenid: SnapshotV1PlatformDeviceMetadata,
     vmclock: SnapshotV1PlatformDeviceMetadata,
+    vmclock_abi: Option<VmClockAbi>,
 }
 
 impl SnapshotV1DeviceState {
@@ -252,6 +255,7 @@ impl SnapshotV1DeviceState {
         serial_state: SerialMmioState,
         vmgenid: SnapshotV1PlatformDeviceMetadata,
         vmclock: SnapshotV1PlatformDeviceMetadata,
+        vmclock_abi: Option<VmClockAbi>,
     ) -> Self {
         Self {
             root_block,
@@ -260,6 +264,7 @@ impl SnapshotV1DeviceState {
             serial_state,
             vmgenid,
             vmclock,
+            vmclock_abi,
         }
     }
 
@@ -285,6 +290,10 @@ impl SnapshotV1DeviceState {
 
     pub const fn vmclock(&self) -> SnapshotV1PlatformDeviceMetadata {
         self.vmclock
+    }
+
+    pub const fn vmclock_abi(&self) -> Option<VmClockAbi> {
+        self.vmclock_abi
     }
 }
 
@@ -333,6 +342,8 @@ pub enum SnapshotV1DeviceCaptureError {
     InvalidSerialMetadata,
     InvalidVmGenIdMetadata,
     InvalidVmClockMetadata,
+    ReadVmClock,
+    InvalidVmClockAbi,
 }
 
 impl fmt::Display for SnapshotV1DeviceCaptureError {
@@ -372,6 +383,12 @@ impl fmt::Display for SnapshotV1DeviceCaptureError {
             Self::InvalidVmClockMetadata => {
                 f.write_str("snapshot device capture VMClock metadata is invalid")
             }
+            Self::ReadVmClock => {
+                f.write_str("snapshot device capture could not read the VMClock ABI")
+            }
+            Self::InvalidVmClockAbi => {
+                f.write_str("snapshot device capture VMClock ABI is invalid")
+            }
         }
     }
 }
@@ -406,6 +423,13 @@ pub fn capture_snapshot_v1_device_state(
         .map_err(|_| SnapshotV1DeviceCaptureError::InvalidVmGenIdMetadata)?;
     validate_platform_metadata(input.vmclock, ARM64_FDT_VMCLOCK_SIZE, input.memory)
         .map_err(|_| SnapshotV1DeviceCaptureError::InvalidVmClockMetadata)?;
+    let mut vmclock_bytes = [0; VMCLOCK_ABI_SIZE];
+    input
+        .memory
+        .read_slice(&mut vmclock_bytes, input.vmclock.range().start())
+        .map_err(|_| SnapshotV1DeviceCaptureError::ReadVmClock)?;
+    let vmclock_abi = VmClockAbi::from_bytes(vmclock_bytes)
+        .map_err(|_| SnapshotV1DeviceCaptureError::InvalidVmClockAbi)?;
 
     if matches!(
         input.block_retry,
@@ -468,6 +492,7 @@ pub fn capture_snapshot_v1_device_state(
         input.serial_state,
         input.vmgenid,
         input.vmclock,
+        Some(vmclock_abi),
     ))
 }
 
@@ -588,6 +613,7 @@ pub enum SnapshotV1DeviceDecodeError {
     InvalidTransport,
     InvalidLimiter,
     InvalidRetry,
+    InvalidVmClockAbi,
 }
 
 impl fmt::Display for SnapshotV1DeviceDecodeError {
@@ -617,6 +643,7 @@ impl fmt::Display for SnapshotV1DeviceDecodeError {
             Self::InvalidTransport => f.write_str("native-v1 virtio transport is invalid"),
             Self::InvalidLimiter => f.write_str("native-v1 block limiter is invalid"),
             Self::InvalidRetry => f.write_str("native-v1 block retry is invalid"),
+            Self::InvalidVmClockAbi => f.write_str("native-v1 VMClock ABI is invalid"),
         }
     }
 }
@@ -678,7 +705,14 @@ pub fn encode_snapshot_v1_device_state(
         .map_err(|_| SnapshotV1DeviceEncodeError::Allocation)?;
     output.extend_from_slice(&SNAPSHOT_V1_DEVICE_MAGIC);
     write_u16(&mut output, SNAPSHOT_V1_DEVICE_MAJOR);
-    write_u16(&mut output, SNAPSHOT_V1_DEVICE_MINOR);
+    write_u16(
+        &mut output,
+        if state.vmclock_abi().is_some() {
+            SNAPSHOT_V1_DEVICE_MINOR
+        } else {
+            SNAPSHOT_V1_DEVICE_LEGACY_MINOR
+        },
+    );
     write_u16(&mut output, SNAPSHOT_V1_DEVICE_PATCH);
     write_u16(&mut output, SNAPSHOT_V1_DEVICE_PROFILE);
     write_u32(&mut output, SNAPSHOT_V1_DEVICE_FLAGS);
@@ -730,6 +764,9 @@ pub fn encode_snapshot_v1_device_state(
     encode_serial_state(&mut output, state.serial_state());
     encode_platform_metadata(&mut output, state.vmgenid());
     encode_platform_metadata(&mut output, state.vmclock());
+    if let Some(vmclock_abi) = state.vmclock_abi() {
+        output.extend_from_slice(&vmclock_abi.to_bytes());
+    }
 
     if output.len() > SNAPSHOT_V1_DEVICE_MAX_SIZE {
         return Err(SnapshotV1DeviceEncodeError::TooLarge);
@@ -1034,15 +1071,13 @@ pub fn decode_snapshot_v1_device_state(
         return Err(SnapshotV1DeviceDecodeError::InvalidMagic);
     }
     let version = (reader.read_u16()?, reader.read_u16()?, reader.read_u16()?);
-    if version
-        != (
-            SNAPSHOT_V1_DEVICE_MAJOR,
-            SNAPSHOT_V1_DEVICE_MINOR,
-            SNAPSHOT_V1_DEVICE_PATCH,
-        )
-    {
-        return Err(SnapshotV1DeviceDecodeError::UnsupportedVersion);
-    }
+    let has_vmclock_abi = match version {
+        (SNAPSHOT_V1_DEVICE_MAJOR, SNAPSHOT_V1_DEVICE_MINOR, SNAPSHOT_V1_DEVICE_PATCH) => true,
+        (SNAPSHOT_V1_DEVICE_MAJOR, SNAPSHOT_V1_DEVICE_LEGACY_MINOR, SNAPSHOT_V1_DEVICE_PATCH) => {
+            false
+        }
+        _ => return Err(SnapshotV1DeviceDecodeError::UnsupportedVersion),
+    };
     if reader.read_u16()? != SNAPSHOT_V1_DEVICE_PROFILE {
         return Err(SnapshotV1DeviceDecodeError::UnsupportedProfile);
     }
@@ -1100,6 +1135,14 @@ pub fn decode_snapshot_v1_device_state(
     let serial_state = decode_serial_state(&mut reader)?;
     let vmgenid = decode_platform_metadata(&mut reader)?;
     let vmclock = decode_platform_metadata(&mut reader)?;
+    let vmclock_abi = if has_vmclock_abi {
+        Some(
+            VmClockAbi::from_bytes(reader.read_array::<VMCLOCK_ABI_SIZE>()?)
+                .map_err(|_| SnapshotV1DeviceDecodeError::InvalidVmClockAbi)?,
+        )
+    } else {
+        None
+    };
 
     if !reader.is_finished() {
         return Err(SnapshotV1DeviceDecodeError::TrailingData);
@@ -1125,6 +1168,7 @@ pub fn decode_snapshot_v1_device_state(
         serial_state,
         vmgenid,
         vmclock,
+        vmclock_abi,
     ))
 }
 
@@ -1503,7 +1547,11 @@ mod tests {
     use crate::machine::MachineConfig;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange, aarch64};
     use crate::mmio::{MmioRegion, MmioRegionId};
-    use crate::rtc::RtcMmioLayout;
+    use crate::rtc::{
+        Pl031RtcDevice, RTC_CONTROL_REGISTER_OFFSET, RTC_DATA_REGISTER_OFFSET,
+        RTC_INTERRUPT_MASK_REGISTER_OFFSET, RTC_MASKED_INTERRUPT_STATUS_REGISTER_OFFSET,
+        RTC_MATCH_REGISTER_OFFSET, RTC_RAW_INTERRUPT_STATUS_REGISTER_OFFSET, RtcMmioLayout,
+    };
     use crate::serial::SerialMmioState;
     use crate::startup::{
         PrepareSnapshotV1DeviceProfileError, install_snapshot_v1_runtime,
@@ -1515,6 +1563,7 @@ mod tests {
         VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceRegisters, VirtioMmioQueueState,
         VirtioMmioTransportState,
     };
+    use crate::vmclock::VmClockAbi;
 
     use super::{
         SNAPSHOT_V1_DEVICE_HEADER_SIZE, SNAPSHOT_V1_DEVICE_MAGIC,
@@ -1635,6 +1684,7 @@ mod tests {
             SerialMmioState::new(1, 0x83, 3, 0x5a, 0x34, 0x12),
             platform(0x1000, 16, 34),
             platform(0x2000, 4096, 35),
+            Some(VmClockAbi::initial()),
         )
     }
 
@@ -1649,6 +1699,18 @@ mod tests {
             )
             .expect("test backing identity should be valid"),
         )
+    }
+
+    fn write_fixture_vmclock(memory: &mut GuestMemory, state: &SnapshotV1DeviceState) {
+        memory
+            .write_slice(
+                &state
+                    .vmclock_abi()
+                    .expect("current fixture should carry VMClock state")
+                    .to_bytes(),
+                state.vmclock().range().start(),
+            )
+            .expect("fixture VMClock ABI should write");
     }
 
     #[test]
@@ -1669,12 +1731,28 @@ mod tests {
                 .is_regular_file()
         );
         assert_eq!(&first[..8], &SNAPSHOT_V1_DEVICE_MAGIC);
-        assert_eq!(first.len(), 566);
+        assert_eq!(first.len(), 678);
         assert_eq!(
             u32::from_le_bytes(first[20..24].try_into().expect("body length should exist")),
             u32::try_from(first.len() - SNAPSHOT_V1_DEVICE_HEADER_SIZE)
                 .expect("fixture length should fit")
         );
+    }
+
+    #[test]
+    fn native_v1_device_codec_retains_legacy_vmclock_page_policy() {
+        let mut state = fixture();
+        state.vmclock_abi = None;
+
+        let encoded =
+            encode_snapshot_v1_device_state(&state).expect("legacy fixture should encode");
+        let decoded =
+            decode_snapshot_v1_device_state(&encoded).expect("legacy fixture should decode");
+
+        assert_eq!(encoded.len(), 566);
+        assert_eq!(u16::from_le_bytes([encoded[10], encoded[11]]), 0);
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.vmclock_abi(), None);
     }
 
     #[test]
@@ -1798,6 +1876,15 @@ mod tests {
             decode_snapshot_v1_device_state(&trailing).expect_err("trailing byte should reject"),
             SnapshotV1DeviceDecodeError::TrailingData
         );
+
+        let mut invalid_vmclock = encoded.clone();
+        let vmclock_offset = invalid_vmclock.len() - super::VMCLOCK_ABI_SIZE;
+        invalid_vmclock[vmclock_offset] ^= 0xff;
+        assert_eq!(
+            decode_snapshot_v1_device_state(&invalid_vmclock)
+                .expect_err("invalid VMClock payload should reject"),
+            SnapshotV1DeviceDecodeError::InvalidVmClockAbi
+        );
     }
 
     #[test]
@@ -1861,6 +1948,7 @@ mod tests {
         memory
             .write_slice(&generation_id, state.vmgenid().range().start())
             .expect("source generation should write");
+        write_fixture_vmclock(&mut memory, &state);
 
         let prepared = prepare_snapshot_v1_device_profile(&state, &memory, Instant::now())
             .expect("supported device state should prepare");
@@ -1886,6 +1974,7 @@ mod tests {
         );
         assert!(prepared.serial_handler().output().metrics().is_empty());
         assert_eq!(prepared.vmgenid_device().generation_id, generation_id);
+        assert_eq!(prepared.vmclock_device().abi, VmClockAbi::initial());
         assert!(format!("{prepared:?}").contains("<redacted>"));
         assert!(!format!("{prepared:?}").contains(file.path().to_string_lossy().as_ref()));
 
@@ -1911,6 +2000,24 @@ mod tests {
             prepare_snapshot_v1_device_profile(&unrelated_identity_state, &memory, Instant::now(),)
                 .expect_err("unrelated persisted block ID should reject"),
             PrepareSnapshotV1DeviceProfileError::BlockDeviceIdMismatch
+        );
+
+        let mut legacy_vmclock_state = state.clone();
+        legacy_vmclock_state.vmclock_abi = None;
+        let legacy =
+            prepare_snapshot_v1_device_profile(&legacy_vmclock_state, &memory, Instant::now())
+                .expect("legacy device state should recover VMClock from memory");
+        assert_eq!(legacy.vmclock_device().abi, VmClockAbi::initial());
+
+        let mut different_vmclock_bytes = VmClockAbi::initial().to_bytes();
+        different_vmclock_bytes[104..112].copy_from_slice(&1_u64.to_le_bytes());
+        memory
+            .write_slice(&different_vmclock_bytes, state.vmclock().range().start())
+            .expect("different valid VMClock should write");
+        assert_eq!(
+            prepare_snapshot_v1_device_profile(&state, &memory, Instant::now())
+                .expect_err("encoded and memory VMClock mismatch should reject"),
+            PrepareSnapshotV1DeviceProfileError::VmClockStateMismatch
         );
 
         let mut duplicate_region_id = state.clone();
@@ -1964,10 +2071,11 @@ mod tests {
         memory
             .write_slice(&[0x7a; 16], state.vmgenid().range().start())
             .expect("source generation should write");
+        write_fixture_vmclock(&mut memory, &state);
 
         let prepared = prepare_snapshot_v1_device_profile(&state, &memory, Instant::now())
             .expect("supported device state should prepare");
-        let installed = install_snapshot_v1_runtime(
+        let mut installed = install_snapshot_v1_runtime(
             prepared,
             MachineConfig::default(),
             memory,
@@ -1991,6 +2099,37 @@ mod tests {
         assert_eq!(installed.drive_config.path_on_host(), Some(file.path()));
         assert_eq!(installed.block_retry, SnapshotV1BlockRetryState::None);
         assert_eq!(installed.mmio_dispatcher.regions().len(), 3);
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_secs();
+        let before = u32::try_from(before).expect("PL031 test time should fit u32");
+        let rtc = installed
+            .mmio_dispatcher
+            .handler_mut::<Pl031RtcDevice>(MmioRegionId::new(10))
+            .expect("restored runtime should reconstruct PL031");
+        let observed = rtc
+            .read_register(RTC_DATA_REGISTER_OFFSET)
+            .expect("restored PL031 wall clock should read");
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_secs();
+        let after = u32::try_from(after).expect("PL031 test time should fit u32");
+        assert!((before..=after).contains(&observed));
+        for offset in [
+            RTC_MATCH_REGISTER_OFFSET,
+            RTC_CONTROL_REGISTER_OFFSET,
+            RTC_INTERRUPT_MASK_REGISTER_OFFSET,
+            RTC_RAW_INTERRUPT_STATUS_REGISTER_OFFSET,
+            RTC_MASKED_INTERRUPT_STATUS_REGISTER_OFFSET,
+        ] {
+            assert_eq!(
+                rtc.read_register(offset)
+                    .expect("fresh PL031 no-alarm register should read"),
+                0
+            );
+        }
         assert_eq!(
             installed
                 .serial_output_buffer
@@ -2030,6 +2169,7 @@ mod tests {
         memory
             .write_slice(&[0x6b; 16], state.vmgenid().range().start())
             .expect("source generation should write");
+        write_fixture_vmclock(&mut memory, &state);
 
         let prepared = prepare_snapshot_v1_device_profile_with_root_backing(
             &state,

@@ -59,7 +59,8 @@ policy plus ordered nontransactional restore of its complete two-Boolean value, 
 physical-timer CNTKCTL/control/CVAL/TVAL capture, a virtual-timer
 mask/offset/control/CVAL boundary, a normalized freeze-downtime timer state with
 never-run restore, a fail-closed inactive SVE/SME/debug snapshot classifier,
-prepared-session VMGenID replacement plus edge notification, CPU-level IRQ/FIQ pending capture plus
+prepared-session VMGenID replacement plus edge notification and typed VMClock
+odd/fenced/counter/fenced/even update plus edge notification, CPU-level IRQ/FIQ pending capture plus
 ordered nontransactional restore of its complete typed value, a bounded
 internal boot-session run-loop pump, owned internal boot-session handle,
 process-level owned
@@ -363,7 +364,7 @@ optional-device parity.
 | [#5793 cross-slot virtio-mem updates](https://github.com/firecracker-microvm/firecracker/pull/5793) | Implemented at bangbang's block-owned/HVF-mapping abstraction. Firecracker updates [every intersecting KVM slot](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/mem/device.rs#L502-L554); bangbang does not expose KVM slot identity and instead proves adjacent, partial, cross-conceptual-slot, and rollback behavior over exact dynamic mappings. |
 | [#5794 balloon statistics bound](https://github.com/firecracker-microvm/firecracker/pull/5794) and [#5884 hinting `204`](https://github.com/firecracker-microvm/firecracker/pull/5884) | Implemented. Statistics are bounded to the same [256-tag limit](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/balloon/device.rs#L48-L52); hinting routes return `204 No Content`. |
 | [#5818 virtio initialization/status sequencing](https://github.com/firecracker-microvm/firecracker/pull/5818) | The new PCI sequencing is transport-limited; existing virtio-MMIO ordered initialization and clear-bit rejection except reset are implemented and tested. |
-| [#5809 x86 KVM clock restore](https://github.com/firecracker-microvm/firecracker/pull/5809) | Platform/profile-limited. It is not the aarch64 startup VMClock contract; mutable VMClock restore/signaling remains outside native-v1. |
+| [#5809 x86 KVM clock restore](https://github.com/firecracker-microvm/firecracker/pull/5809) | Platform/profile-limited. The x86 KVM clock and `clock_realtime` adjustment mechanism is unavailable on arm64 HVF and remains rejected. It is separate from bangbang's implemented aarch64 VMClock ABI capture, counter update, and notification during native-v1 restore. |
 
 Other v1.16.0 changelog entries are not silently absorbed into this device
 scope. [#5824 serial limiting](https://github.com/firecracker-microvm/firecracker/pull/5824)
@@ -400,13 +401,15 @@ The pinned signed executable source contains the exact
 [pmem limiter/flush](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L2808),
 and [native-v1 VMGenID replacement](https://github.com/seven332/bangbang/blob/1bffe45784cc2d627adb8419b85453ec82b3fa71/crates/bangbang/tests/executable_hvf_e2e.rs#L5385)
 cases. These are guest-visible gates; the validation matrix keeps broader
-focused backend coverage separate.
+focused backend coverage separate. #1477 extends the native-v1 case so guest
+code also polls stable VMClock disruption/generation updates and destination
+RTC monotonicity before shutdown.
 
 Firecracker's aarch64
 [PL031 node has no interrupt property](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/fdt.rs#L443-L456),
 so bangbang's no-alarm PL031 is an implemented Firecracker aarch64 subset rather
-than a missing interrupt implementation. ARM PVTime remains platform-limited:
-Firecracker allocates and registers
+than a missing interrupt implementation. ARM PVTime remains unimplemented and
+audit-required under #1478 and #1480. Firecracker allocates and registers
 [one KVM-backed 64-byte region per vCPU](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/builder.rs#L558-L600),
 while an HVF execution-time observation alone is not that shared-page guest ABI.
 
@@ -746,6 +749,15 @@ records contain 191 `implemented-and-verified`, 207 `audit-required`, three
 Exactly `semantic.device:serial-stdin-stdout-rx-and-restore` retains the Wave 6
 serial encoding, artifact integration, endpoint reconstruction, restore,
 migration/clone, portability, and signed restored-guest handoff.
+
+After #1477, the checked
+[time and identity restore contract](../compat/firecracker/v1.16.0/time-identity-contract.md)
+certifies PL031 destination reconstruction plus complete VMGenID and VMClock
+native-v1 restore behavior. It changes no disposition, so the current counts
+remain 191/207/3/17. Exactly
+`semantic.device:rtc-vmclock-vmgenid-and-pvtime` remains `audit-required` for
+#1478's HVF PVTime ABI, #1480's PVTime accounting/certification, and #1481's
+final aggregate clone/portability reconciliation.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
@@ -1283,7 +1295,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /snapshot/load` | `mem_backend.backend_type` | required when `mem_backend` is present | Accepts `File` and `Uffd`; only `File` passes the native-v1 gate, while `Uffd` returns the same snapshot-specific unsupported fault. |
 | `PUT /snapshot/load` | `mem_file_path` | deprecated-compatible alternative; normalized | Must not be combined with `mem_backend`; it is normalized to a redacted `File` backend and retains deprecated-usage provenance. |
 | `PUT /snapshot/load` | `enable_diff_snapshots` | deprecated-compatible optional boolean; normalized and implemented for tracking | ORed with `track_dirty_pages`; only true counts as deprecated usage. The effective value activates destination tracking but does not enable Diff artifact serialization. |
-| `PUT /snapshot/load` | `track_dirty_pages` | optional boolean; implemented | The destination request overrides the source snapshot's active flag. Tracking attaches after image population and before mapping/protection, runner creation, VMGenID replacement, or guest progress. |
+| `PUT /snapshot/load` | `track_dirty_pages` | optional boolean; implemented | The destination request overrides the source snapshot's active flag. Tracking attaches after image population and before mapping/protection, runner creation, VMGenID replacement, VMClock update, or guest progress. |
 | `PUT /snapshot/load` | `resume_vm` | optional; implemented | Load always commits an initially paused real session first. `false` returns `204` in `Paused`; `true` then uses the ordinary process/session resume path and returns only in `Running`. |
 | `PUT /snapshot/load` | `clock_realtime` | optional; retained, rejected when true | Retained through VMM policy; native-v1 rejects clock adjustment before any VM construction. |
 | `PUT /snapshot/load` | `network_overrides` | optional; retained/redacted, rejected when nonempty | Required entry fields are retained but both interface ID and host device name are redacted; native-v1 does not apply overrides. |
@@ -1443,7 +1455,8 @@ paused handoff, optional resume, and recoverable-versus-terminal cleanup
 evidence. Its shared page epoch combines exact owned HVF guest-CPU write faults
 with bounded boot, VMM, device, discard, and dynamic-memory mutations. Normal
 boot starts tracking before population; load-time tracking starts after the
-image baseline and records VMGenID replacement. Visible Full publication
+image baseline and records VMGenID replacement plus the VMClock sequence and
+counter update. Visible Full publication
 transactionally re-protects restored pages before clearing and advancing the
 epoch; failed rollback poisons the paused VM and prevents resume without
 misreporting artifact visibility. Optional resources, overrides, `Diff`
@@ -2528,8 +2541,8 @@ same placement and interrupt line.
 
 ## RTC-Adjacent Time And Identity Devices
 
-bangbang currently implements only the guest-visible PL031 RTC subset described
-above. Runtime metrics can emit a non-empty Firecracker-shaped `rtc` object
+bangbang implements the guest-visible PL031 RTC subset described above. Runtime
+metrics can emit a non-empty Firecracker-shaped `rtc` object
 with `error_count`, `missed_read_count`, and `missed_write_count` for PL031
 MMIO error paths. Signed executable direct-rootfs coverage checks that Linux
 exposes `/dev/rtc0` as a character device and reports PL031 RTC evidence
@@ -2537,12 +2550,18 @@ through sysfs, procfs, or dmesg. RTC alarm interrupts are intentionally
 unsupported in that subset because Firecracker's aarch64 PL031 node is exposed
 without an interrupt line; guest flows that depend on RTC alarm interrupts
 should not be treated as supported by the current compatibility surface.
+Native-v1 load reconstructs PL031 against destination `SystemTime`, naturally
+rebasing across snapshot downtime, with match, control, mask, raw-status, and
+masked-status registers clear. Focused tests bound its data register by the
+destination wall clock, and signed cross-process guest code requires the
+restored RTC value not to precede the captured value.
 
 PVTime/steal-time is a separate platform capability rather than an RTC feature.
 Firecracker implements ARM steal-time by allocating per-vCPU memory and
-registering it through KVM ARM vCPU device attributes. bangbang should not claim
-PVTime until an HVF-specific capability and guest ABI design exists; for now it
-is platform-limited and deferred.
+registering it through KVM ARM vCPU device attributes. bangbang does not claim
+that KVM mechanism or an HVF substitute yet. #1478 owns the HVF-specific ABI
+foundation and #1480 owns its accounting and certification; the aggregate
+record remains nonterminal until those slices and #1481 complete.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are
 not part of the minimal RTC device. The backend-neutral arm64 FDT builder emits
@@ -2561,21 +2580,31 @@ compatible string `amazon,vmclock`, a 4 KiB `reg` region, and `interrupts =
 VMClock page is exactly 4 KiB, does not overflow, does not overlap GIC, RTC,
 serial, virtio-mmio, VMGenID, or FDT-advertised RAM ranges, and that the
 interrupt line is an SPI INTID. During startup, bangbang places the VMClock
-page at the end of the reserved arm64 system-memory area, writes the minimal
-Firecracker VMClock ABI fields for guest discovery, and leaves unsupported time
-fields zeroed. Signed executable direct-rootfs coverage checks that Linux
+page at the end of the reserved arm64 system-memory area, writes the complete
+112-byte Firecracker VMClock ABI with startup time fields zeroed, and retains
+the typed value. Signed executable direct-rootfs coverage checks that Linux
 observes the startup `amazon,vmclock` `ptp@...` device-tree node with a 16-byte
 `reg` property tuple and 4 KiB region size through the public `bangbang` startup
-path. Internally, a prepared never-run boot session can generate a distinct
-nonzero VMGenID, write the complete guest buffer, commit retained metadata, and
-then assert the edge-rising SPI. Random/preflight/write failures send no edge;
-a signal failure is reported after commit and requires another replacement or
-session discard. Public native-v1 load uses that transaction after aggregate
-interrupt restore, and signed cross-process coverage proves the guest observes
-both saved 64-bit VMGenID halves change before continued execution. VMClock
-generation-counter updates, signaling, and mutable restore semantics remain
-outside the narrow native-v1 profile; optional-device snapshot profiles and
-broader time portability remain deferred.
+path. New native-v1 captures read and validate the live ABI under the paused
+supervisor/quiescence owner and append it to nested `BANGDEV\0` 1.1.0 state.
+Legacy 1.0.0 loads derive the same value from the bound memory page; 1.1.0 loads
+require exact encoded-page agreement.
+
+After aggregate device, vCPU, GIC, ICC, timer, and pending-interrupt restore, a
+never-run destination preflights both SPI lines and mapped memory. It generates
+a distinct nonzero VMGenID, writes the complete guest buffer, commits metadata,
+and asserts the VMGenID SPI. It then writes an odd VMClock sequence, executes a
+release fence, increments the disruption marker and generation counter with
+wrapping arithmetic, executes a second release fence, writes the next even
+sequence, and asserts the VMClock SPI. Only then can the restored session commit
+as `Paused` and later resume. A clean precommit failure is retryable after full
+cleanup; any failure after VMGenID replacement or a VMClock write is terminal,
+even if cleanup succeeds, so no partial destination runs. Signed cross-process
+coverage proves both saved VMGenID halves change, the VMClock sequence is stable
+and even, both counters change, and RTC time does not regress. The exact
+[time/identity ledger](../compat/firecracker/v1.16.0/time-identity-contract.md)
+keeps optional-device profiles, PVTime, and broader cross-host portability as
+separate work.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
@@ -3580,8 +3609,8 @@ Their eventual support level should follow the endpoint matrix:
   `TRANSPORT_RESET`, and post-restore RX gating remain the stable #543
   exclusions rather than live snapshot-compatibility claims
 - snapshot behavior beyond the implemented narrow native-v1 profile, including
-  optional-device state, mutable VMClock restore/signaling, Diff artifacts,
-  overrides, Firecracker artifact compatibility, and cross-host portability
+  optional-device state, Diff artifacts, overrides, Firecracker artifact
+  compatibility, and cross-host portability
 - full MMDS TCP routing, stream reassembly, and retransmission policy
 - balloon producers outside the implemented queue/discard/reporting activity
   and serialized/restored balloon state; live paired PFN accounting and

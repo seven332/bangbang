@@ -21,12 +21,13 @@ virtio-balloon reporting and zero-safe best-effort Darwin discard, bounded
 virtio-rng, targeted and rate-limited virtio-pmem flush, a block-granular
 virtio-mem plug/unplug lifecycle, the no-interrupt aarch64 PL031 RTC,
 DeviceTree VMGenID including native-v1 replacement notification, and startup
-VMClock discovery. Pmem now registers its retained file-backed mapping directly
+plus native-v1 mutable VMClock capture/update/notification. Pmem now registers
+its retained file-backed mapping directly
 with HVF, supports deterministic read-only or writable root boot, and retains
 exact dynamic PCI flush, teardown, and range reuse; PCI network attach/delete
-owns per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime,
-serialized/restorable pmem snapshot state, and mutable VMClock restore remain
-explicit limits. Host discard never promises synchronous RSS or footprint
+owns per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime and
+serialized/restorable pmem snapshot state remain explicit limits. Host discard
+never promises synchronous RSS or footprint
 reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
@@ -275,7 +276,9 @@ mutable values with derived RPR validation.
 A native-v1 optional-state classifier fails closed for active SVE/SME and
 enabled hardware breakpoint/watchpoint state. Prepared boot sessions can also
 replace the 16-byte VMGenID buffer and retained metadata before first run, then
-inject its edge-rising SPI after replacement. A separate no-handle query
+inject its edge-rising SPI after replacement, and can publish an
+odd/fenced/counter/fenced/even update of the complete typed VMClock ABI before
+injecting its SPI. A separate no-handle query
 exposes the maximum SME streaming vector length used for the Z-, P-, and
 ZA-register allocations.
 
@@ -315,11 +318,16 @@ failure and prevents resume.
 fresh process, except that logger and metrics configuration are allowed. It
 supports a `File` memory backend (or the deprecated sole `mem_file_path` alias),
 constructs a fresh HVF VM/GIC/vCPU, restores the exact local native state,
-replaces and signals VMGenID, and first commits the session as `Paused`.
+reconstructs PL031 from destination wall clock, replaces and signals VMGenID,
+then updates and signals the exact captured VMClock before first committing the
+session as `Paused`. New nested `BANGDEV\0` 1.1.0 state carries the validated
+112-byte VMClock ABI; legacy 1.0.0 loads recover it from the bound memory image.
 `track_dirty_pages: true` or deprecated `enable_diff_snapshots: true` installs
 tracking after the loaded memory baseline and before mapping, vCPU ownership,
-and VMGenID replacement; the destination request controls the restored setting
-independently of the source snapshot.
+and either time/identity write; the destination request controls the restored
+setting independently of the source snapshot. A load failure after VMGenID or
+VMClock mutation is terminal even when cleanup succeeds, and no partially
+updated destination may resume.
 `resume_vm: true` then uses the ordinary resume path; otherwise resume later
 with `PATCH /vm`. The external root backing must still match the captured
 regular-file identity. Snapshot files and guest state are untrusted and
@@ -1152,7 +1160,10 @@ records its exact 17-terminal/two-Wave-6 split, and the
 [entropy closure ledger](compat/firecracker/v1.16.0/entropy-contract.md)
 records its exact five-terminal/two-Wave-6 split, and the
 [serial closure ledger](compat/firecracker/v1.16.0/serial-contract.md) records
-its exact five-terminal/one-Wave-6 split.
+its exact five-terminal/one-Wave-6 split. The
+[time and identity restore ledger](compat/firecracker/v1.16.0/time-identity-contract.md)
+records the completed PL031, VMGenID, and VMClock subset while retaining its one
+aggregate record for PVTime and final clone/portability certification.
 
 ## Build And Test
 
