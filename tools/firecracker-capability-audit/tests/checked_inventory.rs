@@ -194,6 +194,14 @@ fn delivery_closure_policy_is_stable() {
         "corpus:entropy",
         "semantic.device:entropy-queues-limits-metrics-and-state",
     ];
+    const SERIAL_TERMINAL: [&str; 5] = [
+        "api-operation:PUT /serial",
+        "api-path:/serial",
+        "api-property:SerialDevice.rate_limiter",
+        "api-property:SerialDevice.serial_out_path",
+        "api-schema:SerialDevice",
+    ];
+    const SERIAL_WAVE_6: [&str; 1] = ["semantic.device:serial-stdin-stdout-rx-and-restore"];
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -242,8 +250,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 186);
-    assert_eq!(count(Disposition::AuditRequired), 212);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 191);
+    assert_eq!(count(Disposition::AuditRequired), 207);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -520,6 +528,56 @@ fn delivery_closure_policy_is_stable() {
             entropy_contract.matches(&format!("| `{id}` |")).count(),
             1,
             "checked entropy contract row must be unique: {id}"
+        );
+    }
+
+    let serial_ids = SERIAL_TERMINAL
+        .into_iter()
+        .chain(SERIAL_WAVE_6)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(serial_ids.len(), 6, "serial closure ledger must stay exact");
+    for id in SERIAL_TERMINAL {
+        let capability = by_id.get(id).expect("terminal serial record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "serial record must remain implemented: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "terminal serial record must retain concrete evidence: {id}"
+        );
+    }
+    for id in SERIAL_WAVE_6 {
+        let capability = by_id.get(id).expect("Wave 6 serial record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "Wave 6 serial handoff must remain audit-owned: {id}"
+        );
+        assert!(
+            capability.summary.contains("Wave 6"),
+            "Wave 6 serial handoff must name its owner: {id}"
+        );
+    }
+
+    let serial_contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/serial-contract.md"),
+    )
+    .expect("checked serial contract must be readable");
+    assert_eq!(
+        serial_contract
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .count(),
+        6,
+        "checked serial contract must contain each exact ledger row once"
+    );
+    for id in serial_ids {
+        assert_eq!(
+            serial_contract.matches(&format!("| `{id}` |")).count(),
+            1,
+            "checked serial contract row must be unique: {id}"
         );
     }
 

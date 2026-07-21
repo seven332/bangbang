@@ -231,6 +231,7 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             )
             .with_boot_timer_enabled(boot_timer)
             .with_pci_enabled(enable_pci)
+            .with_process_serial_stdio()
             .with_process_metrics_diagnostics(process_metrics_diagnostics)
             .with_process_signal_metrics(signal_metrics.clone())
             .with_snapshot_capture_cancellation(snapshot_cancellation.clone())

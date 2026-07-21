@@ -42,6 +42,16 @@ VIRTIO_PCI_RNG_ENTROPY_BYTE = 0xA5
 VIRTIO_PCI_RNG_READ_SIZE = 32
 VIRTIO_PCI_RNG_PROC_BUFFER_SIZE = 2048
 VIRTIO_PCI_RNG_YIELD_COUNT = 64
+SERIAL_RX_INPUT = b"BANGBANG_SERIAL_RX_" + (b"A" * 80) + b"_END\n"
+SERIAL_RX_READY_MARKER = b"BANGBANG_SERIAL_RX_READY\n"
+SERIAL_RX_SUCCESS_MARKER = b"BANGBANG_SERIAL_RX_OK\n"
+SERIAL_RX_FAILURE_MARKER = b"BANGBANG_SERIAL_RX_FAIL\n"
+SERIAL_TTY_PATH = b"/dev/ttyS0\0"
+SERIAL_TTY_RAW_TERMIOS = (
+    struct.pack("<IIII", 0, 0, 0x08BF, 0)
+    + b"\0"
+    + bytes((0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+)
 DEV_TMPFS_NAME = b"devtmpfs\0"
 DEV_PATH = b"/dev\0"
 MNT_PATH = b"/mnt\0"
@@ -75,6 +85,7 @@ LINUX_MOUNT_FLAG_RDONLY = 1
 LINUX_OPEN_FLAG_RDWR = 2
 LINUX_OPEN_FLAG_WRONLY = 1
 LINUX_AARCH64_SYSCALL_MOUNT = 40
+LINUX_AARCH64_SYSCALL_IOCTL = 29
 LINUX_AARCH64_SYSCALL_OPENAT = 56
 LINUX_AARCH64_SYSCALL_CLOSE = 57
 LINUX_AARCH64_SYSCALL_READ = 63
@@ -89,6 +100,7 @@ LINUX_AARCH64_SYSCALL_GETCPU = 168
 LINUX_AARCH64_SYSCALL_CLONE = 220
 LINUX_CLONE_VM = 0x100
 LINUX_SIGCHLD = 17
+LINUX_TCSETS = 0x5402
 LINUX_REBOOT_MAGIC1 = 0xFEE1DEAD
 LINUX_REBOOT_MAGIC2 = 0x28121969
 LINUX_REBOOT_CMD_RESTART = 0x01234567
@@ -168,6 +180,11 @@ def add_imm_64(destination: int, source: int, immediate: int) -> bytes:
     return struct.pack("<I", instruction)
 
 
+def add_reg_64(destination: int, left: int, right: int) -> bytes:
+    instruction = 0x8B000000 | (right << 16) | (left << 5) | destination
+    return struct.pack("<I", instruction)
+
+
 def sub_imm_64(destination: int, source: int, immediate: int) -> bytes:
     if not 0 <= immediate <= 0xFFF:
         raise RuntimeError(f"unsupported SUB immediate: {immediate}")
@@ -177,6 +194,11 @@ def sub_imm_64(destination: int, source: int, immediate: int) -> bytes:
         | (source << 5)
         | destination
     )
+    return struct.pack("<I", instruction)
+
+
+def sub_reg_64(destination: int, left: int, right: int) -> bytes:
+    instruction = 0xCB000000 | (right << 16) | (left << 5) | destination
     return struct.pack("<I", instruction)
 
 
@@ -545,6 +567,163 @@ def build_guest_init_elf() -> bytes:
         raise RuntimeError("guest init code size changed after address assignment")
 
     data = b"".join(data for _name, data in guest_init_data())
+    return build_guest_elf(code, data)
+
+
+def serial_rx_init_data() -> list[tuple[str, bytes]]:
+    return [
+        ("serial_tty", SERIAL_TTY_PATH),
+        ("raw_termios", SERIAL_TTY_RAW_TERMIOS),
+        ("expected_input", SERIAL_RX_INPUT),
+        ("input_buffer", bytes(len(SERIAL_RX_INPUT))),
+        ("ready_marker", SERIAL_RX_READY_MARKER),
+        ("success_marker", SERIAL_RX_SUCCESS_MARKER),
+        ("failure_marker", SERIAL_RX_FAILURE_MARKER),
+    ]
+
+
+def serial_rx_init_addresses(code_size: int) -> dict[str, int]:
+    addresses: dict[str, int] = {}
+    data_offset = ELF_CODE_OFFSET + code_size
+    for name, data in serial_rx_init_data():
+        addresses[name] = ELF_BASE_VADDR + data_offset
+        data_offset += len(data)
+    return addresses
+
+
+def build_serial_rx_init_code(addresses: dict[str, int]) -> bytes:
+    code = Aarch64CodeBuilder()
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses["serial_tty"]),
+                movz_64(2, LINUX_OPEN_FLAG_RDWR),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_MI)
+    code.emit(mov_reg_64(19, 0))
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                movz_64(1, LINUX_TCSETS),
+                mov_imm_64(2, addresses["raw_termios"]),
+                movz_64(8, LINUX_AARCH64_SYSCALL_IOCTL),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["ready_marker"],
+            len(SERIAL_RX_READY_MARKER),
+        )
+    )
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(20, addresses["input_buffer"]),
+                movz_64(21, len(SERIAL_RX_INPUT)),
+            )
+        )
+    )
+    code.label("read_input")
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                mov_reg_64(1, 20),
+                mov_reg_64(2, 21),
+                movz_64(8, LINUX_AARCH64_SYSCALL_READ),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_MI)
+    code.branch_cond("read_input", AARCH64_COND_EQ)
+    code.emit(
+        b"".join(
+            (
+                add_reg_64(20, 20, 0),
+                sub_reg_64(21, 21, 0),
+                cmp_imm_64(21, 0),
+            )
+        )
+    )
+    code.branch_cond("read_input", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(20, addresses["input_buffer"]),
+                mov_imm_64(21, addresses["expected_input"]),
+                movz_64(22, len(SERIAL_RX_INPUT)),
+            )
+        )
+    )
+    code.label("compare_input")
+    code.emit(
+        b"".join(
+            (
+                ldrb_u32(23, 20),
+                ldrb_u32(24, 21),
+                cmp_reg_32(23, 24),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                add_imm_64(20, 20, 1),
+                add_imm_64(21, 21, 1),
+                sub_imm_64(22, 22, 1),
+                cmp_imm_64(22, 0),
+            )
+        )
+    )
+    code.branch_cond("compare_input", AARCH64_COND_NE)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["success_marker"],
+            len(SERIAL_RX_SUCCESS_MARKER),
+        )
+    )
+    code.branch("done")
+    code.label("failure")
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["failure_marker"],
+            len(SERIAL_RX_FAILURE_MARKER),
+        )
+    )
+    code.label("done")
+    code.emit(branch_to_self())
+    return code.build()
+
+
+def build_serial_rx_init_elf() -> bytes:
+    placeholder_addresses = {
+        name: ELF_BASE_VADDR for name, _data in serial_rx_init_data()
+    }
+    code_size = len(build_serial_rx_init_code(placeholder_addresses))
+    addresses = serial_rx_init_addresses(code_size)
+    code = build_serial_rx_init_code(addresses)
+    if len(code) != code_size:
+        raise RuntimeError("guest serial RX init code size changed after address assignment")
+
+    data = b"".join(data for _name, data in serial_rx_init_data())
     return build_guest_elf(code, data)
 
 
@@ -1595,6 +1774,7 @@ def cpio_entry(
 
 def build_initrd() -> bytes:
     guest_init = build_guest_init_elf()
+    serial_rx_init = build_serial_rx_init_elf()
     pci_rng_init = build_pci_rng_init_elf()
     smp_init = build_smp_init_elf()
     smp_progress_init = build_smp_progress_init_elf()
@@ -1613,6 +1793,13 @@ def build_initrd() -> bytes:
                 mode=S_IFCHR | 0o600,
                 rdevmajor=5,
                 rdevminor=1,
+            ),
+            cpio_entry(
+                name="dev/ttyS0",
+                ino=14,
+                mode=S_IFCHR | 0o600,
+                rdevmajor=4,
+                rdevminor=64,
             ),
             cpio_entry(name="init", ino=6, mode=S_IFREG | 0o755, data=guest_init),
             cpio_entry(
@@ -1651,7 +1838,13 @@ def build_initrd() -> bytes:
                 mode=S_IFREG | 0o755,
                 data=pci_rng_init,
             ),
-            cpio_entry(name="TRAILER!!!", ino=13, mode=0, nlink=1),
+            cpio_entry(
+                name="serial-rx-init",
+                ino=13,
+                mode=S_IFREG | 0o755,
+                data=serial_rx_init,
+            ),
+            cpio_entry(name="TRAILER!!!", ino=15, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -1892,6 +2085,39 @@ def validate_smp_hotplug_init_entry(entries: dict[str, dict[str, object]]) -> No
         raise RuntimeError("guest initrd smp-hotplug-init payload does not contain SVC #0")
 
 
+def validate_serial_rx_init_entry(entries: dict[str, dict[str, object]]) -> None:
+    entry = required_entry(entries, "serial-rx-init")
+    if file_type(entry["mode"]) != S_IFREG:
+        raise RuntimeError("guest initrd serial-rx-init entry is not a regular file")
+    payload = bytes(entry["payload"])
+    if not payload.startswith(b"\x7fELF"):
+        raise RuntimeError("guest initrd serial-rx-init payload is not an ELF file")
+    for marker in (
+        SERIAL_TTY_PATH,
+        SERIAL_TTY_RAW_TERMIOS,
+        SERIAL_RX_INPUT,
+        SERIAL_RX_READY_MARKER,
+        SERIAL_RX_SUCCESS_MARKER,
+        SERIAL_RX_FAILURE_MARKER,
+    ):
+        if marker not in payload:
+            raise RuntimeError(
+                f"guest initrd serial-rx-init payload does not contain {marker!r}"
+            )
+    for syscall, description in (
+        (LINUX_AARCH64_SYSCALL_OPENAT, "openat"),
+        (LINUX_AARCH64_SYSCALL_IOCTL, "ioctl"),
+        (LINUX_AARCH64_SYSCALL_READ, "read"),
+        (LINUX_AARCH64_SYSCALL_WRITE, "write"),
+    ):
+        if movz_64(8, syscall) not in payload:
+            raise RuntimeError(
+                f"guest initrd serial-rx-init payload does not load {description}"
+            )
+    if svc_0() not in payload:
+        raise RuntimeError("guest initrd serial-rx-init payload does not contain SVC #0")
+
+
 def validate_initrd(data: bytes) -> None:
     if not data:
         raise RuntimeError("guest initrd is empty")
@@ -1907,6 +2133,7 @@ def validate_initrd(data: bytes) -> None:
         "mnt",
         "sys",
         "dev/console",
+        "dev/ttyS0",
         "init",
         "poweroff-init",
         "reboot-init",
@@ -1914,6 +2141,7 @@ def validate_initrd(data: bytes) -> None:
         "smp-progress-init",
         "smp-hotplug-init",
         "pci-rng-init",
+        "serial-rx-init",
         CPIO_TRAILER,
     ]
     if names != expected_names:
@@ -1940,6 +2168,12 @@ def validate_initrd(data: bytes) -> None:
         raise RuntimeError("guest initrd dev/console entry is not a character device")
     if int(console["rdevmajor"]) != 5 or int(console["rdevminor"]) != 1:
         raise RuntimeError("guest initrd dev/console is not character device 5:1")
+
+    serial_tty = required_entry(entries, "dev/ttyS0")
+    if file_type(serial_tty["mode"]) != S_IFCHR:
+        raise RuntimeError("guest initrd dev/ttyS0 entry is not a character device")
+    if int(serial_tty["rdevmajor"]) != 4 or int(serial_tty["rdevminor"]) != 64:
+        raise RuntimeError("guest initrd dev/ttyS0 is not character device 4:64")
 
     init = required_entry(entries, "init")
     if file_type(init["mode"]) != S_IFREG:
@@ -2032,6 +2266,7 @@ def validate_initrd(data: bytes) -> None:
     validate_smp_init_entry(entries)
     validate_smp_progress_init_entry(entries)
     validate_smp_hotplug_init_entry(entries)
+    validate_serial_rx_init_entry(entries)
 
 
 def default_output_path() -> Path:

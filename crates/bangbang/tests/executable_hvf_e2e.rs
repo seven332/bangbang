@@ -249,6 +249,11 @@ mod macos_arm64 {
         "console=ttyS0 reboot=k panic=1 rdinit=/smp-hotplug-init";
     const GUEST_POWEROFF_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init";
     const GUEST_RESET_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/reboot-init";
+    const GUEST_SERIAL_RX_BOOT_ARGS: &str =
+        "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rdinit=/serial-rx-init";
+    const GUEST_SERIAL_RX_READY_MARKER: &str = "BANGBANG_SERIAL_RX_READY";
+    const GUEST_SERIAL_RX_SUCCESS_MARKER: &str = "BANGBANG_SERIAL_RX_OK";
+    const GUEST_SERIAL_RX_FAILURE_MARKER: &str = "BANGBANG_SERIAL_RX_FAIL";
     const SMP_PROGRESS_CPU0_TOKEN: u8 = 0xa5;
     const SMP_PROGRESS_CPU1_TOKEN: u8 = 0xd3;
     const SMP_HOTPLUG_READY_MARKER: &[u8] = b"BBHOTREADY";
@@ -1816,6 +1821,425 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang direct rootfs serial",
+        );
+    }
+
+    #[test]
+    fn signed_executable_streams_default_serial_stdio_across_lifecycle_boundaries() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let metrics_path = test_dir.path().join("metrics.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(&machine_response, "PUT /machine-config serial stdio");
+
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"initrd_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(path_text(&initrd_path)),
+            json_string(GUEST_SERIAL_RX_BOOT_ARGS),
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(&boot_response, "PUT /boot-source serial stdio");
+
+        create_empty_file(&metrics_path);
+        let metrics_body = format!(
+            r#"{{"metrics_path":{}}}"#,
+            json_string(path_text(&metrics_path))
+        );
+        let metrics_response = http_put_json(&socket_path, "/metrics", &metrics_body);
+        assert_no_content_response(&metrics_response, "PUT /metrics serial stdio");
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(&start_response, "PUT /actions InstanceStart serial stdio");
+
+        bangbang
+            .wait_for_stdout_marker(GUEST_SERIAL_RX_READY_MARKER, GUEST_EXECUTION_TIMEOUT)
+            .unwrap_or_else(|error| panic!("guest serial receiver should become ready: {error}"));
+
+        let mut serial_input = b"BANGBANG_SERIAL_RX_".to_vec();
+        serial_input.extend(std::iter::repeat_n(b'A', 80));
+        serial_input.extend_from_slice(b"_END\n");
+        assert!(
+            serial_input.len() > bangbang_runtime::serial::SERIAL_RECEIVE_FIFO_CAPACITY,
+            "test input must cross the bounded host receive chunk"
+        );
+        let pause_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        assert_no_content_response(&pause_response, "PATCH /vm Paused serial stdio");
+        let paused = http_get(&socket_path, "/");
+        assert_ok_response(&paused, "GET / while serial stdio paused");
+        assert_response_contains(
+            &paused,
+            r#""state":"Paused""#,
+            "GET / while serial stdio paused",
+        );
+
+        bangbang.write_stdin(&serial_input);
+        std::thread::sleep(Duration::from_millis(200));
+        let paused_stdout = bangbang.stdout_snapshot();
+        assert!(paused_stdout.contains(GUEST_SERIAL_RX_READY_MARKER));
+        assert!(!paused_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
+        assert!(!paused_stdout.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
+
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused serial stdio capture preflight",
+        );
+        let captured_stdout = bangbang.stdout_snapshot();
+        assert!(!captured_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
+        assert!(!captured_stdout.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
+
+        let resume_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        assert_no_content_response(&resume_response, "PATCH /vm Resumed serial stdio");
+        bangbang
+            .wait_for_stdout_marker(GUEST_SERIAL_RX_SUCCESS_MARKER, GUEST_EXECUTION_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("guest should receive the full bounded serial stream after resume: {error}")
+            });
+        assert!(
+            !bangbang
+                .stdout_snapshot()
+                .contains(GUEST_SERIAL_RX_FAILURE_MARKER),
+            "guest must validate the exact serial input"
+        );
+
+        bangbang.close_stdin();
+        std::thread::sleep(Duration::from_millis(100));
+        let after_eof = http_get(&socket_path, "/");
+        assert_ok_response(&after_eof, "GET / after serial stdin EOF");
+        assert_response_contains(
+            &after_eof,
+            r#""state":"Running""#,
+            "GET / after serial stdin EOF",
+        );
+
+        let flush_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"FlushMetrics"}"#,
+        );
+        assert_no_content_response(&flush_response, "FlushMetrics serial stdio");
+        let metrics_output = fs::read_to_string(&metrics_path)
+            .expect("serial stdio metrics output should be readable");
+        let metrics: serde_json::Value = serde_json::from_str(
+            metrics_output
+                .lines()
+                .next_back()
+                .expect("serial stdio metrics should contain a generation"),
+        )
+        .expect("serial stdio metrics generation should be JSON");
+        assert_eq!(
+            metrics.pointer("/uart/input_count"),
+            Some(&serde_json::json!(serial_input.len())),
+            "UART metrics must account for the exact bounded input stream"
+        );
+        assert_eq!(
+            metrics.pointer("/uart/error_count"),
+            Some(&serde_json::json!(0)),
+            "serial stdin EOF must detach without recording an input error"
+        );
+        assert_eq!(
+            metrics.pointer("/uart/overrun_count"),
+            Some(&serde_json::json!(0)),
+            "bounded host reads must not overrun the UART FIFO"
+        );
+
+        let output = bangbang.terminate();
+        assert!(output.stdout.contains(GUEST_SERIAL_RX_READY_MARKER));
+        assert!(output.stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
+        assert!(!output.stdout.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
+        assert_clean_shutdown(output, &socket_path, "bangbang default serial stdio");
+    }
+
+    #[test]
+    fn signed_executable_configured_serial_output_does_not_consume_process_stdin() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let serial_output_path = test_dir.path().join("serial.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+        create_empty_file(&serial_output_path);
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(
+            &machine_response,
+            "PUT /machine-config configured serial stdin exclusion",
+        );
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"initrd_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(path_text(&initrd_path)),
+            json_string(GUEST_SERIAL_RX_BOOT_ARGS),
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(
+            &boot_response,
+            "PUT /boot-source configured serial stdin exclusion",
+        );
+        let serial_body = format!(
+            r#"{{"serial_out_path":{}}}"#,
+            json_string(path_text(&serial_output_path))
+        );
+        let serial_response = http_put_json(&socket_path, "/serial", &serial_body);
+        assert_no_content_response(
+            &serial_response,
+            "PUT /serial configured serial stdin exclusion",
+        );
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(
+            &start_response,
+            "PUT /actions configured serial stdin exclusion",
+        );
+        wait_for_file_contains_marker(
+            &serial_output_path,
+            GUEST_SERIAL_RX_READY_MARKER.as_bytes(),
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .unwrap_or_else(|error| panic!("configured serial receiver should become ready: {error}"));
+
+        let mut serial_input = b"BANGBANG_SERIAL_RX_".to_vec();
+        serial_input.extend(std::iter::repeat_n(b'A', 80));
+        serial_input.extend_from_slice(b"_END\n");
+        bangbang.write_stdin(&serial_input);
+        std::thread::sleep(Duration::from_millis(300));
+        let configured_output = fs::read_to_string(&serial_output_path)
+            .expect("configured serial output should remain readable");
+        assert!(configured_output.contains(GUEST_SERIAL_RX_READY_MARKER));
+        assert!(!configured_output.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
+        assert!(!configured_output.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
+        assert!(
+            !bangbang
+                .stdout_snapshot()
+                .contains(GUEST_SERIAL_RX_READY_MARKER)
+        );
+
+        bangbang.close_stdin();
+        let running = http_get(&socket_path, "/");
+        assert_ok_response(&running, "GET / configured serial stdin exclusion");
+        assert_response_contains(
+            &running,
+            r#""state":"Running""#,
+            "GET / configured serial stdin exclusion",
+        );
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang configured serial stdin exclusion",
+        );
+        let configured_output = fs::read_to_string(&serial_output_path)
+            .expect("configured serial output should remain readable after shutdown");
+        assert!(!configured_output.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
+        assert!(!configured_output.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
+    }
+
+    #[test]
+    fn signed_executable_rate_limits_default_serial_stdout_and_records_drops() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let metrics_path = test_dir.path().join("metrics.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+        create_empty_file(&metrics_path);
+        let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(
+            &machine_response,
+            "PUT /machine-config rate-limited serial stdout",
+        );
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"initrd_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(path_text(&initrd_path)),
+            json_string(GUEST_SERIAL_RX_BOOT_ARGS),
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(
+            &boot_response,
+            "PUT /boot-source rate-limited serial stdout",
+        );
+        let metrics_body = format!(
+            r#"{{"metrics_path":{}}}"#,
+            json_string(path_text(&metrics_path))
+        );
+        let metrics_response = http_put_json(&socket_path, "/metrics", &metrics_body);
+        assert_no_content_response(&metrics_response, "PUT /metrics rate-limited serial stdout");
+        let serial_response = http_put_json(
+            &socket_path,
+            "/serial",
+            r#"{"rate_limiter":{"size":1,"refill_time":60000}}"#,
+        );
+        assert_no_content_response(&serial_response, "PUT /serial rate-limited stdout");
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(&start_response, "PUT /actions rate-limited serial stdout");
+
+        std::thread::sleep(Duration::from_millis(300));
+        let flush_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"FlushMetrics"}"#,
+        );
+        assert_no_content_response(&flush_response, "FlushMetrics rate-limited serial stdout");
+        let metrics_output = fs::read_to_string(&metrics_path)
+            .expect("rate-limited serial metrics should be readable");
+        let metrics: serde_json::Value = serde_json::from_str(
+            metrics_output
+                .lines()
+                .next_back()
+                .expect("rate-limited serial metrics should contain a generation"),
+        )
+        .expect("rate-limited serial metrics generation should be JSON");
+        assert!(
+            metrics
+                .pointer("/uart/rate_limiter_dropped_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|dropped| dropped > 0),
+            "serial stdout limiter must account for dropped guest bytes: {metrics}"
+        );
+        assert_eq!(
+            metrics.pointer("/uart/error_count"),
+            Some(&serde_json::json!(0)),
+            "intentional rate limiting must not be reported as an output error"
+        );
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang rate-limited default serial stdout",
+        );
+    }
+
+    #[test]
+    fn signed_executable_isolates_concurrent_default_serial_stdio_streams() {
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let start_guest = |test_dir: &TestDir, process_name: &str| {
+            let socket_path = test_dir.path().join("api.socket");
+            let process = BangbangProcess::start(&socket_path, &test_dir.instance_id());
+            let machine_response = http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            );
+            assert_no_content_response(
+                &machine_response,
+                &format!("PUT /machine-config {process_name}"),
+            );
+            let boot_body = format!(
+                r#"{{"kernel_image_path":{},"initrd_path":{},"boot_args":{}}}"#,
+                json_string(path_text(&kernel_path)),
+                json_string(path_text(&initrd_path)),
+                json_string(GUEST_SERIAL_RX_BOOT_ARGS),
+            );
+            let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+            assert_no_content_response(&boot_response, &format!("PUT /boot-source {process_name}"));
+            let start_response = http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            );
+            assert_no_content_response(&start_response, &format!("PUT /actions {process_name}"));
+            process
+                .wait_for_stdout_marker(GUEST_SERIAL_RX_READY_MARKER, GUEST_EXECUTION_TIMEOUT)
+                .unwrap_or_else(|error| {
+                    panic!("{process_name} serial receiver should become ready: {error}")
+                });
+            process
+        };
+
+        let first_dir = TestDir::new();
+        let second_dir = TestDir::new();
+        let first_socket = first_dir.path().join("api.socket");
+        let second_socket = second_dir.path().join("api.socket");
+        let mut first = start_guest(&first_dir, "concurrent serial process A");
+        let mut second = start_guest(&second_dir, "concurrent serial process B");
+
+        let pause_first = http_json(&first_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        assert_no_content_response(&pause_first, "pause concurrent serial process A");
+        let mut serial_input = b"BANGBANG_SERIAL_RX_".to_vec();
+        serial_input.extend(std::iter::repeat_n(b'A', 80));
+        serial_input.extend_from_slice(b"_END\n");
+
+        second.write_stdin(&serial_input);
+        second
+            .wait_for_stdout_marker(GUEST_SERIAL_RX_SUCCESS_MARKER, GUEST_EXECUTION_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("concurrent serial process B should receive only its input: {error}")
+            });
+        assert!(
+            !first
+                .stdout_snapshot()
+                .contains(GUEST_SERIAL_RX_SUCCESS_MARKER)
+        );
+
+        first.write_stdin(&serial_input);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !first
+                .stdout_snapshot()
+                .contains(GUEST_SERIAL_RX_SUCCESS_MARKER),
+            "paused concurrent process A must not consume its own queued input"
+        );
+        let resume_first = http_json(&first_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        assert_no_content_response(&resume_first, "resume concurrent serial process A");
+        first
+            .wait_for_stdout_marker(GUEST_SERIAL_RX_SUCCESS_MARKER, GUEST_EXECUTION_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("concurrent serial process A should consume its input after resume: {error}")
+            });
+
+        assert!(
+            !first
+                .stdout_snapshot()
+                .contains(GUEST_SERIAL_RX_FAILURE_MARKER)
+        );
+        assert!(
+            !second
+                .stdout_snapshot()
+                .contains(GUEST_SERIAL_RX_FAILURE_MARKER)
+        );
+        first.close_stdin();
+        second.close_stdin();
+        assert_clean_shutdown(
+            first.terminate(),
+            &first_socket,
+            "concurrent default serial process A",
+        );
+        assert_clean_shutdown(
+            second.terminate(),
+            &second_socket,
+            "concurrent default serial process B",
         );
     }
 
@@ -7423,7 +7847,7 @@ mod macos_arm64 {
         let output_a = process_a.terminate();
         if !output_a.status.success()
             || socket_a.exists()
-            || !concurrent_mmds_output_is_redacted(&output_a, &private_fragments)
+            || !concurrent_mmds_diagnostics_are_redacted(&output_a, &private_fragments)
         {
             fail_concurrent_mmds_survivor(
                 &mut process_b,
@@ -7525,9 +7949,13 @@ mod macos_arm64 {
 
         let output_b = process_b.terminate();
         assert!(
-            concurrent_mmds_output_is_redacted(&output_a, &private_fragments)
-                && concurrent_mmds_output_is_redacted(&output_b, &private_fragments),
+            concurrent_mmds_diagnostics_are_redacted(&output_a, &private_fragments)
+                && concurrent_mmds_diagnostics_are_redacted(&output_b, &private_fragments),
             "concurrent MMDS diagnostics exposed private test data"
+        );
+        assert!(
+            concurrent_mmds_serial_outputs_are_isolated(&output_a, &output_b),
+            "concurrent MMDS guest serial streams crossed process boundaries"
         );
         assert!(
             output_a.status.success() && output_b.status.success(),
@@ -9014,13 +9442,46 @@ mod macos_arm64 {
         fragments
     }
 
-    fn concurrent_mmds_output_is_redacted(
+    fn concurrent_mmds_diagnostics_are_redacted(
         output: &CompletedProcess,
         private_fragments: &[String],
     ) -> bool {
-        private_fragments.iter().all(|fragment| {
-            !output.stdout.contains(fragment.as_str()) && !output.stderr.contains(fragment.as_str())
-        })
+        private_fragments
+            .iter()
+            .all(|fragment| !output.stderr.contains(fragment.as_str()))
+    }
+
+    fn concurrent_mmds_serial_outputs_are_isolated(
+        process_a: &CompletedProcess,
+        process_b: &CompletedProcess,
+    ) -> bool {
+        let private_values = [
+            CONCURRENT_MMDS_PROCESS_A_VALUE,
+            CONCURRENT_MMDS_PROCESS_B_VALUE,
+            CONCURRENT_MMDS_PROCESS_B_PENDING,
+            CONCURRENT_MMDS_PROCESS_B_RELEASE,
+        ];
+        private_values
+            .iter()
+            .all(|value| !process_a.stdout.contains(value) && !process_b.stdout.contains(value))
+            && process_a
+                .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_A_SUCCESS).as_ref())
+            && !process_a
+                .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_READY).as_ref())
+            && !process_a
+                .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_SUCCESS).as_ref())
+            && process_b
+                .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_READY).as_ref())
+            && process_b
+                .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_SUCCESS).as_ref())
+            && !process_b
+                .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_A_SUCCESS).as_ref())
     }
 
     fn fail_concurrent_mmds_pair(
@@ -9032,8 +9493,8 @@ mod macos_arm64 {
         let first_output = first.force_stop_and_collect();
         let second_output = second.force_stop_and_collect();
         assert!(
-            concurrent_mmds_output_is_redacted(&first_output, private_fragments)
-                && concurrent_mmds_output_is_redacted(&second_output, private_fragments),
+            concurrent_mmds_diagnostics_are_redacted(&first_output, private_fragments)
+                && concurrent_mmds_diagnostics_are_redacted(&second_output, private_fragments),
             "concurrent MMDS diagnostics exposed private test data"
         );
         panic!(
@@ -9050,8 +9511,8 @@ mod macos_arm64 {
     ) -> ! {
         let survivor_output = survivor.force_stop_and_collect();
         assert!(
-            concurrent_mmds_output_is_redacted(exited_output, private_fragments)
-                && concurrent_mmds_output_is_redacted(&survivor_output, private_fragments),
+            concurrent_mmds_diagnostics_are_redacted(exited_output, private_fragments)
+                && concurrent_mmds_diagnostics_are_redacted(&survivor_output, private_fragments),
             "concurrent MMDS diagnostics exposed private test data"
         );
         panic!(

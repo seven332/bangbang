@@ -23,13 +23,13 @@ use bangbang_hvf::{
     HvfArm64BootPciBalloonDeviceUpdater, HvfArm64BootPciBlockDeviceUpdater,
     HvfArm64BootPciNetworkDeviceUpdater, HvfArm64BootPciPmemDeviceUpdater,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
-    HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-    HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
-    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootStorageCaptureError,
-    HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError,
-    HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition, HvfSnapshotV1RestoreError,
-    HvfSnapshotV1State, HvfVcpuRunCoordinatorError, OwnedHvfArm64BootSession,
-    PrepareHvfSnapshotV1LoadError, PreparedHvfArm64BootPciNetworkRemoval,
+    HvfArm64BootRunLoopStopToken, HvfArm64BootSerialCaptureError, HvfArm64BootSerialDeviceConfig,
+    HvfArm64BootSessionConfig, HvfArm64BootSnapshotV1CaptureStage,
+    HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootSnapshotV1StateCaptureError,
+    HvfArm64BootStorageCaptureError, HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle,
+    HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
+    HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfVcpuRunCoordinatorError,
+    OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError, PreparedHvfArm64BootPciNetworkRemoval,
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
@@ -84,8 +84,8 @@ use bangbang_runtime::pmem::{
 };
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
-    SerialConfig, SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
-    SharedSerialOutputBuffer,
+    SerialConfig, SerialConfigError, SerialConfigInput, SerialOutputFile, SerialStdio,
+    SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use bangbang_runtime::snapshot::{
     SnapshotCreateInput, SnapshotLoadInput, SnapshotV1ControllerCommit,
@@ -237,6 +237,14 @@ pub(crate) trait InstanceStartExecutor {
         Ok(())
     }
 
+    fn preflight_snapshot_v1_serial(
+        &mut self,
+        _session: &mut Self::Session,
+        _config: SerialConfig,
+    ) -> Result<(), HvfArm64BootSerialCaptureError> {
+        Ok(())
+    }
+
     fn publish_snapshot_v1(
         &mut self,
         session: &mut Self::Session,
@@ -349,6 +357,7 @@ pub(crate) enum NativeV1SnapshotPublicationError {
     BalloonPreflight(HvfArm64BootBalloonCaptureError),
     MemoryHotplugPreflight(HvfArm64BootMemoryHotplugCaptureError),
     EntropyPreflight(HvfArm64BootEntropyCaptureError),
+    SerialPreflight(HvfArm64BootSerialCaptureError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -373,6 +382,9 @@ impl fmt::Display for NativeV1SnapshotPublicationError {
             Self::EntropyPreflight(source) => {
                 write!(f, "native-v1 entropy preflight failed: {source}")
             }
+            Self::SerialPreflight(source) => {
+                write!(f, "native-v1 serial preflight failed: {source}")
+            }
             Self::Resource(source) => {
                 write!(
                     f,
@@ -396,6 +408,7 @@ impl std::error::Error for NativeV1SnapshotPublicationError {
             Self::BalloonPreflight(source) => Some(source),
             Self::MemoryHotplugPreflight(source) => Some(source),
             Self::EntropyPreflight(source) => Some(source),
+            Self::SerialPreflight(source) => Some(source),
             Self::Resource(source) => Some(source),
             Self::Transaction(source) => Some(source),
             Self::SessionUnavailable | Self::ConfigurationUnavailable => None,
@@ -1664,6 +1677,11 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
     pub(crate) fn with_pci_enabled(mut self, enabled: bool) -> Self {
         self.pci_enabled = enabled;
         self.starter.pci_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn with_process_serial_stdio(mut self) -> Self {
+        self.starter.process_serial_stdio = true;
         self
     }
 }
@@ -3633,6 +3651,10 @@ where
         self.starter
             .preflight_snapshot_v1_entropy(session, entropy_config)
             .map_err(NativeV1SnapshotPublicationError::EntropyPreflight)?;
+        let serial_config = self.controller.serial_config().clone();
+        self.starter
+            .preflight_snapshot_v1_serial(session, serial_config.clone())
+            .map_err(NativeV1SnapshotPublicationError::SerialPreflight)?;
 
         self.controller
             .preflight_create_snapshot_profile()
@@ -3647,7 +3669,6 @@ where
             [drive_config] => drive_config.clone(),
             _ => return Err(NativeV1SnapshotPublicationError::ConfigurationUnavailable),
         };
-        let serial_config = self.controller.serial_config().clone();
         let paths = SnapshotArtifactPaths::new(input.snapshot_path(), input.mem_file_path());
         if self.started_session.is_none() {
             return Err(NativeV1SnapshotPublicationError::SessionUnavailable);
@@ -3783,6 +3804,7 @@ where
 pub(crate) struct HvfInstanceStartExecutor {
     boot_timer_enabled: bool,
     pci_enabled: bool,
+    process_serial_stdio: bool,
     serial_output: SharedSerialOutputBuffer,
     active_serial_output: Option<SharedSerialOutput>,
 }
@@ -3887,11 +3909,38 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         mut startup_resources: VmStartupResources,
     ) -> Result<Self::Session, BackendError> {
         let provided_serial_output = startup_resources.take_serial_output();
-        let serial_output = self
-            .serial_output_for_controller(controller, provided_serial_output)
-            .map_err(|err| {
-                BackendError::Hypervisor(format!("failed to initialize serial output: {err}"))
-            })?;
+        let (serial_output, serial_input) = if self.process_serial_stdio
+            && controller.serial_config().serial_out_path().is_none()
+            && provided_serial_output.is_none()
+        {
+            let (output, input) = SerialStdio::from_process_standard_streams()
+                .map_err(|err| {
+                    BackendError::Hypervisor(format!(
+                        "failed to initialize serial standard streams: {err}"
+                    ))
+                })?
+                .into_parts();
+            (
+                SharedSerialOutput::with_rate_limiter(
+                    output,
+                    controller.serial_config().rate_limiter(),
+                ),
+                input,
+            )
+        } else {
+            (
+                self.serial_output_for_controller(controller, provided_serial_output)
+                    .map_err(|err| {
+                        BackendError::Hypervisor(format!(
+                            "failed to initialize serial output: {err}"
+                        ))
+                    })?,
+                None,
+            )
+        };
+        if let Some(serial_input) = serial_input {
+            startup_resources = startup_resources.with_serial_input(serial_input);
+        }
         let boot_session_config = self.boot_session_config_for_controller_with_serial_output(
             controller,
             serial_output.clone(),
@@ -3949,6 +3998,14 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         config: Option<EntropyConfig>,
     ) -> Result<(), HvfArm64BootEntropyCaptureError> {
         session.capture_ready_entropy_state(config).map(|_| ())
+    }
+
+    fn preflight_snapshot_v1_serial(
+        &mut self,
+        session: &mut Self::Session,
+        config: SerialConfig,
+    ) -> Result<(), HvfArm64BootSerialCaptureError> {
+        session.capture_ready_serial_state(config).map(|_| ())
     }
 
     fn publish_snapshot_v1(
@@ -4393,6 +4450,15 @@ where
 }
 
 impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
+    fn capture_ready_serial_state(
+        &self,
+        config: SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<bangbang_runtime::serial::CaptureReadySerialState, HvfArm64BootSerialCaptureError>
+    {
+        self.session.capture_ready_serial_state(config, guard)
+    }
+
     fn capture_ready_balloon_state(
         &self,
         config: Option<BalloonConfig>,
@@ -7326,6 +7392,24 @@ fn balloon_capture_error_from_boot_run_loop_command<C>(
     }
 }
 
+fn serial_capture_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, HvfArm64BootSerialCaptureError>,
+) -> HvfArm64BootSerialCaptureError {
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::WorkerNotPaused
+        | BootRunLoopCommandError::SnapshotQuiescenceActive
+        | BootRunLoopCommandError::AdmissionClosed
+        | BootRunLoopCommandError::QueueFull
+        | BootRunLoopCommandError::QueueClosed
+        | BootRunLoopCommandError::Wakeup { .. }
+        | BootRunLoopCommandError::ResponseClosed => {
+            HvfArm64BootSerialCaptureError::OwnerUnavailable
+        }
+    }
+}
+
 fn memory_hotplug_capture_error_from_boot_run_loop_command<C>(
     err: BootRunLoopCommandError<C, HvfArm64BootMemoryHotplugCaptureError>,
 ) -> HvfArm64BootMemoryHotplugCaptureError {
@@ -8290,6 +8374,22 @@ impl
         ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider>,
     >
 {
+    pub(crate) fn capture_ready_serial_state(
+        &self,
+        config: SerialConfig,
+    ) -> Result<bangbang_runtime::serial::CaptureReadySerialState, HvfArm64BootSerialCaptureError>
+    {
+        self.run_snapshot_quiesced(move |session| {
+            let guard = session
+                .quiesce_snapshot_auxiliary_work()
+                .map_err(|_| HvfArm64BootSerialCaptureError::OwnerUnavailable)?;
+            let result = session.capture_ready_serial_state(config, &guard);
+            drop(guard);
+            result
+        })
+        .map_err(serial_capture_error_from_boot_run_loop_command)
+    }
+
     pub(crate) fn capture_ready_balloon_state(
         &self,
         config: Option<BalloonConfig>,
@@ -9165,19 +9265,19 @@ mod tests {
         DEFAULT_PMEM_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
         HvfArm64BootBalloonCaptureError, HvfArm64BootEntropyCaptureError,
-        HvfArm64BootMemoryHotplugCaptureError, HvfArm64BootSnapshotV1CaptureStage,
-        HvfArm64BootStorageCaptureError, HvfInstanceStartExecutor, InstanceStartExecutor,
-        NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
-        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
-        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
-        NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
-        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        HvfArm64BootMemoryHotplugCaptureError, HvfArm64BootSerialCaptureError,
+        HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootStorageCaptureError,
+        HvfInstanceStartExecutor, InstanceStartExecutor, NativeV1SnapshotCaptureCancellation,
+        NativeV1SnapshotCaptureError, NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
+        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
+        NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
+        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
+        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
+        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
+        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
+        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
+        ProcessVmm, ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
         require_native_v1_composite_record, snapshot_destination_machine_config,
     };
@@ -10260,6 +10360,9 @@ mod tests {
         snapshot_entropy_preflight_calls: usize,
         last_snapshot_entropy_config: Option<Option<EntropyConfig>>,
         snapshot_entropy_preflight_failure: bool,
+        snapshot_serial_preflight_calls: usize,
+        last_snapshot_serial_config: Option<SerialConfig>,
+        snapshot_serial_preflight_failure: bool,
         snapshot_publication_failure: bool,
     }
 
@@ -10286,6 +10389,9 @@ mod tests {
                 snapshot_entropy_preflight_calls: 0,
                 last_snapshot_entropy_config: None,
                 snapshot_entropy_preflight_failure: false,
+                snapshot_serial_preflight_calls: 0,
+                last_snapshot_serial_config: None,
+                snapshot_serial_preflight_failure: false,
                 snapshot_publication_failure: false,
             }
         }
@@ -10318,6 +10424,11 @@ mod tests {
             self
         }
 
+        fn with_snapshot_serial_preflight_failure(mut self) -> Self {
+            self.snapshot_serial_preflight_failure = true;
+            self
+        }
+
         const fn failure(source: BackendError) -> Self {
             Self {
                 result: FakeStartResult::Failure(source),
@@ -10336,6 +10447,9 @@ mod tests {
                 snapshot_entropy_preflight_calls: 0,
                 last_snapshot_entropy_config: None,
                 snapshot_entropy_preflight_failure: false,
+                snapshot_serial_preflight_calls: 0,
+                last_snapshot_serial_config: None,
+                snapshot_serial_preflight_failure: false,
                 snapshot_publication_failure: false,
             }
         }
@@ -10424,6 +10538,20 @@ mod tests {
             self.last_snapshot_entropy_config = Some(config);
             if self.snapshot_entropy_preflight_failure {
                 Err(HvfArm64BootEntropyCaptureError::OwnerUnavailable)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn preflight_snapshot_v1_serial(
+            &mut self,
+            _session: &mut Self::Session,
+            config: SerialConfig,
+        ) -> Result<(), HvfArm64BootSerialCaptureError> {
+            self.snapshot_serial_preflight_calls += 1;
+            self.last_snapshot_serial_config = Some(config);
+            if self.snapshot_serial_preflight_failure {
+                Err(HvfArm64BootSerialCaptureError::OwnerUnavailable)
             } else {
                 Ok(())
             }
@@ -12319,6 +12447,11 @@ mod tests {
         );
         assert_eq!(create_vmm.starter.snapshot_entropy_preflight_calls, 1);
         assert_eq!(create_vmm.starter.last_snapshot_entropy_config, Some(None));
+        assert_eq!(create_vmm.starter.snapshot_serial_preflight_calls, 1);
+        assert_eq!(
+            create_vmm.starter.last_snapshot_serial_config,
+            Some(create_vmm.controller.serial_config().clone())
+        );
         let session = create_vmm
             .started_session
             .as_ref()
@@ -17932,6 +18065,11 @@ mod tests {
             vmm.starter.last_snapshot_entropy_config,
             Some(vmm.controller.entropy_config())
         );
+        assert_eq!(vmm.starter.snapshot_serial_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_serial_config,
+            Some(vmm.controller.serial_config().clone())
+        );
         let session = vmm
             .started_session
             .as_ref()
@@ -18093,6 +18231,67 @@ mod tests {
             .started_session
             .as_ref()
             .expect("entropy preflight failure should retain the paused session");
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn serial_preflight_failure_is_typed_and_precedes_publication() {
+        let state_path = missing_temp_child_path("serial-preflight.state");
+        let memory_path = state_path.with_file_name("serial-preflight.memory");
+        let parent = state_path
+            .parent()
+            .expect("missing serial preflight path should have a parent");
+        let mut vmm = snapshot_profile_vmm(
+            FakeStarter::success(165).with_snapshot_serial_preflight_failure(),
+        );
+        vmm.handle_action(VmmAction::PutSerial(
+            SerialConfigInput::new()
+                .with_serial_out_path("/private/serial")
+                .with_rate_limiter(bangbang_runtime::serial::SerialRateLimiterConfig::new(
+                    8,
+                    Some(16),
+                    100,
+                )),
+        ))
+        .expect("serial preflight fixture should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("serial preflight fake session should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("serial preflight fake session should pause");
+
+        let error = vmm
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                &state_path,
+                &memory_path,
+            )))
+            .expect_err("serial preflight failure should stop before publication");
+
+        assert_eq!(
+            error,
+            VmmActionError::SnapshotCreate(BackendError::Hypervisor(
+                "native-v1 serial preflight failed: serial capture owner is unavailable"
+                    .to_string()
+            ))
+        );
+        assert_eq!(vmm.starter.snapshot_storage_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_balloon_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_memory_hotplug_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_entropy_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_serial_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_serial_config,
+            Some(vmm.controller.serial_config().clone())
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("serial preflight failure should retain the paused session");
         assert_eq!(session.native_snapshot_publication_count, 0);
         assert_eq!(session.native_snapshot_producer_count, 0);
         assert_eq!(vmm.instance_info().state, InstanceState::Paused);

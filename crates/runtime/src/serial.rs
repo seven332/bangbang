@@ -3,7 +3,9 @@
 use std::collections::{TryReserveError, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -624,6 +626,11 @@ impl SharedSerialOutput {
     pub fn metrics(&self) -> SerialOutputMetrics {
         self.metrics.snapshot()
     }
+
+    /// Record one host-input lifecycle failure without changing UART state.
+    pub fn record_host_input_error(&self) {
+        self.metrics.record_error();
+    }
 }
 
 impl From<SharedSerialOutputBuffer> for SharedSerialOutput {
@@ -733,6 +740,354 @@ impl SerialOutput for SerialOutputFile {
         self.file
             .write_all(&[byte])
             .map_err(|err| SerialOutputError::file_write(err.kind()))
+    }
+}
+
+/// Process-standard serial endpoints with one shared restoration lifetime.
+pub struct SerialStdio {
+    output: SerialStdioOutput,
+    input: Option<SerialStdioInput>,
+}
+
+impl fmt::Debug for SerialStdio {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SerialStdio")
+            .field("output", &"<owned>")
+            .field("input", &self.input.as_ref().map(|_| "<owned>"))
+            .finish()
+    }
+}
+
+impl SerialStdio {
+    /// Prepare the process standard streams for Firecracker-compatible serial
+    /// output and optional terminal/FIFO input.
+    pub fn from_process_standard_streams() -> Result<Self, SerialStdioError> {
+        Self::from_descriptors(libc::STDIN_FILENO, libc::STDOUT_FILENO)
+    }
+
+    /// Prepare caller-owned descriptors while retaining the caller's ownership.
+    ///
+    /// This exists for focused descriptor and pseudo-terminal verification. The
+    /// returned endpoints use close-on-exec duplicates and restore the shared
+    /// open-file-description state when their final owner is dropped.
+    #[doc(hidden)]
+    pub fn from_descriptors(
+        input_descriptor: RawFd,
+        output_descriptor: RawFd,
+    ) -> Result<Self, SerialStdioError> {
+        let output = duplicate_stdio_descriptor(output_descriptor)
+            .map_err(|source| SerialStdioError::DuplicateOutput { source })?;
+        let output_flags = descriptor_status_flags(output.as_raw_fd())
+            .map_err(|source| SerialStdioError::InspectOutput { source })?;
+        if output_flags & libc::O_ACCMODE == libc::O_RDONLY {
+            return Err(SerialStdioError::OutputNotWritable);
+        }
+
+        let input_kind = serial_input_kind(input_descriptor)?;
+        let (input, input_flags, input_termios) = match input_kind {
+            Some(SerialStdioInputKind::Terminal) => {
+                let input = duplicate_stdio_descriptor(input_descriptor)
+                    .map_err(|source| SerialStdioError::DuplicateInput { source })?;
+                let input_flags = descriptor_status_flags(input.as_raw_fd())
+                    .map_err(|source| SerialStdioError::InspectInput { source })?;
+                if input_flags & libc::O_ACCMODE == libc::O_WRONLY {
+                    return Err(SerialStdioError::InputNotReadable);
+                }
+                let termios = terminal_attributes(input.as_raw_fd())
+                    .map_err(|source| SerialStdioError::InspectTerminal { source })?;
+                (Some(input), Some(input_flags), Some(termios))
+            }
+            Some(SerialStdioInputKind::Fifo) => {
+                let input = duplicate_stdio_descriptor(input_descriptor)
+                    .map_err(|source| SerialStdioError::DuplicateInput { source })?;
+                let input_flags = descriptor_status_flags(input.as_raw_fd())
+                    .map_err(|source| SerialStdioError::InspectInput { source })?;
+                if input_flags & libc::O_ACCMODE == libc::O_WRONLY {
+                    return Err(SerialStdioError::InputNotReadable);
+                }
+                (Some(input), Some(input_flags), None)
+            }
+            None => (None, None, None),
+        };
+
+        let descriptors = Arc::new(SerialStdioDescriptors {
+            output,
+            output_flags,
+            input,
+            input_flags,
+            input_termios,
+        });
+
+        set_descriptor_status_flags(
+            descriptors.output.as_raw_fd(),
+            output_flags | libc::O_NONBLOCK,
+        )
+        .map_err(|source| SerialStdioError::ConfigureOutput { source })?;
+        if let (Some(input), Some(flags)) = (&descriptors.input, input_flags) {
+            if let Some(termios) = input_termios {
+                set_raw_terminal(input.as_raw_fd(), termios)
+                    .map_err(|source| SerialStdioError::ConfigureTerminal { source })?;
+            }
+            set_descriptor_status_flags(input.as_raw_fd(), flags | libc::O_NONBLOCK)
+                .map_err(|source| SerialStdioError::ConfigureInput { source })?;
+        }
+
+        let input = descriptors.input.as_ref().map(|input| SerialStdioInput {
+            descriptor: input.as_raw_fd(),
+            descriptors: Arc::clone(&descriptors),
+        });
+        Ok(Self {
+            output: SerialStdioOutput { descriptors },
+            input,
+        })
+    }
+
+    pub fn into_parts(self) -> (SerialStdioOutput, Option<SerialStdioInput>) {
+        (self.output, self.input)
+    }
+}
+
+struct SerialStdioDescriptors {
+    output: File,
+    output_flags: libc::c_int,
+    input: Option<File>,
+    input_flags: Option<libc::c_int>,
+    input_termios: Option<libc::termios>,
+}
+
+impl fmt::Debug for SerialStdioDescriptors {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SerialStdioDescriptors")
+            .field("endpoints", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for SerialStdioDescriptors {
+    fn drop(&mut self) {
+        if let Some(input) = self.input.as_ref() {
+            if let Some(termios) = self.input_termios.as_ref() {
+                // SAFETY: The descriptor and retained terminal attributes remain
+                // valid until this restoration owner finishes dropping.
+                let _ = unsafe { libc::tcsetattr(input.as_raw_fd(), libc::TCSANOW, termios) };
+            }
+            if let Some(flags) = self.input_flags {
+                let _ = set_descriptor_status_flags(input.as_raw_fd(), flags);
+            }
+        }
+        let _ = set_descriptor_status_flags(self.output.as_raw_fd(), self.output_flags);
+    }
+}
+
+/// Nonblocking stdout half of one prepared serial stdio lifetime.
+pub struct SerialStdioOutput {
+    descriptors: Arc<SerialStdioDescriptors>,
+}
+
+impl fmt::Debug for SerialStdioOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SerialStdioOutput")
+            .field("endpoint", &"<redacted>")
+            .finish()
+    }
+}
+
+impl SerialOutput for SerialStdioOutput {
+    fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
+        let mut output = &self.descriptors.output;
+        output
+            .write_all(&[byte])
+            .map_err(|error| SerialOutputError::file_write(error.kind()))
+    }
+}
+
+/// Optional nonblocking terminal/FIFO stdin half of a serial stdio lifetime.
+pub struct SerialStdioInput {
+    descriptor: RawFd,
+    descriptors: Arc<SerialStdioDescriptors>,
+}
+
+impl SerialStdioInput {
+    pub fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let Some(input) = self.descriptors.input.as_ref() else {
+            return Err(std::io::Error::other(
+                "serial stdio input descriptor is unavailable",
+            ));
+        };
+        let mut input = input;
+        input.read(buffer)
+    }
+}
+
+impl AsRawFd for SerialStdioInput {
+    fn as_raw_fd(&self) -> RawFd {
+        self.descriptor
+    }
+}
+
+impl fmt::Debug for SerialStdioInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SerialStdioInput")
+            .field("endpoint", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SerialStdioError {
+    InspectInput { source: std::io::ErrorKind },
+    InspectOutput { source: std::io::ErrorKind },
+    DuplicateInput { source: std::io::ErrorKind },
+    DuplicateOutput { source: std::io::ErrorKind },
+    InputNotReadable,
+    OutputNotWritable,
+    InspectTerminal { source: std::io::ErrorKind },
+    ConfigureTerminal { source: std::io::ErrorKind },
+    ConfigureInput { source: std::io::ErrorKind },
+    ConfigureOutput { source: std::io::ErrorKind },
+}
+
+impl fmt::Display for SerialStdioError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InspectInput { source } => {
+                write!(formatter, "serial stdin could not be inspected: {source:?}")
+            }
+            Self::InspectOutput { source } => {
+                write!(
+                    formatter,
+                    "serial stdout could not be inspected: {source:?}"
+                )
+            }
+            Self::DuplicateInput { source } => {
+                write!(
+                    formatter,
+                    "serial stdin could not be duplicated: {source:?}"
+                )
+            }
+            Self::DuplicateOutput { source } => {
+                write!(
+                    formatter,
+                    "serial stdout could not be duplicated: {source:?}"
+                )
+            }
+            Self::InputNotReadable => formatter.write_str("serial stdin is not readable"),
+            Self::OutputNotWritable => formatter.write_str("serial stdout is not writable"),
+            Self::InspectTerminal { source } => {
+                write!(
+                    formatter,
+                    "serial terminal could not be inspected: {source:?}"
+                )
+            }
+            Self::ConfigureTerminal { source } => {
+                write!(
+                    formatter,
+                    "serial terminal could not be configured: {source:?}"
+                )
+            }
+            Self::ConfigureInput { source } => {
+                write!(
+                    formatter,
+                    "serial stdin could not be configured: {source:?}"
+                )
+            }
+            Self::ConfigureOutput { source } => {
+                write!(
+                    formatter,
+                    "serial stdout could not be configured: {source:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SerialStdioError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SerialStdioInputKind {
+    Terminal,
+    Fifo,
+}
+
+fn serial_input_kind(descriptor: RawFd) -> Result<Option<SerialStdioInputKind>, SerialStdioError> {
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `metadata` is writable for one complete `stat` value and the
+    // descriptor is borrowed without ownership transfer.
+    if unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } != 0 {
+        return Ok(None);
+    }
+    // SAFETY: Successful `fstat` initialized the complete value.
+    let metadata = unsafe { metadata.assume_init() };
+    // SAFETY: `isatty` only inspects the borrowed descriptor.
+    if unsafe { libc::isatty(descriptor) } == 1 {
+        Ok(Some(SerialStdioInputKind::Terminal))
+    } else if metadata.st_mode & libc::S_IFMT == libc::S_IFIFO {
+        Ok(Some(SerialStdioInputKind::Fifo))
+    } else {
+        Ok(None)
+    }
+}
+
+fn duplicate_stdio_descriptor(descriptor: RawFd) -> Result<File, std::io::ErrorKind> {
+    // SAFETY: `F_DUPFD_CLOEXEC` duplicates the borrowed descriptor and returns
+    // a fresh descriptor on success.
+    let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        Err(std::io::Error::last_os_error().kind())
+    } else {
+        // SAFETY: `duplicate` is a fresh successful descriptor owned here.
+        Ok(unsafe { File::from_raw_fd(duplicate) })
+    }
+}
+
+fn descriptor_status_flags(descriptor: RawFd) -> Result<libc::c_int, std::io::ErrorKind> {
+    // SAFETY: `F_GETFL` only inspects one borrowed live descriptor.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        Err(std::io::Error::last_os_error().kind())
+    } else {
+        Ok(flags)
+    }
+}
+
+fn set_descriptor_status_flags(
+    descriptor: RawFd,
+    flags: libc::c_int,
+) -> Result<(), std::io::ErrorKind> {
+    // SAFETY: `F_SETFL` changes only status flags on the borrowed live open file
+    // description.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags) } < 0 {
+        Err(std::io::Error::last_os_error().kind())
+    } else {
+        Ok(())
+    }
+}
+
+fn terminal_attributes(descriptor: RawFd) -> Result<libc::termios, std::io::ErrorKind> {
+    let mut attributes = MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `attributes` is writable for a complete terminal state and the
+    // descriptor is borrowed.
+    if unsafe { libc::tcgetattr(descriptor, attributes.as_mut_ptr()) } != 0 {
+        Err(std::io::Error::last_os_error().kind())
+    } else {
+        // SAFETY: Successful `tcgetattr` initialized the complete value.
+        Ok(unsafe { attributes.assume_init() })
+    }
+}
+
+fn set_raw_terminal(descriptor: RawFd, original: libc::termios) -> Result<(), std::io::ErrorKind> {
+    let mut raw = original;
+    // SAFETY: `raw` is a complete local termios value for in-place conversion.
+    unsafe { libc::cfmakeraw(&raw mut raw) };
+    // SAFETY: The descriptor is borrowed and `raw` remains valid for the call.
+    if unsafe { libc::tcsetattr(descriptor, libc::TCSANOW, &raw) } != 0 {
+        Err(std::io::Error::last_os_error().kind())
+    } else {
+        Ok(())
     }
 }
 
@@ -1057,6 +1412,42 @@ impl fmt::Debug for SerialMmioCaptureState {
         formatter
             .debug_struct("SerialMmioCaptureState")
             .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Reconstructible serial configuration paired with complete guest-visible
+/// UART state. Live host endpoints intentionally remain outside this value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CaptureReadySerialState {
+    config: SerialConfig,
+    device: SerialMmioCaptureState,
+}
+
+impl CaptureReadySerialState {
+    pub const fn new(config: SerialConfig, device: SerialMmioCaptureState) -> Self {
+        Self { config, device }
+    }
+
+    pub const fn config(&self) -> &SerialConfig {
+        &self.config
+    }
+
+    pub const fn device(&self) -> &SerialMmioCaptureState {
+        &self.device
+    }
+
+    pub fn into_parts(self) -> (SerialConfig, SerialMmioCaptureState) {
+        (self.config, self.device)
+    }
+}
+
+impl fmt::Debug for CaptureReadySerialState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CaptureReadySerialState")
+            .field("config", &self.config)
+            .field("device", &self.device)
             .finish()
     }
 }
@@ -1817,8 +2208,9 @@ fn has_control_character(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
-    use std::fs::{self, OpenOptions};
-    use std::io;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Read as _, Write as _};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1841,7 +2233,7 @@ mod tests {
         SerialMmioCaptureState, SerialMmioCaptureStateError, SerialMmioCaptureStateParts,
         SerialMmioDevice, SerialMmioError, SerialMmioLegacyStateError, SerialMmioState,
         SerialOutput, SerialOutputBuffer, SerialOutputError, SerialOutputFile, SerialOutputMetrics,
-        SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
+        SerialRateLimiterConfig, SerialStdio, SharedSerialOutput, SharedSerialOutputBuffer,
         SharedSerialOutputMetrics,
     };
     use crate::memory::GuestAddress;
@@ -1893,6 +2285,156 @@ mod tests {
             "bangbang-serial-test-{}-{nanos}-{name}",
             std::process::id()
         ))
+    }
+
+    fn pipe_files() -> (File, File) {
+        let mut descriptors = [-1; 2];
+        // SAFETY: `descriptors` provides space for both descriptors returned by
+        // a successful `pipe` call.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        // SAFETY: A successful `pipe` returned two fresh owned descriptors.
+        let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+        // SAFETY: A successful `pipe` returned two fresh owned descriptors.
+        let writer = unsafe { File::from_raw_fd(descriptors[1]) };
+        (reader, writer)
+    }
+
+    #[test]
+    fn serial_stdio_pipe_round_trip_and_final_drop_restore_status_flags() {
+        let (input_reader, mut input_writer) = pipe_files();
+        let (mut output_reader, output_writer) = pipe_files();
+        let original_input_flags =
+            super::descriptor_status_flags(input_reader.as_raw_fd()).expect("input flags");
+        let original_output_flags =
+            super::descriptor_status_flags(output_writer.as_raw_fd()).expect("output flags");
+
+        let (mut output, input) =
+            SerialStdio::from_descriptors(input_reader.as_raw_fd(), output_writer.as_raw_fd())
+                .expect("pipe stdio should prepare")
+                .into_parts();
+        let mut input = input.expect("pipe stdin should attach");
+
+        assert_ne!(
+            super::descriptor_status_flags(input_reader.as_raw_fd()).expect("input flags")
+                & libc::O_NONBLOCK,
+            0
+        );
+        assert_ne!(
+            super::descriptor_status_flags(output_writer.as_raw_fd()).expect("output flags")
+                & libc::O_NONBLOCK,
+            0
+        );
+
+        output.write_byte(b'O').expect("stdout byte should write");
+        let mut output_byte = [0];
+        output_reader
+            .read_exact(&mut output_byte)
+            .expect("stdout pipe should receive byte");
+        assert_eq!(output_byte, *b"O");
+
+        input_writer
+            .write_all(b"input")
+            .expect("stdin pipe should accept bytes");
+        let mut input_bytes = [0; 5];
+        assert_eq!(
+            input.read(&mut input_bytes).expect("stdin should read"),
+            input_bytes.len()
+        );
+        assert_eq!(&input_bytes, b"input");
+
+        assert_eq!(Arc::strong_count(&output.descriptors), 2);
+        drop(output);
+        assert_eq!(Arc::strong_count(&input.descriptors), 1);
+        assert_ne!(
+            super::descriptor_status_flags(output_writer.as_raw_fd()).expect("output flags")
+                & libc::O_NONBLOCK,
+            0,
+            "the remaining input owner must retain the shared stdio lifetime"
+        );
+        drop(input);
+        assert_eq!(
+            super::descriptor_status_flags(input_reader.as_raw_fd()).expect("restored input flags")
+                & (libc::O_ACCMODE | libc::O_NONBLOCK),
+            original_input_flags & (libc::O_ACCMODE | libc::O_NONBLOCK)
+        );
+        assert_eq!(
+            super::descriptor_status_flags(output_writer.as_raw_fd())
+                .expect("restored output flags")
+                & (libc::O_ACCMODE | libc::O_NONBLOCK),
+            original_output_flags & (libc::O_ACCMODE | libc::O_NONBLOCK)
+        );
+    }
+
+    #[test]
+    fn serial_stdio_ignores_non_pollable_or_invalid_input() {
+        let unsupported_input = File::open("/dev/null").expect("null input should open");
+        let (_output_reader, output_writer) = pipe_files();
+
+        let (_, input) =
+            SerialStdio::from_descriptors(unsupported_input.as_raw_fd(), output_writer.as_raw_fd())
+                .expect("unsupported stdin should not prevent stdout setup")
+                .into_parts();
+        assert!(input.is_none());
+
+        let (_, input) = SerialStdio::from_descriptors(-1, output_writer.as_raw_fd())
+            .expect("closed stdin should not prevent stdout setup")
+            .into_parts();
+        assert!(input.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn serial_stdio_terminal_is_raw_until_final_drop_then_restored() {
+        let mut master_descriptor = -1;
+        let mut slave_descriptor = -1;
+        assert_eq!(
+            // SAFETY: Both output pointers are valid and null optional settings
+            // ask `openpty` to apply its defaults.
+            unsafe {
+                libc::openpty(
+                    &raw mut master_descriptor,
+                    &raw mut slave_descriptor,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        // SAFETY: Successful `openpty` returned fresh owned descriptors.
+        let _master = unsafe { File::from_raw_fd(master_descriptor) };
+        // SAFETY: Successful `openpty` returned a fresh owned descriptor.
+        let slave = unsafe { File::from_raw_fd(slave_descriptor) };
+        let original = super::terminal_attributes(slave.as_raw_fd()).expect("terminal state");
+
+        let (output, input) = SerialStdio::from_descriptors(slave.as_raw_fd(), slave.as_raw_fd())
+            .expect("terminal stdio should prepare")
+            .into_parts();
+        let input = input.expect("terminal stdin should attach");
+        let raw = super::terminal_attributes(slave.as_raw_fd()).expect("raw terminal state");
+        assert_eq!(raw.c_lflag & (libc::ICANON | libc::ECHO), 0);
+
+        drop(output);
+        assert_eq!(
+            super::terminal_attributes(slave.as_raw_fd())
+                .expect("retained raw terminal state")
+                .c_lflag
+                & (libc::ICANON | libc::ECHO),
+            0
+        );
+        drop(input);
+        let restored =
+            super::terminal_attributes(slave.as_raw_fd()).expect("restored terminal state");
+        assert_eq!(restored.c_iflag, original.c_iflag);
+        assert_eq!(restored.c_oflag, original.c_oflag);
+        assert_eq!(restored.c_cflag, original.c_cflag);
+        assert_eq!(
+            restored.c_lflag & !libc::PENDIN,
+            original.c_lflag & !libc::PENDIN
+        );
+        assert_eq!(restored.c_cc, original.c_cc);
+        assert_eq!(restored.c_ispeed, original.c_ispeed);
+        assert_eq!(restored.c_ospeed, original.c_ospeed);
     }
 
     fn write(

@@ -11,9 +11,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -244,6 +245,11 @@ impl Drop for TestDir {
 pub(crate) struct BangbangProcess {
     binary_path: PathBuf,
     child: Option<Child>,
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    stdin: Option<ChildStdin>,
     stdout: Option<OutputReader>,
     stderr: Option<OutputReader>,
     ready: Receiver<()>,
@@ -384,6 +390,7 @@ impl BangbangProcess {
 
     fn spawn_command(binary_path: PathBuf, mut command: Command) -> Self {
         let mut child = command
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -394,6 +401,7 @@ impl BangbangProcess {
                 )
             });
 
+        let stdin = child.stdin.take().expect("stdin should be piped");
         let stdout = child.stdout.take().expect("stdout should be piped");
         let stderr = child.stderr.take().expect("stderr should be piped");
         let (stdout, ready) = OutputReader::stdout(stdout);
@@ -401,6 +409,7 @@ impl BangbangProcess {
         Self {
             binary_path,
             child: Some(child),
+            stdin: Some(stdin),
             stdout: Some(stdout),
             stderr: Some(stderr),
             ready,
@@ -425,6 +434,65 @@ impl BangbangProcess {
 
     pub(crate) fn terminate(self) -> CompletedProcess {
         self.stop_with_signal(libc::SIGTERM, "SIGTERM")
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn write_stdin(&mut self, bytes: &[u8]) {
+        self.stdin
+            .as_mut()
+            .expect("stdin should remain open")
+            .write_all(bytes)
+            .expect("bangbang stdin should accept bytes");
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn wait_for_stdout_marker(
+        &self,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let output = self
+                .stdout
+                .as_ref()
+                .expect("stdout reader should be present")
+                .snapshot();
+            if output.contains(marker) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "stdout did not contain {marker:?} before {timeout:?}; stdout:\n{output}"
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn stdout_snapshot(&self) -> String {
+        self.stdout
+            .as_ref()
+            .expect("stdout reader should be present")
+            .snapshot()
     }
 
     #[allow(
@@ -544,13 +612,20 @@ pub(crate) struct CompletedProcess {
 #[derive(Debug)]
 struct OutputReader {
     handle: JoinHandle<String>,
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    output: Arc<Mutex<String>>,
 }
 
 impl OutputReader {
     fn stdout(stdout: impl Read + Send + 'static) -> (Self, Receiver<()>) {
         let (ready_sender, ready_receiver) = mpsc::channel();
+        let output = Arc::new(Mutex::new(String::new()));
+        let shared_output = Arc::clone(&output);
         let handle = thread::spawn(move || {
-            let mut output = String::new();
+            let mut collected = String::new();
             let mut reader = BufReader::new(stdout);
 
             loop {
@@ -564,32 +639,44 @@ impl OutputReader {
                         {
                             let _ = ready_sender.send(());
                         }
-                        output.push_str(&line);
+                        collected.push_str(&line);
+                        shared_output
+                            .lock()
+                            .expect("stdout snapshot should lock")
+                            .push_str(&line);
                     }
                     Err(err) => {
-                        output.push_str(&format!("\n<stdout read error: {err}>\n"));
+                        let error = format!("\n<stdout read error: {err}>\n");
+                        collected.push_str(&error);
+                        shared_output
+                            .lock()
+                            .expect("stdout snapshot should lock")
+                            .push_str(&error);
                         break;
                     }
                 }
             }
 
-            output
+            collected
         });
 
-        (Self { handle }, ready_receiver)
+        (Self { handle, output }, ready_receiver)
     }
 
     fn stderr(stderr: impl Read + Send + 'static) -> Self {
+        let output = Arc::new(Mutex::new(String::new()));
+        let shared_output = Arc::clone(&output);
         let handle = thread::spawn(move || {
             let mut output = String::new();
-            let mut reader = BufReader::new(stderr);
-            match reader.read_to_string(&mut output) {
-                Ok(_) => output,
-                Err(err) => format!("<stderr read error: {err}>"),
+            let result = BufReader::new(stderr).read_to_string(&mut output);
+            if let Err(err) = result {
+                output = format!("<stderr read error: {err}>");
             }
+            *shared_output.lock().expect("stderr snapshot should lock") = output.clone();
+            output
         });
 
-        Self { handle }
+        Self { handle, output }
     }
 
     fn join(self) -> String {
@@ -600,6 +687,17 @@ impl OutputReader {
 
     fn try_join(self) -> Result<String, Box<dyn std::any::Any + Send + 'static>> {
         self.handle.join()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    fn snapshot(&self) -> String {
+        self.output
+            .lock()
+            .expect("output snapshot should lock")
+            .clone()
     }
 }
 

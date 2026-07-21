@@ -72,7 +72,10 @@ use bangbang_runtime::pmem::{
     VirtioPmemConfigSpace, VirtioPmemDevice, VirtioPmemFlushStatus,
 };
 use bangbang_runtime::rtc::RtcMmioLayout;
-use bangbang_runtime::serial::{SerialConfig, SharedSerialOutput, SharedSerialOutputBuffer};
+use bangbang_runtime::serial::{
+    CaptureReadySerialState, SERIAL_RECEIVE_FIFO_CAPACITY, SerialConfig, SerialStdioInput,
+    SharedSerialOutput, SharedSerialOutputBuffer,
+};
 use bangbang_runtime::snapshot_device::{SnapshotV1BlockRetryState, SnapshotV1DeviceState};
 use bangbang_runtime::startup::{
     Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
@@ -93,14 +96,19 @@ use bangbang_runtime::startup::{
     Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
     Arm64BootResourceParts, Arm64BootResources,
     Arm64BootRtcDeviceConfig as RuntimeArm64BootRtcDeviceConfig, Arm64BootRuntimeResources,
-    Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig, Arm64BootVmGenIdDevice,
-    Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
-    Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
-    Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, OpenedBlockDeviceLiveUpdate,
-    VmStartupResources, capture_balloon_state_for_device, capture_entropy_state_for_device_at,
-    capture_memory_hotplug_state_for_device, memory_hotplug_status_for_device,
+    Arm64BootSerialCaptureError, Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
+    Arm64BootSerialRuntimeError, Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError,
+    Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
+    Arm64BootVsockNotificationDispatches, Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime,
+    OpenedBlockDeviceLiveUpdate, VmStartupResources, capture_balloon_state_for_device,
+    capture_entropy_state_for_device_at, capture_memory_hotplug_state_for_device,
+    capture_ready_serial_state_for_device, inject_serial_receive_bytes_for_device,
+    memory_hotplug_status_for_device, pending_serial_interrupt_intent_for_device,
+    record_serial_host_input_error_for_device,
     refresh_vhost_user_block_config_for_devices_with_signal, replace_arm64_boot_vmgenid,
-    update_live_block_device_for_devices_with_opened, update_memory_hotplug_config_for_device,
+    serial_receive_capacity_for_device, take_serial_input_ready_intent_for_device,
+    take_serial_interrupt_intent_for_device, update_live_block_device_for_devices_with_opened,
+    update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::storage_capture::{
     CaptureReadyBlockDeviceState, CaptureReadyPmemDeviceState, CaptureReadyStorageConfigs,
@@ -172,8 +180,8 @@ const BLOCK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME: &str = "bangbang-hvf-block-retry
 const PMEM_RETRY_WAKEUP_SCHEDULER_THREAD_NAME: &str = "bangbang-hvf-pmem-retry-wakeup";
 const ENTROPY_RETRY_WAKEUP_SCHEDULER_THREAD_NAME: &str = "bangbang-hvf-entropy-retry-wakeup";
 const NETWORK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME: &str = "bangbang-hvf-network-retry-wakeup";
-const VSOCK_WAKEUP_MONITOR_THREAD_NAME: &str = "bangbang-hvf-vsock-wakeup";
-const VSOCK_WAKEUP_MONITOR_STOP_BYTE: [u8; 1] = [0];
+const RUN_LOOP_WAKEUP_MONITOR_THREAD_NAME: &str = "bangbang-hvf-run-loop-wakeup";
+const RUN_LOOP_WAKEUP_MONITOR_STOP_BYTE: [u8; 1] = [0];
 const POLL_FOREVER: libc::c_int = -1;
 const PCI_VALIDATION_VIRTIO_RNG_BAR_REGION_ID: MmioRegionId = MmioRegionId::new(4001);
 const PCI_VALIDATION_VIRTIO_RNG_VECTOR_COUNT: usize = 2;
@@ -3142,6 +3150,7 @@ pub struct HvfArm64BootSession<'vm> {
     entropy_interrupt_line: Option<GuestInterruptLine>,
     memory_hotplug_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
+    serial_input: Option<HvfArm64BootSerialInput>,
     vmgenid_interrupt_line: GuestInterruptLine,
     vmclock_interrupt_line: GuestInterruptLine,
     boot_registers: Option<HvfArm64BootRegisters>,
@@ -3184,9 +3193,29 @@ pub struct OwnedHvfArm64BootSession {
     entropy_interrupt_line: Option<GuestInterruptLine>,
     memory_hotplug_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
+    serial_input: Option<HvfArm64BootSerialInput>,
     vmgenid_interrupt_line: GuestInterruptLine,
     vmclock_interrupt_line: GuestInterruptLine,
     boot_registers: Option<HvfArm64BootRegisters>,
+}
+
+#[derive(Debug)]
+struct HvfArm64BootSerialInput {
+    endpoint: SerialStdioInput,
+    armed: bool,
+}
+
+impl HvfArm64BootSerialInput {
+    const fn new(endpoint: SerialStdioInput) -> Self {
+        Self {
+            endpoint,
+            armed: true,
+        }
+    }
+
+    fn wakeup_fd(&self) -> Option<RawFd> {
+        self.armed.then(|| self.endpoint.as_raw_fd())
+    }
 }
 
 /// A never-run native-v1 session plus process-owned restored configuration.
@@ -4442,6 +4471,75 @@ impl HvfArm64BootSnapshotV1DeviceCaptureOwners<'_> {
             )
             .map_err(|_| HvfArm64BootSnapshotV1DeviceCaptureError::RuntimeCapture)
     }
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootSerialCaptureError {
+    OwnerUnavailable,
+    WrongQuiescenceGuard,
+    MissingDevice,
+    MmioDispatcherBusy,
+    MmioDispatcherPoisoned,
+    Capture { source: Arm64BootSerialCaptureError },
+}
+
+impl fmt::Display for HvfArm64BootSerialCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OwnerUnavailable => formatter.write_str("serial capture owner is unavailable"),
+            Self::WrongQuiescenceGuard => {
+                formatter.write_str("serial capture quiescence guard belongs to another session")
+            }
+            Self::MissingDevice => formatter.write_str("serial capture device is unavailable"),
+            Self::MmioDispatcherBusy => {
+                formatter.write_str("serial capture MMIO dispatcher is busy")
+            }
+            Self::MmioDispatcherPoisoned => {
+                formatter.write_str("serial capture MMIO dispatcher is poisoned")
+            }
+            Self::Capture { source } => write!(formatter, "serial capture failed: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootSerialCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture { source } => Some(source),
+            Self::OwnerUnavailable
+            | Self::WrongQuiescenceGuard
+            | Self::MissingDevice
+            | Self::MmioDispatcherBusy
+            | Self::MmioDispatcherPoisoned => None,
+        }
+    }
+}
+
+fn capture_ready_serial_state(
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &Arm64BootRuntimeResources,
+    block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    config: SerialConfig,
+    guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+) -> Result<CaptureReadySerialState, HvfArm64BootSerialCaptureError> {
+    if !Arc::ptr_eq(&guard.block.shared, &block_retry_wakeup_scheduler.shared) {
+        return Err(HvfArm64BootSerialCaptureError::WrongQuiescenceGuard);
+    }
+    let serial = runtime_resources
+        .serial_device
+        .as_ref()
+        .ok_or(HvfArm64BootSerialCaptureError::MissingDevice)?;
+    let mut dispatcher =
+        lock_boot_mmio_dispatcher(mmio_dispatcher).map_err(|source| match source {
+            HvfArm64BootMmioDispatcherError::Busy => {
+                HvfArm64BootSerialCaptureError::MmioDispatcherBusy
+            }
+            HvfArm64BootMmioDispatcherError::Poisoned => {
+                HvfArm64BootSerialCaptureError::MmioDispatcherPoisoned
+            }
+        })?;
+    capture_ready_serial_state_for_device(serial, &mut dispatcher, &config)
+        .map_err(|source| HvfArm64BootSerialCaptureError::Capture { source })
 }
 
 fn capture_ready_balloon_state(
@@ -5911,7 +6009,7 @@ pub enum HvfArm64BootRunLoopOutcome {
 
 #[derive(Debug)]
 pub enum HvfArm64BootRunLoopError {
-    StartVsockWakeupMonitor {
+    StartWakeupMonitor {
         steps_completed: usize,
         source: Box<HvfArm64BootRunLoopWakeupMonitorError>,
     },
@@ -5919,9 +6017,13 @@ pub enum HvfArm64BootRunLoopError {
         steps_completed: usize,
         source: Box<HvfArm64BootVcpuError>,
     },
-    StopVsockWakeupMonitor {
+    StopWakeupMonitor {
         steps_completed: usize,
         source: Box<HvfArm64BootRunLoopWakeupMonitorError>,
+    },
+    DispatchSerialInput {
+        steps_completed: usize,
+        source: Box<HvfArm64BootSerialInputDispatchError>,
     },
     DispatchBlockNotifications {
         steps_completed: usize,
@@ -5960,12 +6062,12 @@ pub enum HvfArm64BootRunLoopError {
 impl fmt::Display for HvfArm64BootRunLoopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StartVsockWakeupMonitor {
+            Self::StartWakeupMonitor {
                 steps_completed,
                 source,
             } => write!(
                 f,
-                "failed to start HVF boot-session vsock wakeup monitor after {steps_completed} completed steps: {source}"
+                "failed to start HVF boot-session wakeup monitor after {steps_completed} completed steps: {source}"
             ),
             Self::RunStep {
                 steps_completed,
@@ -5974,12 +6076,19 @@ impl fmt::Display for HvfArm64BootRunLoopError {
                 f,
                 "failed to run HVF boot-session vCPU step after {steps_completed} completed steps: {source}"
             ),
-            Self::StopVsockWakeupMonitor {
+            Self::StopWakeupMonitor {
                 steps_completed,
                 source,
             } => write!(
                 f,
-                "failed to stop HVF boot-session vsock wakeup monitor after {steps_completed} completed steps: {source}"
+                "failed to stop HVF boot-session wakeup monitor after {steps_completed} completed steps: {source}"
+            ),
+            Self::DispatchSerialInput {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to dispatch HVF boot-session serial input after {steps_completed} completed steps: {source}"
             ),
             Self::DispatchBlockNotifications {
                 steps_completed,
@@ -6044,9 +6153,10 @@ impl fmt::Display for HvfArm64BootRunLoopError {
 impl std::error::Error for HvfArm64BootRunLoopError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::StartVsockWakeupMonitor { source, .. } => Some(source.as_ref()),
+            Self::StartWakeupMonitor { source, .. } => Some(source.as_ref()),
             Self::RunStep { source, .. } => Some(source.as_ref()),
-            Self::StopVsockWakeupMonitor { source, .. } => Some(source.as_ref()),
+            Self::StopWakeupMonitor { source, .. } => Some(source.as_ref()),
+            Self::DispatchSerialInput { source, .. } => Some(source.as_ref()),
             Self::DispatchBlockNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchPmemNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchNetworkNotifications { source, .. } => Some(source.as_ref()),
@@ -6118,25 +6228,28 @@ impl fmt::Display for HvfArm64BootRunLoopWakeupMonitorError {
             Self::PollFdAllocation { source } => {
                 write!(
                     f,
-                    "failed to allocate boot vsock wakeup poll fd list: {source}"
+                    "failed to allocate boot run-loop wakeup poll fd list: {source}"
                 )
             }
             Self::TooManyPollFds { count } => {
-                write!(f, "too many boot vsock wakeup poll fds: {count}")
+                write!(f, "too many boot run-loop wakeup poll fds: {count}")
             }
             Self::CreateStopPipe { source } => {
-                write!(f, "failed to create boot vsock wakeup stop pipe: {source}")
+                write!(
+                    f,
+                    "failed to create boot run-loop wakeup stop pipe: {source}"
+                )
             }
             Self::ThreadSpawn { source } => {
-                write!(f, "failed to spawn boot vsock wakeup monitor: {source}")
+                write!(f, "failed to spawn boot run-loop wakeup monitor: {source}")
             }
             Self::StopSignal { source } => {
                 write!(
                     f,
-                    "failed to signal boot vsock wakeup monitor stop: {source}"
+                    "failed to signal boot run-loop wakeup monitor stop: {source}"
                 )
             }
-            Self::ThreadPanicked => f.write_str("boot vsock wakeup monitor thread panicked"),
+            Self::ThreadPanicked => f.write_str("boot run-loop wakeup monitor thread panicked"),
         }
     }
 }
@@ -6202,6 +6315,20 @@ impl HvfArm64BootSession<'_> {
                 &self.entropy_retry_wakeup,
                 &self.entropy_retry_wakeup_scheduler,
             ),
+        )
+    }
+
+    pub fn capture_ready_serial_state(
+        &self,
+        config: SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<CaptureReadySerialState, HvfArm64BootSerialCaptureError> {
+        capture_ready_serial_state(
+            &self.mmio_dispatcher,
+            &self.runtime_resources,
+            &self.block_retry_wakeup_scheduler,
+            config,
+            guard,
         )
     }
 
@@ -8086,6 +8213,7 @@ impl OwnedHvfArm64BootSession {
             entropy_interrupt_line: prepared.entropy_interrupt_line,
             memory_hotplug_interrupt_line: prepared.memory_hotplug_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
+            serial_input: prepared.serial_input,
             vmgenid_interrupt_line: prepared.vmgenid_interrupt_line,
             vmclock_interrupt_line: prepared.vmclock_interrupt_line,
             boot_registers: prepared.boot_registers,
@@ -8404,6 +8532,7 @@ impl OwnedHvfArm64BootSession {
             entropy_interrupt_line: None,
             memory_hotplug_interrupt_line: None,
             serial_interrupt_line,
+            serial_input: None,
             vmgenid_interrupt_line,
             vmclock_interrupt_line,
             boot_registers: None,
@@ -8441,6 +8570,20 @@ impl OwnedHvfArm64BootSession {
                 &self.entropy_retry_wakeup,
                 &self.entropy_retry_wakeup_scheduler,
             ),
+        )
+    }
+
+    pub fn capture_ready_serial_state(
+        &self,
+        config: SerialConfig,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<CaptureReadySerialState, HvfArm64BootSerialCaptureError> {
+        capture_ready_serial_state(
+            &self.mmio_dispatcher,
+            &self.runtime_resources,
+            &self.block_retry_wakeup_scheduler,
+            config,
+            guard,
         )
     }
 
@@ -10237,13 +10380,16 @@ impl OwnedHvfArm64BootSession {
 }
 
 impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
-    fn start_run_loop_vsock_wakeup_monitor(
+    fn start_run_loop_wakeup_monitor(
         &mut self,
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
-        start_run_loop_vsock_wakeup_monitor(
+        start_run_loop_wakeup_monitor(
             &self.runtime_resources,
             self.pci_data_devices.as_ref(),
             &self.mmio_dispatcher,
+            self.serial_input
+                .as_ref()
+                .and_then(HvfArm64BootSerialInput::wakeup_fd),
             self.runner.control(),
             self.run_loop_wakeup.clone(),
         )
@@ -10255,6 +10401,19 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
 
     fn take_run_loop_control_wakeup_request(&mut self) -> bool {
         self.control_wakeup.take_wakeup_request()
+    }
+
+    fn dispatch_run_loop_serial_input(
+        &mut self,
+        read_ready: bool,
+    ) -> Result<HvfArm64BootSerialInputDispatch, HvfArm64BootSerialInputDispatchError> {
+        dispatch_serial_input(
+            &mut self.serial_input,
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            &self.gic,
+            read_ready,
+        )
     }
 
     fn take_run_loop_block_retry_wakeup_request(&mut self) -> bool {
@@ -10429,10 +10588,10 @@ impl<P> BootSessionRunLoopSession for NetworkPacketIoBootSessionRunLoopSession<'
 where
     P: Arm64BootNetworkPacketIoProvider,
 {
-    fn start_run_loop_vsock_wakeup_monitor(
+    fn start_run_loop_wakeup_monitor(
         &mut self,
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
-        self.session.start_run_loop_vsock_wakeup_monitor()
+        self.session.start_run_loop_wakeup_monitor()
     }
 
     fn take_run_loop_wakeup_request(&mut self) -> bool {
@@ -10441,6 +10600,13 @@ where
 
     fn take_run_loop_control_wakeup_request(&mut self) -> bool {
         self.session.take_run_loop_control_wakeup_request()
+    }
+
+    fn dispatch_run_loop_serial_input(
+        &mut self,
+        read_ready: bool,
+    ) -> Result<HvfArm64BootSerialInputDispatch, HvfArm64BootSerialInputDispatchError> {
+        self.session.dispatch_run_loop_serial_input(read_ready)
     }
 
     fn take_run_loop_block_retry_wakeup_request(&mut self) -> bool {
@@ -11667,10 +11833,11 @@ fn run_boot_session_coordinated_vcpu_step(
     })
 }
 
-fn start_run_loop_vsock_wakeup_monitor(
+fn start_run_loop_wakeup_monitor(
     runtime_resources: &Arm64BootRuntimeResources,
     pci_data_devices: Option<&HvfArm64BootPciDataDevices>,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    serial_input_fd: Option<RawFd>,
     vcpu_control: HvfVcpuRunControl,
     wakeup_token: HvfArm64BootRunLoopWakeupToken,
 ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
@@ -11689,6 +11856,7 @@ fn start_run_loop_vsock_wakeup_monitor(
         && !has_mmio_block
         && !has_pci_block
         && async_block_fd.is_none()
+        && serial_input_fd.is_none()
     {
         return Ok(HvfArm64BootRunLoopWakeupMonitor::inactive());
     }
@@ -11697,6 +11865,13 @@ fn start_run_loop_vsock_wakeup_monitor(
     let mut write_fds = Vec::new();
     let mut deadline = None;
     let mut has_block_wakeup_fds = async_block_fd.is_some();
+    let has_serial_input_fd = serial_input_fd.is_some();
+    if let Some(descriptor) = serial_input_fd {
+        read_fds
+            .try_reserve_exact(1)
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
+        read_fds.push(descriptor);
+    }
     if let Some(descriptor) = async_block_fd {
         read_fds
             .try_reserve_exact(1)
@@ -11783,6 +11958,7 @@ fn start_run_loop_vsock_wakeup_monitor(
         write_fds,
         deadline,
         has_block_wakeup_fds,
+        has_serial_input_fd,
         vcpu_control,
         wakeup_token,
     )
@@ -11796,8 +11972,240 @@ fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HvfArm64BootSerialInputDispatch {
+    bytes_read: usize,
+    rearmed: bool,
+    backpressured: bool,
+    detached: bool,
+    interrupt_delivered: bool,
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootSerialInputDispatchError {
+    MissingDevice,
+    MmioDispatcher {
+        source: HvfArm64BootMmioDispatcherError,
+    },
+    Runtime {
+        source: Arm64BootSerialRuntimeError,
+    },
+    CreateSignaler {
+        source: HvfGicSpiSignalError,
+    },
+    Signal {
+        source: HvfGicSpiSignalError,
+    },
+    InvalidInjectionOutcome,
+    InterruptIntentChanged,
+}
+
+impl fmt::Display for HvfArm64BootSerialInputDispatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingDevice => {
+                formatter.write_str("serial input has no configured UART device")
+            }
+            Self::MmioDispatcher { source } => {
+                write!(
+                    formatter,
+                    "serial input MMIO dispatcher is unavailable: {source}"
+                )
+            }
+            Self::Runtime { source } => {
+                write!(formatter, "serial input UART dispatch failed: {source}")
+            }
+            Self::CreateSignaler { source } => {
+                write!(
+                    formatter,
+                    "serial input SPI signaler setup failed: {source}"
+                )
+            }
+            Self::Signal { source } => {
+                write!(formatter, "serial input SPI delivery failed: {source}")
+            }
+            Self::InvalidInjectionOutcome => {
+                formatter.write_str("serial input UART accepted an invalid bounded read")
+            }
+            Self::InterruptIntentChanged => {
+                formatter.write_str("serial input interrupt intent changed during delivery")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootSerialInputDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MmioDispatcher { source } => Some(source),
+            Self::Runtime { source } => Some(source),
+            Self::CreateSignaler { source } | Self::Signal { source } => Some(source),
+            Self::MissingDevice | Self::InvalidInjectionOutcome | Self::InterruptIntentChanged => {
+                None
+            }
+        }
+    }
+}
+
+fn dispatch_serial_input(
+    serial_input: &mut Option<HvfArm64BootSerialInput>,
+    runtime_resources: &Arm64BootRuntimeResources,
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    gic: &HvfGicMetadata,
+    read_ready: bool,
+) -> Result<HvfArm64BootSerialInputDispatch, HvfArm64BootSerialInputDispatchError> {
+    dispatch_serial_input_with(
+        serial_input,
+        runtime_resources,
+        mmio_dispatcher,
+        read_ready,
+        |interrupt_line| {
+            let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+                HvfArm64BootSerialInputDispatchError::CreateSignaler { source }
+            })?;
+            signaler
+                .set_level(interrupt_line, true)
+                .map_err(|source| HvfArm64BootSerialInputDispatchError::Signal { source })
+        },
+    )
+}
+
+fn dispatch_pending_serial_interrupt_with(
+    serial: &bangbang_runtime::startup::Arm64BootSerialDevice,
+    dispatcher: &mut MmioDispatcher,
+    dispatch: &mut HvfArm64BootSerialInputDispatch,
+    signal_interrupt: &mut impl FnMut(
+        GuestInterruptLine,
+    ) -> Result<(), HvfArm64BootSerialInputDispatchError>,
+) -> Result<(), HvfArm64BootSerialInputDispatchError> {
+    if pending_serial_interrupt_intent_for_device(serial, dispatcher)
+        .map_err(|source| HvfArm64BootSerialInputDispatchError::Runtime { source })?
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    signal_interrupt(serial.fdt_device.interrupt_line)?;
+    if take_serial_interrupt_intent_for_device(serial, dispatcher)
+        .map_err(|source| HvfArm64BootSerialInputDispatchError::Runtime { source })?
+        .is_none()
+    {
+        return Err(HvfArm64BootSerialInputDispatchError::InterruptIntentChanged);
+    }
+    dispatch.interrupt_delivered = true;
+    Ok(())
+}
+
+fn dispatch_serial_input_with(
+    serial_input: &mut Option<HvfArm64BootSerialInput>,
+    runtime_resources: &Arm64BootRuntimeResources,
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    read_ready: bool,
+    mut signal_interrupt: impl FnMut(
+        GuestInterruptLine,
+    ) -> Result<(), HvfArm64BootSerialInputDispatchError>,
+) -> Result<HvfArm64BootSerialInputDispatch, HvfArm64BootSerialInputDispatchError> {
+    let Some(serial) = runtime_resources.serial_device.as_ref() else {
+        return if serial_input.is_some() {
+            Err(HvfArm64BootSerialInputDispatchError::MissingDevice)
+        } else {
+            Ok(HvfArm64BootSerialInputDispatch::default())
+        };
+    };
+    let mut dispatcher = lock_boot_mmio_dispatcher_runtime(mmio_dispatcher)
+        .map_err(|source| HvfArm64BootSerialInputDispatchError::MmioDispatcher { source })?;
+    let mut dispatch = HvfArm64BootSerialInputDispatch::default();
+
+    if take_serial_input_ready_intent_for_device(serial, &mut dispatcher)
+        .map_err(|source| HvfArm64BootSerialInputDispatchError::Runtime { source })?
+        .is_some()
+        && let Some(input) = serial_input.as_mut()
+    {
+        input.armed = true;
+        dispatch.rearmed = true;
+    }
+    dispatch_pending_serial_interrupt_with(
+        serial,
+        &mut dispatcher,
+        &mut dispatch,
+        &mut signal_interrupt,
+    )?;
+    let Some(input) = serial_input.as_mut() else {
+        return Ok(dispatch);
+    };
+    if !read_ready || !input.armed {
+        return Ok(dispatch);
+    }
+
+    let capacity = serial_receive_capacity_for_device(serial, &mut dispatcher)
+        .map_err(|source| HvfArm64BootSerialInputDispatchError::Runtime { source })?;
+    if capacity == 0 {
+        input.armed = false;
+        dispatch.backpressured = true;
+        return Ok(dispatch);
+    }
+    if capacity > SERIAL_RECEIVE_FIFO_CAPACITY {
+        return Err(HvfArm64BootSerialInputDispatchError::InvalidInjectionOutcome);
+    }
+
+    let mut bytes = [0_u8; SERIAL_RECEIVE_FIFO_CAPACITY];
+    let read = input.endpoint.read(
+        bytes
+            .get_mut(..capacity)
+            .ok_or(HvfArm64BootSerialInputDispatchError::InvalidInjectionOutcome)?,
+    );
+    let count = match read {
+        Ok(0) => {
+            drop(dispatcher);
+            *serial_input = None;
+            dispatch.detached = true;
+            return Ok(dispatch);
+        }
+        Ok(count) => count,
+        Err(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            return Ok(dispatch);
+        }
+        Err(_) => {
+            record_serial_host_input_error_for_device(serial, &mut dispatcher)
+                .map_err(|source| HvfArm64BootSerialInputDispatchError::Runtime { source })?;
+            drop(dispatcher);
+            *serial_input = None;
+            dispatch.detached = true;
+            return Ok(dispatch);
+        }
+    };
+
+    let read_bytes = bytes
+        .get(..count)
+        .ok_or(HvfArm64BootSerialInputDispatchError::InvalidInjectionOutcome)?;
+    let injected = inject_serial_receive_bytes_for_device(serial, &mut dispatcher, read_bytes)
+        .map_err(|source| HvfArm64BootSerialInputDispatchError::Runtime { source })?;
+    if injected.accepted_bytes() != count || injected.rejected_bytes() != 0 {
+        return Err(HvfArm64BootSerialInputDispatchError::InvalidInjectionOutcome);
+    }
+    dispatch.bytes_read = count;
+    if injected.is_backpressured() {
+        input.armed = false;
+        dispatch.backpressured = true;
+    }
+
+    dispatch_pending_serial_interrupt_with(
+        serial,
+        &mut dispatcher,
+        &mut dispatch,
+        &mut signal_interrupt,
+    )?;
+
+    Ok(dispatch)
+}
+
 trait BootSessionRunLoopSession {
-    fn start_run_loop_vsock_wakeup_monitor(
+    fn start_run_loop_wakeup_monitor(
         &mut self,
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
         Ok(HvfArm64BootRunLoopWakeupMonitor::inactive())
@@ -11809,6 +12217,13 @@ trait BootSessionRunLoopSession {
 
     fn take_run_loop_control_wakeup_request(&mut self) -> bool {
         false
+    }
+
+    fn dispatch_run_loop_serial_input(
+        &mut self,
+        _read_ready: bool,
+    ) -> Result<HvfArm64BootSerialInputDispatch, HvfArm64BootSerialInputDispatchError> {
+        Ok(HvfArm64BootSerialInputDispatch::default())
     }
 
     fn take_run_loop_block_retry_wakeup_request(&mut self) -> bool {
@@ -11883,13 +12298,16 @@ trait BootSessionRunLoopSession {
 }
 
 impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
-    fn start_run_loop_vsock_wakeup_monitor(
+    fn start_run_loop_wakeup_monitor(
         &mut self,
     ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
-        start_run_loop_vsock_wakeup_monitor(
+        start_run_loop_wakeup_monitor(
             &self.runtime_resources,
             self.pci_data_devices.as_ref(),
             &self.mmio_dispatcher,
+            self.serial_input
+                .as_ref()
+                .and_then(HvfArm64BootSerialInput::wakeup_fd),
             self.runner.control(),
             self.run_loop_wakeup.clone(),
         )
@@ -11901,6 +12319,19 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
 
     fn take_run_loop_control_wakeup_request(&mut self) -> bool {
         self.control_wakeup.take_wakeup_request()
+    }
+
+    fn dispatch_run_loop_serial_input(
+        &mut self,
+        read_ready: bool,
+    ) -> Result<HvfArm64BootSerialInputDispatch, HvfArm64BootSerialInputDispatchError> {
+        dispatch_serial_input(
+            &mut self.serial_input,
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            &self.gic,
+            read_ready,
+        )
     }
 
     fn take_run_loop_block_retry_wakeup_request(&mut self) -> bool {
@@ -12076,6 +12507,20 @@ fn dispatch_run_loop_block_notifications_for_step(
     Ok(())
 }
 
+fn dispatch_run_loop_serial_input_for_step(
+    session: &mut impl BootSessionRunLoopSession,
+    steps_completed: usize,
+    read_ready: bool,
+) -> Result<(), HvfArm64BootRunLoopError> {
+    session
+        .dispatch_run_loop_serial_input(read_ready)
+        .map(|_| ())
+        .map_err(|source| HvfArm64BootRunLoopError::DispatchSerialInput {
+            steps_completed,
+            source: Box::new(source),
+        })
+}
+
 fn dispatch_run_loop_block_retry_notifications_for_step(
     session: &mut impl BootSessionRunLoopSession,
     steps_completed: usize,
@@ -12237,28 +12682,29 @@ fn run_boot_session_loop_with_observer_inner(
             return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
         }
 
-        let monitor = session
-            .start_run_loop_vsock_wakeup_monitor()
-            .map_err(|source| HvfArm64BootRunLoopError::StartVsockWakeupMonitor {
+        let monitor = session.start_run_loop_wakeup_monitor().map_err(|source| {
+            HvfArm64BootRunLoopError::StartWakeupMonitor {
                 steps_completed: steps,
                 source: Box::new(source),
-            })?;
+            }
+        })?;
         let monitor_has_block_wakeup_fds = monitor.has_block_wakeup_fds();
+        let monitor_has_serial_input_fd = monitor.has_serial_input_fd();
         let outcome_result = session.run_loop_vcpu_step();
         let finish_result = monitor.finish();
         let monitor_wakeup_requested = match &outcome_result {
-            Ok(_) => finish_result.map_err(|source| {
-                HvfArm64BootRunLoopError::StopVsockWakeupMonitor {
+            Ok(_) => {
+                finish_result.map_err(|source| HvfArm64BootRunLoopError::StopWakeupMonitor {
                     steps_completed: steps.saturating_add(1),
                     source: Box::new(source),
-                }
-            })?,
-            Err(_) => finish_result.map_err(|source| {
-                HvfArm64BootRunLoopError::StopVsockWakeupMonitor {
+                })?
+            }
+            Err(_) => {
+                finish_result.map_err(|source| HvfArm64BootRunLoopError::StopWakeupMonitor {
                     steps_completed: steps,
                     source: Box::new(source),
-                }
-            })?,
+                })?
+            }
         };
         let outcome = outcome_result.map_err(|source| HvfArm64BootRunLoopError::RunStep {
             steps_completed: steps,
@@ -12282,6 +12728,16 @@ fn run_boot_session_loop_with_observer_inner(
                     session.take_run_loop_network_retry_wakeup_request();
                 let entropy_retry_wakeup_requested =
                     session.take_run_loop_entropy_retry_wakeup_request();
+                if !control_wakeup_requested {
+                    dispatch_run_loop_serial_input_for_step(
+                        session,
+                        steps,
+                        monitor_wakeup_requested && monitor_has_serial_input_fd,
+                    )?;
+                    if stop_token.is_stop_requested() {
+                        return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                    }
+                }
                 if block_retry_wakeup_requested {
                     dispatch_run_loop_block_notifications_for_step(session, steps)?;
                     if stop_token.is_stop_requested() {
@@ -12416,6 +12872,10 @@ fn run_boot_session_loop_with_observer_inner(
                 }
             }
             HvfVcpuRunStepOutcome::Mmio { .. } => {
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                dispatch_run_loop_serial_input_for_step(session, steps, false)?;
                 let _ = session.take_run_loop_block_retry_wakeup_request();
                 let _ = session.take_run_loop_pmem_retry_wakeup_request();
                 let _ = session.take_run_loop_network_retry_wakeup_request();
@@ -12475,6 +12935,7 @@ struct HvfArm64BootRunLoopWakeupMonitor {
     thread: Option<JoinHandle<bool>>,
     completed_wakeup: bool,
     has_block_wakeup_fds: bool,
+    has_serial_input_fd: bool,
 }
 
 impl HvfArm64BootRunLoopWakeupMonitor {
@@ -12484,6 +12945,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
             thread: None,
             completed_wakeup: false,
             has_block_wakeup_fds: false,
+            has_serial_input_fd: false,
         }
     }
 
@@ -12494,6 +12956,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
             thread: None,
             completed_wakeup,
             has_block_wakeup_fds: false,
+            has_serial_input_fd: false,
         }
     }
 
@@ -12504,6 +12967,18 @@ impl HvfArm64BootRunLoopWakeupMonitor {
             thread: None,
             completed_wakeup,
             has_block_wakeup_fds: true,
+            has_serial_input_fd: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn completed_serial_for_test(completed_wakeup: bool) -> Self {
+        Self {
+            stop_writer: None,
+            thread: None,
+            completed_wakeup,
+            has_block_wakeup_fds: false,
+            has_serial_input_fd: true,
         }
     }
 
@@ -12512,6 +12987,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
         host_write_fds: Vec<RawFd>,
         deadline: Option<Instant>,
         has_block_wakeup_fds: bool,
+        has_serial_input_fd: bool,
         vcpu_control: HvfVcpuRunControl,
         wakeup_token: HvfArm64BootRunLoopWakeupToken,
     ) -> Result<Self, HvfArm64BootRunLoopWakeupMonitorError> {
@@ -12522,16 +12998,16 @@ impl HvfArm64BootRunLoopWakeupMonitor {
         let (stop_reader, stop_writer) =
             UnixStream::pair().map_err(|source| Self::create_stop_pipe_error(source.kind()))?;
         let mut pollfds =
-            vsock_wakeup_pollfds(host_read_fds, host_write_fds, stop_reader.as_raw_fd())?;
+            run_loop_wakeup_pollfds(host_read_fds, host_write_fds, stop_reader.as_raw_fd())?;
         let pollfd_count = libc::nfds_t::try_from(pollfds.len()).map_err(|_| {
             HvfArm64BootRunLoopWakeupMonitorError::TooManyPollFds {
                 count: pollfds.len(),
             }
         })?;
         let thread = thread::Builder::new()
-            .name(VSOCK_WAKEUP_MONITOR_THREAD_NAME.to_owned())
+            .name(RUN_LOOP_WAKEUP_MONITOR_THREAD_NAME.to_owned())
             .spawn(move || {
-                run_vsock_wakeup_monitor(
+                run_loop_wakeup_monitor(
                     &mut pollfds,
                     pollfd_count,
                     stop_reader,
@@ -12547,6 +13023,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
             thread: Some(thread),
             completed_wakeup: false,
             has_block_wakeup_fds,
+            has_serial_input_fd,
         })
     }
 
@@ -12554,10 +13031,14 @@ impl HvfArm64BootRunLoopWakeupMonitor {
         self.has_block_wakeup_fds
     }
 
+    const fn has_serial_input_fd(&self) -> bool {
+        self.has_serial_input_fd
+    }
+
     fn finish(mut self) -> Result<bool, HvfArm64BootRunLoopWakeupMonitorError> {
         let mut stop_signal_error = None;
         if let Some(mut stop_writer) = self.stop_writer.take() {
-            match stop_writer.write_all(&VSOCK_WAKEUP_MONITOR_STOP_BYTE) {
+            match stop_writer.write_all(&RUN_LOOP_WAKEUP_MONITOR_STOP_BYTE) {
                 Ok(()) => {}
                 Err(source)
                     if matches!(
@@ -12592,7 +13073,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
     }
 }
 
-fn vsock_wakeup_pollfds(
+fn run_loop_wakeup_pollfds(
     mut host_read_fds: Vec<RawFd>,
     mut host_write_fds: Vec<RawFd>,
     stop_fd: RawFd,
@@ -12654,7 +13135,7 @@ fn vsock_wakeup_pollfds(
     Ok(pollfds)
 }
 
-fn run_vsock_wakeup_monitor(
+fn run_loop_wakeup_monitor(
     pollfds: &mut [libc::pollfd],
     pollfd_count: libc::nfds_t,
     _stop_reader: UnixStream,
@@ -12662,7 +13143,7 @@ fn run_vsock_wakeup_monitor(
     vcpu_control: HvfVcpuRunControl,
     wakeup_token: HvfArm64BootRunLoopWakeupToken,
 ) -> bool {
-    run_vsock_wakeup_monitor_with(
+    run_loop_wakeup_monitor_with(
         pollfds,
         pollfd_count,
         deadline,
@@ -12685,7 +13166,7 @@ fn run_vsock_wakeup_monitor(
     )
 }
 
-fn run_vsock_wakeup_monitor_with(
+fn run_loop_wakeup_monitor_with(
     pollfds: &mut [libc::pollfd],
     pollfd_count: libc::nfds_t,
     deadline: Option<Instant>,
@@ -13994,6 +14475,7 @@ fn signal_device_interrupt(
 #[derive(Debug)]
 pub enum HvfArm64BootSessionError {
     BackendAlreadyInitialized,
+    SerialInputWithoutDevice,
     UnsupportedVcpuCount {
         vcpu_count: u8,
     },
@@ -14080,6 +14562,9 @@ impl fmt::Display for HvfArm64BootSessionError {
         match self {
             Self::BackendAlreadyInitialized => {
                 f.write_str("HVF arm64 boot session requires a backend without an existing VM")
+            }
+            Self::SerialInputWithoutDevice => {
+                f.write_str("HVF arm64 boot serial input requires a configured serial device")
             }
             Self::UnsupportedVcpuCount { vcpu_count } => write!(
                 f,
@@ -14223,6 +14708,7 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::MapGuestMemory { source } => Some(source),
             Self::ConfigureBootRegisters { source } => Some(source),
             Self::BackendAlreadyInitialized
+            | Self::SerialInputWithoutDevice
             | Self::UnsupportedVcpuCount { .. }
             | Self::PowerTopology
             | Self::MissingPciValidationMsiSignaler
@@ -14418,6 +14904,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     entropy_interrupt_line: Option<GuestInterruptLine>,
     memory_hotplug_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
+    serial_input: Option<HvfArm64BootSerialInput>,
     vmgenid_interrupt_line: GuestInterruptLine,
     vmclock_interrupt_line: GuestInterruptLine,
     boot_registers: Option<HvfArm64BootRegisters>,
@@ -14508,6 +14995,7 @@ impl HvfBackend {
             entropy_interrupt_line: prepared.entropy_interrupt_line,
             memory_hotplug_interrupt_line: prepared.memory_hotplug_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
+            serial_input: prepared.serial_input,
             vmgenid_interrupt_line: prepared.vmgenid_interrupt_line,
             vmclock_interrupt_line: prepared.vmclock_interrupt_line,
             boot_registers: prepared.boot_registers,
@@ -14534,7 +15022,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     backend: &mut HvfBackend,
     controller: &VmmController,
     config: HvfArm64BootSessionConfig,
-    startup_resources: VmStartupResources,
+    mut startup_resources: VmStartupResources,
     prepare_cache: impl FnOnce(
         u8,
     ) -> Result<
@@ -14542,6 +15030,12 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         crate::cache::HvfArm64CacheTopologyError,
     >,
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
+    let serial_input = startup_resources
+        .take_serial_input()
+        .map(HvfArm64BootSerialInput::new);
+    if serial_input.is_some() && config.serial_device.is_none() {
+        return Err(HvfArm64BootSessionError::SerialInputWithoutDevice);
+    }
     let cpu_template = controller
         .custom_cpu_template()
         .map(crate::cpu_template::PreparedHvfArm64CpuTemplate::from_runtime)
@@ -14916,6 +15410,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         entropy_interrupt_line: interrupt_lines.entropy,
         memory_hotplug_interrupt_line: interrupt_lines.memory_hotplug,
         serial_interrupt_line: interrupt_lines.serial,
+        serial_input,
         vmgenid_interrupt_line: interrupt_lines.vmgenid,
         vmclock_interrupt_line: interrupt_lines.vmclock,
         boot_registers: Some(boot_registers),
@@ -15885,9 +16380,10 @@ fn allocate_interrupt_lines(
 mod tests {
     use std::collections::VecDeque;
     use std::error::Error as _;
-    use std::fs::{self, OpenOptions};
+    use std::fs::{self, File, OpenOptions};
     use std::io::{self, Write};
     use std::num::{NonZeroU32, NonZeroUsize};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
@@ -15956,7 +16452,11 @@ mod tests {
         VIRTIO_PMEM_REQUEST_TYPE_FLUSH, VIRTIO_PMEM_STATUS_SIZE, VirtioPmemFlushStatus,
     };
     use bangbang_runtime::rtc::RtcMmioLayout;
-    use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
+    use bangbang_runtime::serial::{
+        SERIAL_INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE, SERIAL_INTERRUPT_ENABLE_REGISTER_OFFSET,
+        SERIAL_RECEIVE_FIFO_CAPACITY, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialStdio,
+        SharedSerialOutput, SharedSerialOutputBuffer,
+    };
     use bangbang_runtime::snapshot_device::SnapshotV1BlockRetryState;
     use bangbang_runtime::startup::{
         ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonNotificationDispatches,
@@ -15968,9 +16468,11 @@ mod tests {
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
         Arm64BootPciValidationConfig, Arm64BootPmemFlushProvider,
         Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
-        Arm64BootRuntimeResources, Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError,
-        Arm64BootVsockNotificationDispatches, memory_hotplug_status_for_device,
-        update_memory_hotplug_config_for_device,
+        Arm64BootRuntimeResources,
+        Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig, Arm64BootVmGenIdDevice,
+        Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatches,
+        capture_serial_state_for_device, memory_hotplug_status_for_device,
+        pending_serial_interrupt_intent_for_device, update_memory_hotplug_config_for_device,
     };
     use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
     use bangbang_runtime::virtio_mmio::{
@@ -15999,23 +16501,24 @@ mod tests {
         HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatchError,
         HvfArm64BootPmemNotificationDispatchError, HvfArm64BootRunLoopControl,
         HvfArm64BootRunLoopControlWakeupToken, HvfArm64BootRunLoopOutcome,
-        HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-        HvfArm64BootSessionError, HvfArm64BootTimerDeviceConfig, HvfArm64BootVmGenIdRestoreError,
+        HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSerialInput,
+        HvfArm64BootSerialInputDispatchError, HvfArm64BootSessionConfig, HvfArm64BootSessionError,
+        HvfArm64BootTimerDeviceConfig, HvfArm64BootVmGenIdRestoreError,
         HvfArm64BootVsockNotificationDispatchError, PCI_ENDPOINT_SLOT_COUNT,
         allocate_interrupt_lines, collect_balloon_notification_dispatches,
         collect_block_notification_dispatches, collect_entropy_notification_dispatches,
         collect_memory_hotplug_notification_dispatches, collect_network_notification_dispatches,
         collect_vsock_notification_dispatches,
         dispatch_memory_hotplug_runtime_notifications_with_executor,
-        dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
-        lock_boot_mmio_dispatcher_runtime, pci_all_virtio_gic_msi_configuration,
-        pci_all_virtio_resource_demand, pci_data_available_bar_count, pci_data_bar_plan,
-        pci_data_endpoint_count, pci_data_region_id, pci_data_resource_demand,
-        preflight_pci_data_dispatcher, quiesce_limiter_retry_wakeups,
-        record_entropy_dispatch_metrics, record_memory_hotplug_signal_metrics,
-        record_memory_hotplug_teardown_metrics, record_pmem_dispatch_metrics,
-        replace_vmgenid_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
-        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        dispatch_network_runtime_notifications_with_packet_io, dispatch_serial_input_with,
+        lock_boot_mmio_dispatcher, lock_boot_mmio_dispatcher_runtime,
+        pci_all_virtio_gic_msi_configuration, pci_all_virtio_resource_demand,
+        pci_data_available_bar_count, pci_data_bar_plan, pci_data_endpoint_count,
+        pci_data_region_id, pci_data_resource_demand, preflight_pci_data_dispatcher,
+        quiesce_limiter_retry_wakeups, record_entropy_dispatch_metrics,
+        record_memory_hotplug_signal_metrics, record_memory_hotplug_teardown_metrics,
+        record_pmem_dispatch_metrics, replace_vmgenid_and_signal_with, run_boot_session_loop,
+        run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_capture_ready_mmio_block_interrupts, signal_entropy_queue_interrupts,
         signal_memory_hotplug_queue_interrupts, signal_network_queue_interrupts,
         signal_pmem_queue_interrupts, signal_vsock_queue_interrupts,
@@ -16053,8 +16556,8 @@ mod tests {
     }
 
     #[test]
-    fn vsock_wakeup_pollfds_preserve_read_and_write_interests() {
-        let pollfds = super::vsock_wakeup_pollfds(vec![13, 11, 13], vec![12, 13, 12], 10)
+    fn run_loop_wakeup_pollfds_preserve_read_and_write_interests() {
+        let pollfds = super::run_loop_wakeup_pollfds(vec![13, 11, 13], vec![12, 13, 12], 10)
             .expect("vsock poll descriptors should build");
         let descriptors = pollfds
             .iter()
@@ -16108,7 +16611,7 @@ mod tests {
     }
 
     #[test]
-    fn vsock_wakeup_monitor_recomputes_deadline_only_timeout_after_interrupt() {
+    fn run_loop_wakeup_monitor_recomputes_deadline_only_timeout_after_interrupt() {
         let now = Instant::now();
         let deadline = now + Duration::from_millis(5);
         let mut pollfds = [libc::pollfd {
@@ -16124,7 +16627,7 @@ mod tests {
         let mut timeouts = Vec::new();
         let mut wakeups = 0usize;
 
-        let woke = super::run_vsock_wakeup_monitor_with(
+        let woke = super::run_loop_wakeup_monitor_with(
             &mut pollfds,
             1,
             Some(deadline),
@@ -16146,7 +16649,7 @@ mod tests {
     }
 
     #[test]
-    fn vsock_wakeup_monitor_preserves_stop_precedence_over_fd_and_deadline() {
+    fn run_loop_wakeup_monitor_preserves_stop_precedence_over_fd_and_deadline() {
         let now = Instant::now();
         let mut pollfds = [
             libc::pollfd {
@@ -16162,7 +16665,7 @@ mod tests {
         ];
         let mut wakeups = 0usize;
 
-        let woke = super::run_vsock_wakeup_monitor_with(
+        let woke = super::run_loop_wakeup_monitor_with(
             &mut pollfds,
             2,
             Some(now),
@@ -16181,7 +16684,7 @@ mod tests {
     }
 
     #[test]
-    fn vsock_wakeup_monitor_coalesces_simultaneous_fd_and_deadline_readiness() {
+    fn run_loop_wakeup_monitor_coalesces_simultaneous_fd_and_deadline_readiness() {
         let now = Instant::now();
         let mut pollfds = [
             libc::pollfd {
@@ -16197,7 +16700,7 @@ mod tests {
         ];
         let mut wakeups = 0usize;
 
-        let woke = super::run_vsock_wakeup_monitor_with(
+        let woke = super::run_loop_wakeup_monitor_with(
             &mut pollfds,
             2,
             Some(now),
@@ -16215,7 +16718,7 @@ mod tests {
     }
 
     #[test]
-    fn vsock_wakeup_monitor_conservatively_wakes_owner_on_poll_error() {
+    fn run_loop_wakeup_monitor_conservatively_wakes_owner_on_poll_error() {
         let now = Instant::now();
         let mut pollfds = [libc::pollfd {
             fd: 10,
@@ -16224,7 +16727,7 @@ mod tests {
         }];
         let mut wakeups = 0usize;
 
-        let woke = super::run_vsock_wakeup_monitor_with(
+        let woke = super::run_loop_wakeup_monitor_with(
             &mut pollfds,
             1,
             None,
@@ -16252,6 +16755,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(Instant::now() + Duration::from_secs(60 * 60)),
+            false,
             false,
             coordinator.control(),
             wakeup.clone(),
@@ -17637,7 +18141,7 @@ mod tests {
                 HvfArm64BootPmemNotificationDispatchError,
             >,
         >,
-        monitor_wakeup_results: VecDeque<(bool, bool)>,
+        monitor_wakeup_results: VecDeque<(bool, bool, bool)>,
         network_dispatch_results: VecDeque<
             Result<
                 super::HvfArm64BootNetworkNotificationDispatches,
@@ -17692,6 +18196,7 @@ mod tests {
         scheduled_entropy_retry_wakeups: Vec<Option<Duration>>,
         pmem_retry_cancel_count: usize,
         network_retry_cancel_count: usize,
+        serial_readiness: Vec<bool>,
     }
 
     impl RecordingBootSessionRunLoopSession {
@@ -17730,6 +18235,7 @@ mod tests {
                 scheduled_entropy_retry_wakeups: Vec::new(),
                 pmem_retry_cancel_count: 0,
                 network_retry_cancel_count: 0,
+                serial_readiness: Vec::new(),
             }
         }
 
@@ -17768,6 +18274,7 @@ mod tests {
                 scheduled_entropy_retry_wakeups: Vec::new(),
                 pmem_retry_cancel_count: 0,
                 network_retry_cancel_count: 0,
+                serial_readiness: Vec::new(),
             }
         }
 
@@ -17812,11 +18319,15 @@ mod tests {
         }
 
         fn push_monitor_wakeup(&mut self) {
-            self.monitor_wakeup_results.push_back((true, false));
+            self.monitor_wakeup_results.push_back((true, false, false));
         }
 
         fn push_block_monitor_wakeup(&mut self) {
-            self.monitor_wakeup_results.push_back((true, true));
+            self.monitor_wakeup_results.push_back((true, true, false));
+        }
+
+        fn push_serial_monitor_wakeup(&mut self) {
+            self.monitor_wakeup_results.push_back((true, false, true));
         }
 
         fn push_network_dispatch_error(
@@ -17927,13 +18438,13 @@ mod tests {
     }
 
     impl super::BootSessionRunLoopSession for RecordingBootSessionRunLoopSession {
-        fn start_run_loop_vsock_wakeup_monitor(
+        fn start_run_loop_wakeup_monitor(
             &mut self,
         ) -> Result<
             super::HvfArm64BootRunLoopWakeupMonitor,
             super::HvfArm64BootRunLoopWakeupMonitorError,
         > {
-            let (completed_wakeup, has_block_wakeup_fds) =
+            let (completed_wakeup, has_block_wakeup_fds, has_serial_input_fd) =
                 self.monitor_wakeup_results.pop_front().unwrap_or_default();
             if completed_wakeup {
                 self.wakeup_request_count = self.wakeup_request_count.saturating_add(1);
@@ -17941,6 +18452,8 @@ mod tests {
 
             Ok(if has_block_wakeup_fds {
                 super::HvfArm64BootRunLoopWakeupMonitor::completed_block_for_test(completed_wakeup)
+            } else if has_serial_input_fd {
+                super::HvfArm64BootRunLoopWakeupMonitor::completed_serial_for_test(completed_wakeup)
             } else {
                 super::HvfArm64BootRunLoopWakeupMonitor::completed_for_test(completed_wakeup)
             })
@@ -17958,6 +18471,17 @@ mod tests {
             let wakeup_requested = self.control_wakeup_requested;
             self.control_wakeup_requested = false;
             wakeup_requested
+        }
+
+        fn dispatch_run_loop_serial_input(
+            &mut self,
+            read_ready: bool,
+        ) -> Result<
+            super::HvfArm64BootSerialInputDispatch,
+            super::HvfArm64BootSerialInputDispatchError,
+        > {
+            self.serial_readiness.push(read_ready);
+            Ok(super::HvfArm64BootSerialInputDispatch::default())
         }
 
         fn take_run_loop_block_retry_wakeup_request(&mut self) -> bool {
@@ -18563,6 +19087,268 @@ mod tests {
         let parts = resources.into_parts();
 
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
+    fn boot_runtime_with_serial() -> (Arm64BootRuntimeResources, MmioDispatcher) {
+        let kernel = temp_file("kernel-with-serial", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let mut config = valid_boot_resource_config(&[]);
+        config.serial_device = Some(RuntimeArm64BootSerialDeviceConfig::new(
+            MmioRegionId::new(150),
+            GuestAddress::new(0x4000_a000),
+            line(40),
+            SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+        ));
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("serial boot resources should assemble");
+        let parts = resources.into_parts();
+        (parts.runtime, parts.mmio_dispatcher)
+    }
+
+    fn test_pipe_files() -> (File, File) {
+        let mut descriptors = [-1; 2];
+        // SAFETY: `descriptors` has space for both fresh pipe descriptors.
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        // SAFETY: Successful `pipe` returned two fresh owned descriptors.
+        let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+        // SAFETY: Successful `pipe` returned two fresh owned descriptors.
+        let writer = unsafe { File::from_raw_fd(descriptors[1]) };
+        (reader, writer)
+    }
+
+    fn serial_input_for_test(input_descriptor: &File) -> HvfArm64BootSerialInput {
+        let output = OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("null output should open");
+        let (_output, input) =
+            SerialStdio::from_descriptors(input_descriptor.as_raw_fd(), output.as_raw_fd())
+                .expect("test serial stdio should prepare")
+                .into_parts();
+        HvfArm64BootSerialInput::new(input.expect("test pipe input should attach"))
+    }
+
+    fn read_serial_byte(
+        runtime: &Arm64BootRuntimeResources,
+        dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    ) -> u8 {
+        let serial = runtime
+            .serial_device
+            .as_ref()
+            .expect("serial device should exist");
+        let mut dispatcher = dispatcher.lock().expect("dispatcher should lock");
+        let access = dispatcher
+            .lookup(
+                serial
+                    .region
+                    .range()
+                    .start()
+                    .checked_add(SERIAL_TRANSMIT_REGISTER_OFFSET)
+                    .expect("serial receive address should fit"),
+                1,
+            )
+            .expect("serial receive access should resolve");
+        match dispatcher
+            .dispatch(MmioOperation::read(access).expect("serial read should build"))
+            .expect("serial read should dispatch")
+        {
+            MmioDispatchOutcome::Read { data } => data.as_slice()[0],
+            MmioDispatchOutcome::Write => panic!("serial receive must be a read"),
+        }
+    }
+
+    fn enable_serial_receive_interrupt(
+        runtime: &Arm64BootRuntimeResources,
+        dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    ) {
+        let serial = runtime
+            .serial_device
+            .as_ref()
+            .expect("serial device should exist");
+        let mut dispatcher = dispatcher.lock().expect("dispatcher should lock");
+        let access = dispatcher
+            .lookup(
+                serial
+                    .region
+                    .range()
+                    .start()
+                    .checked_add(SERIAL_INTERRUPT_ENABLE_REGISTER_OFFSET)
+                    .expect("serial interrupt-enable address should fit"),
+                1,
+            )
+            .expect("serial interrupt-enable access should resolve");
+        dispatcher
+            .dispatch(
+                MmioOperation::write(
+                    access,
+                    MmioAccessBytes::new(&[SERIAL_INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE])
+                        .expect("serial interrupt-enable byte should build"),
+                )
+                .expect("serial interrupt-enable write should build"),
+            )
+            .expect("serial interrupt-enable write should dispatch");
+    }
+
+    #[test]
+    fn serial_input_dispatch_bounds_rearms_and_detaches_after_eof() {
+        let (input_reader, mut input_writer) = test_pipe_files();
+        let mut serial_input = Some(serial_input_for_test(&input_reader));
+        let (runtime, dispatcher) = boot_runtime_with_serial();
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        let bytes = (0_u8..100).collect::<Vec<_>>();
+        input_writer
+            .write_all(&bytes)
+            .expect("test serial bytes should write");
+
+        let first =
+            dispatch_serial_input_with(&mut serial_input, &runtime, &dispatcher, true, |_| Ok(()))
+                .expect("first serial input should dispatch");
+        assert_eq!(first.bytes_read, SERIAL_RECEIVE_FIFO_CAPACITY);
+        assert!(first.backpressured);
+        assert!(
+            serial_input
+                .as_ref()
+                .expect("serial input should remain attached")
+                .wakeup_fd()
+                .is_none()
+        );
+        for expected in bytes.iter().copied().take(SERIAL_RECEIVE_FIFO_CAPACITY) {
+            assert_eq!(read_serial_byte(&runtime, &dispatcher), expected);
+        }
+
+        let rearmed =
+            dispatch_serial_input_with(&mut serial_input, &runtime, &dispatcher, false, |_| Ok(()))
+                .expect("empty FIFO should rearm input");
+        assert!(rearmed.rearmed);
+        assert!(
+            serial_input
+                .as_ref()
+                .expect("serial input should remain attached")
+                .wakeup_fd()
+                .is_some()
+        );
+
+        let second =
+            dispatch_serial_input_with(&mut serial_input, &runtime, &dispatcher, true, |_| Ok(()))
+                .expect("remaining serial input should dispatch");
+        assert_eq!(
+            second.bytes_read,
+            bytes.len() - SERIAL_RECEIVE_FIFO_CAPACITY
+        );
+        assert!(!second.backpressured);
+        drop(input_writer);
+
+        let eof =
+            dispatch_serial_input_with(&mut serial_input, &runtime, &dispatcher, true, |_| Ok(()))
+                .expect("serial EOF should detach cleanly");
+        assert!(eof.detached);
+        assert!(serial_input.is_none());
+        for expected in bytes.iter().copied().skip(SERIAL_RECEIVE_FIFO_CAPACITY) {
+            assert_eq!(read_serial_byte(&runtime, &dispatcher), expected);
+        }
+    }
+
+    #[test]
+    fn serial_input_dispatch_detaches_and_records_read_errors() {
+        let (input_reader, _input_writer) = test_pipe_files();
+        let mut serial_input = Some(serial_input_for_test(&input_reader));
+        let (runtime, dispatcher) = boot_runtime_with_serial();
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        let replacement = OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("write-only replacement should open");
+        let endpoint_descriptor = serial_input
+            .as_ref()
+            .expect("serial input should exist")
+            .endpoint
+            .as_raw_fd();
+        assert_eq!(
+            // SAFETY: Both descriptors are live. Replacing the owned duplicate
+            // with a write-only descriptor makes its next read fail while
+            // preserving ownership and ordinary close-on-drop behavior.
+            unsafe { libc::dup2(replacement.as_raw_fd(), endpoint_descriptor) },
+            endpoint_descriptor
+        );
+
+        let dispatch =
+            dispatch_serial_input_with(&mut serial_input, &runtime, &dispatcher, true, |_| Ok(()))
+                .expect("host read failure should detach without failing the VM run loop");
+
+        assert!(dispatch.detached);
+        assert!(serial_input.is_none());
+        assert_eq!(
+            runtime
+                .serial_device
+                .as_ref()
+                .expect("serial device should exist")
+                .output
+                .metrics()
+                .error_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn serial_input_interrupt_intent_is_taken_only_after_successful_signal() {
+        let (input_reader, mut input_writer) = test_pipe_files();
+        let mut serial_input = Some(serial_input_for_test(&input_reader));
+        let (runtime, dispatcher) = boot_runtime_with_serial();
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        enable_serial_receive_interrupt(&runtime, &dispatcher);
+        input_writer
+            .write_all(b"I")
+            .expect("interrupt test byte should write");
+
+        let error =
+            dispatch_serial_input_with(&mut serial_input, &runtime, &dispatcher, true, |_| {
+                Err(HvfArm64BootSerialInputDispatchError::InterruptIntentChanged)
+            })
+            .expect_err("injected signal failure should propagate");
+        assert!(matches!(
+            error,
+            HvfArm64BootSerialInputDispatchError::InterruptIntentChanged
+        ));
+        let serial = runtime
+            .serial_device
+            .as_ref()
+            .expect("serial device should exist");
+        assert!(
+            pending_serial_interrupt_intent_for_device(
+                serial,
+                &mut dispatcher.lock().expect("dispatcher should lock")
+            )
+            .expect("serial interrupt intent should be readable")
+            .is_some()
+        );
+
+        let mut signal_calls = 0;
+        let retried =
+            dispatch_serial_input_with(&mut serial_input, &runtime, &dispatcher, false, |line| {
+                signal_calls += 1;
+                assert_eq!(line, serial.fdt_device.interrupt_line);
+                Ok(())
+            })
+            .expect("retained interrupt should retry");
+        assert_eq!(signal_calls, 1);
+        assert!(retried.interrupt_delivered);
+        assert_eq!(retried.bytes_read, 0);
+        assert!(
+            pending_serial_interrupt_intent_for_device(
+                serial,
+                &mut dispatcher.lock().expect("dispatcher should lock")
+            )
+            .expect("serial interrupt intent should be readable")
+            .is_none()
+        );
+
+        let state = capture_serial_state_for_device(
+            serial,
+            &mut dispatcher.lock().expect("dispatcher should lock"),
+        )
+        .expect("serial state should capture");
+        assert_eq!(state.receive_bytes(), b"I");
+        assert!(!state.receive_interrupt_intent_pending());
     }
 
     fn boot_runtime_with_drives(
@@ -23644,6 +24430,22 @@ mod tests {
 
         assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Wakeup { steps: 1 });
         assert_eq!(session.events, ["run"]);
+        assert!(session.serial_readiness.is_empty());
+    }
+
+    #[test]
+    fn boot_session_run_loop_excludes_serial_read_during_control_wakeup() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.push_serial_monitor_wakeup();
+        session.request_run_loop_control_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("serial plus control wakeup should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Wakeup { steps: 1 });
+        assert!(session.serial_readiness.is_empty());
     }
 
     #[test]
@@ -23708,6 +24510,24 @@ mod tests {
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
         );
         assert_eq!(session.events, ["run", "vsock-dispatch"]);
+        assert_eq!(session.serial_readiness, [false]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_marks_serial_monitor_wakeup_readable() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.push_serial_monitor_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("serial monitor wakeup loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(session.serial_readiness, [true]);
     }
 
     #[test]
@@ -23881,6 +24701,7 @@ mod tests {
             outcome,
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
         );
+        assert_eq!(session.serial_readiness, [false]);
         assert_eq!(
             session.events,
             [

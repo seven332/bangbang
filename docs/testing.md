@@ -974,15 +974,19 @@ identities, count arithmetic, and removal of stale future-#1388 summaries. The
 records the corresponding evidence and later-wave boundaries. Generic source,
 reference, and disposition invariants remain owned by the validator itself.
 
-After the checked storage, balloon, memory-hotplug, and entropy delivery
-closures, the same 418-record overlay contains 186
-`implemented-and-verified`, 212 `audit-required`, three
+After the checked storage, balloon, memory-hotplug, entropy, and serial delivery
+closures, the same 418-record overlay contains 191
+`implemented-and-verified`, 207 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. The
 [entropy closure ledger](../compat/firecracker/v1.16.0/entropy-contract.md)
 pins five terminal API leaves and exactly two Wave 6 optional-device
 serialization/restore handoffs. When changing entropy code or evidence, run
 the focused runtime tests, both signed MMIO/PCI lifecycle cases, the capability
-validator, and the ordinary workspace gates.
+validator, and the ordinary workspace gates. The
+[serial closure ledger](../compat/firecracker/v1.16.0/serial-contract.md) pins
+five terminal API leaves and exactly one Wave 6 optional-device
+encoding/endpoint-reconstruction handoff. Serial changes additionally require
+the signed default-stdio executable cases and production-bundle boundary case.
 
 Run the offline compiler's focused surface with:
 
@@ -1541,6 +1545,13 @@ nonblocking file/FIFO behavior, path redaction, exact token-bucket refill/drop
 decisions, the 64-byte RX FIFO, DR/OE/RDA/FCR transitions, coalesced typed
 interrupt/drain intents, prefix acceptance and recovery, malformed MMIO metrics,
 fallible redacted capture/restore, and exhaustive short state-machine sequences.
+Process-stdio tests additionally use pipes and a pseudo-terminal to prove
+close-on-exec duplication, access preservation, byte-exact raw input, ignored
+nonpollable/invalid stdin, and restoration of input/output status flags and
+terminal attributes only after the final shared endpoint owner drops. HVF
+run-loop tests prove capacity-bounded reads, full-FIFO disarming, guest-drain
+rearming, EOF/error detachment, retained interrupt intent after failed GIC
+delivery, and no serial side thread.
 Focused vectors compare the shared FIFO/DR/RDA/IIR/drain surface against pinned
 vm-superio 0.8.1. Snapshot tests prove that bangbang-native v1 keeps its six-byte
 UART encoding, constructs a fresh output pipeline with empty metrics, and
@@ -1562,7 +1573,14 @@ The existing API-driven and config-file-driven signed executable scenarios each
 observe session-initial plus explicit output before shutdown and one additional
 normal-terminal line after exit. The signed boot-timer scenario proves a guest
 magic write reaches the configured logger; signed initrd/direct-rootfs serial
-scenarios prove public TX output and clear behavior; signed device cases cover
+scenarios prove configured public TX output and clear behavior. Dedicated
+signed serial-stdio cases use a raw `/dev/ttyS0` guest protocol and an exact
+104-byte payload to prove default stdout, 64-byte FIFO backpressure/rearm,
+stdin exclusion for configured output, limiter drops, queued input across
+pause/capture/resume, EOF with a live API, two-process isolation, metrics, and
+clean process termination. The production-bundle case repeats default
+stdin/stdout flow across the launcher/App Sandbox worker boundary and verifies
+socket/session cleanup. Signed device cases otherwise cover
 representative block, pmem, network/MMDS, vsock, entropy, RTC, balloon, UART,
 signal, latency, and startup producers. Guest poweroff/reset cases separately
 prove API and no-api terminal process paths. The two-process MMDS case proves
