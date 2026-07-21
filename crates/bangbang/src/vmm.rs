@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use bangbang_hvf::{
     HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonCaptureState,
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
-    HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugDeviceConfig,
+    HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugCaptureError,
+    HvfArm64BootMemoryHotplugCaptureState, HvfArm64BootMemoryHotplugDeviceConfig,
     HvfArm64BootPciBalloonDeviceUpdater, HvfArm64BootPciBlockDeviceUpdater,
     HvfArm64BootPciNetworkDeviceUpdater, HvfArm64BootPciPmemDeviceUpdater,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
@@ -56,9 +57,9 @@ use bangbang_runtime::memory_hotplug::{
 };
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
-    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMmdsMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
-    SharedSignalMetrics, SharedVsockDeviceMetrics,
+    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
+    SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
+    SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -219,6 +220,14 @@ pub(crate) trait InstanceStartExecutor {
         Ok(())
     }
 
+    fn preflight_snapshot_v1_memory_hotplug(
+        &mut self,
+        _session: &mut Self::Session,
+        _config: Option<MemoryHotplugConfig>,
+    ) -> Result<(), HvfArm64BootMemoryHotplugCaptureError> {
+        Ok(())
+    }
+
     fn publish_snapshot_v1(
         &mut self,
         session: &mut Self::Session,
@@ -329,6 +338,7 @@ pub(crate) enum NativeV1SnapshotPublicationError {
     Preflight(VmmActionError),
     StoragePreflight(HvfArm64BootStorageCaptureError),
     BalloonPreflight(HvfArm64BootBalloonCaptureError),
+    MemoryHotplugPreflight(HvfArm64BootMemoryHotplugCaptureError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -346,6 +356,9 @@ impl fmt::Display for NativeV1SnapshotPublicationError {
             }
             Self::BalloonPreflight(source) => {
                 write!(f, "native-v1 balloon preflight failed: {source}")
+            }
+            Self::MemoryHotplugPreflight(source) => {
+                write!(f, "native-v1 memory-hotplug preflight failed: {source}")
             }
             Self::Resource(source) => {
                 write!(
@@ -368,6 +381,7 @@ impl std::error::Error for NativeV1SnapshotPublicationError {
             Self::Preflight(source) => Some(source),
             Self::StoragePreflight(source) => Some(source),
             Self::BalloonPreflight(source) => Some(source),
+            Self::MemoryHotplugPreflight(source) => Some(source),
             Self::Resource(source) => Some(source),
             Self::Transaction(source) => Some(source),
             Self::SessionUnavailable | Self::ConfigurationUnavailable => None,
@@ -3597,6 +3611,10 @@ where
         self.starter
             .preflight_snapshot_v1_balloon(session, balloon_config)
             .map_err(NativeV1SnapshotPublicationError::BalloonPreflight)?;
+        let memory_hotplug_config = self.controller.memory_hotplug_config();
+        self.starter
+            .preflight_snapshot_v1_memory_hotplug(session, memory_hotplug_config)
+            .map_err(NativeV1SnapshotPublicationError::MemoryHotplugPreflight)?;
 
         self.controller
             .preflight_create_snapshot_profile()
@@ -3895,6 +3913,16 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         config: Option<BalloonConfig>,
     ) -> Result<(), HvfArm64BootBalloonCaptureError> {
         session.capture_ready_balloon_state(config).map(|_| ())
+    }
+
+    fn preflight_snapshot_v1_memory_hotplug(
+        &mut self,
+        session: &mut Self::Session,
+        config: Option<MemoryHotplugConfig>,
+    ) -> Result<(), HvfArm64BootMemoryHotplugCaptureError> {
+        session
+            .capture_ready_memory_hotplug_state(config)
+            .map(|_| ())
     }
 
     fn publish_snapshot_v1(
@@ -4345,6 +4373,16 @@ impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
         guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
     ) -> Result<Option<HvfArm64BootBalloonCaptureState>, HvfArm64BootBalloonCaptureError> {
         self.session.capture_ready_balloon_state(config, guard)
+    }
+
+    fn capture_ready_memory_hotplug_state(
+        &self,
+        config: Option<MemoryHotplugConfig>,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<HvfArm64BootMemoryHotplugCaptureState>, HvfArm64BootMemoryHotplugCaptureError>
+    {
+        self.session
+            .capture_ready_memory_hotplug_state(config, guard)
     }
 
     fn capture_ready_storage_state_at_with_cancel(
@@ -5625,6 +5663,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
+        None
+    }
+
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         None
     }
@@ -5859,6 +5901,10 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         ))
     }
 
+    fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
+        OwnedHvfArm64BootSession::shared_memory_hotplug_device_metrics(self)
+    }
+
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         Some(OwnedHvfArm64BootSession::shared_block_device_metrics(self))
     }
@@ -6083,6 +6129,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
+        None
+    }
+
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         None
     }
@@ -6275,6 +6325,10 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         Some(OwnedHvfArm64BootSession::shared_balloon_device_metrics(
             self,
         ))
+    }
+
+    fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
+        OwnedHvfArm64BootSession::shared_memory_hotplug_device_metrics(self)
     }
 
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
@@ -6473,6 +6527,10 @@ where
 
     fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
         self.session.shared_balloon_device_metrics()
+    }
+
+    fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
+        self.session.shared_memory_hotplug_device_metrics()
     }
 
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
@@ -7232,6 +7290,24 @@ fn balloon_capture_error_from_boot_run_loop_command<C>(
     }
 }
 
+fn memory_hotplug_capture_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, HvfArm64BootMemoryHotplugCaptureError>,
+) -> HvfArm64BootMemoryHotplugCaptureError {
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::WorkerNotPaused
+        | BootRunLoopCommandError::SnapshotQuiescenceActive
+        | BootRunLoopCommandError::AdmissionClosed
+        | BootRunLoopCommandError::QueueFull
+        | BootRunLoopCommandError::QueueClosed
+        | BootRunLoopCommandError::Wakeup { .. }
+        | BootRunLoopCommandError::ResponseClosed => {
+            HvfArm64BootMemoryHotplugCaptureError::OwnerUnavailable
+        }
+    }
+}
+
 pub(crate) struct BootRunLoopCommandHandle<S>
 where
     S: BootRunLoopSession,
@@ -7482,6 +7558,7 @@ where
     block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
     pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
     balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
+    memory_hotplug_device_metrics: Option<SharedMemoryHotplugDeviceMetrics>,
     network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
     mmds_metrics: Option<SharedMmdsMetrics>,
     vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
@@ -7579,6 +7656,7 @@ where
         let block_device_metrics = session.shared_block_device_metrics();
         let pmem_device_metrics = session.shared_pmem_device_metrics();
         let balloon_device_metrics = session.shared_balloon_device_metrics();
+        let memory_hotplug_device_metrics = session.shared_memory_hotplug_device_metrics();
         let network_interface_metrics = session.shared_network_interface_metrics();
         let mmds_metrics = session.shared_mmds_metrics();
         let vsock_device_metrics = session.shared_vsock_device_metrics();
@@ -7712,6 +7790,7 @@ where
             block_device_metrics,
             pmem_device_metrics,
             balloon_device_metrics,
+            memory_hotplug_device_metrics,
             network_interface_metrics,
             mmds_metrics,
             vsock_device_metrics,
@@ -8172,6 +8251,22 @@ impl
         .map_err(balloon_capture_error_from_boot_run_loop_command)
     }
 
+    pub(crate) fn capture_ready_memory_hotplug_state(
+        &self,
+        config: Option<MemoryHotplugConfig>,
+    ) -> Result<Option<HvfArm64BootMemoryHotplugCaptureState>, HvfArm64BootMemoryHotplugCaptureError>
+    {
+        self.run_snapshot_quiesced(move |session| {
+            let guard = session
+                .quiesce_snapshot_auxiliary_work()
+                .map_err(|_| HvfArm64BootMemoryHotplugCaptureError::OwnerUnavailable)?;
+            let result = session.capture_ready_memory_hotplug_state(config, &guard);
+            drop(guard);
+            result
+        })
+        .map_err(memory_hotplug_capture_error_from_boot_run_loop_command)
+    }
+
     fn preflight_capture_ready_storage(
         &self,
         configs: CaptureReadyStorageConfigs,
@@ -8367,6 +8462,9 @@ where
         }
         if let Some(metrics) = &self.balloon_device_metrics {
             diagnostics = diagnostics.with_balloon_device_metrics(metrics.snapshot());
+        }
+        if let Some(metrics) = &self.memory_hotplug_device_metrics {
+            diagnostics = diagnostics.with_memory_hotplug_device_metrics(metrics.snapshot());
         }
         diagnostics
     }
@@ -8910,9 +9008,10 @@ mod tests {
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigInput, MetricsDiagnostics,
         MmdsMetrics, NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface,
         PmemDeviceMetrics, PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMmdsMetrics,
-        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
-        SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVsockDeviceMetrics, VsockDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
+        SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
@@ -8996,19 +9095,19 @@ mod tests {
         DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_PMEM_MMIO_BASE,
         DEFAULT_PMEM_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
-        HvfArm64BootBalloonCaptureError, HvfArm64BootSnapshotV1CaptureStage,
-        HvfArm64BootStorageCaptureError, HvfInstanceStartExecutor, InstanceStartExecutor,
-        NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
-        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
-        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
-        NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
-        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        HvfArm64BootBalloonCaptureError, HvfArm64BootMemoryHotplugCaptureError,
+        HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootStorageCaptureError,
+        HvfInstanceStartExecutor, InstanceStartExecutor, NativeV1SnapshotCaptureCancellation,
+        NativeV1SnapshotCaptureError, NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
+        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
+        NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
+        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
+        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
+        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
+        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
+        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
+        ProcessVmm, ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
         require_native_v1_composite_record, snapshot_destination_machine_config,
     };
@@ -10085,6 +10184,9 @@ mod tests {
         snapshot_balloon_preflight_calls: usize,
         last_snapshot_balloon_config: Option<Option<BalloonConfig>>,
         snapshot_balloon_preflight_failure: bool,
+        snapshot_memory_hotplug_preflight_calls: usize,
+        last_snapshot_memory_hotplug_config: Option<Option<MemoryHotplugConfig>>,
+        snapshot_memory_hotplug_preflight_failure: bool,
         snapshot_publication_failure: bool,
     }
 
@@ -10105,6 +10207,9 @@ mod tests {
                 snapshot_balloon_preflight_calls: 0,
                 last_snapshot_balloon_config: None,
                 snapshot_balloon_preflight_failure: false,
+                snapshot_memory_hotplug_preflight_calls: 0,
+                last_snapshot_memory_hotplug_config: None,
+                snapshot_memory_hotplug_preflight_failure: false,
                 snapshot_publication_failure: false,
             }
         }
@@ -10127,6 +10232,11 @@ mod tests {
             self
         }
 
+        fn with_snapshot_memory_hotplug_preflight_failure(mut self) -> Self {
+            self.snapshot_memory_hotplug_preflight_failure = true;
+            self
+        }
+
         const fn failure(source: BackendError) -> Self {
             Self {
                 result: FakeStartResult::Failure(source),
@@ -10139,6 +10249,9 @@ mod tests {
                 snapshot_balloon_preflight_calls: 0,
                 last_snapshot_balloon_config: None,
                 snapshot_balloon_preflight_failure: false,
+                snapshot_memory_hotplug_preflight_calls: 0,
+                last_snapshot_memory_hotplug_config: None,
+                snapshot_memory_hotplug_preflight_failure: false,
                 snapshot_publication_failure: false,
             }
         }
@@ -10199,6 +10312,20 @@ mod tests {
             self.last_snapshot_balloon_config = Some(config);
             if self.snapshot_balloon_preflight_failure {
                 Err(HvfArm64BootBalloonCaptureError::OwnerUnavailable)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn preflight_snapshot_v1_memory_hotplug(
+            &mut self,
+            _session: &mut Self::Session,
+            config: Option<MemoryHotplugConfig>,
+        ) -> Result<(), HvfArm64BootMemoryHotplugCaptureError> {
+            self.snapshot_memory_hotplug_preflight_calls += 1;
+            self.last_snapshot_memory_hotplug_config = Some(config);
+            if self.snapshot_memory_hotplug_preflight_failure {
+                Err(HvfArm64BootMemoryHotplugCaptureError::OwnerUnavailable)
             } else {
                 Ok(())
             }
@@ -10621,6 +10748,7 @@ mod tests {
         block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
         pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
+        memory_hotplug_device_metrics: Option<SharedMemoryHotplugDeviceMetrics>,
         network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
         mmds_metrics: Option<SharedMmdsMetrics>,
         vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
@@ -10672,6 +10800,7 @@ mod tests {
                 block_device_metrics: None,
                 pmem_device_metrics: None,
                 balloon_device_metrics: None,
+                memory_hotplug_device_metrics: None,
                 network_interface_metrics: None,
                 mmds_metrics: None,
                 vsock_device_metrics: None,
@@ -10880,6 +11009,14 @@ mod tests {
 
         fn with_balloon_device_metrics(mut self, metrics: SharedBalloonDeviceMetrics) -> Self {
             self.balloon_device_metrics = Some(metrics);
+            self
+        }
+
+        fn with_memory_hotplug_device_metrics(
+            mut self,
+            metrics: SharedMemoryHotplugDeviceMetrics,
+        ) -> Self {
+            self.memory_hotplug_device_metrics = Some(metrics);
             self
         }
 
@@ -11134,6 +11271,10 @@ mod tests {
 
         fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
             self.balloon_device_metrics.clone()
+        }
+
+        fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
+            self.memory_hotplug_device_metrics.clone()
         }
 
         fn shared_network_interface_metrics(
@@ -14192,6 +14333,42 @@ mod tests {
         assert_eq!(
             supervisor.metrics_diagnostics().balloon_device_metrics(),
             Some(BalloonDeviceMetrics::new(0, 0, 0, 1, 0, 1))
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_reports_memory_hotplug_device_metrics() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_memory_hotplug_device_metrics(metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        metrics.record_queue_event_failure();
+        metrics.record_interrupt_failure();
+
+        assert_eq!(
+            supervisor
+                .metrics_diagnostics()
+                .memory_hotplug_device_metrics(),
+            Some(metrics.snapshot())
         );
 
         drop(supervisor);
@@ -17610,6 +17787,8 @@ mod tests {
                 .with_free_page_reporting(true),
         ))
         .expect("broad snapshot balloon should configure");
+        vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("broad snapshot memory hotplug should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("broad snapshot fake session should start");
         vmm.handle_action(VmmAction::Pause)
@@ -17636,6 +17815,11 @@ mod tests {
         assert_eq!(
             vmm.starter.last_snapshot_balloon_config,
             Some(vmm.controller.balloon_config())
+        );
+        assert_eq!(vmm.starter.snapshot_memory_hotplug_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_memory_hotplug_config,
+            Some(vmm.controller.memory_hotplug_config())
         );
         let session = vmm
             .started_session
@@ -17695,6 +17879,57 @@ mod tests {
             .started_session
             .as_ref()
             .expect("balloon preflight failure should retain the paused session");
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn memory_hotplug_preflight_failure_is_typed_and_precedes_publication() {
+        let state_path = missing_temp_child_path("memory-hotplug-preflight.state");
+        let memory_path = state_path.with_file_name("memory-hotplug-preflight.memory");
+        let parent = state_path
+            .parent()
+            .expect("missing memory-hotplug preflight path should have a parent");
+        let mut vmm = snapshot_profile_vmm(
+            FakeStarter::success(163).with_snapshot_memory_hotplug_preflight_failure(),
+        );
+        vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("memory-hotplug preflight fixture should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("memory-hotplug preflight fake session should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("memory-hotplug preflight fake session should pause");
+
+        let error = vmm
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                &state_path,
+                &memory_path,
+            )))
+            .expect_err("memory-hotplug preflight failure should stop before publication");
+
+        assert_eq!(
+            error,
+            VmmActionError::SnapshotCreate(BackendError::Hypervisor(
+                "native-v1 memory-hotplug preflight failed: memory-hotplug capture owner is unavailable"
+                    .to_string()
+            ))
+        );
+        assert_eq!(vmm.starter.snapshot_storage_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_balloon_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_memory_hotplug_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_memory_hotplug_config,
+            Some(vmm.controller.memory_hotplug_config())
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("memory-hotplug preflight failure should retain the paused session");
         assert_eq!(session.native_snapshot_publication_count, 0);
         assert_eq!(session.native_snapshot_producer_count, 0);
         assert_eq!(vmm.instance_info().state, InstanceState::Paused);

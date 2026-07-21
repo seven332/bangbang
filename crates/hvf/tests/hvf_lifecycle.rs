@@ -5418,6 +5418,150 @@ fn capture_ready_balloon_traverses_signed_mmio_and_pci_owners() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn capture_ready_memory_hotplug_traverses_signed_mmio_and_pci_owners() {
+    use bangbang_hvf::{
+        HvfArm64BootMemoryHotplugCaptureError, HvfArm64BootMemoryHotplugDeviceConfig,
+        HvfArm64BootMemoryHotplugTransportState, HvfArm64BootSessionConfig,
+        OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, VirtioMemMmioLayout};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    const MIB: u64 = 1024 * 1024;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("capture-ready-memory-hotplug-kernel", &image)
+        .expect("memory-hotplug capture kernel should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("memory-hotplug capture boot source should configure");
+    controller
+        .handle_action(VmmAction::PutMemoryHotplug(MemoryHotplugConfigInput::new(
+            128, 2, 128,
+        )))
+        .expect("memory-hotplug capture device should configure");
+    let memory_hotplug_config = controller
+        .memory_hotplug_config()
+        .expect("memory-hotplug config should exist");
+    let memory_hotplug_device = HvfArm64BootMemoryHotplugDeviceConfig::new(
+        VirtioMemMmioLayout::new(GuestAddress::new(0x4000_8000), MmioRegionId::new(4001)),
+    );
+    let base_session_config = || {
+        HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            test_rtc_mmio_layout(),
+        )
+        .with_memory_hotplug_device(memory_hotplug_device)
+    };
+
+    let mut mmio_session = OwnedHvfArm64BootSession::new(&controller, base_session_config())
+        .expect("signed MMIO memory-hotplug session should prepare");
+    let mmio_metrics = mmio_session
+        .shared_memory_hotplug_device_metrics()
+        .expect("MMIO memory-hotplug metrics should be retained");
+    let mmio_guard = mmio_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("MMIO auxiliary publishers should quiesce");
+    let mmio_first = mmio_session
+        .capture_ready_memory_hotplug_state(Some(memory_hotplug_config), &mmio_guard)
+        .expect("signed MMIO memory-hotplug should become capture-ready")
+        .expect("configured MMIO memory-hotplug should be captured");
+    let mmio_second = mmio_session
+        .capture_ready_memory_hotplug_state(Some(memory_hotplug_config), &mmio_guard)
+        .expect("signed MMIO memory-hotplug should support repeated detached capture")
+        .expect("configured MMIO memory-hotplug should remain captured");
+    assert_eq!(mmio_first.config(), memory_hotplug_config);
+    let HvfArm64BootMemoryHotplugTransportState::Mmio { state, .. } = mmio_first.transport() else {
+        panic!("MMIO memory-hotplug should retain MMIO ownership");
+    };
+    assert!(state.device().active_queue().is_none());
+    assert!(!state.transport().is_device_activated());
+    assert_eq!(mmio_first.mapping().active_ranges(), []);
+    assert_eq!(mmio_first.mapping().active_bytes(), 0);
+    assert_eq!(mmio_first.mapping().offline_bytes(), 128 * MIB);
+    assert_eq!(mmio_first.mapping().reservation().range().size(), 128 * MIB);
+    assert_eq!(
+        mmio_first.mapping().mapping_identity(),
+        mmio_first.mapping().reservation().mapping_identity()
+    );
+    assert_eq!(mmio_first, mmio_second);
+    assert!(!format!("{mmio_first:?}").contains("40008000"));
+    assert!(matches!(
+        mmio_session.capture_ready_memory_hotplug_state(None, &mmio_guard),
+        Err(HvfArm64BootMemoryHotplugCaptureError::OwnershipMismatch {
+            configured: false,
+            mmio_owner: true,
+            pci_owner: false,
+        })
+    ));
+    drop(mmio_guard);
+    mmio_session
+        .shutdown()
+        .expect("signed MMIO memory-hotplug session should shut down");
+    assert_eq!(mmio_metrics.snapshot().teardown_count(), 1);
+    assert_eq!(mmio_metrics.snapshot().teardown_fails(), 0);
+
+    let mut pci_session =
+        OwnedHvfArm64BootSession::new(&controller, base_session_config().with_pci_enabled())
+            .expect("signed PCI memory-hotplug session should prepare");
+    let pci_metrics = pci_session
+        .shared_memory_hotplug_device_metrics()
+        .expect("PCI memory-hotplug metrics should be retained");
+    let pci_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI auxiliary publishers should quiesce");
+    let pci = pci_session
+        .capture_ready_memory_hotplug_state(Some(memory_hotplug_config), &pci_guard)
+        .expect("signed PCI memory-hotplug should become capture-ready")
+        .expect("configured PCI memory-hotplug should be captured");
+    let HvfArm64BootMemoryHotplugTransportState::Pci {
+        sbdf,
+        bar_range,
+        state,
+    } = pci.transport()
+    else {
+        panic!("PCI memory-hotplug should retain PCI ownership");
+    };
+    assert!(sbdf.device() > 0);
+    assert_eq!(bar_range.size(), VIRTIO_PCI_CAPABILITY_BAR_SIZE);
+    assert!(state.device().active_queue().is_none());
+    assert!(!state.transport().is_device_activated());
+    assert_eq!(pci.mapping().active_ranges(), []);
+    assert_eq!(pci.mapping().active_bytes(), 0);
+    assert_eq!(pci.mapping().offline_bytes(), 128 * MIB);
+    assert_eq!(pci.mapping().reservation().range().size(), 128 * MIB);
+    assert_eq!(
+        pci.mapping().mapping_identity(),
+        pci.mapping().reservation().mapping_identity()
+    );
+    assert!(!format!("{pci:?}").contains("40008000"));
+    drop(pci_guard);
+    pci_session
+        .shutdown()
+        .expect("signed PCI memory-hotplug session should shut down");
+    assert_eq!(pci_metrics.snapshot().teardown_count(), 1);
+    assert_eq!(pci_metrics.snapshot().teardown_fails(), 0);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn guest_write_to_writable_pmem_is_visible_before_any_pmem_flush() {
     use std::os::unix::fs::FileExt;
 

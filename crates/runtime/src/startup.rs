@@ -53,12 +53,13 @@ use crate::memory::{
 use crate::memory_dirty::GuestMemoryDirtyTrackerError;
 use crate::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
-    MemoryHotplugUpdateError, PreparedVirtioMemDevice, VirtioMemDeviceNotificationDispatch,
-    VirtioMemDeviceNotificationError, VirtioMemMmioDeviceRegistration, VirtioMemMmioHandler,
+    MemoryHotplugUpdateError, PreparedVirtioMemDevice, VirtioMemDeviceCaptureError,
+    VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError,
+    VirtioMemMmioCaptureState, VirtioMemMmioDeviceRegistration, VirtioMemMmioHandler,
     VirtioMemMmioLayout, VirtioMemMmioRegistrationError, VirtioMemMutationExecutor,
     VirtioMemPrepareError,
 };
-use crate::metrics::SharedRtcDeviceMetrics;
+use crate::metrics::{SharedMemoryHotplugDeviceMetrics, SharedRtcDeviceMetrics};
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
     MmioRegionId, MmioRegistrationError, MmioRegistrationLease, MmioRegistrationOwner,
@@ -2509,11 +2510,20 @@ pub struct Arm64BootBalloonDevice {
     pub fdt_device: Arm64FdtVirtioMmioDevice,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Arm64BootMemoryHotplugDevice {
     pub registration: VirtioMemMmioDeviceRegistration,
     pub fdt_device: Arm64FdtVirtioMmioDevice,
+    pub metrics: SharedMemoryHotplugDeviceMetrics,
 }
+
+impl PartialEq for Arm64BootMemoryHotplugDevice {
+    fn eq(&self, other: &Self) -> bool {
+        self.registration == other.registration && self.fdt_device == other.fdt_device
+    }
+}
+
+impl Eq for Arm64BootMemoryHotplugDevice {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootEntropyDevice {
@@ -3694,6 +3704,45 @@ pub fn memory_hotplug_status_for_device(
     MemoryHotplugStatus::try_from_plugged_size_bytes(config, plugged_size, requested_size_mib)
 }
 
+pub fn capture_memory_hotplug_state_for_device(
+    device: &Arm64BootMemoryHotplugDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: MemoryHotplugConfig,
+    memory: &GuestMemory,
+) -> Result<VirtioMemMmioCaptureState, Arm64BootMemoryHotplugCaptureError> {
+    mmio_dispatcher
+        .handler_mut::<VirtioMemMmioHandler>(device.registration.region_id())
+        .map_err(|source| Arm64BootMemoryHotplugCaptureError::HandlerLookup { source })?
+        .capture_memory_hotplug_state(config, memory)
+        .map_err(Arm64BootMemoryHotplugCaptureError::Device)
+}
+
+#[derive(Debug)]
+pub enum Arm64BootMemoryHotplugCaptureError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    Device(VirtioMemDeviceCaptureError),
+}
+
+impl fmt::Display for Arm64BootMemoryHotplugCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HandlerLookup { .. } => {
+                formatter.write_str("failed to locate the boot memory-hotplug MMIO handler")
+            }
+            Self::Device(_) => formatter.write_str("boot memory-hotplug MMIO capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootMemoryHotplugCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::Device(source) => Some(source),
+        }
+    }
+}
+
 pub fn update_balloon_statistics_for_device(
     device: &Arm64BootBalloonDevice,
     mmio_dispatcher: &mut MmioDispatcher,
@@ -4426,7 +4475,7 @@ impl Arm64BootResources {
         };
         let mut memory = GuestMemory::allocate_with_backing(&layout, guest_memory_backing)
             .map_err(|source| Arm64BootResourceError::GuestMemoryAllocation { source })?;
-        if let Some(prepared) = prepared_memory_hotplug {
+        if let Some(prepared) = prepared_memory_hotplug.as_ref() {
             let config_space = prepared.config_space();
             let range = GuestMemoryRange::new(
                 GuestAddress::new(config_space.addr()),
@@ -4647,6 +4696,7 @@ impl Arm64BootResources {
                 let interrupt_line = device_config
                     .interrupt_line
                     .ok_or_else(|| memory_hotplug_interrupt_line_count_error(true, false))?;
+                let metrics = prepared.shared_metrics();
                 let mem_mmio = prepared
                     .register_mmio_with_dispatcher(device_config.mmio_layout, mmio_dispatcher)
                     .map_err(|source| Arm64BootResourceError::RegisterMemoryHotplugMmio {
@@ -4654,8 +4704,11 @@ impl Arm64BootResources {
                     })?;
                 let (dispatcher, registration) = mem_mmio.into_parts();
                 mmio_dispatcher = dispatcher;
-                let (device, fdt_device) =
-                    arm64_boot_memory_hotplug_device_metadata(registration, interrupt_line);
+                let (device, fdt_device) = arm64_boot_memory_hotplug_device_metadata(
+                    registration,
+                    interrupt_line,
+                    metrics,
+                );
                 fdt_devices.try_reserve_exact(1).map_err(|source| {
                     Arm64BootResourceError::MemoryHotplugDeviceMetadataAllocation { source }
                 })?;
@@ -5335,6 +5388,7 @@ fn arm64_boot_balloon_device_metadata(
 fn arm64_boot_memory_hotplug_device_metadata(
     registration: VirtioMemMmioDeviceRegistration,
     interrupt_line: GuestInterruptLine,
+    metrics: SharedMemoryHotplugDeviceMetrics,
 ) -> (Arm64BootMemoryHotplugDevice, Arm64FdtVirtioMmioDevice) {
     let range = registration.region().range();
     let fdt_device = Arm64FdtVirtioMmioDevice {
@@ -5349,6 +5403,7 @@ fn arm64_boot_memory_hotplug_device_metadata(
         Arm64BootMemoryHotplugDevice {
             registration,
             fdt_device,
+            metrics,
         },
         fdt_device,
     )
@@ -5508,7 +5563,8 @@ mod tests {
     };
     use crate::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
-        VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
+        VIRTIO_FEATURE_VERSION_1, VIRTIO_MEM_DEFAULT_REGION_ADDRESS,
+        VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
         VirtioMemMmioHandler, VirtioMemMmioLayout,
     };
     use crate::mmio::{
@@ -6475,6 +6531,23 @@ mod tests {
             VirtioMmioRegister::Status,
             VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
         );
+        for (selector, word) in [
+            (0, 1_u32 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE),
+            (1, 1_u32 << (VIRTIO_FEATURE_VERSION_1 - 32)),
+        ] {
+            write_boot_memory_hotplug_mmio_u32(
+                runtime,
+                mmio_dispatcher,
+                VirtioMmioRegister::DriverFeaturesSel,
+                selector,
+            );
+            write_boot_memory_hotplug_mmio_u32(
+                runtime,
+                mmio_dispatcher,
+                VirtioMmioRegister::DriverFeatures,
+                word,
+            );
+        }
         write_boot_memory_hotplug_mmio_u32(
             runtime,
             mmio_dispatcher,

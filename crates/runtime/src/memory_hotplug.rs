@@ -2,10 +2,12 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
+use std::time::Instant;
 
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange, aarch64,
 };
+use crate::metrics::{MemoryHotplugMetricOperation, SharedMemoryHotplugDeviceMetrics};
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
@@ -14,10 +16,14 @@ use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
-    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
-    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError,
+    VirtioMmioQueueRegisters, VirtioMmioQueueState, VirtioMmioRegisterHandler,
+    VirtioMmioRegisterHandlerError, VirtioMmioTransportState,
 };
-use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
+use crate::virtio_pci::{
+    VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError,
+    VirtioPciTransportState,
+};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
@@ -53,6 +59,10 @@ const VIRTIO_MEM_STATE_UNPLUGGED: u16 = 1;
 const VIRTIO_MEM_STATE_MIXED: u16 = 2;
 const VIRTIO_MEM_REQUEST_SIZE_U32: u32 = VIRTIO_MEM_REQUEST_SIZE as u32;
 const VIRTIO_MEM_RESPONSE_SIZE_U32: u32 = VIRTIO_MEM_RESPONSE_SIZE as u32;
+
+fn elapsed_micros_saturating(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
 
 pub type VirtioMemMmioHandler = VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice>;
 
@@ -453,10 +463,19 @@ impl std::error::Error for MemoryHotplugUpdateError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PreparedVirtioMemDevice {
     config_space: VirtioMemConfigSpace,
+    metrics: SharedMemoryHotplugDeviceMetrics,
 }
+
+impl PartialEq for PreparedVirtioMemDevice {
+    fn eq(&self, other: &Self) -> bool {
+        self.config_space == other.config_space
+    }
+}
+
+impl Eq for PreparedVirtioMemDevice {}
 
 impl PreparedVirtioMemDevice {
     pub fn from_config(config: MemoryHotplugConfig) -> Result<Self, VirtioMemPrepareError> {
@@ -490,16 +509,24 @@ impl PreparedVirtioMemDevice {
 
         Ok(Self {
             config_space: VirtioMemConfigSpace::new(block_size, address.raw_value(), region_size),
+            metrics: SharedMemoryHotplugDeviceMetrics::default(),
         })
     }
 
-    pub const fn config_space(self) -> VirtioMemConfigSpace {
+    pub const fn config_space(&self) -> VirtioMemConfigSpace {
         self.config_space
     }
 
+    pub fn shared_metrics(&self) -> SharedMemoryHotplugDeviceMetrics {
+        self.metrics.clone()
+    }
+
     #[doc(hidden)]
-    pub const fn into_parts(self) -> (VirtioMemConfigSpace, VirtioMemDevice) {
-        (self.config_space, VirtioMemDevice::new())
+    pub fn into_parts(self) -> (VirtioMemConfigSpace, VirtioMemDevice) {
+        (
+            self.config_space,
+            VirtioMemDevice::with_metrics(self.metrics),
+        )
     }
 
     pub fn register_mmio(
@@ -646,12 +673,14 @@ impl VirtioMemMmioDevice {
         dispatcher: MmioDispatcher,
     ) -> Result<Self, VirtioMemMmioRegistrationError> {
         let region = layout.region()?;
-        let handler = virtio_mem_mmio_handler_from_config_space(prepared.config_space()).map_err(
-            |source| VirtioMemMmioRegistrationError::BuildHandler {
-                region_id: layout.region_id(),
-                source,
-            },
-        )?;
+        let (config_space, activation_handler) = prepared.into_parts();
+        let handler =
+            virtio_mem_mmio_handler(config_space, activation_handler).map_err(|source| {
+                VirtioMemMmioRegistrationError::BuildHandler {
+                    region_id: layout.region_id(),
+                    source,
+                }
+            })?;
         let mut dispatcher = dispatcher;
         let inserted_region = dispatcher
             .insert_region(
@@ -1103,6 +1132,25 @@ impl VirtioMemRequestKind {
             request_type => Self::Unsupported { request_type },
         }
     }
+
+    const fn metric_operation(self) -> Option<MemoryHotplugMetricOperation> {
+        match self {
+            Self::Plug(_) => Some(MemoryHotplugMetricOperation::Plug),
+            Self::Unplug(_) => Some(MemoryHotplugMetricOperation::Unplug),
+            Self::UnplugAll => Some(MemoryHotplugMetricOperation::UnplugAll),
+            Self::State(_) => Some(MemoryHotplugMetricOperation::State),
+            Self::Unsupported { .. } => None,
+        }
+    }
+
+    const fn requested_bytes(self, block_size: u64) -> u64 {
+        match self {
+            Self::Plug(range) | Self::Unplug(range) => {
+                (range.block_count() as u64).saturating_mul(block_size)
+            }
+            Self::UnplugAll | Self::State(_) | Self::Unsupported { .. } => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1356,6 +1404,7 @@ impl VirtioMemRequest {
         config_space: VirtioMemConfigSpace,
         plugged_blocks: &VirtioMemPluggedBlocks,
         mutation_executor: &mut impl VirtioMemMutationExecutor,
+        metrics: &SharedMemoryHotplugDeviceMetrics,
     ) -> Result<VirtioMemRequestExecution, VirtioMemRequestExecutionError> {
         let prepared = response_for_request(self.kind, config_space, plugged_blocks);
         let mut response = prepared.response;
@@ -1372,6 +1421,8 @@ impl VirtioMemRequest {
                     applied_mutation = Some(applied);
                 }
                 Err(source) => {
+                    let rollback = source.rollback_outcome();
+                    metrics.record_rollbacks(rollback.attempts(), rollback.failures());
                     response = VirtioMemResponse::Error;
                     outcome = VirtioMemRequestExecutionOutcome::MutationFailed { source };
                     commit_mutation = None;
@@ -1389,16 +1440,16 @@ impl VirtioMemRequest {
             )),
             Err(source) => {
                 if let Some(applied) = applied_mutation {
-                    mutation_executor
-                        .rollback(memory, applied)
-                        .map_err(|rollback_source| {
-                            VirtioMemRequestExecutionError::ResponseWriteRollback {
-                                descriptor_head: self.descriptor_head,
-                                address: self.response.address(),
-                                response_source: source,
-                                rollback_source,
-                            }
-                        })?;
+                    let rollback = mutation_executor.rollback(memory, applied);
+                    metrics.record_rollbacks(1, u64::from(rollback.is_err()));
+                    rollback.map_err(|rollback_source| {
+                        VirtioMemRequestExecutionError::ResponseWriteRollback {
+                            descriptor_head: self.descriptor_head,
+                            address: self.response.address(),
+                            response_source: source,
+                            rollback_source,
+                        }
+                    })?;
                 }
 
                 Ok(VirtioMemRequestExecution::new(
@@ -1589,6 +1640,59 @@ pub struct VirtioMemAppliedMutation {
     mutation: VirtioMemMutation,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtioMemMutationRollbackOutcome {
+    attempts: u64,
+    failures: u64,
+}
+
+impl VirtioMemMutationRollbackOutcome {
+    pub const fn new(attempts: u64, failures: u64) -> Self {
+        Self { attempts, failures }
+    }
+
+    pub const fn attempts(self) -> u64 {
+        self.attempts
+    }
+
+    pub const fn failures(self) -> u64 {
+        self.failures
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtioMemMutationCommitOutcome {
+    discard_failures: u64,
+    owner_cleanup_attempts: u64,
+    owner_cleanup_failures: u64,
+}
+
+impl VirtioMemMutationCommitOutcome {
+    pub const fn new(
+        discard_failures: u64,
+        owner_cleanup_attempts: u64,
+        owner_cleanup_failures: u64,
+    ) -> Self {
+        Self {
+            discard_failures,
+            owner_cleanup_attempts,
+            owner_cleanup_failures,
+        }
+    }
+
+    pub const fn discard_failures(self) -> u64 {
+        self.discard_failures
+    }
+
+    pub const fn owner_cleanup_attempts(self) -> u64 {
+        self.owner_cleanup_attempts
+    }
+
+    pub const fn owner_cleanup_failures(self) -> u64 {
+        self.owner_cleanup_failures
+    }
+}
+
 impl VirtioMemAppliedMutation {
     pub const fn new(mutation: VirtioMemMutation) -> Self {
         Self { mutation }
@@ -1614,7 +1718,13 @@ pub trait VirtioMemMutationExecutor {
 
     /// Finalize one mutation after its response and used-ring entry are both
     /// visible to the guest.
-    fn commit(&mut self, _memory: &mut GuestMemory, _applied: &VirtioMemAppliedMutation) {}
+    fn commit(
+        &mut self,
+        _memory: &mut GuestMemory,
+        _applied: &VirtioMemAppliedMutation,
+    ) -> VirtioMemMutationCommitOutcome {
+        VirtioMemMutationCommitOutcome::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1641,13 +1751,24 @@ impl VirtioMemMutationExecutor for NoopVirtioMemMutationExecutor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioMemMutationError {
     message: String,
+    rollback: VirtioMemMutationRollbackOutcome,
 }
 
 impl VirtioMemMutationError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            rollback: VirtioMemMutationRollbackOutcome::new(0, 0),
         }
+    }
+
+    pub fn with_rollback_outcome(mut self, rollback: VirtioMemMutationRollbackOutcome) -> Self {
+        self.rollback = rollback;
+        self
+    }
+
+    pub const fn rollback_outcome(&self) -> VirtioMemMutationRollbackOutcome {
+        self.rollback
     }
 }
 
@@ -1898,6 +2019,77 @@ impl VirtioMemQueue {
         &self.used
     }
 
+    fn capture_state(
+        &self,
+        transport: &VirtioMmioQueueState,
+        memory: &GuestMemory,
+    ) -> Result<VirtioMemQueueCaptureState, VirtioMemQueueCaptureError> {
+        if !transport.ready()
+            || transport.size() != self.available.queue_size()
+            || transport.descriptor_table() != self.available.descriptor_table()
+            || transport.driver_ring() != self.available.available_ring()
+            || transport.device_ring() != self.used.used_ring()
+            || self.available.queue_size() != self.used.queue_size()
+        {
+            return Err(VirtioMemQueueCaptureError::TransportMismatch);
+        }
+        self.available
+            .validate_mapped(memory)
+            .map_err(|_| VirtioMemQueueCaptureError::AvailableRingInvalid)?;
+        self.used
+            .validate_mapped(memory)
+            .map_err(|_| VirtioMemQueueCaptureError::UsedRingInvalid)?;
+        let descriptor_range = self
+            .available
+            .descriptor_table_range()
+            .map_err(|_| VirtioMemQueueCaptureError::QueueRangeInvalid)?;
+        let available_range = self
+            .available
+            .available_ring_range()
+            .map_err(|_| VirtioMemQueueCaptureError::QueueRangeInvalid)?;
+        let used_range = self
+            .used
+            .used_ring_range()
+            .map_err(|_| VirtioMemQueueCaptureError::QueueRangeInvalid)?;
+        if descriptor_range.overlaps(available_range)
+            || descriptor_range.overlaps(used_range)
+            || available_range.overlaps(used_range)
+        {
+            return Err(VirtioMemQueueCaptureError::QueueRangesOverlap);
+        }
+
+        let used_index = self
+            .used
+            .used_index(memory)
+            .map_err(|_| VirtioMemQueueCaptureError::UsedRingInvalid)?;
+        if used_index != self.used.next_used() {
+            return Err(VirtioMemQueueCaptureError::UsedCursorMismatch);
+        }
+        let available_index = self
+            .available
+            .available_index(memory)
+            .map_err(|_| VirtioMemQueueCaptureError::AvailableRingInvalid)?;
+        if available_index.wrapping_sub(self.available.next_avail()) > self.available.queue_size() {
+            return Err(VirtioMemQueueCaptureError::AvailableCursorOutOfBounds);
+        }
+        let unpublished = self
+            .available
+            .next_avail()
+            .wrapping_sub(self.used.next_used());
+        if unpublished != 0 {
+            return Err(
+                VirtioMemQueueCaptureError::UnpublishedDescriptorCountMismatch {
+                    actual: unpublished,
+                },
+            );
+        }
+
+        Ok(VirtioMemQueueCaptureState {
+            next_available: self.available.next_avail(),
+            next_used: self.used.next_used(),
+        })
+    }
+
     #[cfg(test)]
     fn dispatch(
         &mut self,
@@ -1909,12 +2101,31 @@ impl VirtioMemQueue {
         self.dispatch_with_executor(memory, config_space, plugged_blocks, &mut mutation_executor)
     }
 
+    #[cfg(test)]
     fn dispatch_with_executor(
         &mut self,
         memory: &mut GuestMemory,
         config_space: &mut VirtioMemConfigSpace,
         plugged_blocks: &mut VirtioMemPluggedBlocks,
         mutation_executor: &mut impl VirtioMemMutationExecutor,
+    ) -> Result<VirtioMemQueueDispatch, VirtioMemQueueDispatchError> {
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
+        self.dispatch_with_executor_and_metrics(
+            memory,
+            config_space,
+            plugged_blocks,
+            mutation_executor,
+            &metrics,
+        )
+    }
+
+    fn dispatch_with_executor_and_metrics(
+        &mut self,
+        memory: &mut GuestMemory,
+        config_space: &mut VirtioMemConfigSpace,
+        plugged_blocks: &mut VirtioMemPluggedBlocks,
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
+        metrics: &SharedMemoryHotplugDeviceMetrics,
     ) -> Result<VirtioMemQueueDispatch, VirtioMemQueueDispatchError> {
         let mut dispatch = VirtioMemQueueDispatch::default();
         while let Some(chain) = self
@@ -1926,15 +2137,41 @@ impl VirtioMemQueue {
             })?
         {
             let descriptor_head = chain.head_index();
+            let mut metric_context = None;
             let (completion, outcome, mutation, mut applied_mutation) =
                 match VirtioMemRequest::parse(memory, &chain) {
                     Ok(request) => {
-                        let execution = request
-                            .execute(memory, *config_space, plugged_blocks, mutation_executor)
-                            .map_err(|source| VirtioMemQueueDispatchError::MutationRollback {
-                                completed_dispatch: Box::new(dispatch.clone()),
-                                source,
-                            })?;
+                        let started = Instant::now();
+                        metric_context = request.kind().metric_operation().map(|operation| {
+                            (
+                                operation,
+                                request.kind().requested_bytes(config_space.block_size()),
+                                started,
+                            )
+                        });
+                        let execution = match request.execute(
+                            memory,
+                            *config_space,
+                            plugged_blocks,
+                            mutation_executor,
+                            metrics,
+                        ) {
+                            Ok(execution) => execution,
+                            Err(source) => {
+                                if let Some((operation, _, started)) = metric_context {
+                                    metrics.record_operation(
+                                        operation,
+                                        false,
+                                        0,
+                                        elapsed_micros_saturating(started),
+                                    );
+                                }
+                                return Err(VirtioMemQueueDispatchError::MutationRollback {
+                                    completed_dispatch: Box::new(dispatch.clone()),
+                                    source,
+                                });
+                            }
+                        };
                         (
                             execution.completion(),
                             VirtioMemQueueDispatchOutcome::from_execution(&execution),
@@ -1950,29 +2187,59 @@ impl VirtioMemQueue {
                     ),
                 };
 
-            let publication = self
-                .used
-                .publish_used_element_with_notification(
-                    memory,
-                    completion.descriptor_head(),
-                    completion.bytes_written_to_guest(),
-                    VirtqueueNotificationSuppression::Disabled,
-                )
-                .map_err(|source| VirtioMemQueueDispatchError::UsedRing {
-                    completed_dispatch: Box::new(dispatch.clone()),
-                    descriptor_head: completion.descriptor_head(),
-                    bytes_written_to_guest: completion.bytes_written_to_guest(),
-                    rollback_error: applied_mutation
-                        .take()
-                        .map(|applied| mutation_executor.rollback(memory, applied).err())
-                        .unwrap_or(None),
-                    source,
-                })?;
+            let publication = match self.used.publish_used_element_with_notification(
+                memory,
+                completion.descriptor_head(),
+                completion.bytes_written_to_guest(),
+                VirtqueueNotificationSuppression::Disabled,
+            ) {
+                Ok(publication) => publication,
+                Err(source) => {
+                    let rollback_error = applied_mutation.take().and_then(|applied| {
+                        let rollback = mutation_executor.rollback(memory, applied);
+                        metrics.record_rollbacks(1, u64::from(rollback.is_err()));
+                        rollback.err()
+                    });
+                    if let Some((operation, _, started)) = metric_context {
+                        metrics.record_operation(
+                            operation,
+                            false,
+                            0,
+                            elapsed_micros_saturating(started),
+                        );
+                    }
+                    return Err(VirtioMemQueueDispatchError::UsedRing {
+                        completed_dispatch: Box::new(dispatch.clone()),
+                        descriptor_head: completion.descriptor_head(),
+                        bytes_written_to_guest: completion.bytes_written_to_guest(),
+                        rollback_error,
+                        source,
+                    });
+                }
+            };
             if let Some(applied) = applied_mutation.as_ref() {
-                mutation_executor.commit(memory, applied);
+                let commit = mutation_executor.commit(memory, applied);
+                metrics.record_unplug_discard_failures(commit.discard_failures());
+                metrics.record_owner_cleanup(
+                    commit.owner_cleanup_attempts(),
+                    commit.owner_cleanup_failures(),
+                );
             }
             if let Some(mutation) = mutation {
                 mutation.commit(config_space, plugged_blocks);
+            }
+            if let Some((operation, requested_bytes, started)) = metric_context {
+                let succeeded = matches!(
+                    &outcome,
+                    VirtioMemQueueDispatchOutcome::State { .. }
+                        | VirtioMemQueueDispatchOutcome::MutationAccepted
+                );
+                metrics.record_operation(
+                    operation,
+                    succeeded,
+                    if succeeded { requested_bytes } else { 0 },
+                    elapsed_micros_saturating(started),
+                );
             }
             dispatch.record(outcome, publication);
         }
@@ -2311,18 +2578,327 @@ impl std::error::Error for VirtioMemDeviceNotificationError {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMemQueueCaptureState {
+    next_available: u16,
+    next_used: u16,
+}
+
+impl VirtioMemQueueCaptureState {
+    pub const fn next_available(self) -> u16 {
+        self.next_available
+    }
+
+    pub const fn next_used(self) -> u16 {
+        self.next_used
+    }
+}
+
+impl fmt::Debug for VirtioMemQueueCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioMemQueueCaptureState")
+            .field("cursors", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMemPluggedRangeCaptureState {
+    start_block: u64,
+    block_count: u64,
+}
+
+impl VirtioMemPluggedRangeCaptureState {
+    pub const fn start_block(self) -> u64 {
+        self.start_block
+    }
+
+    pub const fn block_count(self) -> u64 {
+        self.block_count
+    }
+}
+
+/// Encoding-independent, detached virtio-mem device state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioMemDeviceCaptureState {
+    config: MemoryHotplugConfig,
+    available_features: u64,
+    negotiated_features: u64,
+    config_space: VirtioMemConfigSpace,
+    active_queue: Option<VirtioMemQueueCaptureState>,
+    plugged_ranges: Vec<VirtioMemPluggedRangeCaptureState>,
+}
+
+impl VirtioMemDeviceCaptureState {
+    pub const fn config(&self) -> MemoryHotplugConfig {
+        self.config
+    }
+
+    pub const fn available_features(&self) -> u64 {
+        self.available_features
+    }
+
+    pub const fn negotiated_features(&self) -> u64 {
+        self.negotiated_features
+    }
+
+    pub const fn config_space(&self) -> VirtioMemConfigSpace {
+        self.config_space
+    }
+
+    pub const fn active_queue(&self) -> Option<VirtioMemQueueCaptureState> {
+        self.active_queue
+    }
+
+    pub fn plugged_ranges(&self) -> &[VirtioMemPluggedRangeCaptureState] {
+        &self.plugged_ranges
+    }
+
+    pub fn plugged_guest_ranges(
+        &self,
+    ) -> Result<Vec<GuestMemoryRange>, VirtioMemDeviceCaptureError> {
+        let mut guest_ranges = Vec::new();
+        guest_ranges
+            .try_reserve_exact(self.plugged_ranges.len())
+            .map_err(|source| VirtioMemDeviceCaptureError::PluggedRangeAllocation { source })?;
+        for (range_index, range) in self.plugged_ranges.iter().copied().enumerate() {
+            let offset = range
+                .start_block
+                .checked_mul(self.config_space.block_size())
+                .ok_or(VirtioMemDeviceCaptureError::PluggedRangeInvalid { range_index })?;
+            let size = range
+                .block_count
+                .checked_mul(self.config_space.block_size())
+                .ok_or(VirtioMemDeviceCaptureError::PluggedRangeInvalid { range_index })?;
+            let start = self
+                .config_space
+                .addr()
+                .checked_add(offset)
+                .ok_or(VirtioMemDeviceCaptureError::PluggedRangeInvalid { range_index })?;
+            guest_ranges.push(
+                GuestMemoryRange::new(GuestAddress::new(start), size).map_err(|_| {
+                    VirtioMemDeviceCaptureError::PluggedRangeInvalid { range_index }
+                })?,
+            );
+        }
+        Ok(guest_ranges)
+    }
+}
+
+impl fmt::Debug for VirtioMemDeviceCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioMemDeviceCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioMemMmioCaptureState {
+    device: VirtioMemDeviceCaptureState,
+    transport: VirtioMmioTransportState,
+}
+
+impl VirtioMemMmioCaptureState {
+    pub const fn device(&self) -> &VirtioMemDeviceCaptureState {
+        &self.device
+    }
+
+    pub const fn transport(&self) -> &VirtioMmioTransportState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for VirtioMemMmioCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioMemMmioCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioMemPciCaptureState {
+    device: VirtioMemDeviceCaptureState,
+    transport: VirtioPciTransportState,
+}
+
+impl VirtioMemPciCaptureState {
+    pub const fn device(&self) -> &VirtioMemDeviceCaptureState {
+        &self.device
+    }
+
+    pub const fn transport(&self) -> &VirtioPciTransportState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for VirtioMemPciCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioMemPciCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioMemQueueCaptureError {
+    TransportMismatch,
+    AvailableRingInvalid,
+    UsedRingInvalid,
+    QueueRangeInvalid,
+    QueueRangesOverlap,
+    UsedCursorMismatch,
+    AvailableCursorOutOfBounds,
+    UnpublishedDescriptorCountMismatch { actual: u16 },
+}
+
+impl fmt::Display for VirtioMemQueueCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TransportMismatch => {
+                formatter.write_str("active queue does not match transport queue state")
+            }
+            Self::AvailableRingInvalid => formatter.write_str("available ring is invalid"),
+            Self::UsedRingInvalid => formatter.write_str("used ring is invalid"),
+            Self::QueueRangeInvalid => formatter.write_str("queue range is invalid"),
+            Self::QueueRangesOverlap => formatter.write_str("queue ranges overlap"),
+            Self::UsedCursorMismatch => {
+                formatter.write_str("used cursor does not match guest memory")
+            }
+            Self::AvailableCursorOutOfBounds => {
+                formatter.write_str("available cursor is inconsistent with guest memory")
+            }
+            Self::UnpublishedDescriptorCountMismatch { actual } => write!(
+                formatter,
+                "queue has {actual} consumed-but-unpublished descriptors"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioMemQueueCaptureError {}
+
+#[derive(Debug)]
+pub enum VirtioMemDeviceCaptureError {
+    ConfigurationMismatch,
+    GeometryInvalid,
+    AvailableFeaturesMismatch,
+    NegotiatedFeaturesUnsupported,
+    RequiredFeatureNotAcknowledged,
+    ActivationMismatch,
+    QueueCountMismatch,
+    Queue { source: VirtioMemQueueCaptureError },
+    PluggedRangeAllocation { source: TryReserveError },
+    PluggedRangeInvalid { range_index: usize },
+    PluggedSizeMismatch,
+}
+
+impl fmt::Display for VirtioMemDeviceCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConfigurationMismatch => formatter
+                .write_str("live virtio-mem state does not match its external configuration"),
+            Self::GeometryInvalid => {
+                formatter.write_str("live virtio-mem geometry is inconsistent")
+            }
+            Self::AvailableFeaturesMismatch => formatter
+                .write_str("virtio-mem transport available features do not match configuration"),
+            Self::NegotiatedFeaturesUnsupported => {
+                formatter.write_str("virtio-mem negotiated unsupported features")
+            }
+            Self::RequiredFeatureNotAcknowledged => formatter
+                .write_str("active virtio-mem transport did not acknowledge its required feature"),
+            Self::ActivationMismatch => {
+                formatter.write_str("virtio-mem device and transport activation state disagree")
+            }
+            Self::QueueCountMismatch => {
+                formatter.write_str("virtio-mem transport must contain exactly one queue")
+            }
+            Self::Queue { source } => {
+                write!(formatter, "virtio-mem queue is not capture-ready: {source}")
+            }
+            Self::PluggedRangeAllocation { .. } => {
+                formatter.write_str("failed to clone virtio-mem plugged range metadata")
+            }
+            Self::PluggedRangeInvalid { range_index } => write!(
+                formatter,
+                "virtio-mem plugged range {range_index} is invalid"
+            ),
+            Self::PluggedSizeMismatch => formatter
+                .write_str("virtio-mem plugged ranges do not match configured plugged size"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioMemDeviceCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Queue { source } => Some(source),
+            Self::PluggedRangeAllocation { source } => Some(source),
+            Self::ConfigurationMismatch
+            | Self::GeometryInvalid
+            | Self::AvailableFeaturesMismatch
+            | Self::NegotiatedFeaturesUnsupported
+            | Self::RequiredFeatureNotAcknowledged
+            | Self::ActivationMismatch
+            | Self::QueueCountMismatch
+            | Self::PluggedRangeInvalid { .. }
+            | Self::PluggedSizeMismatch => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioMemPciCaptureError {
+    Device(VirtioMemDeviceCaptureError),
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Display for VirtioMemPciCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Device(_) => formatter.write_str("PCI virtio-mem device capture failed"),
+            Self::Endpoint(_) => formatter.write_str("PCI virtio-mem transport capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioMemPciCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Device(source) => Some(source),
+            Self::Endpoint(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct VirtioMemDevice {
     active_queue: Option<VirtioMemQueue>,
     plugged_blocks: VirtioMemPluggedBlocks,
+    metrics: SharedMemoryHotplugDeviceMetrics,
 }
 
 impl VirtioMemDevice {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_metrics(SharedMemoryHotplugDeviceMetrics::default())
+    }
+
+    pub fn with_metrics(metrics: SharedMemoryHotplugDeviceMetrics) -> Self {
         Self {
             active_queue: None,
             plugged_blocks: VirtioMemPluggedBlocks { ranges: Vec::new() },
+            metrics,
         }
+    }
+
+    pub fn shared_metrics(&self) -> SharedMemoryHotplugDeviceMetrics {
+        self.metrics.clone()
     }
 
     pub fn is_activated(&self) -> bool {
@@ -2335,6 +2911,128 @@ impl VirtioMemDevice {
 
     pub fn active_queue_mut(&mut self) -> Option<&mut VirtioMemQueue> {
         self.active_queue.as_mut()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_state(
+        &self,
+        config_space: VirtioMemConfigSpace,
+        config: MemoryHotplugConfig,
+        device_registers: &VirtioMmioDeviceRegisters,
+        queue_registers: &VirtioMmioQueueRegisters,
+        transport_activated: bool,
+        memory: &GuestMemory,
+    ) -> Result<VirtioMemDeviceCaptureState, VirtioMemDeviceCaptureError> {
+        let block_size = config
+            .block_size_mib()
+            .checked_mul(MIB)
+            .ok_or(VirtioMemDeviceCaptureError::ConfigurationMismatch)?;
+        let slot_size = config
+            .slot_size_mib()
+            .checked_mul(MIB)
+            .ok_or(VirtioMemDeviceCaptureError::ConfigurationMismatch)?;
+        let total_size = config
+            .total_size_mib()
+            .checked_mul(MIB)
+            .ok_or(VirtioMemDeviceCaptureError::ConfigurationMismatch)?;
+        if config_space.block_size() != block_size
+            || config_space.region_size() != total_size
+            || slot_size == 0
+            || !config_space.addr().is_multiple_of(slot_size)
+            || config_space
+                .addr()
+                .checked_add(config_space.region_size())
+                .is_none()
+        {
+            return Err(VirtioMemDeviceCaptureError::ConfigurationMismatch);
+        }
+        if block_size == 0
+            || config_space.usable_region_size() > total_size
+            || config_space.requested_size() > total_size
+            || config_space.plugged_size() > total_size
+            || !config_space.usable_region_size().is_multiple_of(block_size)
+            || !config_space.requested_size().is_multiple_of(block_size)
+            || !config_space.plugged_size().is_multiple_of(block_size)
+            || !config_space.usable_region_size().is_multiple_of(slot_size)
+        {
+            return Err(VirtioMemDeviceCaptureError::GeometryInvalid);
+        }
+
+        let available_features = config_space.available_features();
+        if device_registers.device_id() != VIRTIO_MEM_DEVICE_ID
+            || device_registers.device_features() != available_features
+        {
+            return Err(VirtioMemDeviceCaptureError::AvailableFeaturesMismatch);
+        }
+        let negotiated_features = device_registers.driver_features();
+        if negotiated_features & !available_features != 0 {
+            return Err(VirtioMemDeviceCaptureError::NegotiatedFeaturesUnsupported);
+        }
+        if self.active_queue.is_some() != transport_activated {
+            return Err(VirtioMemDeviceCaptureError::ActivationMismatch);
+        }
+        if transport_activated
+            && (negotiated_features & virtio_feature_bit(VIRTIO_FEATURE_VERSION_1) == 0
+                || negotiated_features & virtio_feature_bit(VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE)
+                    == 0)
+        {
+            return Err(VirtioMemDeviceCaptureError::RequiredFeatureNotAcknowledged);
+        }
+        if queue_registers.queue_count() != VIRTIO_MEM_QUEUE_COUNT {
+            return Err(VirtioMemDeviceCaptureError::QueueCountMismatch);
+        }
+
+        let mut plugged_ranges = Vec::new();
+        plugged_ranges
+            .try_reserve_exact(self.plugged_blocks.ranges.len())
+            .map_err(|source| VirtioMemDeviceCaptureError::PluggedRangeAllocation { source })?;
+        let usable_blocks = config_space.usable_region_size() / block_size;
+        let mut previous_end = None;
+        let mut plugged_bytes = 0_u64;
+        for (range_index, range) in self.plugged_blocks.ranges.iter().copied().enumerate() {
+            if range.start() >= range.end()
+                || range.end() > usable_blocks
+                || previous_end.is_some_and(|end| range.start() <= end)
+            {
+                return Err(VirtioMemDeviceCaptureError::PluggedRangeInvalid { range_index });
+            }
+            let range_bytes = range
+                .len_bytes(block_size)
+                .ok_or(VirtioMemDeviceCaptureError::PluggedRangeInvalid { range_index })?;
+            plugged_bytes = plugged_bytes
+                .checked_add(range_bytes)
+                .ok_or(VirtioMemDeviceCaptureError::PluggedSizeMismatch)?;
+            plugged_ranges.push(VirtioMemPluggedRangeCaptureState {
+                start_block: range.start(),
+                block_count: range.block_count(),
+            });
+            previous_end = Some(range.end());
+        }
+        if plugged_bytes != config_space.plugged_size() {
+            return Err(VirtioMemDeviceCaptureError::PluggedSizeMismatch);
+        }
+
+        let active_queue = match self.active_queue.as_ref() {
+            Some(queue) => {
+                let transport = queue_registers
+                    .queue(0)
+                    .map_err(|_| VirtioMemDeviceCaptureError::QueueCountMismatch)?;
+                Some(
+                    queue
+                        .capture_state(transport, memory)
+                        .map_err(|source| VirtioMemDeviceCaptureError::Queue { source })?,
+                )
+            }
+            None => None,
+        };
+        Ok(VirtioMemDeviceCaptureState {
+            config,
+            available_features,
+            negotiated_features,
+            config_space,
+            active_queue,
+            plugged_ranges,
+        })
     }
 
     #[cfg(test)]
@@ -2360,6 +3058,8 @@ impl VirtioMemDevice {
         drained_notifications: Vec<usize>,
         mutation_executor: &mut impl VirtioMemMutationExecutor,
     ) -> Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError> {
+        self.metrics
+            .record_queue_events(drained_notifications.len());
         if drained_notifications.is_empty() {
             return Ok(VirtioMemDeviceNotificationDispatch::new(
                 drained_notifications,
@@ -2372,6 +3072,7 @@ impl VirtioMemDevice {
             .copied()
             .find(|queue_index| *queue_index != 0)
         {
+            self.metrics.record_queue_event_failure();
             return Err(VirtioMemDeviceNotificationError::UnsupportedQueue {
                 drained_notifications,
                 queue_index,
@@ -2379,25 +3080,30 @@ impl VirtioMemDevice {
         }
 
         let Some(queue) = self.active_queue.as_mut() else {
+            self.metrics.record_queue_event_failure();
             return Err(VirtioMemDeviceNotificationError::Inactive {
                 drained_notifications,
             });
         };
 
-        match queue.dispatch_with_executor(
+        match queue.dispatch_with_executor_and_metrics(
             memory,
             config_space,
             &mut self.plugged_blocks,
             mutation_executor,
+            &self.metrics,
         ) {
             Ok(dispatch) => Ok(VirtioMemDeviceNotificationDispatch::new(
                 drained_notifications,
                 Some(dispatch),
             )),
-            Err(source) => Err(VirtioMemDeviceNotificationError::QueueDispatch {
-                drained_notifications,
-                source,
-            }),
+            Err(source) => {
+                self.metrics.record_queue_event_failure();
+                Err(VirtioMemDeviceNotificationError::QueueDispatch {
+                    drained_notifications,
+                    source,
+                })
+            }
         }
     }
 
@@ -2405,34 +3111,47 @@ impl VirtioMemDevice {
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMemDeviceActivationError> {
-        if self.active_queue.is_some() {
-            return Err(VirtioMemDeviceActivationError::AlreadyActive);
-        }
-
-        let queue_count = activation.queue_count();
-        if queue_count != VIRTIO_MEM_QUEUE_COUNT {
-            return Err(VirtioMemDeviceActivationError::QueueCountMismatch {
-                expected: VIRTIO_MEM_QUEUE_COUNT,
-                actual: queue_count,
-            });
-        }
-
-        let queue_index = 0;
-        let queue = *activation.queue(queue_index).map_err(|source| {
-            VirtioMemDeviceActivationError::QueueMetadata {
-                queue_index,
-                source,
+        let result = (|| {
+            if self.active_queue.is_some() {
+                return Err(VirtioMemDeviceActivationError::AlreadyActive);
             }
-        })?;
-        validate_virtio_mem_queue(queue_index, queue)?;
-        self.active_queue = Some(VirtioMemQueue::from_mmio_queue_state(&queue).map_err(
-            |source| VirtioMemDeviceActivationError::QueueBuild {
-                queue_index,
-                source,
-            },
-        )?);
 
-        Ok(())
+            if activation.driver_features()
+                & virtio_feature_bit(VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE)
+                == 0
+            {
+                return Err(VirtioMemDeviceActivationError::RequiredFeatureNotAcknowledged);
+            }
+
+            let queue_count = activation.queue_count();
+            if queue_count != VIRTIO_MEM_QUEUE_COUNT {
+                return Err(VirtioMemDeviceActivationError::QueueCountMismatch {
+                    expected: VIRTIO_MEM_QUEUE_COUNT,
+                    actual: queue_count,
+                });
+            }
+
+            let queue_index = 0;
+            let queue = *activation.queue(queue_index).map_err(|source| {
+                VirtioMemDeviceActivationError::QueueMetadata {
+                    queue_index,
+                    source,
+                }
+            })?;
+            validate_virtio_mem_queue(queue_index, queue)?;
+            self.active_queue = Some(VirtioMemQueue::from_mmio_queue_state(&queue).map_err(
+                |source| VirtioMemDeviceActivationError::QueueBuild {
+                    queue_index,
+                    source,
+                },
+            )?);
+
+            Ok(())
+        })();
+        if result.is_err() {
+            self.metrics.record_activation_failure();
+        }
+        result
     }
 
     pub fn reset(&mut self) {
@@ -2440,7 +3159,36 @@ impl VirtioMemDevice {
     }
 }
 
+impl Default for VirtioMemDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice> {
+    pub fn capture_memory_hotplug_state(
+        &self,
+        config: MemoryHotplugConfig,
+        memory: &GuestMemory,
+    ) -> Result<VirtioMemMmioCaptureState, VirtioMemDeviceCaptureError> {
+        let device = self.activation_handler().capture_state(
+            *self.device_config_handler(),
+            config,
+            self.device_registers(),
+            self.queue_registers(),
+            self.is_device_activated(),
+            memory,
+        )?;
+        Ok(VirtioMemMmioCaptureState {
+            device,
+            transport: self.transport_state(),
+        })
+    }
+
+    pub fn shared_memory_hotplug_metrics(&self) -> SharedMemoryHotplugDeviceMetrics {
+        self.activation_handler().shared_metrics()
+    }
+
     pub fn dispatch_mem_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
@@ -2498,6 +3246,39 @@ impl VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice> {
 }
 
 impl VirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice> {
+    pub fn capture_memory_hotplug_state(
+        &self,
+        config: MemoryHotplugConfig,
+        memory: &GuestMemory,
+    ) -> Result<VirtioMemPciCaptureState, VirtioMemPciCaptureError> {
+        let (device, transport) = self
+            .capture_transport_with(
+                |registers, queues, config_space, device, transport_activated| {
+                    device.capture_state(
+                        *config_space,
+                        config,
+                        registers,
+                        queues,
+                        transport_activated,
+                        memory,
+                    )
+                },
+            )
+            .map_err(VirtioMemPciCaptureError::Endpoint)?;
+        Ok(VirtioMemPciCaptureState {
+            device: device.map_err(VirtioMemPciCaptureError::Device)?,
+            transport,
+        })
+    }
+
+    pub fn shared_memory_hotplug_metrics(
+        &self,
+    ) -> Result<SharedMemoryHotplugDeviceMetrics, VirtioPciEndpointError> {
+        let (metrics, _) =
+            self.capture_transport_with(|_, _, _, device, _| device.shared_metrics())?;
+        Ok(metrics)
+    }
+
     pub fn dispatch_mem_queue_notifications_with_executor(
         &self,
         memory: &mut GuestMemory,
@@ -2512,7 +3293,7 @@ impl VirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice> {
         let work = self
             .admit_device_work()
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
-        let dispatch = work
+        let (dispatch, metrics) = work
             .with_core_mut(|core| {
                 let drained_notifications =
                     core.queue_notifications.take_pending_queue_notifications();
@@ -2537,10 +3318,14 @@ impl VirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice> {
                 if needs_queue_interrupt {
                     core.record_interrupt_intent(VirtioInterruptIntent::Queue { queue_index: 0 });
                 }
-                dispatch
+                (dispatch, core.activation.shared_metrics())
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
-        VirtioPciDeviceOperationError::combine(dispatch, work.drain_interrupt_intents())
+        let interrupt = work.drain_interrupt_intents();
+        if interrupt.is_err() {
+            metrics.record_interrupt_failure();
+        }
+        VirtioPciDeviceOperationError::combine(dispatch, interrupt)
     }
 
     pub fn update_mem_requested_size(
@@ -2550,16 +3335,24 @@ impl VirtioPciEndpoint<VirtioMemConfigSpace, VirtioMemDevice> {
         let work = self
             .admit_device_work()
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
-        let result = work
+        let (result, metrics) = work
             .with_core_mut(|core| {
-                let config_space = core.device_config.updated_requested_size(update)?;
-                core.device_config = config_space;
-                core.device.increment_config_generation();
-                core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
-                Ok(())
+                let metrics = core.activation.shared_metrics();
+                let result = (|| {
+                    let config_space = core.device_config.updated_requested_size(update)?;
+                    core.device_config = config_space;
+                    core.device.increment_config_generation();
+                    core.record_interrupt_intent(VirtioInterruptIntent::Configuration);
+                    Ok(())
+                })();
+                (result, metrics)
             })
             .map_err(VirtioPciDeviceOperationError::Endpoint)?;
-        VirtioPciDeviceOperationError::combine(result, work.drain_interrupt_intents())
+        let interrupt = work.drain_interrupt_intents();
+        if interrupt.is_err() {
+            metrics.record_interrupt_failure();
+        }
+        VirtioPciDeviceOperationError::combine(result, interrupt)
     }
 
     pub fn plugged_size(&self) -> Result<u64, VirtioPciEndpointError> {
@@ -2584,6 +3377,7 @@ impl VirtioMmioDeviceActivationHandler for VirtioMemDevice {
 #[derive(Debug)]
 pub enum VirtioMemDeviceActivationError {
     AlreadyActive,
+    RequiredFeatureNotAcknowledged,
     QueueCountMismatch {
         expected: usize,
         actual: usize,
@@ -2613,6 +3407,7 @@ impl PartialEq for VirtioMemDeviceActivationError {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::AlreadyActive, Self::AlreadyActive) => true,
+            (Self::RequiredFeatureNotAcknowledged, Self::RequiredFeatureNotAcknowledged) => true,
             (
                 Self::QueueCountMismatch {
                     expected: left_expected,
@@ -2686,6 +3481,9 @@ impl fmt::Display for VirtioMemDeviceActivationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AlreadyActive => f.write_str("virtio-mem device is already active"),
+            Self::RequiredFeatureNotAcknowledged => f.write_str(
+                "virtio-mem requires VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE acknowledgement",
+            ),
             Self::QueueCountMismatch { expected, actual } => {
                 write!(
                     f,
@@ -2730,6 +3528,7 @@ impl std::error::Error for VirtioMemDeviceActivationError {
             Self::QueueMetadata { source, .. } => Some(source),
             Self::QueueBuild { source, .. } => Some(source),
             Self::AlreadyActive
+            | Self::RequiredFeatureNotAcknowledged
             | Self::QueueCountMismatch { .. }
             | Self::QueueMaxSizeMismatch { .. }
             | Self::QueueSizeZero { .. }
@@ -2747,12 +3546,19 @@ impl From<VirtioMemDeviceActivationError> for VirtioMmioDeviceActivationError {
 pub fn virtio_mem_mmio_handler_from_config_space(
     config_space: VirtioMemConfigSpace,
 ) -> Result<VirtioMemMmioHandler, VirtioMmioRegisterHandlerError> {
+    virtio_mem_mmio_handler(config_space, VirtioMemDevice::new())
+}
+
+fn virtio_mem_mmio_handler(
+    config_space: VirtioMemConfigSpace,
+    activation_handler: VirtioMemDevice,
+) -> Result<VirtioMemMmioHandler, VirtioMmioRegisterHandlerError> {
     VirtioMmioRegisterHandler::with_device_config_and_activation(
         VIRTIO_MEM_DEVICE_ID,
         config_space.available_features(),
         &VIRTIO_MEM_QUEUE_SIZES,
         config_space,
-        VirtioMemDevice::new(),
+        activation_handler,
     )
 }
 
@@ -3326,6 +4132,7 @@ mod tests {
     fn virtio_mem_mmio_device_registers_handler() {
         let prepared = PreparedVirtioMemDevice::from_config(memory_hotplug_config())
             .expect("virtio-mem device should prepare");
+        let prepared_metrics = prepared.shared_metrics();
         let mut device = prepared
             .register_mmio(VirtioMemMmioLayout::new(
                 GuestAddress::new(TEST_VIRTIO_MEM_MMIO_BASE),
@@ -3355,6 +4162,10 @@ mod tests {
                 .expect("device ID should read"),
             VIRTIO_MEM_DEVICE_ID
         );
+        handler
+            .shared_memory_hotplug_metrics()
+            .record_activation_failure();
+        assert_eq!(prepared_metrics.snapshot().activate_fails(), 1);
     }
 
     #[test]
@@ -4090,11 +4901,19 @@ mod tests {
             .with_usable_region_size(0x80_0000)
             .with_requested_size(0x80_0000);
         let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default();
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
 
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 2);
         write_available_heads(&mut memory, &[0]);
         let dispatch = queue
-            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .dispatch_with_executor_and_metrics(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+                &metrics,
+            )
             .expect("plug request should dispatch");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -4105,7 +4924,13 @@ mod tests {
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, 0x4000_0000, 1);
         write_available_heads(&mut memory, &[0, 0]);
         let dispatch = queue
-            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .dispatch_with_executor_and_metrics(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+                &metrics,
+            )
             .expect("plugged state request should dispatch");
 
         assert_eq!(dispatch.state_requests(), 1);
@@ -4117,7 +4942,13 @@ mod tests {
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, 0x4000_0000, 3);
         write_available_heads(&mut memory, &[0, 0, 0]);
         queue
-            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .dispatch_with_executor_and_metrics(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+                &metrics,
+            )
             .expect("mixed state request should dispatch");
 
         assert_eq!(
@@ -4128,7 +4959,13 @@ mod tests {
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_UNPLUG, 0x4000_0000, 2);
         write_available_heads(&mut memory, &[0, 0, 0, 0]);
         queue
-            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .dispatch_with_executor_and_metrics(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+                &metrics,
+            )
             .expect("unplug request should dispatch");
 
         assert_eq!(read_response(&memory), VirtioMemResponse::Ack.to_le_bytes());
@@ -4137,19 +4974,47 @@ mod tests {
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4040_0000, 1);
         write_available_heads(&mut memory, &[0, 0, 0, 0, 0]);
         queue
-            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .dispatch_with_executor_and_metrics(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+                &metrics,
+            )
             .expect("second plug request should dispatch");
         assert_eq!(config_space.plugged_size(), 0x20_0000);
 
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_UNPLUG_ALL, 0, 0);
         write_available_heads(&mut memory, &[0, 0, 0, 0, 0, 0]);
         queue
-            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .dispatch_with_executor_and_metrics(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+                &metrics,
+            )
             .expect("unplug all request should dispatch");
 
         assert_eq!(read_response(&memory), VirtioMemResponse::Ack.to_le_bytes());
         assert_eq!(config_space.plugged_size(), 0);
         assert_eq!(config_space.usable_region_size(), 0);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.plug_count(), 2);
+        assert_eq!(snapshot.plug_bytes(), 0x60_0000);
+        assert_eq!(snapshot.plug_fails(), 0);
+        assert_eq!(snapshot.plug_agg().sample_count(), 2);
+        assert_eq!(snapshot.unplug_count(), 1);
+        assert_eq!(snapshot.unplug_bytes(), 0x40_0000);
+        assert_eq!(snapshot.unplug_fails(), 0);
+        assert_eq!(snapshot.unplug_agg().sample_count(), 1);
+        assert_eq!(snapshot.unplug_all_count(), 1);
+        assert_eq!(snapshot.unplug_all_fails(), 0);
+        assert_eq!(snapshot.unplug_all_agg().sample_count(), 1);
+        assert_eq!(snapshot.state_count(), 2);
+        assert_eq!(snapshot.state_fails(), 0);
+        assert_eq!(snapshot.state_agg().sample_count(), 2);
+        assert_eq!(snapshot.rollback_count(), 0);
     }
 
     #[test]
@@ -4425,16 +5290,19 @@ mod tests {
             .expect("second plug should dispatch");
         assert_eq!(plugged_blocks.ranges.len(), 1);
         assert_eq!(plugged_blocks.ranges[0].block_count(), 2);
-        let mut executor = RecordingMutationExecutor::default();
+        let mut executor = RecordingMutationExecutor::default()
+            .with_commit_outcome(VirtioMemMutationCommitOutcome::new(2, 3, 1));
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
 
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_UNPLUG_ALL, 0, 0);
         write_available_heads(&mut memory, &[0, 0, 0]);
         let dispatch = queue
-            .dispatch_with_executor(
+            .dispatch_with_executor_and_metrics(
                 &mut memory,
                 &mut config_space,
                 &mut plugged_blocks,
                 &mut executor,
+                &metrics,
             )
             .expect("unplug-all should dispatch through executor");
 
@@ -4450,6 +5318,13 @@ mod tests {
         );
         assert_eq!(config_space.plugged_size(), 0);
         assert_eq!(config_space.usable_region_size(), 0);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.unplug_all_count(), 1);
+        assert_eq!(snapshot.unplug_all_fails(), 0);
+        assert_eq!(snapshot.unplug_discard_fails(), 2);
+        assert_eq!(snapshot.owner_cleanup_count(), 3);
+        assert_eq!(snapshot.owner_cleanup_fails(), 1);
+        assert_eq!(snapshot.rollback_count(), 0);
     }
 
     #[test]
@@ -4547,15 +5422,19 @@ mod tests {
             .with_usable_region_size(0x20_0000)
             .with_requested_size(0x20_0000);
         let mut plugged_blocks = VirtioMemPluggedBlocks::default();
-        let mut executor = RecordingMutationExecutor::default()
-            .with_apply_error(VirtioMemMutationError::new("map failed"));
+        let mut executor = RecordingMutationExecutor::default().with_apply_error(
+            VirtioMemMutationError::new("map failed")
+                .with_rollback_outcome(VirtioMemMutationRollbackOutcome::new(2, 1)),
+        );
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
 
         let dispatch = queue
-            .dispatch_with_executor(
+            .dispatch_with_executor_and_metrics(
                 &mut memory,
                 &mut config_space,
                 &mut plugged_blocks,
                 &mut executor,
+                &metrics,
             )
             .expect("executor failure should still publish error response");
 
@@ -4590,6 +5469,13 @@ mod tests {
         );
         assert!(executor.rolled_back.is_empty());
         assert!(executor.committed.is_empty());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.plug_count(), 1);
+        assert_eq!(snapshot.plug_bytes(), 0);
+        assert_eq!(snapshot.plug_fails(), 1);
+        assert_eq!(snapshot.plug_agg().sample_count(), 1);
+        assert_eq!(snapshot.rollback_count(), 2);
+        assert_eq!(snapshot.rollback_fails(), 1);
     }
 
     #[test]
@@ -4703,13 +5589,15 @@ mod tests {
             .with_requested_size(0x40_0000);
         let mut plugged_blocks = VirtioMemPluggedBlocks::default();
         let mut executor = RecordingMutationExecutor::default();
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
 
         let error = queue
-            .dispatch_with_executor(
+            .dispatch_with_executor_and_metrics(
                 &mut memory,
                 &mut config_space,
                 &mut plugged_blocks,
                 &mut executor,
+                &metrics,
             )
             .expect_err("used ring publication should fail after rollback");
 
@@ -4728,6 +5616,12 @@ mod tests {
             executor.rolled_back_mutations(),
             [plug_blocks_mutation(0x4000_0000, 0x20_0000, 2)]
         );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.plug_count(), 1);
+        assert_eq!(snapshot.plug_bytes(), 0);
+        assert_eq!(snapshot.plug_fails(), 1);
+        assert_eq!(snapshot.rollback_count(), 1);
+        assert_eq!(snapshot.rollback_fails(), 0);
     }
 
     #[test]
@@ -4886,6 +5780,11 @@ mod tests {
                 .expect("interrupt status should read"),
             DeviceInterruptKind::Queue.status().bits()
         );
+        let metrics = handler.shared_memory_hotplug_metrics().snapshot();
+        assert_eq!(metrics.queue_event_count(), 1);
+        assert_eq!(metrics.queue_event_fails(), 0);
+        assert_eq!(metrics.state_count(), 1);
+        assert_eq!(metrics.state_fails(), 0);
     }
 
     #[test]
@@ -4962,6 +5861,10 @@ mod tests {
         );
         assert!(handler.pending_queue_notifications().is_empty());
         assert!(!handler.activation_handler().is_activated());
+        let metrics = handler.shared_memory_hotplug_metrics().snapshot();
+        assert_eq!(metrics.activate_fails(), 1);
+        assert_eq!(metrics.queue_event_count(), 1);
+        assert_eq!(metrics.queue_event_fails(), 1);
     }
 
     #[test]
@@ -4984,6 +5887,9 @@ mod tests {
             }
             other => panic!("expected unsupported queue error, got {other:?}"),
         }
+        let metrics = device.shared_metrics().snapshot();
+        assert_eq!(metrics.queue_event_count(), 2);
+        assert_eq!(metrics.queue_event_fails(), 1);
     }
 
     #[test]
@@ -5052,6 +5958,140 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mem_mmio_capture_preserves_completed_queue_ranges_and_pending_state() {
+        let config = memory_hotplug_config();
+        let config_space = PreparedVirtioMemDevice::from_config(config)
+            .expect("virtio-mem device should prepare")
+            .config_space()
+            .with_usable_region_size(128 * MIB)
+            .with_requested_size(128 * MIB);
+        let mut handler = mem_mmio_handler(config_space);
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, config_space.addr(), 1);
+        write_available_heads(&mut memory, &[0]);
+        configure_mem_mmio_handler_queue(&mut handler);
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_DRIVER_OK_STATUS)
+            .expect("DRIVER_OK status should activate virtio-mem");
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should write");
+        handler
+            .dispatch_mem_queue_notifications(&mut memory)
+            .expect("plug request should dispatch");
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("pending queue notification should write");
+        handler
+            .update_mem_requested_size(
+                config
+                    .validate_size_update(MemoryHotplugSizeUpdateInput::new(128))
+                    .expect("requested size should validate"),
+            )
+            .expect("requested size update should succeed");
+
+        let capture = handler
+            .capture_memory_hotplug_state(config, &memory)
+            .expect("quiesced completed queue should be capture-ready");
+
+        assert_eq!(capture.device().config(), config);
+        assert_eq!(capture.device().config_space().plugged_size(), 2 * MIB);
+        assert_eq!(
+            capture.device().negotiated_features(),
+            capture.device().available_features()
+        );
+        assert_eq!(
+            capture.device().active_queue(),
+            Some(VirtioMemQueueCaptureState {
+                next_available: 1,
+                next_used: 1,
+            })
+        );
+        assert_eq!(
+            capture.device().plugged_ranges(),
+            [VirtioMemPluggedRangeCaptureState {
+                start_block: 0,
+                block_count: 1,
+            }]
+        );
+        assert_eq!(
+            capture
+                .device()
+                .plugged_guest_ranges()
+                .expect("captured plugged ranges should expand"),
+            [guest_range(config_space.addr(), 2 * MIB)]
+        );
+        assert!(capture.transport().is_device_activated());
+        assert_eq!(capture.transport().pending_notifications(), [true]);
+        assert_eq!(
+            capture.transport().interrupt_status().bits(),
+            DeviceInterruptKind::Queue.status().bits()
+                | DeviceInterruptKind::Config.status().bits()
+        );
+        assert_eq!(
+            format!("{capture:?}"),
+            "VirtioMemMmioCaptureState { state: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
+    fn virtio_mem_mmio_capture_rejects_consumed_unpublished_descriptor() {
+        let config = memory_hotplug_config();
+        let config_space = PreparedVirtioMemDevice::from_config(config)
+            .expect("virtio-mem device should prepare")
+            .config_space()
+            .with_usable_region_size(128 * MIB)
+            .with_requested_size(128 * MIB);
+        let mut handler = mem_mmio_handler(config_space);
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, config_space.addr(), 1);
+        write_available_heads(&mut memory, &[0]);
+        configure_mem_mmio_handler_queue(&mut handler);
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_DRIVER_OK_STATUS)
+            .expect("DRIVER_OK status should activate virtio-mem");
+        handler
+            .activation_handler_mut()
+            .active_queue_mut()
+            .expect("active queue should exist")
+            .available
+            .pop_descriptor_chain(&memory)
+            .expect("available ring should remain readable")
+            .expect("one descriptor should be available");
+
+        let error = handler
+            .capture_memory_hotplug_state(config, &memory)
+            .expect_err("consumed but unpublished request must block capture");
+
+        assert!(matches!(
+            error,
+            VirtioMemDeviceCaptureError::Queue {
+                source: VirtioMemQueueCaptureError::UnpublishedDescriptorCountMismatch {
+                    actual: 1
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn virtio_mem_mmio_capture_requires_exact_external_configuration() {
+        let config = memory_hotplug_config();
+        let config_space = PreparedVirtioMemDevice::from_config(config)
+            .expect("virtio-mem device should prepare")
+            .config_space();
+        let handler = mem_mmio_handler(config_space);
+        let memory = request_memory();
+        let wrong_config =
+            MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(2048, 2, 128))
+                .expect("alternate configuration should validate");
+
+        assert!(matches!(
+            handler.capture_memory_hotplug_state(wrong_config, &memory),
+            Err(VirtioMemDeviceCaptureError::ConfigurationMismatch)
+        ));
+    }
+
+    #[test]
     fn virtio_mem_mmio_handler_rejects_driver_ok_before_queue_ready() {
         let mut handler = mem_mmio_handler(virtio_mem_config_space());
 
@@ -5083,6 +6123,31 @@ mod tests {
 
         assert_eq!(error, VirtioMemDeviceActivationError::AlreadyActive);
         assert_eq!(error.to_string(), "virtio-mem device is already active");
+    }
+
+    #[test]
+    fn virtio_mem_device_activation_requires_unplugged_inaccessible_feature() {
+        let queues = configured_mem_queue(&[VIRTIO_MEM_QUEUE_SIZE], VIRTIO_MEM_QUEUE_SIZE, true);
+        let available_features = virtio_mem_config_space().available_features();
+        let device_registers =
+            VirtioMmioDeviceRegisters::new(VIRTIO_MEM_DEVICE_ID, available_features)
+                .with_runtime_state(
+                    [0, 0],
+                    virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+                    TEST_DRIVER_OK_STATUS,
+                );
+        let mut device = VirtioMemDevice::new();
+
+        let error = device
+            .activate_mem(mem_device_activation(&device_registers, &queues))
+            .expect_err("missing unplugged-inaccessible feature should fail activation");
+
+        assert_eq!(
+            error,
+            VirtioMemDeviceActivationError::RequiredFeatureNotAcknowledged
+        );
+        assert!(!device.is_activated());
+        assert_eq!(device.shared_metrics().snapshot().activate_fails(), 1);
     }
 
     #[test]
@@ -5294,6 +6359,15 @@ mod tests {
                 VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
             )
             .expect("DRIVER status should write");
+        let features = handler.device_registers().device_features();
+        for (selector, word) in [(0, features as u32), (1, (features >> 32) as u32)] {
+            handler
+                .write_register(VirtioMmioRegister::DriverFeaturesSel, selector)
+                .expect("driver feature selector should write");
+            handler
+                .write_register(VirtioMmioRegister::DriverFeatures, word)
+                .expect("driver feature word should write");
+        }
         handler
             .write_register(VirtioMmioRegister::Status, TEST_QUEUE_CONFIG_STATUS)
             .expect("FEATURES_OK status should write");
@@ -5351,9 +6425,11 @@ mod tests {
     }
 
     fn mem_device_registers() -> VirtioMmioDeviceRegisters {
-        VirtioMmioDeviceRegisters::new(
-            VIRTIO_MEM_DEVICE_ID,
-            virtio_mem_config_space().available_features(),
+        let features = virtio_mem_config_space().available_features();
+        VirtioMmioDeviceRegisters::new(VIRTIO_MEM_DEVICE_ID, features).with_runtime_state(
+            [0, 0],
+            features,
+            0,
         )
     }
 
@@ -5368,6 +6444,7 @@ mod tests {
     struct RecordingMutationExecutor {
         apply_results: VecDeque<Result<(), VirtioMemMutationError>>,
         rollback_results: VecDeque<Result<(), VirtioMemMutationRollbackError>>,
+        commit_outcomes: VecDeque<VirtioMemMutationCommitOutcome>,
         apply_calls: Vec<VirtioMemMutation>,
         rolled_back: Vec<VirtioMemAppliedMutation>,
         committed: Vec<VirtioMemMutation>,
@@ -5381,6 +6458,11 @@ mod tests {
 
         fn with_rollback_error(mut self, source: VirtioMemMutationRollbackError) -> Self {
             self.rollback_results.push_back(Err(source));
+            self
+        }
+
+        fn with_commit_outcome(mut self, outcome: VirtioMemMutationCommitOutcome) -> Self {
+            self.commit_outcomes.push_back(outcome);
             self
         }
 
@@ -5421,8 +6503,13 @@ mod tests {
             }
         }
 
-        fn commit(&mut self, _memory: &mut GuestMemory, applied: &VirtioMemAppliedMutation) {
+        fn commit(
+            &mut self,
+            _memory: &mut GuestMemory,
+            applied: &VirtioMemAppliedMutation,
+        ) -> VirtioMemMutationCommitOutcome {
             self.committed.push(applied.mutation().clone());
+            self.commit_outcomes.pop_front().unwrap_or_default()
         }
     }
 

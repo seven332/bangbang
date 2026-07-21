@@ -9,9 +9,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 use crate::memory_dirty::{GuestMemoryDirtyTracker, GuestMemoryDirtyTrackerError};
 
@@ -376,6 +377,87 @@ pub enum GuestMemoryBacking {
     Shared,
 }
 
+static NEXT_GUEST_MEMORY_MAPPING_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_guest_memory_mapping_identity()
+-> Result<GuestMemoryMappingIdentity, GuestMemoryAllocationError> {
+    NEXT_GUEST_MEMORY_MAPPING_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(GuestMemoryMappingIdentity)
+        .map_err(|_| GuestMemoryAllocationError::MappingIdentityExhausted)
+}
+
+/// Opaque process-local value identifying one mapping without retaining it or
+/// exposing its address or descriptor.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GuestMemoryMappingIdentity(u64);
+
+impl fmt::Debug for GuestMemoryMappingIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GuestMemoryMappingIdentity(<redacted>)")
+    }
+}
+
+/// Detached identity and range for one descriptor-backed shared reservation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GuestMemorySharedReservationCaptureState {
+    range: GuestMemoryRange,
+    mapping_identity: GuestMemoryMappingIdentity,
+}
+
+impl GuestMemorySharedReservationCaptureState {
+    pub const fn range(self) -> GuestMemoryRange {
+        self.range
+    }
+
+    pub const fn mapping_identity(self) -> GuestMemoryMappingIdentity {
+        self.mapping_identity
+    }
+}
+
+impl fmt::Debug for GuestMemorySharedReservationCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestMemorySharedReservationCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum GuestMemorySharedReservationCaptureError {
+    Missing {
+        range: GuestMemoryRange,
+    },
+    InvalidBacking {
+        source: GuestMemorySharedBackingError,
+    },
+}
+
+impl fmt::Display for GuestMemorySharedReservationCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing { .. } => {
+                formatter.write_str("shared guest-memory reservation is missing")
+            }
+            Self::InvalidBacking { .. } => {
+                formatter.write_str("shared guest-memory reservation backing is invalid")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GuestMemorySharedReservationCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidBacking { source } => Some(source),
+            Self::Missing { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct GuestMemory {
     regions: Vec<GuestMemoryRegion>,
@@ -468,6 +550,30 @@ impl GuestMemory {
     /// Return the active shared dirty-page tracker, if configured.
     pub fn dirty_tracker(&self) -> Option<Arc<GuestMemoryDirtyTracker>> {
         self.dirty_tracker.as_ref().map(Arc::clone)
+    }
+
+    /// Capture one exact shared reservation without cloning its mapping or
+    /// descriptor.
+    pub fn shared_reservation_capture_state(
+        &self,
+        range: GuestMemoryRange,
+    ) -> Result<GuestMemorySharedReservationCaptureState, GuestMemorySharedReservationCaptureError>
+    {
+        let reservation = self
+            .shared_reservations
+            .iter()
+            .find(|reservation| reservation.range() == range)
+            .ok_or(GuestMemorySharedReservationCaptureError::Missing { range })?;
+        let shared = reservation.validate_shared_backing().map_err(|source| {
+            GuestMemorySharedReservationCaptureError::InvalidBacking { source }
+        })?;
+        if !shared {
+            return Err(GuestMemorySharedReservationCaptureError::Missing { range });
+        }
+        Ok(GuestMemorySharedReservationCaptureState {
+            range,
+            mapping_identity: reservation.mapping_identity(),
+        })
     }
 
     /// Allocate and add one process-owned guest memory region.
@@ -1014,6 +1120,11 @@ impl GuestMemoryRegion {
         self.mapping.backing()
     }
 
+    /// Return an opaque value identity without retaining the backing mapping.
+    pub fn mapping_identity(&self) -> GuestMemoryMappingIdentity {
+        self.mapping.identity()
+    }
+
     /// Validates shared descriptor metadata without duplicating the descriptor.
     ///
     /// Returns `false` for anonymous regions and `true` for a valid shared
@@ -1214,6 +1325,7 @@ pub enum GuestMemoryAllocationError {
     SharedMmapReturnedNull {
         size: usize,
     },
+    MappingIdentityExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1318,6 +1430,9 @@ impl fmt::Display for GuestMemoryAllocationError {
                 f,
                 "descriptor-backed shared guest memory mapping of {size} bytes returned a null address"
             ),
+            Self::MappingIdentityExhausted => {
+                f.write_str("guest-memory mapping identity space is exhausted")
+            }
         }
     }
 }
@@ -1343,7 +1458,8 @@ impl std::error::Error for GuestMemoryAllocationError {
             | Self::SharedBackingSizeTooLarge { .. }
             | Self::SharedBackingReservationMissing { .. }
             | Self::SharedReservationRequiresSharedBacking { .. }
-            | Self::SharedMmapReturnedNull { .. } => None,
+            | Self::SharedMmapReturnedNull { .. }
+            | Self::MappingIdentityExhausted => None,
         }
     }
 }
@@ -2224,6 +2340,7 @@ impl GuestMemoryMapper for SystemGuestMemoryMapper {
 pub(crate) struct GuestMemoryMapping {
     address: NonNull<c_void>,
     size: usize,
+    identity: GuestMemoryMappingIdentity,
     kind: GuestMemoryMappingKind,
 }
 
@@ -2239,6 +2356,7 @@ unsafe impl Sync for GuestMemoryMapping {}
 
 impl GuestMemoryMapping {
     fn map_anonymous(size: usize) -> Result<Self, GuestMemoryAllocationError> {
+        let identity = next_guest_memory_mapping_identity()?;
         // SAFETY: The call requests a new private anonymous read/write mapping.
         // `size` was validated from a non-empty guest memory range before this
         // function is called. No aliasing Rust reference is created here.
@@ -2273,11 +2391,13 @@ impl GuestMemoryMapping {
         Ok(Self {
             address,
             size,
+            identity,
             kind: GuestMemoryMappingKind::Anonymous,
         })
     }
 
     fn map_shared(size: usize, file: File) -> Result<Self, GuestMemoryAllocationError> {
+        let identity = next_guest_memory_mapping_identity()?;
         // SAFETY: The descriptor owns an exact-sized object and remains live in
         // the returned mapping owner. No Rust reference is created here.
         let address = unsafe {
@@ -2310,6 +2430,7 @@ impl GuestMemoryMapping {
         Ok(Self {
             address,
             size,
+            identity,
             kind: GuestMemoryMappingKind::Shared { file },
         })
     }
@@ -2319,6 +2440,8 @@ impl GuestMemoryMapping {
         Self {
             address: NonNull::<u8>::dangling().cast(),
             size,
+            identity: next_guest_memory_mapping_identity()
+                .expect("test mapping identity should remain available"),
             kind: GuestMemoryMappingKind::Test { drop_count },
         }
     }
@@ -2329,6 +2452,10 @@ impl GuestMemoryMapping {
 
     const fn size(&self) -> usize {
         self.size
+    }
+
+    const fn identity(&self) -> GuestMemoryMappingIdentity {
+        self.identity
     }
 
     const fn backing(&self) -> GuestMemoryBacking {
@@ -2473,8 +2600,8 @@ mod tests {
         GuestMemoryBacking, GuestMemoryDiscardAdviser, GuestMemoryDiscardFailureKind,
         GuestMemoryError, GuestMemoryLayout, GuestMemoryMapper, GuestMemoryMapping,
         GuestMemoryMappingKind, GuestMemoryRange, GuestMemoryRegion, GuestMemorySharedBackingError,
-        SharedMemoryResourceLimits, aarch64, host_page_size,
-        preflight_shared_memory_resource_values_with_limits,
+        GuestMemorySharedReservationCaptureError, SharedMemoryResourceLimits, aarch64,
+        host_page_size, preflight_shared_memory_resource_values_with_limits,
         preflight_shared_memory_resources_with_limits,
     };
 
@@ -2935,6 +3062,8 @@ mod tests {
                 mapping: Arc::new(GuestMemoryMapping {
                     address: host_address,
                     size: page_size,
+                    identity: super::next_guest_memory_mapping_identity()
+                        .expect("test mapping identity should remain available"),
                     kind: GuestMemoryMappingKind::Test {
                         drop_count: Arc::clone(&drop_count),
                     },
@@ -4258,6 +4387,20 @@ mod tests {
             .reserve_shared_region(reservation_range)
             .expect("shared reservation should succeed");
 
+        let capture = memory
+            .shared_reservation_capture_state(reservation_range)
+            .expect("exact shared reservation should be capture-ready");
+        assert_eq!(capture.range(), reservation_range);
+        assert!(matches!(
+            memory.shared_reservation_capture_state(online_range),
+            Err(GuestMemorySharedReservationCaptureError::Missing { range })
+                if range == online_range
+        ));
+        assert_eq!(
+            format!("{capture:?}"),
+            "GuestMemorySharedReservationCaptureState { state: \"<redacted>\" }"
+        );
+
         assert_eq!(memory_ranges(&memory), vec![boot_range]);
         assert_eq!(memory.total_size(), page_size);
         assert_eq!(
@@ -4311,6 +4454,7 @@ mod tests {
             .iter()
             .find(|region| region.range() == online_range)
             .expect("online view should be active");
+        assert_eq!(online.mapping_identity(), capture.mapping_identity());
         assert_eq!(
             online.host_address().as_ptr().addr(),
             reservation_address + usize::try_from(page_size).expect("page size should fit usize")
@@ -4388,6 +4532,44 @@ mod tests {
                 .map(GuestMemoryRegion::range)
                 .collect::<Vec<_>>(),
             vec![reservation_range, boot_range]
+        );
+    }
+
+    #[test]
+    fn shared_reservation_capture_identities_are_stable_and_not_reused() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let boot_range = range(0, page_size);
+        let reservation_range = range(page_size * 2, page_size * 2);
+        let layout =
+            GuestMemoryLayout::new(vec![boot_range]).expect("page-aligned layout should be valid");
+        let mut first = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("first shared memory should allocate");
+        let mut second = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("second shared memory should allocate");
+        first
+            .reserve_shared_region(reservation_range)
+            .expect("first reservation should succeed");
+        second
+            .reserve_shared_region(reservation_range)
+            .expect("second reservation should succeed");
+
+        let first_capture = first
+            .shared_reservation_capture_state(reservation_range)
+            .expect("first reservation should capture");
+        let repeated_capture = first
+            .shared_reservation_capture_state(reservation_range)
+            .expect("repeated capture should succeed");
+        let second_capture = second
+            .shared_reservation_capture_state(reservation_range)
+            .expect("second reservation should capture");
+
+        assert_eq!(
+            first_capture.mapping_identity(),
+            repeated_capture.mapping_identity()
+        );
+        assert_ne!(
+            first_capture.mapping_identity(),
+            second_capture.mapping_identity()
         );
     }
 

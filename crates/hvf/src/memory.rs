@@ -8,12 +8,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::memory::{
-    GuestMemory, GuestMemoryAllocationError, GuestMemoryRange, GuestMemoryRegion,
-    GuestMemoryRegionRemovalError,
+    GuestAddress, GuestMemory, GuestMemoryAllocationError, GuestMemoryMappingIdentity,
+    GuestMemoryRange, GuestMemoryRegion, GuestMemoryRegionRemovalError,
+    GuestMemorySharedReservationCaptureError, GuestMemorySharedReservationCaptureState,
 };
 use bangbang_runtime::memory_hotplug::{
-    VirtioMemAppliedMutation, VirtioMemMutation, VirtioMemMutationError, VirtioMemMutationExecutor,
-    VirtioMemMutationKind, VirtioMemMutationRollbackError,
+    VirtioMemAppliedMutation, VirtioMemDeviceCaptureError, VirtioMemDeviceCaptureState,
+    VirtioMemMutation, VirtioMemMutationCommitOutcome, VirtioMemMutationError,
+    VirtioMemMutationExecutor, VirtioMemMutationKind, VirtioMemMutationRollbackError,
+    VirtioMemMutationRollbackOutcome,
 };
 use bangbang_runtime::pmem::PmemBackingMapping;
 
@@ -431,6 +434,199 @@ impl HvfGuestMemoryFlushFailure {
     }
 }
 
+/// Detached projection proving virtio-mem ownership across guest memory, HVF,
+/// and dirty tracking.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfVirtioMemMappingCaptureState {
+    reservation: GuestMemorySharedReservationCaptureState,
+    mapping_identity: GuestMemoryMappingIdentity,
+    active_ranges: Vec<GuestMemoryRange>,
+    active_bytes: u64,
+    offline_bytes: u64,
+    current_memory_bytes: u64,
+    guest_dirty_tracking: bool,
+    hvf_dirty_tracking: bool,
+    dirty_epoch: Option<u64>,
+}
+
+impl HvfVirtioMemMappingCaptureState {
+    pub const fn reservation(&self) -> GuestMemorySharedReservationCaptureState {
+        self.reservation
+    }
+
+    pub const fn mapping_identity(&self) -> GuestMemoryMappingIdentity {
+        self.mapping_identity
+    }
+
+    pub fn active_ranges(&self) -> &[GuestMemoryRange] {
+        &self.active_ranges
+    }
+
+    pub const fn active_bytes(&self) -> u64 {
+        self.active_bytes
+    }
+
+    pub const fn offline_bytes(&self) -> u64 {
+        self.offline_bytes
+    }
+
+    pub const fn current_memory_bytes(&self) -> u64 {
+        self.current_memory_bytes
+    }
+
+    pub const fn guest_dirty_tracking(&self) -> bool {
+        self.guest_dirty_tracking
+    }
+
+    pub const fn hvf_dirty_tracking(&self) -> bool {
+        self.hvf_dirty_tracking
+    }
+
+    pub const fn dirty_epoch(&self) -> Option<u64> {
+        self.dirty_epoch
+    }
+}
+
+impl fmt::Debug for HvfVirtioMemMappingCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfVirtioMemMappingCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum HvfVirtioMemMappingCaptureError {
+    GuestMemoryUnavailable,
+    ApertureRangeInvalid,
+    Reservation {
+        source: GuestMemorySharedReservationCaptureError,
+    },
+    PluggedRanges {
+        source: VirtioMemDeviceCaptureError,
+    },
+    Allocation {
+        source: TryReserveError,
+    },
+    GuestOwnerMismatch,
+    MappingIdentityMismatch,
+    DynamicMappingMismatch,
+    HvfMappingMismatch,
+    DirtyTrackingUnavailable,
+    DirtyTrackingMismatch,
+    AccountingOverflow,
+}
+
+impl fmt::Display for HvfVirtioMemMappingCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GuestMemoryUnavailable => {
+                formatter.write_str("virtio-mem guest-memory owner is unavailable")
+            }
+            Self::ApertureRangeInvalid => {
+                formatter.write_str("virtio-mem aperture range is invalid")
+            }
+            Self::Reservation { .. } => {
+                formatter.write_str("virtio-mem shared reservation is not capture-ready")
+            }
+            Self::PluggedRanges { .. } => {
+                formatter.write_str("virtio-mem plugged ranges are not capture-ready")
+            }
+            Self::Allocation { .. } => {
+                formatter.write_str("failed to allocate virtio-mem capture metadata")
+            }
+            Self::GuestOwnerMismatch => {
+                formatter.write_str("virtio-mem plugged ranges do not match guest-memory owners")
+            }
+            Self::MappingIdentityMismatch => {
+                formatter.write_str("virtio-mem active views do not share the reservation identity")
+            }
+            Self::DynamicMappingMismatch => formatter
+                .write_str("virtio-mem plugged ranges do not match dynamic mapping metadata"),
+            Self::HvfMappingMismatch => {
+                formatter.write_str("virtio-mem plugged ranges do not match actual HVF mappings")
+            }
+            Self::DirtyTrackingUnavailable => {
+                formatter.write_str("virtio-mem dirty-write tracker is unavailable")
+            }
+            Self::DirtyTrackingMismatch => {
+                formatter.write_str("virtio-mem plugged ranges do not match dirty tracking")
+            }
+            Self::AccountingOverflow => {
+                formatter.write_str("virtio-mem capture byte accounting overflowed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfVirtioMemMappingCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Reservation { source } => Some(source),
+            Self::PluggedRanges { source } => Some(source),
+            Self::Allocation { source } => Some(source),
+            Self::GuestMemoryUnavailable
+            | Self::ApertureRangeInvalid
+            | Self::GuestOwnerMismatch
+            | Self::MappingIdentityMismatch
+            | Self::DynamicMappingMismatch
+            | Self::HvfMappingMismatch
+            | Self::DirtyTrackingUnavailable
+            | Self::DirtyTrackingMismatch
+            | Self::AccountingOverflow => None,
+        }
+    }
+}
+
+fn normalize_capture_ranges(ranges: &mut Vec<GuestMemoryRange>) -> bool {
+    ranges.sort_unstable_by_key(|range| range.start().raw_value());
+    let mut write_index = 0_usize;
+    for read_index in 0..ranges.len() {
+        let Some(current) = ranges.get(read_index).copied() else {
+            return false;
+        };
+        if write_index == 0 {
+            let Some(first) = ranges.first_mut() else {
+                return false;
+            };
+            *first = current;
+            write_index = 1;
+            continue;
+        }
+
+        let Some(previous_index) = write_index.checked_sub(1) else {
+            return false;
+        };
+        let Some(previous) = ranges.get(previous_index).copied() else {
+            return false;
+        };
+        if previous.overlaps(current) {
+            return false;
+        }
+        if previous.end_exclusive() == current.start() {
+            let Some(size) = previous.size().checked_add(current.size()) else {
+                return false;
+            };
+            let Ok(merged) = GuestMemoryRange::new(previous.start(), size) else {
+                return false;
+            };
+            let Some(destination) = ranges.get_mut(previous_index) else {
+                return false;
+            };
+            *destination = merged;
+        } else {
+            let Some(destination) = ranges.get_mut(write_index) else {
+                return false;
+            };
+            *destination = current;
+            write_index += 1;
+        }
+    }
+    ranges.truncate(write_index);
+    true
+}
+
 #[derive(Debug)]
 pub(crate) struct HvfGuestMemoryMapping {
     memory: Option<GuestMemory>,
@@ -534,6 +730,141 @@ impl HvfGuestMemoryMapping {
             .ok_or(HvfGuestMemoryMappingError::InvalidState(
                 "guest memory owner is missing",
             ))
+    }
+
+    pub(crate) fn capture_virtio_mem_mapping_state(
+        &self,
+        device: &VirtioMemDeviceCaptureState,
+    ) -> Result<HvfVirtioMemMappingCaptureState, HvfVirtioMemMappingCaptureError> {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or(HvfVirtioMemMappingCaptureError::GuestMemoryUnavailable)?;
+        let config_space = device.config_space();
+        let aperture = GuestMemoryRange::new(
+            GuestAddress::new(config_space.addr()),
+            config_space.region_size(),
+        )
+        .map_err(|_| HvfVirtioMemMappingCaptureError::ApertureRangeInvalid)?;
+        let reservation = memory
+            .shared_reservation_capture_state(aperture)
+            .map_err(|source| HvfVirtioMemMappingCaptureError::Reservation { source })?;
+        let mapping_identity = reservation.mapping_identity();
+        let mut expected = device
+            .plugged_guest_ranges()
+            .map_err(|source| HvfVirtioMemMappingCaptureError::PluggedRanges { source })?;
+        if !normalize_capture_ranges(&mut expected) {
+            return Err(HvfVirtioMemMappingCaptureError::PluggedRanges {
+                source: VirtioMemDeviceCaptureError::PluggedRangeInvalid { range_index: 0 },
+            });
+        }
+
+        let mut guest_ranges = Vec::new();
+        guest_ranges
+            .try_reserve_exact(expected.len())
+            .map_err(|source| HvfVirtioMemMappingCaptureError::Allocation { source })?;
+        for region in memory.regions() {
+            if !region.range().overlaps(aperture) {
+                continue;
+            }
+            if region.mapping_identity() != mapping_identity {
+                return Err(HvfVirtioMemMappingCaptureError::MappingIdentityMismatch);
+            }
+            guest_ranges.push(region.range());
+        }
+        if !normalize_capture_ranges(&mut guest_ranges) || guest_ranges != expected {
+            return Err(HvfVirtioMemMappingCaptureError::GuestOwnerMismatch);
+        }
+
+        let dynamic_range_count = self
+            .state
+            .dynamic_regions
+            .iter()
+            .filter(|range| range.overlaps(aperture))
+            .count();
+        let mut dynamic_ranges = Vec::new();
+        dynamic_ranges
+            .try_reserve_exact(dynamic_range_count)
+            .map_err(|source| HvfVirtioMemMappingCaptureError::Allocation { source })?;
+        dynamic_ranges.extend(
+            self.state
+                .dynamic_regions
+                .iter()
+                .copied()
+                .filter(|range| range.overlaps(aperture)),
+        );
+        if !normalize_capture_ranges(&mut dynamic_ranges) || dynamic_ranges != expected {
+            return Err(HvfVirtioMemMappingCaptureError::DynamicMappingMismatch);
+        }
+
+        let mapped_count = self
+            .state
+            .mapped_regions
+            .iter()
+            .filter(|mapped| mapped.range.overlaps(aperture))
+            .count();
+        let mut mapped_ranges = Vec::new();
+        mapped_ranges
+            .try_reserve_exact(mapped_count)
+            .map_err(|source| HvfVirtioMemMappingCaptureError::Allocation { source })?;
+        for mapped in self
+            .state
+            .mapped_regions
+            .iter()
+            .filter(|mapped| mapped.range.overlaps(aperture))
+        {
+            if !mapped.permissions.contains(HvfMemoryPermissions::GUEST_RAM) {
+                return Err(HvfVirtioMemMappingCaptureError::HvfMappingMismatch);
+            }
+            mapped_ranges.push(mapped.range);
+        }
+        if !normalize_capture_ranges(&mut mapped_ranges) || mapped_ranges != expected {
+            return Err(HvfVirtioMemMappingCaptureError::HvfMappingMismatch);
+        }
+
+        let guest_dirty = memory.dirty_tracker();
+        let hvf_dirty = self
+            .state
+            .active_dirty_write_tracker()
+            .map_err(|_| HvfVirtioMemMappingCaptureError::DirtyTrackingUnavailable)?;
+        if guest_dirty.is_some() != hvf_dirty.is_some() {
+            return Err(HvfVirtioMemMappingCaptureError::DirtyTrackingMismatch);
+        }
+        if let (Some(guest_dirty), Some(hvf_dirty)) = (&guest_dirty, &hvf_dirty) {
+            for range in &expected {
+                if !guest_dirty.contains_range(*range)
+                    || !hvf_dirty
+                        .contains_range(*range)
+                        .map_err(|_| HvfVirtioMemMappingCaptureError::DirtyTrackingUnavailable)?
+                {
+                    return Err(HvfVirtioMemMappingCaptureError::DirtyTrackingMismatch);
+                }
+            }
+        }
+
+        let active_bytes = expected.iter().try_fold(0_u64, |bytes, range| {
+            bytes
+                .checked_add(range.size())
+                .ok_or(HvfVirtioMemMappingCaptureError::AccountingOverflow)
+        })?;
+        if active_bytes != config_space.plugged_size() {
+            return Err(HvfVirtioMemMappingCaptureError::AccountingOverflow);
+        }
+        let offline_bytes = config_space
+            .region_size()
+            .checked_sub(active_bytes)
+            .ok_or(HvfVirtioMemMappingCaptureError::AccountingOverflow)?;
+        Ok(HvfVirtioMemMappingCaptureState {
+            reservation,
+            mapping_identity,
+            active_ranges: expected,
+            active_bytes,
+            offline_bytes,
+            current_memory_bytes: memory.total_size(),
+            guest_dirty_tracking: guest_dirty.is_some(),
+            hvf_dirty_tracking: hvf_dirty.is_some(),
+            dirty_epoch: guest_dirty.as_ref().map(|tracker| tracker.epoch()),
+        })
     }
 
     // HVF destroys guest mappings with the VM. Use this only after `hv_vm_destroy`
@@ -1314,10 +1645,16 @@ impl<'a> HvfVirtioMemMutationExecutor<'a> {
                 if let Err(rollback_source) = self.rollback_plug(memory, applied_ranges) {
                     return Err(VirtioMemMutationError::new(format!(
                         "{source}; also failed to roll back partially applied plug: {rollback_source}"
-                    )));
+                    ))
+                    .with_rollback_outcome(VirtioMemMutationRollbackOutcome::new(1, 1)));
                 }
 
-                return Err(source);
+                return Err(
+                    source.with_rollback_outcome(VirtioMemMutationRollbackOutcome::new(
+                        u64::from(index != 0),
+                        0,
+                    )),
+                );
             }
         }
 
@@ -1361,10 +1698,16 @@ impl<'a> HvfVirtioMemMutationExecutor<'a> {
                 if let Err(rollback_source) = self.rollback_unplug(memory, applied_ranges) {
                     return Err(VirtioMemMutationError::new(format!(
                         "{source}; also failed to roll back partially applied {operation}: {rollback_source}"
-                    )));
+                    ))
+                    .with_rollback_outcome(VirtioMemMutationRollbackOutcome::new(1, 1)));
                 }
 
-                return Err(source);
+                return Err(
+                    source.with_rollback_outcome(VirtioMemMutationRollbackOutcome::new(
+                        u64::from(index != 0),
+                        0,
+                    )),
+                );
             }
         }
 
@@ -1422,21 +1765,33 @@ impl VirtioMemMutationExecutor for HvfVirtioMemMutationExecutor<'_> {
         }
     }
 
-    fn commit(&mut self, memory: &mut GuestMemory, applied: &VirtioMemAppliedMutation) {
+    fn commit(
+        &mut self,
+        memory: &mut GuestMemory,
+        applied: &VirtioMemAppliedMutation,
+    ) -> VirtioMemMutationCommitOutcome {
         let ranges = match applied.mutation().kind() {
-            VirtioMemMutationKind::Plug(_) => return,
+            VirtioMemMutationKind::Plug(_) => return VirtioMemMutationCommitOutcome::default(),
             VirtioMemMutationKind::Unplug(ranges) | VirtioMemMutationKind::UnplugAll(ranges) => {
                 ranges
             }
         };
+        let mut discard_failures = 0_u64;
+        let mut owner_cleanup_attempts = 0_u64;
+        let mut owner_cleanup_failures = 0_u64;
         for range in ranges.iter().copied() {
-            let _ = memory.discard_range(range);
-            let removal = memory.remove_region(range);
-            debug_assert!(
-                removal.is_ok(),
-                "committed virtio-mem unplug must retain its owner view until finalization"
-            );
+            discard_failures =
+                discard_failures.saturating_add(memory.discard_range(range).failures().total());
+            owner_cleanup_attempts = owner_cleanup_attempts.saturating_add(1);
+            if memory.remove_region(range).is_err() {
+                owner_cleanup_failures = owner_cleanup_failures.saturating_add(1);
+            }
         }
+        VirtioMemMutationCommitOutcome::new(
+            discard_failures,
+            owner_cleanup_attempts,
+            owner_cleanup_failures,
+        )
     }
 }
 
@@ -1962,8 +2317,18 @@ mod tests {
         GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange,
     };
     use bangbang_runtime::memory_hotplug::{
-        VirtioMemMutation, VirtioMemMutationExecutor, VirtioMemMutationKind,
+        MemoryHotplugConfig, MemoryHotplugConfigInput, NoopVirtioMemMutationExecutor,
+        PreparedVirtioMemDevice, VIRTIO_FEATURE_VERSION_1, VIRTIO_MEM_QUEUE_SIZE,
+        VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE, VirtioMemConfigSpace,
+        VirtioMemDeviceCaptureState, VirtioMemMmioHandler, VirtioMemMutation,
+        VirtioMemMutationExecutor, VirtioMemMutationKind,
+        virtio_mem_mmio_handler_from_config_space,
     };
+    use bangbang_runtime::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+    };
+    use bangbang_runtime::virtio_queue::{VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE};
 
     use crate::dirty::HvfDirtyWriteTrackerStartError;
     use crate::memory::FailedGuestMemoryMapping;
@@ -1971,8 +2336,19 @@ mod tests {
     use super::{
         HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping,
         HvfMappedGuestMemoryRegion, HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions,
-        host_page_size, validate_map_request,
+        HvfVirtioMemMappingCaptureError, host_page_size, validate_map_request,
     };
+
+    const MIB: u64 = 1024 * 1024;
+    const TEST_MEM_REQUEST: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_MEM_RESPONSE: GuestAddress = GuestAddress::new(0x2000);
+    const TEST_MEM_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x4000);
+    const TEST_MEM_DRIVER_RING: GuestAddress = GuestAddress::new(0x8000);
+    const TEST_MEM_DEVICE_RING: GuestAddress = GuestAddress::new(0xc000);
+    const TEST_MEM_FEATURES_OK: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    const TEST_MEM_DRIVER_OK: u32 = TEST_MEM_FEATURES_OK | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 
     fn range(start: u64, size: u64) -> GuestMemoryRange {
         GuestMemoryRange::new(GuestAddress::new(start), size)
@@ -2000,6 +2376,117 @@ mod tests {
 
     fn writable_pmem_permissions() -> HvfMemoryPermissions {
         HvfMemoryPermissions::new(true, true, false)
+    }
+
+    fn memory_hotplug_config() -> MemoryHotplugConfig {
+        MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(128, 2, 128))
+            .expect("test memory hotplug configuration should validate")
+    }
+
+    fn active_virtio_mem_handler(config_space: VirtioMemConfigSpace) -> VirtioMemMmioHandler {
+        let mut handler = virtio_mem_mmio_handler_from_config_space(config_space)
+            .expect("virtio-mem handler should build");
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("ACKNOWLEDGE status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("DRIVER status should write");
+        let features = handler.device_registers().device_features();
+        assert_ne!(features & (1_u64 << VIRTIO_FEATURE_VERSION_1), 0);
+        for (selector, word) in [(0, features as u32), (1, (features >> 32) as u32)] {
+            handler
+                .write_register(VirtioMmioRegister::DriverFeaturesSel, selector)
+                .expect("driver feature selector should write");
+            handler
+                .write_register(VirtioMmioRegister::DriverFeatures, word)
+                .expect("driver feature word should write");
+        }
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_MEM_FEATURES_OK)
+            .expect("FEATURES_OK status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNum,
+                u32::from(VIRTIO_MEM_QUEUE_SIZE),
+            )
+            .expect("queue size should write");
+        for (register, address) in [
+            (VirtioMmioRegister::QueueDescLow, TEST_MEM_DESCRIPTOR_TABLE),
+            (VirtioMmioRegister::QueueDriverLow, TEST_MEM_DRIVER_RING),
+            (VirtioMmioRegister::QueueDeviceLow, TEST_MEM_DEVICE_RING),
+        ] {
+            handler
+                .write_register(
+                    register,
+                    u32::try_from(address.raw_value()).expect("test address should fit u32"),
+                )
+                .expect("queue address should write");
+        }
+        handler
+            .write_register(VirtioMmioRegister::QueueReady, 1)
+            .expect("queue ready should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_MEM_DRIVER_OK)
+            .expect("DRIVER_OK status should activate virtio-mem");
+        handler
+    }
+
+    fn write_virtio_mem_plug_request(
+        memory: &mut GuestMemory,
+        address: GuestAddress,
+        block_count: u16,
+    ) {
+        let mut request = [0_u8; VIRTIO_MEM_REQUEST_SIZE];
+        request[0..2].copy_from_slice(&0_u16.to_le_bytes());
+        request[8..16].copy_from_slice(&address.raw_value().to_le_bytes());
+        request[16..18].copy_from_slice(&block_count.to_le_bytes());
+        memory
+            .write_slice(&request, TEST_MEM_REQUEST)
+            .expect("plug request should write");
+
+        let mut request_descriptor = [0_u8; 16];
+        request_descriptor[0..8].copy_from_slice(&TEST_MEM_REQUEST.raw_value().to_le_bytes());
+        request_descriptor[8..12].copy_from_slice(&(VIRTIO_MEM_REQUEST_SIZE as u32).to_le_bytes());
+        request_descriptor[12..14].copy_from_slice(&VIRTQUEUE_DESC_F_NEXT.to_le_bytes());
+        request_descriptor[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        memory
+            .write_slice(&request_descriptor, TEST_MEM_DESCRIPTOR_TABLE)
+            .expect("request descriptor should write");
+
+        let mut response_descriptor = [0_u8; 16];
+        response_descriptor[0..8].copy_from_slice(&TEST_MEM_RESPONSE.raw_value().to_le_bytes());
+        response_descriptor[8..12]
+            .copy_from_slice(&(VIRTIO_MEM_RESPONSE_SIZE as u32).to_le_bytes());
+        response_descriptor[12..14].copy_from_slice(&VIRTQUEUE_DESC_F_WRITE.to_le_bytes());
+        memory
+            .write_slice(
+                &response_descriptor,
+                TEST_MEM_DESCRIPTOR_TABLE
+                    .checked_add(16)
+                    .expect("second descriptor address should fit"),
+            )
+            .expect("response descriptor should write");
+
+        memory
+            .write_slice(
+                &1_u16.to_le_bytes(),
+                TEST_MEM_DRIVER_RING
+                    .checked_add(2)
+                    .expect("available index address should fit"),
+            )
+            .expect("available index should write");
+        memory
+            .write_slice(
+                &0_u16.to_le_bytes(),
+                TEST_MEM_DRIVER_RING
+                    .checked_add(4)
+                    .expect("available head address should fit"),
+            )
+            .expect("available head should write");
     }
 
     fn counted_pmem_mapping(
@@ -3739,6 +4226,240 @@ mod tests {
         mapping
             .unmap_all()
             .expect("tracker and mapping should stop");
+    }
+
+    #[test]
+    fn virtio_mem_capture_proves_shared_owner_hvf_mapping_dirty_state_and_accounting() {
+        let page_size = page_size();
+        let boot_range = range(0, page_size * 16);
+        let extra_dynamic_range = range(page_size * 20, page_size);
+        let config = memory_hotplug_config();
+        let config_space = PreparedVirtioMemDevice::from_config(config)
+            .expect("virtio-mem device should prepare")
+            .config_space()
+            .with_usable_region_size(128 * MIB)
+            .with_requested_size(128 * MIB);
+        let aperture = range(config_space.addr(), config_space.region_size());
+        let plugged_range = range(config_space.addr(), 2 * MIB);
+        let layout = GuestMemoryLayout::new(vec![boot_range])
+            .expect("shared boot memory layout should validate");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared boot memory should allocate");
+        memory
+            .reserve_shared_region(aperture)
+            .expect("virtio-mem aperture should reserve");
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping =
+            HvfGuestMemoryMapping::map_with_mapper(memory, HvfMemoryPermissions::GUEST_RAM, mapper)
+                .expect("boot memory should map");
+        mapping
+            .map_dynamic_region(extra_dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("unrelated dynamic memory should map");
+        mapping
+            .start_dirty_write_tracking()
+            .expect("dirty-write tracking should start before hotplug");
+        write_virtio_mem_plug_request(
+            mapping
+                .memory_mut()
+                .expect("guest memory owner should remain available"),
+            plugged_range.start(),
+            1,
+        );
+        let mut handler = active_virtio_mem_handler(config_space);
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should write");
+        {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem mutation executor should borrow mapped memory");
+            handler
+                .dispatch_mem_queue_notifications_with_executor(memory, &mut executor)
+                .expect("plug request should dispatch through HVF mutation executor");
+        }
+        let transport_capture = handler
+            .capture_memory_hotplug_state(
+                config,
+                mapping
+                    .memory()
+                    .expect("guest memory owner should remain available"),
+            )
+            .expect("completed virtio-mem queue should capture");
+        let device_capture: VirtioMemDeviceCaptureState = transport_capture.device().clone();
+
+        let capture = mapping
+            .capture_virtio_mem_mapping_state(&device_capture)
+            .expect("matching shared owner and HVF mappings should capture");
+
+        assert_eq!(capture.reservation().range(), aperture);
+        assert_eq!(
+            capture.mapping_identity(),
+            capture.reservation().mapping_identity()
+        );
+        assert_eq!(capture.active_ranges(), [plugged_range]);
+        assert_eq!(capture.active_bytes(), 2 * MIB);
+        assert_eq!(capture.offline_bytes(), 126 * MIB);
+        assert_eq!(
+            capture.current_memory_bytes(),
+            boot_range.size() + extra_dynamic_range.size() + plugged_range.size()
+        );
+        assert!(capture.guest_dirty_tracking());
+        assert!(capture.hvf_dirty_tracking());
+        assert!(capture.dirty_epoch().is_some());
+        assert_eq!(
+            format!("{capture:?}"),
+            "HvfVirtioMemMappingCaptureState { state: \"<redacted>\" }"
+        );
+
+        let dynamic_index = mapping
+            .state
+            .dynamic_regions
+            .iter()
+            .position(|range| *range == plugged_range)
+            .expect("plugged range should have dynamic mapping metadata");
+        let dynamic_range = mapping.state.dynamic_regions.remove(dynamic_index);
+        assert!(matches!(
+            mapping.capture_virtio_mem_mapping_state(&device_capture),
+            Err(HvfVirtioMemMappingCaptureError::DynamicMappingMismatch)
+        ));
+        mapping
+            .state
+            .dynamic_regions
+            .insert(dynamic_index, dynamic_range);
+
+        let mapped_index = mapping
+            .state
+            .mapped_regions
+            .iter()
+            .position(|mapped| mapped.range == plugged_range)
+            .expect("plugged range should have HVF mapping metadata");
+        let mapped_permissions = mapping.state.mapped_regions[mapped_index].permissions;
+        mapping.state.mapped_regions[mapped_index].permissions = HvfMemoryPermissions::READ;
+        assert!(matches!(
+            mapping.capture_virtio_mem_mapping_state(&device_capture),
+            Err(HvfVirtioMemMappingCaptureError::HvfMappingMismatch)
+        ));
+        mapping.state.mapped_regions[mapped_index].permissions = mapped_permissions;
+
+        let hvf_dirty = mapping
+            .active_dirty_write_tracker()
+            .expect("active HVF dirty tracker should remain queryable")
+            .expect("HVF dirty tracker should remain active");
+        {
+            let mut mutation = hvf_dirty
+                .begin_mapping_mutation()
+                .expect("HVF dirty metadata should be mutable while quiesced");
+            let tracked_index = mutation
+                .prepare_remove(plugged_range, mapped_permissions)
+                .expect("plugged dirty range should prepare for removal");
+            mutation.commit_remove(tracked_index);
+        }
+        assert!(matches!(
+            mapping.capture_virtio_mem_mapping_state(&device_capture),
+            Err(HvfVirtioMemMappingCaptureError::DirtyTrackingMismatch)
+        ));
+        {
+            let mut mutation = hvf_dirty
+                .begin_mapping_mutation()
+                .expect("HVF dirty metadata should remain repairable while quiesced");
+            let prepared = mutation
+                .prepare_add(plugged_range, mapped_permissions)
+                .expect("plugged dirty range should prepare for reinsertion")
+                .expect("writable plugged range should require dirty metadata");
+            mutation.commit_add(prepared);
+        }
+
+        mapping
+            .stop_dirty_write_tracking()
+            .expect("HVF dirty-write tracking should stop");
+        assert!(matches!(
+            mapping.capture_virtio_mem_mapping_state(&device_capture),
+            Err(HvfVirtioMemMappingCaptureError::DirtyTrackingMismatch)
+        ));
+
+        mapping
+            .unmap_dynamic_region(plugged_range)
+            .expect("plugged range should unmap for mismatch test");
+        assert!(matches!(
+            mapping.capture_virtio_mem_mapping_state(&device_capture),
+            Err(HvfVirtioMemMappingCaptureError::GuestOwnerMismatch)
+        ));
+    }
+
+    #[test]
+    fn virtio_mem_capture_normalizes_adjacent_split_mapping_and_dirty_owners() {
+        let page_size = page_size();
+        let boot_range = range(0, page_size * 16);
+        let config = memory_hotplug_config();
+        let config_space = PreparedVirtioMemDevice::from_config(config)
+            .expect("virtio-mem device should prepare")
+            .config_space()
+            .with_usable_region_size(128 * MIB)
+            .with_requested_size(128 * MIB);
+        let aperture = range(config_space.addr(), config_space.region_size());
+        let first = range(config_space.addr(), 2 * MIB);
+        let second = range(config_space.addr() + 2 * MIB, 2 * MIB);
+        let combined = range(config_space.addr(), 4 * MIB);
+        let layout = GuestMemoryLayout::new(vec![boot_range])
+            .expect("shared boot memory layout should validate");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared boot memory should allocate");
+        memory
+            .reserve_shared_region(aperture)
+            .expect("virtio-mem aperture should reserve");
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping =
+            HvfGuestMemoryMapping::map_with_mapper(memory, HvfMemoryPermissions::GUEST_RAM, mapper)
+                .expect("boot memory should map");
+        mapping
+            .map_dynamic_region(first, HvfMemoryPermissions::GUEST_RAM)
+            .expect("first split owner should map");
+        mapping
+            .map_dynamic_region(second, HvfMemoryPermissions::GUEST_RAM)
+            .expect("second split owner should map");
+        mapping
+            .start_dirty_write_tracking()
+            .expect("dirty-write tracking should cover both split owners");
+
+        write_virtio_mem_plug_request(
+            mapping
+                .memory_mut()
+                .expect("guest memory owner should remain available"),
+            combined.start(),
+            2,
+        );
+        let mut handler = active_virtio_mem_handler(config_space);
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should write");
+        let mut executor = NoopVirtioMemMutationExecutor;
+        handler
+            .dispatch_mem_queue_notifications_with_executor(
+                mapping
+                    .memory_mut()
+                    .expect("guest memory owner should remain available"),
+                &mut executor,
+            )
+            .expect("combined device request should publish without remapping split owners");
+        let device_capture = handler
+            .capture_memory_hotplug_state(
+                config,
+                mapping
+                    .memory()
+                    .expect("guest memory owner should remain available"),
+            )
+            .expect("combined device ledger should capture")
+            .device()
+            .clone();
+
+        let capture = mapping
+            .capture_virtio_mem_mapping_state(&device_capture)
+            .expect("adjacent split owners should normalize to the combined ledger");
+        assert_eq!(capture.active_ranges(), [combined]);
+        assert_eq!(capture.active_bytes(), 4 * MIB);
+        assert_eq!(capture.offline_bytes(), 124 * MIB);
+        assert!(capture.guest_dirty_tracking());
+        assert!(capture.hvf_dirty_tracking());
     }
 
     #[test]

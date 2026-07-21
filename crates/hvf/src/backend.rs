@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bangbang_runtime::memory::{GuestMemory, GuestMemoryRange};
+use bangbang_runtime::memory_hotplug::VirtioMemDeviceCaptureState;
 use bangbang_runtime::pmem::PreparedPmemDevice;
 use bangbang_runtime::{BackendError, VmBackend};
 
@@ -14,7 +15,8 @@ use crate::gic::{
 };
 use crate::memory::{
     HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping, HvfMemoryMapper,
-    HvfMemoryPermissions, HvfPmemFlushExecutor, HvfVirtioMemMutationExecutor, RealHvfMemoryMapper,
+    HvfMemoryPermissions, HvfPmemFlushExecutor, HvfVirtioMemMappingCaptureError,
+    HvfVirtioMemMappingCaptureState, HvfVirtioMemMutationExecutor, RealHvfMemoryMapper,
 };
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
@@ -210,6 +212,16 @@ impl HvfBackend {
                 GUEST_MEMORY_NOT_MAPPED_MESSAGE,
             ))?
             .memory()
+    }
+
+    pub(crate) fn capture_virtio_mem_mapping_state(
+        &self,
+        device: &VirtioMemDeviceCaptureState,
+    ) -> Result<HvfVirtioMemMappingCaptureState, HvfVirtioMemMappingCaptureError> {
+        self.guest_memory
+            .as_ref()
+            .ok_or(HvfVirtioMemMappingCaptureError::GuestMemoryUnavailable)?
+            .capture_virtio_mem_mapping_state(device)
     }
 
     pub(crate) fn mapped_guest_memory_mut(

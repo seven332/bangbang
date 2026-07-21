@@ -538,6 +538,41 @@ impl HvfDirtyWriteTracker {
         }
     }
 
+    /// Return whether one guest range is fully covered by active protected
+    /// mapping metadata without exposing the tracker or its mapper.
+    pub fn contains_range(
+        &self,
+        range: GuestMemoryRange,
+    ) -> Result<bool, HvfDirtyWriteTrackerQueryError> {
+        let state = self.lock_query()?;
+        state.ensure_active().map_err(|source| match source {
+            HvfDirtyWriteFaultError::InvalidState(message) => {
+                HvfDirtyWriteTrackerQueryError::InvalidState(message)
+            }
+            _ => HvfDirtyWriteTrackerQueryError::InvalidState(
+                "dirty-write tracker cannot validate range coverage",
+            ),
+        })?;
+        let mut current = range.start().raw_value();
+        for region in &state.regions {
+            if region.range.end_exclusive().raw_value() <= current {
+                continue;
+            }
+            if region.range.start().raw_value() > current {
+                return Ok(false);
+            }
+            current = region
+                .range
+                .end_exclusive()
+                .raw_value()
+                .min(range.end_exclusive().raw_value());
+            if current == range.end_exclusive().raw_value() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn dirty_pages(&self) -> Result<Vec<GuestAddress>, HvfDirtyWriteTrackerQueryError> {
         let state = self.lock_query()?;
         match state.status {

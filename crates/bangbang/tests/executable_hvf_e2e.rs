@@ -3068,9 +3068,12 @@ mod macos_arm64 {
 
     #[test]
     fn signed_executable_hotplugs_memory_from_direct_rootfs_guest() {
+        const MIB: u64 = 1024 * 1024;
+
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let data_backing_path = test_dir.path().join("data.img");
+        let metrics_path = test_dir.path().join("metrics.out");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -3087,6 +3090,16 @@ mod macos_arm64 {
         assert_no_content_response(
             &machine_response,
             "PUT /machine-config memory hotplug direct rootfs",
+        );
+
+        let metrics_body = format!(
+            r#"{{"metrics_path":{}}}"#,
+            json_string(path_text(&metrics_path))
+        );
+        let metrics_response = http_put_json(&socket_path, "/metrics", &metrics_body);
+        assert_no_content_response(
+            &metrics_response,
+            "PUT /metrics memory hotplug direct rootfs",
         );
 
         let memory_hotplug_response = http_put_json(
@@ -3250,6 +3263,38 @@ mod macos_arm64 {
             "GET /hotplug/memory after guest-completed grow",
         );
 
+        let grow_metrics = flush_memory_hotplug_metrics(
+            &socket_path,
+            &metrics_path,
+            "FlushMetrics after virtio-mem grow",
+        );
+        assert_eq!(grow_metrics["plug_bytes"].as_u64(), Some(128 * MIB));
+        assert!(
+            grow_metrics["plug_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert_eq!(grow_metrics["plug_fails"].as_u64(), Some(0));
+        assert!(
+            grow_metrics["queue_event_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause before memory-hotplug capture-ready preflight",
+        );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused MMIO memory-hotplug capture-ready preflight",
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume after memory-hotplug capture-ready preflight",
+        );
+
         let memory_hotplug_shrink = http_json_with_io_timeout(
             &socket_path,
             "PATCH",
@@ -3300,6 +3345,19 @@ mod macos_arm64 {
             r#""requested_size_mib":0"#,
             "GET /hotplug/memory after guest-completed shrink",
         );
+        let shrink_metrics = flush_memory_hotplug_metrics(
+            &socket_path,
+            &metrics_path,
+            "FlushMetrics after virtio-mem shrink",
+        );
+        assert_eq!(shrink_metrics["unplug_bytes"].as_u64(), Some(128 * MIB));
+        assert!(
+            shrink_metrics["unplug_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert_eq!(shrink_metrics["unplug_fails"].as_u64(), Some(0));
+        assert_eq!(shrink_metrics["plug_bytes"].as_u64(), Some(0));
 
         assert_clean_shutdown(
             bangbang.terminate(),
@@ -4116,6 +4174,8 @@ mod macos_arm64 {
 
     #[test]
     fn signed_executable_runs_all_startup_virtio_devices_over_product_pci() {
+        const MIB: u64 = 1024 * 1024;
+
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let data_backing_path = test_dir.path().join("data.img");
@@ -4353,6 +4413,40 @@ mod macos_arm64 {
                 output.status, output.stdout, output.stderr
             );
         }
+        wait_for_http_response_fragment(
+            &socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":128"#,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("product PCI public status should report completed virtio-mem grow");
+        let grow_metrics = flush_memory_hotplug_metrics(
+            &socket_path,
+            &metrics_path,
+            "FlushMetrics after product PCI virtio-mem grow",
+        );
+        assert_eq!(grow_metrics["plug_bytes"].as_u64(), Some(128 * MIB));
+        assert!(
+            grow_metrics["plug_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert_eq!(grow_metrics["plug_fails"].as_u64(), Some(0));
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause before product PCI memory-hotplug capture-ready preflight",
+        );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused product PCI memory-hotplug capture-ready preflight",
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume after product PCI memory-hotplug capture-ready preflight",
+        );
+
         assert_no_content_response(
             &http_json_with_io_timeout(
                 &socket_path,
@@ -4363,6 +4457,26 @@ mod macos_arm64 {
             ),
             "PATCH /hotplug/memory shrink product PCI",
         );
+        wait_for_http_response_fragment(
+            &socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":0"#,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("product PCI public status should report completed virtio-mem shrink");
+        let shrink_metrics = flush_memory_hotplug_metrics(
+            &socket_path,
+            &metrics_path,
+            "FlushMetrics after product PCI virtio-mem shrink",
+        );
+        assert_eq!(shrink_metrics["unplug_bytes"].as_u64(), Some(128 * MIB));
+        assert!(
+            shrink_metrics["unplug_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        assert_eq!(shrink_metrics["unplug_fails"].as_u64(), Some(0));
+        assert_eq!(shrink_metrics["plug_bytes"].as_u64(), Some(0));
 
         if let Err(err) = wait_for_file_prefix_marker(
             &data_backing_path,
@@ -9393,6 +9507,33 @@ mod macos_arm64 {
             json_string(path_text(state_path)),
             json_string(path_text(memory_path))
         )
+    }
+
+    fn flush_memory_hotplug_metrics(
+        socket_path: &Path,
+        metrics_path: &Path,
+        context: &str,
+    ) -> serde_json::Value {
+        let response = http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
+        assert_no_content_response(&response, context);
+        let output = fs::read_to_string(metrics_path).unwrap_or_else(|err| {
+            panic!(
+                "memory-hotplug metrics {} should be readable: {err}",
+                metrics_path.display()
+            )
+        });
+        output
+            .lines()
+            .rev()
+            .find_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()?
+                    .get("memory_hotplug")
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                panic!("{context} should emit memory_hotplug metrics; output:\n{output}")
+            })
     }
 
     fn wait_for_uart_write_count(

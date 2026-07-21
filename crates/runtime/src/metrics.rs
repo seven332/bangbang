@@ -5473,6 +5473,523 @@ struct SharedBalloonDeviceMetricsInner {
     free_page_report_failures: AtomicU64,
 }
 
+/// Bounded latency aggregate for one virtio-mem operation family.
+///
+/// `sample_count` is retained for snapshot/delta correctness. The public JSON
+/// shape intentionally matches Firecracker's `LatencyAggregateMetrics` and
+/// therefore emits only `min_us`, `max_us`, and `sum_us`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryHotplugLatencyMetrics {
+    min_us: u64,
+    max_us: u64,
+    sum_us: u64,
+    sample_count: u64,
+}
+
+impl MemoryHotplugLatencyMetrics {
+    pub const fn min_us(self) -> u64 {
+        self.min_us
+    }
+
+    pub const fn max_us(self) -> u64 {
+        self.max_us
+    }
+
+    pub const fn sum_us(self) -> u64 {
+        self.sum_us
+    }
+
+    pub const fn sample_count(self) -> u64 {
+        self.sample_count
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.sample_count == 0
+    }
+
+    const fn delta_since(self, previous: Self) -> Self {
+        let sample_count = incremental_delta(self.sample_count, previous.sample_count);
+        if sample_count == 0 {
+            return Self {
+                min_us: 0,
+                max_us: 0,
+                sum_us: 0,
+                sample_count: 0,
+            };
+        }
+        Self {
+            min_us: self.min_us,
+            max_us: self.max_us,
+            sum_us: incremental_delta(self.sum_us, previous.sum_us),
+            sample_count,
+        }
+    }
+
+    const fn merged_with(mut self, other: Self) -> Self {
+        if other.is_empty() {
+            return self;
+        }
+        if self.is_empty() || other.min_us < self.min_us {
+            self.min_us = other.min_us;
+        }
+        if other.max_us > self.max_us {
+            self.max_us = other.max_us;
+        }
+        self.sum_us = self.sum_us.saturating_add(other.sum_us);
+        self.sample_count = self.sample_count.saturating_add(other.sample_count);
+        self
+    }
+}
+
+/// Firecracker-shaped singleton virtio-mem metrics plus Bangbang transaction
+/// and owner-lifecycle extensions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryHotplugDeviceMetrics {
+    activate_fails: u64,
+    queue_event_fails: u64,
+    queue_event_count: u64,
+    plug_agg: MemoryHotplugLatencyMetrics,
+    plug_count: u64,
+    plug_bytes: u64,
+    plug_fails: u64,
+    unplug_agg: MemoryHotplugLatencyMetrics,
+    unplug_count: u64,
+    unplug_bytes: u64,
+    unplug_fails: u64,
+    unplug_discard_fails: u64,
+    unplug_all_agg: MemoryHotplugLatencyMetrics,
+    unplug_all_count: u64,
+    unplug_all_fails: u64,
+    state_agg: MemoryHotplugLatencyMetrics,
+    state_count: u64,
+    state_fails: u64,
+    interrupt_fails: u64,
+    rollback_count: u64,
+    rollback_fails: u64,
+    owner_cleanup_count: u64,
+    owner_cleanup_fails: u64,
+    teardown_count: u64,
+    teardown_fails: u64,
+}
+
+impl MemoryHotplugDeviceMetrics {
+    pub const fn is_empty(self) -> bool {
+        self.activate_fails == 0
+            && self.queue_event_fails == 0
+            && self.queue_event_count == 0
+            && self.plug_agg.is_empty()
+            && self.plug_count == 0
+            && self.plug_bytes == 0
+            && self.plug_fails == 0
+            && self.unplug_agg.is_empty()
+            && self.unplug_count == 0
+            && self.unplug_bytes == 0
+            && self.unplug_fails == 0
+            && self.unplug_discard_fails == 0
+            && self.unplug_all_agg.is_empty()
+            && self.unplug_all_count == 0
+            && self.unplug_all_fails == 0
+            && self.state_agg.is_empty()
+            && self.state_count == 0
+            && self.state_fails == 0
+            && self.interrupt_fails == 0
+            && self.rollback_count == 0
+            && self.rollback_fails == 0
+            && self.owner_cleanup_count == 0
+            && self.owner_cleanup_fails == 0
+            && self.teardown_count == 0
+            && self.teardown_fails == 0
+    }
+
+    pub const fn activate_fails(self) -> u64 {
+        self.activate_fails
+    }
+
+    pub const fn queue_event_fails(self) -> u64 {
+        self.queue_event_fails
+    }
+
+    pub const fn queue_event_count(self) -> u64 {
+        self.queue_event_count
+    }
+
+    pub const fn plug_agg(self) -> MemoryHotplugLatencyMetrics {
+        self.plug_agg
+    }
+
+    pub const fn plug_count(self) -> u64 {
+        self.plug_count
+    }
+
+    pub const fn plug_bytes(self) -> u64 {
+        self.plug_bytes
+    }
+
+    pub const fn plug_fails(self) -> u64 {
+        self.plug_fails
+    }
+
+    pub const fn unplug_agg(self) -> MemoryHotplugLatencyMetrics {
+        self.unplug_agg
+    }
+
+    pub const fn unplug_count(self) -> u64 {
+        self.unplug_count
+    }
+
+    pub const fn unplug_bytes(self) -> u64 {
+        self.unplug_bytes
+    }
+
+    pub const fn unplug_fails(self) -> u64 {
+        self.unplug_fails
+    }
+
+    pub const fn unplug_discard_fails(self) -> u64 {
+        self.unplug_discard_fails
+    }
+
+    pub const fn unplug_all_agg(self) -> MemoryHotplugLatencyMetrics {
+        self.unplug_all_agg
+    }
+
+    pub const fn unplug_all_count(self) -> u64 {
+        self.unplug_all_count
+    }
+
+    pub const fn unplug_all_fails(self) -> u64 {
+        self.unplug_all_fails
+    }
+
+    pub const fn state_agg(self) -> MemoryHotplugLatencyMetrics {
+        self.state_agg
+    }
+
+    pub const fn state_count(self) -> u64 {
+        self.state_count
+    }
+
+    pub const fn state_fails(self) -> u64 {
+        self.state_fails
+    }
+
+    pub const fn interrupt_fails(self) -> u64 {
+        self.interrupt_fails
+    }
+
+    pub const fn rollback_count(self) -> u64 {
+        self.rollback_count
+    }
+
+    pub const fn rollback_fails(self) -> u64 {
+        self.rollback_fails
+    }
+
+    pub const fn owner_cleanup_count(self) -> u64 {
+        self.owner_cleanup_count
+    }
+
+    pub const fn owner_cleanup_fails(self) -> u64 {
+        self.owner_cleanup_fails
+    }
+
+    pub const fn teardown_count(self) -> u64 {
+        self.teardown_count
+    }
+
+    pub const fn teardown_fails(self) -> u64 {
+        self.teardown_fails
+    }
+
+    const fn delta_since(self, previous: Self) -> Self {
+        Self {
+            activate_fails: incremental_delta(self.activate_fails, previous.activate_fails),
+            queue_event_fails: incremental_delta(
+                self.queue_event_fails,
+                previous.queue_event_fails,
+            ),
+            queue_event_count: incremental_delta(
+                self.queue_event_count,
+                previous.queue_event_count,
+            ),
+            plug_agg: self.plug_agg.delta_since(previous.plug_agg),
+            plug_count: incremental_delta(self.plug_count, previous.plug_count),
+            plug_bytes: incremental_delta(self.plug_bytes, previous.plug_bytes),
+            plug_fails: incremental_delta(self.plug_fails, previous.plug_fails),
+            unplug_agg: self.unplug_agg.delta_since(previous.unplug_agg),
+            unplug_count: incremental_delta(self.unplug_count, previous.unplug_count),
+            unplug_bytes: incremental_delta(self.unplug_bytes, previous.unplug_bytes),
+            unplug_fails: incremental_delta(self.unplug_fails, previous.unplug_fails),
+            unplug_discard_fails: incremental_delta(
+                self.unplug_discard_fails,
+                previous.unplug_discard_fails,
+            ),
+            unplug_all_agg: self.unplug_all_agg.delta_since(previous.unplug_all_agg),
+            unplug_all_count: incremental_delta(self.unplug_all_count, previous.unplug_all_count),
+            unplug_all_fails: incremental_delta(self.unplug_all_fails, previous.unplug_all_fails),
+            state_agg: self.state_agg.delta_since(previous.state_agg),
+            state_count: incremental_delta(self.state_count, previous.state_count),
+            state_fails: incremental_delta(self.state_fails, previous.state_fails),
+            interrupt_fails: incremental_delta(self.interrupt_fails, previous.interrupt_fails),
+            rollback_count: incremental_delta(self.rollback_count, previous.rollback_count),
+            rollback_fails: incremental_delta(self.rollback_fails, previous.rollback_fails),
+            owner_cleanup_count: incremental_delta(
+                self.owner_cleanup_count,
+                previous.owner_cleanup_count,
+            ),
+            owner_cleanup_fails: incremental_delta(
+                self.owner_cleanup_fails,
+                previous.owner_cleanup_fails,
+            ),
+            teardown_count: incremental_delta(self.teardown_count, previous.teardown_count),
+            teardown_fails: incremental_delta(self.teardown_fails, previous.teardown_fails),
+        }
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            activate_fails: self.activate_fails.saturating_add(other.activate_fails),
+            queue_event_fails: self
+                .queue_event_fails
+                .saturating_add(other.queue_event_fails),
+            queue_event_count: self
+                .queue_event_count
+                .saturating_add(other.queue_event_count),
+            plug_agg: self.plug_agg.merged_with(other.plug_agg),
+            plug_count: self.plug_count.saturating_add(other.plug_count),
+            plug_bytes: self.plug_bytes.saturating_add(other.plug_bytes),
+            plug_fails: self.plug_fails.saturating_add(other.plug_fails),
+            unplug_agg: self.unplug_agg.merged_with(other.unplug_agg),
+            unplug_count: self.unplug_count.saturating_add(other.unplug_count),
+            unplug_bytes: self.unplug_bytes.saturating_add(other.unplug_bytes),
+            unplug_fails: self.unplug_fails.saturating_add(other.unplug_fails),
+            unplug_discard_fails: self
+                .unplug_discard_fails
+                .saturating_add(other.unplug_discard_fails),
+            unplug_all_agg: self.unplug_all_agg.merged_with(other.unplug_all_agg),
+            unplug_all_count: self.unplug_all_count.saturating_add(other.unplug_all_count),
+            unplug_all_fails: self.unplug_all_fails.saturating_add(other.unplug_all_fails),
+            state_agg: self.state_agg.merged_with(other.state_agg),
+            state_count: self.state_count.saturating_add(other.state_count),
+            state_fails: self.state_fails.saturating_add(other.state_fails),
+            interrupt_fails: self.interrupt_fails.saturating_add(other.interrupt_fails),
+            rollback_count: self.rollback_count.saturating_add(other.rollback_count),
+            rollback_fails: self.rollback_fails.saturating_add(other.rollback_fails),
+            owner_cleanup_count: self
+                .owner_cleanup_count
+                .saturating_add(other.owner_cleanup_count),
+            owner_cleanup_fails: self
+                .owner_cleanup_fails
+                .saturating_add(other.owner_cleanup_fails),
+            teardown_count: self.teardown_count.saturating_add(other.teardown_count),
+            teardown_fails: self.teardown_fails.saturating_add(other.teardown_fails),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryHotplugMetricOperation {
+    Plug,
+    Unplug,
+    UnplugAll,
+    State,
+}
+
+/// Shared producer installed with one virtio-mem device before activation.
+#[derive(Debug, Clone, Default)]
+pub struct SharedMemoryHotplugDeviceMetrics {
+    inner: Arc<SharedMemoryHotplugDeviceMetricsInner>,
+}
+
+impl SharedMemoryHotplugDeviceMetrics {
+    pub fn record_activation_failure(&self) {
+        record_atomic_metric(&self.inner.activate_fails, 1);
+    }
+
+    pub fn record_queue_events(&self, count: usize) {
+        let count = usize_to_u64_saturating(count);
+        if count != 0 {
+            record_atomic_metric(&self.inner.queue_event_count, count);
+        }
+    }
+
+    pub fn record_queue_event_failure(&self) {
+        record_atomic_metric(&self.inner.queue_event_fails, 1);
+    }
+
+    pub fn record_operation(
+        &self,
+        operation: MemoryHotplugMetricOperation,
+        succeeded: bool,
+        committed_bytes: u64,
+        latency_us: u64,
+    ) {
+        let (latency, count, bytes, failures) = match operation {
+            MemoryHotplugMetricOperation::Plug => (
+                &self.inner.plug_agg,
+                &self.inner.plug_count,
+                Some(&self.inner.plug_bytes),
+                &self.inner.plug_fails,
+            ),
+            MemoryHotplugMetricOperation::Unplug => (
+                &self.inner.unplug_agg,
+                &self.inner.unplug_count,
+                Some(&self.inner.unplug_bytes),
+                &self.inner.unplug_fails,
+            ),
+            MemoryHotplugMetricOperation::UnplugAll => (
+                &self.inner.unplug_all_agg,
+                &self.inner.unplug_all_count,
+                None,
+                &self.inner.unplug_all_fails,
+            ),
+            MemoryHotplugMetricOperation::State => (
+                &self.inner.state_agg,
+                &self.inner.state_count,
+                None,
+                &self.inner.state_fails,
+            ),
+        };
+        record_atomic_metric(count, 1);
+        latency.record_sample(latency_us);
+        if succeeded {
+            if committed_bytes != 0
+                && let Some(bytes) = bytes
+            {
+                record_atomic_metric(bytes, committed_bytes);
+            }
+        } else {
+            record_atomic_metric(failures, 1);
+        }
+    }
+
+    pub fn record_unplug_discard_failures(&self, failures: u64) {
+        if failures != 0 {
+            record_atomic_metric(&self.inner.unplug_discard_fails, failures);
+        }
+    }
+
+    pub fn record_interrupt_failure(&self) {
+        record_atomic_metric(&self.inner.interrupt_fails, 1);
+    }
+
+    pub fn record_rollbacks(&self, attempts: u64, failures: u64) {
+        if attempts != 0 {
+            record_atomic_metric(&self.inner.rollback_count, attempts);
+        }
+        if failures != 0 {
+            record_atomic_metric(&self.inner.rollback_fails, failures);
+        }
+    }
+
+    pub fn record_owner_cleanup(&self, attempts: u64, failures: u64) {
+        if attempts != 0 {
+            record_atomic_metric(&self.inner.owner_cleanup_count, attempts);
+        }
+        if failures != 0 {
+            record_atomic_metric(&self.inner.owner_cleanup_fails, failures);
+        }
+    }
+
+    pub fn record_teardown(&self, succeeded: bool) {
+        record_atomic_metric(&self.inner.teardown_count, 1);
+        if !succeeded {
+            record_atomic_metric(&self.inner.teardown_fails, 1);
+        }
+    }
+
+    pub fn snapshot(&self) -> MemoryHotplugDeviceMetrics {
+        MemoryHotplugDeviceMetrics {
+            activate_fails: self.inner.activate_fails.load(Ordering::Relaxed),
+            queue_event_fails: self.inner.queue_event_fails.load(Ordering::Relaxed),
+            queue_event_count: self.inner.queue_event_count.load(Ordering::Relaxed),
+            plug_agg: self.inner.plug_agg.snapshot(),
+            plug_count: self.inner.plug_count.load(Ordering::Relaxed),
+            plug_bytes: self.inner.plug_bytes.load(Ordering::Relaxed),
+            plug_fails: self.inner.plug_fails.load(Ordering::Relaxed),
+            unplug_agg: self.inner.unplug_agg.snapshot(),
+            unplug_count: self.inner.unplug_count.load(Ordering::Relaxed),
+            unplug_bytes: self.inner.unplug_bytes.load(Ordering::Relaxed),
+            unplug_fails: self.inner.unplug_fails.load(Ordering::Relaxed),
+            unplug_discard_fails: self.inner.unplug_discard_fails.load(Ordering::Relaxed),
+            unplug_all_agg: self.inner.unplug_all_agg.snapshot(),
+            unplug_all_count: self.inner.unplug_all_count.load(Ordering::Relaxed),
+            unplug_all_fails: self.inner.unplug_all_fails.load(Ordering::Relaxed),
+            state_agg: self.inner.state_agg.snapshot(),
+            state_count: self.inner.state_count.load(Ordering::Relaxed),
+            state_fails: self.inner.state_fails.load(Ordering::Relaxed),
+            interrupt_fails: self.inner.interrupt_fails.load(Ordering::Relaxed),
+            rollback_count: self.inner.rollback_count.load(Ordering::Relaxed),
+            rollback_fails: self.inner.rollback_fails.load(Ordering::Relaxed),
+            owner_cleanup_count: self.inner.owner_cleanup_count.load(Ordering::Relaxed),
+            owner_cleanup_fails: self.inner.owner_cleanup_fails.load(Ordering::Relaxed),
+            teardown_count: self.inner.teardown_count.load(Ordering::Relaxed),
+            teardown_fails: self.inner.teardown_fails.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedMemoryHotplugLatencyMetricsInner {
+    state: Mutex<MemoryHotplugLatencyMetrics>,
+}
+
+impl SharedMemoryHotplugLatencyMetricsInner {
+    fn record_sample(&self, latency_us: u64) {
+        let mut state = lock_memory_hotplug_latency_metrics(&self.state);
+        if state.sample_count == 0 || latency_us < state.min_us {
+            state.min_us = latency_us;
+        }
+        if state.sample_count == 0 || latency_us > state.max_us {
+            state.max_us = latency_us;
+        }
+        state.sum_us = state.sum_us.saturating_add(latency_us);
+        state.sample_count = state.sample_count.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> MemoryHotplugLatencyMetrics {
+        *lock_memory_hotplug_latency_metrics(&self.state)
+    }
+}
+
+fn lock_memory_hotplug_latency_metrics(
+    state: &Mutex<MemoryHotplugLatencyMetrics>,
+) -> MutexGuard<'_, MemoryHotplugLatencyMetrics> {
+    match state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedMemoryHotplugDeviceMetricsInner {
+    activate_fails: AtomicU64,
+    queue_event_fails: AtomicU64,
+    queue_event_count: AtomicU64,
+    plug_agg: SharedMemoryHotplugLatencyMetricsInner,
+    plug_count: AtomicU64,
+    plug_bytes: AtomicU64,
+    plug_fails: AtomicU64,
+    unplug_agg: SharedMemoryHotplugLatencyMetricsInner,
+    unplug_count: AtomicU64,
+    unplug_bytes: AtomicU64,
+    unplug_fails: AtomicU64,
+    unplug_discard_fails: AtomicU64,
+    unplug_all_agg: SharedMemoryHotplugLatencyMetricsInner,
+    unplug_all_count: AtomicU64,
+    unplug_all_fails: AtomicU64,
+    state_agg: SharedMemoryHotplugLatencyMetricsInner,
+    state_count: AtomicU64,
+    state_fails: AtomicU64,
+    interrupt_fails: AtomicU64,
+    rollback_count: AtomicU64,
+    rollback_fails: AtomicU64,
+    owner_cleanup_count: AtomicU64,
+    owner_cleanup_fails: AtomicU64,
+    teardown_count: AtomicU64,
+    teardown_fails: AtomicU64,
+}
+
 fn record_balloon_discard_metrics(
     attempts: &AtomicU64,
     advised_bytes: &AtomicU64,
@@ -5586,6 +6103,7 @@ pub struct MetricsDiagnostics {
     entropy_device_metrics: Option<EntropyDeviceMetrics>,
     rtc_device_metrics: Option<RtcDeviceMetrics>,
     balloon_device_metrics: Option<BalloonDeviceMetrics>,
+    memory_hotplug_device_metrics: Option<MemoryHotplugDeviceMetrics>,
     boot_run_loop_status: Option<BootRunLoopMetricStatus>,
     start_time_us: Option<u64>,
     start_time_cpu_us: Option<u64>,
@@ -5608,6 +6126,7 @@ impl MetricsDiagnostics {
             entropy_device_metrics: None,
             rtc_device_metrics: None,
             balloon_device_metrics: None,
+            memory_hotplug_device_metrics: None,
             boot_run_loop_status: None,
             start_time_us: None,
             start_time_cpu_us: None,
@@ -5690,6 +6209,14 @@ impl MetricsDiagnostics {
         self
     }
 
+    pub fn with_memory_hotplug_device_metrics(
+        mut self,
+        memory_hotplug_device_metrics: MemoryHotplugDeviceMetrics,
+    ) -> Self {
+        self.memory_hotplug_device_metrics = Some(memory_hotplug_device_metrics);
+        self
+    }
+
     pub fn with_boot_run_loop_status(mut self, status: BootRunLoopMetricStatus) -> Self {
         self.boot_run_loop_status = Some(status);
         self
@@ -5760,6 +6287,9 @@ impl MetricsDiagnostics {
             }),
             balloon_device_metrics: self.balloon_device_metrics.map(|current| {
                 current.delta_since(previous.balloon_device_metrics.unwrap_or_default())
+            }),
+            memory_hotplug_device_metrics: self.memory_hotplug_device_metrics.map(|current| {
+                current.delta_since(previous.memory_hotplug_device_metrics.unwrap_or_default())
             }),
             boot_run_loop_status: self.boot_run_loop_status,
             start_time_us: self.start_time_us,
@@ -5842,6 +6372,12 @@ impl MetricsDiagnostics {
                 None => metrics,
             });
         }
+        if let Some(metrics) = other.memory_hotplug_device_metrics {
+            self.memory_hotplug_device_metrics = Some(match self.memory_hotplug_device_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
         if other.boot_run_loop_status.is_some() {
             self.boot_run_loop_status = other.boot_run_loop_status;
         }
@@ -5911,6 +6447,10 @@ impl MetricsDiagnostics {
 
     pub fn balloon_device_metrics(&self) -> Option<BalloonDeviceMetrics> {
         self.balloon_device_metrics
+    }
+
+    pub fn memory_hotplug_device_metrics(&self) -> Option<MemoryHotplugDeviceMetrics> {
+        self.memory_hotplug_device_metrics
     }
 
     pub fn boot_run_loop_status(&self) -> Option<BootRunLoopMetricStatus> {
@@ -6460,6 +7000,25 @@ fn latency_aggregate_metrics_json_object(
     aggregate
 }
 
+fn memory_hotplug_latency_metrics_json_object(
+    metrics: MemoryHotplugLatencyMetrics,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut aggregate = serde_json::Map::new();
+    aggregate.insert(
+        "min_us".to_string(),
+        serde_json::Value::Number(metrics.min_us().into()),
+    );
+    aggregate.insert(
+        "max_us".to_string(),
+        serde_json::Value::Number(metrics.max_us().into()),
+    );
+    aggregate.insert(
+        "sum_us".to_string(),
+        serde_json::Value::Number(metrics.sum_us().into()),
+    );
+    aggregate
+}
+
 impl MetricsSink {
     fn open(config: &MetricsConfig) -> Result<Self, MetricsConfigError> {
         let file = OpenOptions::new()
@@ -6635,6 +7194,123 @@ impl MetricsSink {
             root.insert(
                 "rtc".to_string(),
                 serde_json::Value::Object(rtc_device_metrics_json_object(rtc_device_metrics)),
+            );
+        }
+        if let Some(metrics) = diagnostics.memory_hotplug_device_metrics()
+            && !metrics.is_empty()
+        {
+            let mut memory_hotplug = serde_json::Map::new();
+            memory_hotplug.insert(
+                "activate_fails".to_string(),
+                serde_json::Value::Number(metrics.activate_fails().into()),
+            );
+            memory_hotplug.insert(
+                "queue_event_fails".to_string(),
+                serde_json::Value::Number(metrics.queue_event_fails().into()),
+            );
+            memory_hotplug.insert(
+                "queue_event_count".to_string(),
+                serde_json::Value::Number(metrics.queue_event_count().into()),
+            );
+            memory_hotplug.insert(
+                "plug_agg".to_string(),
+                serde_json::Value::Object(memory_hotplug_latency_metrics_json_object(
+                    metrics.plug_agg(),
+                )),
+            );
+            memory_hotplug.insert(
+                "plug_count".to_string(),
+                serde_json::Value::Number(metrics.plug_count().into()),
+            );
+            memory_hotplug.insert(
+                "plug_bytes".to_string(),
+                serde_json::Value::Number(metrics.plug_bytes().into()),
+            );
+            memory_hotplug.insert(
+                "plug_fails".to_string(),
+                serde_json::Value::Number(metrics.plug_fails().into()),
+            );
+            memory_hotplug.insert(
+                "unplug_agg".to_string(),
+                serde_json::Value::Object(memory_hotplug_latency_metrics_json_object(
+                    metrics.unplug_agg(),
+                )),
+            );
+            memory_hotplug.insert(
+                "unplug_count".to_string(),
+                serde_json::Value::Number(metrics.unplug_count().into()),
+            );
+            memory_hotplug.insert(
+                "unplug_bytes".to_string(),
+                serde_json::Value::Number(metrics.unplug_bytes().into()),
+            );
+            memory_hotplug.insert(
+                "unplug_fails".to_string(),
+                serde_json::Value::Number(metrics.unplug_fails().into()),
+            );
+            memory_hotplug.insert(
+                "unplug_discard_fails".to_string(),
+                serde_json::Value::Number(metrics.unplug_discard_fails().into()),
+            );
+            memory_hotplug.insert(
+                "unplug_all_agg".to_string(),
+                serde_json::Value::Object(memory_hotplug_latency_metrics_json_object(
+                    metrics.unplug_all_agg(),
+                )),
+            );
+            memory_hotplug.insert(
+                "unplug_all_count".to_string(),
+                serde_json::Value::Number(metrics.unplug_all_count().into()),
+            );
+            memory_hotplug.insert(
+                "unplug_all_fails".to_string(),
+                serde_json::Value::Number(metrics.unplug_all_fails().into()),
+            );
+            memory_hotplug.insert(
+                "state_agg".to_string(),
+                serde_json::Value::Object(memory_hotplug_latency_metrics_json_object(
+                    metrics.state_agg(),
+                )),
+            );
+            memory_hotplug.insert(
+                "state_count".to_string(),
+                serde_json::Value::Number(metrics.state_count().into()),
+            );
+            memory_hotplug.insert(
+                "state_fails".to_string(),
+                serde_json::Value::Number(metrics.state_fails().into()),
+            );
+            memory_hotplug.insert(
+                "interrupt_fails".to_string(),
+                serde_json::Value::Number(metrics.interrupt_fails().into()),
+            );
+            memory_hotplug.insert(
+                "rollback_count".to_string(),
+                serde_json::Value::Number(metrics.rollback_count().into()),
+            );
+            memory_hotplug.insert(
+                "rollback_fails".to_string(),
+                serde_json::Value::Number(metrics.rollback_fails().into()),
+            );
+            memory_hotplug.insert(
+                "owner_cleanup_count".to_string(),
+                serde_json::Value::Number(metrics.owner_cleanup_count().into()),
+            );
+            memory_hotplug.insert(
+                "owner_cleanup_fails".to_string(),
+                serde_json::Value::Number(metrics.owner_cleanup_fails().into()),
+            );
+            memory_hotplug.insert(
+                "teardown_count".to_string(),
+                serde_json::Value::Number(metrics.teardown_count().into()),
+            );
+            memory_hotplug.insert(
+                "teardown_fails".to_string(),
+                serde_json::Value::Number(metrics.teardown_fails().into()),
+            );
+            root.insert(
+                "memory_hotplug".to_string(),
+                serde_json::Value::Object(memory_hotplug),
             );
         }
         if let Some(balloon_device_metrics) = diagnostics.balloon_device_metrics()
@@ -7035,17 +7711,20 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         BalloonDeviceMetrics, BalloonDiscardMetrics, BalloonFreePageReportMetrics,
         BlockDeviceMetrics, BlockDeviceMetricsByDrive, BlockDeviceMetricsRegistryError,
-        BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
-        MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState, MmdsMetrics,
-        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface,
-        NetworkInterfaceMetricsRegistryError, PmemDeviceMetrics, PmemDeviceMetricsByDevice,
-        PmemDeviceMetricsRegistryError, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        BootRunLoopMetricStatus, EntropyDeviceMetrics, MemoryHotplugMetricOperation,
+        MetricsConfigError, MetricsConfigInput, MetricsDiagnostics, MetricsFlushError,
+        MetricsOutput, MetricsState, MmdsMetrics, NetworkInterfaceMetrics,
+        NetworkInterfaceMetricsByInterface, NetworkInterfaceMetricsRegistryError,
+        PmemDeviceMetrics, PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError,
+        RtcDeviceMetrics, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedMemoryHotplugDeviceMetrics, SharedMemoryHotplugLatencyMetricsInner,
         SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
         SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
         SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
@@ -9179,6 +9858,163 @@ mod tests {
             BalloonDeviceMetrics::new(1, 0, 0, 1, 0, 1)
         );
         assert_eq!(second.snapshot(), BalloonDeviceMetrics::default());
+    }
+
+    #[test]
+    fn writes_firecracker_shaped_memory_hotplug_metrics_with_lifecycle_extensions() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
+
+        metrics.record_activation_failure();
+        metrics.record_queue_events(2);
+        metrics.record_queue_event_failure();
+        metrics.record_operation(MemoryHotplugMetricOperation::Plug, true, 2 * 1024 * 1024, 7);
+        metrics.record_operation(MemoryHotplugMetricOperation::Plug, false, 0, 9);
+        metrics.record_operation(
+            MemoryHotplugMetricOperation::Unplug,
+            true,
+            2 * 1024 * 1024,
+            11,
+        );
+        metrics.record_operation(MemoryHotplugMetricOperation::UnplugAll, false, 0, 13);
+        metrics.record_operation(MemoryHotplugMetricOperation::State, true, 0, 17);
+        metrics.record_unplug_discard_failures(2);
+        metrics.record_interrupt_failure();
+        metrics.record_rollbacks(3, 1);
+        metrics.record_owner_cleanup(2, 1);
+        metrics.record_teardown(true);
+        metrics.record_teardown(false);
+
+        let diagnostics =
+            MetricsDiagnostics::new().with_memory_hotplug_device_metrics(metrics.snapshot());
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        let value: serde_json::Value =
+            serde_json::from_str(&output.lines()[0]).expect("metrics line should be valid JSON");
+        assert_eq!(
+            value["memory_hotplug"],
+            serde_json::json!({
+                "activate_fails": 1,
+                "queue_event_fails": 1,
+                "queue_event_count": 2,
+                "plug_agg": {"min_us": 7, "max_us": 9, "sum_us": 16},
+                "plug_count": 2,
+                "plug_bytes": 2 * 1024 * 1024,
+                "plug_fails": 1,
+                "unplug_agg": {"min_us": 11, "max_us": 11, "sum_us": 11},
+                "unplug_count": 1,
+                "unplug_bytes": 2 * 1024 * 1024,
+                "unplug_fails": 0,
+                "unplug_discard_fails": 2,
+                "unplug_all_agg": {"min_us": 13, "max_us": 13, "sum_us": 13},
+                "unplug_all_count": 1,
+                "unplug_all_fails": 1,
+                "state_agg": {"min_us": 17, "max_us": 17, "sum_us": 17},
+                "state_count": 1,
+                "state_fails": 0,
+                "interrupt_fails": 1,
+                "rollback_count": 3,
+                "rollback_fails": 1,
+                "owner_cleanup_count": 2,
+                "owner_cleanup_fails": 1,
+                "teardown_count": 2,
+                "teardown_fails": 1,
+            })
+        );
+    }
+
+    #[test]
+    fn memory_hotplug_metric_deltas_do_not_reemit_latency_sums() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
+
+        metrics.record_operation(MemoryHotplugMetricOperation::Plug, true, 2 * 1024 * 1024, 7);
+        let first =
+            MetricsDiagnostics::new().with_memory_hotplug_device_metrics(metrics.snapshot());
+        assert_eq!(state.flush_with_diagnostics(&first), Ok(true));
+
+        metrics.record_operation(MemoryHotplugMetricOperation::Plug, false, 0, 11);
+        let second =
+            MetricsDiagnostics::new().with_memory_hotplug_device_metrics(metrics.snapshot());
+        assert_eq!(state.flush_with_diagnostics(&second), Ok(true));
+        assert_eq!(state.flush_with_diagnostics(&second), Ok(true));
+
+        let lines = output.lines();
+        let first: serde_json::Value =
+            serde_json::from_str(&lines[0]).expect("first metrics line should be valid JSON");
+        let second: serde_json::Value =
+            serde_json::from_str(&lines[1]).expect("second metrics line should be valid JSON");
+        let unchanged: serde_json::Value =
+            serde_json::from_str(&lines[2]).expect("third metrics line should be valid JSON");
+        assert_eq!(first["memory_hotplug"]["plug_count"], 1);
+        assert_eq!(first["memory_hotplug"]["plug_agg"]["sum_us"], 7);
+        assert_eq!(second["memory_hotplug"]["plug_count"], 1);
+        assert_eq!(second["memory_hotplug"]["plug_fails"], 1);
+        assert_eq!(second["memory_hotplug"]["plug_agg"]["min_us"], 7);
+        assert_eq!(second["memory_hotplug"]["plug_agg"]["max_us"], 11);
+        assert_eq!(second["memory_hotplug"]["plug_agg"]["sum_us"], 11);
+        assert!(unchanged.get("memory_hotplug").is_none());
+    }
+
+    #[test]
+    fn shared_memory_hotplug_metrics_are_per_instance() {
+        let first = SharedMemoryHotplugDeviceMetrics::default();
+        let second = SharedMemoryHotplugDeviceMetrics::default();
+
+        first.record_queue_events(1);
+        first.record_operation(MemoryHotplugMetricOperation::State, false, 0, 5);
+
+        assert_eq!(first.snapshot().queue_event_count(), 1);
+        assert_eq!(first.snapshot().state_count(), 1);
+        assert_eq!(first.snapshot().state_fails(), 1);
+        assert!(second.snapshot().is_empty());
+    }
+
+    #[test]
+    fn concurrent_memory_hotplug_latency_snapshots_are_coherent() {
+        const LATENCY_US: u64 = 7;
+        const SAMPLE_COUNT_PER_WORKER: usize = 10_000;
+        const WORKER_COUNT: usize = 4;
+
+        let latency = Arc::new(SharedMemoryHotplugLatencyMetricsInner::default());
+        let workers = (0..WORKER_COUNT)
+            .map(|_| {
+                let latency = Arc::clone(&latency);
+                thread::spawn(move || {
+                    for _ in 0..SAMPLE_COUNT_PER_WORKER {
+                        latency.record_sample(LATENCY_US);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for _ in 0..SAMPLE_COUNT_PER_WORKER {
+            let snapshot = latency.snapshot();
+            assert_eq!(
+                snapshot.sum_us(),
+                snapshot.sample_count().saturating_mul(LATENCY_US)
+            );
+            if !snapshot.is_empty() {
+                assert_eq!(snapshot.min_us(), LATENCY_US);
+                assert_eq!(snapshot.max_us(), LATENCY_US);
+            }
+        }
+        for worker in workers {
+            worker.join().expect("latency writer should not panic");
+        }
+
+        let snapshot = latency.snapshot();
+        assert_eq!(
+            snapshot.sample_count(),
+            u64::try_from(WORKER_COUNT * SAMPLE_COUNT_PER_WORKER)
+                .expect("test sample count should fit u64")
+        );
+        assert_eq!(
+            snapshot.sum_us(),
+            snapshot.sample_count().saturating_mul(LATENCY_US)
+        );
     }
 
     #[test]
