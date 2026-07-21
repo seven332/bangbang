@@ -191,11 +191,45 @@
     {
       "id": "api-operation:PATCH /drives/{drive_id}",
       "family": "api-contract",
-      "summary": "Apply failure-atomic live file-backing and incremental limiter updates to Sync or Async drives over MMIO or PCI. A path change opens or adopts the candidate first, quiesces the old Async generation before replacement, and commits public configuration only after the new generation is live; a limiter-only update preserves the current backing and engine. Direct or contained vhost-user block retains its separate ID-only CONFIG refresh. Continue auditing every remaining broad PATCH outcome before promotion.",
+      "summary": "Apply a strict matching-ID PartialDrive update after startup. File-backed Sync or Async drives accept an optional path replacement and incremental limiter update; the candidate backing and Async generation are prepared and quiesced failure-atomically before public configuration commits. Vhost-user drives accept only an ID-only CONFIG refresh on the existing stream. Empty, mismatched, unsupported, failed, and terminal updates are redacted and nonmutating.",
       "source_refs": [
         "api-operation:PATCH /drives/{drive_id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "parse_drive_patch_request and DrivePatchRequest"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::update_block_device"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveConfigs live update preparation and commit"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict drive PATCH shape and matching-ID tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_aggregate_storage_semantics_over_product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /hotplug/memory",
@@ -280,11 +314,45 @@
     {
       "id": "api-operation:PATCH /pmem/{id}",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /pmem/{id}.",
+      "summary": "Apply a strict matching-ID PartialPmem limiter update to one live MMIO or PCI pmem device in Running or Paused state. Missing buckets preserve current state, explicitly disabled buckets clear it, and owner-thread retry scheduling plus metrics change only after live update succeeds. Unknown, mismatched, empty, malformed, unavailable, and terminal updates leave configuration unchanged.",
       "source_refs": [
         "api-operation:PATCH /pmem/{id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "parse_pmem_patch_request and PmemPatchRequest"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::update_pmem"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemConfigs::prepare_update and PmemUpdate"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict pmem PATCH and rate-limiter parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_aggregate_storage_semantics_over_product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /vm",
@@ -1006,11 +1074,45 @@
     {
       "id": "api-path:/drives/{drive_id}",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /drives/{drive_id}.",
+      "summary": "Provide the complete applicable /drives/{drive_id} path: strict PUT configuration or PCI runtime attach/replacement, post-start PATCH, and bodyless PCI DELETE. The path enforces matching IDs and the file-versus-vhost field matrix, one cross-storage root, transactional authority/owner publication, exact configuration readback, redacted failures, and stable rejection of root or default-MMIO runtime mutation.",
       "source_refs": [
         "api-path:/drives/{drive_id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PUT, PATCH, and bodyless DELETE /drives/{drive_id} routing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm drive configure, replace, update, insert, and remove transactions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveConfig, DriveUpdate, and live device ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict drive PUT, PATCH, and DELETE parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate storage lifecycle over product PCI"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed aggregate contained storage lifecycle"
+        }
+      ]
     },
     {
       "id": "api-path:/entropy",
@@ -1131,7 +1233,7 @@
     {
       "id": "api-path:/pmem/{id}",
       "family": "api-contract",
-      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration including deterministic root boot, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs, strict fields, and the one-block-or-pmem-root invariant before authority use; preserves the public projection until live commits succeed; maps the retained file/private-tail range directly into HVF; synchronizes exactly the file prefix; redacts backing, descriptor, grant, and address details; and retains default-MMIO and runtime-root mutation as stable nonmutating rejections. Dirty tracking, snapshot state, and broad pmem certification remain separately audited.",
+      "summary": "Provide the complete currently applicable /pmem/{id} control-plane path: strict pre-boot configuration including deterministic root boot, PCI-only Running/Paused non-root PUT and bodyless DELETE transactions, and post-boot limiter PATCH. The path validates matching IDs, strict fields, and the one-block-or-pmem-root invariant before authority use; preserves the public projection until live commits succeed; preflights owner capacity before grant/open/map work; maps the retained file/private-tail range directly into HVF; synchronizes exactly the file prefix; redacts backing, descriptor, grant, and address details; and retains default-MMIO and runtime-root mutation as stable nonmutating rejections. Aggregate signed storage certification is complete; optional-device pmem serialization and restore remain with the two Wave 6 composites.",
       "source_refs": [
         "api-path:/pmem/{id}"
       ],
@@ -2120,20 +2222,68 @@
     {
       "id": "api-property:Drive.cache_type",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Drive.cache_type.",
+      "summary": "Accept only Unsafe or Writeback and default omission to Unsafe for file-backed and vhost-user drives. Unsafe omits the virtio FLUSH feature; Writeback advertises FLUSH and file-backed completion synchronizes the authoritative backing, while vhost-user forwards the negotiated cache policy to its backend. The selected value survives configuration readback, replacement, hotplug, and reuse.",
       "source_refs": [
         "api-property:Drive.cache_type"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveCacheType, VirtioBlockConfigSpace, and FLUSH dispatch"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate Writeback persistence and replacement evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate Writeback persistence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "Unsafe and Writeback feature, queue, and persistence tests"
+        }
+      ]
     },
     {
       "id": "api-property:Drive.drive_id",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Drive.drive_id.",
+      "summary": "Require one valid nonempty body identifier equal to the path identifier, reject same-family duplicates, preserve stable order and exact readback, and bind every update, metrics generation, grant/child lease, endpoint owner, teardown, and reuse transaction to that identity. Block and pmem identities remain type-scoped; virtio GET_ID is separately derived from the opened file backing rather than this API identifier.",
       "source_refs": [
         "api-property:Drive.drive_id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveConfigInput identity validation and DriveConfigs ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "drive path/body identity and malformed-ID tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate backing-derived identity and runtime reuse evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate exact grant and identity evidence"
+        }
+      ]
     },
     {
       "id": "api-property:Drive.io_engine",
@@ -2201,56 +2351,225 @@
     {
       "id": "api-property:Drive.is_read_only",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Drive.is_read_only.",
+      "summary": "Require and exactly report read-only state for file-backed drives, require it to be absent for vhost-user drives, open or adopt the backing with matching access, and expose VIRTIO_BLK_F_RO so guest writes fail without mutating a read-only image. Root and non-root devices retain the value across MMIO/PCI startup and runtime owner transitions.",
       "source_refs": [
         "api-property:Drive.is_read_only"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveConfig field matrix, backing access, and VIRTIO_BLK_F_RO"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate read-only Sync root evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate read-only granted root evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "read-only configuration, backing, feature, and queue tests"
+        }
+      ]
     },
     {
       "id": "api-property:Drive.is_root_device",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Drive.is_root_device.",
+      "summary": "Require the Boolean field, allow exactly one root across ordinary block and pmem before startup, preserve replacement order, and derive the guest root command line from block order or optional PARTUUID. Runtime insertion, replacement, and removal of a root remain stable nonmutating rejections; signed aggregate guests boot the selected read-only Sync root while other storage classes coexist.",
       "source_refs": [
         "api-property:Drive.is_root_device"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "cross-family block and pmem root admission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "append_root_device_command_line"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "root_device_conflicts_across_block_and_pmem_are_atomic"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate Sync root and mixed-storage boot evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate root grant and boot evidence"
+        }
+      ]
     },
     {
       "id": "api-property:Drive.partuuid",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Drive.partuuid.",
+      "summary": "Accept an optional partition UUID for file-backed or vhost-user drives, preserve it in exact configuration projection, and when the drive is root select the Firecracker-shaped PARTUUID boot argument instead of positional block naming. It is immutable under PartialDrive PATCH and remains bound to the endpoint across startup and runtime lifecycle operations.",
       "source_refs": [
         "api-property:Drive.partuuid"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveConfig partuuid validation and storage"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/startup.rs",
+          "anchor": "block PARTUUID root command-line selection"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed block root and aggregate configuration evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "partuuid configuration, replacement, and root tests"
+        }
+      ]
     },
     {
       "id": "api-property:Drive.path_on_host",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Drive.path_on_host.",
+      "summary": "Require a nonempty path for file-backed drives and mutual exclusion with socket, supporting regular files and exact validated macOS block-special devices. Direct mode opens the configured object; contained mode adopts only an exact typed grant and never reopens its tag. Live path replacement prepares the candidate before owner mutation, changes backing-derived GET_ID/capacity only on success, redacts failures, and leaves vhost-user paths absent.",
       "source_refs": [
         "api-property:Drive.path_on_host"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "direct and contained backing preparation and live replacement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveBackendConfig::File and block backing inspection"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "failure-atomic direct and contained drive replacement tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate Async backing replacement and persistence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate pathname-replacement identity evidence"
+        }
+      ]
     },
     {
       "id": "api-property:Drive.rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Drive.rate_limiter.",
+      "summary": "Accept optional bandwidth and operations token buckets for file-backed Sync or Async drives, reject the field for vhost-user drives, normalize disabled buckets, and exactly report effective configuration. Queue admission rolls back operations tokens when bandwidth throttles, schedules bounded owner retries without busy polling, and applies incremental PATCH updates without replacing the active backing or engine.",
       "source_refs": [
         "api-property:Drive.rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "block limiter retry scheduling for MMIO and PCI"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveRateLimiterConfig and VirtioBlockRateLimiter dispatch"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate disjoint Async limiter update evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate Async limiter evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "block limiter admission, rollback, update, and retry tests"
+        }
+      ]
     },
     {
       "id": "api-property:Drive.socket",
       "family": "api-contract",
-      "summary": "Direct configuration accepts and exactly reports a nonempty vhost-user block socket only under the pinned field matrix; contained configuration accepts only an exact grant/child reference backed by repeatable connect-only directory authority. InstanceStart accepts either ordering with virtio-mem, obtains a bounded redacted direct or brokered stream, and activates one queue over MMIO or PCI. Shared topology exports boot RAM plus one complete deterministic hotplug aperture in an immutable at-most-three-region arm64 table; only plugged views enter guest CPU/HVF/current accounting, while the trusted backend can access offline aperture bytes. Active devices support ID-only exact config refresh. An eligible already-shared all-PCI VM, including a dynamic-memory VM without an initial vhost device, supports preconnection-validated new-ID non-root direct or contained attach and caller-coordinated DELETE/reuse while preserving the VM-owned aperture; same-ID PUT remains duplicate rejection without broker I/O. Signed direct/contained evidence covers root/scratch I/O across grow/shrink, exact stable table geometry, guest-visible memory status, MMIO/PCI config refresh, backend death, Running/Paused attach/remove/reuse, negotiation rollback, duplicate/anonymous zero-connect rejection, unchanged entitlements, and no steady helper. Native-v1 snapshot state, Async interaction, backend policy, and the broad vhost/storage audit remain pending before terminal promotion.",
+      "summary": "Accept and exactly report one nonempty vhost-user socket only under the pinned socket-only field matrix. Direct mode connects to that Unix socket; contained mode resolves an exact grant/child through repeatable connect-only directory authority and a bounded authenticated broker with no ambient fallback or steady helper. MMIO/PCI startup and eligible PCI runtime attach use one queue and the VM-owned immutable boot-plus-full-virtio-mem aperture, support ID-only CONFIG refresh, and release only frontend clones on DELETE or backend death. Snapshot creation remains an explicit pre-artifact rejection, and backend caching, limits, jail, health, and availability remain operator-owned.",
       "source_refs": [
         "api-property:Drive.socket"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "direct and contained vhost-user startup, preflight, refresh, insertion, and removal"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "vhost-user MMIO/PCI activation and shared-memory aperture ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveBackendConfig::VhostUser and PreparedVhostUserBlockFrontend"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "zero-request owner preflight and broker rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate vhost I/O, CONFIG, aperture, grow/shrink, and death evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate child authority, I/O, aperture, and cleanup evidence"
+        }
+      ]
     },
     {
       "id": "api-property:EntropyDevice.rate_limiter",
@@ -2387,11 +2706,40 @@
     {
       "id": "api-property:FullVmConfiguration.drives",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.drives.",
+      "summary": "Return the complete ordered committed drive projection in GET /vm/config, including the backend-specific field matrix, defaults, limiter state, root/partuuid/cache/engine choices, direct paths or authorized contained tags, and runtime insert/update/delete outcomes. Failed preparation, owner mutation, broker negotiation, or teardown never appears in the array.",
       "source_refs": [
         "api-property:FullVmConfiguration.drives"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "drive_config_response_from_runtime"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "VmmController::vm_config committed drive projection"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "drive ordering and GET /vm/config serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate final drive projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate final drive projection"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.entropy",
@@ -2493,11 +2841,40 @@
     {
       "id": "api-property:FullVmConfiguration.pmem",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.pmem.",
+      "summary": "Return the complete ordered committed pmem projection in GET /vm/config, including ID, authorized direct path or contained tag, root/read-only values, limiter state, and runtime insert/update/delete results. Mapping, grant, capacity, publication, update, or teardown failures leave the array unchanged, while successful removal and deterministic reuse are reflected only after owner commit.",
       "source_refs": [
         "api-property:FullVmConfiguration.pmem"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "pmem_config_response_from_runtime"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "VmmController::vm_config committed pmem projection"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "pmem GET /vm/config and runtime mutation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate final pmem projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate final pmem projection"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.vsock",
@@ -3232,29 +3609,101 @@
     {
       "id": "api-property:PartialDrive.drive_id",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property PartialDrive.drive_id.",
+      "summary": "Require the PartialDrive body identifier to be valid and exactly equal to the path identifier before state or authority inspection. It selects one existing live drive; unknown, mismatched, empty, and malformed identities fail without opening a backing, contacting a vhost backend, changing limiter state, or mutating configuration.",
       "source_refs": [
         "api-property:PartialDrive.drive_id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveUpdateInput and DriveUpdate identity validation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PartialDrive matching, empty, malformed, and unknown-field tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate disjoint drive PATCH evidence"
+        }
+      ]
     },
     {
       "id": "api-property:PartialDrive.path_on_host",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property PartialDrive.path_on_host.",
+      "summary": "Treat an omitted PartialDrive path as no backing change and a nonempty supplied path as a failure-atomic live replacement for file-backed Sync or Async drives. The candidate is opened or adopted before owner mutation, Async work is generation-quiesced, capacity and backing-derived GET_ID refresh together, and configuration commits last. Vhost-user drives reject the field.",
       "source_refs": [
         "api-property:PartialDrive.path_on_host"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::update_block_device backing preparation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveUpdate path and live replacement transaction"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live drive replacement failure and contained grant rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate paused Async backing replacement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate exact-grant replacement"
+        }
+      ]
     },
     {
       "id": "api-property:PartialDrive.rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property PartialDrive.rate_limiter.",
+      "summary": "Treat an omitted PartialDrive limiter as unchanged and merge a supplied bandwidth/operations pair incrementally: omitted buckets retain current state and disabled buckets clear it. File-backed Sync and Async owners update live scheduling without changing their backing or engine; vhost-user drives reject limiter PATCH, and failed updates preserve both live and reported state.",
       "source_refs": [
         "api-property:PartialDrive.rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveRateLimiterConfig::applied_to and live update"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate concurrent Async limiter PATCH"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate concurrent Async limiter PATCH"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "incremental limiter preserve, clear, throttle, and retry tests"
+        }
+      ]
     },
     {
       "id": "api-property:PartialNetworkInterface.iface_id",
@@ -3286,29 +3735,96 @@
     {
       "id": "api-property:PartialPmem.id",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property PartialPmem.id.",
+      "summary": "Require the PartialPmem body identifier to be valid and exactly equal to the path identifier before live owner lookup. Unknown, mismatched, empty, malformed, and pre-start updates fail without changing the mapping, limiter, retry deadline, metrics generation, or public pmem projection.",
       "source_refs": [
         "api-property:PartialPmem.id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemUpdateInput and PmemUpdate identity validation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PartialPmem matching, malformed, and strict-field tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate concurrent pmem PATCH"
+        }
+      ]
     },
     {
       "id": "api-property:PartialPmem.rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property PartialPmem.rate_limiter.",
+      "summary": "Treat an omitted PartialPmem limiter as a no-op and merge supplied bandwidth and operations buckets incrementally into the live device. Missing buckets retain their current values, disabled buckets clear them, and owner retry scheduling plus configuration commit occur only after the live update succeeds in Running or Paused state.",
       "source_refs": [
         "api-property:PartialPmem.rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemRateLimiterConfig::applied_to and PmemConfig::updated"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate concurrent pmem limiter PATCH"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate concurrent pmem limiter PATCH"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "incremental pmem limiter preserve, clear, throttle, and retry tests"
+        }
+      ]
     },
     {
       "id": "api-property:Pmem.id",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Pmem.id.",
+      "summary": "Require one valid nonempty pmem identifier equal to the request path, reject same-family duplicates, preserve stable order and exact readback, and bind mapping, guest range, metrics generation, PCI function, grant owner, update, teardown, and deterministic reuse to it. Pmem identity is type-scoped from an ordinary drive with the same string.",
       "source_refs": [
         "api-property:Pmem.id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemConfig identity validation and PmemConfigs ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "type-scoped mixed runtime identity and reuse tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate pmem identity, removal, and range reuse evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate exact pmem grant identity evidence"
+        }
+      ]
     },
     {
       "id": "api-property:Pmem.path_on_host",
@@ -3356,11 +3872,40 @@
     {
       "id": "api-property:Pmem.rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Pmem.rate_limiter.",
+      "summary": "Accept and exactly report optional bandwidth and operations token buckets for startup or runtime pmem. Each flush charges the exact persistent file prefix, rolls operations back when bandwidth throttles, coalesces queue notifications, exposes retry/metrics state, and supports incremental live PATCH or disable without replacing the backing, mapping, guest range, or endpoint.",
       "source_refs": [
         "api-property:Pmem.rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "pmem limiter retry scheduling for MMIO and PCI"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemRateLimiterConfig and VirtioPmemDevice flush dispatch"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate pmem limiter and persistence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate pmem limiter and persistence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "exact-length pmem limiter, rollback, coalescing, update, and retry tests"
+        }
+      ]
     },
     {
       "id": "api-property:Pmem.read_only",
@@ -4267,11 +4812,40 @@
     {
       "id": "api-schema:Drive",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema Drive.",
+      "summary": "Implement the strict Firecracker Drive shape with exact path/body identity, required root state, file-versus-vhost field exclusivity, Unsafe/Writeback cache, Sync/portable-Async engine, optional partuuid and limiter, redacted resources, ordered full-config projection, preboot replacement, live file replacement/PATCH, and PCI attach/delete/reuse. Unsupported combinations fail before authority or owner mutation.",
       "source_refs": [
         "api-schema:Drive"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "DriveConfigRequestBody and DriveConfigResponse"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveConfigInput, DriveConfig, and DriveBackendConfig"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Drive parser and response-shape tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate file and vhost Drive lifecycle"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate Drive authority and lifecycle"
+        }
+      ]
     },
     {
       "id": "api-schema:EntropyDevice",
@@ -4477,11 +5051,40 @@
     {
       "id": "api-schema:PartialDrive",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema PartialDrive.",
+      "summary": "Implement the strict matching-ID PartialDrive PATCH shape with only optional path_on_host and rate_limiter fields. File-backed Sync/Async updates are failure-atomic and incremental; vhost-user accepts only the ID-only CONFIG refresh. Unknown fields, empty bodies, invalid paths, unsupported backend combinations, owner failures, and grant failures preserve the live and reported drive.",
       "source_refs": [
         "api-schema:PartialDrive"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "DrivePatchRequestBody and DrivePatchRequest"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "DriveUpdateInput, DriveUpdate, and incremental limiter merge"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict PartialDrive parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate Async and vhost PATCH evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate Async and vhost PATCH evidence"
+        }
+      ]
     },
     {
       "id": "api-schema:PartialNetworkInterface",
@@ -4495,20 +5098,83 @@
     {
       "id": "api-schema:PartialPmem",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema PartialPmem.",
+      "summary": "Implement the strict matching-ID PartialPmem PATCH shape with only an optional rate_limiter. Running and Paused updates merge buckets into the live MMIO/PCI device and commit reported state afterward; omitted input is a no-op, disabled buckets clear state, and malformed, unknown, unavailable, recoverable, or terminal outcomes preserve the prior configuration.",
       "source_refs": [
         "api-schema:PartialPmem"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PmemPatchRequestBody and PmemPatchRequest"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemUpdateInput, PmemUpdate, and PmemConfigs::prepare_update"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict PartialPmem parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate live pmem PATCH evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate live pmem PATCH evidence"
+        }
+      ]
     },
     {
       "id": "api-schema:Pmem",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema Pmem.",
+      "summary": "Implement the strict Firecracker Pmem shape with matching ID, required nonempty backing, default false root/read-only flags, optional limiter, exact configuration projection, direct or typed contained ownership, one file/private-tail mapping, deterministic root selection, MMIO/PCI startup, PCI runtime PUT/PATCH/DELETE/reuse, exact-prefix flush, rollback, redaction, metrics, and cleanup. Optional-device snapshot serialization/restore remains a separate Wave 6 composite rather than a missing schema leaf.",
       "source_refs": [
         "api-schema:Pmem"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PmemConfigRequestBody and PmemConfigResponse"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "MMIO/PCI pmem startup and runtime ownership"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "PmemConfigInput, PmemConfig, backing mapping, limiter, and device"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict Pmem parser and response-shape tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate pmem root, update, I/O, hotplug, flush, and reuse evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate pmem authority and lifecycle evidence"
+        }
+      ]
     },
     {
       "id": "api-schema:RateLimiter",
@@ -4734,11 +5400,40 @@
     {
       "id": "corpus:block-caching",
       "family": "storage",
-      "summary": "Audit all applicable capability claims owned by the pinned block-caching source corpus.",
+      "summary": "Implement every applicable pinned block-caching outcome on macOS arm64/HVF: Unsafe is the default and omits virtio FLUSH, Writeback advertises FLUSH and synchronizes the exact opened file or block-special backing, Sync and portable Async share the same guest-visible ordering/status contract, and live replacement changes cache/capacity/GET_ID only after owner success. Vhost-user passes cache negotiation to the trusted external backend, whose internal cache policy remains operator-owned. Signed direct and contained aggregate guests prove simultaneous Sync/Async/vhost/pmem I/O and persistence without importing Linux page-cache numbers.",
       "source_refs": [
         "corpus:block-caching"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "Unsafe/Writeback features, Sync/Async queue execution, FLUSH, and live replacement"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block/async_executor.rs",
+          "anchor": "portable bounded Async execution and completion ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate Sync/Async/vhost/pmem persistence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate cache and persistence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "cache feature, flush, ordering, limiter, and replacement tests"
+        }
+      ]
     },
     {
       "id": "corpus:block-io-engine",
@@ -4796,11 +5491,45 @@
     {
       "id": "corpus:block-vhost-user",
       "family": "storage",
-      "summary": "Direct and contained startup implement the pinned one-queue vhost-user block path over MMIO or PCI: strict socket-only configuration, bounded discovery, immutable descriptor-backed memory transfer, translated vring setup, kick/call notification, root/partuuid/cache behavior, redacted terminal disconnect handling, metrics, cleanup, and pre-artifact snapshot rejection. Virtio-mem may be configured in either order. Startup reserves its full deterministic aperture before block preparation; every frontend receives boot RAM plus that aperture in one bounded table, while only plugged views enter guest CPU/HVF/current accounting and the trusted backend may access offline bytes. Contained mode uses an exact repeatable connect-only directory grant, per-drive child leases, and an authenticated anchored stream broker with no ambient fallback or steady helper. Runtime behavior adds repeated CONFIG refresh and failure-atomic new-ID non-root direct or contained PCI attach/delete/reuse in eligible shared dynamic-memory VMs without changing the VM-owned aperture. Signed proof covers storage I/O across grow/shrink, exact stable geometry, guest-visible memory status, backend death, Running/Paused reuse, rollback, cleanup, and unchanged entitlements. Continue auditing snapshot serialization/restore, Async interaction, external backend policy/outcomes, and complete corpus semantics before promotion.",
+      "summary": "Implement every applicable pinned vhost-user block frontend outcome over MMIO or PCI: strict socket-only configuration, bounded discovery, one queue, descriptor-backed shared-memory transfer, translated vrings, kick/call notification, root/partuuid/cache behavior, exact CONFIG refresh, redacted terminal disconnect, metrics, cleanup, and explicit pre-artifact snapshot rejection. The frontend exports immutable boot RAM plus the complete virtio-mem aperture, including offline bytes trusted to the backend. Contained mode uses one exact connect-only directory, child leases, and an authenticated anchored broker with no ambient fallback or steady helper. Runtime attach/delete/reuse preserves the VM aperture. Backend caching, limiting, jail, health, and availability are explicit operator boundaries rather than frontend claims.",
       "source_refs": [
         "corpus:block-vhost-user"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "direct and contained vhost broker, preflight, runtime, and cleanup transactions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "PreparedVhostUserBlockFrontend and VhostUser block endpoint"
+        },
+        {
+          "kind": "local",
+          "path": "crates/vhost-user/src/frontend.rs",
+          "anchor": "bounded protocol, vring, memory table, and notification frontend"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate vhost I/O, immutable aperture, CONFIG, growth, shrink, and death evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate vhost grant, child, frontend, and helper cleanup evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/vhost-user/src/frontend.rs",
+          "anchor": "protocol negotiation, shared-memory, vring, CONFIG, notification, and failure tests"
+        }
+      ]
     },
     {
       "id": "corpus:cpu-boot-protocol",
@@ -5148,11 +5877,45 @@
     {
       "id": "corpus:patch-block",
       "family": "storage",
-      "summary": "Ordinary runtime block PATCH retains failure-atomic backing and limiter mutation with backend-neutral retry scheduling for Sync and Async drives. A path change prepares a new engine generation, quiesces the old Async generation, and publishes only after replacement succeeds; limiter-only PATCH is incremental and retains the current backing and engine. For direct or contained vhost-user block, an ID-only PATCH performs one bounded exact 60-byte CONFIG acquisition on the existing stream, publishes only a validated reply, advances one MMIO/PCI config generation, sends one configuration interrupt, and records success-only optional change latency; it neither reconnects nor consumes contained directory authority. Continue auditing snapshot state and every remaining broad patch-block outcome before promotion.",
+      "summary": "Implement every applicable pinned block PATCH outcome. Ordinary Sync and portable-Async drives support failure-atomic live backing refresh plus incremental limiter mutation; path replacement prepares the candidate, quiesces the old Async generation, publishes new capacity/config/GET_ID together, and commits public state last. An ID-only direct or contained vhost-user PATCH performs one bounded exact CONFIG acquisition on the existing stream, validates it, advances one MMIO/PCI generation, and notifies the guest without reconnecting or consuming directory authority. PATCH is cooperative and is not an atomic guest-filesystem transaction; in-flight I/O may cross a pause/update boundary.",
       "source_refs": [
         "corpus:patch-block"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::update_block_device"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "file-backed live replacement and vhost CONFIG refresh"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block/async_executor.rs",
+          "anchor": "generation-safe Async replacement quiescence"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "failure-atomic file, contained grant, and vhost ID-only update tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed aggregate concurrent Async limiter, paused replacement, and vhost CONFIG evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained aggregate concurrent PATCH and exact-grant replacement evidence"
+        }
+      ]
     },
     {
       "id": "corpus:patch-network-interface",
@@ -5166,7 +5929,7 @@
     {
       "id": "corpus:pmem",
       "family": "storage",
-      "summary": "Startup and non-root runtime PCI pmem now include deterministic root boot, transactional PUT/PATCH/DELETE, exact direct and contained descriptor ownership, one authoritative file/private-tail mapping registered directly with HVF, exact-prefix MS_SYNC, aligned first-fit guest ranges, rollback, metrics, cleanup, and signed direct/contained root and same-ID/slot/range reuse. Capture-ready traversal retains exact config, range/protection, stable backing and authoritative mapping identity, queue/limiter/retry, origin, and complete MMIO/PCI transport state without changing native-v1. Continue auditing the broad pmem corpus for dirty policy, sharing/huge-page guidance, performance, serialization/restore, and aggregate completeness.",
+      "summary": "Live pmem API, mapping, deterministic root, protection, limiting, exact-prefix persistence, capture-ready traversal, PCI hotplug/delete/range reuse, rollback, metrics, cleanup, direct ownership, contained descriptor authority, and aggregate signed coexistence are implemented and verified. Wave 6 retains this broad corpus because Firecracker v1.16.0 also requires optional-device snapshot serialization and restore against the same external backing, including artifact, migration, and portability consequences that bangbang does not yet implement. DAX choice, private aligned tail, page-fault/huge-page/page-cache/RSS/eviction behavior, same-backing sharing and side-channel risk, and profiling guidance are documented without Linux numeric promises.",
       "source_refs": [
         "corpus:pmem"
       ],
@@ -6941,19 +7704,53 @@
     {
       "id": "semantic.storage:block-sync-async-vhost-and-limits",
       "family": "storage",
-      "summary": "Regular-file and macOS block-special Sync/portable-Async startup/runtime behavior plus direct or contained vhost-user block cover selected MMIO/PCI transports, root/partuuid/cache/flush semantics, bounded session execution, limiter/dirty/status/used/interrupt publication, metrics, cleanup, failure-atomic live regular/block backing or engine replacement, PCI hotplug/delete/reuse, shared-memory vring transfer, exact active vhost config refresh, and explicit snapshot rejection. Direct block-special control uses public geometry/cache ioctls; contained BBG2 grants and the fixed retained-descriptor facet preserve exact identity/access/geometry without ambient paths or added entitlements. Vhost now coexists with virtio-mem in either startup order and eligible runtime insertion: every frontend gets one immutable boot-plus-full-aperture table, storage I/O continues across guest-completed grow/shrink, and backend death/DELETE releases only frontend clones while preserving exact aperture/slot/child reuse. The trusted backend may access unplugged bytes; Darwin seals, a bundled backend, and backend policy are not claimed. Signed direct/contained scenarios cover exact geometry, CONFIG refresh, pause/run, rollback, persistence, cleanup, unchanged entitlements, and no helper. Capture-ready traversal retains exact regular/Async/pmem live state, while vhost owners still reject before mutation/artifacts. Continue auditing complete caching, limiter, backend, snapshot serialization/restore, performance, and remaining aggregate storage outcomes under #1450 before promotion.",
+      "summary": "Certify the complete applicable block aggregate across regular-file and exact macOS block-special Sync/portable-Async plus direct or contained vhost-user frontends. The implementation covers MMIO/PCI, root/partuuid, Unsafe/Writeback/FLUSH, limiter/status/used/interrupt/metrics paths, failure-atomic live replacement, PCI attach/delete/reuse, shared-memory vrings and immutable virtio-mem aperture, CONFIG refresh, explicit snapshot rejection, redacted terminal failure, and exact owner cleanup. Signed direct and production-contained guests run Sync, Async, vhost, and pmem together through concurrent disjoint updates, pause/resume, memory grow/shrink, runtime replacement/hotplug/reuse, persistence, backend death or orderly cleanup, exact grants, unchanged entitlements, and no helper. Backend policy and Linux io_uring/memfd/cgroup identities remain documented platform/operator boundaries.",
       "source_refs": [
         "corpus:block-caching",
         "corpus:block-io-engine",
         "corpus:block-vhost-user",
         "corpus:patch-block"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "failure-atomic direct and contained storage owner transactions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "MMIO/PCI block publication, shared capacity, notification, and teardown"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "Sync, Async, vhost-user, cache, limiter, update, and capture-ready block implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "mixed storage identity, capacity preflight, grant, broker, and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_aggregate_storage_semantics_over_product_pci"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants"
+        }
+      ]
     },
     {
       "id": "semantic.storage:pmem-root-mapping-flush-and-state",
       "family": "storage",
-      "summary": "Startup and non-root runtime pmem now provide selected MMIO-or-PCI activation, deterministic root boot, runtime PCI attach/update/delete, one direct authoritative file/private-tail mapping, exact-prefix persistence flush, limiting/retry, exact cleanup, contained descriptor authority, metrics, and signed root/protection/coherence/range-reuse evidence. Capture-ready traversal retains exact config, guest range/protection, stable backing identity, an opaque owner-retaining mapping identity, queue/limiter/retry, origin, and complete MMIO/PCI transport state. Continue auditing dirty policy, sharing/performance outcomes, snapshot serialization/restore, and every remaining pmem leaf before promoting this aggregate storage record.",
+      "summary": "Selected MMIO/PCI activation, deterministic pmem root, runtime PCI attach/update/delete, one authoritative file/private-tail mapping, exact-prefix persistence, limiting/retry, capacity preflight, exact cleanup, direct or contained descriptor authority, metrics, capture-ready state, and signed aggregate protection/coherence/range-reuse are implemented and verified. Wave 6 retains this semantic aggregate solely for optional-device snapshot serialization and restore with the same external backing, generalized artifact state, migration/portability outcomes, and their signed restore evidence; those missing outcomes must not be inferred from live capture-ready state.",
       "source_refs": [
         "corpus:pmem"
       ],

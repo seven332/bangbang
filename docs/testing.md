@@ -218,6 +218,41 @@ bound, `/dev/pmem<i>` plus `ro`/`rw`, MMIO/PCI enumeration, runtime-root
 rejection, and exact contained descriptor identity after pathname replacement.
 The wrapper must run on Apple Silicon without `--allow-unsupported`.
 
+Aggregate storage closure changes additionally require both
+`macos_arm64::signed_executable_certifies_aggregate_storage_semantics_over_product_pci`
+and
+`normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants`
+through `scripts/run-integration-tests.sh`. Each launches one signed
+product-PCI guest with a read-only Sync root, writable Sync control drive,
+writable portable-Async data drive, writable vhost-user drive, writable pmem
+device, and virtio-mem. The generated direct-rootfs init selects this profile
+with `bangbang.storage-certification=1` and discovers storage from unique
+on-media markers; startup tests must not assume fixed BDFs after the permanent
+root/control functions.
+
+Both profiles must prove initial and continuing Sync/Async/vhost/pmem I/O,
+Writeback and queue-driven persistence, disjoint concurrent block/pmem/vhost
+updates, paused Async replacement, `0 -> 128 MiB -> 0` memory growth, exact
+final config projection, and clean termination. Dynamic block and pmem
+attach/remove/reinsert phases stay serialized around Linux PCI rescan and sysfs
+removal: placing both removed namespaces in the kernel's tombstone state at
+once can block deterministic rescans and is not part of the public concurrent
+mutation claim. The second insertion must reuse the first block slot and pmem
+slot/resource without sleeps. The direct branch must then kill the vhost
+backend and observe terminal frontend/process cleanup; the contained branch
+must prove exact grants/children, pathname-replacement resistance, redaction,
+unchanged entitlements, and orderly frontend/session/helper cleanup.
+
+Unsigned companions must pin no-side-effect capacity ordering. In particular,
+`runtime_pmem_owner_preflight_precedes_grant_claim_mapping_and_config_commit`
+must exhaust an owner-side resource before runtime PUT and prove the error is a
+capacity error, not a grant error; insert count, public config, active claims,
+broker requests, opens, and mappings remain zero, and the exact grant stays
+reusable. Shared endpoint, pmem inventory, PCI function, BAR, MSI-X,
+dispatcher, and metrics checks remain focused lower-layer companions. The
+checked capability-audit test must continue enforcing an exact 40-row storage
+ledger with 38 terminal records and exactly two Wave 6 handoffs.
+
 Runtime network hotplug changes additionally require both
 `macos_arm64::signed_executable_hotplugs_mmds_network_and_reuses_product_pci_slot`
 and `normal_bundle_hotplugs_mmds_network_without_vmnet_authority` through the
@@ -1598,7 +1633,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v59.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v67.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test

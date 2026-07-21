@@ -73,6 +73,51 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_VHOST_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1 bangbang.expect-vhost-resize=1";
     const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
     const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
+    const DIRECT_ROOTFS_STORAGE_CERTIFICATION_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 root=/dev/vda ro rootwait memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.storage-certification=1";
+    const STORAGE_CONTROL_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTROL_HOST";
+    const STORAGE_CONTROL_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTROL_GUEST";
+    const STORAGE_ASYNC_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_ASYNC_HOST";
+    const STORAGE_ASYNC_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_ASYNC_GUEST";
+    const STORAGE_ASYNC_REPLACEMENT_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_ASYNC_REPLACEMENT_HOST";
+    const STORAGE_ASYNC_REPLACEMENT_GUEST_MARKER: &[u8] =
+        b"BANGBANG_STORAGE_ASYNC_REPLACEMENT_GUEST";
+    const STORAGE_VHOST_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_VHOST_HOST";
+    const STORAGE_VHOST_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_VHOST_GUEST";
+    const STORAGE_PMEM_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_PMEM_HOST";
+    const STORAGE_PMEM_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_PMEM_GUEST";
+    const STORAGE_RUNTIME_BLOCK_ONE_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_BLOCK_ONE_HOST";
+    const STORAGE_RUNTIME_BLOCK_ONE_GUEST_MARKER: &[u8] =
+        b"BANGBANG_STORAGE_RUNTIME_BLOCK_ONE_GUEST";
+    const STORAGE_RUNTIME_BLOCK_TWO_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_BLOCK_TWO_HOST";
+    const STORAGE_RUNTIME_BLOCK_TWO_GUEST_MARKER: &[u8] =
+        b"BANGBANG_STORAGE_RUNTIME_BLOCK_TWO_GUEST";
+    const STORAGE_RUNTIME_PMEM_ONE_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_PMEM_ONE_HOST";
+    const STORAGE_RUNTIME_PMEM_ONE_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_PMEM_ONE_GUEST";
+    const STORAGE_RUNTIME_PMEM_TWO_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_PMEM_TWO_HOST";
+    const STORAGE_RUNTIME_PMEM_TWO_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_PMEM_TWO_GUEST";
+    const STORAGE_READY_MARKER: &[u8] = b"BANGBANG_STORAGE_READY";
+    const STORAGE_CONTINUE_ONE_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTINUE_ONE";
+    const STORAGE_FIRST_REMOVED_MARKER: &[u8] = b"BANGBANG_STORAGE_FIRST_REMOVED";
+    const STORAGE_CONTINUE_TWO_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTINUE_TWO";
+    const STORAGE_SECOND_BLOCK_REMOVED_MARKER: &[u8] = b"BANGBANG_STORAGE_SECOND_BLOCK_REMOVED";
+    const STORAGE_CONTINUE_PMEM_ONE_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTINUE_PMEM_ONE";
+    const STORAGE_FIRST_PMEM_REMOVED_MARKER: &[u8] = b"BANGBANG_STORAGE_FIRST_PMEM_REMOVED";
+    const STORAGE_CONTINUE_PMEM_TWO_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTINUE_PMEM_TWO";
+    const STORAGE_SUCCESS_MARKER: &[u8] = b"BANGBANG_STORAGE_SUCCESS";
+    const STORAGE_CONTROL_GUEST_OFFSET: u64 = 2 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const STORAGE_READY_OFFSET: u64 = bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const STORAGE_CONTINUE_ONE_OFFSET: u64 = 3 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const STORAGE_FIRST_REMOVED_OFFSET: u64 = 4 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const STORAGE_CONTINUE_TWO_OFFSET: u64 = 5 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const STORAGE_SUCCESS_OFFSET: u64 = 6 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const STORAGE_SECOND_BLOCK_REMOVED_OFFSET: u64 =
+        7 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const STORAGE_CONTINUE_PMEM_ONE_OFFSET: u64 =
+        8 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const STORAGE_FIRST_PMEM_REMOVED_OFFSET: u64 =
+        9 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
+    const STORAGE_CONTINUE_PMEM_TWO_OFFSET: u64 =
+        10 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
     const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
     const BLOCK_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_ONE";
     const BLOCK_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_ONE";
@@ -2384,6 +2429,40 @@ mod macos_arm64 {
         assert_eq!(report.memory_table_requests, 1);
     }
 
+    fn assert_aggregate_storage_vhost_user_memory_aperture(report: &VhostUserBlockBackendReport) {
+        const MIB: u64 = 1024 * 1024;
+        let geometry = report
+            .memory_region_geometry
+            .iter()
+            .map(|region| {
+                (
+                    region.guest_phys_addr,
+                    region.memory_size,
+                    region.mmap_offset,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            geometry,
+            vec![
+                (
+                    bangbang_runtime::memory::aarch64::DRAM_MEM_START,
+                    256 * MIB,
+                    0,
+                ),
+                (
+                    bangbang_runtime::memory_hotplug::VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value()
+                        + 128 * MIB,
+                    128 * MIB,
+                    0,
+                ),
+            ],
+            "aggregate startup pmem must move the complete virtio-mem aperture to the next 128 MiB slot",
+        );
+        assert_eq!(report.memory_regions, geometry.len());
+        assert_eq!(report.memory_table_requests, 1);
+    }
+
     fn wait_for_block_event_failure(
         socket_path: &Path,
         metrics_path: &Path,
@@ -4268,6 +4347,650 @@ mod macos_arm64 {
         assert!(
             !uds_path.exists(),
             "product PCI shutdown should remove the owned main vsock listener"
+        );
+    }
+
+    #[test]
+    fn signed_executable_certifies_aggregate_storage_semantics_over_product_pci() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let control_backing_path = test_dir.path().join("storage-control.img");
+        let async_backing_path = test_dir.path().join("storage-async.img");
+        let async_replacement_path = test_dir.path().join("storage-async-replacement.img");
+        let vhost_backing_path = test_dir.path().join("storage-vhost.img");
+        let vhost_socket_path = test_dir.path().join("storage-vhost.socket");
+        let startup_pmem_path = test_dir.path().join("storage-pmem.img");
+        let runtime_block_one_path = test_dir.path().join("storage-runtime-block-one.img");
+        let runtime_block_two_path = test_dir.path().join("storage-runtime-block-two.img");
+        let runtime_pmem_one_path = test_dir.path().join("storage-runtime-pmem-one.img");
+        let runtime_pmem_two_path = test_dir.path().join("storage-runtime-pmem-two.img");
+        let metrics_path = test_dir.path().join("storage-metrics.out");
+        let serial_path = test_dir.path().join("storage-serial.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_block_backing_with_prefix(&control_backing_path, 16, STORAGE_CONTROL_HOST_MARKER);
+        create_block_backing_with_prefix(&async_backing_path, 8, STORAGE_ASYNC_HOST_MARKER);
+        create_block_backing_with_prefix(
+            &async_replacement_path,
+            8,
+            STORAGE_ASYNC_REPLACEMENT_HOST_MARKER,
+        );
+        create_block_backing_with_prefix(&vhost_backing_path, 8, STORAGE_VHOST_HOST_MARKER);
+        create_pmem_backing(&startup_pmem_path, STORAGE_PMEM_HOST_MARKER);
+        create_block_backing_with_prefix(
+            &runtime_block_one_path,
+            8,
+            STORAGE_RUNTIME_BLOCK_ONE_HOST_MARKER,
+        );
+        create_block_backing_with_prefix(
+            &runtime_block_two_path,
+            8,
+            STORAGE_RUNTIME_BLOCK_TWO_HOST_MARKER,
+        );
+        create_pmem_backing(&runtime_pmem_one_path, STORAGE_RUNTIME_PMEM_ONE_HOST_MARKER);
+        create_pmem_backing(&runtime_pmem_two_path, STORAGE_RUNTIME_PMEM_TWO_HOST_MARKER);
+        create_empty_file(&metrics_path);
+        create_empty_file(&serial_path);
+        let vhost_backend = VhostUserBlockBackend::start(
+            &vhost_socket_path,
+            &vhost_backing_path,
+            VhostUserBlockBackendOptions::regular(false),
+        )
+        .expect("aggregate storage vhost-user backend should start");
+
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT aggregate storage machine config",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/hotplug/memory",
+                r#"{"total_size_mib":128,"block_size_mib":2,"slot_size_mib":128}"#,
+            ),
+            "PUT aggregate storage memory hotplug config",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/boot-source",
+                &format!(
+                    r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+                    json_string(path_text(&kernel_path)),
+                    json_string(DIRECT_ROOTFS_STORAGE_CERTIFICATION_BOOT_ARGS),
+                ),
+            ),
+            "PUT aggregate storage boot source",
+        );
+        let startup_storage = [
+            (
+                "/drives/rootfs",
+                format!(
+                    r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true,"io_engine":"Sync"}}"#,
+                    json_string(path_text(&rootfs_path)),
+                ),
+                "PUT aggregate read-only Sync rootfs",
+            ),
+            (
+                "/drives/control",
+                format!(
+                    r#"{{"drive_id":"control","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}}"#,
+                    json_string(path_text(&control_backing_path)),
+                ),
+                "PUT aggregate writable Sync control",
+            ),
+            (
+                "/drives/asyncdata",
+                format!(
+                    r#"{{"drive_id":"asyncdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Async"}}"#,
+                    json_string(path_text(&async_backing_path)),
+                ),
+                "PUT aggregate writable Async data",
+            ),
+            (
+                "/drives/vhostdata",
+                format!(
+                    r#"{{"drive_id":"vhostdata","socket":{},"is_root_device":false,"cache_type":"Writeback"}}"#,
+                    json_string(path_text(&vhost_socket_path)),
+                ),
+                "PUT aggregate writable vhost-user data",
+            ),
+        ];
+        for (route, body, context) in startup_storage {
+            assert_no_content_response(&http_put_json(&socket_path, route, &body), context);
+        }
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/pmem/pmem0",
+                &format!(
+                    r#"{{"id":"pmem0","path_on_host":{},"read_only":false}}"#,
+                    json_string(path_text(&startup_pmem_path)),
+                ),
+            ),
+            "PUT aggregate writable pmem",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/metrics",
+                &format!(
+                    r#"{{"metrics_path":{}}}"#,
+                    json_string(path_text(&metrics_path))
+                ),
+            ),
+            "PUT aggregate storage metrics",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/serial",
+                &format!(
+                    r#"{{"serial_out_path":{}}}"#,
+                    json_string(path_text(&serial_path))
+                ),
+            ),
+            "PUT aggregate storage serial output",
+        );
+
+        let configured = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&configured, "GET aggregate startup storage config");
+        for expected in [
+            r#""drive_id":"rootfs""#,
+            r#""drive_id":"control""#,
+            r#""drive_id":"asyncdata""#,
+            r#""drive_id":"vhostdata""#,
+            r#""io_engine":"Sync""#,
+            r#""io_engine":"Async""#,
+            r#""id":"pmem0""#,
+        ] {
+            assert_response_contains(&configured, expected, "aggregate startup storage config");
+        }
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "start aggregate storage guest",
+        );
+
+        if let Err(error) = wait_for_file_markers_at(
+            &control_backing_path,
+            &[(
+                STORAGE_READY_OFFSET,
+                STORAGE_READY_MARKER,
+                b"BANGBANG_STORAGE_CERTIFICATION_FAIL",
+            )],
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let report = vhost_backend.report();
+            let failure = String::from_utf8_lossy(&file_bytes_at(
+                &control_backing_path,
+                15 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+                128,
+            ))
+            .into_owned();
+            let serial_tail = file_tail_lossy(&serial_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "aggregate storage guest did not finish initial I/O: {error}; failure marker: {failure:?}; serial tail:\n{serial_tail}\nvhost report: {report:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        vhost_backend
+            .wait_for_activation(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("aggregate startup vhost-user backend should activate");
+        assert_eq!(
+            file_bytes_at(
+                &control_backing_path,
+                STORAGE_CONTROL_GUEST_OFFSET,
+                STORAGE_CONTROL_GUEST_MARKER.len(),
+            ),
+            STORAGE_CONTROL_GUEST_MARKER,
+        );
+        assert_eq!(
+            file_bytes_at(
+                &async_backing_path,
+                STORAGE_CONTROL_GUEST_OFFSET,
+                STORAGE_ASYNC_GUEST_MARKER.len(),
+            ),
+            STORAGE_ASYNC_GUEST_MARKER,
+        );
+        assert_eq!(
+            file_bytes_at(
+                &vhost_backing_path,
+                STORAGE_CONTROL_GUEST_OFFSET,
+                STORAGE_VHOST_GUEST_MARKER.len(),
+            ),
+            STORAGE_VHOST_GUEST_MARKER,
+        );
+        assert_eq!(
+            file_bytes_at(
+                &startup_pmem_path,
+                PMEM_GUEST_FLUSH_OFFSET,
+                STORAGE_PMEM_GUEST_MARKER.len(),
+            ),
+            STORAGE_PMEM_GUEST_MARKER,
+        );
+        vhost_backend
+            .wait_for_flush(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("aggregate startup vhost-user write should flush");
+
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&vhost_backing_path)
+            .expect("aggregate vhost backing should reopen for resize")
+            .set_len(16 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE)
+            .expect("aggregate vhost backing should resize");
+        let (async_patch, pmem_patch, vhost_patch) = std::thread::scope(|scope| {
+            let async_patch = scope.spawn(|| {
+                http_json(
+                    &socket_path,
+                    "PATCH",
+                    "/drives/asyncdata",
+                    r#"{"drive_id":"asyncdata","rate_limiter":{"ops":{"size":2,"one_time_burst":1,"refill_time":100}}}"#,
+                )
+            });
+            let pmem_patch = scope.spawn(|| {
+                http_json(
+                    &socket_path,
+                    "PATCH",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","rate_limiter":{"ops":{"size":3,"one_time_burst":1,"refill_time":100}}}"#,
+                )
+            });
+            let vhost_patch = scope.spawn(|| {
+                http_json(
+                    &socket_path,
+                    "PATCH",
+                    "/drives/vhostdata",
+                    r#"{"drive_id":"vhostdata"}"#,
+                )
+            });
+            (
+                async_patch
+                    .join()
+                    .expect("aggregate Async PATCH should join"),
+                pmem_patch.join().expect("aggregate pmem PATCH should join"),
+                vhost_patch
+                    .join()
+                    .expect("aggregate vhost PATCH should join"),
+            )
+        });
+        assert_no_content_response(&async_patch, "concurrent PATCH aggregate Async limiter");
+        assert_no_content_response(&pmem_patch, "concurrent PATCH aggregate pmem limiter");
+        assert_no_content_response(&vhost_patch, "concurrent PATCH aggregate vhost config");
+        assert_eq!(
+            vhost_backend.report().config_requests,
+            2,
+            "aggregate vhost startup and ID-only refresh should issue two config requests",
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":128}"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            ),
+            "grow aggregate storage memory",
+        );
+        wait_for_http_response_fragment(
+            &socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":128"#,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("aggregate storage guest should complete memory grow");
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause aggregate storage guest before replacement",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/drives/asyncdata",
+                &format!(
+                    r#"{{"drive_id":"asyncdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Async","rate_limiter":{{"ops":{{"size":4,"one_time_burst":1,"refill_time":100}}}}}}"#,
+                    json_string(path_text(&async_replacement_path)),
+                ),
+            ),
+            "paused same-ID aggregate Async replacement",
+        );
+        let runtime_block_one = format!(
+            r#"{{"drive_id":"runtime_block","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}}"#,
+            json_string(path_text(&runtime_block_one_path)),
+        );
+        let runtime_pmem_one = format!(
+            r#"{{"id":"runtime_pmem","path_on_host":{},"read_only":false}}"#,
+            json_string(path_text(&runtime_pmem_one_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/runtime_block", &runtime_block_one),
+            "paused PUT first aggregate runtime block",
+        );
+        let replaced = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&replaced, "GET aggregate storage replaced config");
+        assert_response_contains(
+            &replaced,
+            path_text(&async_replacement_path),
+            "aggregate Async replacement projection",
+        );
+        assert!(!replaced.contains(path_text(&async_backing_path)));
+        write_block_marker_at(
+            &control_backing_path,
+            STORAGE_CONTINUE_ONE_OFFSET,
+            STORAGE_CONTINUE_ONE_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume aggregate storage guest for first runtime round",
+        );
+
+        if let Err(error) = wait_for_file_markers_at(
+            &control_backing_path,
+            &[(
+                STORAGE_FIRST_REMOVED_OFFSET,
+                STORAGE_FIRST_REMOVED_MARKER,
+                b"BANGBANG_STORAGE_CERTIFICATION_FAIL",
+            )],
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let report = vhost_backend.report();
+            let failure = String::from_utf8_lossy(&file_bytes_at(
+                &control_backing_path,
+                15 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+                128,
+            ))
+            .into_owned();
+            let serial_tail = file_tail_lossy(&serial_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "aggregate first runtime storage round failed: {error}; failure marker: {failure:?}; serial tail:\n{serial_tail}\nvhost report: {report:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_eq!(
+            file_bytes_at(
+                &async_replacement_path,
+                STORAGE_CONTROL_GUEST_OFFSET,
+                STORAGE_ASYNC_REPLACEMENT_GUEST_MARKER.len(),
+            ),
+            STORAGE_ASYNC_REPLACEMENT_GUEST_MARKER,
+        );
+        assert_eq!(
+            file_bytes_at(
+                &runtime_block_one_path,
+                STORAGE_CONTROL_GUEST_OFFSET,
+                STORAGE_RUNTIME_BLOCK_ONE_GUEST_MARKER.len(),
+            ),
+            STORAGE_RUNTIME_BLOCK_ONE_GUEST_MARKER,
+        );
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause aggregate storage guest before runtime reuse",
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/drives/runtime_block"),
+            "DELETE first aggregate runtime block",
+        );
+        let runtime_block_two = format!(
+            r#"{{"drive_id":"runtime_block_two","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}}"#,
+            json_string(path_text(&runtime_block_two_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/drives/runtime_block_two",
+                &runtime_block_two,
+            ),
+            "paused PUT reused aggregate runtime block",
+        );
+        write_block_marker_at(
+            &control_backing_path,
+            STORAGE_CONTINUE_TWO_OFFSET,
+            STORAGE_CONTINUE_TWO_MARKER,
+        );
+        assert_eq!(
+            file_bytes_at(
+                &control_backing_path,
+                STORAGE_CONTINUE_TWO_OFFSET,
+                STORAGE_CONTINUE_TWO_MARKER.len(),
+            ),
+            STORAGE_CONTINUE_TWO_MARKER,
+            "host must persist the second aggregate control marker before resume",
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume aggregate storage guest for reused block round",
+        );
+        if let Err(error) = wait_for_file_markers_at(
+            &control_backing_path,
+            &[(
+                STORAGE_SECOND_BLOCK_REMOVED_OFFSET,
+                STORAGE_SECOND_BLOCK_REMOVED_MARKER,
+                b"BANGBANG_STORAGE_CERTIFICATION_FAIL",
+            )],
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let failure = String::from_utf8_lossy(&file_bytes_at(
+                &control_backing_path,
+                15 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+                128,
+            ))
+            .into_owned();
+            let serial_tail = file_tail_lossy(&serial_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "aggregate reused block round failed: {error}; failure marker: {failure:?}; serial tail:\n{serial_tail}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_eq!(
+            file_bytes_at(
+                &runtime_block_two_path,
+                STORAGE_CONTROL_GUEST_OFFSET,
+                STORAGE_RUNTIME_BLOCK_TWO_GUEST_MARKER.len(),
+            ),
+            STORAGE_RUNTIME_BLOCK_TWO_GUEST_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause aggregate storage guest before first pmem round",
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/drives/runtime_block_two"),
+            "DELETE reused aggregate runtime block",
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/pmem/runtime_pmem", &runtime_pmem_one),
+            "paused PUT first aggregate runtime pmem",
+        );
+        write_block_marker_at(
+            &control_backing_path,
+            STORAGE_CONTINUE_PMEM_ONE_OFFSET,
+            STORAGE_CONTINUE_PMEM_ONE_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume aggregate storage guest for first pmem round",
+        );
+        if let Err(error) = wait_for_file_markers_at(
+            &control_backing_path,
+            &[(
+                STORAGE_FIRST_PMEM_REMOVED_OFFSET,
+                STORAGE_FIRST_PMEM_REMOVED_MARKER,
+                b"BANGBANG_STORAGE_CERTIFICATION_FAIL",
+            )],
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let failure = String::from_utf8_lossy(&file_bytes_at(
+                &control_backing_path,
+                15 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+                128,
+            ))
+            .into_owned();
+            let serial_tail = file_tail_lossy(&serial_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "aggregate first pmem round failed: {error}; failure marker: {failure:?}; serial tail:\n{serial_tail}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_eq!(
+            file_bytes_at(
+                &runtime_pmem_one_path,
+                PMEM_GUEST_FLUSH_OFFSET,
+                STORAGE_RUNTIME_PMEM_ONE_GUEST_MARKER.len(),
+            ),
+            STORAGE_RUNTIME_PMEM_ONE_GUEST_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause aggregate storage guest before reused pmem round",
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/pmem/runtime_pmem"),
+            "DELETE first aggregate runtime pmem",
+        );
+        let runtime_pmem_two = format!(
+            r#"{{"id":"runtime_pmem_two","path_on_host":{},"read_only":false,"rate_limiter":{{"ops":{{"size":5,"refill_time":100}}}}}}"#,
+            json_string(path_text(&runtime_pmem_two_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/pmem/runtime_pmem_two", &runtime_pmem_two),
+            "paused PUT reused aggregate runtime pmem",
+        );
+        write_block_marker_at(
+            &control_backing_path,
+            STORAGE_CONTINUE_PMEM_TWO_OFFSET,
+            STORAGE_CONTINUE_PMEM_TWO_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume aggregate storage guest for reused pmem round",
+        );
+        if let Err(error) = wait_for_file_markers_at(
+            &control_backing_path,
+            &[(
+                STORAGE_SUCCESS_OFFSET,
+                STORAGE_SUCCESS_MARKER,
+                b"BANGBANG_STORAGE_CERTIFICATION_FAIL",
+            )],
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let report = vhost_backend.report();
+            let failure = String::from_utf8_lossy(&file_bytes_at(
+                &control_backing_path,
+                15 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+                128,
+            ))
+            .into_owned();
+            let serial_tail = file_tail_lossy(&serial_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "aggregate reused runtime storage round failed: {error}; failure marker: {failure:?}; serial tail:\n{serial_tail}\nvhost report: {report:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_eq!(
+            file_bytes_at(
+                &runtime_pmem_two_path,
+                PMEM_GUEST_FLUSH_OFFSET,
+                STORAGE_RUNTIME_PMEM_TWO_GUEST_MARKER.len(),
+            ),
+            STORAGE_RUNTIME_PMEM_TWO_GUEST_MARKER,
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/pmem/runtime_pmem_two"),
+            "final DELETE aggregate runtime pmem",
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":0}"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            ),
+            "shrink aggregate storage memory",
+        );
+        wait_for_http_response_fragment(
+            &socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":0"#,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("aggregate storage guest should complete memory shrink");
+        let final_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&final_config, "GET final aggregate storage config");
+        for expected in [
+            r#""drive_id":"rootfs""#,
+            r#""drive_id":"control""#,
+            r#""drive_id":"asyncdata""#,
+            r#""drive_id":"vhostdata""#,
+            r#""id":"pmem0""#,
+            path_text(&async_replacement_path),
+        ] {
+            assert_response_contains(&final_config, expected, "final aggregate storage config");
+        }
+        for removed in [
+            "runtime_block",
+            "runtime_block_two",
+            "runtime_pmem",
+            "runtime_pmem_two",
+            path_text(&async_backing_path),
+        ] {
+            assert!(
+                !final_config.contains(removed),
+                "final aggregate config must omit removed or replaced storage {removed:?}: {final_config}",
+            );
+        }
+        assert_aggregate_storage_vhost_user_memory_aperture(&vhost_backend.report());
+
+        vhost_backend
+            .disconnect()
+            .expect("aggregate vhost-user backend should disconnect last");
+        let terminal_vhost_report = vhost_backend
+            .finish()
+            .expect("aggregate vhost-user backend should finish after disconnect");
+        assert!(terminal_vhost_report.activated);
+        assert!(terminal_vhost_report.reads > 0);
+        assert!(terminal_vhost_report.writes > 0);
+        assert!(terminal_vhost_report.flushes > 0);
+        wait_for_block_event_failure(
+            &socket_path,
+            &metrics_path,
+            "vhostdata",
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("aggregate terminal vhost-user closure should reach block metrics");
+        let after_backend_death = http_get(&socket_path, "/");
+        assert_response_contains(
+            &after_backend_death,
+            r#""state":"Running""#,
+            "aggregate VM state after terminal backend death",
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang aggregate storage certification",
+        );
+        assert!(
+            !vhost_socket_path.exists(),
+            "aggregate vhost-user socket should be cleaned up",
         );
     }
 

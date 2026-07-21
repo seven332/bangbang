@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v59"
+direct_boot_variant="direct-boot-v67"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -531,6 +531,397 @@ vdd_starts_with_marker() {
   [ -b /dev/vdd ] || return 1
   actual=$(dd if=/dev/vdd bs=1 count="${#marker}" 2>/dev/null || true)
   [ "$actual" = "$marker" ]
+}
+
+storage_block_starts_with_marker() {
+  device=$1
+  marker=$2
+  [ -b "$device" ] || return 1
+  actual=$(timeout 2 dd if="$device" bs=1 count="${#marker}" 2>/dev/null || true)
+  [ "$actual" = "$marker" ]
+}
+
+find_storage_block() {
+  marker=$1
+  storage_block_device=
+  for device in /dev/vd*; do
+    [ -b "$device" ] || continue
+    if storage_block_starts_with_marker "$device" "$marker"; then
+      storage_block_device=$device
+      return 0
+    fi
+  done
+  return 1
+}
+
+rescan_storage_pci() {
+  timeout -k 1 5 sh -c 'printf "1\n" > /sys/bus/pci/rescan'
+}
+
+wait_for_storage_block() {
+  marker=$1
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    if find_storage_block "$marker"; then
+      return 0
+    fi
+    rescan_storage_pci 2>/dev/null || return 1
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+storage_block_sector_starts_with_marker() {
+  device=$1
+  marker=$2
+  sector=$3
+  [ -b "$device" ] || return 1
+  actual=$(timeout 2 dd if="$device" bs=512 skip="$sector" count=1 2>/dev/null \
+    | dd bs=1 count="${#marker}" 2>/dev/null || true)
+  [ "$actual" = "$marker" ]
+}
+
+write_storage_block_sector_marker() {
+  device=$1
+  marker=$2
+  sector=$3
+  [ -b "$device" ] || return 1
+  printf '%-512s' "$marker" \
+    | timeout 5 dd of="$device" bs=512 seek="$sector" count=1 conv=notrunc,fsync 2>/dev/null
+}
+
+storage_block_pci_path() {
+  device=$1
+  block_name=${device##*/}
+  path=$(readlink -f "/sys/class/block/$block_name/device" 2>/dev/null || true)
+  while [ -n "$path" ] && [ "$path" != / ]; do
+    if [ -e "$path/remove" ] && [ -r "$path/vendor" ] && [ -r "$path/device" ]; then
+      vendor=$(cat "$path/vendor" 2>/dev/null || true)
+      pci_device=$(cat "$path/device" 2>/dev/null || true)
+      if [ "$vendor" = 0x1af4 ] && [ "$pci_device" = 0x1042 ]; then
+        printf '%s\n' "$path"
+        return 0
+      fi
+    fi
+    parent=${path%/*}
+    [ "$parent" != "$path" ] || break
+    path=$parent
+  done
+  return 1
+}
+
+find_storage_pmem() {
+  marker=$1
+  storage_pmem_device=
+  storage_pmem_pci_path=
+  storage_pmem_resource=
+
+  for function_path in /sys/bus/pci/devices/*; do
+    [ -d "$function_path" ] || continue
+    function=${function_path##*/}
+    pci_function_has_identity "$function" 0x105b || continue
+    for block_path in "$function_path"/virtio*/ndbus*/region*/namespace*/block/*; do
+      [ -e "$block_path" ] || continue
+      namespace_path=${block_path%/block/*}
+      resource=$(cat "$namespace_path/resource" 2>/dev/null || true)
+      [ -n "$resource" ] || continue
+      device="/dev/${block_path##*/}"
+      [ -b "$device" ] || continue
+      actual=$(timeout 2 dd if="$device" bs=1 count="${#marker}" 2>/dev/null || true)
+      [ "$actual" = "$marker" ] || continue
+      storage_pmem_device=$device
+      storage_pmem_pci_path=$function_path
+      storage_pmem_resource=$resource
+      return 0
+    done
+  done
+
+  return 1
+}
+
+wait_for_storage_pmem() {
+  marker=$1
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    rescan_storage_pci 2>/dev/null || return 1
+    sleep 1
+    if find_storage_pmem "$marker"; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+storage_pmem_marker_at_offset() {
+  device=$1
+  marker=$2
+  offset=$3
+  actual=$(timeout 2 dd if="$device" bs=1 skip="$offset" count="${#marker}" 2>/dev/null || true)
+  [ "$actual" = "$marker" ]
+}
+
+storage_certification_fail() {
+  reason=$1
+  marker="BANGBANG_STORAGE_CERTIFICATION_FAIL_$reason"
+  emit_line "$marker"
+  if [ -n "${storage_control_device:-}" ]; then
+    for sector in 1 4 6 7 9 15; do
+      write_storage_block_sector_marker "$storage_control_device" "$marker" "$sector" || true
+    done
+    sync "$storage_control_device" 2>/dev/null || sync
+  fi
+}
+
+wait_for_storage_control_marker() {
+  marker=$1
+  sector=$2
+  attempts=0
+  emit_line "BANGBANG_STORAGE_CONTROL_WAIT_${sector}_${storage_control_device##*/}"
+  while ! storage_block_sector_starts_with_marker \
+    "$storage_control_device" "$marker" "$sector"; do
+    if [ "$attempts" -eq 0 ]; then
+      observed=$(timeout 2 dd if="$storage_control_device" bs=512 skip="$sector" count=1 2>/dev/null \
+        | dd bs=1 count="${#marker}" 2>/dev/null || true)
+      emit_line "BANGBANG_STORAGE_CONTROL_OBSERVED_${sector}_$observed"
+    fi
+    if [ "$attempts" -ge 60 ]; then
+      return 1
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  emit_line "BANGBANG_STORAGE_CONTROL_SEEN_$sector"
+}
+
+run_storage_block_round() {
+  expected=$1
+  written=$2
+  phase=$3
+  if ! wait_for_storage_block "$expected"; then
+    storage_certification_fail "${phase}_BLOCK_RESCAN"
+    return 1
+  fi
+  emit_line "BANGBANG_STORAGE_${phase}_BLOCK_FOUND"
+  storage_round_block_device=$storage_block_device
+  storage_round_block_pci_path=$(storage_block_pci_path "$storage_round_block_device") || {
+    storage_certification_fail "${phase}_BLOCK_IDENTITY"
+    return 1
+  }
+  if [ "$phase" = FIRST ]; then
+    storage_first_block_pci_path=$storage_round_block_pci_path
+  elif [ "$storage_round_block_pci_path" != "$storage_first_block_pci_path" ]; then
+    storage_certification_fail "${phase}_BLOCK_SLOT_REUSE"
+    return 1
+  fi
+  if ! write_storage_block_sector_marker "$storage_round_block_device" "$written" 2 \
+    || ! storage_block_sector_starts_with_marker \
+      "$storage_round_block_device" "$written" 2; then
+    storage_certification_fail "${phase}_BLOCK_IO"
+    return 1
+  fi
+  emit_line "BANGBANG_STORAGE_${phase}_BLOCK_IO"
+  if ! printf '1\n' > "$storage_round_block_pci_path/remove" 2>/dev/null; then
+    storage_certification_fail "${phase}_BLOCK_REMOVE"
+    return 1
+  fi
+  attempts=0
+  while [ -b "$storage_round_block_device" ] && [ "$attempts" -lt 30 ]; do
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  if [ -b "$storage_round_block_device" ]; then
+    storage_certification_fail "${phase}_BLOCK_REMOVE_WAIT"
+    return 1
+  fi
+  emit_line "BANGBANG_STORAGE_${phase}_BLOCK_REMOVED"
+}
+
+run_storage_pmem_round() {
+  expected=$1
+  written=$2
+  phase=$3
+  if ! wait_for_storage_pmem "$expected"; then
+    storage_certification_fail "${phase}_PMEM_RESCAN"
+    return 1
+  fi
+  emit_line "BANGBANG_STORAGE_${phase}_PMEM_FOUND"
+  storage_round_pmem_device=$storage_pmem_device
+  storage_round_pmem_pci_path=$storage_pmem_pci_path
+  storage_round_pmem_resource=$storage_pmem_resource
+  if [ "$phase" = FIRST ]; then
+    storage_first_pmem_pci_path=$storage_round_pmem_pci_path
+    storage_first_pmem_resource=$storage_round_pmem_resource
+  elif [ "$storage_round_pmem_pci_path" != "$storage_first_pmem_pci_path" ]; then
+    storage_certification_fail "${phase}_PMEM_SLOT_REUSE"
+    return 1
+  elif [ "$storage_round_pmem_resource" != "$storage_first_pmem_resource" ]; then
+    storage_certification_fail "${phase}_PMEM_RANGE_REUSE"
+    return 1
+  fi
+  if ! printf '%s' "$written" \
+    | timeout 5 dd of="$storage_round_pmem_device" bs=1 seek=4096 conv=notrunc 2>/dev/null \
+    || ! timeout 5 sync "$storage_round_pmem_device" 2>/dev/null \
+    || ! storage_pmem_marker_at_offset \
+      "$storage_round_pmem_device" "$written" 4096; then
+    storage_certification_fail "${phase}_PMEM_IO"
+    return 1
+  fi
+  emit_line "BANGBANG_STORAGE_${phase}_PMEM_IO"
+  if ! printf '1\n' > "$storage_round_pmem_pci_path/remove" 2>/dev/null; then
+    storage_certification_fail "${phase}_PMEM_REMOVE"
+    return 1
+  fi
+  attempts=0
+  while [ -b "$storage_round_pmem_device" ] && [ "$attempts" -lt 30 ]; do
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  if [ -b "$storage_round_pmem_device" ]; then
+    storage_certification_fail "${phase}_PMEM_REMOVE_WAIT"
+    return 1
+  fi
+  emit_line "BANGBANG_STORAGE_${phase}_PMEM_REMOVED"
+}
+
+check_storage_certification() {
+  storage_control_device=
+  storage_first_block_pci_path=
+  storage_first_pmem_pci_path=
+  storage_first_pmem_resource=
+
+  if ! cmdline_has root=/dev/vda || ! cmdline_has ro \
+    || [ "$(cat /sys/class/block/vda/ro 2>/dev/null || true)" != 1 ]; then
+    storage_certification_fail ROOT_READ_ONLY
+    return
+  fi
+  if ! wait_for_storage_block BANGBANG_STORAGE_CONTROL_HOST; then
+    storage_certification_fail CONTROL_DISCOVERY
+    return
+  fi
+  storage_control_device=$storage_block_device
+  if ! wait_for_storage_block BANGBANG_STORAGE_ASYNC_HOST; then
+    storage_certification_fail ASYNC_DISCOVERY
+    return
+  fi
+  storage_async_device=$storage_block_device
+  if ! wait_for_storage_block BANGBANG_STORAGE_VHOST_HOST; then
+    storage_certification_fail VHOST_DISCOVERY
+    return
+  fi
+  storage_vhost_device=$storage_block_device
+  if ! wait_for_storage_pmem BANGBANG_STORAGE_PMEM_HOST; then
+    storage_certification_fail PMEM_DISCOVERY
+    return
+  fi
+  storage_startup_pmem_device=$storage_pmem_device
+
+  if [ "$storage_control_device" = "$storage_async_device" ] \
+    || [ "$storage_control_device" = "$storage_vhost_device" ] \
+    || [ "$storage_async_device" = "$storage_vhost_device" ]; then
+    storage_certification_fail BLOCK_IDENTITIES
+    return
+  fi
+  if ! write_storage_block_sector_marker \
+      "$storage_control_device" BANGBANG_STORAGE_CONTROL_GUEST 2 \
+    || ! write_storage_block_sector_marker \
+      "$storage_async_device" BANGBANG_STORAGE_ASYNC_GUEST 2 \
+    || ! write_storage_block_sector_marker \
+      "$storage_vhost_device" BANGBANG_STORAGE_VHOST_GUEST 2 \
+    || ! printf '%s' BANGBANG_STORAGE_PMEM_GUEST \
+      | timeout 5 dd of="$storage_startup_pmem_device" bs=1 seek=4096 conv=notrunc 2>/dev/null \
+    || ! timeout 5 sync "$storage_startup_pmem_device" 2>/dev/null \
+    || ! storage_pmem_marker_at_offset \
+      "$storage_startup_pmem_device" BANGBANG_STORAGE_PMEM_GUEST 4096; then
+    storage_certification_fail INITIAL_IO
+    return
+  fi
+  if ! write_storage_block_sector_marker \
+    "$storage_control_device" BANGBANG_STORAGE_READY 1; then
+    storage_certification_fail READY
+    return
+  fi
+  emit_line BANGBANG_STORAGE_READY
+
+  if ! wait_for_storage_control_marker BANGBANG_STORAGE_CONTINUE_ONE 3; then
+    storage_certification_fail FIRST_CONTINUE
+    return
+  fi
+  storage_vhost_name=${storage_vhost_device##*/}
+  attempts=0
+  while [ "$(cat "/sys/class/block/$storage_vhost_name/size" 2>/dev/null || true)" != 16 ]; do
+    if [ "$attempts" -ge 30 ]; then
+      storage_certification_fail VHOST_RESIZE
+      return
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  if ! wait_for_storage_block BANGBANG_STORAGE_ASYNC_REPLACEMENT_HOST; then
+    storage_certification_fail ASYNC_REPLACEMENT_DISCOVERY
+    return
+  fi
+  storage_replacement_device=$storage_block_device
+  if ! write_storage_block_sector_marker \
+      "$storage_replacement_device" BANGBANG_STORAGE_ASYNC_REPLACEMENT_GUEST 2 \
+    || ! run_storage_block_round \
+      BANGBANG_STORAGE_RUNTIME_BLOCK_ONE_HOST \
+      BANGBANG_STORAGE_RUNTIME_BLOCK_ONE_GUEST FIRST; then
+    return
+  fi
+  if ! write_storage_block_sector_marker \
+    "$storage_control_device" BANGBANG_STORAGE_FIRST_REMOVED 4; then
+    storage_certification_fail FIRST_REMOVED
+    return
+  fi
+  emit_line BANGBANG_STORAGE_FIRST_REMOVED
+
+  if ! wait_for_storage_control_marker BANGBANG_STORAGE_CONTINUE_TWO 5; then
+    storage_certification_fail SECOND_CONTINUE
+    return
+  fi
+  if ! run_storage_block_round \
+      BANGBANG_STORAGE_RUNTIME_BLOCK_TWO_HOST \
+      BANGBANG_STORAGE_RUNTIME_BLOCK_TWO_GUEST SECOND; then
+    return
+  fi
+  if ! write_storage_block_sector_marker \
+    "$storage_control_device" BANGBANG_STORAGE_SECOND_BLOCK_REMOVED 7; then
+    storage_certification_fail SECOND_BLOCK_REMOVED
+    return
+  fi
+  emit_line BANGBANG_STORAGE_SECOND_BLOCK_REMOVED
+  if ! wait_for_storage_control_marker BANGBANG_STORAGE_CONTINUE_PMEM_ONE 8; then
+    storage_certification_fail FIRST_PMEM_CONTINUE
+    return
+  fi
+  if ! run_storage_pmem_round \
+      BANGBANG_STORAGE_RUNTIME_PMEM_ONE_HOST \
+      BANGBANG_STORAGE_RUNTIME_PMEM_ONE_GUEST FIRST; then
+    return
+  fi
+  if ! write_storage_block_sector_marker \
+    "$storage_control_device" BANGBANG_STORAGE_FIRST_PMEM_REMOVED 9; then
+    storage_certification_fail FIRST_PMEM_REMOVED
+    return
+  fi
+  emit_line BANGBANG_STORAGE_FIRST_PMEM_REMOVED
+  if ! wait_for_storage_control_marker BANGBANG_STORAGE_CONTINUE_PMEM_TWO 10; then
+    storage_certification_fail SECOND_PMEM_CONTINUE
+    return
+  fi
+  if ! run_storage_pmem_round \
+      BANGBANG_STORAGE_RUNTIME_PMEM_TWO_HOST \
+      BANGBANG_STORAGE_RUNTIME_PMEM_TWO_GUEST SECOND; then
+    return
+  fi
+  if ! write_storage_block_sector_marker \
+    "$storage_control_device" BANGBANG_STORAGE_SUCCESS 6; then
+    storage_certification_fail SUCCESS_MARKER
+    return
+  fi
+  emit_line BANGBANG_STORAGE_SUCCESS
 }
 
 block_hotplug_fail() {
@@ -3102,7 +3493,9 @@ if cmdline_has bangbang.block-serial=vda; then
 elif cmdline_has bangbang.block-serial=vdb; then
   report_block_serial vdb
 fi
-if cmdline_has bangbang.pmem-root=ro; then
+if cmdline_has bangbang.storage-certification=1; then
+  check_storage_certification
+elif cmdline_has bangbang.pmem-root=ro; then
   check_pmem_root_marker ro
 elif cmdline_has bangbang.pmem-root=rw; then
   check_pmem_root_marker rw

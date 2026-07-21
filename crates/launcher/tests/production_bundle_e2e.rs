@@ -77,6 +77,9 @@ const GUEST_ROOTFS_ID: &str = "grant-guest-rootfs-1362";
 const GUEST_DATA_ID: &str = "grant-guest-data-1362";
 const GUEST_REPLACEMENT_ID: &str = "grant-guest-replacement-1362";
 const GUEST_HOTPLUG_REUSE_ID: &str = "grant-guest-hotplug-reuse-1420";
+const GUEST_STORAGE_BLOCK_ONE_ID: &str = "grant-guest-storage-block-one-1471";
+const GUEST_STORAGE_BLOCK_TWO_ID: &str = "grant-guest-storage-block-two-1471";
+const GUEST_STORAGE_PMEM_ID: &str = "grant-guest-storage-pmem-1471";
 const GUEST_PMEM_ID: &str = "grant-guest-pmem-1362";
 const GUEST_PMEM_REUSE_ID: &str = "grant-guest-pmem-reuse-1421";
 const GUEST_PMEM_ROOT_ID: &str = "grant-guest-pmem-root-1444";
@@ -85,6 +88,9 @@ const GUEST_ROOTFS_REF: &str = "bangbang-grant:grant-guest-rootfs-1362";
 const GUEST_DATA_REF: &str = "bangbang-grant:grant-guest-data-1362";
 const GUEST_REPLACEMENT_REF: &str = "bangbang-grant:grant-guest-replacement-1362";
 const GUEST_HOTPLUG_REUSE_REF: &str = "bangbang-grant:grant-guest-hotplug-reuse-1420";
+const GUEST_STORAGE_BLOCK_ONE_REF: &str = "bangbang-grant:grant-guest-storage-block-one-1471";
+const GUEST_STORAGE_BLOCK_TWO_REF: &str = "bangbang-grant:grant-guest-storage-block-two-1471";
+const GUEST_STORAGE_PMEM_REF: &str = "bangbang-grant:grant-guest-storage-pmem-1471";
 const GUEST_PMEM_REF: &str = "bangbang-grant:grant-guest-pmem-1362";
 const GUEST_PMEM_REUSE_REF: &str = "bangbang-grant:grant-guest-pmem-reuse-1421";
 const GUEST_PMEM_ROOT_REF: &str = "bangbang-grant:grant-guest-pmem-root-1444";
@@ -201,6 +207,44 @@ const DIRECT_ROOTFS_VHOST_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=
 const DIRECT_ROOTFS_BLOCK_LIFECYCLE_TWO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-backing-lifecycle=two bangbang.expect-block-limiter-patch=1";
 const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
 const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
+const DIRECT_ROOTFS_STORAGE_CERTIFICATION_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 root=/dev/vda ro rootwait memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.storage-certification=1";
+const STORAGE_CONTROL_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTROL_HOST";
+const STORAGE_CONTROL_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTROL_GUEST";
+const STORAGE_ASYNC_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_ASYNC_HOST";
+const STORAGE_ASYNC_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_ASYNC_GUEST";
+const STORAGE_ASYNC_REPLACEMENT_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_ASYNC_REPLACEMENT_HOST";
+const STORAGE_ASYNC_REPLACEMENT_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_ASYNC_REPLACEMENT_GUEST";
+const STORAGE_VHOST_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_VHOST_HOST";
+const STORAGE_VHOST_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_VHOST_GUEST";
+const STORAGE_PMEM_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_PMEM_HOST";
+const STORAGE_PMEM_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_PMEM_GUEST";
+const STORAGE_RUNTIME_BLOCK_ONE_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_BLOCK_ONE_HOST";
+const STORAGE_RUNTIME_BLOCK_ONE_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_BLOCK_ONE_GUEST";
+const STORAGE_RUNTIME_BLOCK_TWO_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_BLOCK_TWO_HOST";
+const STORAGE_RUNTIME_BLOCK_TWO_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_BLOCK_TWO_GUEST";
+const STORAGE_RUNTIME_PMEM_ONE_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_PMEM_ONE_HOST";
+const STORAGE_RUNTIME_PMEM_ONE_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_PMEM_ONE_GUEST";
+const STORAGE_RUNTIME_PMEM_TWO_HOST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_PMEM_TWO_HOST";
+const STORAGE_RUNTIME_PMEM_TWO_GUEST_MARKER: &[u8] = b"BANGBANG_STORAGE_RUNTIME_PMEM_TWO_GUEST";
+const STORAGE_READY_MARKER: &[u8] = b"BANGBANG_STORAGE_READY";
+const STORAGE_CONTINUE_ONE_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTINUE_ONE";
+const STORAGE_FIRST_REMOVED_MARKER: &[u8] = b"BANGBANG_STORAGE_FIRST_REMOVED";
+const STORAGE_CONTINUE_TWO_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTINUE_TWO";
+const STORAGE_SECOND_BLOCK_REMOVED_MARKER: &[u8] = b"BANGBANG_STORAGE_SECOND_BLOCK_REMOVED";
+const STORAGE_CONTINUE_PMEM_ONE_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTINUE_PMEM_ONE";
+const STORAGE_FIRST_PMEM_REMOVED_MARKER: &[u8] = b"BANGBANG_STORAGE_FIRST_PMEM_REMOVED";
+const STORAGE_CONTINUE_PMEM_TWO_MARKER: &[u8] = b"BANGBANG_STORAGE_CONTINUE_PMEM_TWO";
+const STORAGE_SUCCESS_MARKER: &[u8] = b"BANGBANG_STORAGE_SUCCESS";
+const STORAGE_CONTROL_GUEST_OFFSET: u64 = 2 * VIRTIO_BLOCK_SECTOR_BYTES;
+const STORAGE_READY_OFFSET: u64 = VIRTIO_BLOCK_SECTOR_BYTES;
+const STORAGE_CONTINUE_ONE_OFFSET: u64 = 3 * VIRTIO_BLOCK_SECTOR_BYTES;
+const STORAGE_FIRST_REMOVED_OFFSET: u64 = 4 * VIRTIO_BLOCK_SECTOR_BYTES;
+const STORAGE_CONTINUE_TWO_OFFSET: u64 = 5 * VIRTIO_BLOCK_SECTOR_BYTES;
+const STORAGE_SUCCESS_OFFSET: u64 = 6 * VIRTIO_BLOCK_SECTOR_BYTES;
+const STORAGE_SECOND_BLOCK_REMOVED_OFFSET: u64 = 7 * VIRTIO_BLOCK_SECTOR_BYTES;
+const STORAGE_CONTINUE_PMEM_ONE_OFFSET: u64 = 8 * VIRTIO_BLOCK_SECTOR_BYTES;
+const STORAGE_FIRST_PMEM_REMOVED_OFFSET: u64 = 9 * VIRTIO_BLOCK_SECTOR_BYTES;
+const STORAGE_CONTINUE_PMEM_TWO_OFFSET: u64 = 10 * VIRTIO_BLOCK_SECTOR_BYTES;
 const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
 const BLOCK_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_ONE";
 const BLOCK_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_ONE";
@@ -1747,6 +1791,673 @@ fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers(
     assert!(!root_socket.exists() && !scratch_socket.exists());
     assert!(!fixture.vsock_socket().exists());
     assert!(session_entries().is_empty());
+}
+
+#[test]
+fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants() {
+    let bundle = production_bundle();
+    let fixture = SocketDirectoryGrantFixture::new_with_vhost_user("storage-certification");
+    let vhost_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_ONE);
+    let vhost_backing = fixture.vhost_user_backing("storage-certification-vhost.img");
+
+    resize_and_write_file_marker_at(
+        &fixture.devices.data,
+        16 * VIRTIO_BLOCK_SECTOR_BYTES,
+        0,
+        STORAGE_CONTROL_HOST_MARKER,
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.replacement,
+        8 * VIRTIO_BLOCK_SECTOR_BYTES,
+        0,
+        STORAGE_ASYNC_HOST_MARKER,
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.hotplug_reuse,
+        8 * VIRTIO_BLOCK_SECTOR_BYTES,
+        0,
+        STORAGE_ASYNC_REPLACEMENT_HOST_MARKER,
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.storage_block_one,
+        8 * VIRTIO_BLOCK_SECTOR_BYTES,
+        0,
+        STORAGE_RUNTIME_BLOCK_ONE_HOST_MARKER,
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.storage_block_two,
+        8 * VIRTIO_BLOCK_SECTOR_BYTES,
+        0,
+        STORAGE_RUNTIME_BLOCK_TWO_HOST_MARKER,
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.pmem,
+        PMEM_BACKING_LEN,
+        0,
+        STORAGE_PMEM_HOST_MARKER,
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.pmem_reuse,
+        PMEM_BACKING_LEN,
+        0,
+        STORAGE_RUNTIME_PMEM_ONE_HOST_MARKER,
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.storage_pmem,
+        PMEM_BACKING_LEN,
+        0,
+        STORAGE_RUNTIME_PMEM_TWO_HOST_MARKER,
+    );
+    create_sized_file(&vhost_backing, 8 * VIRTIO_BLOCK_SECTOR_BYTES);
+    resize_and_write_file_marker_at(
+        &vhost_backing,
+        8 * VIRTIO_BLOCK_SECTOR_BYTES,
+        0,
+        STORAGE_VHOST_HOST_MARKER,
+    );
+    let vhost_backend = VhostUserBlockBackend::start(
+        &vhost_socket,
+        &vhost_backing,
+        VhostUserBlockBackendOptions::regular(false),
+    )
+    .expect("contained aggregate vhost-user backend should start");
+
+    let mut running = spawn_ready_socket_grant_api_launcher_with_extra_args(
+        &bundle,
+        &fixture,
+        "storage-certification",
+        &["--enable-pci"],
+    );
+    fixture.devices.replace_source_pathnames();
+    let worker = only_worker_pid(&running.child);
+    assert!(
+        child_pids(worker).is_empty(),
+        "contained aggregate setup must not retain a broker helper",
+    );
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT contained aggregate machine config",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/hotplug/memory",
+            r#"{"total_size_mib":128,"block_size_mib":2,"slot_size_mib":128}"#,
+        ),
+        204,
+        "PUT contained aggregate memory hotplug config",
+    );
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "boot_args": DIRECT_ROOTFS_STORAGE_CERTIFICATION_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source).expect("aggregate boot source should serialize"),
+        ),
+        204,
+        "PUT contained aggregate boot source",
+    );
+    for (path, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": GUEST_ROOTFS_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+                "io_engine": "Sync",
+            }),
+            "PUT contained aggregate read-only Sync rootfs",
+        ),
+        (
+            "/drives/control",
+            serde_json::json!({
+                "drive_id": "control",
+                "path_on_host": GUEST_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+                "io_engine": "Sync",
+            }),
+            "PUT contained aggregate Sync control",
+        ),
+        (
+            "/drives/asyncdata",
+            serde_json::json!({
+                "drive_id": "asyncdata",
+                "path_on_host": GUEST_REPLACEMENT_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+                "io_engine": "Async",
+            }),
+            "PUT contained aggregate Async data",
+        ),
+        (
+            "/drives/vhostdata",
+            serde_json::json!({
+                "drive_id": "vhostdata",
+                "socket": VHOST_USER_SOCKET_REF_ONE,
+                "is_root_device": false,
+                "cache_type": "Writeback",
+            }),
+            "PUT contained aggregate vhost-user data",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("aggregate drive should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/pmem/pmem0",
+            &serde_json::json!({
+                "id": "pmem0",
+                "path_on_host": GUEST_PMEM_REF,
+                "read_only": false,
+            })
+            .to_string(),
+        ),
+        204,
+        "PUT contained aggregate startup pmem",
+    );
+    let configured = http_get(&running.socket, "/vm/config");
+    assert_http_status(&configured, 200, "GET contained aggregate startup config");
+    for expected in [
+        GUEST_ROOTFS_REF,
+        GUEST_DATA_REF,
+        GUEST_REPLACEMENT_REF,
+        GUEST_PMEM_REF,
+        VHOST_USER_SOCKET_REF_ONE,
+        r#""io_engine":"Sync""#,
+        r#""io_engine":"Async""#,
+    ] {
+        assert!(
+            configured.contains(expected),
+            "contained aggregate config should contain {expected:?}: {configured}",
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start contained aggregate storage guest",
+    );
+    wait_for_file_marker_at(
+        &fixture.devices.opened_data,
+        STORAGE_READY_OFFSET,
+        STORAGE_READY_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained aggregate guest should complete initial storage I/O");
+    vhost_backend
+        .wait_for_activation(PROCESS_TIMEOUT)
+        .expect("contained aggregate vhost-user backend should activate");
+    assert_eq!(
+        file_bytes_at(
+            &fixture.devices.opened_data,
+            STORAGE_CONTROL_GUEST_OFFSET,
+            STORAGE_CONTROL_GUEST_MARKER.len(),
+        ),
+        STORAGE_CONTROL_GUEST_MARKER,
+    );
+    assert_eq!(
+        file_bytes_at(
+            &fixture.devices.opened_replacement,
+            STORAGE_CONTROL_GUEST_OFFSET,
+            STORAGE_ASYNC_GUEST_MARKER.len(),
+        ),
+        STORAGE_ASYNC_GUEST_MARKER,
+    );
+    assert_eq!(
+        file_bytes_at(
+            &vhost_backing,
+            STORAGE_CONTROL_GUEST_OFFSET,
+            STORAGE_VHOST_GUEST_MARKER.len(),
+        ),
+        STORAGE_VHOST_GUEST_MARKER,
+    );
+    assert_eq!(
+        file_bytes_at(
+            &fixture.devices.opened_pmem,
+            PMEM_GUEST_FLUSH_OFFSET,
+            STORAGE_PMEM_GUEST_MARKER.len(),
+        ),
+        STORAGE_PMEM_GUEST_MARKER,
+    );
+    vhost_backend
+        .wait_for_flush(PROCESS_TIMEOUT)
+        .expect("contained aggregate vhost-user write should flush");
+
+    OpenOptions::new()
+        .write(true)
+        .open(&vhost_backing)
+        .expect("contained aggregate vhost backing should reopen")
+        .set_len(16 * VIRTIO_BLOCK_SECTOR_BYTES)
+        .expect("contained aggregate vhost backing should resize");
+    let (async_patch, pmem_patch, vhost_patch) = thread::scope(|scope| {
+        let async_patch = scope.spawn(|| {
+            http_request(
+                &running.socket,
+                "PATCH",
+                "/drives/asyncdata",
+                r#"{"drive_id":"asyncdata","rate_limiter":{"ops":{"size":2,"one_time_burst":1,"refill_time":100}}}"#,
+            )
+        });
+        let pmem_patch = scope.spawn(|| {
+            http_request(
+                &running.socket,
+                "PATCH",
+                "/pmem/pmem0",
+                r#"{"id":"pmem0","rate_limiter":{"ops":{"size":3,"one_time_burst":1,"refill_time":100}}}"#,
+            )
+        });
+        let vhost_patch = scope.spawn(|| {
+            http_request(
+                &running.socket,
+                "PATCH",
+                "/drives/vhostdata",
+                r#"{"drive_id":"vhostdata"}"#,
+            )
+        });
+        (
+            async_patch
+                .join()
+                .expect("contained Async PATCH should join"),
+            pmem_patch.join().expect("contained pmem PATCH should join"),
+            vhost_patch
+                .join()
+                .expect("contained vhost PATCH should join"),
+        )
+    });
+    assert_http_status(&async_patch, 204, "concurrent contained Async PATCH");
+    assert_http_status(&pmem_patch, 204, "concurrent contained pmem PATCH");
+    assert_http_status(&vhost_patch, 204, "concurrent contained vhost PATCH");
+    assert_eq!(vhost_backend.report().config_requests, 2);
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":128}"#,
+        ),
+        204,
+        "grow contained aggregate memory",
+    );
+    let grown = wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":128"#,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained aggregate memory should grow");
+    assert_http_status(&grown, 200, "GET grown contained aggregate memory");
+
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause contained aggregate guest before replacement",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/asyncdata",
+            &serde_json::json!({
+                "drive_id": "asyncdata",
+                "path_on_host": GUEST_HOTPLUG_REUSE_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+                "io_engine": "Async",
+                "rate_limiter": {"ops": {"size": 4, "one_time_burst": 1, "refill_time": 100}},
+            })
+            .to_string(),
+        ),
+        204,
+        "replace contained aggregate Async backing",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/runtime_block",
+            &serde_json::json!({
+                "drive_id": "runtime_block",
+                "path_on_host": GUEST_STORAGE_BLOCK_ONE_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+                "io_engine": "Sync",
+            })
+            .to_string(),
+        ),
+        204,
+        "PUT first contained aggregate runtime block",
+    );
+    let replaced = http_get(&running.socket, "/vm/config");
+    assert_http_status(&replaced, 200, "GET contained aggregate replaced config");
+    assert!(replaced.contains(GUEST_HOTPLUG_REUSE_REF));
+    assert!(!replaced.contains(GUEST_REPLACEMENT_REF));
+    resize_and_write_file_marker_at(
+        &fixture.devices.opened_data,
+        16 * VIRTIO_BLOCK_SECTOR_BYTES,
+        STORAGE_CONTINUE_ONE_OFFSET,
+        STORAGE_CONTINUE_ONE_MARKER,
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume contained aggregate first block round",
+    );
+    wait_for_file_marker_at(
+        &fixture.devices.opened_data,
+        STORAGE_FIRST_REMOVED_OFFSET,
+        STORAGE_FIRST_REMOVED_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained aggregate first block should leave the guest");
+    assert_eq!(
+        file_bytes_at(
+            &fixture.devices.opened_hotplug_reuse,
+            STORAGE_CONTROL_GUEST_OFFSET,
+            STORAGE_ASYNC_REPLACEMENT_GUEST_MARKER.len(),
+        ),
+        STORAGE_ASYNC_REPLACEMENT_GUEST_MARKER,
+    );
+    assert_eq!(
+        file_bytes_at(
+            &fixture.devices.opened_storage_block_one,
+            STORAGE_CONTROL_GUEST_OFFSET,
+            STORAGE_RUNTIME_BLOCK_ONE_GUEST_MARKER.len(),
+        ),
+        STORAGE_RUNTIME_BLOCK_ONE_GUEST_MARKER,
+    );
+
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause contained aggregate before block reuse",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/drives/runtime_block", ""),
+        204,
+        "DELETE first contained aggregate runtime block",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/runtime_block_two",
+            &serde_json::json!({
+                "drive_id": "runtime_block_two",
+                "path_on_host": GUEST_STORAGE_BLOCK_TWO_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+                "io_engine": "Sync",
+            })
+            .to_string(),
+        ),
+        204,
+        "PUT reused contained aggregate runtime block",
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.opened_data,
+        16 * VIRTIO_BLOCK_SECTOR_BYTES,
+        STORAGE_CONTINUE_TWO_OFFSET,
+        STORAGE_CONTINUE_TWO_MARKER,
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume contained aggregate reused block round",
+    );
+    wait_for_file_marker_at(
+        &fixture.devices.opened_data,
+        STORAGE_SECOND_BLOCK_REMOVED_OFFSET,
+        STORAGE_SECOND_BLOCK_REMOVED_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained aggregate reused block should preserve its PCI slot");
+    assert_eq!(
+        file_bytes_at(
+            &fixture.devices.opened_storage_block_two,
+            STORAGE_CONTROL_GUEST_OFFSET,
+            STORAGE_RUNTIME_BLOCK_TWO_GUEST_MARKER.len(),
+        ),
+        STORAGE_RUNTIME_BLOCK_TWO_GUEST_MARKER,
+    );
+
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause contained aggregate before first pmem",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/drives/runtime_block_two", ""),
+        204,
+        "DELETE reused contained aggregate runtime block",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/pmem/runtime_pmem",
+            &serde_json::json!({
+                "id": "runtime_pmem",
+                "path_on_host": GUEST_PMEM_REUSE_REF,
+                "read_only": false,
+            })
+            .to_string(),
+        ),
+        204,
+        "PUT first contained aggregate runtime pmem",
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.opened_data,
+        16 * VIRTIO_BLOCK_SECTOR_BYTES,
+        STORAGE_CONTINUE_PMEM_ONE_OFFSET,
+        STORAGE_CONTINUE_PMEM_ONE_MARKER,
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume contained aggregate first pmem round",
+    );
+    wait_for_file_marker_at(
+        &fixture.devices.opened_data,
+        STORAGE_FIRST_PMEM_REMOVED_OFFSET,
+        STORAGE_FIRST_PMEM_REMOVED_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained aggregate first pmem should leave the guest");
+    assert_eq!(
+        file_bytes_at(
+            &fixture.devices.opened_pmem_reuse,
+            PMEM_GUEST_FLUSH_OFFSET,
+            STORAGE_RUNTIME_PMEM_ONE_GUEST_MARKER.len(),
+        ),
+        STORAGE_RUNTIME_PMEM_ONE_GUEST_MARKER,
+    );
+
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause contained aggregate before pmem reuse",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/pmem/runtime_pmem", ""),
+        204,
+        "DELETE first contained aggregate runtime pmem",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/pmem/runtime_pmem_two",
+            &serde_json::json!({
+                "id": "runtime_pmem_two",
+                "path_on_host": GUEST_STORAGE_PMEM_REF,
+                "read_only": false,
+                "rate_limiter": {"ops": {"size": 5, "refill_time": 100}},
+            })
+            .to_string(),
+        ),
+        204,
+        "PUT reused contained aggregate runtime pmem",
+    );
+    resize_and_write_file_marker_at(
+        &fixture.devices.opened_data,
+        16 * VIRTIO_BLOCK_SECTOR_BYTES,
+        STORAGE_CONTINUE_PMEM_TWO_OFFSET,
+        STORAGE_CONTINUE_PMEM_TWO_MARKER,
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume contained aggregate reused pmem round",
+    );
+    wait_for_file_marker_at(
+        &fixture.devices.opened_data,
+        STORAGE_SUCCESS_OFFSET,
+        STORAGE_SUCCESS_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained aggregate guest should complete storage certification");
+    assert_eq!(
+        file_bytes_at(
+            &fixture.devices.opened_storage_pmem,
+            PMEM_GUEST_FLUSH_OFFSET,
+            STORAGE_RUNTIME_PMEM_TWO_GUEST_MARKER.len(),
+        ),
+        STORAGE_RUNTIME_PMEM_TWO_GUEST_MARKER,
+    );
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/pmem/runtime_pmem_two", ""),
+        204,
+        "final DELETE contained aggregate runtime pmem",
+    );
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":0}"#,
+        ),
+        204,
+        "shrink contained aggregate memory",
+    );
+    let shrunk = wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":0"#,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained aggregate memory should shrink");
+    assert_http_status(&shrunk, 200, "GET shrunk contained aggregate memory");
+    let final_config = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &final_config,
+        200,
+        "GET final contained aggregate storage config",
+    );
+    for expected in [
+        GUEST_ROOTFS_REF,
+        GUEST_DATA_REF,
+        GUEST_HOTPLUG_REUSE_REF,
+        GUEST_PMEM_REF,
+        VHOST_USER_SOCKET_REF_ONE,
+        r#""drive_id":"asyncdata""#,
+        r#""id":"pmem0""#,
+    ] {
+        assert!(
+            final_config.contains(expected),
+            "final contained aggregate config should contain {expected:?}: {final_config}",
+        );
+    }
+    for removed in [
+        GUEST_REPLACEMENT_REF,
+        GUEST_STORAGE_BLOCK_ONE_REF,
+        GUEST_STORAGE_BLOCK_TWO_REF,
+        GUEST_PMEM_REUSE_REF,
+        GUEST_STORAGE_PMEM_REF,
+        r#""drive_id":"runtime_block""#,
+        r#""drive_id":"runtime_block_two""#,
+        r#""id":"runtime_pmem""#,
+        r#""id":"runtime_pmem_two""#,
+    ] {
+        assert!(
+            !final_config.contains(removed),
+            "final contained aggregate config must omit removed or replaced storage {removed:?}: {final_config}",
+        );
+    }
+    assert_aggregate_storage_vhost_user_memory_aperture(&vhost_backend.report());
+    assert!(
+        child_pids(worker).is_empty(),
+        "contained aggregate storage must not retain a helper",
+    );
+
+    stop_running_launcher(&mut running, "contained aggregate storage shutdown");
+    vhost_backend
+        .wait_for_frontend_close(PROCESS_TIMEOUT)
+        .expect("contained aggregate vhost frontend should close orderly");
+    let report = vhost_backend
+        .finish()
+        .expect("contained aggregate vhost backend should finish");
+    assert!(report.activated && report.frontend_closed);
+    assert!(report.reads > 0 && report.writes > 0 && report.flushes > 0);
+    assert!(!vhost_socket.exists());
+    assert!(!fixture.api_socket().exists());
+    assert!(session_entries().is_empty());
+    for (path, marker) in [
+        (&fixture.devices.data, STORAGE_CONTROL_GUEST_MARKER),
+        (&fixture.devices.replacement, STORAGE_ASYNC_GUEST_MARKER),
+        (
+            &fixture.devices.hotplug_reuse,
+            STORAGE_ASYNC_REPLACEMENT_GUEST_MARKER,
+        ),
+        (
+            &fixture.devices.storage_block_one,
+            STORAGE_RUNTIME_BLOCK_ONE_GUEST_MARKER,
+        ),
+        (
+            &fixture.devices.storage_block_two,
+            STORAGE_RUNTIME_BLOCK_TWO_GUEST_MARKER,
+        ),
+        (&fixture.devices.pmem, STORAGE_PMEM_GUEST_MARKER),
+        (
+            &fixture.devices.pmem_reuse,
+            STORAGE_RUNTIME_PMEM_ONE_GUEST_MARKER,
+        ),
+        (
+            &fixture.devices.storage_pmem,
+            STORAGE_RUNTIME_PMEM_TWO_GUEST_MARKER,
+        ),
+    ] {
+        assert!(
+            !fs::read(path)
+                .expect("planted replacement backing should read")
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "contained aggregate guest marker must remain on the launcher-opened object",
+        );
+    }
 }
 
 #[test]
@@ -5945,15 +6656,21 @@ struct GuestDeviceGrantFixture {
     data: PathBuf,
     replacement: PathBuf,
     hotplug_reuse: PathBuf,
+    storage_block_one: PathBuf,
+    storage_block_two: PathBuf,
     pmem: PathBuf,
     pmem_reuse: PathBuf,
+    storage_pmem: PathBuf,
     read_only_data: PathBuf,
     opened_rootfs: PathBuf,
     opened_data: PathBuf,
     opened_replacement: PathBuf,
     opened_hotplug_reuse: PathBuf,
+    opened_storage_block_one: PathBuf,
+    opened_storage_block_two: PathBuf,
     opened_pmem: PathBuf,
     opened_pmem_reuse: PathBuf,
+    opened_storage_pmem: PathBuf,
     opened_read_only_data: PathBuf,
     manifest: PathBuf,
 }
@@ -5967,15 +6684,21 @@ impl GuestDeviceGrantFixture {
         let data = canonical_root.join("external-data.img");
         let replacement = canonical_root.join("external-replacement.img");
         let hotplug_reuse = canonical_root.join("external-hotplug-reuse.img");
+        let storage_block_one = canonical_root.join("external-storage-block-one.img");
+        let storage_block_two = canonical_root.join("external-storage-block-two.img");
         let pmem = canonical_root.join("external-pmem.img");
         let pmem_reuse = canonical_root.join("external-pmem-reuse.img");
+        let storage_pmem = canonical_root.join("external-storage-pmem.img");
         let read_only_data = canonical_root.join("external-read-only-data.img");
         let opened_rootfs = canonical_root.join("opened-rootfs.ext4");
         let opened_data = canonical_root.join("opened-data.img");
         let opened_replacement = canonical_root.join("opened-replacement.img");
         let opened_hotplug_reuse = canonical_root.join("opened-hotplug-reuse.img");
+        let opened_storage_block_one = canonical_root.join("opened-storage-block-one.img");
+        let opened_storage_block_two = canonical_root.join("opened-storage-block-two.img");
         let opened_pmem = canonical_root.join("opened-pmem.img");
         let opened_pmem_reuse = canonical_root.join("opened-pmem-reuse.img");
+        let opened_storage_pmem = canonical_root.join("opened-storage-pmem.img");
         let opened_read_only_data = canonical_root.join("opened-read-only-data.img");
         let manifest = canonical_root.join("grant-manifest.json");
 
@@ -5983,8 +6706,11 @@ impl GuestDeviceGrantFixture {
         create_sized_file(&data, 512);
         create_sized_file(&replacement, 512);
         create_sized_file(&hotplug_reuse, 512);
+        create_sized_file(&storage_block_one, 512);
+        create_sized_file(&storage_block_two, 512);
         create_pmem_file(&pmem, PMEM_HOST_MARKER);
         create_pmem_file(&pmem_reuse, PMEM_HOTPLUG_HOST_TWO_MARKER);
+        create_pmem_file(&storage_pmem, STORAGE_RUNTIME_PMEM_TWO_HOST_MARKER);
         create_sized_file(&read_only_data, 512);
 
         let manifest_json = serde_json::json!({
@@ -6015,6 +6741,18 @@ impl GuestDeviceGrantFixture {
                     "source": path_text(&hotplug_reuse),
                 },
                 {
+                    "id": GUEST_STORAGE_BLOCK_ONE_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&storage_block_one),
+                },
+                {
+                    "id": GUEST_STORAGE_BLOCK_TWO_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&storage_block_two),
+                },
+                {
                     "id": GUEST_PMEM_ID,
                     "role": "pmem-backing",
                     "access": "read-write",
@@ -6025,6 +6763,12 @@ impl GuestDeviceGrantFixture {
                     "role": "pmem-backing",
                     "access": "read-write",
                     "source": path_text(&pmem_reuse),
+                },
+                {
+                    "id": GUEST_STORAGE_PMEM_ID,
+                    "role": "pmem-backing",
+                    "access": "read-write",
+                    "source": path_text(&storage_pmem),
                 },
                 {
                     "id": GUEST_READ_ONLY_DATA_ID,
@@ -6046,15 +6790,21 @@ impl GuestDeviceGrantFixture {
             data,
             replacement,
             hotplug_reuse,
+            storage_block_one,
+            storage_block_two,
             pmem,
             pmem_reuse,
+            storage_pmem,
             read_only_data,
             opened_rootfs,
             opened_data,
             opened_replacement,
             opened_hotplug_reuse,
+            opened_storage_block_one,
+            opened_storage_block_two,
             opened_pmem,
             opened_pmem_reuse,
+            opened_storage_pmem,
             opened_read_only_data,
             manifest,
         }
@@ -6066,8 +6816,11 @@ impl GuestDeviceGrantFixture {
             (&self.data, &self.opened_data),
             (&self.replacement, &self.opened_replacement),
             (&self.hotplug_reuse, &self.opened_hotplug_reuse),
+            (&self.storage_block_one, &self.opened_storage_block_one),
+            (&self.storage_block_two, &self.opened_storage_block_two),
             (&self.pmem, &self.opened_pmem),
             (&self.pmem_reuse, &self.opened_pmem_reuse),
+            (&self.storage_pmem, &self.opened_storage_pmem),
             (&self.read_only_data, &self.opened_read_only_data),
         ] {
             fs::rename(source, opened).expect("launcher-opened source should move");
@@ -6076,8 +6829,11 @@ impl GuestDeviceGrantFixture {
         create_sized_file(&self.data, 512);
         create_sized_file(&self.replacement, 512);
         create_sized_file(&self.hotplug_reuse, 512);
+        create_sized_file(&self.storage_block_one, 512);
+        create_sized_file(&self.storage_block_two, 512);
         create_sized_file(&self.pmem, PMEM_BACKING_LEN);
         create_sized_file(&self.pmem_reuse, PMEM_BACKING_LEN);
+        create_sized_file(&self.storage_pmem, PMEM_BACKING_LEN);
         create_sized_file(&self.read_only_data, 512);
     }
 
@@ -6087,31 +6843,43 @@ impl GuestDeviceGrantFixture {
             path_text(&self.data),
             path_text(&self.replacement),
             path_text(&self.hotplug_reuse),
+            path_text(&self.storage_block_one),
+            path_text(&self.storage_block_two),
             path_text(&self.pmem),
             path_text(&self.pmem_reuse),
+            path_text(&self.storage_pmem),
             path_text(&self.read_only_data),
             path_text(&self.opened_rootfs),
             path_text(&self.opened_data),
             path_text(&self.opened_replacement),
             path_text(&self.opened_hotplug_reuse),
+            path_text(&self.opened_storage_block_one),
+            path_text(&self.opened_storage_block_two),
             path_text(&self.opened_pmem),
             path_text(&self.opened_pmem_reuse),
+            path_text(&self.opened_storage_pmem),
             path_text(&self.opened_read_only_data),
             path_text(&self.manifest),
             GUEST_ROOTFS_ID,
             GUEST_DATA_ID,
             GUEST_REPLACEMENT_ID,
             GUEST_HOTPLUG_REUSE_ID,
+            GUEST_STORAGE_BLOCK_ONE_ID,
+            GUEST_STORAGE_BLOCK_TWO_ID,
             GUEST_PMEM_ID,
             GUEST_PMEM_REUSE_ID,
+            GUEST_STORAGE_PMEM_ID,
             GUEST_PMEM_ROOT_ID,
             GUEST_READ_ONLY_DATA_ID,
             GUEST_ROOTFS_REF,
             GUEST_DATA_REF,
             GUEST_REPLACEMENT_REF,
             GUEST_HOTPLUG_REUSE_REF,
+            GUEST_STORAGE_BLOCK_ONE_REF,
+            GUEST_STORAGE_BLOCK_TWO_REF,
             GUEST_PMEM_REF,
             GUEST_PMEM_REUSE_REF,
+            GUEST_STORAGE_PMEM_REF,
             GUEST_PMEM_ROOT_REF,
             GUEST_READ_ONLY_DATA_REF,
             std::str::from_utf8(PMEM_HOST_MARKER).expect("pmem marker should be UTF-8"),
@@ -8141,6 +8909,28 @@ fn file_bytes_at(path: &Path, offset: u64, len: usize) -> Vec<u8> {
     bytes
 }
 
+fn wait_for_file_marker_at(
+    path: &Path,
+    offset: u64,
+    marker: &[u8],
+    timeout: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        if fs::metadata(path).is_ok() && file_bytes_at(path, offset, marker.len()) == marker {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            let observed = file_bytes_at(path, offset, marker.len());
+            return Err(format!(
+                "timed out after {timeout:?} waiting for marker {:?} at offset {offset}; observed {observed:?}",
+                String::from_utf8_lossy(marker),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn write_virtual_block_marker_at(media: &MacosVirtualBlock, offset: u64, marker: &[u8]) {
     let mut sector = vec![0_u8; VIRTIO_BLOCK_SECTOR_BYTES as usize];
     sector[..marker.len()].copy_from_slice(marker);
@@ -8249,6 +9039,33 @@ fn assert_vhost_user_memory_aperture(report: &VhostUserBlockBackendReport, conte
             (VIRTIO_MEM_APERTURE_START, 128 * MIB, 0),
         ],
         "{context} backend must receive boot RAM plus one complete stable aperture"
+    );
+    assert_eq!(report.memory_regions, geometry.len());
+    assert_eq!(report.memory_table_requests, 1);
+}
+
+fn assert_aggregate_storage_vhost_user_memory_aperture(report: &VhostUserBlockBackendReport) {
+    const MIB: u64 = 1024 * 1024;
+    const ARM64_DRAM_START: u64 = 0x8000_0000;
+    const VIRTIO_MEM_APERTURE_AFTER_PMEM: u64 = 0x80_0800_0000;
+    let geometry = report
+        .memory_region_geometry
+        .iter()
+        .map(|region| {
+            (
+                region.guest_phys_addr,
+                region.memory_size,
+                region.mmap_offset,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        geometry,
+        vec![
+            (ARM64_DRAM_START, 256 * MIB, 0),
+            (VIRTIO_MEM_APERTURE_AFTER_PMEM, 128 * MIB, 0),
+        ],
+        "contained aggregate startup pmem must move the complete virtio-mem aperture to the next 128 MiB slot",
     );
     assert_eq!(report.memory_regions, geometry.len());
     assert_eq!(report.memory_table_requests, 1);

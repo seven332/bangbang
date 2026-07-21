@@ -987,6 +987,101 @@ impl HvfArm64BootPciDataDevices {
         Ok(())
     }
 
+    fn preflight_runtime_pmem(
+        &self,
+        config: &PmemConfig,
+        runtime_pmem_device_count: usize,
+        runtime_pmem_device_capacity: usize,
+        metrics: &SharedPmemDeviceMetricsRegistry,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        if !self.runtime_hotplug {
+            return Err(PmemRuntimeMutationError::PciNotEnabled);
+        }
+        if config.root_device() {
+            return Err(PmemRuntimeMutationError::RootInsertUnsupported);
+        }
+        if self.pmem.iter().any(|device| device.pmem_id == config.id()) {
+            return Err(PmemRuntimeMutationError::DuplicatePmem);
+        }
+        if self.endpoint_count() >= PCI_ENDPOINT_SLOT_COUNT {
+            return Err(PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI endpoint capacity is exhausted".to_string(),
+            });
+        }
+        if self.pmem.len() == self.pmem.capacity()
+            || runtime_pmem_device_count == runtime_pmem_device_capacity
+        {
+            return Err(PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime pmem inventory capacity is exhausted".to_string(),
+            });
+        }
+        let available_slots = self
+            .validation
+            .segment()
+            .with_segment(|segment| segment.available_endpoint_slots())
+            .map_err(|source| PmemRuntimeMutationError::ActiveSessionCommand {
+                message: format!("PCI segment is unavailable: {source}"),
+            })?;
+        if available_slots == 0 {
+            return Err(PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI function capacity is exhausted".to_string(),
+            });
+        }
+        let available_bars = pci_data_available_bar_count(self.validation.bar_allocator())
+            .map_err(|source| PmemRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            })?;
+        if available_bars == 0 {
+            return Err(PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI capability BAR capacity is exhausted".to_string(),
+            });
+        }
+        let planned_bar = pci_data_bar_plan(self.validation.bar_allocator(), 1)
+            .map_err(|source| PmemRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI capability BAR capacity is exhausted".to_string(),
+            })?;
+        if self
+            .msi_interrupts
+            .as_ref()
+            .is_none_or(|interrupts| interrupts.lease_count() == 0)
+        {
+            return Err(PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI interrupt resources are unavailable".to_string(),
+            });
+        }
+        let dispatcher =
+            self.dispatcher
+                .lock()
+                .map_err(|_| PmemRuntimeMutationError::ActiveSessionCommand {
+                    message: "PCI data-device MMIO dispatcher is unavailable".to_string(),
+                })?;
+        Self::available_region_id(&dispatcher).map_err(|source| {
+            PmemRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        if dispatcher
+            .regions()
+            .iter()
+            .any(|region| region.range().overlaps(planned_bar))
+        {
+            return Err(PmemRuntimeMutationError::PrepareDevice {
+                message: "runtime PCI capability BAR overlaps live MMIO state".to_string(),
+            });
+        }
+        metrics.preflight_device(config.id()).map_err(|source| {
+            PmemRuntimeMutationError::PrepareDevice {
+                message: source.to_string(),
+            }
+        })?;
+        Ok(())
+    }
+
     fn update_runtime_block(
         &self,
         config: &DriveConfig,
@@ -1368,27 +1463,12 @@ impl HvfArm64BootPciDataDevices {
         backing: PmemFileBacking,
         metrics: &SharedPmemDeviceMetricsRegistry,
     ) -> Result<(), PmemRuntimeMutationError> {
-        if !self.runtime_hotplug {
-            return Err(PmemRuntimeMutationError::PciNotEnabled);
-        }
-        if config.root_device() {
-            return Err(PmemRuntimeMutationError::RootInsertUnsupported);
-        }
-        if self.pmem.iter().any(|device| device.pmem_id == config.id()) {
-            return Err(PmemRuntimeMutationError::DuplicatePmem);
-        }
-        if self.endpoint_count() >= PCI_ENDPOINT_SLOT_COUNT {
-            return Err(PmemRuntimeMutationError::PrepareDevice {
-                message: "runtime PCI endpoint capacity is exhausted".to_string(),
-            });
-        }
-        if self.pmem.len() == self.pmem.capacity()
-            || runtime_pmem_devices.len() == runtime_pmem_devices.capacity()
-        {
-            return Err(PmemRuntimeMutationError::PrepareDevice {
-                message: "runtime pmem inventory capacity is exhausted".to_string(),
-            });
-        }
+        self.preflight_runtime_pmem(
+            config,
+            runtime_pmem_devices.len(),
+            runtime_pmem_devices.capacity(),
+            metrics,
+        )?;
 
         let reserved_count = self
             .pmem_static_reserved_ranges
@@ -5754,6 +5834,22 @@ impl HvfArm64BootSession<'_> {
         )
     }
 
+    /// Checks owner-side runtime pmem capacity without opening or mapping its backing.
+    pub fn preflight_runtime_pmem_device(
+        &self,
+        config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(PmemRuntimeMutationError::PciNotEnabled)?
+            .preflight_runtime_pmem(
+                config,
+                self.runtime_resources.pmem_devices.len(),
+                self.runtime_resources.pmem_devices.capacity(),
+                &self.pmem_device_metrics,
+            )
+    }
+
     /// Maps and publishes one pmem endpoint in the owner-thread PCI inventory.
     pub fn insert_runtime_pmem_device(
         &mut self,
@@ -7910,6 +8006,22 @@ impl OwnedHvfArm64BootSession {
             &self.block_device_metrics,
             drive_id,
         )
+    }
+
+    /// Checks owner-side runtime pmem capacity without opening or mapping its backing.
+    pub fn preflight_runtime_pmem_device(
+        &self,
+        config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        self.pci_data_devices
+            .as_ref()
+            .ok_or(PmemRuntimeMutationError::PciNotEnabled)?
+            .preflight_runtime_pmem(
+                config,
+                self.runtime_resources.pmem_devices.len(),
+                self.runtime_resources.pmem_devices.capacity(),
+                &self.pmem_device_metrics,
+            )
     }
 
     /// Maps and publishes one pmem endpoint in the owner-thread PCI inventory.

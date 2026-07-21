@@ -116,6 +116,50 @@ fn delivery_closure_policy_is_stable() {
         "semantic.hotplug:runtime-device-manager",
         "semantic.transport:pci-msi-and-coexistence",
     ];
+    const STORAGE_TERMINAL: [&str; 38] = [
+        "api-operation:PATCH /drives/{drive_id}",
+        "api-operation:PATCH /pmem/{id}",
+        "api-operation:PUT /drives/{drive_id}",
+        "api-operation:PUT /pmem/{id}",
+        "api-path:/drives/{drive_id}",
+        "api-path:/pmem/{id}",
+        "api-property:Drive.cache_type",
+        "api-property:Drive.drive_id",
+        "api-property:Drive.io_engine",
+        "api-property:Drive.is_read_only",
+        "api-property:Drive.is_root_device",
+        "api-property:Drive.partuuid",
+        "api-property:Drive.path_on_host",
+        "api-property:Drive.rate_limiter",
+        "api-property:Drive.socket",
+        "api-property:FullVmConfiguration.drives",
+        "api-property:FullVmConfiguration.pmem",
+        "api-property:PartialDrive.drive_id",
+        "api-property:PartialDrive.path_on_host",
+        "api-property:PartialDrive.rate_limiter",
+        "api-property:PartialPmem.id",
+        "api-property:PartialPmem.rate_limiter",
+        "api-property:Pmem.id",
+        "api-property:Pmem.path_on_host",
+        "api-property:Pmem.rate_limiter",
+        "api-property:Pmem.read_only",
+        "api-property:Pmem.root_device",
+        "api-schema:Drive",
+        "api-schema:PartialDrive",
+        "api-schema:PartialPmem",
+        "api-schema:Pmem",
+        "corpus:block-caching",
+        "corpus:block-io-engine",
+        "corpus:block-vhost-user",
+        "corpus:patch-block",
+        "non-swagger-route:DELETE /drives/{drive_id}",
+        "non-swagger-route:DELETE /pmem/{id}",
+        "semantic.storage:block-sync-async-vhost-and-limits",
+    ];
+    const STORAGE_WAVE_6: [&str; 2] = [
+        "corpus:pmem",
+        "semantic.storage:pmem-root-mapping-flush-and-state",
+    ];
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -164,8 +208,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 86);
-    assert_eq!(count(Disposition::AuditRequired), 312);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 114);
+    assert_eq!(count(Disposition::AuditRequired), 284);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -266,6 +310,68 @@ fn delivery_closure_policy_is_stable() {
         assert!(
             !capability.implementation.is_empty() && !capability.validation.is_empty(),
             "PCI/runtime-hotplug aggregate must retain concrete evidence: {id}"
+        );
+    }
+
+    let storage_ids = STORAGE_TERMINAL
+        .into_iter()
+        .chain(STORAGE_WAVE_6)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        storage_ids.len(),
+        40,
+        "storage closure ledger must stay exact"
+    );
+
+    for id in STORAGE_TERMINAL {
+        let capability = by_id.get(id).expect("terminal storage record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "storage record must remain implemented: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "terminal storage record must retain concrete evidence: {id}"
+        );
+        assert!(
+            !capability.summary.contains("#1450")
+                && !capability.summary.contains("before promotion")
+                && !capability.summary.contains("Continue auditing")
+                && !capability.summary.contains("broad storage audit"),
+            "terminal storage summary still names future storage work: {id}"
+        );
+    }
+    for id in STORAGE_WAVE_6 {
+        let capability = by_id.get(id).expect("Wave 6 storage record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "Wave 6 storage handoff must remain audit-owned: {id}"
+        );
+        assert!(
+            capability.summary.contains("Wave 6"),
+            "Wave 6 storage handoff must name its owner: {id}"
+        );
+    }
+
+    let storage_contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/storage-contract.md"),
+    )
+    .expect("checked storage contract must be readable");
+    assert_eq!(
+        storage_contract
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .count(),
+        40,
+        "checked storage contract must contain each exact ledger row once"
+    );
+    for id in storage_ids {
+        assert_eq!(
+            storage_contract.matches(&format!("| `{id}` |")).count(),
+            1,
+            "checked storage contract row must be unique: {id}"
         );
     }
 
