@@ -1676,6 +1676,45 @@ Error messages for host file open failures should not echo configured host
 paths. Tests already cover this for several path surfaces, and new host path
 features should add resource-specific redaction and file-type tests.
 
+## Aggregate Storage Trust and Capacity Boundary
+
+The #1471 direct and normal-production signed profiles compose Sync, portable
+Async, vhost-user, pmem, and virtio-mem in one product-PCI VM. This does not
+widen host authority. Direct mode retains the existing operator-owned files and
+Unix sockets. Contained mode can consume only exact startup-batch file grants
+and exact children below a connect-only vhost-user directory grant; replacing
+the source pathname cannot redirect an already-opened backing. Failed
+prepublication candidates restore reusable authority, successful publication
+consumes it once, and final shutdown must release device, mapping, stream,
+broker, session, and helper ownership without adding an entitlement.
+
+Runtime pmem insertion is fail-closed before host-side effects. Root and
+duplicate checks plus the shared 31-endpoint budget, pmem inventory, PCI
+function, BAR aperture, MSI-X demand, dispatcher region, and metrics generation
+are preflighted on the VM owner before a contained grant is claimed or a direct
+file is opened and mapped. Mapping and endpoint publication precede public
+configuration and grant-consumption commit. A preflight failure therefore
+opens no path, maps no bytes, sends no broker request, consumes no grant, and
+changes neither live nor public state.
+
+An operator-selected vhost-user backend remains trusted for confidentiality,
+integrity, and availability of the complete immutable memory table, including
+the offline virtio-mem aperture. Darwin supplies no Linux memfd-seal equivalent,
+and bangbang does not ship, jail, monitor, or define caching and rate-limiting
+policy for that backend. Backend death terminalizes only its frontend/session
+path and never falls back to ambient local storage.
+
+Pmem is one direct file/private-tail mapping, not anonymous guest RAM. The
+exact file prefix is persistent and flushable; alignment tail bytes are
+private and volatile. Operators must treat DAX as a guest/filesystem choice and
+profile page faults, page-cache/RSS accounting, huge-page realization,
+eviction, same-backing physical-page sharing, side channels, and throughput on
+the deployed macOS/HVF system. Linux Firecracker measurements are not portable
+security or performance promises. The live aggregate certification adds no
+snapshot authority: exactly the two checked Wave 6 pmem composites retain
+optional-device serialization/restore, external-backing identity, artifact,
+migration, portability, and signed-restore work.
+
 ## Offline Seccompiler Artifact Boundary
 
 `seccompiler-bin` is an offline host utility, not part of the production

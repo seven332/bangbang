@@ -46,6 +46,10 @@ claims mechanically visible.
   grant or vmnet-authority rollback, dynamic pmem mapping, per-entry network
   packet I/O, guest lifecycle, signed evidence, shared capacity/identity, and
   the completed live aggregate boundary.
+- [`storage-contract.md`](storage-contract.md) is the #1471 aggregate storage
+  ledger. It pins the exact 40-record family, 38 terminal outcomes, the two
+  Wave 6 pmem snapshot handoffs, field-specific implementation evidence, and
+  signed direct/production coexistence and cleanup proof.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -221,7 +225,7 @@ cross-device IDs, duplicate-MAC policy, mixed Running/Paused mutation order,
 concurrent owner serialization, repeated reuse, and success-authoritative live
 configuration. It terminalizes exactly `corpus:device-hotplug`,
 `semantic.hotplug:runtime-device-manager`, and
-`semantic.transport:pci-msi-and-coexistence`. The current overlay is therefore
+`semantic.transport:pci-msi-and-coexistence`. At that checkpoint the overlay was
 81 `implemented-and-verified`, 317 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` records.
 Native-v1 PCI persistence and external vmnet evidence remain respectively
@@ -309,9 +313,9 @@ scenarios certify complementary Sync/Async, Unsafe/Writeback,
 read-only/read-write, limiter retry, 4/6/8-MiB configuration refresh, GET_ID,
 regular/block replacement, guest persistence, capture rejection, DELETE/reuse,
 unchanged entitlements, and exact fixture cleanup. Native-v1 remains
-regular-only. The broad `semantic.storage:block-sync-async-vhost-and-limits`
-record is still `audit-required` for #1450, so disposition counts remain
-unchanged.
+regular-only. At that checkpoint the broad
+`semantic.storage:block-sync-async-vhost-and-limits` record remained
+`audit-required` for #1450, so disposition counts were unchanged.
 
 #1462 extends the nonterminal `Drive.socket`, `FullVmConfiguration.memory-
 hotplug`, `corpus:block-vhost-user`, `corpus:memory-hotplug`, and aggregate
@@ -326,9 +330,29 @@ both configuration orders, storage I/O across grow/shrink, exact stable region
 geometry, CONFIG refresh, backend death, Running/Paused attach/delete/reuse,
 unchanged entitlements, no helper, and unchanged pre-artifact snapshot
 rejection. Darwin memfd sealing, a bundled production backend, backend policy,
-optional-device persistence, and broad storage promotion are not claimed. The
-six records remain `audit-required` for #1450/Wave 6, so inventory counts remain
-unchanged.
+optional-device persistence, and broad storage promotion were not claimed by
+that slice. At that checkpoint the six broad records remained
+`audit-required`: #1450 still owned aggregate storage certification and Wave 6
+owned optional-device persistence, so inventory counts were unchanged.
+
+#1471 completes the #1450 aggregate storage certification. One direct signed
+executable and one signed production App Sandbox bundle run Sync, portable
+Async, vhost-user, and pmem together with virtio-mem through concurrent
+disjoint PATCH, pause/resume, memory grow/shrink, Async backing replacement,
+serialized block/pmem attach/remove/reuse, persistence, exact owner-capacity
+reuse, and terminal or orderly cleanup. The contained case uses only existing
+exact file grants plus a connect-only vhost directory, proves pathname
+replacement resistance, redaction, child/frontend/session cleanup, unchanged
+entitlements, and no helper. Owner capacity preflight now rejects before a
+vhost request, pmem grant claim, direct open/map, or public configuration
+change. The checked [`storage-contract.md`](storage-contract.md) terminalizes
+38 of the exact 40 records: the previous ten remain terminal and 24 API
+records, three block corpora, and the block semantic aggregate are promoted.
+Exactly `corpus:pmem` and
+`semantic.storage:pmem-root-mapping-flush-and-state` remain
+`audit-required` for Wave 6 optional-device serialization/restore. The current
+overlay is therefore 114 `implemented-and-verified`, 284 `audit-required`,
+three `missing-platform-feasible`, and 17 `proven-platform-impossible` records.
 
 ## Commands
 

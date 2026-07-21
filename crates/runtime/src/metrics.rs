@@ -2865,6 +2865,39 @@ impl SharedPmemDeviceMetricsRegistry {
         })
     }
 
+    /// Validates one prospective runtime pmem device without reserving a
+    /// metrics generation or changing the visible registry.
+    pub fn preflight_device(&self, device_id: &str) -> Result<(), PmemDeviceMetricsRegistryError> {
+        let state = lock_pmem_metrics_registry(&self.per_device);
+        if state
+            .entries
+            .iter()
+            .any(|entry| entry.device_id == device_id)
+            || state
+                .reservations
+                .iter()
+                .any(|reservation| reservation.device_id == device_id)
+        {
+            return Err(PmemDeviceMetricsRegistryError::DuplicateDevice);
+        }
+        let claimed_capacity = state
+            .entries
+            .len()
+            .checked_add(state.reservations.len())
+            .ok_or(PmemDeviceMetricsRegistryError::Capacity)?;
+        if claimed_capacity >= state.capacity
+            || state.entries.capacity() < state.capacity
+            || state.reservations.capacity() < state.capacity
+        {
+            return Err(PmemDeviceMetricsRegistryError::Capacity);
+        }
+        state
+            .next_generation
+            .checked_add(1)
+            .ok_or(PmemDeviceMetricsRegistryError::GenerationExhausted)?;
+        Ok(())
+    }
+
     /// Claims drop ownership for one device registered during bounded startup.
     pub fn claim_device_lease(
         &self,
@@ -8235,10 +8268,22 @@ mod tests {
     fn pmem_metrics_runtime_reservation_is_invisible_and_drop_reuses_capacity() {
         let registry = SharedPmemDeviceMetricsRegistry::from_device_ids_with_capacity([], 1)
             .expect("bounded pmem metrics should construct");
+        registry
+            .preflight_device("pmem0")
+            .expect("preflight should accept free identity and capacity");
+        assert!(registry.per_device("pmem0").is_none());
         let prepared = registry
             .prepare_device("pmem0")
             .expect("pmem metrics should reserve");
         assert!(registry.per_device("pmem0").is_none());
+        assert_eq!(
+            registry.preflight_device("pmem0").unwrap_err(),
+            PmemDeviceMetricsRegistryError::DuplicateDevice
+        );
+        assert_eq!(
+            registry.preflight_device("pmem1").unwrap_err(),
+            PmemDeviceMetricsRegistryError::Capacity
+        );
         assert_eq!(
             registry.prepare_device("pmem1").unwrap_err(),
             PmemDeviceMetricsRegistryError::Capacity

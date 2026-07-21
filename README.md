@@ -128,6 +128,21 @@ complete live vhost inventory first and returns one typed, path-redacted
 unsupported result before Async mutation, contained grant claims, or artifact
 staging.
 
+The checked
+[storage closure contract](compat/firecracker/v1.16.0/storage-contract.md)
+certifies these block and pmem leaves together. A purpose-built signed guest
+profile runs a read-only Sync root, writable Sync control, portable-Async
+drive, vhost-user drive, pmem, and virtio-mem in one product-PCI lifecycle.
+Direct and production-contained cases prove disjoint concurrent PATCH,
+pause/resume, grow/shrink, failure-atomic Async backing replacement,
+block/pmem attach-remove-reuse, exact persistence and capacity reuse, and
+terminal or orderly cleanup. The contained case uses only existing exact
+grants and a connect-only vhost directory, with no helper or entitlement
+change. Runtime pmem capacity preflight now precedes direct open/map and
+contained grant claim. The live pmem schema and API leaves are terminal;
+`corpus:pmem` and its state aggregate remain Wave 6 work solely for
+optional-device snapshot serialization/restore and portability outcomes.
+
 ## Layout
 
 ```text
@@ -1110,12 +1125,14 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 86 implemented-and-verified, 312 audit-required, three
+delivery overlay with 114 implemented-and-verified, 284 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
 tooling/specification, and Wave 8 final-certification handoffs. Nonterminal
-entries do not make new runtime claims.
+entries do not make new runtime claims. The
+[storage closure ledger](compat/firecracker/v1.16.0/storage-contract.md)
+records its exact 38-terminal/two-Wave-6 split.
 
 ## Build And Test
 

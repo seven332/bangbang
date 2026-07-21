@@ -550,6 +550,13 @@ pub(crate) trait ProcessSessionDiagnostics {
         Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
     }
 
+    fn preflight_runtime_pmem_device(
+        &mut self,
+        _config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
     fn insert_runtime_pmem_device(
         &mut self,
         _config: PmemConfig,
@@ -2743,6 +2750,13 @@ where
         }
         let prepared_config = self.controller.prepare_runtime_pmem_insert(input)?;
         let config = prepared_config.config();
+        self.started_session
+            .as_mut()
+            .ok_or(VmmActionError::PmemRuntimeMutation(
+                PmemRuntimeMutationError::ActiveSessionUnavailable,
+            ))?
+            .preflight_runtime_pmem_device(config)
+            .map_err(VmmActionError::PmemRuntimeMutation)?;
         let mut grant_claim: Option<PreparedFileGrantClaim> = match &self.grant_authority {
             Some(authority) => Some(
                 authority
@@ -5496,6 +5510,13 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
     }
 
+    fn preflight_runtime_pmem_device(
+        &mut self,
+        _config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
     fn insert_runtime_pmem_device(
         &mut self,
         _config: PmemConfig,
@@ -5690,6 +5711,13 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         drive_id: &str,
     ) -> Result<(), DriveRuntimeMutationError> {
         OwnedHvfArm64BootSession::remove_runtime_block_device(self, drive_id)
+    }
+
+    fn preflight_runtime_pmem_device(
+        &mut self,
+        config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        OwnedHvfArm64BootSession::preflight_runtime_pmem_device(self, config)
     }
 
     fn insert_runtime_pmem_device(
@@ -5953,6 +5981,13 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         Err(DriveRuntimeMutationError::ActiveSessionUnavailable)
     }
 
+    fn preflight_runtime_pmem_device(
+        &mut self,
+        _config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        Err(PmemRuntimeMutationError::ActiveSessionUnavailable)
+    }
+
     fn insert_runtime_pmem_device(
         &mut self,
         _config: PmemConfig,
@@ -6134,6 +6169,13 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         drive_id: &str,
     ) -> Result<(), DriveRuntimeMutationError> {
         OwnedHvfArm64BootSession::remove_runtime_block_device(self, drive_id)
+    }
+
+    fn preflight_runtime_pmem_device(
+        &mut self,
+        config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        OwnedHvfArm64BootSession::preflight_runtime_pmem_device(self, config)
     }
 
     fn insert_runtime_pmem_device(
@@ -6333,6 +6375,13 @@ where
         drive_id: &str,
     ) -> Result<(), DriveRuntimeMutationError> {
         self.session.remove_runtime_block_device(drive_id)
+    }
+
+    fn preflight_runtime_pmem_device(
+        &mut self,
+        config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        self.session.preflight_runtime_pmem_device(config)
     }
 
     fn insert_runtime_pmem_device(
@@ -8392,6 +8441,21 @@ where
         result
     }
 
+    fn preflight_runtime_pmem_device(
+        &mut self,
+        config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        if !matches!(
+            self.status(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
+            return Err(PmemRuntimeMutationError::ActiveSessionUnavailable);
+        }
+        let config = config.clone();
+        self.run_command(move |session| session.preflight_runtime_pmem_device(&config))
+            .map_err(pmem_runtime_mutation_error_from_boot_run_loop_command)
+    }
+
     fn insert_runtime_pmem_device(
         &mut self,
         config: PmemConfig,
@@ -9271,6 +9335,8 @@ mod tests {
         pmem_update_count: usize,
         last_pmem_update: Option<PmemUpdate>,
         pmem_update_result: Option<PmemUpdateError>,
+        pmem_preflight_count: usize,
+        pmem_preflight_result: Option<PmemRuntimeMutationError>,
         pmem_insert_count: usize,
         last_pmem_insert: Option<String>,
         pmem_insert_result: Option<PmemRuntimeMutationError>,
@@ -9346,6 +9412,8 @@ mod tests {
                 pmem_update_count: 0,
                 last_pmem_update: None,
                 pmem_update_result: None,
+                pmem_preflight_count: 0,
+                pmem_preflight_result: None,
                 pmem_insert_count: 0,
                 last_pmem_insert: None,
                 pmem_insert_result: None,
@@ -9424,6 +9492,12 @@ mod tests {
         fn with_pmem_update_result(id: u64, result: PmemUpdateError) -> Self {
             let mut session = Self::new(id);
             session.pmem_update_result = Some(result);
+            session
+        }
+
+        fn with_pmem_preflight_result(id: u64, result: PmemRuntimeMutationError) -> Self {
+            let mut session = Self::new(id);
+            session.pmem_preflight_result = Some(result);
             session
         }
 
@@ -9666,6 +9740,17 @@ mod tests {
             self.last_pmem_update = Some(update);
             match self.pmem_update_result.clone() {
                 Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn preflight_runtime_pmem_device(
+            &mut self,
+            _config: &PmemConfig,
+        ) -> Result<(), PmemRuntimeMutationError> {
+            self.pmem_preflight_count += 1;
+            match self.pmem_preflight_result.clone() {
+                Some(error) => Err(error),
                 None => Ok(()),
             }
         }
@@ -19495,6 +19580,50 @@ mod tests {
         ));
         assert_eq!(remove_vmm.controller.pmem_configs().len(), 1);
         assert_eq!(remove_vmm.controller.pmem_configs()[0].id(), "pmem0");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_pmem_owner_preflight_precedes_grant_claim_mapping_and_config_commit() {
+        const BACKING_REFERENCE: &str = "bangbang-grant:drive-rw";
+
+        let capacity_error = PmemRuntimeMutationError::PrepareDevice {
+            message: "runtime PCI endpoint capacity is exhausted".to_string(),
+        };
+        let authority = file_grant_authority_for_test();
+        let observer = authority.clone();
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_pmem_preflight_result(123, capacity_error.clone()),
+        ))
+        .with_grant_authority(Some(authority));
+        vmm.pci_enabled = true;
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                "runtime_pmem",
+                BACKING_REFERENCE,
+            ))),
+            Err(VmmActionError::PmemRuntimeMutation(capacity_error))
+        );
+        assert!(vmm.controller.pmem_configs().is_empty());
+        assert!(vmm.pmem_grant_states.is_empty());
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pmem_preflight_count, 1);
+        assert_eq!(session.pmem_insert_count, 0);
+
+        let restored = observer
+            .prepare_drive_backing_claim(
+                Path::new(BACKING_REFERENCE),
+                bangbang_session::GrantAccess::ReadWrite,
+            )
+            .expect("owner preflight should not inspect the mismatched grant role")
+            .expect("owner preflight should preserve the exact grant");
+        drop(restored);
     }
 
     #[test]

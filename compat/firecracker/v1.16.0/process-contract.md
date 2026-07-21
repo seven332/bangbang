@@ -89,8 +89,9 @@ authority. Signed direct and normal-production MMIO/PCI cases prove
 regular/block replacements, read-only/read-write, Sync/Async,
 Unsafe/Writeback, limiter retry, GET_ID, capacity refresh, guest persistence,
 capture rejection, DELETE/reuse, unchanged entitlements, and exact cleanup.
-Native-v1 remains regular-only, and the broad storage aggregate remains
-nonterminal for its independent #1450 audit.
+Native-v1 remains regular-only. #1471 now closes the independent live-storage
+aggregate; exactly the two checked Wave 6 pmem composites remain nonterminal
+for optional-device serialization and restore.
 
 ## Platform-excluded seccomp inputs
 
