@@ -21176,7 +21176,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"uart\":{\"error_count\":0,\"flush_count\":0,\"missed_read_count\":0,\"missed_write_count\":0,\"rate_limiter_dropped_bytes\":2,\"read_count\":0,\"write_count\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
+            "{\"uart\":{\"error_count\":0,\"flush_count\":0,\"input_count\":0,\"interrupt_count\":0,\"missed_read_count\":0,\"missed_write_count\":0,\"overrun_count\":0,\"rate_limiter_dropped_bytes\":2,\"read_count\":0,\"write_count\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
         );
     }
 

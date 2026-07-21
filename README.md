@@ -1106,10 +1106,14 @@ Omitting or clearing `serial_out_path` keeps TX in a bounded 64-KiB internal
 buffer instead of stdout; a configured file/FIFO is opened nonblocking with
 path-redacted errors. An optional token bucket drops exhausted bytes without
 sleeping or failing the guest write and reports the drop count in `uart`
-metrics. There is no public serial RX, stdin route, or streaming API. The
-bangbang-native v1 profile captures default serial MMIO metadata/registers but
-restores a fresh output buffer and does not capture a public path, buffered or
-in-flight bytes, limiter state, or UART counters.
+metrics. The backend-neutral UART also owns a 64-byte RX FIFO, DR/OE/RDA and
+FIFO-clear behavior, typed interrupt/drain intents, and complete redacted
+capture-ready state. There is still no public serial RX source, stdin route,
+default stdout, or streaming API; host fd and GIC delivery remain separate
+work. The bangbang-native v1 profile keeps its six-register encoding, rejects
+live RX/status/intent state that it cannot represent, restores a fresh output
+buffer, and does not capture a public path, TX bytes, limiter state, or UART
+counters.
 
 The exact field classes, failure semantics, and native-v1 boundary are in
 [Firecracker Compatibility Scope](docs/firecracker-compatibility.md#firecracker-v1160-observability-contract).

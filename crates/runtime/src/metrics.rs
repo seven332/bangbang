@@ -6908,12 +6908,24 @@ fn serial_output_metrics_json_object(
         serde_json::Value::Number(metrics.flush_count().into()),
     );
     uart.insert(
+        "input_count".to_string(),
+        serde_json::Value::Number(metrics.input_count().into()),
+    );
+    uart.insert(
+        "interrupt_count".to_string(),
+        serde_json::Value::Number(metrics.interrupt_count().into()),
+    );
+    uart.insert(
         "missed_read_count".to_string(),
         serde_json::Value::Number(metrics.missed_read_count().into()),
     );
     uart.insert(
         "missed_write_count".to_string(),
         serde_json::Value::Number(metrics.missed_write_count().into()),
+    );
+    uart.insert(
+        "overrun_count".to_string(),
+        serde_json::Value::Number(metrics.overrun_count().into()),
     );
     uart.insert(
         "read_count".to_string(),
@@ -7905,11 +7917,14 @@ mod tests {
         SerialOutputMetrics::default()
             .with_error_count(scale)
             .with_flush_count(2 * scale)
-            .with_missed_read_count(3 * scale)
-            .with_missed_write_count(4 * scale)
-            .with_read_count(5 * scale)
-            .with_write_count(6 * scale)
-            .with_rate_limiter_dropped_bytes(7 * scale)
+            .with_input_count(3 * scale)
+            .with_interrupt_count(4 * scale)
+            .with_missed_read_count(5 * scale)
+            .with_missed_write_count(6 * scale)
+            .with_overrun_count(7 * scale)
+            .with_read_count(8 * scale)
+            .with_write_count(9 * scale)
+            .with_rate_limiter_dropped_bytes(10 * scale)
     }
 
     fn balloon_metrics_with_all_fields() -> BalloonDeviceMetrics {
@@ -8434,7 +8449,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"uart":{"error_count":1,"flush_count":0,"missed_read_count":0,"missed_write_count":2,"rate_limiter_dropped_bytes":4,"read_count":0,"write_count":3},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"uart":{"error_count":1,"flush_count":0,"input_count":0,"interrupt_count":0,"missed_read_count":0,"missed_write_count":2,"overrun_count":0,"rate_limiter_dropped_bytes":4,"read_count":0,"write_count":3},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }

@@ -424,11 +424,12 @@ accounting.
 
 ## Firecracker v1.16.0 Observability Contract
 
-Bangbang implements a process-local logger, interval metrics writer, and TX-only
-serial output subset. Compatibility here describes observable records, trigger
-and failure behavior, stable field names, and ownership; it does not require
-Firecracker's Linux timerfd/eventfd plumbing, global metric/logger statics, or
-lock-free packed limiter representation.
+Bangbang implements a process-local logger, interval metrics writer, serial
+output, and a backend-neutral bounded UART receive/state core. Compatibility
+here describes observable records, trigger and failure behavior, stable field
+names, and ownership; it does not require Firecracker's Linux timerfd/eventfd
+plumbing, global metric/logger statics, or lock-free packed limiter
+representation.
 
 ### Logger records and delivery
 
@@ -515,16 +516,25 @@ panic-hook or fatal-signal durability.
 `PUT /serial` stores a nullable public output path and optional byte token
 bucket before boot. A configured file or FIFO is opened nonblocking with
 path-redacted errors. With no path, guest TX goes to one bounded 64-KiB internal
-capture buffer rather than stdout. There is no public serial RX, stdin route,
-or streaming API. An exhausted limiter drops bytes without sleeping or failing
-the guest write; the interval `uart` object reports implemented TX writes,
-missed writes, output errors, and rate-limiter dropped bytes. Read and flush
-fields remain zero because the TX-only implementation has no such producers.
+capture buffer rather than stdout. The portable UART core has a fixed 64-byte
+RX FIFO with ordered RBR reads, DR plus sticky clear-on-read OE status, RDA plus
+`0xc0` FIFO identification, RX clear, and coalesced receive-interrupt and
+input-ready intents. Injection accepts the available prefix and reports exact
+accepted/rejected counts and remaining capacity; rejected bytes count as
+overruns. The interval `uart` object also reports accepted input bytes, guest
+RBR reads, receive intents, RX clears, overruns, and malformed MMIO reads and
+writes in the same saturating generation as existing TX metrics. There is no
+public serial RX source, stdin route, default stdout, streaming API, host-fd
+readiness, or GIC delivery yet.
 
 Bangbang-native v1 accepts only `SerialConfig::default()`. Its device state
 captures the serial MMIO metadata plus interrupt-enable, line-control,
 modem-control, scratch, and both divisor-latch register bytes. Restore creates
-a fresh bounded output buffer with empty UART metrics. Buffered or in-flight TX
+a fresh bounded output buffer with empty UART metrics. A separate immutable,
+redacted capture-ready value retains complete UART registers, ordered RX bytes,
+and pending intents for later snapshot work. Native-v1 deliberately keeps its
+existing encoding and rejects any nonrepresentable RX/status/intent state
+before artifact publication instead of dropping it. Buffered or in-flight TX
 bytes, a public path, limiter configuration or budget, and UART counters are
 not captured. This exact local profile is not Firecracker snapshot-artifact
 compatibility.
@@ -535,7 +545,7 @@ The ordinary CLI has no production rotation, syslog, journald, tracing, remote
 telemetry, or resource-broker policy. Logger and metrics state remains
 process-owned rather than global, so there is no panic/fatal-signal durability
 claim. These named product and architecture boundaries, the sparse metrics
-schema, and the serial RX/stdout/native-v1 limits replace an open-ended “full
+schema, and the serial host-RX/stdout/native-v1 limits replace an open-ended “full
 logging and metrics” placeholder.
 
 The ordinary `bangbang` CLI remains the direct, uncontained process entry point.
@@ -1188,7 +1198,7 @@ compatibility targets.
 | `PUT` | `/actions` | supported target; internal startup execution and explicit metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` and routes them through the process VMM owner. Parsed request and successful action logger records are best effort and never gate the functional result. `InstanceStart` validates boot source and state, prepares an owned HVF session with configured or bounded internal serial TX, starts the worker, and commits `Running` after the worker handle is retained. `FlushMetrics` is rejected before startup; after startup it returns `204` for an unconfigured/successful sink or a metrics fault for a failed configured write, and it retains its API/action/logger effects. Automatic initial, periodic, and terminal writes do not route through `/actions` and create no action log. The aarch64 `SendCtrlAltDel` parser path contributes to `put_api_requests.actions_count` but not `actions_fails`, matching Firecracker's parser-entry placement. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. The unsupported request is counted under `put_api_requests.actions_count` without incrementing `actions_fails`. |
 | `PUT` | `/logger` | implemented supported process-local subset | Stores pre-boot configuration, opens an optional nonblocking sink, applies level/show/module filters, and omits observability state from `GET /vm/config`. Parsed API method/path and successful `InstanceStart`/explicit `FlushMetrics` actions are unrestricted host records with no bodies. Boot-timer records use the bounded callsite and recovery contract above. Sink contention/poison/write/flush failure increments `missed_log_count` and never changes the request, action, or guest result. No sink is configured by default. |
-| `PUT` | `/serial` | implemented TX output and limiter subset | Stores an optional pre-boot public path and byte token bucket; `{}` or `"serial_out_path": null` clears the public path. Startup opens a configured file/FIFO nonblocking, otherwise it uses a bounded 64-KiB internal buffer rather than stdout. Exhausted bytes are dropped without blocking, sleeping, or failing the guest write, and implemented UART deltas report writes, errors, missed writes, and dropped bytes. Public RX/stdin/streaming and read/flush producers are absent. |
+| `PUT` | `/serial` | implemented output/limiter plus portable RX/state core | Stores an optional pre-boot public path and byte token bucket; `{}` or `"serial_out_path": null` clears the public path. Startup opens a configured file/FIFO nonblocking, otherwise it uses a bounded 64-KiB internal buffer rather than stdout. Exhausted TX bytes are dropped without blocking, sleeping, or failing the guest write. The backend-neutral UART has a bounded 64-byte RX FIFO, DR/OE/RDA/FCR behavior, typed delivery/drain intents, complete capture-ready state, and shared RX/TX metrics. Public RX/stdin/default-stdout/streaming, host-fd readiness, and GIC delivery are absent. |
 | `PUT` | `/cpu-config` | supported finite arm64 custom profile; all other categories terminally classified | Parses bounded ordered Firecracker aarch64 custom templates with a 256-entry limit per array, exact 32/64/128-bit ARM identities/bitmaps, fixed seven-word vCPU-feature indexes, stronger duplicate-identity checks, and value-redacted diagnostics. A successful custom PUT replaces static/custom state; empty input clears it. Exact `(baseline & !filter) | value` execution covers eleven U64 ID registers, ACTLR.EnTSO, U64 X0/X4-X30 and reviewed SP/PC/PSTATE fields, U128 Q0-Q31 with explicit little-endian transport, and U32 FPCR/FPSR with fail-closed scalar conversion. ZFR0/SMFR0 require a public macOS 15.2 pre-VM gate; ACTLR filters are limited to bit 1. Every requested typed baseline is read on every owner before any write, targets are common, and each write is immediately reread; boot setup then overrides X0/PC/PSTATE. Any failure destroys the unpublished VM. X1-X3, banked state, all named unsafe/dependency/time/ownership/EL2 public-HVF families, aliases, unnamed encodings, and invalid KVM fields receive stable value-free policy faults; KVM capability, vCPU-feature, demux, firmware, firmware-feature, SVE, and unknown classes have distinct platform faults. Custom contents are omitted from GET and excluded from native-v1 snapshots. See the checked CPU-template contract. |
 | `PUT` | `/network-interfaces/{iface_id}` | pre-boot storage plus PCI-only Running/Paused insertion implemented | Stores up to 16 initial virtio-net configurations before boot without opening host networking resources, including Firecracker-shaped RX/TX bandwidth and ops limiters. Startup preparation attaches configured interfaces over the selected virtio-MMIO/FDT or modern PCI transport. In a live PCI session, a new validated ID/MAC prepares one independent packet-I/O entry using the immutable startup/MMDS policy, checks actual contained vmnet authority, publishes metrics and PCI ownership on the owner thread, and commits live configuration last. Existing entries keep their queues and resources. Duplicate ID/MAC, invalid host config, capacity, authority, command, and publication failures preserve prior state; uncertain cleanup is terminal. Default MMIO rejects runtime insertion. Internal notification dispatch and runtime PATCH retain the same limiter/retry behavior. External direct-vmnet connectivity, limiter-specific metrics, and snapshots remain deferred. |
 | `PUT` | `/vsock` | supported target; implemented supported live MMIO-or-PCI startup/Unix-socket subset | Repeated valid pre-boot requests atomically replace stored configuration; post-start PUT is stably rejected without mutation. Direct mode defers opening the ordinary path until startup. Contained mode recognizes only exact `bangbang-grant:<GrantId>/<SocketChild>` references, claims one exact `VsockSocketDirectory` after complete request validation, and retains its scope/anchor without reopening the tag; rejected replacement preserves prior public and private state. Startup either binds and inode-tracks the direct path or exclusively publishes a supplied owner-only listener through the exact anchor, then attaches one guest-visible endpoint over the selected startup transport with three 256-entry queues and cleans up only its own socket. Host initiation uses that main listener. Guest initiation in contained mode uses a session-bound launcher facet fixed once to the anchor/child and carrying only monotonic `u32` ports plus connected stream descriptors; the launcher receives no guest payload and the worker gains no outgoing-network entitlement. The live handler supports bounded handshakes and four-packet directional backlogs, 256 connections per direction, dynamic 64-KiB credit windows with wrapping counters, partial/full shutdown, two-second request/shutdown cleanup, reset/error handling, `EVENT_IDX`, no-op event notifications, and path/payload-redacted diagnostics. Signed Apple Silicon cases verify both initiation directions, ≥1 MiB direct transfers and a 1-MiB granted host-initiated transfer, both peers' write-half-close/EOF, terminal cleanup, two-stream isolation, an outside-container granted API listener, and no steady-state helper or entitlement change. Indirect descriptors are a supported bangbang extension. PATCH, DELETE, runtime hotplug, broader CID routing, full event payloads, runtime PCI hotplug, vhost/KVM, and general performance/artifact parity remain excluded. Native-v1 snapshot UDS override, event-queue `TRANSPORT_RESET`, and post-restore RX gating remain the stable #543 exclusions. |
@@ -3563,9 +3573,10 @@ Their eventual support level should follow the endpoint matrix:
 - full Firecracker active timerfd/eventfd rate-limiter wakeup parity beyond the
   current HVF block, PMEM, network, and entropy retry schedulers, including shared
   event-source behavior
-- serial input/stdin, default stdout, public streaming, and read/flush
-  producers beyond the implemented TX output path; native-v1 captures default
-  UART registers but not its output buffer, path, limiter state, or counters
+- host serial input/stdin, default stdout, public streaming, fd readiness, and
+  GIC delivery beyond the implemented TX path and portable bounded RX/state
+  core; native-v1 captures only its legacy six UART bytes, rejects live RX
+  state, and excludes the output buffer, path, limiter state, and counters
 - process-global panic/fatal observability durability and production rotation,
   syslog, journald, tracing, or remote telemetry; the implemented logger and
   sparse interval metrics schema do not fabricate absent records or devices
