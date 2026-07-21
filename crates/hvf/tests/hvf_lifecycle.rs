@@ -1535,6 +1535,93 @@ fn captures_configured_arm64_general_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn measures_real_hvf_vcpu_execution_time_on_owner_thread() {
+    use bangbang_hvf::{
+        HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuExit,
+        is_hvf_arm64_pvtime_measurement_available,
+    };
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+
+    const NOP: u32 = 0xd503_201f;
+    const HVC_ZERO: u32 = 0xd400_0002;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    assert!(
+        is_hvf_arm64_pvtime_measurement_available(),
+        "the signed host must export the public macOS 11 execution-time primitive"
+    );
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let mut memory =
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_code = std::iter::repeat_n(NOP, 128)
+        .chain([HVC_ZERO])
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("execution-time guest should fit");
+
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    backend
+        .create_gic()
+        .expect("GIC should be created before the execution-time vCPU");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_entry,
+            })
+            .expect("guest boot registers should configure");
+
+        let before = runner
+            .pvtime_execution_time_ns()
+            .expect("initial owner-thread measurement should succeed");
+        let HvfVcpuExit::Exception(exit) = runner
+            .run_once()
+            .expect("measurement guest should exit through HVC")
+        else {
+            panic!("measurement guest should produce an exception exit");
+        };
+        assert_eq!(
+            exit.decode_hvc()
+                .expect("measurement guest exit should decode")
+                .immediate(),
+            0
+        );
+        let after = runner
+            .pvtime_execution_time_ns()
+            .expect("post-run owner-thread measurement should succeed");
+        let repeated = runner
+            .pvtime_execution_time_ns()
+            .expect("repeated owner-thread measurement should succeed");
+        assert!(
+            after > before,
+            "guest execution must increase cumulative time"
+        );
+        assert!(
+            repeated >= after,
+            "cumulative execution time must not regress"
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn restores_arm64_general_registers_on_runner_thread() {
     use bangbang_hvf::{HvfArm64BootRegisters, HvfBackend};
     use bangbang_runtime::VmBackend;
@@ -6966,7 +7053,7 @@ fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
         (0xc400_0014, NOT_SUPPORTED), // MEM_PROTECT_CHECK_RANGE64
         (0xdead_beef, NOT_SUPPORTED), // unknown
     ];
-    const EXTRA_RESULT_COUNT: usize = 5;
+    const EXTRA_RESULT_COUNT: usize = 10;
     const RESULT_COUNT: usize = FEATURE_QUERIES.len() + EXTRA_RESULT_COUNT;
     const RESULTS_SIZE: usize = RESULT_COUNT * size_of::<u64>();
     const PSCI_VERSION: u64 = 0x8400_0000;
@@ -6974,6 +7061,8 @@ fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
     const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
     const ARM_SMCCC_VERSION: u64 = 0x8000_0000;
     const ARM_SMCCC_ARCH_FEATURES: u64 = 0x8000_0001;
+    const ARM_SMCCC_PV_TIME_FEATURES_64: u64 = 0xc500_0020;
+    const ARM_SMCCC_PV_TIME_ST_64: u64 = 0xc500_0021;
 
     // Loop over the host-supplied PSCI_FEATURES table, then query PSCI and
     // SMCCC versions plus the mandatory minimum SMCCC_ARCH_FEATURES boundary.
@@ -7012,6 +7101,30 @@ fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
         0xf2b0_0001, // movk x1, #0x8000, lsl #16 (WORKAROUND_1 query)
         0xd280_0020, // mov x0, #1
         0xf2b0_0000, // movk x0, #0x8000, lsl #16 (SMCCC_ARCH_FEATURES)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd280_0401, // mov x1, #0x20
+        0xf2b8_a001, // movk x1, #0xc500, lsl #16 (PV_TIME_FEATURES query)
+        0xd280_0020, // mov x0, #1
+        0xf2b0_0000, // movk x0, #0x8000, lsl #16 (SMCCC_ARCH_FEATURES)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd280_0421, // mov x1, #0x21
+        0xf2b8_a001, // movk x1, #0xc500, lsl #16 (PV_TIME_ST query)
+        0xd280_0400, // mov x0, #0x20
+        0xf2b8_a000, // movk x0, #0xc500, lsl #16 (PV_TIME_FEATURES64)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd280_0420, // mov x0, #0x21
+        0xf2b8_a000, // movk x0, #0xc500, lsl #16 (PV_TIME_ST64)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd280_0400, // mov x0, #0x20
+        0xf2b0_a000, // movk x0, #0x8500, lsl #16 (PV_TIME_FEATURES32)
+        0xd400_0002, // hvc #0
+        0xf800_8660, // str x0, [x19], #8
+        0xd280_0420, // mov x0, #0x21
+        0xf2b0_a000, // movk x0, #0x8500, lsl #16 (PV_TIME_ST32)
         0xd400_0002, // hvc #0
         0xf800_8660, // str x0, [x19], #8
         0xd280_0100, // mov x0, #8
@@ -7148,8 +7261,24 @@ fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
                 }
             ))
             .count(),
-        3
+        4
     );
+    assert!(observed.iter().any(|step| matches!(
+        step,
+        HvfVcpuRunStepOutcome::Hvc {
+            function_id: ARM_SMCCC_PV_TIME_FEATURES_64,
+            return_value: u64::MAX,
+            ..
+        }
+    )));
+    assert!(observed.iter().any(|step| matches!(
+        step,
+        HvfVcpuRunStepOutcome::Hvc {
+            function_id: ARM_SMCCC_PV_TIME_ST_64,
+            return_value: u64::MAX,
+            ..
+        }
+    )));
     assert!(matches!(
         observed.last(),
         Some(HvfVcpuRunStepOutcome::GuestShutdown {
@@ -7172,7 +7301,18 @@ fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
         .iter()
         .map(|(_, result)| *result)
         .collect::<Vec<_>>();
-    expected.extend([0x0001_0000, 0x0001_0001, 0, 0, NOT_SUPPORTED]);
+    expected.extend([
+        0x0001_0000,
+        0x0001_0001,
+        0,
+        0,
+        NOT_SUPPORTED,
+        NOT_SUPPORTED,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+    ]);
     assert_eq!(actual, expected);
 
     session

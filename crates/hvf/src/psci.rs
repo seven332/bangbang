@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::pvtime::{ARM_SMCCC_PV_TIME_FEATURES_64, HvfArm64PvTimeHvcPolicy, dispatch_pvtime_call};
+
 const PSCI_VERSION: u64 = 0x8400_0000;
 const PSCI_CPU_SUSPEND_32: u64 = 0x8400_0001;
 const PSCI_CPU_OFF: u64 = 0x8400_0002;
@@ -47,14 +49,17 @@ impl PsciCall {
 }
 
 pub(crate) const fn call_uses_arg0(function_id: u64) -> bool {
-    matches!(function_id, PSCI_FEATURES | ARM_SMCCC_ARCH_FEATURES)
+    matches!(
+        function_id,
+        PSCI_FEATURES | ARM_SMCCC_ARCH_FEATURES | ARM_SMCCC_PV_TIME_FEATURES_64
+    )
 }
 
 pub(crate) const fn coordinated_call_argument_count(function_id: u64) -> usize {
     match function_id {
         PSCI_CPU_SUSPEND_32 | PSCI_CPU_SUSPEND_64 | PSCI_CPU_ON_32 | PSCI_CPU_ON_64 => 3,
         PSCI_AFFINITY_INFO_32 | PSCI_AFFINITY_INFO_64 => 2,
-        PSCI_FEATURES | ARM_SMCCC_ARCH_FEATURES => 1,
+        PSCI_FEATURES | ARM_SMCCC_ARCH_FEATURES | ARM_SMCCC_PV_TIME_FEATURES_64 => 1,
         _ => 0,
     }
 }
@@ -193,7 +198,18 @@ impl PsciCallResult {
     }
 }
 
+#[cfg(test)]
 pub(crate) const fn handle_call(call: PsciCall) -> PsciCallResult {
+    handle_call_with_pvtime(call, HvfArm64PvTimeHvcPolicy::disabled())
+}
+
+pub(crate) const fn handle_call_with_pvtime(
+    call: PsciCall,
+    pvtime: HvfArm64PvTimeHvcPolicy,
+) -> PsciCallResult {
+    if let Some(return_value) = dispatch_pvtime_call(call.function_id, call.arg0, pvtime) {
+        return PsciCallResult::returned(return_value);
+    }
     if call.function_id != ARM_SMCCC_ARCH_FEATURES {
         let Some(features) = psci_function_features(call.function_id) else {
             return not_supported_result();
@@ -210,7 +226,9 @@ pub(crate) const fn handle_call(call: PsciCall) -> PsciCallResult {
             let status = if matches!(
                 narrow_u32(call.arg0),
                 ARM_SMCCC_VERSION | ARM_SMCCC_ARCH_FEATURES
-            ) {
+            ) || (narrow_u32(call.arg0) == ARM_SMCCC_PV_TIME_FEATURES_64
+                && pvtime.available())
+            {
                 PsciStatus::Success
             } else {
                 PsciStatus::NotSupported
@@ -373,7 +391,15 @@ pub(crate) enum PsciCoordinatedDispatch {
     Coordinate(PsciCoordinatorRequest),
 }
 
+#[cfg(test)]
 pub(crate) const fn handle_coordinated_call(call: PsciCall) -> PsciCoordinatedDispatch {
+    handle_coordinated_call_with_pvtime(call, HvfArm64PvTimeHvcPolicy::disabled())
+}
+
+pub(crate) const fn handle_coordinated_call_with_pvtime(
+    call: PsciCall,
+    pvtime: HvfArm64PvTimeHvcPolicy,
+) -> PsciCoordinatedDispatch {
     if call.function_id == PSCI_FEATURES {
         let return_value = match advertised_psci_features(narrow_u32(call.arg0), true) {
             Some(flags) => flags,
@@ -383,14 +409,18 @@ pub(crate) const fn handle_coordinated_call(call: PsciCall) -> PsciCoordinatedDi
     }
 
     if call.function_id == ARM_SMCCC_ARCH_FEATURES {
-        return PsciCoordinatedDispatch::Immediate(handle_call(call));
+        return PsciCoordinatedDispatch::Immediate(handle_call_with_pvtime(call, pvtime));
+    }
+
+    if dispatch_pvtime_call(call.function_id, call.arg0, pvtime).is_some() {
+        return PsciCoordinatedDispatch::Immediate(handle_call_with_pvtime(call, pvtime));
     }
 
     let Some(features) = psci_function_features(call.function_id) else {
         return PsciCoordinatedDispatch::Immediate(not_supported_result());
     };
     if !features.requires_coordination() {
-        return PsciCoordinatedDispatch::Immediate(handle_call(call));
+        return PsciCoordinatedDispatch::Immediate(handle_call_with_pvtime(call, pvtime));
     }
 
     if call.function_id == PSCI_CPU_OFF {
@@ -1138,7 +1168,12 @@ mod tests {
         PsciCpuOffResponse, PsciCpuOnBegin, PsciCpuOnRequest, PsciCpuOnResponse,
         PsciCpuPowerCoordinator, PsciCpuPowerError, PsciCpuPowerState, PsciCpuSuspendToken,
         PsciStatus, call_uses_arg0, coordinated_call_argument_count, handle_call,
-        handle_coordinated_call, not_supported_result,
+        handle_call_with_pvtime, handle_coordinated_call, handle_coordinated_call_with_pvtime,
+        not_supported_result,
+    };
+    use crate::pvtime::{
+        ARM_SMCCC_PV_TIME_FEATURES_32, ARM_SMCCC_PV_TIME_FEATURES_64, ARM_SMCCC_PV_TIME_ST_32,
+        ARM_SMCCC_PV_TIME_ST_64, HvfArm64PvTimeHvcPolicy,
     };
 
     fn coordinator() -> PsciCpuPowerCoordinator {
@@ -1238,6 +1273,81 @@ mod tests {
                 PsciStatus::NotSupported.return_value()
             );
         }
+    }
+
+    #[test]
+    fn pvtime_policy_preserves_default_denial_and_exact_enabled_64_bit_calls() {
+        let disabled = HvfArm64PvTimeHvcPolicy::disabled();
+        let first = HvfArm64PvTimeHvcPolicy::enabled(0x801f_e800);
+        let second = HvfArm64PvTimeHvcPolicy::enabled(0x801f_e840);
+
+        assert_eq!(
+            handle_call(PsciCall::new(
+                ARM_SMCCC_ARCH_FEATURES,
+                ARM_SMCCC_PV_TIME_FEATURES_64,
+            ))
+            .return_value(),
+            PsciStatus::NotSupported.return_value()
+        );
+        assert_eq!(
+            handle_call_with_pvtime(
+                PsciCall::new(ARM_SMCCC_ARCH_FEATURES, ARM_SMCCC_PV_TIME_FEATURES_64),
+                first,
+            )
+            .return_value(),
+            PsciStatus::Success.return_value()
+        );
+        assert_eq!(
+            handle_call_with_pvtime(
+                PsciCall::new(ARM_SMCCC_PV_TIME_FEATURES_64, ARM_SMCCC_PV_TIME_FEATURES_64,),
+                first,
+            )
+            .return_value(),
+            0
+        );
+        assert_eq!(
+            handle_call_with_pvtime(
+                PsciCall::new(ARM_SMCCC_PV_TIME_FEATURES_64, ARM_SMCCC_PV_TIME_ST_64),
+                first,
+            )
+            .return_value(),
+            0
+        );
+        assert_eq!(
+            handle_call_with_pvtime(PsciCall::new(ARM_SMCCC_PV_TIME_ST_64, 0), first)
+                .return_value(),
+            0x801f_e800
+        );
+        assert_eq!(
+            handle_call_with_pvtime(PsciCall::new(ARM_SMCCC_PV_TIME_ST_64, 0), second)
+                .return_value(),
+            0x801f_e840
+        );
+        for function_id in [ARM_SMCCC_PV_TIME_FEATURES_32, ARM_SMCCC_PV_TIME_ST_32] {
+            assert_eq!(
+                handle_call_with_pvtime(PsciCall::new(function_id, 0), first).return_value(),
+                u64::MAX
+            );
+        }
+        assert_eq!(
+            handle_call_with_pvtime(
+                PsciCall::new(ARM_SMCCC_PV_TIME_FEATURES_64, u64::MAX),
+                disabled,
+            )
+            .return_value(),
+            u64::MAX
+        );
+
+        assert_eq!(
+            handle_coordinated_call_with_pvtime(PsciCall::new(ARM_SMCCC_PV_TIME_ST_64, 0), second,),
+            PsciCoordinatedDispatch::Immediate(super::PsciCallResult::returned(0x801f_e840,))
+        );
+        assert!(call_uses_arg0(ARM_SMCCC_PV_TIME_FEATURES_64));
+        assert_eq!(
+            coordinated_call_argument_count(ARM_SMCCC_PV_TIME_FEATURES_64),
+            1
+        );
+        assert_eq!(coordinated_call_argument_count(ARM_SMCCC_PV_TIME_ST_64), 0);
     }
 
     #[test]

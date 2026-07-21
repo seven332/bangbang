@@ -30,9 +30,10 @@ use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
     PsciCall, PsciCallAction, PsciCoordinatedDispatch, PsciCoordinatorRequest,
     PsciCoordinatorResponse, call_uses_arg0, coordinated_call_argument_count,
-    handle_call as handle_psci_call, handle_coordinated_call, not_supported_result,
+    handle_call_with_pvtime, handle_coordinated_call_with_pvtime, not_supported_result,
     response_matches_request,
 };
+use crate::pvtime::{HvfArm64PvTimeHvcPolicy, HvfArm64PvTimeMeasurementError};
 use crate::snapshot::{
     HvfArm64SnapshotOptionalStateRejection, HvfArm64SnapshotTimerPolicyError,
     HvfArm64SnapshotTimerRestoreError, HvfArm64SnapshotTimerRestoreOperation,
@@ -163,6 +164,7 @@ type RunnerState = Arc<Mutex<RunnerHandleState>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfVcpuRunnerError {
     Backend(BackendError),
+    PvTimeMeasurement(HvfArm64PvTimeMeasurementError),
     CpuTemplate(HvfArm64CpuTemplateVcpuError),
     Gic(HvfGicError),
     GicIccRegisterRestore(HvfArm64GicIccRegisterRestoreError),
@@ -652,6 +654,7 @@ impl fmt::Display for HvfVcpuRunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Backend(err) => write!(f, "{err}"),
+            Self::PvTimeMeasurement(err) => write!(f, "{err}"),
             Self::CpuTemplate(err) => write!(f, "{err}"),
             Self::Gic(err) => write!(f, "{err}"),
             Self::GicIccRegisterRestore(err) => write!(f, "{err}"),
@@ -729,6 +732,7 @@ impl std::error::Error for HvfVcpuRunnerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(err) => Some(err),
+            Self::PvTimeMeasurement(err) => Some(err),
             Self::CpuTemplate(err) => Some(err),
             Self::Gic(err) => Some(err),
             Self::GicIccRegisterRestore(err) => Some(err),
@@ -768,6 +772,12 @@ impl std::error::Error for HvfVcpuRunnerError {
 impl From<BackendError> for HvfVcpuRunnerError {
     fn from(err: BackendError) -> Self {
         Self::Backend(err)
+    }
+}
+
+impl From<HvfArm64PvTimeMeasurementError> for HvfVcpuRunnerError {
+    fn from(err: HvfArm64PvTimeMeasurementError) -> Self {
+        Self::PvTimeMeasurement(err)
     }
 }
 
@@ -1162,6 +1172,9 @@ enum RunnerCommand {
         response_sender: mpsc::Sender<Result<MmioDispatchOutcome, HvfVcpuRunnerError>>,
     },
     ReadMpidrEl1 {
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    },
+    ReadPvTimeExecutionTimeNs {
         response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
     },
     ProbeSnapshotRestoreAvailability {
@@ -1931,6 +1944,11 @@ trait RunnerVcpu {
     fn mach_timebase_info(&mut self) -> Result<crate::ffi::MachTimebaseInfo, BackendError> {
         Err(BackendError::InvalidState(
             "vCPU does not support Mach timebase reads",
+        ))
+    }
+    fn pvtime_execution_time_ns(&mut self) -> Result<u64, HvfArm64PvTimeMeasurementError> {
+        Err(HvfArm64PvTimeMeasurementError::ExecutionTime(
+            BackendError::InvalidState("vCPU does not support execution-time reads"),
         ))
     }
     fn capture_arm64_snapshot_timer_state(
@@ -2724,6 +2742,10 @@ impl RunnerVcpu for RealRunnerVcpu {
         crate::ffi::timebase_info()
     }
 
+    fn pvtime_execution_time_ns(&mut self) -> Result<u64, HvfArm64PvTimeMeasurementError> {
+        self.owner.pvtime_execution_time_ns()
+    }
+
     fn get_pending_interrupt(
         &mut self,
         interrupt_type: HvfInterruptType,
@@ -3201,6 +3223,19 @@ impl<'vm> HvfVcpuRunner<'vm> {
     pub fn mpidr_el1(&self) -> Result<u64, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         let _in_flight_read = self.start_mpidr_el1_read(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Read cumulative vCPU execution time in nanoseconds on the owning thread.
+    ///
+    /// This is an internal PVTime measurement primitive. It does not advertise
+    /// the guest ABI, calculate stolen time, or update guest memory.
+    pub fn pvtime_execution_time_ns(&self) -> Result<u64, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_read = self.start_pvtime_execution_time_read(response_sender)?;
 
         response_receiver
             .recv()
@@ -4996,6 +5031,22 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
     ) -> Result<InFlightMetadataRead, HvfVcpuRunnerError> {
+        self.start_metadata_read_command(RunnerCommand::ReadMpidrEl1 { response_sender })
+    }
+
+    fn start_pvtime_execution_time_read(
+        &self,
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightMetadataRead, HvfVcpuRunnerError> {
+        self.start_metadata_read_command(RunnerCommand::ReadPvTimeExecutionTimeNs {
+            response_sender,
+        })
+    }
+
+    fn start_metadata_read_command(
+        &self,
+        command: RunnerCommand,
+    ) -> Result<InFlightMetadataRead, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -5041,11 +5092,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
 
         state.metadata_read_in_flight = true;
-        if self
-            .command_sender
-            .send(RunnerCommand::ReadMpidrEl1 { response_sender })
-            .is_err()
-        {
+        if self.command_sender.send(command).is_err() {
             state.metadata_read_in_flight = false;
             return Err(HvfVcpuRunnerError::ChannelClosed(
                 COMMAND_CHANNEL_CLOSED_MESSAGE,
@@ -7055,6 +7102,12 @@ fn run_runner_thread<C, V>(
                 let result = vcpu.mpidr_el1().map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::ReadPvTimeExecutionTimeNs { response_sender } => {
+                let result = vcpu
+                    .pvtime_execution_time_ns()
+                    .map_err(HvfVcpuRunnerError::PvTimeMeasurement);
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::ProbeSnapshotRestoreAvailability { response_sender } => {
                 let _ = response_sender.send(Ok(()));
             }
@@ -8021,7 +8074,7 @@ fn run_once_and_handle_mmio_on_runner_thread(
         HvfVcpuExit::Unknown { reason } => Ok(HvfVcpuRunStepOutcome::Unknown { reason }),
         HvfVcpuExit::Exception(exit) => {
             if let Ok(hvc) = exit.decode_hvc() {
-                return handle_hvc_on_runner_thread(vcpu, hvc);
+                return handle_hvc_on_runner_thread(vcpu, hvc, HvfArm64PvTimeHvcPolicy::disabled());
             }
             if let Ok(sys64) = exit.decode_sys64() {
                 return handle_sys64_on_runner_thread(vcpu, sys64);
@@ -8062,7 +8115,12 @@ fn run_once_and_handle_mmio_coordinated_on_runner_thread(
         HvfVcpuExit::Unknown { reason } => HvfVcpuRunStepOutcome::Unknown { reason },
         HvfVcpuExit::Exception(exit) => {
             if let Ok(hvc) = exit.decode_hvc() {
-                return handle_coordinated_hvc_on_runner_thread(vcpu, hvc, psci_state);
+                return handle_coordinated_hvc_on_runner_thread(
+                    vcpu,
+                    hvc,
+                    psci_state,
+                    HvfArm64PvTimeHvcPolicy::disabled(),
+                );
             }
             if let Ok(sys64) = exit.decode_sys64() {
                 return handle_sys64_on_runner_thread(vcpu, sys64)
@@ -8160,6 +8218,7 @@ fn advance_arm64_pc(vcpu: &mut impl RunnerVcpu) -> Result<(), HvfVcpuRunnerError
 fn handle_hvc_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     exit: HvfHvcExit,
+    pvtime: HvfArm64PvTimeHvcPolicy,
 ) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
     let function_id = vcpu
         .read_register(HvfRegister::X0)
@@ -8171,7 +8230,7 @@ fn handle_hvc_on_runner_thread(
         0
     };
     let result = if exit.immediate() == 0 {
-        handle_psci_call(PsciCall::new(function_id, arg0))
+        handle_call_with_pvtime(PsciCall::new(function_id, arg0), pvtime)
     } else {
         not_supported_result()
     };
@@ -8186,6 +8245,7 @@ fn handle_coordinated_hvc_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     exit: HvfHvcExit,
     psci_state: &mut RunnerThreadPsciState,
+    pvtime: HvfArm64PvTimeHvcPolicy,
 ) -> Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError> {
     let function_id = vcpu
         .read_register(HvfRegister::X0)
@@ -8201,7 +8261,10 @@ fn handle_coordinated_hvc_on_runner_thread(
                 .read_register(register)
                 .map_err(HvfVcpuRunnerError::Backend)?;
         }
-        handle_coordinated_call(PsciCall::from_arguments(function_id, arguments))
+        handle_coordinated_call_with_pvtime(
+            PsciCall::from_arguments(function_id, arguments),
+            pvtime,
+        )
     } else {
         PsciCoordinatedDispatch::Immediate(not_supported_result())
     };
@@ -8403,7 +8466,7 @@ pub(crate) mod tests {
         HvfArm64SnapshotV1RestoreStage, HvfVcpuCoordinatedRunStepOutcome,
         HvfVcpuMpidrAffinityStage, HvfVcpuPsciCallToken, HvfVcpuRunCompletion,
         HvfVcpuRunStepOutcome, HvfVcpuRunToken, HvfVcpuRunner, HvfVcpuRunnerError, RunnerVcpu,
-        cancel_vcpu_run_batch_with, spawn_runner_thread,
+        cancel_vcpu_run_batch_with, handle_hvc_on_runner_thread, spawn_runner_thread,
     };
     use crate::cpu_template::{
         HvfArm64CpuTemplateRegister, HvfArm64CpuTemplateRegister64, HvfArm64CpuTemplateTarget,
@@ -8429,6 +8492,10 @@ pub(crate) mod tests {
     use crate::psci::{
         PsciAffinityInfoResponse, PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOnBegin,
         PsciCpuOnResponse, PsciCpuPowerCoordinator, PsciCpuPowerState, PsciCpuSuspendResponse,
+    };
+    use crate::pvtime::{
+        ARM_SMCCC_PV_TIME_FEATURES_32, ARM_SMCCC_PV_TIME_FEATURES_64, ARM_SMCCC_PV_TIME_ST_32,
+        ARM_SMCCC_PV_TIME_ST_64, HvfArm64PvTimeHvcPolicy,
     };
     use crate::snapshot::{
         HvfArm64SnapshotOptionalStateRejection, HvfArm64SnapshotTimerPolicyError,
@@ -10228,6 +10295,12 @@ pub(crate) mod tests {
         index: usize,
         fail_destroy: bool,
         destroyed_sender: mpsc::Sender<usize>,
+    }
+
+    struct PvTimeMeasurementRecordingVcpu {
+        observations: VecDeque<Result<u64, crate::pvtime::HvfArm64PvTimeMeasurementError>>,
+        query_sender: mpsc::Sender<thread::ThreadId>,
+        destroyed_sender: mpsc::Sender<()>,
     }
 
     struct Sys64RunStepRecordingVcpu {
@@ -16857,6 +16930,54 @@ pub(crate) mod tests {
 
         fn destroy(&mut self) -> Result<(), BackendError> {
             Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PvTimeMeasurementRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(0x77)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn pvtime_execution_time_ns(
+            &mut self,
+        ) -> Result<u64, crate::pvtime::HvfArm64PvTimeMeasurementError> {
+            self.query_sender
+                .send(thread::current().id())
+                .map_err(|_| {
+                    crate::pvtime::HvfArm64PvTimeMeasurementError::ExecutionTime(
+                        BackendError::InvalidState("fake PVTime query receiver closed"),
+                    )
+                })?;
+            self.observations.pop_front().unwrap_or(Err(
+                crate::pvtime::HvfArm64PvTimeMeasurementError::ExecutionTime(
+                    BackendError::InvalidState("fake PVTime observations exhausted"),
+                ),
+            ))
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            self.destroyed_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake destroy receiver closed"))
         }
     }
 
@@ -34239,6 +34360,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pvtime_measurement_runs_on_permanent_owner_and_cleans_up_exactly_once() {
+        let caller_thread = thread::current().id();
+        let (query_sender, query_receiver) = mpsc::channel();
+        let (destroyed_sender, destroyed_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(PvTimeMeasurementRecordingVcpu {
+                observations: VecDeque::from([
+                    Ok(11),
+                    Ok(29),
+                    Err(crate::pvtime::HvfArm64PvTimeMeasurementError::InvalidTimebase),
+                ]),
+                query_sender,
+                destroyed_sender,
+            })
+        })
+        .expect("fake PVTime runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        assert_eq!(runner.pvtime_execution_time_ns(), Ok(11));
+        assert_eq!(runner.pvtime_execution_time_ns(), Ok(29));
+        assert_eq!(
+            runner.pvtime_execution_time_ns(),
+            Err(HvfVcpuRunnerError::PvTimeMeasurement(
+                crate::pvtime::HvfArm64PvTimeMeasurementError::InvalidTimebase
+            ))
+        );
+        let query_threads = query_receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(query_threads.len(), 3);
+        assert!(
+            query_threads
+                .iter()
+                .all(|thread_id| *thread_id == query_threads[0])
+        );
+        assert_ne!(query_threads[0], caller_thread);
+
+        runner.shutdown().expect("runner should shut down");
+        assert_eq!(destroyed_receiver.try_iter().count(), 1);
+        assert_eq!(
+            runner.pvtime_execution_time_ns(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+    }
+
+    #[test]
     fn coordinated_smccc_arch_features_reads_one_argument_without_deferred_work() {
         for queried_function in [ARM_SMCCC_VERSION, ARM_SMCCC_ARCH_FEATURES, 0x8000_8000] {
             let expected = if matches!(
@@ -34279,6 +34447,132 @@ pub(crate) mod tests {
             );
             runner.shutdown().expect("runner should shut down");
         }
+    }
+
+    #[test]
+    fn production_runner_denies_pvtime_discovery_direct_calls_and_32_bit_aliases() {
+        for (function_id, argument, expected, reads_argument) in [
+            (
+                ARM_SMCCC_ARCH_FEATURES,
+                ARM_SMCCC_PV_TIME_FEATURES_64,
+                PSCI_RET_NOT_SUPPORTED,
+                true,
+            ),
+            (
+                ARM_SMCCC_PV_TIME_FEATURES_64,
+                ARM_SMCCC_PV_TIME_ST_64,
+                u64::MAX,
+                true,
+            ),
+            (ARM_SMCCC_PV_TIME_ST_64, 0, u64::MAX, false),
+            (ARM_SMCCC_PV_TIME_FEATURES_32, 0, u64::MAX, false),
+            (ARM_SMCCC_PV_TIME_ST_32, 0, u64::MAX, false),
+        ] {
+            let x1 = if reads_argument {
+                Ok(argument)
+            } else {
+                Err(BackendError::InvalidState("PVTime call must not read X1"))
+            };
+            let (runner, register_write_receiver) =
+                start_psci_run_step_recording_runner_with_x1(function_id, x1);
+
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Ok(HvfVcpuRunStepOutcome::Hvc {
+                    exit: hvc_exit(0),
+                    function_id,
+                    return_value: expected,
+                })
+            );
+            assert_eq!(
+                register_write_receiver.recv().unwrap(),
+                (HvfRegister::X0, expected)
+            );
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn enabled_synthetic_hvc_dispatch_preserves_calling_vcpu_affinity() {
+        let mut observations = Vec::new();
+        for record_ipa in [0x801f_e800, 0x801f_e840] {
+            let (register_write_sender, register_write_receiver) = mpsc::channel();
+            let mut vcpu = PsciRunStepRecordingVcpu {
+                run_once_result: Ok(hvc_exception_exit(0)),
+                x0: ARM_SMCCC_PV_TIME_ST_64,
+                x1: Err(BackendError::InvalidState("PV_TIME_ST must not read X1")),
+                register_write_sender,
+            };
+
+            let outcome = handle_hvc_on_runner_thread(
+                &mut vcpu,
+                hvc_exit(0),
+                HvfArm64PvTimeHvcPolicy::enabled(record_ipa),
+            )
+            .expect("enabled PV_TIME_ST should dispatch");
+            assert_eq!(
+                outcome,
+                HvfVcpuRunStepOutcome::Hvc {
+                    exit: hvc_exit(0),
+                    function_id: ARM_SMCCC_PV_TIME_ST_64,
+                    return_value: record_ipa,
+                }
+            );
+            assert_eq!(
+                register_write_receiver.recv().unwrap(),
+                (HvfRegister::X0, record_ipa)
+            );
+            observations.push(vcpu.x0);
+        }
+        assert_eq!(observations, vec![0x801f_e800, 0x801f_e840]);
+
+        let (register_write_sender, register_write_receiver) = mpsc::channel();
+        let mut feature_vcpu = PsciRunStepRecordingVcpu {
+            run_once_result: Ok(hvc_exception_exit(0)),
+            x0: ARM_SMCCC_PV_TIME_FEATURES_64,
+            x1: Ok(ARM_SMCCC_PV_TIME_ST_64),
+            register_write_sender,
+        };
+        assert_eq!(
+            handle_hvc_on_runner_thread(
+                &mut feature_vcpu,
+                hvc_exit(0),
+                HvfArm64PvTimeHvcPolicy::enabled(0x801f_e800),
+            ),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(0),
+                function_id: ARM_SMCCC_PV_TIME_FEATURES_64,
+                return_value: 0,
+            })
+        );
+        assert_eq!(
+            register_write_receiver.recv().unwrap(),
+            (HvfRegister::X0, 0)
+        );
+
+        let (register_write_sender, register_write_receiver) = mpsc::channel();
+        let mut self_feature_vcpu = PsciRunStepRecordingVcpu {
+            run_once_result: Ok(hvc_exception_exit(0)),
+            x0: ARM_SMCCC_PV_TIME_FEATURES_64,
+            x1: Ok(ARM_SMCCC_PV_TIME_FEATURES_64),
+            register_write_sender,
+        };
+        assert_eq!(
+            handle_hvc_on_runner_thread(
+                &mut self_feature_vcpu,
+                hvc_exit(0),
+                HvfArm64PvTimeHvcPolicy::enabled(0x801f_e800),
+            ),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(0),
+                function_id: ARM_SMCCC_PV_TIME_FEATURES_64,
+                return_value: 0,
+            })
+        );
+        assert_eq!(
+            register_write_receiver.recv().unwrap(),
+            (HvfRegister::X0, 0)
+        );
     }
 
     #[test]

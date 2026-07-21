@@ -81,6 +81,9 @@ use crate::pmem::{
     PreparedPmemDeviceError, PreparedPmemDevices, VirtioPmemDeviceNotificationDispatch,
     VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus, VirtioPmemMmioHandler,
 };
+use crate::pvtime::{
+    Arm64PvTimeLayout, Arm64PvTimeLayoutError, initialize_arm64_pvtime_records_with,
+};
 use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use crate::serial::{
     CaptureReadySerialState, SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialInputReadyIntent,
@@ -278,6 +281,46 @@ const ARM64_BOOT_VMGENID_ADDRESS: GuestAddress = GuestAddress::new(
 const ARM64_BOOT_VMCLOCK_ADDRESS: GuestAddress = GuestAddress::new(
     aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE - ARM64_FDT_VMCLOCK_SIZE,
 );
+
+/// Hidden per-vCPU PVTime backing state retained for later certified enablement.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Arm64BootPvTimeState {
+    layout: Option<Arm64PvTimeLayout>,
+}
+
+impl Arm64BootPvTimeState {
+    const fn unavailable() -> Self {
+        Self { layout: None }
+    }
+
+    fn prepared(layout: Arm64PvTimeLayout) -> Self {
+        Self {
+            layout: Some(layout),
+        }
+    }
+
+    /// Return the topology-ordered hidden record layout, when boot initialized it.
+    pub const fn layout(&self) -> Option<&Arm64PvTimeLayout> {
+        self.layout.as_ref()
+    }
+
+    /// Return whether the public startup path may advertise PVTime.
+    pub const fn advertised(&self) -> bool {
+        false
+    }
+}
+
+impl fmt::Debug for Arm64BootPvTimeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Arm64BootPvTimeState")
+            .field(
+                "record_count",
+                &self.layout.as_ref().map_or(0, Arm64PvTimeLayout::len),
+            )
+            .field("advertised", &false)
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Arm64BootResourceConfig<'a> {
@@ -490,6 +533,8 @@ pub struct Arm64BootResources {
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub vmgenid_device: Arm64BootVmGenIdDevice,
     pub vmclock_device: Arm64BootVmClockDevice,
+    #[doc(hidden)]
+    pub pvtime_state: Arm64BootPvTimeState,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub block_async_runtime: SharedBlockAsyncRuntime,
     #[doc(hidden)]
@@ -567,6 +612,8 @@ pub struct Arm64BootRuntimeResources {
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub vmgenid_device: Arm64BootVmGenIdDevice,
     pub vmclock_device: Arm64BootVmClockDevice,
+    #[doc(hidden)]
+    pub pvtime_state: Arm64BootPvTimeState,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub block_async_runtime: SharedBlockAsyncRuntime,
     #[doc(hidden)]
@@ -1211,6 +1258,7 @@ pub fn install_snapshot_v1_runtime(
         serial_device: Some(serial_device),
         vmgenid_device,
         vmclock_device,
+        pvtime_state: Arm64BootPvTimeState::unavailable(),
         block_devices,
         block_async_runtime: SharedBlockAsyncRuntime::new(),
         pci_block_devices: Vec::new(),
@@ -4114,6 +4162,17 @@ pub enum Arm64BootResourceError {
     RegisterPciEcam {
         source: MmioRegistrationError,
     },
+    PvTimeArena {
+        source: GuestMemoryError,
+    },
+    PvTimeLayout {
+        source: Arm64PvTimeLayoutError,
+    },
+    PvTimeGuestMemoryWrite {
+        initialized_records: usize,
+        rollback_failures: usize,
+        source: GuestMemoryAccessError,
+    },
     VmGenIdRegion {
         source: GuestMemoryError,
     },
@@ -4293,6 +4352,20 @@ impl fmt::Display for Arm64BootResourceError {
             Self::RegisterPciEcam { source } => {
                 write!(f, "failed to register the PCI ECAM window: {source}")
             }
+            Self::PvTimeArena { source } => {
+                write!(f, "failed to prepare the arm64 PVTime arena: {source}")
+            }
+            Self::PvTimeLayout { source } => {
+                write!(f, "failed to plan arm64 PVTime records: {source}")
+            }
+            Self::PvTimeGuestMemoryWrite {
+                initialized_records,
+                rollback_failures,
+                source,
+            } => write!(
+                f,
+                "failed to initialize arm64 PVTime after {initialized_records} records with {rollback_failures} rollback failures: {source}"
+            ),
             Self::VmGenIdRegion { source } => {
                 write!(f, "failed to prepare VMGenID guest memory range: {source}")
             }
@@ -4410,6 +4483,9 @@ impl std::error::Error for Arm64BootResourceError {
             Self::PciAddressPlan { source } => Some(source),
             Self::PreparePciValidationFunction { source } => Some(source),
             Self::RegisterPciEcam { source } => Some(source),
+            Self::PvTimeArena { source } => Some(source),
+            Self::PvTimeLayout { source } => Some(source),
+            Self::PvTimeGuestMemoryWrite { source, .. } => Some(source),
             Self::VmGenIdRegion { source } => Some(source),
             Self::VmGenIdGuestMemoryWrite { source } => Some(source),
             Self::VmClockRegion { source } => Some(source),
@@ -4999,6 +5075,7 @@ impl Arm64BootResources {
         };
         let rtc_fdt_device = rtc_device.as_ref().map(|device| device.fdt_device);
         let serial_fdt_device = serial_device.as_ref().map(|device| device.fdt_device);
+        let pvtime_state = create_initial_pvtime_state(&mut memory, machine_config.vcpu_count())?;
         let vmgenid_device = create_initial_vmgenid_device(&mut memory, vmgenid_interrupt_line)?;
         let vmclock_device = create_initial_vmclock_device(&mut memory, vmclock_interrupt_line)?;
         let fdt_config = Arm64FdtConfig {
@@ -5031,6 +5108,7 @@ impl Arm64BootResources {
             serial_device,
             vmgenid_device,
             vmclock_device,
+            pvtime_state,
             block_devices,
             block_async_runtime,
             pci_block_devices,
@@ -5065,6 +5143,7 @@ impl Arm64BootResources {
                 serial_device: self.serial_device,
                 vmgenid_device: self.vmgenid_device,
                 vmclock_device: self.vmclock_device,
+                pvtime_state: self.pvtime_state,
                 block_devices: self.block_devices,
                 block_async_runtime: self.block_async_runtime,
                 pci_block_devices: self.pci_block_devices,
@@ -5193,6 +5272,38 @@ fn create_initial_vmgenid_device(
         generation_id,
         fdt_device,
     })
+}
+
+fn create_initial_pvtime_state(
+    memory: &mut GuestMemory,
+    vcpu_count: u8,
+) -> Result<Arm64BootPvTimeState, Arm64BootResourceError> {
+    let arena_size = ARM64_BOOT_VMGENID_ADDRESS
+        .raw_value()
+        .checked_sub(aarch64::SYSTEM_MEM_START)
+        .ok_or_else(|| Arm64BootResourceError::PvTimeArena {
+            source: GuestMemoryError::AddressOverflow {
+                start: GuestAddress::new(aarch64::SYSTEM_MEM_START),
+                size: aarch64::SYSTEM_MEM_SIZE,
+            },
+        })?;
+    let arena = GuestMemoryRange::new(GuestAddress::new(aarch64::SYSTEM_MEM_START), arena_size)
+        .map_err(|source| Arm64BootResourceError::PvTimeArena { source })?;
+    let layout = Arm64PvTimeLayout::plan(vcpu_count, arena)
+        .map_err(|source| Arm64BootResourceError::PvTimeLayout { source })?;
+    if let Err(error) = initialize_arm64_pvtime_records_with(&layout, |_, _, range, bytes| {
+        memory.write_slice(bytes, range.start())
+    }) {
+        let initialized_records = error.initialized_records();
+        let rollback_failures = error.rollback_failures();
+        return Err(Arm64BootResourceError::PvTimeGuestMemoryWrite {
+            initialized_records,
+            rollback_failures,
+            source: error.into_source(),
+        });
+    }
+
+    Ok(Arm64BootPvTimeState::prepared(layout))
 }
 
 fn create_initial_vmclock_device(
@@ -5806,6 +5917,9 @@ mod tests {
     };
     use crate::pmem::{
         PmemConfig, PmemConfigInput, PmemMmioLayout, PreparedPmemDeviceError, VIRTIO_PMEM_ALIGNMENT,
+    };
+    use crate::pvtime::{
+        ARM64_PVTIME_STRUCTURE_ALIGNMENT, ARM64_PVTIME_STRUCTURE_SIZE, Arm64PvTimeStAbi,
     };
     use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
     use crate::serial::{
@@ -8968,6 +9082,73 @@ mod tests {
         );
         assert_eq!(prop_u32_cells(vmgenid, "interrupts"), vec![0, 95, 1]);
         assert!(!vmgenid.has_prop("interrupt-parent"));
+    }
+
+    #[test]
+    fn assembles_hidden_aligned_pvtime_records_for_maximum_topology() {
+        let kernel = temp_file("kernel-with-pvtime-foundation", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(
+                32,
+                TEST_MEMORY_MIB,
+            )))
+            .expect("maximum machine topology should be stored");
+
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+        let state = &resources.pvtime_state;
+        let layout = state
+            .layout()
+            .expect("boot should retain hidden PVTime state");
+        let records = layout.records();
+
+        assert_eq!(records.len(), 32);
+        assert!(!state.advertised());
+        assert_eq!(
+            records.last().unwrap().end_exclusive().raw_value(),
+            ARM64_BOOT_VMGENID_ADDRESS.raw_value() & !(ARM64_PVTIME_STRUCTURE_ALIGNMENT - 1)
+        );
+        assert!(
+            !records
+                .last()
+                .unwrap()
+                .overlaps(initial_vmgenid_range().unwrap())
+        );
+        assert!(records.windows(2).all(|pair| !pair[0].overlaps(pair[1])));
+        for record in records {
+            assert_eq!(record.size(), ARM64_PVTIME_STRUCTURE_SIZE as u64);
+            assert!(
+                record
+                    .start()
+                    .is_aligned(ARM64_PVTIME_STRUCTURE_ALIGNMENT)
+                    .unwrap()
+            );
+            let bytes: [u8; ARM64_PVTIME_STRUCTURE_SIZE] = read_guest_bytes(
+                &resources.memory,
+                record.start(),
+                ARM64_PVTIME_STRUCTURE_SIZE,
+            )
+            .try_into()
+            .expect("record should have exact size");
+            assert_eq!(
+                Arm64PvTimeStAbi::from_bytes(bytes).unwrap(),
+                Arm64PvTimeStAbi::initial()
+            );
+        }
+        let debug = format!("{state:?}");
+        assert!(debug.contains("record_count: 32"));
+        assert!(!debug.contains("0x"));
+
+        let tree = read_fdt(&resources);
+        assert!(tree.find("/pvtime").is_none());
+        assert!(tree.find("/stolen-time").is_none());
+
+        let expected = layout.clone();
+        let parts = resources.into_parts();
+        assert_eq!(parts.runtime.pvtime_state.layout(), Some(&expected));
+        assert!(!parts.runtime.pvtime_state.advertised());
     }
 
     #[test]

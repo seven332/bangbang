@@ -23,6 +23,7 @@ pub mod network;
 pub(crate) mod output_file;
 pub mod pci;
 pub mod pmem;
+pub mod pvtime;
 pub mod rtc;
 pub mod serial;
 pub mod snapshot;

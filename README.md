@@ -25,9 +25,11 @@ plus native-v1 mutable VMClock capture/update/notification. Pmem now registers
 its retained file-backed mapping directly
 with HVF, supports deterministic read-only or writable root boot, and retains
 exact dynamic PCI flush, teardown, and range reuse; PCI network attach/delete
-owns per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime and
-serialized/restorable pmem snapshot state remain explicit limits. Host discard
-never promises synchronous RSS or footprint
+owns per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime now
+has a hidden per-vCPU shared-structure and owner-thread HVF measurement
+foundation; guest discovery, stolen-time accounting, and certification remain
+disabled. Serialized/restorable pmem snapshot state is also an explicit limit.
+Host discard never promises synchronous RSS or footprint
 reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
@@ -1162,8 +1164,9 @@ records its exact five-terminal/two-Wave-6 split, and the
 [serial closure ledger](compat/firecracker/v1.16.0/serial-contract.md) records
 its exact five-terminal/one-Wave-6 split. The
 [time and identity restore ledger](compat/firecracker/v1.16.0/time-identity-contract.md)
-records the completed PL031, VMGenID, and VMClock subset while retaining its one
-aggregate record for PVTime and final clone/portability certification.
+records the completed PL031, VMGenID, VMClock, and internal PVTime foundation
+while retaining its one aggregate record for public PVTime accounting and final
+clone/portability certification.
 
 ## Build And Test
 

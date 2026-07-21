@@ -1,13 +1,13 @@
-# Firecracker v1.16.0 time and identity restore contract
+# Firecracker v1.16.0 time and identity contract
 
-This ledger is the checked closure record for #1477, the sixth delivery slice
-of #1440 under #1348. It covers the delivered aarch64 PL031 RTC, VMGenID, and
-VMClock portions of exactly one aggregate identity:
+This ledger is the checked closure record through #1478, the seventh delivery
+slice of #1440 under #1348. It covers the delivered aarch64 PL031 RTC, VMGenID,
+VMClock, and hidden PVTime ABI/measurement foundation portions of exactly one
+aggregate identity:
 `semantic.device:rtc-vmclock-vmgenid-and-pvtime`. That identity remains
-`audit-required` because it also owns ARM PVTime, its accounting and
-clone/portability policy, and final aggregate certification under #1478, #1480,
-and #1481. This slice therefore changes no inventory disposition or global
-count.
+`audit-required` because public ARM PVTime accounting, guest certification,
+clone/portability policy, and final aggregate certification remain under #1480
+and #1481. #1478 therefore changes no inventory disposition or global count.
 
 ## Evidence keys
 
@@ -34,6 +34,18 @@ count.
   PL031 against destination wall clock and verifies its match, control, mask,
   raw-status, and masked-status registers are zero. The aarch64 FDT intentionally
   supplies no RTC interrupt, matching the pinned Firecracker shape.
+- **PVTime ABI and placement** — `crates/runtime/src/pvtime.rs` owns the exact
+  64-byte little-endian revision-0/attributes-0 stolen-time structure and plans
+  one aligned, nonoverlapping record per topology-ordered vCPU. Ordinary boot
+  initializes those hidden records below VMGenID, retains their exact IPAs, and
+  deliberately emits no guest discovery contract.
+- **HVF measurement and firmware-call gate** — the HVF `ffi`, `pvtime`,
+  `runner`, and `psci` modules runtime-resolve the macOS 11
+  `hv_vcpu_get_exec_time`
+  primitive, converts Mach absolute units with checked integer arithmetic on
+  the permanent owner thread, and models exact 64-bit `PV_TIME_FEATURES` and
+  `PV_TIME_ST` dispatch. The production runner injects a disabled policy, so
+  discovery, direct calls, and both 32-bit aliases return not-supported.
 - **Focused and signed validation** — runtime and HVF unit tests cover ABI
   bytes, validation, wrapping counters, partial writes, legacy decode, encoded
   memory mismatch, destination RTC reconstruction, ordering, and retryability.
@@ -41,12 +53,15 @@ count.
   into fresh signed HVF processes; guest code observes both VMGenID halves
   change, a stable even VMClock sequence with changed disruption/generation
   counters, and a destination RTC value no earlier than its captured value.
+  Signed `hvf_lifecycle` tests additionally prove the public HVF execution-time
+  symbol on Apple Silicon, owner-thread cumulative measurements across real
+  guest execution, and unchanged guest-visible PVTime denial.
 
 ## Exact one-record ledger
 
 | Identity | Current disposition | Exact contract and remaining handoff |
 | --- | --- | --- |
-| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, same-host repeated-load behavior, failure classification, redaction, and signed guest observation are implemented and verified. **#1478** owns the HVF ARM PVTime ABI foundation, **#1480** owns PVTime accounting and focused certification, and **#1481** owns final aggregate clone/portability reconciliation and terminal disposition. |
+| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, same-host repeated-load behavior, failure classification, redaction, signed guest observation, and the hidden per-vCPU PVTime ABI/owner-thread measurement foundation are implemented and verified. **#1480** owns stolen-time accounting, public enablement, capture continuity, and focused guest certification; **#1481** owns final aggregate clone/portability reconciliation and terminal disposition. |
 
 ## VMClock state and version contract
 
@@ -100,9 +115,10 @@ it is not a claim of alarm delivery or source-wall-clock freezing.
 
 ## Explicit remaining handoff
 
-This ledger does not claim KVM's ARM steal-time device attribute, a substitute
-HVF ABI, PVTime accounting, or cross-host time-source portability. #1478 must
-define and implement a safe HVF-specific shared-page ABI, #1480 must account and
-certify its guest-visible time, and #1481 must reconcile repeated clone and
-portability outcomes across the complete remaining-device family before the
-aggregate inventory record can become terminal.
+This ledger does not claim KVM's ARM steal-time device attribute, public
+PVTime discovery, stolen-time accounting, capture continuity, Linux guest
+certification, or cross-host time-source portability. #1480 must build and
+certify those guest-visible behaviors on #1478's disabled internal foundation,
+and #1481 must reconcile repeated clone and portability outcomes across the
+complete remaining-device family before the aggregate inventory record can
+become terminal.
