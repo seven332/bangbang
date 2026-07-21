@@ -62,6 +62,11 @@ mod macos_arm64 {
     const VHOST_USER_BLOCK_RW_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_rw_OK";
     const VHOST_USER_BLOCK_PARTUUID: &str = "0eaa91a0-01";
     const DIRECT_ROOTFS_ENTROPY_MARKER: &[u8] = b"BANGBANG_ENTROPY_GUEST_READ_OK";
+    const DIRECT_ROOTFS_ENTROPY_LIFECYCLE_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-lifecycle=1";
+    const DIRECT_ROOTFS_ENTROPY_LIFECYCLE_READY_MARKER: &[u8] = b"BANGBANG_ENTROPY_LIFECYCLE_READY";
+    const DIRECT_ROOTFS_ENTROPY_HOST_CONTINUE_MARKER: &[u8] = b"BANGBANG_ENTROPY_HOST_CONTINUE";
+    const DIRECT_ROOTFS_ENTROPY_LIFECYCLE_SUCCESS_MARKER: &[u8] = b"BANGBANG_ENTROPY_LIFECYCLE_OK";
+    const ENTROPY_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(60);
     const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
     const DIRECT_ROOTFS_PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
     const DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER: &[u8] = b"BANGBANG_PMEM_ROOT_RO_OK";
@@ -4169,6 +4174,220 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang entropy direct rootfs",
+        );
+    }
+
+    #[test]
+    fn signed_executable_captures_throttled_entropy_lifecycle_over_mmio() {
+        run_signed_entropy_capture_lifecycle(false);
+    }
+
+    #[test]
+    fn signed_executable_captures_throttled_entropy_lifecycle_over_product_pci() {
+        run_signed_entropy_capture_lifecycle(true);
+    }
+
+    fn run_signed_entropy_capture_lifecycle(enable_pci: bool) {
+        let transport = if enable_pci { "product PCI" } else { "MMIO" };
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let data_backing_path = test_dir.path().join("entropy-control.img");
+        let metrics_path = test_dir.path().join("entropy-metrics.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing_with_sectors(&data_backing_path, 4);
+        let mut bangbang = if enable_pci {
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"])
+        } else {
+            BangbangProcess::start(&socket_path, &instance_id)
+        };
+
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            &format!("PUT /machine-config entropy lifecycle {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/entropy",
+                r#"{"rate_limiter":{"bandwidth":{"size":64,"one_time_burst":256,"refill_time":2000},"ops":{"size":1,"one_time_burst":4,"refill_time":2000}}}"#,
+            ),
+            &format!("PUT /entropy lifecycle {transport}"),
+        );
+        let vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(
+            &vm_config,
+            &format!("GET /vm/config entropy lifecycle {transport}"),
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""bandwidth":{"one_time_burst":256,"refill_time":2000,"size":64}"#,
+            &format!("GET /vm/config entropy bandwidth lifecycle {transport}"),
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""ops":{"one_time_burst":4,"refill_time":2000,"size":1}"#,
+            &format!("GET /vm/config entropy ops lifecycle {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/metrics",
+                &format!(
+                    r#"{{"metrics_path":{}}}"#,
+                    json_string(path_text(&metrics_path))
+                ),
+            ),
+            &format!("PUT /metrics entropy lifecycle {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/boot-source",
+                &format!(
+                    r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+                    json_string(path_text(&kernel_path)),
+                    json_string(DIRECT_ROOTFS_ENTROPY_LIFECYCLE_BOOT_ARGS)
+                ),
+            ),
+            &format!("PUT /boot-source entropy lifecycle {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/drives/rootfs",
+                &format!(
+                    r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+                    json_string(path_text(&rootfs_path))
+                ),
+            ),
+            &format!("PUT /drives/rootfs entropy lifecycle {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/drives/data",
+                &format!(
+                    r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+                    json_string(path_text(&data_backing_path))
+                ),
+            ),
+            &format!("PUT /drives/data entropy lifecycle {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            &format!("PUT /actions InstanceStart entropy lifecycle {transport}"),
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_ENTROPY_LIFECYCLE_READY_MARKER,
+            ENTROPY_LIFECYCLE_TIMEOUT,
+        ) {
+            let prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} entropy guest did not reach lifecycle readiness: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"FlushMetrics"}"#,
+            ),
+            &format!("baseline FlushMetrics entropy lifecycle {transport}"),
+        );
+        let first_lifecycle_metric_line = metrics_line_count(&metrics_path);
+        write_block_marker_at(
+            &data_backing_path,
+            bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+            DIRECT_ROOTFS_ENTROPY_HOST_CONTINUE_MARKER,
+        );
+
+        let throttled = wait_for_entropy_metric_since(
+            &socket_path,
+            &metrics_path,
+            first_lifecycle_metric_line,
+            "entropy_rate_limiter_throttled",
+            1,
+            ENTROPY_LIFECYCLE_TIMEOUT,
+        )
+        .unwrap_or_else(|err| {
+            let prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} entropy lifecycle did not throttle after host continuation: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        });
+        assert!(throttled >= 1);
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            &format!("pause throttled entropy lifecycle {transport}"),
+        );
+        let paused = http_get(&socket_path, "/");
+        assert_ok_response(
+            &paused,
+            &format!("GET paused entropy lifecycle {transport}"),
+        );
+        assert_response_contains(
+            &paused,
+            r#""state":"Paused""#,
+            &format!("GET paused entropy lifecycle {transport}"),
+        );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            &format!("paused {transport} entropy capture-ready preflight"),
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            &format!("resume throttled entropy lifecycle {transport}"),
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_ENTROPY_LIFECYCLE_SUCCESS_MARKER,
+            ENTROPY_LIFECYCLE_TIMEOUT,
+        ) {
+            let prefix = file_prefix_lossy(&data_backing_path, 128);
+            let metrics = fs::read_to_string(&metrics_path)
+                .unwrap_or_else(|metrics_err| format!("<metrics unavailable: {metrics_err}>"));
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} entropy guest did not complete repeated reads after resume: {err}; control prefix: {prefix:?}; metrics:\n{metrics}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        let retry_events = wait_for_entropy_metric_since(
+            &socket_path,
+            &metrics_path,
+            first_lifecycle_metric_line,
+            "rate_limiter_event_count",
+            1,
+            ENTROPY_LIFECYCLE_TIMEOUT,
+        )
+        .expect("resumed entropy lifecycle should publish a retry-event metric");
+        assert!(retry_events >= 1);
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            &format!("bangbang entropy lifecycle {transport}"),
         );
     }
 
@@ -9570,6 +9789,64 @@ mod macos_arm64 {
                 .get("write_count")?
                 .as_u64()
         })
+    }
+
+    fn metrics_line_count(path: &Path) -> usize {
+        fs::read_to_string(path)
+            .map(|output| output.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn entropy_metric_total_since(path: &Path, first_line: usize, key: &str) -> u64 {
+        fs::read_to_string(path)
+            .ok()
+            .into_iter()
+            .flat_map(|output| {
+                output
+                    .lines()
+                    .skip(first_line)
+                    .filter_map(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .ok()?
+                            .get("entropy")?
+                            .get(key)?
+                            .as_u64()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .fold(0, u64::saturating_add)
+    }
+
+    fn wait_for_entropy_metric_since(
+        socket_path: &Path,
+        metrics_path: &Path,
+        first_line: usize,
+        key: &str,
+        expected: u64,
+        timeout: Duration,
+    ) -> Result<u64, String> {
+        let started_at = Instant::now();
+        loop {
+            let response =
+                http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
+            if !response.starts_with("HTTP/1.1 204 No Content\r\n") {
+                return Err(format!(
+                    "FlushMetrics failed while waiting for entropy.{key}:\n{response}"
+                ));
+            }
+            let observed = entropy_metric_total_since(metrics_path, first_line, key);
+            if observed >= expected {
+                return Ok(observed);
+            }
+            if started_at.elapsed() >= timeout {
+                let output = fs::read_to_string(metrics_path)
+                    .unwrap_or_else(|err| format!("<metrics unavailable: {err}>"));
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for entropy.{key} >= {expected}; observed={observed}; metrics:\n{output}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     fn assert_no_snapshot_staging(directory: &Path) {

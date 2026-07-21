@@ -288,6 +288,11 @@ five-component `BANGHVF\0` payload and nested `BANGDEV\0` device profile.
 
 Create reserves one FIFO boot-worker transaction, then failure-atomically
 quiesces the block, PMEM, network, and entropy retry publishers. The same lease
+traverses capture-ready storage, balloon, memory-hotplug, and entropy MMIO/PCI
+owners before applying the narrow public optional-device profile rejection.
+Entropy traversal validates exact queue, feature, limiter, pending-descriptor,
+and scheduler state without persisting host entropy bytes or a wall-clock
+value. The same lease
 preflights both final namespaces, streams the paused aggregate capture into an
 owner-only staging inode, verifies and synchronizes it, publishes memory first
 and state last as the commit marker without replacing existing entries, and
@@ -1033,8 +1038,8 @@ implemented guest MMDS packet detour and response queue activity; a top-level
 `vsock` object for implemented virtio-vsock RX/TX queue activity, packet
 counts, byte counts, connection cleanup counters, and classifiable queue/event
 failures; a top-level `entropy` object with Firecracker-shaped counters for
-implemented virtio-rng request, byte, host-randomness failure, and event-failure
-activity; a
+implemented virtio-rng request, byte, host-randomness failure, event-failure,
+dual-bucket throttle, and retry activity; a
 top-level `uart` object with Firecracker-shaped serial counters for implemented
 TX writes, missed writes, output errors, and rate-limiter drops; a top-level
 `signals` object with `sigpipe` counts for handled non-terminating `SIGPIPE`;
@@ -1125,7 +1130,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 164 implemented-and-verified, 234 audit-required, three
+delivery overlay with 186 implemented-and-verified, 212 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1134,7 +1139,11 @@ entries do not make new runtime claims. The
 [storage closure ledger](compat/firecracker/v1.16.0/storage-contract.md)
 records its exact 38-terminal/two-Wave-6 split, and the
 [balloon closure ledger](compat/firecracker/v1.16.0/balloon-contract.md)
-records its exact 50-terminal/two-Wave-6 split.
+records its exact 50-terminal/two-Wave-6 split, the
+[memory-hotplug closure ledger](compat/firecracker/v1.16.0/memory-hotplug-contract.md)
+records its exact 17-terminal/two-Wave-6 split, and the
+[entropy closure ledger](compat/firecracker/v1.16.0/entropy-contract.md)
+records its exact five-terminal/two-Wave-6 split.
 
 ## Build And Test
 

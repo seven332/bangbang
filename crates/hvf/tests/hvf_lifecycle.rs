@@ -1,3 +1,7 @@
+// clippy.toml allows these in #[test] bodies, but integration-test helpers are
+// ordinary functions in the test crate. Keep the exception scoped to this test.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 #[cfg(target_os = "macos")]
 #[path = "../../../tests/support/macos_virtual_block.rs"]
 mod macos_virtual_block;
@@ -5414,6 +5418,484 @@ fn capture_ready_balloon_traverses_signed_mmio_and_pci_owners() {
     pci_session
         .shutdown()
         .expect("signed PCI balloon session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ENTROPY_CAPTURE_QUEUE_SIZE: u16 = 8;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ENTROPY_CAPTURE_DESCRIPTOR_TABLE: bangbang_runtime::memory::GuestAddress =
+    bangbang_runtime::memory::GuestAddress::new(0x8040_0000);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ENTROPY_CAPTURE_AVAILABLE_RING: bangbang_runtime::memory::GuestAddress =
+    bangbang_runtime::memory::GuestAddress::new(0x8041_0000);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ENTROPY_CAPTURE_USED_RING: bangbang_runtime::memory::GuestAddress =
+    bangbang_runtime::memory::GuestAddress::new(0x8042_0000);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ENTROPY_CAPTURE_FIRST_DATA: bangbang_runtime::memory::GuestAddress =
+    bangbang_runtime::memory::GuestAddress::new(0x8043_0000);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ENTROPY_CAPTURE_SECOND_DATA: bangbang_runtime::memory::GuestAddress =
+    bangbang_runtime::memory::GuestAddress::new(0x8044_0000);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_entropy_capture_mmio(
+    dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher,
+    address: bangbang_runtime::memory::GuestAddress,
+    data: &[u8],
+) {
+    use bangbang_runtime::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioOperation};
+
+    let access = dispatcher
+        .lookup(
+            address,
+            u64::try_from(data.len()).expect("entropy MMIO write length should fit u64"),
+        )
+        .expect("entropy MMIO write should resolve");
+    let outcome = dispatcher
+        .dispatch(
+            MmioOperation::write(
+                access,
+                MmioAccessBytes::new(data).expect("entropy MMIO bytes should validate"),
+            )
+            .expect("entropy MMIO operation should validate"),
+        )
+        .expect("entropy MMIO write should dispatch");
+    assert!(matches!(outcome, MmioDispatchOutcome::Write));
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_entropy_capture_queue(memory: &mut bangbang_runtime::memory::GuestMemory) {
+    use bangbang_runtime::virtio_queue::{VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE};
+
+    for (index, data_address) in [ENTROPY_CAPTURE_FIRST_DATA, ENTROPY_CAPTURE_SECOND_DATA]
+        .into_iter()
+        .enumerate()
+    {
+        let descriptor_address = ENTROPY_CAPTURE_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::try_from(index).expect("descriptor index should fit u64")
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE)
+                        .expect("descriptor size should fit u64"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&data_address.raw_value().to_le_bytes(), descriptor_address)
+            .expect("entropy descriptor address should write");
+        memory
+            .write_slice(
+                &4_u32.to_le_bytes(),
+                descriptor_address.checked_add(8).unwrap(),
+            )
+            .expect("entropy descriptor length should write");
+        memory
+            .write_slice(
+                &VIRTQUEUE_DESC_F_WRITE.to_le_bytes(),
+                descriptor_address.checked_add(12).unwrap(),
+            )
+            .expect("entropy descriptor flags should write");
+        memory
+            .write_slice(
+                &0_u16.to_le_bytes(),
+                descriptor_address.checked_add(14).unwrap(),
+            )
+            .expect("entropy descriptor next index should write");
+    }
+    memory
+        .write_slice(&0_u16.to_le_bytes(), ENTROPY_CAPTURE_AVAILABLE_RING)
+        .expect("entropy available flags should write");
+    memory
+        .write_slice(
+            &2_u16.to_le_bytes(),
+            ENTROPY_CAPTURE_AVAILABLE_RING.checked_add(2).unwrap(),
+        )
+        .expect("entropy available index should write");
+    memory
+        .write_slice(
+            &0_u16.to_le_bytes(),
+            ENTROPY_CAPTURE_AVAILABLE_RING.checked_add(4).unwrap(),
+        )
+        .expect("first entropy available head should write");
+    memory
+        .write_slice(
+            &1_u16.to_le_bytes(),
+            ENTROPY_CAPTURE_AVAILABLE_RING.checked_add(6).unwrap(),
+        )
+        .expect("second entropy available head should write");
+    memory
+        .write_slice(&[0; 4], ENTROPY_CAPTURE_USED_RING)
+        .expect("entropy used ring header should reset");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn activate_and_notify_entropy_capture_queue(
+    session: &mut bangbang_hvf::OwnedHvfArm64BootSession,
+    transport_base: bangbang_runtime::memory::GuestAddress,
+    pci: bool,
+) -> std::time::Duration {
+    use bangbang_runtime::entropy::VirtioRngOsEntropySource;
+    use bangbang_runtime::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+    };
+    use bangbang_runtime::virtio_pci::VIRTIO_PCI_NOTIFICATION_OFFSET;
+
+    let dispatcher = session.mmio_dispatcher();
+    write_entropy_capture_queue(
+        session
+            .guest_memory_mut()
+            .expect("signed entropy guest memory should remain mapped"),
+    );
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("signed entropy MMIO dispatcher should not be poisoned");
+    let write =
+        |dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher, offset: u64, data: &[u8]| {
+            write_entropy_capture_mmio(
+                dispatcher,
+                transport_base
+                    .checked_add(offset)
+                    .expect("entropy transport address should not overflow"),
+                data,
+            );
+        };
+    let features_ok = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    let driver_ok = features_ok | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+    if pci {
+        write(
+            &mut dispatcher,
+            0x14,
+            &[u8::try_from(VIRTIO_DEVICE_STATUS_ACKNOWLEDGE).unwrap()],
+        );
+        write(
+            &mut dispatcher,
+            0x14,
+            &[
+                u8::try_from(VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER)
+                    .unwrap(),
+            ],
+        );
+        write(&mut dispatcher, 0x08, &1_u32.to_le_bytes());
+        write(&mut dispatcher, 0x0c, &1_u32.to_le_bytes());
+        write(&mut dispatcher, 0x14, &[u8::try_from(features_ok).unwrap()]);
+        write(&mut dispatcher, 0x16, &0_u16.to_le_bytes());
+        write(
+            &mut dispatcher,
+            0x18,
+            &ENTROPY_CAPTURE_QUEUE_SIZE.to_le_bytes(),
+        );
+        write(
+            &mut dispatcher,
+            0x20,
+            &u32::try_from(ENTROPY_CAPTURE_DESCRIPTOR_TABLE.raw_value())
+                .unwrap()
+                .to_le_bytes(),
+        );
+        write(
+            &mut dispatcher,
+            0x28,
+            &u32::try_from(ENTROPY_CAPTURE_AVAILABLE_RING.raw_value())
+                .unwrap()
+                .to_le_bytes(),
+        );
+        write(
+            &mut dispatcher,
+            0x30,
+            &u32::try_from(ENTROPY_CAPTURE_USED_RING.raw_value())
+                .unwrap()
+                .to_le_bytes(),
+        );
+        write(&mut dispatcher, 0x1c, &1_u16.to_le_bytes());
+        write(&mut dispatcher, 0x14, &[u8::try_from(driver_ok).unwrap()]);
+        write(
+            &mut dispatcher,
+            VIRTIO_PCI_NOTIFICATION_OFFSET,
+            &0_u16.to_le_bytes(),
+        );
+    } else {
+        for status in [
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        ] {
+            write(
+                &mut dispatcher,
+                VirtioMmioRegister::Status.offset(),
+                &status.to_le_bytes(),
+            );
+        }
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::DriverFeaturesSel.offset(),
+            &1_u32.to_le_bytes(),
+        );
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::DriverFeatures.offset(),
+            &1_u32.to_le_bytes(),
+        );
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::Status.offset(),
+            &features_ok.to_le_bytes(),
+        );
+        for (register, value) in [
+            (
+                VirtioMmioRegister::QueueNum,
+                u32::from(ENTROPY_CAPTURE_QUEUE_SIZE),
+            ),
+            (
+                VirtioMmioRegister::QueueDescLow,
+                u32::try_from(ENTROPY_CAPTURE_DESCRIPTOR_TABLE.raw_value()).unwrap(),
+            ),
+            (
+                VirtioMmioRegister::QueueDriverLow,
+                u32::try_from(ENTROPY_CAPTURE_AVAILABLE_RING.raw_value()).unwrap(),
+            ),
+            (
+                VirtioMmioRegister::QueueDeviceLow,
+                u32::try_from(ENTROPY_CAPTURE_USED_RING.raw_value()).unwrap(),
+            ),
+            (VirtioMmioRegister::QueueReady, 1),
+        ] {
+            write(&mut dispatcher, register.offset(), &value.to_le_bytes());
+        }
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::Status.offset(),
+            &driver_ok.to_le_bytes(),
+        );
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::QueueNotify.offset(),
+            &0_u32.to_le_bytes(),
+        );
+    }
+    drop(dispatcher);
+
+    let mut source = VirtioRngOsEntropySource::new();
+    session
+        .dispatch_entropy_queue_notifications_and_schedule_retry_wakeup(&mut source)
+        .expect("signed entropy owner should dispatch and schedule retry")
+        .rate_limiter_retry_after()
+        .expect("second entropy descriptor should be throttled")
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn capture_ready_entropy_traverses_signed_mmio_and_pci_owners() {
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootEntropyCaptureError, HvfArm64BootEntropyDeviceConfig,
+        HvfArm64BootEntropyTransportState, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::{
+        EntropyConfigInput, EntropyMmioLayout, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
+        VirtioRngRetryCaptureState,
+    };
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("capture-ready-entropy-kernel", &image)
+        .expect("entropy capture kernel should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("entropy capture boot source should configure");
+    let rate_limiter = EntropyRateLimiterConfig::new(
+        Some(EntropyTokenBucketConfig::new(4, None, 60_000)),
+        Some(EntropyTokenBucketConfig::new(1, None, 60_000)),
+    );
+    controller
+        .handle_action(VmmAction::PutEntropy(
+            EntropyConfigInput::new().with_rate_limiter(rate_limiter),
+        ))
+        .expect("entropy capture device should configure");
+    let entropy_config = controller
+        .entropy_config()
+        .expect("entropy capture config should exist");
+    let entropy_device = HvfArm64BootEntropyDeviceConfig::new(EntropyMmioLayout::new(
+        GuestAddress::new(0x4000_7000),
+        MmioRegionId::new(3001),
+    ));
+    let base_session_config = || {
+        HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            test_rtc_mmio_layout(),
+        )
+        .with_entropy_device(entropy_device)
+    };
+
+    let mut mmio_session = OwnedHvfArm64BootSession::new(&controller, base_session_config())
+        .expect("signed MMIO entropy session should prepare");
+    let mmio_guard = mmio_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("MMIO entropy retry publisher should quiesce");
+    let now = Instant::now();
+    let mmio_first = mmio_session
+        .capture_ready_entropy_state_at(Some(entropy_config), &mmio_guard, now)
+        .expect("signed MMIO entropy should become capture-ready")
+        .expect("configured MMIO entropy should be captured");
+    let mmio_second = mmio_session
+        .capture_ready_entropy_state_at(Some(entropy_config), &mmio_guard, now)
+        .expect("signed MMIO entropy should support repeated detached capture")
+        .expect("configured MMIO entropy should remain captured");
+    assert_eq!(mmio_first, mmio_second);
+    assert_eq!(mmio_first.config(), entropy_config);
+    assert_eq!(mmio_first.retry(), VirtioRngRetryCaptureState::None);
+    let HvfArm64BootEntropyTransportState::Mmio {
+        region,
+        interrupt_line,
+        state,
+    } = mmio_first.transport()
+    else {
+        panic!("MMIO entropy should retain MMIO ownership");
+    };
+    let mmio_base = region.range().start();
+    assert_eq!(mmio_base, GuestAddress::new(0x4000_7000));
+    assert!(interrupt_line.raw_value() > 0);
+    assert_eq!(state.device().config(), entropy_config);
+    assert!(state.device().active_queue().is_none());
+    assert!(state.device().rate_limiter().bandwidth().is_some());
+    assert!(state.device().rate_limiter().ops().is_some());
+    assert!(!state.transport().is_device_activated());
+    assert!(!format!("{mmio_first:?}").contains("40007000"));
+    assert!(matches!(
+        mmio_session.capture_ready_entropy_state_at(None, &mmio_guard, now),
+        Err(HvfArm64BootEntropyCaptureError::OwnershipMismatch {
+            configured: false,
+            mmio_owner: true,
+            pci_owner: false,
+        })
+    ));
+    drop(mmio_guard);
+
+    let mmio_retry_after =
+        activate_and_notify_entropy_capture_queue(&mut mmio_session, mmio_base, false);
+    assert!(mmio_retry_after > std::time::Duration::ZERO);
+    assert!(mmio_retry_after <= std::time::Duration::from_secs(60));
+    let mmio_pending_guard = mmio_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("MMIO pending entropy retry publisher should quiesce");
+    let mmio_pending_now = Instant::now();
+    let mmio_pending = mmio_session
+        .capture_ready_entropy_state_at(Some(entropy_config), &mmio_pending_guard, mmio_pending_now)
+        .expect("signed MMIO pending entropy should become capture-ready")
+        .expect("configured MMIO pending entropy should be captured");
+    let mmio_pending_again = mmio_session
+        .capture_ready_entropy_state_at(Some(entropy_config), &mmio_pending_guard, mmio_pending_now)
+        .expect("signed MMIO pending entropy capture should repeat")
+        .expect("configured MMIO pending entropy should remain captured");
+    assert_eq!(mmio_pending, mmio_pending_again);
+    assert!(matches!(
+        mmio_pending.retry(),
+        VirtioRngRetryCaptureState::After { remaining_nanos }
+            if remaining_nanos > 0 && remaining_nanos <= 60_000_000_000
+    ));
+    let mmio_pending_device = mmio_pending
+        .transport()
+        .mmio_state()
+        .expect("pending MMIO capture should retain MMIO transport")
+        .device();
+    assert!(mmio_pending_device.has_pending_rate_limited_queue());
+    assert_eq!(
+        mmio_pending_device
+            .active_queue()
+            .map(|queue| (queue.next_available(), queue.next_used())),
+        Some((1, 1))
+    );
+    drop(mmio_pending_guard);
+    mmio_session
+        .shutdown()
+        .expect("signed MMIO entropy session should shut down");
+
+    let mut pci_session =
+        OwnedHvfArm64BootSession::new(&controller, base_session_config().with_pci_enabled())
+            .expect("signed PCI entropy session should prepare");
+    let pci_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI entropy retry publisher should quiesce");
+    let pci = pci_session
+        .capture_ready_entropy_state_at(Some(entropy_config), &pci_guard, Instant::now())
+        .expect("signed PCI entropy should become capture-ready")
+        .expect("configured PCI entropy should be captured");
+    assert_eq!(pci.config(), entropy_config);
+    assert_eq!(pci.retry(), VirtioRngRetryCaptureState::None);
+    let HvfArm64BootEntropyTransportState::Pci {
+        sbdf,
+        bar_range,
+        state,
+    } = pci.transport()
+    else {
+        panic!("PCI entropy should retain PCI ownership");
+    };
+    let pci_bar_base = bar_range.start();
+    assert!(sbdf.device() > 0);
+    assert_eq!(bar_range.size(), VIRTIO_PCI_CAPABILITY_BAR_SIZE);
+    assert_eq!(state.device().config(), entropy_config);
+    assert!(state.device().active_queue().is_none());
+    assert!(state.device().rate_limiter().bandwidth().is_some());
+    assert!(state.device().rate_limiter().ops().is_some());
+    assert!(!state.transport().is_device_activated());
+    assert!(!format!("{pci:?}").contains("40007000"));
+    drop(pci_guard);
+
+    let pci_retry_after =
+        activate_and_notify_entropy_capture_queue(&mut pci_session, pci_bar_base, true);
+    assert!(pci_retry_after > std::time::Duration::ZERO);
+    assert!(pci_retry_after <= std::time::Duration::from_secs(60));
+    let pci_pending_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI pending entropy retry publisher should quiesce");
+    let pci_pending_now = Instant::now();
+    let pci_pending = pci_session
+        .capture_ready_entropy_state_at(Some(entropy_config), &pci_pending_guard, pci_pending_now)
+        .expect("signed PCI pending entropy should become capture-ready")
+        .expect("configured PCI pending entropy should be captured");
+    let pci_pending_again = pci_session
+        .capture_ready_entropy_state_at(Some(entropy_config), &pci_pending_guard, pci_pending_now)
+        .expect("signed PCI pending entropy capture should repeat")
+        .expect("configured PCI pending entropy should remain captured");
+    assert_eq!(pci_pending, pci_pending_again);
+    assert!(matches!(
+        pci_pending.retry(),
+        VirtioRngRetryCaptureState::After { remaining_nanos }
+            if remaining_nanos > 0 && remaining_nanos <= 60_000_000_000
+    ));
+    let pci_pending_device = pci_pending
+        .transport()
+        .pci_state()
+        .expect("pending PCI capture should retain PCI transport")
+        .device();
+    assert!(pci_pending_device.has_pending_rate_limited_queue());
+    assert_eq!(
+        pci_pending_device
+            .active_queue()
+            .map(|queue| (queue.next_available(), queue.next_used())),
+        Some((1, 1))
+    );
+    drop(pci_pending_guard);
+    pci_session
+        .shutdown()
+        .expect("signed PCI entropy session should shut down");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

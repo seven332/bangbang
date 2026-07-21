@@ -911,11 +911,35 @@
     {
       "id": "api-operation:PUT /entropy",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /entropy.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:PUT /entropy; strict API/model behavior, live MMIO/PCI execution, failure ordering, limiting, metrics, and capture-ready evidence are mapped in the checked entropy closure contract.",
       "source_refs": [
         "api-operation:PUT /entropy"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "entropy request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "live queue, host randomness, limiting, metrics, retry, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI entropy guest, throttling, pause-capture-resume, and repeated-read evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "focused parser, queue, limiter, retry, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /hotplug/memory",
@@ -1531,11 +1555,35 @@
     {
       "id": "api-path:/entropy",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /entropy.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-path:/entropy PUT surface; strict API/model behavior, live MMIO/PCI execution, failure ordering, limiting, metrics, and capture-ready evidence are mapped in the checked entropy closure contract.",
       "source_refs": [
         "api-path:/entropy"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "entropy request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "live queue, host randomness, limiting, metrics, retry, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI entropy guest, throttling, pause-capture-resume, and repeated-read evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "focused parser, queue, limiter, retry, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-path:/hotplug/memory",
@@ -3742,11 +3790,35 @@
     {
       "id": "api-property:EntropyDevice.rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property EntropyDevice.rate_limiter.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:EntropyDevice.rate_limiter; strict API/model behavior, live MMIO/PCI execution, failure ordering, limiting, metrics, and capture-ready evidence are mapped in the checked entropy closure contract.",
       "source_refs": [
         "api-property:EntropyDevice.rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "entropy request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "live queue, host randomness, limiting, metrics, retry, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI entropy guest, throttling, pause-capture-resume, and repeated-read evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "focused parser, queue, limiter, retry, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:Error.fault_message",
@@ -3936,11 +4008,35 @@
     {
       "id": "api-property:FullVmConfiguration.entropy",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.entropy.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:FullVmConfiguration.entropy; strict API/model behavior, live MMIO/PCI execution, failure ordering, limiting, metrics, and capture-ready evidence are mapped in the checked entropy closure contract.",
       "source_refs": [
         "api-property:FullVmConfiguration.entropy"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "entropy request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "live queue, host randomness, limiting, metrics, retry, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI entropy guest, throttling, pause-capture-resume, and repeated-read evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "focused parser, queue, limiter, retry, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.logger",
@@ -6481,11 +6577,35 @@
     {
       "id": "api-schema:EntropyDevice",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema EntropyDevice.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-schema:EntropyDevice; strict API/model behavior, live MMIO/PCI execution, failure ordering, limiting, metrics, and capture-ready evidence are mapped in the checked entropy closure contract.",
       "source_refs": [
         "api-schema:EntropyDevice"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "entropy request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "live queue, host randomness, limiting, metrics, retry, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI entropy guest, throttling, pause-capture-resume, and repeated-read evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/entropy.rs",
+          "anchor": "focused parser, queue, limiter, retry, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:Error",
@@ -7399,7 +7519,7 @@
     {
       "id": "corpus:entropy",
       "family": "remaining-devices",
-      "summary": "Audit all applicable capability claims owned by the pinned entropy source corpus.",
+      "summary": "Strict entropy API/configuration, live MMIO/PCI ownership, bounded host-random queue processing, dual-bucket limiting, retained retry wakeups, metrics, failure ordering, cleanup, and detached capture-ready state are implemented and verified. Wave 6 retains this aggregate until entropy state is encoded, integrated into artifacts, restored into exact transport/queue/limiter/retry owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
       "source_refs": [
         "corpus:entropy"
       ],
@@ -8920,7 +9040,7 @@
     {
       "id": "semantic.device:entropy-queues-limits-metrics-and-state",
       "family": "remaining-devices",
-      "summary": "Audit entropy configuration, guest queue behavior, host randomness, limiting, wakeups, metrics, cleanup, and snapshot state.",
+      "summary": "Live entropy configuration, one-queue processing, the 64-KiB cap, host randomness failures, dual-bucket limiting, scheduler retry, metrics, MMIO/PCI placement, failure-atomic accounting, detached capture, and cleanup are implemented and verified. Wave 6 retains this semantic aggregate solely for optional-device state encoding, artifact integration, live restore construction, migration/clone and portability outcomes, and signed restored-guest certification; those missing outcomes must not be inferred from capture-ready state.",
       "source_refs": [
         "corpus:entropy"
       ],

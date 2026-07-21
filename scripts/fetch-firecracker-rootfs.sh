@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v67"
+direct_boot_variant="direct-boot-v68"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -2000,6 +2000,78 @@ read_entropy_marker() {
   esac
 }
 
+entropy_lifecycle_fail() {
+  reason=$1
+  marker="BANGBANG_ENTROPY_LIFECYCLE_FAIL_$reason"
+  emit_line "$marker"
+  write_vdb_sector_marker "$marker" 0 2>/dev/null || true
+}
+
+read_entropy_lifecycle_marker() {
+  if [ ! -c /dev/hwrng ]; then
+    entropy_lifecycle_fail NO_HWRNG
+    return
+  fi
+  if [ ! -r /sys/class/misc/hw_random/rng_current ]; then
+    entropy_lifecycle_fail NO_RNG_CURRENT
+    return
+  fi
+
+  rng_current=$(cat /sys/class/misc/hw_random/rng_current 2>/dev/null || true)
+  case "$rng_current" in
+    virtio_rng*) ;;
+    *)
+      entropy_lifecycle_fail NOT_VIRTIO_RNG
+      return
+      ;;
+  esac
+
+  entropy_result=$(timeout 30 dd if=/dev/hwrng bs=32 count=1 2>/dev/null \
+    | wc -c 2>/dev/null || true)
+  entropy_bytes=${entropy_result##* }
+  case "$entropy_bytes" in
+    "" | *[!0123456789]* | 0)
+      entropy_lifecycle_fail "FIRST_READ_$entropy_bytes"
+      return
+      ;;
+  esac
+  if ! write_vdb_sector_marker BANGBANG_ENTROPY_LIFECYCLE_READY 0; then
+    entropy_lifecycle_fail READY_MARKER
+    return
+  fi
+  emit_line BANGBANG_ENTROPY_LIFECYCLE_READY
+
+  attempts=0
+  while ! vdb_sector_starts_with_marker BANGBANG_ENTROPY_HOST_CONTINUE 1; do
+    if [ "$attempts" -ge 60 ]; then
+      entropy_lifecycle_fail HOST_CONTINUE
+      return
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+  emit_line BANGBANG_ENTROPY_HOST_CONTINUE_SEEN
+
+  entropy_reads=0
+  while [ "$entropy_reads" -lt 8 ]; do
+    entropy_result=$(timeout 30 dd if=/dev/hwrng bs=32 count=1 2>/dev/null \
+      | wc -c 2>/dev/null || true)
+    entropy_bytes=${entropy_result##* }
+    case "$entropy_bytes" in
+      "" | *[!0123456789]* | 0)
+        entropy_lifecycle_fail REPEATED_READ
+        return
+        ;;
+    esac
+    entropy_reads=$((entropy_reads + 1))
+  done
+  if ! write_vdb_sector_marker BANGBANG_ENTROPY_LIFECYCLE_OK 0; then
+    entropy_lifecycle_fail SUCCESS_MARKER
+    return
+  fi
+  emit_line BANGBANG_ENTROPY_LIFECYCLE_OK
+}
+
 check_balloon_marker() {
   if [ ! -d /sys/bus/virtio/devices ]; then
     emit_line BANGBANG_BALLOON_GUEST_CHECK_FAIL_NO_VIRTIO_BUS
@@ -3521,6 +3593,8 @@ elif cmdline_has bangbang.cache-fdt-check=1; then
   check_cache_fdt_marker
 elif cmdline_has bangbang.entropy-read=1; then
   read_entropy_marker
+elif cmdline_has bangbang.entropy-lifecycle=1; then
+  read_entropy_lifecycle_marker
 elif cmdline_has bangbang.balloon-check=1; then
   check_balloon_marker
 elif cmdline_has bangbang.memory-hotplug-check=1; then

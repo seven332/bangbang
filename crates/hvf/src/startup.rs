@@ -32,9 +32,10 @@ use bangbang_runtime::boot_timer::{
     BootTimerMmioLayout, BootTimerMmioRegistrationError, register_boot_timer_mmio,
 };
 use bangbang_runtime::entropy::{
-    EntropyMmioLayout, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_QUEUE_SIZES, VirtioRngDevice,
-    VirtioRngDeviceNotificationError, VirtioRngEntropySource, VirtioRngEntropySourceError,
-    VirtioRngOsEntropySource,
+    EntropyConfig, EntropyMmioLayout, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_QUEUE_SIZES,
+    VirtioRngDevice, VirtioRngDeviceNotificationError, VirtioRngEntropySource,
+    VirtioRngEntropySourceError, VirtioRngMmioCaptureState, VirtioRngOsEntropySource,
+    VirtioRngPciCaptureError, VirtioRngPciCaptureState, VirtioRngRetryCaptureState,
 };
 use bangbang_runtime::fdt::{Arm64FdtCacheHierarchy, Arm64FdtError};
 use bangbang_runtime::interrupt::{
@@ -77,7 +78,7 @@ use bangbang_runtime::startup::{
     Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
     Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatch,
     Arm64BootBlockNotificationDispatchError, Arm64BootBlockNotificationDispatches,
-    Arm64BootBlockWakeupFdsError,
+    Arm64BootBlockWakeupFdsError, Arm64BootEntropyCaptureError,
     Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
@@ -96,10 +97,10 @@ use bangbang_runtime::startup::{
     Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
     Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
     Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, OpenedBlockDeviceLiveUpdate,
-    VmStartupResources, capture_balloon_state_for_device, capture_memory_hotplug_state_for_device,
-    memory_hotplug_status_for_device, refresh_vhost_user_block_config_for_devices_with_signal,
-    replace_arm64_boot_vmgenid, update_live_block_device_for_devices_with_opened,
-    update_memory_hotplug_config_for_device,
+    VmStartupResources, capture_balloon_state_for_device, capture_entropy_state_for_device_at,
+    capture_memory_hotplug_state_for_device, memory_hotplug_status_for_device,
+    refresh_vhost_user_block_config_for_devices_with_signal, replace_arm64_boot_vmgenid,
+    update_live_block_device_for_devices_with_opened, update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::storage_capture::{
     CaptureReadyBlockDeviceState, CaptureReadyPmemDeviceState, CaptureReadyStorageConfigs,
@@ -3428,6 +3429,17 @@ impl HvfArm64BootLimiterRetryWakeupScheduler {
     }
 }
 
+fn schedule_entropy_retry_wakeup(
+    wakeup: &HvfArm64BootLimiterRetryWakeupToken,
+    scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    retry_after: Option<Duration>,
+) {
+    if retry_after.is_none() {
+        let _ = wakeup.take_wakeup_request();
+    }
+    scheduler.schedule_after(retry_after);
+}
+
 impl Drop for HvfArm64BootLimiterRetryWakeupScheduler {
     fn drop(&mut self) {
         self.stop();
@@ -3503,7 +3515,7 @@ pub struct HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
     block: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
     pmem: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
     _network: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
-    _entropy: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
+    entropy: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
 }
 
 impl HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
@@ -3519,6 +3531,19 @@ impl HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
         now: Instant,
     ) -> Result<SnapshotV1BlockRetryState, HvfArm64BootLimiterRetrySnapshotError> {
         snapshot_limiter_retry_state_at(&self.pmem, now)
+    }
+
+    pub fn entropy_retry_state_at(
+        &self,
+        now: Instant,
+    ) -> Result<VirtioRngRetryCaptureState, HvfArm64BootLimiterRetrySnapshotError> {
+        snapshot_limiter_retry_state_at(&self.entropy, now).map(|state| match state {
+            SnapshotV1BlockRetryState::None => VirtioRngRetryCaptureState::None,
+            SnapshotV1BlockRetryState::Immediate => VirtioRngRetryCaptureState::Immediate,
+            SnapshotV1BlockRetryState::After { remaining_nanos } => {
+                VirtioRngRetryCaptureState::After { remaining_nanos }
+            }
+        })
     }
 }
 
@@ -4018,6 +4043,159 @@ impl std::error::Error for HvfArm64BootMemoryHotplugCaptureError {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum HvfArm64BootEntropyTransportState {
+    Mmio {
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        state: Box<VirtioRngMmioCaptureState>,
+    },
+    Pci {
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+        state: Box<VirtioRngPciCaptureState>,
+    },
+}
+
+impl HvfArm64BootEntropyTransportState {
+    pub fn mmio_state(&self) -> Option<&VirtioRngMmioCaptureState> {
+        match self {
+            Self::Mmio { state, .. } => Some(state.as_ref()),
+            Self::Pci { .. } => None,
+        }
+    }
+
+    pub fn pci_state(&self) -> Option<&VirtioRngPciCaptureState> {
+        match self {
+            Self::Pci { state, .. } => Some(state.as_ref()),
+            Self::Mmio { .. } => None,
+        }
+    }
+}
+
+impl fmt::Debug for HvfArm64BootEntropyTransportState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mmio { .. } => formatter.write_str("EntropyTransportState::Mmio(<redacted>)"),
+            Self::Pci { .. } => formatter.write_str("EntropyTransportState::Pci(<redacted>)"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64BootEntropyCaptureState {
+    config: EntropyConfig,
+    retry: VirtioRngRetryCaptureState,
+    transport: HvfArm64BootEntropyTransportState,
+}
+
+impl HvfArm64BootEntropyCaptureState {
+    pub const fn config(&self) -> EntropyConfig {
+        self.config
+    }
+
+    pub const fn retry(&self) -> VirtioRngRetryCaptureState {
+        self.retry
+    }
+
+    pub const fn transport(&self) -> &HvfArm64BootEntropyTransportState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for HvfArm64BootEntropyCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfArm64BootEntropyCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootEntropyCaptureError {
+    OwnerUnavailable,
+    WrongQuiescenceGuard,
+    OwnershipMismatch {
+        configured: bool,
+        mmio_owner: bool,
+        pci_owner: bool,
+    },
+    RetryState {
+        source: HvfArm64BootLimiterRetrySnapshotError,
+    },
+    RetryMismatch {
+        pending: bool,
+        scheduled: bool,
+    },
+    GuestMemory,
+    MmioDispatcherBusy,
+    MmioDispatcherPoisoned,
+    MmioCapture {
+        source: Arm64BootEntropyCaptureError,
+    },
+    PciPlacement,
+    PciCapture {
+        source: VirtioRngPciCaptureError,
+    },
+}
+
+impl fmt::Display for HvfArm64BootEntropyCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OwnerUnavailable => formatter.write_str("entropy capture owner is unavailable"),
+            Self::WrongQuiescenceGuard => {
+                formatter.write_str("entropy capture quiescence guard belongs to another session")
+            }
+            Self::OwnershipMismatch {
+                configured,
+                mmio_owner,
+                pci_owner,
+            } => write!(
+                formatter,
+                "entropy capture ownership mismatch: configured={configured}, mmio_owner={mmio_owner}, pci_owner={pci_owner}"
+            ),
+            Self::RetryState { source } => {
+                write!(formatter, "entropy retry state capture failed: {source}")
+            }
+            Self::RetryMismatch { pending, scheduled } => write!(
+                formatter,
+                "entropy retry state mismatch: pending={pending}, scheduled={scheduled}"
+            ),
+            Self::GuestMemory => formatter.write_str("entropy guest memory is unavailable"),
+            Self::MmioDispatcherBusy => formatter.write_str("entropy MMIO dispatcher is busy"),
+            Self::MmioDispatcherPoisoned => {
+                formatter.write_str("entropy MMIO dispatcher is poisoned")
+            }
+            Self::MmioCapture { source } => {
+                write!(formatter, "MMIO entropy state capture failed: {source}")
+            }
+            Self::PciPlacement => formatter.write_str("PCI entropy placement is unavailable"),
+            Self::PciCapture { source } => {
+                write!(formatter, "PCI entropy state capture failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootEntropyCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RetryState { source } => Some(source),
+            Self::MmioCapture { source } => Some(source),
+            Self::PciCapture { source } => Some(source),
+            Self::OwnerUnavailable
+            | Self::WrongQuiescenceGuard
+            | Self::OwnershipMismatch { .. }
+            | Self::RetryMismatch { .. }
+            | Self::GuestMemory
+            | Self::MmioDispatcherBusy
+            | Self::MmioDispatcherPoisoned
+            | Self::PciPlacement => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureReadyBlockOwner {
     Mmio {
@@ -4452,6 +4630,128 @@ fn capture_ready_memory_hotplug_state(
         config,
         transport,
         mapping,
+    }))
+}
+
+struct HvfArm64BootEntropyCaptureOwner<'a> {
+    backend: &'a HvfBackend,
+    mmio_dispatcher: &'a Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &'a Arm64BootRuntimeResources,
+    pci_data_devices: &'a Option<HvfArm64BootPciDataDevices>,
+    retry_wakeup_scheduler: &'a HvfArm64BootLimiterRetryWakeupScheduler,
+}
+
+fn capture_ready_entropy_state_at(
+    owner: HvfArm64BootEntropyCaptureOwner<'_>,
+    config: Option<EntropyConfig>,
+    guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    now: Instant,
+) -> Result<Option<HvfArm64BootEntropyCaptureState>, HvfArm64BootEntropyCaptureError> {
+    if !Arc::ptr_eq(&guard.entropy.shared, &owner.retry_wakeup_scheduler.shared) {
+        return Err(HvfArm64BootEntropyCaptureError::WrongQuiescenceGuard);
+    }
+    let retry = guard
+        .entropy_retry_state_at(now)
+        .map_err(|source| HvfArm64BootEntropyCaptureError::RetryState { source })?;
+
+    let mmio = owner.runtime_resources.entropy_device.as_ref();
+    let pci = owner
+        .pci_data_devices
+        .as_ref()
+        .and_then(|devices| devices.entropy.as_ref());
+    let Some(config) = config else {
+        if mmio.is_none() && pci.is_none() {
+            if retry.has_retry() {
+                return Err(HvfArm64BootEntropyCaptureError::RetryMismatch {
+                    pending: false,
+                    scheduled: true,
+                });
+            }
+            return Ok(None);
+        }
+        return Err(HvfArm64BootEntropyCaptureError::OwnershipMismatch {
+            configured: false,
+            mmio_owner: mmio.is_some(),
+            pci_owner: pci.is_some(),
+        });
+    };
+    if mmio.is_some() == pci.is_some() {
+        return Err(HvfArm64BootEntropyCaptureError::OwnershipMismatch {
+            configured: true,
+            mmio_owner: mmio.is_some(),
+            pci_owner: pci.is_some(),
+        });
+    }
+
+    let memory = owner
+        .backend
+        .mapped_guest_memory()
+        .map_err(|_| HvfArm64BootEntropyCaptureError::GuestMemory)?;
+    let transport = if let Some(device) = mmio {
+        let mut dispatcher =
+            lock_boot_mmio_dispatcher(owner.mmio_dispatcher).map_err(|error| match error {
+                HvfArm64BootMmioDispatcherError::Busy => {
+                    HvfArm64BootEntropyCaptureError::MmioDispatcherBusy
+                }
+                HvfArm64BootMmioDispatcherError::Poisoned => {
+                    HvfArm64BootEntropyCaptureError::MmioDispatcherPoisoned
+                }
+            })?;
+        let state =
+            capture_entropy_state_for_device_at(device, &mut dispatcher, config, memory, now)
+                .map_err(|source| HvfArm64BootEntropyCaptureError::MmioCapture { source })?;
+        HvfArm64BootEntropyTransportState::Mmio {
+            region: device.registration.region(),
+            interrupt_line: device.fdt_device.interrupt_line,
+            state: Box::new(state),
+        }
+    } else {
+        let Some(device) = pci else {
+            return Err(HvfArm64BootEntropyCaptureError::OwnershipMismatch {
+                configured: true,
+                mmio_owner: false,
+                pci_owner: false,
+            });
+        };
+        let sbdf = device
+            .published
+            .sbdf()
+            .ok_or(HvfArm64BootEntropyCaptureError::PciPlacement)?;
+        let bar_range = device
+            .published
+            .bar_range()
+            .ok_or(HvfArm64BootEntropyCaptureError::PciPlacement)?;
+        let state = device
+            .published
+            .endpoint()
+            .capture_entropy_state_at(config, memory, now)
+            .map_err(|source| HvfArm64BootEntropyCaptureError::PciCapture { source })?;
+        HvfArm64BootEntropyTransportState::Pci {
+            sbdf,
+            bar_range,
+            state: Box::new(state),
+        }
+    };
+
+    let pending = match &transport {
+        HvfArm64BootEntropyTransportState::Mmio { state, .. } => {
+            state.device().has_pending_rate_limited_queue()
+        }
+        HvfArm64BootEntropyTransportState::Pci { state, .. } => {
+            state.device().has_pending_rate_limited_queue()
+        }
+    };
+    if pending != retry.has_retry() {
+        return Err(HvfArm64BootEntropyCaptureError::RetryMismatch {
+            pending,
+            scheduled: retry.has_retry(),
+        });
+    }
+
+    Ok(Some(HvfArm64BootEntropyCaptureState {
+        config,
+        retry,
+        transport,
     }))
 }
 
@@ -5428,7 +5728,7 @@ fn quiesce_limiter_retry_wakeups(
         block: block_guard,
         pmem: pmem_guard,
         _network: network_guard,
-        _entropy: entropy_guard,
+        entropy: entropy_guard,
     })
 }
 
@@ -5935,6 +6235,26 @@ impl HvfArm64BootSession<'_> {
             &self.block_retry_wakeup_scheduler,
             config,
             guard,
+        )
+    }
+
+    pub fn capture_ready_entropy_state_at(
+        &self,
+        config: Option<EntropyConfig>,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<Option<HvfArm64BootEntropyCaptureState>, HvfArm64BootEntropyCaptureError> {
+        capture_ready_entropy_state_at(
+            HvfArm64BootEntropyCaptureOwner {
+                backend: self.backend,
+                mmio_dispatcher: &self.mmio_dispatcher,
+                runtime_resources: &self.runtime_resources,
+                pci_data_devices: &self.pci_data_devices,
+                retry_wakeup_scheduler: &self.entropy_retry_wakeup_scheduler,
+            },
+            config,
+            guard,
+            now,
         )
     }
 
@@ -7638,6 +7958,28 @@ impl HvfArm64BootSession<'_> {
             entropy_source,
         )
     }
+
+    /// Dispatch queued entropy work and publish its limiter retry deadline.
+    ///
+    /// This is the owner-level counterpart of the run-loop entropy path. It is
+    /// useful when a caller dispatches outside the run loop and still needs the
+    /// same retry scheduler to own a retained throttled descriptor.
+    pub fn dispatch_entropy_queue_notifications_and_schedule_retry_wakeup(
+        &mut self,
+        entropy_source: &mut impl Arm64BootEntropySourceProvider,
+    ) -> Result<
+        HvfArm64BootEntropyNotificationDispatches,
+        HvfArm64BootEntropyNotificationDispatchError,
+    > {
+        let dispatches =
+            self.dispatch_entropy_queue_notifications_and_signal_interrupts(entropy_source)?;
+        schedule_entropy_retry_wakeup(
+            &self.entropy_retry_wakeup,
+            &self.entropy_retry_wakeup_scheduler,
+            dispatches.rate_limiter_retry_after(),
+        );
+        Ok(dispatches)
+    }
 }
 
 impl Drop for HvfArm64BootSession<'_> {
@@ -8132,6 +8474,26 @@ impl OwnedHvfArm64BootSession {
             &self.block_retry_wakeup_scheduler,
             config,
             guard,
+        )
+    }
+
+    pub fn capture_ready_entropy_state_at(
+        &self,
+        config: Option<EntropyConfig>,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<Option<HvfArm64BootEntropyCaptureState>, HvfArm64BootEntropyCaptureError> {
+        capture_ready_entropy_state_at(
+            HvfArm64BootEntropyCaptureOwner {
+                backend: &self.backend,
+                mmio_dispatcher: &self.mmio_dispatcher,
+                runtime_resources: &self.runtime_resources,
+                pci_data_devices: &self.pci_data_devices,
+                retry_wakeup_scheduler: &self.entropy_retry_wakeup_scheduler,
+            },
+            config,
+            guard,
+            now,
         )
     }
 
@@ -9850,6 +10212,28 @@ impl OwnedHvfArm64BootSession {
             entropy_source,
         )
     }
+
+    /// Dispatch queued entropy work and publish its limiter retry deadline.
+    ///
+    /// This is the owner-level counterpart of the run-loop entropy path. It is
+    /// useful when a caller dispatches outside the run loop and still needs the
+    /// same retry scheduler to own a retained throttled descriptor.
+    pub fn dispatch_entropy_queue_notifications_and_schedule_retry_wakeup(
+        &mut self,
+        entropy_source: &mut impl Arm64BootEntropySourceProvider,
+    ) -> Result<
+        HvfArm64BootEntropyNotificationDispatches,
+        HvfArm64BootEntropyNotificationDispatchError,
+    > {
+        let dispatches =
+            self.dispatch_entropy_queue_notifications_and_signal_interrupts(entropy_source)?;
+        schedule_entropy_retry_wakeup(
+            &self.entropy_retry_wakeup,
+            &self.entropy_retry_wakeup_scheduler,
+            dispatches.rate_limiter_retry_after(),
+        );
+        Ok(dispatches)
+    }
 }
 
 impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
@@ -9923,11 +10307,11 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
     }
 
     fn schedule_run_loop_entropy_retry_wakeup(&mut self, retry_after: Option<Duration>) {
-        if retry_after.is_none() {
-            let _ = self.entropy_retry_wakeup.take_wakeup_request();
-        }
-        self.entropy_retry_wakeup_scheduler
-            .schedule_after(retry_after);
+        schedule_entropy_retry_wakeup(
+            &self.entropy_retry_wakeup,
+            &self.entropy_retry_wakeup_scheduler,
+            retry_after,
+        );
     }
 
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
@@ -11569,11 +11953,11 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
     }
 
     fn schedule_run_loop_entropy_retry_wakeup(&mut self, retry_after: Option<Duration>) {
-        if retry_after.is_none() {
-            let _ = self.entropy_retry_wakeup.take_wakeup_request();
-        }
-        self.entropy_retry_wakeup_scheduler
-            .schedule_after(retry_after);
+        schedule_entropy_retry_wakeup(
+            &self.entropy_retry_wakeup,
+            &self.entropy_retry_wakeup_scheduler,
+            retry_after,
+        );
     }
 
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
@@ -15525,6 +15909,7 @@ mod tests {
     use bangbang_runtime::boot_timer::BootTimerMmioLayout;
     use bangbang_runtime::entropy::{
         EntropyMmioLayout, VirtioRngEntropySource, VirtioRngEntropySourceError,
+        VirtioRngRetryCaptureState,
     };
     use bangbang_runtime::fdt::{
         ARM64_FDT_VMGENID_SIZE, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts,
@@ -16139,6 +16524,56 @@ mod tests {
             state.publication_in_flight = false;
         }
         drop(guard);
+    }
+
+    #[test]
+    fn entropy_retry_capture_maps_none_immediate_and_delayed_state() {
+        let block_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let pmem_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let network_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let entropy_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let block = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let pmem = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let network = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let entropy = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let now = Instant::now();
+        {
+            let mut state = super::lock_limiter_retry_wakeup_state(&entropy.shared);
+            state.deadline = now.checked_add(Duration::from_millis(25));
+        }
+        let guard = quiesce_limiter_retry_wakeups(
+            HvfArm64BootLimiterRetryWakeupOwner::new(&block_token, &block),
+            HvfArm64BootLimiterRetryWakeupOwner::new(&pmem_token, &pmem),
+            HvfArm64BootLimiterRetryWakeupOwner::new(&network_token, &network),
+            HvfArm64BootLimiterRetryWakeupOwner::new(&entropy_token, &entropy),
+        )
+        .expect("all limiter retry schedulers should quiesce");
+
+        assert_eq!(
+            guard
+                .entropy_retry_state_at(now)
+                .expect("future entropy retry should capture"),
+            VirtioRngRetryCaptureState::After {
+                remaining_nanos: 25_000_000
+            }
+        );
+        {
+            let mut state = super::lock_limiter_retry_wakeup_state(&entropy.shared);
+            state.deadline = None;
+        }
+        assert_eq!(
+            guard
+                .entropy_retry_state_at(now)
+                .expect("empty entropy retry should capture"),
+            VirtioRngRetryCaptureState::None
+        );
+        guard.entropy.defer_publication();
+        assert_eq!(
+            guard
+                .entropy_retry_state_at(now)
+                .expect("deferred entropy retry should capture"),
+            VirtioRngRetryCaptureState::Immediate
+        );
     }
 
     #[test]

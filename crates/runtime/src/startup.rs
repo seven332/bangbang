@@ -32,10 +32,10 @@ use crate::boot::{
     LoadedBootSource,
 };
 use crate::entropy::{
-    EntropyMmioDeviceRegistration, EntropyMmioLayout, EntropyMmioRegistrationError,
-    PreparedEntropyDevice, VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError,
-    VirtioRngEntropySource, VirtioRngEntropySourceError, VirtioRngMmioHandler,
-    VirtioRngOsEntropySource,
+    EntropyConfig, EntropyMmioDeviceRegistration, EntropyMmioLayout, EntropyMmioRegistrationError,
+    PreparedEntropyDevice, VirtioRngDeviceCaptureError, VirtioRngDeviceNotificationDispatch,
+    VirtioRngDeviceNotificationError, VirtioRngEntropySource, VirtioRngEntropySourceError,
+    VirtioRngMmioCaptureState, VirtioRngMmioHandler, VirtioRngOsEntropySource,
 };
 use crate::fdt::{
     ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtBootInfo, Arm64FdtCacheHierarchy,
@@ -3743,6 +3743,46 @@ impl std::error::Error for Arm64BootMemoryHotplugCaptureError {
     }
 }
 
+pub fn capture_entropy_state_for_device_at(
+    device: &Arm64BootEntropyDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: EntropyConfig,
+    memory: &GuestMemory,
+    now: Instant,
+) -> Result<VirtioRngMmioCaptureState, Arm64BootEntropyCaptureError> {
+    mmio_dispatcher
+        .handler_mut::<VirtioRngMmioHandler>(device.registration.region_id())
+        .map_err(|source| Arm64BootEntropyCaptureError::HandlerLookup { source })?
+        .capture_entropy_state_at(config, memory, now)
+        .map_err(Arm64BootEntropyCaptureError::Device)
+}
+
+#[derive(Debug)]
+pub enum Arm64BootEntropyCaptureError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    Device(VirtioRngDeviceCaptureError),
+}
+
+impl fmt::Display for Arm64BootEntropyCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HandlerLookup { .. } => {
+                formatter.write_str("failed to locate the boot entropy MMIO handler")
+            }
+            Self::Device(_) => formatter.write_str("boot entropy MMIO capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootEntropyCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::Device(source) => Some(source),
+        }
+    }
+}
+
 pub fn update_balloon_statistics_for_device(
     device: &Arm64BootBalloonDevice,
     mmio_dispatcher: &mut MmioDispatcher,
@@ -5505,7 +5545,7 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use device_tree::{DeviceTree, Node};
 
@@ -5520,11 +5560,12 @@ mod tests {
         Arm64BootSerialDeviceConfig, Arm64BootSerialMmioRegistrationError, Arm64BootVmGenIdDevice,
         Arm64BootVmGenIdReplacementError, MIB, VmStartupResources,
         arm64_boot_network_device_metadata, balloon_hinting_status_for_device,
-        balloon_stats_for_device, block_device_metadata, ensure_nonzero_vmgenid_generation_id,
-        initial_vmclock_abi_bytes, initial_vmclock_range, initial_vmgenid_range,
-        prepare_pci_validation, replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
-        stop_balloon_hinting_for_device, update_balloon_config_for_device,
-        update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
+        balloon_stats_for_device, block_device_metadata, capture_entropy_state_for_device_at,
+        ensure_nonzero_vmgenid_generation_id, initial_vmclock_abi_bytes, initial_vmclock_range,
+        initial_vmgenid_range, prepare_pci_validation, replace_arm64_boot_vmgenid_with,
+        start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
+        update_balloon_config_for_device, update_balloon_statistics_for_device,
+        update_block_device_for_devices_with_opened,
     };
     use crate::VmmAction;
     use crate::balloon::{
@@ -11455,6 +11496,47 @@ mod tests {
         assert_eq!(dispatches.len(), 0);
         assert!(!dispatches.needs_queue_interrupt());
         assert!(provider.requested_regions.is_empty());
+    }
+
+    #[test]
+    fn boot_runtime_entropy_capture_uses_typed_registered_owner() {
+        let now = Instant::now();
+        let (memory, runtime, mut mmio_dispatcher) =
+            boot_runtime_with_entropy("kernel-entropy-capture-owner");
+        let device = runtime
+            .entropy_device
+            .as_ref()
+            .expect("entropy device should exist")
+            .clone();
+
+        let capture = capture_entropy_state_for_device_at(
+            &device,
+            &mut mmio_dispatcher,
+            crate::entropy::EntropyConfig::new(),
+            &memory,
+            now,
+        )
+        .expect("registered entropy owner should capture");
+
+        assert_eq!(
+            capture.device().config(),
+            crate::entropy::EntropyConfig::new()
+        );
+        assert!(!capture.transport().is_device_activated());
+
+        let mut missing_dispatcher = MmioDispatcher::new();
+        let error = capture_entropy_state_for_device_at(
+            &device,
+            &mut missing_dispatcher,
+            crate::entropy::EntropyConfig::new(),
+            &memory,
+            now,
+        )
+        .expect_err("missing entropy handler should remain typed");
+        assert!(matches!(
+            error,
+            super::Arm64BootEntropyCaptureError::HandlerLookup { .. }
+        ));
     }
 
     #[test]
