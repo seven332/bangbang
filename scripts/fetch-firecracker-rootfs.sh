@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v68"
+direct_boot_variant="direct-boot-v69"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -3539,6 +3539,77 @@ finally:
 PY
 }
 
+pvtime_steal_ticks() {
+  awk 'NR == 1 && $1 == "cpu" { print $9; found = 1; exit }
+       END { if (!found) exit 1 }' /proc/stat 2>/dev/null
+}
+
+pvtime_fail() {
+  emit_line "BANGBANG_PVTIME_FAIL_$1"
+}
+
+check_pvtime_marker() {
+  discovery=$(dmesg 2>/dev/null | grep -m 1 'stolen time PV' || true)
+  if [ -z "$discovery" ]; then
+    pvtime_fail DISCOVERY
+    return
+  fi
+  emit_line "$discovery"
+  emit_line BANGBANG_PVTIME_DISCOVERY_OK
+
+  before=$(pvtime_steal_ticks || true)
+  case "$before" in
+    ''|*[!0-9]*)
+      pvtime_fail BEFORE
+      return
+      ;;
+  esac
+  emit_line "BANGBANG_PVTIME_BEFORE=$before"
+
+  work=0
+  while [ "$work" -lt 200000 ]; do
+    work=$((work + 1))
+  done
+  emit_line BANGBANG_PVTIME_CONTENTION_WORK_0123456789_0123456789_0123456789_0123456789
+
+  after=$(pvtime_steal_ticks || true)
+  case "$after" in
+    ''|*[!0-9]*)
+      pvtime_fail AFTER
+      return
+      ;;
+  esac
+  emit_line "BANGBANG_PVTIME_AFTER=$after"
+  if [ "$after" -le "$before" ]; then
+    pvtime_fail CONTENTION
+    return
+  fi
+  emit_line BANGBANG_PVTIME_CONTENTION_OK
+
+  idle_before=$(pvtime_steal_ticks || true)
+  sleep 1
+  idle_after=$(pvtime_steal_ticks || true)
+  case "$idle_before" in
+    ''|*[!0-9]*)
+      pvtime_fail IDLE_SAMPLE
+      return
+      ;;
+  esac
+  case "$idle_after" in
+    ''|*[!0-9]*)
+      pvtime_fail IDLE_SAMPLE
+      return
+      ;;
+  esac
+  emit_line "BANGBANG_PVTIME_IDLE_BEFORE=$idle_before"
+  emit_line "BANGBANG_PVTIME_IDLE_AFTER=$idle_after"
+  if [ "$idle_after" -ne "$idle_before" ]; then
+    pvtime_fail IDLE_CHANGED
+    return
+  fi
+  emit_line BANGBANG_PVTIME_IDLE_OK
+}
+
 cmdline=
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_BEGIN
 if [ -r /etc/os-release ]; then
@@ -3565,7 +3636,9 @@ if cmdline_has bangbang.block-serial=vda; then
 elif cmdline_has bangbang.block-serial=vdb; then
   report_block_serial vdb
 fi
-if cmdline_has bangbang.storage-certification=1; then
+if cmdline_has bangbang.pvtime-check=1; then
+  check_pvtime_marker
+elif cmdline_has bangbang.storage-certification=1; then
   check_storage_certification
 elif cmdline_has bangbang.pmem-root=ro; then
   check_pmem_root_marker ro

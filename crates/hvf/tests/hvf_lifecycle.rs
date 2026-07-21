@@ -7164,6 +7164,15 @@ fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
     );
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
         .expect("PSCI discovery session should prepare");
+    let pvtime_record_ipa = session
+        .runtime_resources()
+        .pvtime_state
+        .layout()
+        .expect("prepared session should retain its advertised PVTime layout")
+        .records()[0]
+        .start()
+        .raw_value();
+    assert!(session.runtime_resources().pvtime_state.advertised());
     let entry = GuestAddress::new(
         session
             .capture_arm64_general_register_state()
@@ -7267,18 +7276,20 @@ fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
         step,
         HvfVcpuRunStepOutcome::Hvc {
             function_id: ARM_SMCCC_PV_TIME_FEATURES_64,
-            return_value: u64::MAX,
+            return_value: 0,
             ..
         }
     )));
-    assert!(observed.iter().any(|step| matches!(
-        step,
-        HvfVcpuRunStepOutcome::Hvc {
-            function_id: ARM_SMCCC_PV_TIME_ST_64,
-            return_value: u64::MAX,
-            ..
-        }
-    )));
+    assert!(observed.iter().any(|step| {
+        matches!(
+            step,
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: ARM_SMCCC_PV_TIME_ST_64,
+                return_value,
+                ..
+            } if *return_value == pvtime_record_ipa
+        )
+    }));
     assert!(matches!(
         observed.last(),
         Some(HvfVcpuRunStepOutcome::GuestShutdown {
@@ -7307,9 +7318,9 @@ fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
         0,
         0,
         NOT_SUPPORTED,
-        NOT_SUPPORTED,
-        u64::MAX,
-        u64::MAX,
+        0,
+        0,
+        pvtime_record_ipa,
         u64::MAX,
         u64::MAX,
     ]);

@@ -41,7 +41,9 @@ use bangbang_runtime::fdt::{Arm64FdtCacheHierarchy, Arm64FdtError};
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
-use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryRange};
+use bangbang_runtime::memory::{
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryRange,
+};
 use bangbang_runtime::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
     MemoryHotplugUpdateError, VIRTIO_MEM_DEVICE_ID, VIRTIO_MEM_QUEUE_SIZES, VirtioMemConfigSpace,
@@ -71,6 +73,7 @@ use bangbang_runtime::pmem::{
     PmemUpdateError, PreparedPmemDevice, VIRTIO_PMEM_DEVICE_ID, VIRTIO_PMEM_QUEUE_SIZES,
     VirtioPmemConfigSpace, VirtioPmemDevice, VirtioPmemFlushStatus,
 };
+use bangbang_runtime::pvtime::ARM64_PVTIME_STOLEN_TIME_OFFSET;
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
     CaptureReadySerialState, SERIAL_RECEIVE_FIFO_CAPACITY, SerialConfig, SerialStdioInput,
@@ -133,7 +136,9 @@ use bangbang_runtime::vsock::{
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
 use crate::backend::HvfBackend;
-use crate::coordinator::{HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuRunTerminalReport};
+use crate::coordinator::{
+    HvfVcpuRunControl, HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError, HvfVcpuRunTerminalReport,
+};
 use crate::dirty::{HvfDirtyWriteEpochResetError, HvfDirtyWriteTrackerStartError};
 use crate::gic::{
     HvfArm64GicIccRegisterState, HvfGicDeviceState, HvfGicError, HvfGicInterruptLineAllocator,
@@ -146,6 +151,10 @@ use crate::memory::{
     HvfVirtioMemMappingCaptureError, HvfVirtioMemMappingCaptureState,
 };
 use crate::psci::PsciCpuPowerCoordinator;
+use crate::pvtime::{
+    HvfArm64PvTimeAccountingConfig, HvfArm64PvTimeCaptureState, HvfArm64PvTimeContentionProbe,
+    is_hvf_arm64_pvtime_measurement_available,
+};
 use crate::runner::{
     HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1Restore, HvfVcpuRunCancelHandle,
     HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
@@ -224,6 +233,8 @@ pub struct HvfArm64BootSessionConfig {
     pub gic_msi: Option<HvfGicMsiConfiguration>,
     pub pci_validation: Option<Arm64BootPciValidationConfig>,
     pub pci_enabled: bool,
+    #[doc(hidden)]
+    pub pvtime_contention_probe: Option<HvfArm64PvTimeContentionProbe>,
 }
 
 impl HvfArm64BootSessionConfig {
@@ -248,6 +259,7 @@ impl HvfArm64BootSessionConfig {
             gic_msi: None,
             pci_validation: None,
             pci_enabled: false,
+            pvtime_contention_probe: None,
         }
     }
 
@@ -311,6 +323,14 @@ impl HvfArm64BootSessionConfig {
     #[must_use]
     pub const fn with_pci_enabled(mut self) -> Self {
         self.pci_enabled = true;
+        self
+    }
+
+    /// Installs the hidden deterministic runnable-delay certification probe.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_pvtime_contention_probe(mut self, probe: HvfArm64PvTimeContentionProbe) -> Self {
+        self.pvtime_contention_probe = Some(probe);
         self
     }
 }
@@ -6633,6 +6653,22 @@ impl HvfArm64BootSession<'_> {
         &self.runtime_resources
     }
 
+    /// Publish and capture topology-ordered PVTime values after a pause barrier.
+    ///
+    /// This is a capture-ready handoff only; Wave 6 owns artifact encoding and
+    /// destination orchestration.
+    pub fn capture_arm64_pvtime(
+        &self,
+    ) -> Result<HvfArm64PvTimeCaptureState, HvfVcpuRunCoordinatorError> {
+        self.runner.capture_arm64_pvtime()
+    }
+
+    /// Establish an empty-snapshot pause barrier for signed PVTime certification.
+    #[doc(hidden)]
+    pub fn pause_idle_for_arm64_pvtime_capture(&self) -> Result<(), HvfVcpuRunCoordinatorError> {
+        self.runner.pause_idle_for_arm64_pvtime_capture()
+    }
+
     pub fn pci_balloon_device_updater(&self) -> Option<HvfArm64BootPciBalloonDeviceUpdater> {
         self.pci_data_devices
             .as_ref()
@@ -8948,6 +8984,19 @@ impl OwnedHvfArm64BootSession {
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
         &self.runtime_resources
+    }
+
+    /// Publish and capture topology-ordered PVTime values after a pause barrier.
+    pub fn capture_arm64_pvtime(
+        &self,
+    ) -> Result<HvfArm64PvTimeCaptureState, HvfVcpuRunCoordinatorError> {
+        self.runner.capture_arm64_pvtime()
+    }
+
+    /// Establish an empty-snapshot pause barrier for signed PVTime certification.
+    #[doc(hidden)]
+    pub fn pause_idle_for_arm64_pvtime_capture(&self) -> Result<(), HvfVcpuRunCoordinatorError> {
+        self.runner.pause_idle_for_arm64_pvtime_capture()
     }
 
     pub fn pci_balloon_device_updater(&self) -> Option<HvfArm64BootPciBalloonDeviceUpdater> {
@@ -14716,6 +14765,19 @@ pub enum HvfArm64BootSessionError {
     ConfigureBootRegisters {
         source: HvfVcpuRunCoordinatorError,
     },
+    PvTimeAddressOverflow {
+        index: usize,
+    },
+    PvTimeConfigStorage {
+        source: TryReserveError,
+    },
+    PvTimePublisher {
+        index: usize,
+        source: GuestMemoryAccessError,
+    },
+    ConfigurePvTime {
+        source: HvfVcpuRunCoordinatorError,
+    },
 }
 
 impl fmt::Display for HvfArm64BootSessionError {
@@ -14837,6 +14899,24 @@ impl fmt::Display for HvfArm64BootSessionError {
                     "failed to configure primary HVF boot registers: {source}"
                 )
             }
+            Self::PvTimeAddressOverflow { index } => {
+                write!(f, "PVTime record {index} stolen-time address overflows")
+            }
+            Self::PvTimeConfigStorage { source } => {
+                write!(
+                    f,
+                    "failed to allocate PVTime topology configuration: {source}"
+                )
+            }
+            Self::PvTimePublisher { index, source } => {
+                write!(
+                    f,
+                    "failed to retain PVTime record {index} publisher: {source}"
+                )
+            }
+            Self::ConfigurePvTime { source } => {
+                write!(f, "failed to configure HVF PVTime accounting: {source}")
+            }
         }
     }
 }
@@ -14868,9 +14948,13 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::PciData { source } => Some(source),
             Self::MapGuestMemory { source } => Some(source),
             Self::ConfigureBootRegisters { source } => Some(source),
+            Self::PvTimeConfigStorage { source } => Some(source),
+            Self::PvTimePublisher { source, .. } => Some(source),
+            Self::ConfigurePvTime { source } => Some(source),
             Self::BackendAlreadyInitialized
             | Self::SerialInputWithoutDevice
             | Self::UnsupportedVcpuCount { .. }
+            | Self::PvTimeAddressOverflow { .. }
             | Self::PowerTopology
             | Self::MissingPciValidationMsiSignaler
             | Self::PciValidationMmioDispatcherPoisoned => None,
@@ -15319,6 +15403,47 @@ fn prepare_arm64_boot_session_parts<'vm>(
     )
 }
 
+fn configure_arm64_boot_pvtime(
+    backend: &HvfBackend,
+    coordinator: &HvfVcpuRunCoordinator<'_>,
+    runtime: &mut Arm64BootRuntimeResources,
+    contention_probe: Option<HvfArm64PvTimeContentionProbe>,
+) -> Result<(), HvfArm64BootSessionError> {
+    if !is_hvf_arm64_pvtime_measurement_available() {
+        return Ok(());
+    }
+    let Some(layout) = runtime.pvtime_state.layout() else {
+        return Ok(());
+    };
+    let memory = backend
+        .mapped_guest_memory()
+        .map_err(|source| HvfArm64BootSessionError::MapGuestMemory { source })?;
+    let mut configs = Vec::new();
+    configs
+        .try_reserve_exact(layout.len())
+        .map_err(|source| HvfArm64BootSessionError::PvTimeConfigStorage { source })?;
+    for (index, record) in layout.records().iter().copied().enumerate() {
+        let address = record
+            .start()
+            .checked_add(ARM64_PVTIME_STOLEN_TIME_OFFSET as u64)
+            .ok_or(HvfArm64BootSessionError::PvTimeAddressOverflow { index })?;
+        let publisher = memory
+            .atomic_u64(address)
+            .map_err(|source| HvfArm64BootSessionError::PvTimePublisher { index, source })?;
+        configs.push(HvfArm64PvTimeAccountingConfig::new(
+            record.start().raw_value(),
+            publisher,
+            0,
+            contention_probe.clone(),
+        ));
+    }
+    coordinator
+        .configure_arm64_pvtime(configs)
+        .map_err(|source| HvfArm64BootSessionError::ConfigurePvTime { source })?;
+    runtime.pvtime_state.mark_advertised();
+    Ok(())
+}
+
 fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     backend: &mut HvfBackend,
     controller: &VmmController,
@@ -15331,6 +15456,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         crate::cache::HvfArm64CacheTopologyError,
     >,
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
+    let pvtime_contention_probe = config.pvtime_contention_probe.clone();
     let serial_input = startup_resources
         .take_serial_input()
         .map(HvfArm64BootSerialInput::new);
@@ -15516,6 +15642,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     let coordinator = topology
         .into_run_coordinator(Arc::clone(&mmio_dispatcher), &[0])
         .map_err(|source| HvfArm64BootSessionError::RunCoordinator { source })?;
+    configure_arm64_boot_pvtime(backend, &coordinator, &mut runtime, pvtime_contention_probe)?;
     coordinator
         .configure_arm64_boot_registers(0, boot_registers)
         .map_err(|source| HvfArm64BootSessionError::ConfigureBootRegisters { source })?;

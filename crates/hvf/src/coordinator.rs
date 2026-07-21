@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use bangbang_runtime::mmio::MmioDispatcher;
 
 use crate::psci::{PsciCoordinatorRequest, PsciCoordinatorResponse};
+use crate::pvtime::{HvfArm64PvTimeAccountingConfig, HvfArm64PvTimeCaptureState};
 use crate::runner::{
     HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken, HvfVcpuRetainedVtimerWaitOutcome,
     HvfVcpuRunCompletion, HvfVcpuRunToken, HvfVcpuRunner, HvfVcpuRunnerError,
@@ -1469,13 +1470,13 @@ where
         Ok(())
     }
 
-    fn member_operation(
+    fn member_operation<T>(
         &self,
         index: usize,
         operation: &'static str,
         allow_quiescing: bool,
-        apply: impl FnOnce(&M) -> Result<(), HvfVcpuRunnerError>,
-    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        apply: impl FnOnce(&M) -> Result<T, HvfVcpuRunnerError>,
+    ) -> Result<T, HvfVcpuRunCoordinatorError> {
         let member_count = self.members.len();
         let mpidr =
             *self
@@ -1974,6 +1975,67 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
             })
     }
 
+    pub(crate) fn configure_arm64_pvtime(
+        &self,
+        configs: Vec<HvfArm64PvTimeAccountingConfig>,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        if configs.len() != self.member_count() {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "PVTime configuration count does not match the vCPU topology",
+            ));
+        }
+        for (index, config) in configs.into_iter().enumerate() {
+            self.inner
+                .member_operation(index, "PVTime configuration", false, |member| {
+                    member.configure_arm64_pvtime(config)
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pause_idle_for_arm64_pvtime_capture(
+        &self,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        {
+            let state = self.inner.shared.lock_state()?;
+            if !matches!(state.phase, CoordinatorPhase::Running)
+                || !active_tokens(&state).is_empty()
+            {
+                return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                    "PVTime certification pause requires an idle running topology",
+                ));
+            }
+        }
+
+        self.control().request_pause()?.wait()?;
+        Ok(())
+    }
+
+    pub(crate) fn capture_arm64_pvtime(
+        &self,
+    ) -> Result<HvfArm64PvTimeCaptureState, HvfVcpuRunCoordinatorError> {
+        {
+            let state = self.inner.shared.lock_state()?;
+            if !matches!(state.phase, CoordinatorPhase::Paused) {
+                return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                    "PVTime capture requires a completed pause barrier",
+                ));
+            }
+        }
+        let mut captures = Vec::with_capacity(self.member_count());
+        for index in 0..self.member_count() {
+            let capture =
+                self.inner
+                    .member_operation(index, "PVTime capture", false, |member| {
+                        member.capture_arm64_pvtime()
+                    })?;
+            captures.push(capture.ok_or(HvfVcpuRunCoordinatorError::InvalidState(
+                "PVTime capture requires every topology member to be configured",
+            ))?);
+        }
+        Ok(HvfArm64PvTimeCaptureState::new(captures))
+    }
+
     /// Quiesce active runs and shut down every owner in reverse topology order.
     pub fn shutdown(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
         if self.shutdown_complete {
@@ -2057,16 +2119,19 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
 
-    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::memory::{
+        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
+    };
     use bangbang_runtime::mmio::MmioDispatcher;
 
     use super::{
-        BatchCancel, CoordinatorMember, HvfVcpuRunControlReason, HvfVcpuRunCoordinatorError,
-        HvfVcpuRunEvent, RunCoordinator,
+        BatchCancel, CoordinatorMember, HvfVcpuRunControlReason, HvfVcpuRunCoordinator,
+        HvfVcpuRunCoordinatorError, HvfVcpuRunEvent, RunCoordinator,
     };
     use crate::HvfVcpuRunStepOutcome;
     use crate::exit::{HvfExceptionExit, HvfHvcExit};
     use crate::psci::{PsciCoordinatorRequest, PsciCoordinatorResponse};
+    use crate::pvtime::HvfArm64PvTimeAccountingConfig;
     use crate::runner::tests::start_destroy_order_recording_runner;
     use crate::runner::{
         HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken, HvfVcpuRetainedVtimerWaitOutcome,
@@ -2528,6 +2593,91 @@ mod tests {
                 destroyed_receiver
                     .recv()
                     .expect("failing secondary destroy should be observed"),
+                destroyed_receiver
+                    .recv()
+                    .expect("primary destroy should be observed"),
+            ],
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn concrete_pvtime_configuration_and_capture_are_topology_ordered_and_pause_gated() {
+        let range = GuestMemoryRange::new(GuestAddress::new(0), 64 * 1024)
+            .expect("PVTime coordinator range should be valid");
+        let layout = GuestMemoryLayout::new(vec![range]).expect("PVTime layout should be valid");
+        let memory = GuestMemory::allocate(&layout).expect("PVTime memory should allocate");
+        let first = memory
+            .atomic_u64(GuestAddress::new(8))
+            .expect("first PVTime publisher should be aligned");
+        let second = memory
+            .atomic_u64(GuestAddress::new(16))
+            .expect("second PVTime publisher should be aligned");
+        let observed_first = first.clone();
+        let observed_second = second.clone();
+        let (destroyed_sender, destroyed_receiver) = mpsc::channel();
+        let runners = vec![
+            start_destroy_order_recording_runner(0, false, destroyed_sender.clone()),
+            start_destroy_order_recording_runner(1, false, destroyed_sender),
+        ];
+        let mut coordinator = HvfVcpuRunCoordinator::from_test_runners(
+            runners,
+            vec![0, 1],
+            Arc::new(Mutex::new(MmioDispatcher::new())),
+            &[0, 1],
+        )
+        .expect("PVTime coordinator should build");
+
+        assert!(matches!(
+            coordinator.capture_arm64_pvtime(),
+            Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "PVTime capture requires a completed pause barrier"
+            ))
+        ));
+        assert!(matches!(
+            coordinator.configure_arm64_pvtime(Vec::new()),
+            Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "PVTime configuration count does not match the vCPU topology"
+            ))
+        ));
+        coordinator
+            .configure_arm64_pvtime(vec![
+                HvfArm64PvTimeAccountingConfig::new(0x801f_e800, first, 11, None),
+                HvfArm64PvTimeAccountingConfig::new(0x801f_e840, second, 29, None),
+            ])
+            .expect("matching PVTime topology should configure");
+        coordinator
+            .pause_idle_for_arm64_pvtime_capture()
+            .expect("idle topology should complete a pause barrier");
+        let capture = coordinator
+            .capture_arm64_pvtime()
+            .expect("paused topology should capture");
+
+        assert_eq!(
+            capture
+                .vcpus()
+                .iter()
+                .map(|state| state.stolen_time_ns())
+                .collect::<Vec<_>>(),
+            [11, 29]
+        );
+        assert_eq!(observed_first.load_le(), 11);
+        assert_eq!(observed_second.load_le(), 29);
+        assert!(matches!(
+            coordinator.pause_idle_for_arm64_pvtime_capture(),
+            Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "PVTime certification pause requires an idle running topology"
+            ))
+        ));
+
+        coordinator
+            .shutdown()
+            .expect("coordinator should shut down");
+        assert_eq!(
+            [
+                destroyed_receiver
+                    .recv()
+                    .expect("secondary destroy should be observed"),
                 destroyed_receiver
                     .recv()
                     .expect("primary destroy should be observed"),

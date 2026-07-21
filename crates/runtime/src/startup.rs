@@ -286,16 +286,21 @@ const ARM64_BOOT_VMCLOCK_ADDRESS: GuestAddress = GuestAddress::new(
 #[derive(Clone, PartialEq, Eq)]
 pub struct Arm64BootPvTimeState {
     layout: Option<Arm64PvTimeLayout>,
+    advertised: bool,
 }
 
 impl Arm64BootPvTimeState {
     const fn unavailable() -> Self {
-        Self { layout: None }
+        Self {
+            layout: None,
+            advertised: false,
+        }
     }
 
     fn prepared(layout: Arm64PvTimeLayout) -> Self {
         Self {
             layout: Some(layout),
+            advertised: false,
         }
     }
 
@@ -306,7 +311,12 @@ impl Arm64BootPvTimeState {
 
     /// Return whether the public startup path may advertise PVTime.
     pub const fn advertised(&self) -> bool {
-        false
+        self.advertised
+    }
+
+    #[doc(hidden)]
+    pub fn mark_advertised(&mut self) {
+        self.advertised = true;
     }
 }
 
@@ -317,7 +327,7 @@ impl fmt::Debug for Arm64BootPvTimeState {
                 "record_count",
                 &self.layout.as_ref().map_or(0, Arm64PvTimeLayout::len),
             )
-            .field("advertised", &false)
+            .field("advertised", &self.advertised)
             .finish()
     }
 }

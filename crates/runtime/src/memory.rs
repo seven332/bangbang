@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, align_of, size_of};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -464,6 +464,75 @@ pub struct GuestMemory {
     shared_reservations: Vec<GuestMemoryRegion>,
     dirty_tracker: Option<Arc<GuestMemoryDirtyTracker>>,
     backing: GuestMemoryBacking,
+}
+
+/// Retained, aligned 64-bit word inside owned guest memory.
+///
+/// The lease keeps the underlying mapping alive without exposing its host
+/// address. Stores mark the configured dirty tracker before publishing one
+/// little-endian, release-ordered value. Callers must reserve the word for
+/// atomic access before sharing this lease with another thread.
+#[derive(Clone)]
+pub struct GuestMemoryAtomicU64 {
+    mapping: Arc<GuestMemoryMapping>,
+    mapping_offset: usize,
+    range: GuestMemoryRange,
+    dirty_tracker: Option<Arc<GuestMemoryDirtyTracker>>,
+}
+
+impl GuestMemoryAtomicU64 {
+    /// Publish one host value as a little-endian single-copy atomic word.
+    pub fn store_le(&self, value: u64) -> Result<(), GuestMemoryAccessError> {
+        if let Some(tracker) = self.dirty_tracker.as_ref() {
+            tracker
+                .mark_range(self.range)
+                .map_err(|_| GuestMemoryAccessError::DirtyTrackingState)?;
+        }
+
+        // SAFETY: `GuestMemory::atomic_u64` proves that the retained mapping
+        // covers this complete word and that both its guest and derived host
+        // addresses satisfy `AtomicU64` alignment. The mapping remains live
+        // through `self.mapping`, and this lease is the caller-designated
+        // atomic access path for the word.
+        unsafe {
+            self.atomic().store(value.to_le(), Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Read one little-endian word with acquire ordering.
+    pub fn load_le(&self) -> u64 {
+        // SAFETY: construction and retained ownership provide the same bounds,
+        // alignment, and lifetime guarantees as `store_le`.
+        u64::from_le(unsafe { self.atomic().load(Ordering::Acquire) })
+    }
+
+    /// Return the exact guest range covered by this lease.
+    pub const fn range(&self) -> GuestMemoryRange {
+        self.range
+    }
+
+    unsafe fn atomic(&self) -> &AtomicU64 {
+        let address = self
+            .mapping
+            .address()
+            .as_ptr()
+            .cast::<u8>()
+            .wrapping_add(self.mapping_offset)
+            .cast::<AtomicU64>();
+        // SAFETY: the caller relies on the construction proof documented by
+        // `store_le` and `load_le`.
+        unsafe { &*address }
+    }
+}
+
+impl fmt::Debug for GuestMemoryAtomicU64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GuestMemoryAtomicU64")
+            .field("range", &self.range)
+            .field("dirty_tracking", &self.dirty_tracker.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl GuestMemory {
@@ -1016,6 +1085,71 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Retain one aligned 64-bit word for cross-thread atomic publication.
+    pub fn atomic_u64(
+        &self,
+        guest_address: GuestAddress,
+    ) -> Result<GuestMemoryAtomicU64, GuestMemoryAccessError> {
+        const WORD_SIZE: usize = size_of::<u64>();
+        const WORD_ALIGNMENT: u64 = align_of::<AtomicU64>() as u64;
+
+        if !guest_address.is_aligned(WORD_ALIGNMENT).map_err(|_| {
+            GuestMemoryAccessError::UnalignedAtomicAccess {
+                address: guest_address,
+                alignment: WORD_ALIGNMENT,
+            }
+        })? {
+            return Err(GuestMemoryAccessError::UnalignedAtomicAccess {
+                address: guest_address,
+                alignment: WORD_ALIGNMENT,
+            });
+        }
+        let Some(range) = access_range(guest_address, WORD_SIZE)? else {
+            return Err(GuestMemoryAccessError::SizeTooLarge { size: WORD_SIZE });
+        };
+        self.validate_mapped_range(range)?;
+
+        let region = self
+            .regions
+            .iter()
+            .find(|region| {
+                region.range().contains(range.start())
+                    && range.end_exclusive() <= region.range().end_exclusive()
+            })
+            .ok_or(GuestMemoryAccessError::AtomicAccessCrossesRegion { range })?;
+        let offset = range.start().raw_value() - region.range().start().raw_value();
+        let offset =
+            usize::try_from(offset).map_err(|_| GuestMemoryAccessError::SegmentOffsetTooLarge {
+                range: region.range(),
+                offset,
+            })?;
+        let mapping_offset = region.mapping_offset.checked_add(offset).ok_or(
+            GuestMemoryAccessError::AtomicHostOffsetOverflow {
+                address: guest_address,
+            },
+        )?;
+        let host_address = region
+            .mapping
+            .address()
+            .as_ptr()
+            .cast::<u8>()
+            .wrapping_add(mapping_offset)
+            .addr();
+        if !host_address.is_multiple_of(WORD_ALIGNMENT as usize) {
+            return Err(GuestMemoryAccessError::UnalignedAtomicHostAddress {
+                address: guest_address,
+                alignment: WORD_ALIGNMENT,
+            });
+        }
+
+        Ok(GuestMemoryAtomicU64 {
+            mapping: Arc::clone(&region.mapping),
+            mapping_offset,
+            range,
+            dirty_tracker: self.dirty_tracker.as_ref().map(Arc::clone),
+        })
+    }
+
     pub fn read_slice(
         &self,
         destination: &mut [u8],
@@ -1508,6 +1642,20 @@ pub enum GuestMemoryAccessError {
         range: GuestMemoryRange,
         size: u64,
     },
+    UnalignedAtomicAccess {
+        address: GuestAddress,
+        alignment: u64,
+    },
+    UnalignedAtomicHostAddress {
+        address: GuestAddress,
+        alignment: u64,
+    },
+    AtomicAccessCrossesRegion {
+        range: GuestMemoryRange,
+    },
+    AtomicHostOffsetOverflow {
+        address: GuestAddress,
+    },
     DirtyTrackingState,
 }
 
@@ -1541,6 +1689,22 @@ impl fmt::Display for GuestMemoryAccessError {
                     "guest memory access segment of {size} bytes in range {range} is too large for this host"
                 )
             }
+            Self::UnalignedAtomicAccess { address, alignment } => write!(
+                f,
+                "guest memory atomic access at {address} is not aligned to {alignment} bytes"
+            ),
+            Self::UnalignedAtomicHostAddress { address, alignment } => write!(
+                f,
+                "host mapping for guest atomic access at {address} is not aligned to {alignment} bytes"
+            ),
+            Self::AtomicAccessCrossesRegion { range } => write!(
+                f,
+                "guest memory atomic access range {range} crosses a mapping boundary"
+            ),
+            Self::AtomicHostOffsetOverflow { address } => write!(
+                f,
+                "host mapping offset for guest atomic access at {address} overflows"
+            ),
             Self::DirtyTrackingState => {
                 f.write_str("guest memory dirty tracking does not cover the write")
             }
@@ -3583,6 +3747,80 @@ mod tests {
             .expect("guest memory read should succeed");
 
         assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn guest_memory_atomic_u64_publishes_little_endian_and_marks_dirty() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(0, page_size)]);
+        let tracker = memory
+            .enable_dirty_tracking()
+            .expect("dirty tracking should enable");
+        let _ = tracker.clear_quiesced();
+        let address = GuestAddress::new(64);
+        let word = memory
+            .atomic_u64(address)
+            .expect("aligned atomic word should be retained");
+
+        word.store_le(0x0102_0304_0506_0708)
+            .expect("atomic publication should succeed");
+
+        assert_eq!(word.load_le(), 0x0102_0304_0506_0708);
+        let mut bytes = [0; 8];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("published bytes should read");
+        assert_eq!(bytes, 0x0102_0304_0506_0708_u64.to_le_bytes());
+        assert_eq!(
+            tracker.dirty_pages().expect("dirty pages should query"),
+            [GuestAddress::new(0)]
+        );
+    }
+
+    #[test]
+    fn guest_memory_atomic_u64_rejects_unaligned_and_unmapped_words() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![range(page_size, page_size)]);
+
+        assert!(matches!(
+            memory.atomic_u64(GuestAddress::new(page_size + 1)),
+            Err(GuestMemoryAccessError::UnalignedAtomicAccess { .. })
+        ));
+        assert!(matches!(
+            memory.atomic_u64(GuestAddress::new(0)),
+            Err(GuestMemoryAccessError::UnmappedRange { .. })
+        ));
+    }
+
+    #[test]
+    fn guest_memory_atomic_u64_lease_retains_mapping_without_exposing_host_address() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![range(0, page_size)]);
+        let host_address = format!(
+            "{:p}",
+            memory
+                .regions()
+                .first()
+                .expect("memory should contain a region")
+                .host_address()
+                .as_ptr()
+        );
+        let word = memory
+            .atomic_u64(GuestAddress::new(128))
+            .expect("aligned atomic word should be retained");
+        let thread_word = word.clone();
+        drop(memory);
+
+        std::thread::spawn(move || {
+            thread_word
+                .store_le(u64::MAX)
+                .expect("retained mapping should remain writable");
+        })
+        .join()
+        .expect("atomic writer thread should join");
+
+        assert_eq!(word.load_le(), u64::MAX);
+        assert!(!format!("{word:?}").contains(&host_address));
     }
 
     #[test]

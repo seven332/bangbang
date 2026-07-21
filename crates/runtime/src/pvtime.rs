@@ -14,7 +14,8 @@ pub const ARM64_PVTIME_REVISION: u32 = 0;
 /// Current standard stolen-time structure attributes.
 pub const ARM64_PVTIME_ATTRIBUTES: u32 = 0;
 
-const ARM64_PVTIME_STOLEN_TIME_OFFSET: usize = 8;
+/// Byte offset of the atomically updated stolen-time word.
+pub const ARM64_PVTIME_STOLEN_TIME_OFFSET: usize = 8;
 const ARM64_PVTIME_PADDING_OFFSET: usize = 16;
 
 /// Exact standard arm64 PVTime stolen-time structure contents.
