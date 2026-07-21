@@ -5929,44 +5929,35 @@ impl SharedMemoryHotplugDeviceMetrics {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct SharedMemoryHotplugLatencyMetricsInner {
-    min_us: AtomicU64,
-    max_us: AtomicU64,
-    sum_us: AtomicU64,
-    sample_count: AtomicU64,
+    state: Mutex<MemoryHotplugLatencyMetrics>,
 }
 
 impl SharedMemoryHotplugLatencyMetricsInner {
     fn record_sample(&self, latency_us: u64) {
-        record_atomic_min_metric(&self.min_us, latency_us);
-        record_atomic_max_metric(&self.max_us, latency_us);
-        record_atomic_metric(&self.sum_us, latency_us);
-        record_atomic_metric_release(&self.sample_count, 1);
+        let mut state = lock_memory_hotplug_latency_metrics(&self.state);
+        if state.sample_count == 0 || latency_us < state.min_us {
+            state.min_us = latency_us;
+        }
+        if state.sample_count == 0 || latency_us > state.max_us {
+            state.max_us = latency_us;
+        }
+        state.sum_us = state.sum_us.saturating_add(latency_us);
+        state.sample_count = state.sample_count.saturating_add(1);
     }
 
     fn snapshot(&self) -> MemoryHotplugLatencyMetrics {
-        let sample_count = self.sample_count.load(Ordering::Acquire);
-        if sample_count == 0 {
-            return MemoryHotplugLatencyMetrics::default();
-        }
-        MemoryHotplugLatencyMetrics {
-            min_us: self.min_us.load(Ordering::Relaxed),
-            max_us: self.max_us.load(Ordering::Relaxed),
-            sum_us: self.sum_us.load(Ordering::Relaxed),
-            sample_count,
-        }
+        *lock_memory_hotplug_latency_metrics(&self.state)
     }
 }
 
-impl Default for SharedMemoryHotplugLatencyMetricsInner {
-    fn default() -> Self {
-        Self {
-            min_us: AtomicU64::new(u64::MAX),
-            max_us: AtomicU64::new(0),
-            sum_us: AtomicU64::new(0),
-            sample_count: AtomicU64::new(0),
-        }
+fn lock_memory_hotplug_latency_metrics(
+    state: &Mutex<MemoryHotplugLatencyMetrics>,
+) -> MutexGuard<'_, MemoryHotplugLatencyMetrics> {
+    match state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -7720,6 +7711,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -7732,10 +7724,10 @@ mod tests {
         PmemDeviceMetrics, PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError,
         RtcDeviceMetrics, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
         SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetrics,
-        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetrics,
-        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
-        SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
+        SharedMemoryHotplugDeviceMetrics, SharedMemoryHotplugLatencyMetricsInner,
+        SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
+        SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::logger::SharedLoggerMetrics;
@@ -9978,6 +9970,51 @@ mod tests {
         assert_eq!(first.snapshot().state_count(), 1);
         assert_eq!(first.snapshot().state_fails(), 1);
         assert!(second.snapshot().is_empty());
+    }
+
+    #[test]
+    fn concurrent_memory_hotplug_latency_snapshots_are_coherent() {
+        const LATENCY_US: u64 = 7;
+        const SAMPLE_COUNT_PER_WORKER: usize = 10_000;
+        const WORKER_COUNT: usize = 4;
+
+        let latency = Arc::new(SharedMemoryHotplugLatencyMetricsInner::default());
+        let workers = (0..WORKER_COUNT)
+            .map(|_| {
+                let latency = Arc::clone(&latency);
+                thread::spawn(move || {
+                    for _ in 0..SAMPLE_COUNT_PER_WORKER {
+                        latency.record_sample(LATENCY_US);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for _ in 0..SAMPLE_COUNT_PER_WORKER {
+            let snapshot = latency.snapshot();
+            assert_eq!(
+                snapshot.sum_us(),
+                snapshot.sample_count().saturating_mul(LATENCY_US)
+            );
+            if !snapshot.is_empty() {
+                assert_eq!(snapshot.min_us(), LATENCY_US);
+                assert_eq!(snapshot.max_us(), LATENCY_US);
+            }
+        }
+        for worker in workers {
+            worker.join().expect("latency writer should not panic");
+        }
+
+        let snapshot = latency.snapshot();
+        assert_eq!(
+            snapshot.sample_count(),
+            u64::try_from(WORKER_COUNT * SAMPLE_COUNT_PER_WORKER)
+                .expect("test sample count should fit u64")
+        );
+        assert_eq!(
+            snapshot.sum_us(),
+            snapshot.sample_count().saturating_mul(LATENCY_US)
+        );
     }
 
     #[test]
