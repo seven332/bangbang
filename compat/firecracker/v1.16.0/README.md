@@ -55,6 +55,11 @@ claims mechanically visible.
   records publication-safe paired PFN accounting and coherent MMIO/PCI
   capture-ready ownership, and hands exactly two serialization/restore
   aggregates to Wave 6.
+- [`memory-hotplug-contract.md`](memory-hotplug-contract.md) is the #1474
+  virtio-mem ledger. It pins all 19 records, promotes the 17 complete
+  API/path/property/schema leaves, records singleton metrics and exact
+  shared-aperture/HVF/dirty capture ownership, and hands exactly two
+  serialization/restore aggregates to Wave 6.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -371,7 +376,27 @@ all 50 API operation/path/property/schema leaves. Exactly
 `semantic.memory-device:balloon-oom-stats-hinting-and-reporting` remain
 `audit-required`; Wave 6 owns encoding, artifact integration, restore,
 migration/clone behavior, portability, and signed restored-guest outcomes. The
-current overlay is therefore 164 `implemented-and-verified`, 234
+overlay at that checkpoint was therefore 164 `implemented-and-verified`, 234
+`audit-required`, three `missing-platform-feasible`, and 17
+`proven-platform-impossible` records.
+
+#1474 completes the live, observable, and capture-ready virtio-mem slice under
+#1440. One per-device producer exposes Firecracker's exact 18 memory-hotplug
+metrics plus separate Bangbang interrupt, rollback, owner-cleanup, and teardown
+counters. Supported requests record one count and latency sample at the final
+publication boundary; committed bytes, partial or late rollback, post-commit
+discard, and owner cleanup remain distinct. Detached MMIO/PCI state validates
+feature negotiation, queue geometry and cursors, pending notification and
+interrupt state, compact plugged ranges, one exact shared reservation identity,
+guest owners, actual HVF maps, dirty tracking, epoch, and byte accounting. The
+native-v1 create path performs this paused preflight before publication without
+claiming a serialization format. The checked
+[`memory-hotplug-contract.md`](memory-hotplug-contract.md) promotes all 17 API
+operation/path/property/schema leaves. Exactly `corpus:memory-hotplug` and
+`semantic.memory-device:virtio-mem-lifecycle-accounting-and-state` remain
+`audit-required`; Wave 6 owns encoding, artifact integration, restore,
+migration/clone behavior, portability, and signed restored-guest outcomes. The
+current overlay is therefore 181 `implemented-and-verified`, 217
 `audit-required`, three `missing-platform-feasible`, and 17
 `proven-platform-impossible` records.
 

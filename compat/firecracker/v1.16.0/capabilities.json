@@ -138,11 +138,45 @@
     {
       "id": "api-operation:GET /hotplug/memory",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation GET /hotplug/memory.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:GET /hotplug/memory; strict API/model behavior, live MMIO/PCI execution, failure ordering, metrics, and capture-ready evidence are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-operation:GET /hotplug/memory"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug route parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "selected MMIO or PCI owner traversal and mapping capture"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "live virtio-mem queue, metrics, and capture-ready state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux memory-hotplug lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "shared aperture, HVF mapping, dirty-state, and accounting capture tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused parser, queue, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:GET /machine-config",
@@ -402,11 +436,45 @@
     {
       "id": "api-operation:PATCH /hotplug/memory",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /hotplug/memory.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:PATCH /hotplug/memory; strict API/model behavior, live MMIO/PCI execution, failure ordering, metrics, and capture-ready evidence are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-operation:PATCH /hotplug/memory"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug route parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "selected MMIO or PCI owner traversal and mapping capture"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "live virtio-mem queue, metrics, and capture-ready state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux memory-hotplug lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "shared aperture, HVF mapping, dirty-state, and accounting capture tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused parser, queue, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /machine-config",
@@ -852,11 +920,45 @@
     {
       "id": "api-operation:PUT /hotplug/memory",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /hotplug/memory.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:PUT /hotplug/memory; strict API/model behavior, live MMIO/PCI execution, failure ordering, metrics, and capture-ready evidence are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-operation:PUT /hotplug/memory"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug route parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "selected MMIO or PCI owner traversal and mapping capture"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "live virtio-mem queue, metrics, and capture-ready state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux memory-hotplug lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "shared aperture, HVF mapping, dirty-state, and accounting capture tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused parser, queue, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /logger",
@@ -1438,11 +1540,45 @@
     {
       "id": "api-path:/hotplug/memory",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /hotplug/memory.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-path:/hotplug/memory GET/PUT/PATCH surface; strict API/model behavior, live MMIO/PCI execution, failure ordering, metrics, and capture-ready evidence are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-path:/hotplug/memory"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug route parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "selected MMIO or PCI owner traversal and mapping capture"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "live virtio-mem queue, metrics, and capture-ready state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux memory-hotplug lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "shared aperture, HVF mapping, dirty-state, and accounting capture tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused parser, queue, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-path:/logger",
@@ -3861,11 +3997,45 @@
     {
       "id": "api-property:FullVmConfiguration.memory-hotplug",
       "family": "api-contract",
-      "summary": "Accept and exactly report the supported pre-boot memory-hotplug configuration in FullVmConfiguration, including either ordering with vhost-user block. Startup fixes the pmem-aware aperture before block preparation and reserves it as one sparse shared export object when virtio-mem is configured. Offline bytes remain excluded from guest CPU/HVF mappings, dirty metadata, byte access, and current/plugged accounting; plugged blocks are active views. A selected trusted vhost backend receives boot RAM plus the complete aperture in one immutable bounded table and can access unplugged bytes. Native-v1 optional-device serialization/restore and the complete memory-hotplug corpus remain under audit.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:FullVmConfiguration.memory-hotplug; strict API/model behavior, sparse shared-aperture ownership, live MMIO/PCI execution, metrics, and capture-ready evidence are mapped in the checked memory-hotplug closure contract. Native-v1 optional-device serialization remains under Wave 6.",
       "source_refs": [
         "api-property:FullVmConfiguration.memory-hotplug"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug route parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "selected MMIO or PCI owner traversal and mapping capture"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "live virtio-mem queue, metrics, and capture-ready state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux memory-hotplug lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "shared aperture, HVF mapping, dirty-state, and accounting capture tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused parser, queue, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.metrics",
@@ -4449,83 +4619,344 @@
     {
       "id": "api-property:MemoryHotplugConfig.block_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugConfig.block_size_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:MemoryHotplugConfig.block_size_mib; field validation, status projection, live queue behavior, and capture evidence are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-property:MemoryHotplugConfig.block_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug field parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "exact shared-aperture ownership, mapping, dirty state, and accounting"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated configuration, live queue, metrics, and capture-ready state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux memory-hotplug lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused field, queue, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryHotplugConfig.slot_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugConfig.slot_size_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:MemoryHotplugConfig.slot_size_mib; field validation, status projection, live queue behavior, and capture evidence are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-property:MemoryHotplugConfig.slot_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug field parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "exact shared-aperture ownership, mapping, dirty state, and accounting"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated configuration, live queue, metrics, and capture-ready state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux memory-hotplug lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused field, queue, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryHotplugConfig.total_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugConfig.total_size_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:MemoryHotplugConfig.total_size_mib; field validation, status projection, live queue behavior, and capture evidence are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-property:MemoryHotplugConfig.total_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug field parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "exact shared-aperture ownership, mapping, dirty state, and accounting"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated configuration, live queue, metrics, and capture-ready state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux memory-hotplug lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused field, queue, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryHotplugSizeUpdate.requested_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugSizeUpdate.requested_size_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:MemoryHotplugSizeUpdate.requested_size_mib; strict parsing, runtime validation, failure-atomic owner delivery, and signed convergence are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-property:MemoryHotplugSizeUpdate.requested_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug field parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "failure-atomic active-session update and committed status"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated requested-size update, config interrupt, and capture state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux requested-size convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused update validation, interrupt, rollback, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryHotplugStatus.block_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.block_size_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:MemoryHotplugStatus.block_size_mib; exact committed status and live device accounting are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-property:MemoryHotplugStatus.block_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact five-field memory-hotplug status serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "configured and active memory-hotplug status projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated configuration and live plugged/requested accounting"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI public status lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused status, queue accounting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryHotplugStatus.plugged_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.plugged_size_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:MemoryHotplugStatus.plugged_size_mib; exact committed status and live device accounting are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-property:MemoryHotplugStatus.plugged_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact five-field memory-hotplug status serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "configured and active memory-hotplug status projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated configuration and live plugged/requested accounting"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI public status lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused status, queue accounting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryHotplugStatus.requested_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.requested_size_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:MemoryHotplugStatus.requested_size_mib; exact committed status and live device accounting are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-property:MemoryHotplugStatus.requested_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact five-field memory-hotplug status serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "configured and active memory-hotplug status projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated configuration and live plugged/requested accounting"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI public status lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused status, queue accounting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryHotplugStatus.slot_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.slot_size_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:MemoryHotplugStatus.slot_size_mib; exact committed status and live device accounting are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-property:MemoryHotplugStatus.slot_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact five-field memory-hotplug status serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "configured and active memory-hotplug status projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated configuration and live plugged/requested accounting"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI public status lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused status, queue accounting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:MemoryHotplugStatus.total_size_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MemoryHotplugStatus.total_size_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:MemoryHotplugStatus.total_size_mib; exact committed status and live device accounting are mapped in the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-property:MemoryHotplugStatus.total_size_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact five-field memory-hotplug status serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "configured and active memory-hotplug status projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated configuration and live plugged/requested accounting"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI public status lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused status, queue accounting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:Metrics.metrics_path",
@@ -6170,29 +6601,121 @@
     {
       "id": "api-schema:MemoryHotplugConfig",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema MemoryHotplugConfig.",
+      "summary": "Implements and verifies the complete strict Firecracker v1.16 MemoryHotplugConfig schema, semantic geometry, transactional configuration, selected MMIO/PCI execution, metrics, and capture-ready behavior documented by the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-schema:MemoryHotplugConfig"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug schema parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "selected MMIO or PCI owner execution and mapping capture"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated configuration, live queue, metrics, and capture-ready state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux memory-hotplug lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/memory.rs",
+          "anchor": "shared aperture, HVF mapping, dirty-state, and accounting capture tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused schema, queue, failure-order, metric, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:MemoryHotplugSizeUpdate",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema MemoryHotplugSizeUpdate.",
+      "summary": "Implements and verifies the complete strict Firecracker v1.16 MemoryHotplugSizeUpdate schema, runtime validation, failure-atomic owner delivery, config signaling, and committed status behavior documented by the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-schema:MemoryHotplugSizeUpdate"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "strict memory-hotplug update parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "failure-atomic active-session update and committed status"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "validated requested-size update and config interrupt"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Linux requested-size convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused update validation, interrupt, rollback, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:MemoryHotplugStatus",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema MemoryHotplugStatus.",
+      "summary": "Implements and verifies the complete exact five-field Firecracker v1.16 MemoryHotplugStatus schema backed by committed configuration and publication-safe live device accounting documented by the checked memory-hotplug closure contract.",
       "source_refs": [
         "api-schema:MemoryHotplugStatus"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "exact five-field memory-hotplug status serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "configured and active memory-hotplug status projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "publication-safe plugged and requested accounting"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI public status lifecycle evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/memory_hotplug.rs",
+          "anchor": "focused status, queue accounting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:Metrics",
@@ -7023,7 +7546,7 @@
     {
       "id": "corpus:memory-hotplug",
       "family": "memory-devices",
-      "summary": "The supported MMIO/PCI virtio-mem subset implements validated pre-boot sizing, requested/plugged status, block-granular PLUG/UNPLUG/UNPLUG_ALL, guest-completion ordering, HVF/dirty registration, exact rollback, discard, and signed grow/shrink. With vhost-user, one full sparse shared aperture is reserved before device preparation, active blocks are exact offset views, and an immutable boot-plus-aperture backend table remains stable through startup/runtime insertion, resize, pause/run, backend death, deletion, and reuse. Offline bytes remain outside guest CPU/HVF/current accounting but are explicitly accessible to the trusted backend. Continue auditing broader accounting/deletion, metrics, snapshot state, and complete corpus semantics.",
+      "summary": "Validated API sizing and status, block-granular STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe guest/HVF/dirty ownership, exact rollback, best-effort discard, Firecracker-shaped metrics, MMIO/PCI capture-ready state, sparse vhost aperture coexistence, failures, and cleanup are implemented and verified. Wave 6 retains the aggregate until virtio-mem state is encoded, integrated into artifacts, restored into live owners and shared mappings, and certified for migration/clone, portability, and signed restored-guest behavior.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],
@@ -8657,7 +9180,7 @@
     {
       "id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
       "family": "memory-devices",
-      "summary": "Virtio-mem implements supported sizing, requested/plugged state, block lifecycle, guest/HVF mapping, dirty metadata, guest-completion commit, exact reverse rollback, and best-effort discard over MMIO or PCI. Vhost coexistence uses one full sparse reservation with active offset views: offline bytes remain outside CPU/HVF/current accounting, while a trusted backend gets one immutable boot-plus-aperture table and may access unplugged bytes. Focused and signed direct/contained tests cover both setup orders, limits, geometry, grow/shrink, same-mapping rollback/reuse, pause/run, backend death, runtime vhost attach/delete, cleanup, unchanged entitlements, and no steady helper. Continue auditing broader public accounting/deletion, metrics, optional-device snapshot state, migration, and portability.",
+      "summary": "Live virtio-mem sizing and status, block lifecycle, publication-safe guest/HVF mapping, dirty metadata, exact reverse rollback, best-effort discard, singleton metrics, opaque shared-aperture identity, MMIO/PCI capture-ready state, failures, and cleanup are implemented and verified, including stable vhost coexistence. Wave 6 retains the aggregate until detached state is encoded, integrated into native artifacts, restored into exact transport and mapping owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],

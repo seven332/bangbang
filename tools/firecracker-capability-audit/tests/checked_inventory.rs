@@ -160,6 +160,29 @@ fn delivery_closure_policy_is_stable() {
         "corpus:pmem",
         "semantic.storage:pmem-root-mapping-flush-and-state",
     ];
+    const MEMORY_HOTPLUG_TERMINAL: [&str; 17] = [
+        "api-operation:GET /hotplug/memory",
+        "api-operation:PATCH /hotplug/memory",
+        "api-operation:PUT /hotplug/memory",
+        "api-path:/hotplug/memory",
+        "api-property:FullVmConfiguration.memory-hotplug",
+        "api-property:MemoryHotplugConfig.block_size_mib",
+        "api-property:MemoryHotplugConfig.slot_size_mib",
+        "api-property:MemoryHotplugConfig.total_size_mib",
+        "api-property:MemoryHotplugSizeUpdate.requested_size_mib",
+        "api-property:MemoryHotplugStatus.block_size_mib",
+        "api-property:MemoryHotplugStatus.plugged_size_mib",
+        "api-property:MemoryHotplugStatus.requested_size_mib",
+        "api-property:MemoryHotplugStatus.slot_size_mib",
+        "api-property:MemoryHotplugStatus.total_size_mib",
+        "api-schema:MemoryHotplugConfig",
+        "api-schema:MemoryHotplugSizeUpdate",
+        "api-schema:MemoryHotplugStatus",
+    ];
+    const MEMORY_HOTPLUG_WAVE_6: [&str; 2] = [
+        "corpus:memory-hotplug",
+        "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
+    ];
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -208,8 +231,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 164);
-    assert_eq!(count(Disposition::AuditRequired), 234);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 181);
+    assert_eq!(count(Disposition::AuditRequired), 217);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -372,6 +395,66 @@ fn delivery_closure_policy_is_stable() {
             storage_contract.matches(&format!("| `{id}` |")).count(),
             1,
             "checked storage contract row must be unique: {id}"
+        );
+    }
+
+    let memory_hotplug_ids = MEMORY_HOTPLUG_TERMINAL
+        .into_iter()
+        .chain(MEMORY_HOTPLUG_WAVE_6)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        memory_hotplug_ids.len(),
+        19,
+        "memory-hotplug closure ledger must stay exact"
+    );
+    for id in MEMORY_HOTPLUG_TERMINAL {
+        let capability = by_id
+            .get(id)
+            .expect("terminal memory-hotplug record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "memory-hotplug record must remain implemented: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "terminal memory-hotplug record must retain concrete evidence: {id}"
+        );
+    }
+    for id in MEMORY_HOTPLUG_WAVE_6 {
+        let capability = by_id
+            .get(id)
+            .expect("Wave 6 memory-hotplug record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "Wave 6 memory-hotplug handoff must remain audit-owned: {id}"
+        );
+        assert!(
+            capability.summary.contains("Wave 6"),
+            "Wave 6 memory-hotplug handoff must name its owner: {id}"
+        );
+    }
+
+    let memory_hotplug_contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/memory-hotplug-contract.md"),
+    )
+    .expect("checked memory-hotplug contract must be readable");
+    assert_eq!(
+        memory_hotplug_contract
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .count(),
+        19,
+        "checked memory-hotplug contract must contain each exact ledger row once"
+    );
+    for id in memory_hotplug_ids {
+        assert_eq!(
+            memory_hotplug_contract
+                .matches(&format!("| `{id}` |"))
+                .count(),
+            1,
+            "checked memory-hotplug contract row must be unique: {id}"
         );
     }
 

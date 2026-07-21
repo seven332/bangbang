@@ -44,14 +44,15 @@ use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryBacking, Gu
 use bangbang_runtime::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
     MemoryHotplugUpdateError, VIRTIO_MEM_DEVICE_ID, VIRTIO_MEM_QUEUE_SIZES, VirtioMemConfigSpace,
-    VirtioMemDevice, VirtioMemMmioLayout, VirtioMemMutationExecutor,
+    VirtioMemDevice, VirtioMemMmioCaptureState, VirtioMemMmioLayout, VirtioMemMutationExecutor,
+    VirtioMemPciCaptureError, VirtioMemPciCaptureState,
 };
 use bangbang_runtime::message_interrupt::GuestMessageInterruptResources;
 use bangbang_runtime::metrics::{
     BlockDeviceMetricsLease, NetworkInterfaceMetricsLease, PmemDeviceMetricsLease,
     SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
-    SharedVsockDeviceMetrics,
+    SharedMemoryHotplugDeviceMetrics, SharedNetworkInterfaceMetricsRegistry,
+    SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId};
 use bangbang_runtime::network::{
@@ -80,6 +81,7 @@ use bangbang_runtime::startup::{
     Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
+    Arm64BootMemoryHotplugCaptureError,
     Arm64BootMemoryHotplugDeviceConfig as RuntimeArm64BootMemoryHotplugDeviceConfig,
     Arm64BootMemoryHotplugNotificationDispatch, Arm64BootMemoryHotplugNotificationDispatchError,
     Arm64BootMemoryHotplugNotificationDispatches, Arm64BootNetworkInterface,
@@ -94,9 +96,10 @@ use bangbang_runtime::startup::{
     Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
     Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
     Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, OpenedBlockDeviceLiveUpdate,
-    VmStartupResources, capture_balloon_state_for_device, memory_hotplug_status_for_device,
-    refresh_vhost_user_block_config_for_devices_with_signal, replace_arm64_boot_vmgenid,
-    update_live_block_device_for_devices_with_opened, update_memory_hotplug_config_for_device,
+    VmStartupResources, capture_balloon_state_for_device, capture_memory_hotplug_state_for_device,
+    memory_hotplug_status_for_device, refresh_vhost_user_block_config_for_devices_with_signal,
+    replace_arm64_boot_vmgenid, update_live_block_device_for_devices_with_opened,
+    update_memory_hotplug_config_for_device,
 };
 use bangbang_runtime::storage_capture::{
     CaptureReadyBlockDeviceState, CaptureReadyPmemDeviceState, CaptureReadyStorageConfigs,
@@ -128,7 +131,10 @@ use crate::gic::{
     HvfGicMsiDeviceInterruptResources, HvfGicMsiSignaler, HvfGicSpiSignalError, HvfGicSpiSignaler,
     HvfInterruptLineAllocationError,
 };
-use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions, HvfPmemFlushExecutor};
+use crate::memory::{
+    HvfGuestMemoryMappingError, HvfMemoryPermissions, HvfPmemFlushExecutor,
+    HvfVirtioMemMappingCaptureError, HvfVirtioMemMappingCaptureState,
+};
 use crate::psci::PsciCpuPowerCoordinator;
 use crate::runner::{
     HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1Restore, HvfVcpuRunCancelHandle,
@@ -655,6 +661,7 @@ struct HvfArm64BootPciEntropyDevice {
 struct HvfArm64BootPciMemoryHotplugDevice {
     published: PublishedPciMemoryHotplug,
     queue_deliveries: usize,
+    metrics: SharedMemoryHotplugDeviceMetrics,
 }
 
 /// Stable class label in hidden PCI data-device diagnostics.
@@ -3121,6 +3128,7 @@ pub struct HvfArm64BootSession<'vm> {
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
     pmem_device_metrics: SharedPmemDeviceMetricsRegistry,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
+    memory_hotplug_device_metrics: Option<SharedMemoryHotplugDeviceMetrics>,
     network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     vsock_device_metrics: SharedVsockDeviceMetrics,
     entropy_device_metrics: SharedEntropyDeviceMetrics,
@@ -3162,6 +3170,7 @@ pub struct OwnedHvfArm64BootSession {
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
     pmem_device_metrics: SharedPmemDeviceMetricsRegistry,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
+    memory_hotplug_device_metrics: Option<SharedMemoryHotplugDeviceMetrics>,
     network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     vsock_device_metrics: SharedVsockDeviceMetrics,
     entropy_device_metrics: SharedEntropyDeviceMetrics,
@@ -3852,6 +3861,163 @@ impl std::error::Error for HvfArm64BootBalloonCaptureError {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum HvfArm64BootMemoryHotplugTransportState {
+    Mmio {
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        state: Box<VirtioMemMmioCaptureState>,
+    },
+    Pci {
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+        state: Box<VirtioMemPciCaptureState>,
+    },
+}
+
+impl HvfArm64BootMemoryHotplugTransportState {
+    pub fn mmio_state(&self) -> Option<&VirtioMemMmioCaptureState> {
+        match self {
+            Self::Mmio { state, .. } => Some(state.as_ref()),
+            Self::Pci { .. } => None,
+        }
+    }
+
+    pub fn pci_state(&self) -> Option<&VirtioMemPciCaptureState> {
+        match self {
+            Self::Pci { state, .. } => Some(state.as_ref()),
+            Self::Mmio { .. } => None,
+        }
+    }
+}
+
+impl fmt::Debug for HvfArm64BootMemoryHotplugTransportState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mmio { .. } => {
+                formatter.write_str("MemoryHotplugTransportState::Mmio(<redacted>)")
+            }
+            Self::Pci { .. } => formatter.write_str("MemoryHotplugTransportState::Pci(<redacted>)"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64BootMemoryHotplugCaptureState {
+    config: MemoryHotplugConfig,
+    transport: HvfArm64BootMemoryHotplugTransportState,
+    mapping: HvfVirtioMemMappingCaptureState,
+}
+
+impl HvfArm64BootMemoryHotplugCaptureState {
+    pub const fn config(&self) -> MemoryHotplugConfig {
+        self.config
+    }
+
+    pub const fn transport(&self) -> &HvfArm64BootMemoryHotplugTransportState {
+        &self.transport
+    }
+
+    pub const fn mapping(&self) -> &HvfVirtioMemMappingCaptureState {
+        &self.mapping
+    }
+}
+
+impl fmt::Debug for HvfArm64BootMemoryHotplugCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfArm64BootMemoryHotplugCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootMemoryHotplugCaptureError {
+    OwnerUnavailable,
+    WrongQuiescenceGuard,
+    OwnershipMismatch {
+        configured: bool,
+        mmio_owner: bool,
+        pci_owner: bool,
+    },
+    GuestMemory,
+    MmioDispatcherBusy,
+    MmioDispatcherPoisoned,
+    MmioCapture {
+        source: Arm64BootMemoryHotplugCaptureError,
+    },
+    PciPlacement,
+    PciCapture {
+        source: VirtioMemPciCaptureError,
+    },
+    Mapping {
+        source: HvfVirtioMemMappingCaptureError,
+    },
+}
+
+impl fmt::Display for HvfArm64BootMemoryHotplugCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OwnerUnavailable => {
+                formatter.write_str("memory-hotplug capture owner is unavailable")
+            }
+            Self::WrongQuiescenceGuard => formatter
+                .write_str("memory-hotplug capture quiescence guard belongs to another session"),
+            Self::OwnershipMismatch {
+                configured,
+                mmio_owner,
+                pci_owner,
+            } => write!(
+                formatter,
+                "memory-hotplug capture ownership mismatch: configured={configured}, mmio_owner={mmio_owner}, pci_owner={pci_owner}"
+            ),
+            Self::GuestMemory => formatter.write_str("memory-hotplug guest memory is unavailable"),
+            Self::MmioDispatcherBusy => {
+                formatter.write_str("memory-hotplug MMIO dispatcher is busy")
+            }
+            Self::MmioDispatcherPoisoned => {
+                formatter.write_str("memory-hotplug MMIO dispatcher is poisoned")
+            }
+            Self::MmioCapture { source } => {
+                write!(
+                    formatter,
+                    "MMIO memory-hotplug state capture failed: {source}"
+                )
+            }
+            Self::PciPlacement => {
+                formatter.write_str("PCI memory-hotplug placement is unavailable")
+            }
+            Self::PciCapture { source } => {
+                write!(
+                    formatter,
+                    "PCI memory-hotplug state capture failed: {source}"
+                )
+            }
+            Self::Mapping { source } => {
+                write!(formatter, "memory-hotplug mapping capture failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootMemoryHotplugCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MmioCapture { source } => Some(source),
+            Self::PciCapture { source } => Some(source),
+            Self::Mapping { source } => Some(source),
+            Self::OwnerUnavailable
+            | Self::WrongQuiescenceGuard
+            | Self::OwnershipMismatch { .. }
+            | Self::GuestMemory
+            | Self::MmioDispatcherBusy
+            | Self::MmioDispatcherPoisoned
+            | Self::PciPlacement => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureReadyBlockOwner {
     Mmio {
@@ -4184,6 +4350,109 @@ fn capture_ready_balloon_state(
     };
 
     Ok(Some(HvfArm64BootBalloonCaptureState { config, transport }))
+}
+
+fn capture_ready_memory_hotplug_state(
+    backend: &HvfBackend,
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &Arm64BootRuntimeResources,
+    pci_data_devices: &Option<HvfArm64BootPciDataDevices>,
+    block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    config: Option<MemoryHotplugConfig>,
+    guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+) -> Result<Option<HvfArm64BootMemoryHotplugCaptureState>, HvfArm64BootMemoryHotplugCaptureError> {
+    if !Arc::ptr_eq(&guard.block.shared, &block_retry_wakeup_scheduler.shared) {
+        return Err(HvfArm64BootMemoryHotplugCaptureError::WrongQuiescenceGuard);
+    }
+
+    let mmio = runtime_resources.memory_hotplug_device.as_ref();
+    let pci = pci_data_devices
+        .as_ref()
+        .and_then(|devices| devices.memory_hotplug.as_ref());
+    let Some(config) = config else {
+        if mmio.is_none() && pci.is_none() {
+            return Ok(None);
+        }
+        return Err(HvfArm64BootMemoryHotplugCaptureError::OwnershipMismatch {
+            configured: false,
+            mmio_owner: mmio.is_some(),
+            pci_owner: pci.is_some(),
+        });
+    };
+    if mmio.is_some() == pci.is_some() {
+        return Err(HvfArm64BootMemoryHotplugCaptureError::OwnershipMismatch {
+            configured: true,
+            mmio_owner: mmio.is_some(),
+            pci_owner: pci.is_some(),
+        });
+    }
+
+    let memory = backend
+        .mapped_guest_memory()
+        .map_err(|_| HvfArm64BootMemoryHotplugCaptureError::GuestMemory)?;
+    let (transport, mapping) = if let Some(device) = mmio {
+        let mut dispatcher =
+            lock_boot_mmio_dispatcher(mmio_dispatcher).map_err(|error| match error {
+                HvfArm64BootMmioDispatcherError::Busy => {
+                    HvfArm64BootMemoryHotplugCaptureError::MmioDispatcherBusy
+                }
+                HvfArm64BootMmioDispatcherError::Poisoned => {
+                    HvfArm64BootMemoryHotplugCaptureError::MmioDispatcherPoisoned
+                }
+            })?;
+        let state =
+            capture_memory_hotplug_state_for_device(device, &mut dispatcher, config, memory)
+                .map_err(|source| HvfArm64BootMemoryHotplugCaptureError::MmioCapture { source })?;
+        let mapping = backend
+            .capture_virtio_mem_mapping_state(state.device())
+            .map_err(|source| HvfArm64BootMemoryHotplugCaptureError::Mapping { source })?;
+        (
+            HvfArm64BootMemoryHotplugTransportState::Mmio {
+                region: device.registration.region(),
+                interrupt_line: device.fdt_device.interrupt_line,
+                state: Box::new(state),
+            },
+            mapping,
+        )
+    } else {
+        let Some(device) = pci else {
+            return Err(HvfArm64BootMemoryHotplugCaptureError::OwnershipMismatch {
+                configured: true,
+                mmio_owner: false,
+                pci_owner: false,
+            });
+        };
+        let sbdf = device
+            .published
+            .sbdf()
+            .ok_or(HvfArm64BootMemoryHotplugCaptureError::PciPlacement)?;
+        let bar_range = device
+            .published
+            .bar_range()
+            .ok_or(HvfArm64BootMemoryHotplugCaptureError::PciPlacement)?;
+        let state = device
+            .published
+            .endpoint()
+            .capture_memory_hotplug_state(config, memory)
+            .map_err(|source| HvfArm64BootMemoryHotplugCaptureError::PciCapture { source })?;
+        let mapping = backend
+            .capture_virtio_mem_mapping_state(state.device())
+            .map_err(|source| HvfArm64BootMemoryHotplugCaptureError::Mapping { source })?;
+        (
+            HvfArm64BootMemoryHotplugTransportState::Pci {
+                sbdf,
+                bar_range,
+                state: Box::new(state),
+            },
+            mapping,
+        )
+    };
+
+    Ok(Some(HvfArm64BootMemoryHotplugCaptureState {
+        config,
+        transport,
+        mapping,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5652,6 +5921,23 @@ impl HvfArm64BootSession<'_> {
         )
     }
 
+    pub fn capture_ready_memory_hotplug_state(
+        &self,
+        config: Option<MemoryHotplugConfig>,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<HvfArm64BootMemoryHotplugCaptureState>, HvfArm64BootMemoryHotplugCaptureError>
+    {
+        capture_ready_memory_hotplug_state(
+            self.backend,
+            &self.mmio_dispatcher,
+            &self.runtime_resources,
+            &self.pci_data_devices,
+            &self.block_retry_wakeup_scheduler,
+            config,
+            guard,
+        )
+    }
+
     pub fn capture_ready_storage_state_at(
         &mut self,
         configs: &CaptureReadyStorageConfigs,
@@ -5792,18 +6078,23 @@ impl HvfArm64BootSession<'_> {
         };
         let pci_data_result = self.teardown_pci_data_devices();
         let pci_result = self.teardown_pci_validation_endpoint();
-        if let Err(source) = runner_result {
-            return Err(HvfArm64BootSessionShutdownError::Vcpu { source });
-        }
-        block_async_result?;
-        if let Err(source) = pci_data_result {
-            return Err(HvfArm64BootSessionShutdownError::PciData { source });
-        }
-        if let Err(source) = pci_result {
-            return Err(HvfArm64BootSessionShutdownError::PciValidation { source });
-        }
-        <HvfBackend as VmBackend>::destroy_vm(self.backend)
-            .map_err(|source| HvfArm64BootSessionShutdownError::DestroyVm { source })
+        let result = if let Err(source) = runner_result {
+            Err(HvfArm64BootSessionShutdownError::Vcpu { source })
+        } else if let Err(source) = block_async_result {
+            Err(source)
+        } else if let Err(source) = pci_data_result {
+            Err(HvfArm64BootSessionShutdownError::PciData { source })
+        } else if let Err(source) = pci_result {
+            Err(HvfArm64BootSessionShutdownError::PciValidation { source })
+        } else {
+            <HvfBackend as VmBackend>::destroy_vm(self.backend)
+                .map_err(|source| HvfArm64BootSessionShutdownError::DestroyVm { source })
+        };
+        record_memory_hotplug_teardown_metrics(
+            &mut self.memory_hotplug_device_metrics,
+            result.is_ok(),
+        );
+        result
     }
 
     pub const fn gic_metadata(&self) -> HvfGicMetadata {
@@ -6208,6 +6499,10 @@ impl HvfArm64BootSession<'_> {
 
     pub fn shared_balloon_device_metrics(&self) -> SharedBalloonDeviceMetrics {
         self.balloon_device_metrics.clone()
+    }
+
+    pub fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
+        self.memory_hotplug_device_metrics.clone()
     }
 
     pub fn shared_block_device_metrics(&self) -> SharedBlockDeviceMetricsRegistry {
@@ -7206,7 +7501,12 @@ impl HvfArm64BootSession<'_> {
             )?
         };
 
-        collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic)
+        let needs_queue_interrupt = dispatches.needs_queue_interrupt();
+        let result = collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic);
+        if let Some(metrics) = &self.memory_hotplug_device_metrics {
+            record_memory_hotplug_signal_metrics(metrics, needs_queue_interrupt, &result);
+        }
+        result
     }
 
     pub fn update_memory_hotplug_requested_size_and_signal_interrupt(
@@ -7431,6 +7731,7 @@ impl OwnedHvfArm64BootSession {
             block_device_metrics: prepared.block_device_metrics,
             pmem_device_metrics: prepared.pmem_device_metrics,
             balloon_device_metrics: prepared.balloon_device_metrics,
+            memory_hotplug_device_metrics: prepared.memory_hotplug_device_metrics,
             network_interface_metrics: prepared.network_interface_metrics,
             vsock_device_metrics: prepared.vsock_device_metrics,
             entropy_device_metrics: prepared.entropy_device_metrics,
@@ -7748,6 +8049,7 @@ impl OwnedHvfArm64BootSession {
             block_device_metrics,
             pmem_device_metrics: SharedPmemDeviceMetricsRegistry::default(),
             balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+            memory_hotplug_device_metrics: None,
             network_interface_metrics: SharedNetworkInterfaceMetricsRegistry::default(),
             vsock_device_metrics: SharedVsockDeviceMetrics::default(),
             entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
@@ -7806,6 +8108,23 @@ impl OwnedHvfArm64BootSession {
         guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
     ) -> Result<Option<HvfArm64BootBalloonCaptureState>, HvfArm64BootBalloonCaptureError> {
         capture_ready_balloon_state(
+            &self.backend,
+            &self.mmio_dispatcher,
+            &self.runtime_resources,
+            &self.pci_data_devices,
+            &self.block_retry_wakeup_scheduler,
+            config,
+            guard,
+        )
+    }
+
+    pub fn capture_ready_memory_hotplug_state(
+        &self,
+        config: Option<MemoryHotplugConfig>,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<HvfArm64BootMemoryHotplugCaptureState>, HvfArm64BootMemoryHotplugCaptureError>
+    {
+        capture_ready_memory_hotplug_state(
             &self.backend,
             &self.mmio_dispatcher,
             &self.runtime_resources,
@@ -7959,18 +8278,23 @@ impl OwnedHvfArm64BootSession {
         };
         let pci_data_result = self.teardown_pci_data_devices();
         let pci_result = self.teardown_pci_validation_endpoint();
-        if let Err(source) = runner_result {
-            return Err(HvfArm64BootSessionShutdownError::Vcpu { source });
-        }
-        block_async_result?;
-        if let Err(source) = pci_data_result {
-            return Err(HvfArm64BootSessionShutdownError::PciData { source });
-        }
-        if let Err(source) = pci_result {
-            return Err(HvfArm64BootSessionShutdownError::PciValidation { source });
-        }
-        <HvfBackend as VmBackend>::destroy_vm(&mut self.backend)
-            .map_err(|source| HvfArm64BootSessionShutdownError::DestroyVm { source })
+        let result = if let Err(source) = runner_result {
+            Err(HvfArm64BootSessionShutdownError::Vcpu { source })
+        } else if let Err(source) = block_async_result {
+            Err(source)
+        } else if let Err(source) = pci_data_result {
+            Err(HvfArm64BootSessionShutdownError::PciData { source })
+        } else if let Err(source) = pci_result {
+            Err(HvfArm64BootSessionShutdownError::PciValidation { source })
+        } else {
+            <HvfBackend as VmBackend>::destroy_vm(&mut self.backend)
+                .map_err(|source| HvfArm64BootSessionShutdownError::DestroyVm { source })
+        };
+        record_memory_hotplug_teardown_metrics(
+            &mut self.memory_hotplug_device_metrics,
+            result.is_ok(),
+        );
+        result
     }
 
     /// Explicit cleanup evidence for an uncommitted restored destination.
@@ -8398,6 +8722,10 @@ impl OwnedHvfArm64BootSession {
 
     pub fn shared_balloon_device_metrics(&self) -> SharedBalloonDeviceMetrics {
         self.balloon_device_metrics.clone()
+    }
+
+    pub fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
+        self.memory_hotplug_device_metrics.clone()
     }
 
     pub fn shared_block_device_metrics(&self) -> SharedBlockDeviceMetricsRegistry {
@@ -9385,7 +9713,12 @@ impl OwnedHvfArm64BootSession {
             )?
         };
 
-        collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic)
+        let needs_queue_interrupt = dispatches.needs_queue_interrupt();
+        let result = collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic);
+        if let Some(metrics) = &self.memory_hotplug_device_metrics {
+            record_memory_hotplug_signal_metrics(metrics, needs_queue_interrupt, &result);
+        }
+        result
     }
 
     pub fn update_memory_hotplug_requested_size_and_signal_interrupt(
@@ -12553,12 +12886,16 @@ fn update_memory_hotplug_requested_size_and_signal_interrupt(
         update_memory_hotplug_config_for_device(device, &mut mmio_dispatcher, update)?;
     }
 
-    if let Ok(signaler) = HvfGicSpiSignaler::from_metadata(gic) {
-        let _ = signal_device_interrupt(
+    let interrupt_delivered = HvfGicSpiSignaler::from_metadata(gic).is_ok_and(|signaler| {
+        signal_device_interrupt(
             device.fdt_device.interrupt_line,
             DeviceInterruptKind::Config,
             &signaler,
-        );
+        )
+        .is_ok()
+    });
+    if !interrupt_delivered {
+        device.metrics.record_interrupt_failure();
     }
 
     Ok(())
@@ -12822,6 +13159,36 @@ fn record_balloon_signal_metrics(
         if dispatch.signal_error().is_some() {
             metrics.record_event_failure();
         }
+    }
+}
+
+fn record_memory_hotplug_signal_metrics(
+    metrics: &SharedMemoryHotplugDeviceMetrics,
+    needs_queue_interrupt: bool,
+    result: &Result<
+        HvfArm64BootMemoryHotplugNotificationDispatches,
+        HvfArm64BootMemoryHotplugNotificationDispatchError,
+    >,
+) {
+    match result {
+        Ok(dispatches) => {
+            for dispatch in dispatches.as_slice() {
+                if dispatch.signal_error().is_some() {
+                    metrics.record_interrupt_failure();
+                }
+            }
+        }
+        Err(_) if needs_queue_interrupt => metrics.record_interrupt_failure(),
+        Err(_) => {}
+    }
+}
+
+fn record_memory_hotplug_teardown_metrics(
+    metrics: &mut Option<SharedMemoryHotplugDeviceMetrics>,
+    succeeded: bool,
+) {
+    if let Some(metrics) = metrics.take() {
+        metrics.record_teardown(succeeded);
     }
 }
 
@@ -13654,6 +14021,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
     pmem_device_metrics: SharedPmemDeviceMetricsRegistry,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
+    memory_hotplug_device_metrics: Option<SharedMemoryHotplugDeviceMetrics>,
     network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     vsock_device_metrics: SharedVsockDeviceMetrics,
     entropy_device_metrics: SharedEntropyDeviceMetrics,
@@ -13743,6 +14111,7 @@ impl HvfBackend {
             block_device_metrics: prepared.block_device_metrics,
             pmem_device_metrics: prepared.pmem_device_metrics,
             balloon_device_metrics: prepared.balloon_device_metrics,
+            memory_hotplug_device_metrics: prepared.memory_hotplug_device_metrics,
             network_interface_metrics: prepared.network_interface_metrics,
             vsock_device_metrics: prepared.vsock_device_metrics,
             entropy_device_metrics: prepared.entropy_device_metrics,
@@ -14064,6 +14433,16 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         &pmem_device_metrics,
     )
     .map_err(|source| HvfArm64BootSessionError::PciData { source })?;
+    let memory_hotplug_device_metrics = runtime
+        .memory_hotplug_device
+        .as_ref()
+        .map(|device| device.metrics.clone())
+        .or_else(|| {
+            pci_data_devices
+                .as_ref()
+                .and_then(|devices| devices.memory_hotplug.as_ref())
+                .map(|device| device.metrics.clone())
+        });
     let block_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
     let block_retry_wakeup_scheduler = if !has_block_devices && !runtime_pci_hotplug {
         HvfArm64BootLimiterRetryWakeupScheduler::inactive()
@@ -14140,6 +14519,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         block_device_metrics,
         pmem_device_metrics,
         balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+        memory_hotplug_device_metrics,
         network_interface_metrics,
         vsock_device_metrics: SharedVsockDeviceMetrics::default(),
         entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
@@ -14932,6 +15312,7 @@ fn prepare_pci_data_devices(
 
         if let Some(prepared) = memory_hotplug {
             let (config_space, device) = prepared.into_parts();
+            let metrics = device.shared_metrics();
             let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
@@ -14961,6 +15342,7 @@ fn prepare_pci_data_devices(
             manager.memory_hotplug = Some(HvfArm64BootPciMemoryHotplugDevice {
                 published,
                 queue_deliveries: 0,
+                metrics,
             });
             endpoint_index += 1;
         }
@@ -15158,7 +15540,8 @@ mod tests {
     };
     use bangbang_runtime::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
-        VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
+        VIRTIO_FEATURE_VERSION_1, VIRTIO_MEM_DEFAULT_REGION_ADDRESS,
+        VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
         VirtioMemAppliedMutation, VirtioMemMmioLayout, VirtioMemMutation, VirtioMemMutationError,
         VirtioMemMutationExecutor, VirtioMemMutationKind, VirtioMemMutationRollbackError,
     };
@@ -15166,8 +15549,9 @@ mod tests {
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive, EntropyDeviceMetrics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
         PmemDeviceMetricsByDevice, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
-        SharedEntropyDeviceMetrics, SharedNetworkInterfaceMetricsRegistry,
-        SharedPmemDeviceMetricsRegistry, SharedVsockDeviceMetrics, VsockDeviceMetrics,
+        SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
+        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
+        SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use bangbang_runtime::mmio::{
         MmioAccess, MmioAccessBytes, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
@@ -15200,7 +15584,8 @@ mod tests {
         Arm64BootPciValidationConfig, Arm64BootPmemFlushProvider,
         Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
         Arm64BootRuntimeResources, Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError,
-        Arm64BootVsockNotificationDispatches, update_memory_hotplug_config_for_device,
+        Arm64BootVsockNotificationDispatches, memory_hotplug_status_for_device,
+        update_memory_hotplug_config_for_device,
     };
     use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
     use bangbang_runtime::virtio_mmio::{
@@ -15242,13 +15627,14 @@ mod tests {
         pci_all_virtio_resource_demand, pci_data_available_bar_count, pci_data_bar_plan,
         pci_data_endpoint_count, pci_data_region_id, pci_data_resource_demand,
         preflight_pci_data_dispatcher, quiesce_limiter_retry_wakeups,
-        record_entropy_dispatch_metrics, record_pmem_dispatch_metrics,
+        record_entropy_dispatch_metrics, record_memory_hotplug_signal_metrics,
+        record_memory_hotplug_teardown_metrics, record_pmem_dispatch_metrics,
         replace_vmgenid_and_signal_with, run_boot_session_loop, run_boot_session_vcpu_step,
         signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_capture_ready_mmio_block_interrupts, signal_entropy_queue_interrupts,
         signal_memory_hotplug_queue_interrupts, signal_network_queue_interrupts,
         signal_pmem_queue_interrupts, signal_vsock_queue_interrupts,
-        snapshot_limiter_retry_state_at,
+        snapshot_limiter_retry_state_at, update_memory_hotplug_requested_size_and_signal_interrupt,
     };
     use crate::coordinator::HvfVcpuRunCoordinator;
     use crate::exit::{
@@ -19029,6 +19415,23 @@ mod tests {
             VirtioMmioRegister::Status,
             VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
         );
+        for (selector, word) in [
+            (0, 1_u32 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE),
+            (1, 1_u32 << (VIRTIO_FEATURE_VERSION_1 - 32)),
+        ] {
+            write_boot_memory_hotplug_mmio_u32(
+                runtime,
+                mmio_dispatcher,
+                VirtioMmioRegister::DriverFeaturesSel,
+                selector,
+            );
+            write_boot_memory_hotplug_mmio_u32(
+                runtime,
+                mmio_dispatcher,
+                VirtioMmioRegister::DriverFeatures,
+                word,
+            );
+        }
         write_boot_memory_hotplug_mmio_u32(
             runtime,
             mmio_dispatcher,
@@ -21974,6 +22377,86 @@ mod tests {
             DeviceInterruptKind::Queue.status().bits()
         );
         assert_eq!(read_memory_hotplug_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn memory_hotplug_notification_signal_failure_records_interrupt_metric() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_memory_hotplug();
+        configure_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher);
+        write_queued_memory_hotplug_state_request(&mut memory);
+        notify_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher);
+        let dispatches = dispatch_boot_memory_hotplug_notifications(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+        );
+        let (lines, sink) = RecordingSink::failing("injected memory-hotplug signal failure");
+
+        let result = signal_memory_hotplug_queue_interrupts(dispatches, sink.as_ref());
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
+        record_memory_hotplug_signal_metrics(&metrics, true, &result);
+        let dispatches = result.expect("memory-hotplug signal failure should stay per-device");
+
+        let device = &dispatches.as_slice()[0];
+        assert!(dispatches.has_signal_failure());
+        assert!(!device.queue_interrupt_signaled());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(metrics.snapshot().interrupt_fails(), 1);
+        assert_eq!(read_memory_hotplug_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn memory_hotplug_config_signal_failure_records_interrupt_metric_after_update() {
+        let (_, runtime, mmio_dispatcher) = boot_runtime_with_memory_hotplug();
+        let metrics = runtime
+            .memory_hotplug_device
+            .as_ref()
+            .expect("test memory-hotplug device should exist")
+            .metrics
+            .clone();
+        let dispatcher = Arc::new(Mutex::new(mmio_dispatcher));
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("test memory-hotplug config should be valid");
+        let update = config
+            .validate_size_update(MemoryHotplugSizeUpdateInput::new(2))
+            .expect("test memory-hotplug requested size should be valid");
+        let invalid_gic = gic_with_spi_range(0, 1);
+
+        update_memory_hotplug_requested_size_and_signal_interrupt(
+            &runtime,
+            &dispatcher,
+            &invalid_gic,
+            update,
+        )
+        .expect("requested-size update should stay committed after signal failure");
+
+        assert_eq!(metrics.snapshot().interrupt_fails(), 1);
+        let mut dispatcher = dispatcher
+            .lock()
+            .expect("test MMIO dispatcher should remain available");
+        let device = runtime
+            .memory_hotplug_device
+            .as_ref()
+            .expect("test memory-hotplug device should remain available");
+        assert_eq!(
+            memory_hotplug_status_for_device(device, &mut dispatcher, config, 2)
+                .expect("updated memory-hotplug status should remain readable")
+                .requested_size_mib(),
+            2
+        );
+    }
+
+    #[test]
+    fn memory_hotplug_teardown_failure_is_recorded_exactly_once() {
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
+        let mut owner = Some(metrics.clone());
+
+        record_memory_hotplug_teardown_metrics(&mut owner, false);
+        record_memory_hotplug_teardown_metrics(&mut owner, true);
+
+        assert!(owner.is_none());
+        assert_eq!(metrics.snapshot().teardown_count(), 1);
+        assert_eq!(metrics.snapshot().teardown_fails(), 1);
     }
 
     #[test]
