@@ -298,7 +298,6 @@ impl MemoryHotplugSizeUpdate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryHotplugConfigError {
-    IncompatibleVhostUserBlock,
     BlockSizeTooSmall { min_mib: u64 },
     BlockSizeNotPowerOfTwo,
     SlotSizeTooSmall { min_mib: u64 },
@@ -310,9 +309,6 @@ pub enum MemoryHotplugConfigError {
 impl fmt::Display for MemoryHotplugConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IncompatibleVhostUserBlock => {
-                f.write_str("dynamic memory hotplug is incompatible with vhost-user block")
-            }
             Self::BlockSizeTooSmall { min_mib } => {
                 write!(f, "Block size must not be lower than {min_mib} MiB")
             }
@@ -1615,6 +1611,10 @@ pub trait VirtioMemMutationExecutor {
         memory: &mut GuestMemory,
         applied: VirtioMemAppliedMutation,
     ) -> Result<(), VirtioMemMutationRollbackError>;
+
+    /// Finalize one mutation after its response and used-ring entry are both
+    /// visible to the guest.
+    fn commit(&mut self, _memory: &mut GuestMemory, _applied: &VirtioMemAppliedMutation) {}
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1926,7 +1926,7 @@ impl VirtioMemQueue {
             })?
         {
             let descriptor_head = chain.head_index();
-            let (completion, outcome, mutation, applied_mutation) =
+            let (completion, outcome, mutation, mut applied_mutation) =
                 match VirtioMemRequest::parse(memory, &chain) {
                     Ok(request) => {
                         let execution = request
@@ -1963,10 +1963,14 @@ impl VirtioMemQueue {
                     descriptor_head: completion.descriptor_head(),
                     bytes_written_to_guest: completion.bytes_written_to_guest(),
                     rollback_error: applied_mutation
+                        .take()
                         .map(|applied| mutation_executor.rollback(memory, applied).err())
                         .unwrap_or(None),
                     source,
                 })?;
+            if let Some(applied) = applied_mutation.as_ref() {
+                mutation_executor.commit(memory, applied);
+            }
             if let Some(mutation) = mutation {
                 mutation.commit(config_space, plugged_blocks);
             }
@@ -4481,6 +4485,7 @@ mod tests {
                 guest_range(0x4800_0000, 0x20_0000),
             ])
         );
+        assert_eq!(executor.committed_mutations(), &executor.apply_calls);
         assert_eq!(config_space.plugged_size(), 0x40_0000);
     }
 
@@ -4584,6 +4589,7 @@ mod tests {
             [plug_mutation(0x4000_0000, 0x20_0000)]
         );
         assert!(executor.rolled_back.is_empty());
+        assert!(executor.committed.is_empty());
     }
 
     #[test]
@@ -5364,6 +5370,7 @@ mod tests {
         rollback_results: VecDeque<Result<(), VirtioMemMutationRollbackError>>,
         apply_calls: Vec<VirtioMemMutation>,
         rolled_back: Vec<VirtioMemAppliedMutation>,
+        committed: Vec<VirtioMemMutation>,
     }
 
     impl RecordingMutationExecutor {
@@ -5382,6 +5389,10 @@ mod tests {
                 .iter()
                 .map(|applied| applied.mutation().clone())
                 .collect()
+        }
+
+        fn committed_mutations(&self) -> &[VirtioMemMutation] {
+            &self.committed
         }
     }
 
@@ -5408,6 +5419,10 @@ mod tests {
                 Some(result) => result,
                 None => Ok(()),
             }
+        }
+
+        fn commit(&mut self, _memory: &mut GuestMemory, applied: &VirtioMemAppliedMutation) {
+            self.committed.push(applied.mutation().clone());
         }
     }
 

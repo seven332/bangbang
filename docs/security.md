@@ -196,27 +196,40 @@ alternatives, tests, and Challenge references are in the checked
 The internal descriptor-backed guest-memory profile is opt-in and the public
 default remains private anonymous memory. Shared regions use exact-sized `0600`
 files with unpredictable names, unlink the name before mapping/publication,
-retain one close-on-exec descriptor per region, and reserve all descriptors
-before any mapping. `RLIMIT_FSIZE` and `RLIMIT_NOFILE` failures are typed and
-value-bounded. Exports clone only descriptor/offset/length metadata and redact
-the descriptor number, host address, and transient name. Darwin has no Linux
-`memfd` seal parity. Direct startup therefore treats an operator-selected
-vhost-user block backend as a trusted confidentiality, integrity, and
-availability boundary: after bounded negotiation, activation transfers a
-descriptor for every current guest-RAM region plus only the queue call/kick
-descriptors required by the protocol. The backend can read or write all guest
-RAM, and descriptor close is lifetime cleanup rather than hard revocation.
-Ordinary-only VMs keep anonymous RAM. Contained workers reject ambient socket
-paths and instead require an exact retained connect-only directory grant plus a
-session/sequence/grant/child-bound stream from the launcher. The launcher
-validates the target relative to the retained anchor without granting the
-worker ambient network authority. Vhost configuration cannot coexist with
-dynamic memory hotplug or native-v1 capture in the current profile. Runtime
-direct or contained insertion cannot convert an existing VM: the owner first
-requires an already-shared live profile and validates PCI, inventory,
-MMIO-region, interrupt, and metrics capacity without reserving or cloning
-anything; anonymous-profile, duplicate, root, disabled-PCI, and exhausted
-requests fail before a direct connection or contained broker request.
+retain close-on-exec descriptors, and preflight `RLIMIT_FSIZE` and
+`RLIMIT_NOFILE` before VM publication. Exports clone only checked
+descriptor/offset/length metadata and redact descriptor numbers, host
+addresses, and transient names. A dynamic-memory VM reserves its complete
+validated virtio-mem aperture as one sparse shared object even when it starts
+without vhost. That reservation is descriptor authority, not guest RAM
+admission: offline bytes are absent from CPU/HVF mappings, FDT RAM, dirty
+metadata, byte access, current-memory accounting, and public plugged size.
+Online blocks are exact offset views and unplug reclaims the corresponding file
+range only after the guest-visible transaction commits.
+
+Darwin has no Linux `memfd` seal parity. Direct startup or runtime insertion
+therefore treats an operator-selected vhost-user block backend as a trusted
+confidentiality, integrity, and availability boundary: after bounded
+negotiation, activation transfers boot-RAM descriptors plus, when configured,
+the one complete hotplug aperture and only the queue call/kick descriptors
+required by the protocol. This immutable arm64 table contains at most three
+memory regions and no unrelated mapping. The backend can read or write
+currently unplugged aperture bytes even though guest CPUs cannot access them,
+and descriptor close is lifetime cleanup rather than hard revocation. Bangbang
+does not bundle a production vhost backend or claim backend jailer, cache, rate, or security
+policy; those remain operator-owned. Ordinary-only VMs keep anonymous RAM.
+Contained workers reject ambient socket paths and instead require an exact
+retained connect-only directory grant plus a session/sequence/grant/child-bound
+stream from the launcher. The launcher validates the target relative to the
+retained anchor without granting the worker ambient network authority.
+Native-v1 capture still rejects vhost before artifact staging. Runtime direct
+or contained insertion requires an already-shared live profile and validates
+PCI, inventory, MMIO-region, interrupt, and metrics capacity before connecting
+or claiming a child; dynamic-memory startup supplies that eligible profile.
+Anonymous-profile, duplicate, root, disabled-PCI, and exhausted requests fail
+before a direct connection or contained broker request. Backend death or
+DELETE drops device-owned clones and leases without changing the VM-owned
+aperture; shutdown releases it after all active views and devices are gone.
 
 ## Isolation Compatibility Checklist
 
