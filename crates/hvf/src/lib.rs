@@ -11,6 +11,7 @@ mod gic;
 mod memory;
 mod mmio;
 mod psci;
+mod pvtime;
 mod runner;
 mod session_vcpu;
 mod sme;
@@ -57,6 +58,7 @@ pub use memory::{
     HvfVirtioMemMappingCaptureError, HvfVirtioMemMappingCaptureState,
 };
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
+pub use pvtime::{HvfArm64PvTimeMeasurementError, is_hvf_arm64_pvtime_measurement_available};
 pub use runner::{
     HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1CaptureStage,
     HvfArm64SnapshotV1CompatibilityError, HvfArm64SnapshotV1Restore,

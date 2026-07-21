@@ -408,10 +408,13 @@ RTC monotonicity before shutdown.
 Firecracker's aarch64
 [PL031 node has no interrupt property](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/fdt.rs#L443-L456),
 so bangbang's no-alarm PL031 is an implemented Firecracker aarch64 subset rather
-than a missing interrupt implementation. ARM PVTime remains unimplemented and
-audit-required under #1478 and #1480. Firecracker allocates and registers
+than a missing interrupt implementation. #1478 implements the hidden ARM
+PVTime ABI and HVF measurement foundation while deliberately keeping production
+discovery disabled; accounting and guest certification remain audit-required
+under #1480. Firecracker allocates and registers
 [one KVM-backed 64-byte region per vCPU](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/builder.rs#L558-L600),
-while an HVF execution-time observation alone is not that shared-page guest ABI.
+while bangbang now prepares an equivalent standard structure per vCPU without
+claiming KVM's registration mechanism or a completed stolen-time publisher.
 
 Balloon inflate, accepted hinting, and free-page reporting use whole-range
 validation, per-owner segmentation, inward host-page alignment, and Darwin
@@ -755,9 +758,11 @@ After #1477, the checked
 certifies PL031 destination reconstruction plus complete VMGenID and VMClock
 native-v1 restore behavior. It changes no disposition, so the current counts
 remain 191/207/3/17. Exactly
-`semantic.device:rtc-vmclock-vmgenid-and-pvtime` remains `audit-required` for
-#1478's HVF PVTime ABI, #1480's PVTime accounting/certification, and #1481's
-final aggregate clone/portability reconciliation.
+`semantic.device:rtc-vmclock-vmgenid-and-pvtime` remains `audit-required`.
+#1478 adds its hidden aligned per-vCPU PVTime ABI, owner-thread HVF timing
+primitive, and disabled firmware-call policy without changing those counts.
+#1480 owns accounting, public enablement, capture continuity, and focused guest
+certification; #1481 owns final aggregate clone/portability reconciliation.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
@@ -2467,8 +2472,11 @@ outcomes. `PSCI_FEATURES` returns zero only for the delivered PSCI functions
 and `SMCCC_VERSION`; both CPU_SUSPEND IDs therefore declare original
 power-state format and platform-coordinated mode. `SMCCC_VERSION` reports 1.1,
 and its mandatory `SMCCC_ARCH_FEATURES` query returns success only for VERSION
-and itself. Optional architecture workarounds, SoC ID, KVM paravirtual time,
-vendor calls, and TRNG remain safely unsupported. Successful
+and itself on the ordinary production path. The internal dispatcher also
+models exact 64-bit `PV_TIME_FEATURES` and `PV_TIME_ST` behavior behind a
+per-vCPU policy, but production injects the disabled policy and rejects direct
+64-bit calls plus both 32-bit aliases. Optional architecture workarounds, SoC
+ID, KVM vendor calls, and TRNG remain safely unsupported. Successful
 `CPU_OFF` does not return to the caller or write X0; the last committed online
 CPU receives `DENIED`. `CPU_SUSPEND` retains the caller's context and power
 affinity, deliberately ignores all three ABI arguments like KVM's retained
@@ -2558,10 +2566,21 @@ restored RTC value not to precede the captured value.
 
 PVTime/steal-time is a separate platform capability rather than an RTC feature.
 Firecracker implements ARM steal-time by allocating per-vCPU memory and
-registering it through KVM ARM vCPU device attributes. bangbang does not claim
-that KVM mechanism or an HVF substitute yet. #1478 owns the HVF-specific ABI
-foundation and #1480 owns its accounting and certification; the aggregate
-record remains nonterminal until those slices and #1481 complete.
+registering it through KVM ARM vCPU device attributes. #1478 gives bangbang one
+standard 64-byte little-endian revision-0/attributes-0 structure per vCPU,
+aligned and packed without overlap below VMGenID. Startup initializes the exact
+topology-ordered records with rollback on failure and retains their IPAs, but
+does not add an FDT node or advertise them. The HVF backend runtime-resolves the
+public macOS 11 `hv_vcpu_get_exec_time` symbol, reads cumulative Mach units only
+on the permanent vCPU owner thread, and converts them to nanoseconds with
+checked arithmetic. Its policy-gated firmware dispatcher implements exact
+64-bit `PV_TIME_FEATURES` self/`PV_TIME_ST` discovery and `PV_TIME_ST` results,
+and rejects unknown or 32-bit calls; ordinary production runners always inject
+a disabled policy. This is an
+internal foundation, not a claim of KVM's device attribute or guest-visible
+stolen-time behavior. #1480 owns runnable-versus-execution accounting, record
+publication, public enablement, capture continuity, and Linux certification;
+the aggregate remains nonterminal until that slice and #1481 complete.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are
 not part of the minimal RTC device. The backend-neutral arm64 FDT builder emits
@@ -2603,8 +2622,8 @@ even if cleanup succeeds, so no partial destination runs. Signed cross-process
 coverage proves both saved VMGenID halves change, the VMClock sequence is stable
 and even, both counters change, and RTC time does not regress. The exact
 [time/identity ledger](../compat/firecracker/v1.16.0/time-identity-contract.md)
-keeps optional-device profiles, PVTime, and broader cross-host portability as
-separate work.
+keeps optional-device profiles, public PVTime accounting/certification, and
+broader cross-host portability as separate work.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest

@@ -373,6 +373,29 @@ steps and a bounded watchdog, never fixed sleeps. Retain the Firecracker
 `arm,psci-0.2` FDT binding and do not infer host mitigation, KVM PV/vendor,
 TRNG, PSCI 1.1+, or optional power-service support from this gate.
 
+The disabled ARM PVTime foundation extends that firmware-call gate without
+changing the public contract. Runtime tests must prove the exact 64-byte
+little-endian revision-0/attributes-0 structure, zero padding, one aligned and
+nonoverlapping record per vCPU, deterministic topology ordering, bounded arena
+exhaustion, committed-prefix rollback, and no FDT advertisement. HVF unit tests
+must cover checked Mach-to-nanosecond conversion, missing-symbol and error
+redaction, owner-thread admission and cleanup, per-vCPU IPA isolation, exact
+64-bit `PV_TIME_FEATURES` self/`PV_TIME_ST` queries and `PV_TIME_ST` results,
+unknown-feature denial, and both 32-bit aliases. The ordinary runner must always
+use the disabled policy until
+#1480 certifies accounting and Linux discovery. Signed `hvf_lifecycle` proof
+must query the real public macOS 11 execution-time primitive on the permanent
+owner thread before and after bounded guest execution and must separately prove
+that production PSCI/SMCCC discovery and direct PVTime calls remain unsupported:
+
+```sh
+scripts/run-integration-tests.sh --test hvf_lifecycle -- measures_real_hvf_vcpu_execution_time_on_owner_thread --exact
+scripts/run-integration-tests.sh --test hvf_lifecycle -- psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract --exact
+```
+
+These gates do not claim stolen-time accounting, periodic record publication,
+snapshot continuity, guest discovery, or Linux driver certification.
+
 Validation for internal PSCI secondary-power changes must cover both CPU_ON calling
 conventions, exact X1-X3 reads and 32-bit truncation, MPIDR reserved-bit
 validation, all `OFF`/`ON_PENDING`/`ON` transitions and affinity results,
@@ -1852,7 +1875,8 @@ connection exchange through the signed executable, including sustained
 bidirectional streams and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, that RTC alarm
-interrupts, ARM PVTime, cross-host clock portability, or broader
+interrupts, public ARM PVTime accounting/discovery, cross-host clock
+portability, or broader
 RTC-adjacent behavior beyond the checked PL031/VMGenID/VMClock contract is
 supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.

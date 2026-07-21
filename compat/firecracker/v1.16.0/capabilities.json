@@ -9169,7 +9169,7 @@
     {
       "id": "semantic.device:rtc-vmclock-vmgenid-and-pvtime",
       "family": "serial-and-time",
-      "summary": "The aarch64 PL031 no-alarm device, RTC metrics and destination-wall-clock reconstruction, VMGenID startup plus fresh post-restore replacement/notification, and complete typed VMClock startup, capture, backward-compatible native-v1 encoding, ordered counter update/notification, failure classification, same-host repeated load, redaction, and signed guest observation are implemented and verified. The aggregate remains audit-required solely for #1478's HVF ARM PVTime ABI, #1480's PVTime accounting/certification, and #1481's final aggregate clone and portability reconciliation.",
+      "summary": "The aarch64 PL031 no-alarm device, RTC metrics and destination-wall-clock reconstruction, VMGenID startup plus fresh post-restore replacement/notification, complete typed VMClock startup/capture/backward-compatible native-v1 restore, and the hidden aligned per-vCPU PVTime ABI plus owner-thread HVF execution-time measurement foundation are implemented and verified. Public PVTime accounting, enablement, capture continuity, and guest certification remain audit-required under #1480; #1481 owns final aggregate clone and portability reconciliation.",
       "source_refs": [
         "corpus:device-api",
         "corpus:snapshot-random-clones"

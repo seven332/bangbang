@@ -70,12 +70,13 @@ claims mechanically visible.
   leaves, records default stdout, configured-output stdin exclusion, bounded
   terminal/FIFO RX and exact MMIO capture-ready ownership, and hands the one
   serialization/endpoint-reconstruction aggregate to Wave 6.
-- [`time-identity-contract.md`](time-identity-contract.md) is the #1477 PL031,
-  VMGenID, and VMClock restore ledger. It records complete typed VMClock capture,
-  backward-compatible native-v1 state, ordered destination notifications,
-  postcommit terminality, fresh destination PL031 time, and signed guest proof,
-  while leaving the one aggregate record open for PVTime and final
-  clone/portability certification.
+- [`time-identity-contract.md`](time-identity-contract.md) is the #1477/#1478
+  PL031, VMGenID, VMClock, and PVTime-foundation ledger. It records complete
+  typed VMClock capture, backward-compatible native-v1 state, ordered
+  destination notifications, postcommit terminality, fresh destination PL031
+  time, the hidden per-vCPU PVTime ABI and owner-thread HVF measurement
+  primitive, and signed proof while leaving the one aggregate record open for
+  public PVTime accounting and final clone/portability certification.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -477,10 +478,15 @@ PL031 reconstruction uses destination wall clock with every unsupported alarm
 register clear. Signed cross-process guest code observes both VMGenID halves,
 stable VMClock sequence/counters, and non-regressing RTC time. The checked
 [`time-identity-contract.md`](time-identity-contract.md) retains
-`semantic.device:rtc-vmclock-vmgenid-and-pvtime` as `audit-required` solely for
-#1478 PVTime ABI, #1480 PVTime accounting, and #1481 final aggregate
-clone/portability certification. No disposition changes, so the overlay remains
-191/207/3/17.
+`semantic.device:rtc-vmclock-vmgenid-and-pvtime` as `audit-required`.
+
+#1478 adds the exact hidden 64-byte-per-vCPU PVTime ABI placement, checked
+startup initialization and rollback, owner-thread `hv_vcpu_get_exec_time`
+measurement with Mach conversion, and policy-gated 64-bit SMCCC dispatch. The
+ordinary runner remains disabled and unadvertised, so #1480 still owns
+stolen-time accounting, public enablement, capture continuity, and guest
+certification; #1481 still owns final aggregate clone/portability
+reconciliation. No disposition changes, so the overlay remains 191/207/3/17.
 
 ## Commands
 

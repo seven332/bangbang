@@ -12,6 +12,8 @@ pub(crate) const SME_ZA_REGISTER_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME ZA-register capture requires macOS 15.2 or newer";
 pub(crate) const SME_ZT0_REGISTER_REQUIRES_MACOS_15_2_MESSAGE: &str =
     "Hypervisor.framework SME ZT0-register capture requires macOS 15.2 or newer";
+pub(crate) const VCPU_EXEC_TIME_REQUIRES_MACOS_11_MESSAGE: &str =
+    "Hypervisor.framework vCPU execution-time queries require macOS 11 or newer";
 
 pub(crate) type HvVcpu = u64;
 pub(crate) type HvExitReason = u32;
@@ -233,7 +235,7 @@ mod imp {
         MachTimebaseInfo, SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE,
         SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
         SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, SME_ZA_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
-        SME_ZT0_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
+        SME_ZT0_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, VCPU_EXEC_TIME_REQUIRES_MACOS_11_MESSAGE,
     };
 
     pub type HvReturn = i32;
@@ -282,6 +284,7 @@ mod imp {
         unsafe extern "C" fn(vcpu: HvVcpu, value: *mut u8, length: usize) -> HvReturn;
     type HvVcpuGetSmeZt0Reg =
         unsafe extern "C" fn(vcpu: HvVcpu, value: *mut HvSmeZt0Value) -> HvReturn;
+    type HvVcpuGetExecTime = unsafe extern "C" fn(vcpu: HvVcpu, value: *mut u64) -> HvReturn;
 
     const HV_CACHE_TYPE_DATA: HvCacheType = 0;
     const HV_CACHE_TYPE_INSTRUCTION: HvCacheType = 1;
@@ -499,6 +502,54 @@ mod imp {
             Some(name) => format!("{name} (hv_return_t=0x{code:08x})"),
             None => format!("hv_return_t=0x{code:08x}"),
         }
+    }
+
+    fn load_get_vcpu_exec_time() -> Result<HvVcpuGetExecTime, BackendError> {
+        // SAFETY: `RTLD_DEFAULT` searches already loaded process images and the
+        // symbol name is a NUL-terminated static C string.
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"hv_vcpu_get_exec_time".as_ptr()) };
+        vcpu_exec_time_getter_from_symbol(symbol)
+    }
+
+    fn vcpu_exec_time_getter_from_symbol(
+        symbol: *mut c_void,
+    ) -> Result<HvVcpuGetExecTime, BackendError> {
+        if mem::size_of::<HvVcpuGetExecTime>() != mem::size_of::<*mut c_void>() {
+            return Err(BackendError::InvalidState(
+                "Hypervisor.framework execution-time symbol pointer size is invalid",
+            ));
+        }
+        if symbol.is_null() {
+            return Err(BackendError::Unsupported(
+                VCPU_EXEC_TIME_REQUIRES_MACOS_11_MESSAGE,
+            ));
+        }
+
+        // SAFETY: The requested symbol has the SDK's exact
+        // `hv_vcpu_get_exec_time` signature. Function and dynamic-symbol
+        // pointers have the same representation on this target, checked above.
+        Ok(unsafe { mem::transmute_copy::<*mut c_void, HvVcpuGetExecTime>(&symbol) })
+    }
+
+    fn get_vcpu_exec_time_with(
+        vcpu: HvVcpu,
+        get_exec_time: HvVcpuGetExecTime,
+    ) -> Result<u64, BackendError> {
+        let mut value = 0;
+        // SAFETY: The caller owns this current-thread vCPU, the injected
+        // function has the SDK's exact ABI, and `value` is a live out-pointer.
+        unsafe {
+            check(get_exec_time(vcpu, &mut value), "hv_vcpu_get_exec_time")?;
+        }
+        Ok(value)
+    }
+
+    pub fn vcpu_exec_time_available() -> bool {
+        load_get_vcpu_exec_time().is_ok()
+    }
+
+    pub fn get_vcpu_exec_time(vcpu: HvVcpu) -> Result<u64, BackendError> {
+        get_vcpu_exec_time_with(vcpu, load_get_vcpu_exec_time()?)
     }
 
     fn load_sme_config_max_svl_bytes_getter() -> Result<HvSmeConfigGetMaxSvlBytes, BackendError> {
@@ -1304,17 +1355,18 @@ mod imp {
             get_arm64_vcpu_cache_feature_registers_with, get_arm64_vcpu_cache_geometry_with,
             get_arm64_vcpu_cache_manifest_with, get_max_vcpu_count_with,
             get_sme_config_max_svl_bytes_with, get_sme_p_reg_with, get_sme_z_reg_with,
-            get_sme_za_reg_with, get_sme_zt0_reg_with, sme_config_max_svl_bytes_getter_from_symbol,
-            sme_p_reg_getter_from_symbol, sme_state_getter_from_symbol,
-            sme_z_reg_getter_from_symbol, sme_za_reg_getter_from_symbol,
-            sme_zt0_reg_getter_from_symbol,
+            get_sme_za_reg_with, get_sme_zt0_reg_with, get_vcpu_exec_time_with,
+            sme_config_max_svl_bytes_getter_from_symbol, sme_p_reg_getter_from_symbol,
+            sme_state_getter_from_symbol, sme_z_reg_getter_from_symbol,
+            sme_za_reg_getter_from_symbol, sme_zt0_reg_getter_from_symbol,
+            vcpu_exec_time_getter_from_symbol,
         };
         use crate::ffi::{
             SME_CONFIGURATION_REQUIRES_MACOS_15_2_MESSAGE,
             SME_P_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, SME_STATE_REQUIRES_MACOS_15_2_MESSAGE,
             SME_Z_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
             SME_ZA_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
-            SME_ZT0_REGISTER_REQUIRES_MACOS_15_2_MESSAGE,
+            SME_ZT0_REGISTER_REQUIRES_MACOS_15_2_MESSAGE, VCPU_EXEC_TIME_REQUIRES_MACOS_11_MESSAGE,
         };
 
         const TEST_MAX_SVL_BYTES: usize = usize::MAX - 0x1234;
@@ -1351,6 +1403,22 @@ mod imp {
                 7,
             ],
         ];
+        const TEST_EXEC_TIME_VCPU: u64 = 0xfedc_ba98_7654_3210;
+        const TEST_EXEC_TIME_VALUE: u64 = 0x0123_4567_89ab_cdef;
+
+        unsafe extern "C" fn test_get_vcpu_exec_time_success(vcpu: u64, value: *mut u64) -> i32 {
+            assert_eq!(vcpu, TEST_EXEC_TIME_VCPU);
+            // SAFETY: The wrapper supplies a live `u64` out-pointer.
+            unsafe { *value = TEST_EXEC_TIME_VALUE };
+            HV_SUCCESS
+        }
+
+        unsafe extern "C" fn test_get_vcpu_exec_time_failure(_: u64, value: *mut u64) -> i32 {
+            // SAFETY: The wrapper supplies a live `u64` out-pointer. A failed
+            // framework call must not publish this injected observation.
+            unsafe { *value = u64::MAX };
+            HV_DENIED
+        }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum TestVcpuConfigCall {
@@ -1713,6 +1781,36 @@ mod imp {
             assert_eq!(
                 err.to_string(),
                 "hypervisor error: hv_vm_get_max_vcpu_count failed with hv_return_t=0x12345678"
+            );
+        }
+
+        #[test]
+        fn vcpu_exec_time_wrapper_preserves_exact_value() {
+            assert_eq!(
+                get_vcpu_exec_time_with(TEST_EXEC_TIME_VCPU, test_get_vcpu_exec_time_success),
+                Ok(TEST_EXEC_TIME_VALUE)
+            );
+        }
+
+        #[test]
+        fn vcpu_exec_time_wrapper_redacts_handle_and_observation_on_failure() {
+            let error =
+                get_vcpu_exec_time_with(TEST_EXEC_TIME_VCPU, test_get_vcpu_exec_time_failure)
+                    .expect_err("injected HVF status should fail");
+            let message = error.to_string();
+
+            assert!(message.contains("hv_vcpu_get_exec_time failed with HV_DENIED"));
+            assert!(!message.contains(&format!("{TEST_EXEC_TIME_VCPU:x}")));
+            assert!(!message.contains(&u64::MAX.to_string()));
+        }
+
+        #[test]
+        fn missing_vcpu_exec_time_symbol_reports_availability_boundary() {
+            assert_eq!(
+                vcpu_exec_time_getter_from_symbol(ptr::null_mut()),
+                Err(BackendError::Unsupported(
+                    VCPU_EXEC_TIME_REQUIRES_MACOS_11_MESSAGE
+                ))
             );
         }
 
@@ -2424,6 +2522,14 @@ mod imp {
     }
 
     pub fn timebase_info() -> Result<MachTimebaseInfo, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub const fn vcpu_exec_time_available() -> bool {
+        false
+    }
+
+    pub fn get_vcpu_exec_time(_: HvVcpu) -> Result<u64, BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 

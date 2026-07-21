@@ -2077,6 +2077,16 @@ impl HvfVcpuOwner {
         crate::ffi::get_reg(self.handle()?.vcpu, register.raw())
     }
 
+    pub(crate) fn pvtime_execution_time_ns(
+        &self,
+    ) -> Result<u64, crate::pvtime::HvfArm64PvTimeMeasurementError> {
+        let vcpu = self
+            .handle()
+            .map_err(crate::pvtime::HvfArm64PvTimeMeasurementError::ExecutionTime)?
+            .vcpu;
+        crate::pvtime::measure_vcpu_execution_time_ns(vcpu)
+    }
+
     pub(crate) fn get_simd_fp_register(
         &self,
         register: HvfSimdFpRegister,
