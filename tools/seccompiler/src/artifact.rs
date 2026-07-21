@@ -653,6 +653,7 @@ mod tests {
     )]
 
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -660,14 +661,17 @@ mod tests {
     #[derive(Debug)]
     struct TestDirectory(std::path::PathBuf);
 
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     impl TestDirectory {
         fn new() -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock should follow the epoch")
                 .as_nanos();
+            let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "bangbang-seccompiler-artifact-{}-{nonce}",
+                "bangbang-seccompiler-artifact-{}-{nonce}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir(&path).expect("test directory should be created");

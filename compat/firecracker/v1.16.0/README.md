@@ -50,6 +50,11 @@ claims mechanically visible.
   ledger. It pins the exact 40-record family, 38 terminal outcomes, the two
   Wave 6 pmem snapshot handoffs, field-specific implementation evidence, and
   signed direct/production coexistence and cleanup proof.
+- [`balloon-contract.md`](balloon-contract.md) is the #1473 balloon ledger. It
+  pins all 52 records, promotes the 50 complete API/path/property/schema leaves,
+  records publication-safe paired PFN accounting and coherent MMIO/PCI
+  capture-ready ownership, and hands exactly two serialization/restore
+  aggregates to Wave 6.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -350,9 +355,25 @@ change. The checked [`storage-contract.md`](storage-contract.md) terminalizes
 records, three block corpora, and the block semantic aggregate are promoted.
 Exactly `corpus:pmem` and
 `semantic.storage:pmem-root-mapping-flush-and-state` remain
-`audit-required` for Wave 6 optional-device serialization/restore. The current
-overlay is therefore 114 `implemented-and-verified`, 284 `audit-required`,
+`audit-required` for Wave 6 optional-device serialization/restore. At that
+storage-closure checkpoint the overlay was 114 `implemented-and-verified`, 284 `audit-required`,
 three `missing-platform-feasible`, and 17 `proven-platform-impossible` records.
+
+#1473 completes the live and capture-ready balloon slice under #1440. It
+prepares fallible compact PFN accounting before used-ring publication, commits
+by infallible move, captures bounded validated device/queue/statistics/hinting/
+accounting state through the exact paused MMIO or PCI owner, and adds signed
+Linux evidence for polling, optional fields, hint acknowledgement/reporting,
+pause/capture/resume, target-to-zero convergence, metrics, failure diagnostics,
+and cleanup. The checked [`balloon-contract.md`](balloon-contract.md) promotes
+all 50 API operation/path/property/schema leaves. Exactly
+`corpus:ballooning` and
+`semantic.memory-device:balloon-oom-stats-hinting-and-reporting` remain
+`audit-required`; Wave 6 owns encoding, artifact integration, restore,
+migration/clone behavior, portability, and signed restored-guest outcomes. The
+current overlay is therefore 164 `implemented-and-verified`, 234
+`audit-required`, three `missing-platform-feasible`, and 17
+`proven-platform-impossible` records.
 
 ## Commands
 

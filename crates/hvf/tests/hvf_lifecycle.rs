@@ -5291,6 +5291,133 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn capture_ready_balloon_traverses_signed_mmio_and_pci_owners() {
+    use bangbang_hvf::{
+        HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonDeviceConfig,
+        HvfArm64BootBalloonTransportState, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::balloon::{BalloonConfigInput, BalloonMmioLayout, available_features};
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("capture-ready-balloon-kernel", &image)
+        .expect("balloon capture kernel should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("balloon capture boot source should configure");
+    controller
+        .handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(8, true)
+                .with_stats_polling_interval_s(1)
+                .with_free_page_hinting(true)
+                .with_free_page_reporting(true),
+        ))
+        .expect("balloon capture device should configure");
+    let balloon_config = controller
+        .balloon_config()
+        .expect("balloon config should exist");
+    let balloon_device = HvfArm64BootBalloonDeviceConfig::new(BalloonMmioLayout::new(
+        GuestAddress::new(0x4000_8000),
+        MmioRegionId::new(4000),
+    ));
+    let base_session_config = || {
+        HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            test_rtc_mmio_layout(),
+        )
+        .with_balloon_device(balloon_device)
+    };
+
+    let mut mmio_session = OwnedHvfArm64BootSession::new(&controller, base_session_config())
+        .expect("signed MMIO balloon session should prepare");
+    let mmio_guard = mmio_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("MMIO auxiliary publishers should quiesce");
+    let mmio_first = mmio_session
+        .capture_ready_balloon_state(Some(balloon_config), &mmio_guard)
+        .expect("signed MMIO balloon should become capture-ready")
+        .expect("configured MMIO balloon should be captured");
+    let mmio_second = mmio_session
+        .capture_ready_balloon_state(Some(balloon_config), &mmio_guard)
+        .expect("signed MMIO balloon should support repeated detached capture")
+        .expect("configured MMIO balloon should remain captured");
+    assert_eq!(mmio_first.config(), balloon_config);
+    let HvfArm64BootBalloonTransportState::Mmio { state, .. } = mmio_first.transport() else {
+        panic!("MMIO balloon should retain MMIO ownership");
+    };
+    assert_eq!(
+        state.device().available_features(),
+        available_features(balloon_config)
+    );
+    assert!(state.device().active_queues().is_none());
+    assert_eq!(mmio_first, mmio_second);
+    assert!(!format!("{mmio_first:?}").contains("40008000"));
+    assert!(matches!(
+        mmio_session.capture_ready_balloon_state(None, &mmio_guard),
+        Err(HvfArm64BootBalloonCaptureError::OwnershipMismatch {
+            configured: false,
+            mmio_owner: true,
+            pci_owner: false,
+        })
+    ));
+    drop(mmio_guard);
+    mmio_session
+        .shutdown()
+        .expect("signed MMIO balloon session should shut down");
+
+    let mut pci_session =
+        OwnedHvfArm64BootSession::new(&controller, base_session_config().with_pci_enabled())
+            .expect("signed PCI balloon session should prepare");
+    let pci_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI auxiliary publishers should quiesce");
+    let pci = pci_session
+        .capture_ready_balloon_state(Some(balloon_config), &pci_guard)
+        .expect("signed PCI balloon should become capture-ready")
+        .expect("configured PCI balloon should be captured");
+    let HvfArm64BootBalloonTransportState::Pci {
+        sbdf,
+        bar_range,
+        state,
+    } = pci.transport()
+    else {
+        panic!("PCI balloon should retain PCI ownership");
+    };
+    assert!(sbdf.device() > 0);
+    assert_eq!(
+        bar_range.size(),
+        bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE
+    );
+    assert_eq!(
+        state.device().available_features(),
+        available_features(balloon_config)
+    );
+    assert!(state.device().active_queues().is_none());
+    assert!(!format!("{pci:?}").contains("40008000"));
+    drop(pci_guard);
+    pci_session
+        .shutdown()
+        .expect("signed PCI balloon session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn guest_write_to_writable_pmem_is_visible_before_any_pmem_flush() {
     use std::os::unix::fs::FileExt;
 

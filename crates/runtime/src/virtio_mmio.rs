@@ -3139,7 +3139,12 @@ fn validate_device_config_write_status(status: u32) -> Result<(), VirtioMmioRegi
 }
 
 fn validate_queue_notification_status(status: u32) -> Result<(), VirtioMmioQueueNotificationError> {
-    if (status & VIRTIO_DEVICE_STATUS_DRIVER_OK) == VIRTIO_DEVICE_STATUS_DRIVER_OK {
+    if status
+        == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+            | VIRTIO_DEVICE_STATUS_DRIVER
+            | VIRTIO_DEVICE_STATUS_FEATURES_OK
+        || (status & VIRTIO_DEVICE_STATUS_DRIVER_OK) == VIRTIO_DEVICE_STATUS_DRIVER_OK
+    {
         Ok(())
     } else {
         Err(VirtioMmioQueueNotificationError::QueueNotifyNotWritable { status })
@@ -4498,18 +4503,31 @@ mod tests {
     }
 
     #[test]
-    fn queue_notify_requires_driver_ok_status_before_queue_index_check() {
+    fn queue_notify_accepts_features_ok_before_driver_ok() {
         let mut notifications =
             VirtioMmioQueueNotificationRegisters::new(1).expect("notifications should build");
 
+        notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 0, QUEUE_CONFIG_STATUS)
+            .expect("Linux balloon statistics notification should be retained before DRIVER_OK");
+
+        assert_eq!(notifications.pending_queue_notifications(), vec![0]);
+    }
+
+    #[test]
+    fn queue_notify_requires_features_ok_status_before_queue_index_check() {
+        let mut notifications =
+            VirtioMmioQueueNotificationRegisters::new(1).expect("notifications should build");
+        let driver_status = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER;
+
         let err = notifications
-            .write_register(VirtioMmioRegister::QueueNotify, 2, QUEUE_CONFIG_STATUS)
-            .expect_err("queue notification before DRIVER_OK should fail before index check");
+            .write_register(VirtioMmioRegister::QueueNotify, 2, driver_status)
+            .expect_err("queue notification before FEATURES_OK should fail before index check");
 
         assert_eq!(
             err,
             VirtioMmioQueueNotificationError::QueueNotifyNotWritable {
-                status: QUEUE_CONFIG_STATUS,
+                status: driver_status,
             }
         );
         assert!(notifications.pending_queue_notifications().is_empty());
@@ -4586,11 +4604,11 @@ mod tests {
         assert!(err.source().is_none());
 
         let err = VirtioMmioQueueNotificationError::QueueNotifyNotWritable {
-            status: QUEUE_CONFIG_STATUS,
+            status: VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
         };
         assert_eq!(
             err.to_string(),
-            "virtio-mmio queue notification cannot be written while status is 0xb"
+            "virtio-mmio queue notification cannot be written while status is 0x3"
         );
     }
 
