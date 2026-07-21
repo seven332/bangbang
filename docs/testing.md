@@ -1865,31 +1865,48 @@ queue, backend-call interrupts, snapshot rejection before staging, backend
 death metrics, continued API responsiveness, frontend close, and socket
 cleanup. The MMIO case additionally resizes its scratch backing, uses ID-only
 PATCH to fetch the second exact config, and makes Linux observe and write the
-new capacity through a real SPI notification. The product-PCI lifecycle repeats
+new capacity through a real SPI notification. Across the direct and production
+dynamic MMIO/PCI cases, vhost and virtio-mem are configured in both possible
+pre-boot orders, storage I/O runs before memory growth and again while the guest
+has completed a 128-MiB plug, and shrink completes back to zero. Each backend
+must receive exactly one immutable memory-table request containing boot RAM plus
+the exact configured aperture, while public plugged size and guest markers
+complete `0 -> 128 MiB -> 0`. The product-PCI lifecycle repeats
 capacity refresh through MSI-X, rejects invalid negotiation without
 publication, attaches a new non-root backend, performs guest read/write/fsync,
 manually removes and DELETEs the function, then repeats the same ID and released
-slot while Paused. The ordinary anonymous-memory hotplug case proves a candidate
-vhost listener sees zero connections and no public mutation; duplicate IDs
-likewise reject before connection.
+slot while Paused. Its dynamic-memory variant grows before runtime insertion,
+proves the initial, inserted, and reinserted backends all receive the same exact
+table, and shrinks after final DELETE without changing the surviving control
+backend's table. The ordinary anonymous-memory case proves a candidate vhost
+listener sees zero connections and no public mutation; duplicate IDs likewise
+reject before connection.
 
 The signed production-bundle gate separately supplies one repeatable
 connect-only vhost-user directory grant. One normal sandboxed worker boots from
-an exact vhost root, performs real I/O and flush through a scratch child,
-coexists with the independent vsock authority, refreshes guest-visible capacity
-over the existing stream, retains no steady-state helper, and closes both
-streams. A second all-PCI guest starts with a contained vhost control device so
-shared memory is established, then proves invalid-target and negotiation
-rollback, runtime attach and guest I/O, duplicate zero-connect rejection,
-manual removal, DELETE, Paused same-ID reuse through another exact child,
-resumed I/O, final DELETE, and complete control/runtime closure. Unit and
+an exact vhost root with virtio-mem configured first, performs real I/O and
+flush through a scratch child before and during the completed grow/shrink
+lifecycle, verifies the same exact one-table aperture geometry, coexists with
+the independent vsock authority, refreshes guest-visible capacity over the
+existing stream, retains unchanged App Sandbox plus Hypervisor entitlements and
+no steady-state helper, and closes both streams. A second all-PCI dynamic-memory
+guest grows before runtime vhost insertion, then proves invalid-target and
+negotiation rollback, exact table geometry, runtime attach and guest I/O,
+duplicate zero-connect rejection, manual removal, DELETE, Paused same-ID reuse
+through another exact child, resumed I/O, final DELETE, shrink, stable control
+table, and complete control/runtime closure. Unit and
 process tests additionally cover exact grant and child parsing,
 lifecycle/session/sequence correlation, malformed or extra SCM_RIGHTS
 rejection, anchored no-symlink/current-user/socket/single-link validation, cwd
 restoration, retry after a normal broker failure, startup zero-request
 preflight, runtime zero-request owner preflight, multiple children, ID-only
 PATCH, duplicate PUT, DELETE lease release, and same-ID reinsertion.
-Dynamic-memory coexistence, same-ID vhost replacement without DELETE,
+The fixture rejects a second memory-table request and reports only bounded guest
+addresses, sizes, and file offsets; it never reports host addresses, paths,
+descriptor numbers, or payloads. Focused tests cover reservation/view geometry,
+active accounting, exact discard offsets, dirty add/remove, resource limits,
+rollback with the same retained mapping, backend death, pause/run, deletion,
+and descriptor/slot/child reuse. Same-ID vhost replacement without DELETE,
 automatic guest PCI notification, and vhost snapshot state remain outside the
 combined direct and contained vhost subset. File-backed Async uses the portable
 session executor described above rather than Linux io_uring.

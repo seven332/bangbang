@@ -126,6 +126,8 @@ pub(crate) struct VhostUserBlockBackendReport {
     pub(crate) discovery_rejected: bool,
     pub(crate) guest_features: Option<u64>,
     pub(crate) memory_regions: usize,
+    pub(crate) memory_table_requests: u64,
+    pub(crate) memory_region_geometry: Vec<VhostUserBlockMemoryRegionReport>,
     pub(crate) queue_size: Option<u16>,
     pub(crate) activated: bool,
     pub(crate) kicks: u64,
@@ -137,6 +139,13 @@ pub(crate) struct VhostUserBlockBackendReport {
     pub(crate) errors: u64,
     pub(crate) frontend_closed: bool,
     pub(crate) terminal_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VhostUserBlockMemoryRegionReport {
+    pub(crate) guest_phys_addr: u64,
+    pub(crate) memory_size: u64,
+    pub(crate) mmap_offset: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -891,6 +900,9 @@ impl BackendState {
     }
 
     fn install_memory(&mut self, request: VhostUserRequest) -> Result<(), String> {
+        if !self.memory.is_empty() {
+            return Err("frontend sent more than one vhost-user memory table".to_string());
+        }
         let region_count = usize::try_from(read_u32(&request.body, 0)?)
             .map_err(|_| "vhost-user memory region count did not fit usize".to_string())?;
         if region_count == 0
@@ -902,21 +914,35 @@ impl BackendState {
         }
         let mut descriptors = request.descriptors.into_iter();
         let mut regions = Vec::with_capacity(region_count);
+        let mut geometry = Vec::with_capacity(region_count);
         for index in 0..region_count {
             let offset = 8 + index * 32;
             let descriptor = descriptors
                 .next()
                 .ok_or_else(|| "vhost-user memory descriptor was missing".to_string())?;
+            let guest_phys_addr = read_u64(&request.body, offset)?;
+            let memory_size = read_u64(&request.body, offset + 8)?;
+            let userspace_addr = read_u64(&request.body, offset + 16)?;
+            let mmap_offset = read_u64(&request.body, offset + 24)?;
             regions.push(SharedMemoryRegion::map(
-                read_u64(&request.body, offset)?,
-                read_u64(&request.body, offset + 8)?,
-                read_u64(&request.body, offset + 16)?,
-                read_u64(&request.body, offset + 24)?,
+                guest_phys_addr,
+                memory_size,
+                userspace_addr,
+                mmap_offset,
                 descriptor,
             )?);
+            geometry.push(VhostUserBlockMemoryRegionReport {
+                guest_phys_addr,
+                memory_size,
+                mmap_offset,
+            });
         }
         self.memory = regions;
-        self.update_report(|report| report.memory_regions = region_count);
+        self.update_report(|report| {
+            report.memory_regions = region_count;
+            report.memory_table_requests += 1;
+            report.memory_region_geometry = geometry;
+        });
         Ok(())
     }
 

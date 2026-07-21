@@ -313,6 +313,23 @@ regular-only. The broad `semantic.storage:block-sync-async-vhost-and-limits`
 record is still `audit-required` for #1450, so disposition counts remain
 unchanged.
 
+#1462 extends the nonterminal `Drive.socket`, `FullVmConfiguration.memory-
+hotplug`, `corpus:block-vhost-user`, `corpus:memory-hotplug`, and aggregate
+memory/storage summaries with their combined lifecycle. Virtio-mem startup now
+owns one sparse shared reservation for the complete deterministic aperture;
+only plugged offset views enter guest CPU/HVF mappings, dirty state, and current
+accounting. Initial and eligible runtime direct or contained vhost frontends
+receive one immutable table containing boot RAM plus that aperture, so the
+trusted external backend can access currently unplugged bytes without exposing
+unrelated mappings. Signed MMIO/PCI direct and production-bundle scenarios prove
+both configuration orders, storage I/O across grow/shrink, exact stable region
+geometry, CONFIG refresh, backend death, Running/Paused attach/delete/reuse,
+unchanged entitlements, no helper, and unchanged pre-artifact snapshot
+rejection. Darwin memfd sealing, a bundled production backend, backend policy,
+optional-device persistence, and broad storage promotion are not claimed. The
+six records remain `audit-required` for #1450/Wave 6, so inventory counts remain
+unchanged.
+
 ## Commands
 
 Validate checked-in delivery state without an upstream checkout:

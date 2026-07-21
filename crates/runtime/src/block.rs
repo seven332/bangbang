@@ -1135,7 +1135,6 @@ pub enum DriveConfigError {
     EmptyPathOnHost,
     EmptySocket,
     InvalidVhostUserConfiguration,
-    IncompatibleMemoryHotplug,
     RootDeviceAlreadyConfigured,
 }
 
@@ -1237,9 +1236,6 @@ impl fmt::Display for DriveConfigError {
             Self::EmptySocket => f.write_str("drive socket must not be empty"),
             Self::InvalidVhostUserConfiguration => {
                 f.write_str("vhost-user drive contains incompatible file-backed fields")
-            }
-            Self::IncompatibleMemoryHotplug => {
-                f.write_str("vhost-user drive is incompatible with dynamic memory hotplug")
             }
             Self::RootDeviceAlreadyConfigured => f.write_str("a root drive is already configured"),
         }
@@ -5589,10 +5585,10 @@ impl VhostUserBlockMemoryRegion {
     fn preflight_guest_memory(
         memory: &GuestMemory,
     ) -> Result<(), PreparedVhostUserBlockMemoryError> {
-        if memory.regions().is_empty() {
+        if memory.shared_export_regions().next().is_none() {
             return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);
         }
-        for region in memory.regions() {
+        for region in memory.shared_export_regions() {
             if !region
                 .validate_shared_backing()
                 .map_err(PreparedVhostUserBlockMemoryError::SharedBacking)?
@@ -5607,14 +5603,15 @@ impl VhostUserBlockMemoryRegion {
     fn from_guest_memory(
         memory: &GuestMemory,
     ) -> Result<Vec<Self>, PreparedVhostUserBlockMemoryError> {
-        if memory.regions().is_empty() {
+        let region_count = memory.shared_export_regions().count();
+        if region_count == 0 {
             return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);
         }
         let mut regions = Vec::new();
         regions
-            .try_reserve_exact(memory.regions().len())
+            .try_reserve_exact(region_count)
             .map_err(PreparedVhostUserBlockMemoryError::AllocateRegions)?;
-        for region in memory.regions() {
+        for region in memory.shared_export_regions() {
             let backing = region
                 .try_clone_shared_backing()
                 .map_err(PreparedVhostUserBlockMemoryError::SharedBacking)?
@@ -5631,6 +5628,7 @@ impl VhostUserBlockMemoryRegion {
                 backing,
             });
         }
+        regions.sort_unstable_by_key(|region| region.guest_base);
         Ok(regions)
     }
 
@@ -13579,6 +13577,22 @@ mod tests {
         .expect("test shared memory layout should validate");
         let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
             .expect("test shared guest memory should allocate");
+        let reservation = GuestMemoryRange::new(
+            GuestAddress::new(TEST_MEMORY_SIZE * 2),
+            TEST_MEMORY_SIZE * 4,
+        )
+        .expect("test shared reservation should validate");
+        memory
+            .reserve_shared_region(reservation)
+            .expect("test shared reservation should allocate");
+        for start in [TEST_MEMORY_SIZE * 3, TEST_MEMORY_SIZE * 4] {
+            memory
+                .insert_region(
+                    GuestMemoryRange::new(GuestAddress::new(start), TEST_MEMORY_SIZE)
+                        .expect("test online memory view should validate"),
+                )
+                .expect("test online memory view should insert");
+        }
         let prepared = PreparedBlockDevice::from_config_with_vhost_user(&config, frontend, &memory)
             .expect("vhost-user block should prepare with shared memory");
         assert_eq!(prepared.drive_id(), "vhost");
@@ -13620,7 +13634,10 @@ mod tests {
 
         let observation = peer.join().expect("vhost-user peer should finish");
         assert_eq!(observation.guest_features, features);
-        assert_eq!(observation.memory_region_count, 1);
+        assert_eq!(
+            observation.memory_region_count, 2,
+            "boot RAM plus one reservation must be exported regardless of online block count"
+        );
         assert_eq!(observation.queue_size, u32::from(TEST_QUEUE_SIZE));
 
         let error = device

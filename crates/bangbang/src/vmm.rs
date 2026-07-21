@@ -36,9 +36,9 @@ use bangbang_runtime::balloon::{
     BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
 };
 use bangbang_runtime::block::{
-    BlockFileBacking, BlockMmioLayout, DriveBackendConfig, DriveConfig, DriveConfigError,
-    DriveConfigInput, DriveLiveUpdateMode, DriveRateLimiterConfig, DriveRuntimeMutationError,
-    DriveUpdateError, DriveUpdateInput, PreparedBlockDevice, PreparedVhostUserBlockFrontend,
+    BlockFileBacking, BlockMmioLayout, DriveBackendConfig, DriveConfig, DriveConfigInput,
+    DriveLiveUpdateMode, DriveRateLimiterConfig, DriveRuntimeMutationError, DriveUpdateError,
+    DriveUpdateInput, PreparedBlockDevice, PreparedVhostUserBlockFrontend,
     RuntimeBlockDeviceResource,
 };
 use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
@@ -2053,16 +2053,6 @@ where
         self.controller.preflight_instance_start()?;
         validate_process_vmnet_authority(&self.controller, self.vmnet_authority)
             .map_err(process_vmnet_authority_action_error)?;
-        let has_vhost_user_drives = self
-            .controller
-            .drive_configs()
-            .iter()
-            .any(DriveConfig::is_vhost_user);
-        if has_vhost_user_drives && self.controller.memory_hotplug_config().is_some() {
-            return Err(VmmActionError::DriveConfig(
-                DriveConfigError::IncompatibleMemoryHotplug,
-            ));
-        }
         #[cfg(target_os = "macos")]
         let vsock_grant_consumed = matches!(self.vsock_grant_state, VsockGrantState::Consumed);
         #[cfg(not(target_os = "macos"))]
@@ -2286,11 +2276,6 @@ where
             return self.insert_runtime_drive(input);
         }
         let config = self.controller.prepare_drive_config(input)?;
-        if config.is_vhost_user() && self.controller.memory_hotplug_config().is_some() {
-            return Err(VmmActionError::DriveConfig(
-                DriveConfigError::IncompatibleMemoryHotplug,
-            ));
-        }
         #[cfg(target_os = "macos")]
         let prepared_vhost_claim: Option<PreparedVhostUserSocketClaim> =
             if config.is_vhost_user() && self.grant_authority.is_some() {
@@ -2427,16 +2412,6 @@ where
         &mut self,
         input: bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput,
     ) -> Result<VmmData, VmmActionError> {
-        if self
-            .controller
-            .drive_configs()
-            .iter()
-            .any(DriveConfig::is_vhost_user)
-        {
-            return Err(VmmActionError::MemoryHotplugConfig(
-                bangbang_runtime::memory_hotplug::MemoryHotplugConfigError::IncompatibleVhostUserBlock,
-            ));
-        }
         self.controller
             .handle_action(VmmAction::PutMemoryHotplug(input))
     }
@@ -2451,11 +2426,6 @@ where
         let config = prepared_config.config().clone();
         match config.backend() {
             DriveBackendConfig::VhostUser { socket } => {
-                if self.controller.memory_hotplug_config().is_some() {
-                    return Err(VmmActionError::DriveConfig(
-                        DriveConfigError::IncompatibleMemoryHotplug,
-                    ));
-                }
                 self.started_session
                     .as_mut()
                     .ok_or(VmmActionError::DriveRuntimeMutation(
@@ -8783,8 +8753,8 @@ mod tests {
         drain_block_async_drives,
     };
     use bangbang_runtime::block::{
-        BlockFileBacking, BlockMmioLayout, DriveCacheType, DriveConfig, DriveConfigError,
-        DriveConfigInput, DriveConfigs, DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig,
+        BlockFileBacking, BlockMmioLayout, DriveCacheType, DriveConfig, DriveConfigInput,
+        DriveConfigs, DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig,
         DriveReplacementIdentityField, DriveRuntimeMutationError, DriveTokenBucketConfig,
         DriveUpdateError, DriveUpdateInput, PreparedBlockDevice, PreparedBlockDevices,
         RuntimeBlockDeviceResource,
@@ -8800,9 +8770,9 @@ mod tests {
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
     use bangbang_runtime::memory_hotplug::{
-        MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugConfigInput,
-        MemoryHotplugSizeUpdate, MemoryHotplugSizeUpdateInput, MemoryHotplugStatus,
-        MemoryHotplugStatusError, MemoryHotplugUpdateError,
+        MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdate,
+        MemoryHotplugSizeUpdateInput, MemoryHotplugStatus, MemoryHotplugStatusError,
+        MemoryHotplugUpdateError,
     };
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
@@ -18190,43 +18160,27 @@ mod tests {
     }
 
     #[test]
-    fn vhost_user_drive_and_memory_hotplug_reject_both_configuration_orders() {
+    fn vhost_user_drive_and_memory_hotplug_accept_both_configuration_orders() {
         let mut vmm = configured_vmm(FakeStarter::success(28));
         vmm.handle_action(VmmAction::PutDrive(
             DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
                 .with_socket("/private/vhost.sock"),
         ))
         .expect("vhost-user drive should configure before memory hotplug");
-
-        let error = vmm
-            .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
-            .expect_err("memory hotplug should reject an existing vhost-user drive");
-
-        assert_eq!(
-            error,
-            VmmActionError::MemoryHotplugConfig(
-                MemoryHotplugConfigError::IncompatibleVhostUserBlock
-            )
-        );
-        assert!(vmm.controller.memory_hotplug_config().is_none());
+        vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+            .expect("memory hotplug should configure after a vhost-user drive");
+        assert!(vmm.controller.memory_hotplug_config().is_some());
         assert_eq!(vmm.drive_configs().len(), 1);
 
         let mut vmm = configured_vmm(FakeStarter::success(29));
         vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
             .expect("memory hotplug should configure first");
-
-        let error = vmm
-            .handle_action(VmmAction::PutDrive(
-                DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
-                    .with_socket("/private/vhost.sock"),
-            ))
-            .expect_err("vhost-user drive should reject existing memory hotplug");
-
-        assert_eq!(
-            error,
-            VmmActionError::DriveConfig(DriveConfigError::IncompatibleMemoryHotplug)
-        );
-        assert!(vmm.drive_configs().is_empty());
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("/private/vhost.sock"),
+        ))
+        .expect("vhost-user drive should configure after memory hotplug");
+        assert_eq!(vmm.drive_configs().len(), 1);
         assert!(vmm.controller.memory_hotplug_config().is_some());
     }
 

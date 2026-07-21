@@ -36,7 +36,9 @@ use bangbang_session::{
     encode_frame,
 };
 use macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize};
-use vhost_user_block::{VhostUserBlockBackend, VhostUserBlockBackendOptions};
+use vhost_user_block::{
+    VhostUserBlockBackend, VhostUserBlockBackendOptions, VhostUserBlockBackendReport,
+};
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
 const GRANT_TEST_BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH";
@@ -195,6 +197,7 @@ const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k pa
 const BLOCK_SERIAL_BEGIN_MARKER: &[u8] = b"BANGBANG_BLOCK_SERIAL_BEGIN";
 const BLOCK_SERIAL_END_MARKER: &[u8] = b"BANGBANG_BLOCK_SERIAL_END";
 const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
+const DIRECT_ROOTFS_VHOST_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
 const DIRECT_ROOTFS_BLOCK_LIFECYCLE_TWO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-backing-lifecycle=two bangbang.expect-block-limiter-patch=1";
 const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
 const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
@@ -1540,10 +1543,19 @@ fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers(
         204,
         "PUT contained-vhost machine config",
     );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/hotplug/memory",
+            r#"{"total_size_mib":128,"block_size_mib":2,"slot_size_mib":128}"#,
+        ),
+        204,
+        "PUT contained-vhost memory hotplug config",
+    );
     let resources = worker_bundle(&bundle).join("Contents/Resources");
     let boot_source = serde_json::json!({
         "kernel_image_path": path_text(&resources.join("guest-kernel")),
-        "boot_args": "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.vhost-user-block=ro bangbang.expect-vhost-resize=1",
+        "boot_args": "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.vhost-user-block=ro bangbang.expect-vhost-resize=1",
     });
     assert_http_status(
         &http_put(
@@ -1637,6 +1649,26 @@ fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers(
     scratch_backend
         .wait_for_flush(PROCESS_TIMEOUT)
         .expect("contained vhost scratch should observe the synchronous guest write flush");
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":128}"#,
+        ),
+        204,
+        "grow contained-vhost guest memory",
+    );
+    let grown_memory = wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":128"#,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained-vhost guest should complete memory grow");
+    assert_http_status(&grown_memory, 200, "GET grown contained-vhost memory");
+    assert_vhost_user_memory_aperture(&root_backend.report(), "contained root");
+    assert_vhost_user_memory_aperture(&scratch_backend.report(), "contained scratch");
     OpenOptions::new()
         .write(true)
         .open(&scratch_backing)
@@ -1672,6 +1704,30 @@ fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers(
     assert!(scratch_report.reads > 0);
     assert!(scratch_report.writes > 0);
     assert!(scratch_report.flushes > 0);
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":0}"#,
+        ),
+        204,
+        "shrink contained-vhost guest memory",
+    );
+    let shrunk_memory = wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":0"#,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained-vhost guest should complete memory shrink");
+    assert_http_status(&shrunk_memory, 200, "GET shrunk contained-vhost memory");
+    assert_vhost_user_memory_aperture(&root_backend.report(), "contained root after shrink");
+    assert_vhost_user_memory_aperture(&scratch_backend.report(), "contained scratch after shrink");
+    assert!(
+        child_pids(worker).is_empty(),
+        "contained vhost plus dynamic memory must not retain a helper"
+    );
 
     stop_running_launcher(&mut running, "contained-vhost guest shutdown");
     root_backend
@@ -1739,10 +1795,19 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
         204,
         "PUT contained runtime-vhost machine config",
     );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/hotplug/memory",
+            r#"{"total_size_mib":128,"block_size_mib":2,"slot_size_mib":128}"#,
+        ),
+        204,
+        "PUT contained runtime-vhost memory hotplug config",
+    );
     let resources = worker_bundle(&bundle).join("Contents/Resources");
     let boot_source = serde_json::json!({
         "kernel_image_path": path_text(&resources.join("guest-kernel")),
-        "boot_args": DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS,
+        "boot_args": DIRECT_ROOTFS_VHOST_BLOCK_HOTPLUG_BOOT_ARGS,
     });
     assert_http_status(
         &http_put(
@@ -1803,6 +1868,24 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
         PROCESS_TIMEOUT,
     )
     .expect("contained runtime-vhost guest should become ready");
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":128}"#,
+        ),
+        204,
+        "grow memory before contained runtime-vhost insertion",
+    );
+    wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":128"#,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should grow memory before contained runtime-vhost insertion");
+    assert_vhost_user_memory_aperture(&control_backend.report(), "contained runtime control");
 
     let invalid = serde_json::json!({
         "drive_id": "invalid",
@@ -1849,7 +1932,10 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
         400,
         "runtime PUT rejected contained vhost negotiation",
     );
-    assert!(rejected_response.contains("vhost-user backend lacks configuration protocol support"));
+    assert!(
+        rejected_response.contains("vhost-user backend lacks configuration protocol support"),
+        "response:\n{rejected_response}"
+    );
     assert!(!rejected_response.contains(VHOST_USER_SOCKET_REF_TWO));
     assert!(!http_get(&running.socket, "/vm/config").contains(r#""drive_id":"rejected""#));
     let rejected_report = rejected_backend
@@ -1909,6 +1995,7 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
     first_backend
         .wait_for_activation(PROCESS_TIMEOUT)
         .expect("first contained runtime-vhost backend should activate");
+    assert_vhost_user_memory_aperture(&first_backend.report(), "first contained runtime block");
     wait_for_file_prefix(
         &first_backing,
         BLOCK_HOTPLUG_GUEST_ONE_MARKER,
@@ -1955,6 +2042,7 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
     second_backend
         .wait_for_activation(PROCESS_TIMEOUT)
         .expect("reused contained runtime-vhost backend should activate");
+    assert_vhost_user_memory_aperture(&second_backend.report(), "reused contained runtime block");
     wait_for_file_prefix(
         &second_backing,
         BLOCK_HOTPLUG_GUEST_TWO_MARKER,
@@ -1975,6 +2063,27 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
     second_backend
         .wait_for_frontend_close(PROCESS_TIMEOUT)
         .expect("reused contained runtime-vhost frontend should close after DELETE");
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":0}"#,
+        ),
+        204,
+        "shrink memory after contained runtime-vhost reuse",
+    );
+    wait_for_http_response_fragment(
+        &running.socket,
+        "/hotplug/memory",
+        r#""plugged_size_mib":0"#,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should shrink memory after contained runtime-vhost reuse");
+    assert_vhost_user_memory_aperture(
+        &control_backend.report(),
+        "contained runtime control after shrink",
+    );
     assert!(
         child_pids(worker).is_empty(),
         "contained runtime vhost lifecycle must not retain a helper"
@@ -8095,6 +8204,54 @@ fn wait_for_file_contains(path: &Path, marker: &[u8], timeout: Duration) -> Resu
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn wait_for_http_response_fragment(
+    socket: &Path,
+    path: &str,
+    fragment: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let started = Instant::now();
+    loop {
+        let response = http_get(socket, path);
+        if response.contains(fragment) {
+            return Ok(response);
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "timed out after {timeout:?} waiting for {path} to contain {fragment:?}; last response:\n{response}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_vhost_user_memory_aperture(report: &VhostUserBlockBackendReport, context: &str) {
+    const MIB: u64 = 1024 * 1024;
+    const ARM64_DRAM_START: u64 = 0x8000_0000;
+    const VIRTIO_MEM_APERTURE_START: u64 = 0x80_0000_0000;
+    let geometry = report
+        .memory_region_geometry
+        .iter()
+        .map(|region| {
+            (
+                region.guest_phys_addr,
+                region.memory_size,
+                region.mmap_offset,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        geometry,
+        vec![
+            (ARM64_DRAM_START, 256 * MIB, 0),
+            (VIRTIO_MEM_APERTURE_START, 128 * MIB, 0),
+        ],
+        "{context} backend must receive boot RAM plus one complete stable aperture"
+    );
+    assert_eq!(report.memory_regions, geometry.len());
+    assert_eq!(report.memory_table_requests, 1);
 }
 
 fn expected_block_device_id(path: &Path) -> String {

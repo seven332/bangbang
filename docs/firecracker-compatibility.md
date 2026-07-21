@@ -1220,7 +1220,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; supported when `Writeback` | Both backends accept omitted/default `Unsafe` and explicit `Writeback`. File-backed `Unsafe` suppresses FLUSH and `Writeback` advertises it. Regular-file flush uses `sync_data`; direct block-special flush uses public `DKIOCSYNCHRONIZECACHE`; contained block-special flush uses the same ioctl only through the launcher's exact retained-descriptor control facet because App Sandbox rejects it in the worker. Vhost discovery excludes FLUSH from the Unsafe requested intersection and permits it for Writeback only when the backend offers it. |
 | `PUT /drives/{drive_id}` | `rate_limiter` | optional bandwidth/ops token buckets for file-backed drives; omitted for vhost-user | File-backed missing/null/empty/all-null values are unconfigured; valid buckets are stored, reported, and applied without sleeping. A socket-backed request must omit this field because vhost limiting is not implemented. |
 | `PUT /drives/{drive_id}` | `io_engine` | optional `Sync` or `Async` for file-backed drives; omitted for vhost-user | File-backed omission defaults to `Sync`; explicit `Sync` and `Async` are stored and exactly reported. `Async` uses one lazy bounded portable executor per VM session, with owner-thread completion publication over MMIO or PCI, instead of claiming Linux io_uring on macOS. Startup, path PATCH, same-ID engine/backing replacement, runtime PCI hotplug/DELETE/reuse, reset, pause, and shutdown are generation-safe. Native-v1 remains Sync-only: paused create drains, captures, and reopens the live Async generation before rejecting the profile without artifact creation. A socket-backed request must omit the field because I/O execution belongs to the external backend. |
-| `PUT /drives/{drive_id}` | `socket` | optional; direct and contained startup plus eligible PCI runtime vhost-user block implemented | A nonempty socket selects the vhost backend only when `path_on_host`, explicit `is_read_only`, `io_engine`, and `rate_limiter` are absent; drive ID, root selection, `partuuid`, and cache mode remain valid. Direct mode accepts an operator path. Contained mode accepts only `bangbang-grant:<GrantId>/<SocketChild>` backed by an exact repeatable `VhostUserSocketDirectory + ConnectChildren` grant and never attempts ambient access. Successful pre-boot requests store and exactly report the submitted socket without inventing a path. `InstanceStart` obtains one bounded redacted stream, performs strict feature/protocol/CONFIG discovery before VM construction, selects shared RAM, and activates one queue over MMIO or PCI. In Running or Paused all-PCI state, a new non-root ID may connect only after the owner proves the live profile is already shared and all deterministic publication capacity is available; publication commits last and caller-coordinated DELETE releases the complete endpoint. Contained runtime requests perform the same owner preflight before reserving a child lease or using the dedicated broker. ID-only PATCH refreshes the existing active stream; same-ID PUT remains duplicate rejection without a broker request. Failure drops candidates and preserves public/live configuration. One contained directory authority may serve multiple exact children, retry after a broker `Failed`, and reinsertion after DELETE. Dynamic memory plus native-v1 remain incompatible. |
+| `PUT /drives/{drive_id}` | `socket` | optional; direct and contained startup plus eligible PCI runtime vhost-user block implemented | A nonempty socket selects the vhost backend only when `path_on_host`, explicit `is_read_only`, `io_engine`, and `rate_limiter` are absent; drive ID, root selection, `partuuid`, and cache mode remain valid. Direct mode accepts an operator path. Contained mode accepts only `bangbang-grant:<GrantId>/<SocketChild>` backed by an exact repeatable `VhostUserSocketDirectory + ConnectChildren` grant and never attempts ambient access. Successful pre-boot requests store and exactly report the submitted socket without inventing a path. `InstanceStart` obtains one bounded redacted stream, performs strict feature/protocol/CONFIG discovery before VM construction, selects shared RAM, and activates one queue over MMIO or PCI. Virtio-mem may be configured in either pre-boot order; its complete aperture is reserved before block preparation and exported with boot RAM in one immutable table while offline bytes stay outside guest CPU/HVF/current accounting. In Running or Paused all-PCI state, a new non-root ID may connect only after the owner proves the live profile is already shared and all deterministic publication capacity is available; publication commits last and caller-coordinated DELETE releases the complete endpoint without removing the VM-owned aperture. Contained runtime requests perform the same owner preflight before reserving a child lease or using the dedicated broker. ID-only PATCH refreshes the existing active stream; same-ID PUT remains duplicate rejection without a broker request. Failure drops candidates and preserves public/live configuration. One contained directory authority may serve multiple exact children, retry after a broker `Failed`, and reinsertion after DELETE. Native-v1 capture remains incompatible. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value before building the runtime update action. |
 | `PATCH /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |
@@ -1669,14 +1669,18 @@ The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
 The default allocation model creates one anonymous read/write private host
 mapping for each validated guest RAM range. An internal startup resource can
 instead select descriptor-backed shared RAM before allocation. That profile
-preflights the largest region against `RLIMIT_FSIZE`, accounts one retained
-descriptor per region against `RLIMIT_NOFILE`, reserves every descriptor before
-the first mapping, creates exact-sized owner-only files, unlinks each name
-before publication, and maps them `MAP_SHARED`. A bounded export clones only
-the exact descriptor, zero offset, and live region length; debug and errors do
-not expose a pathname, descriptor number, or host address. Dynamic regions
-inherit the selected profile, and all mappings/descriptors close with runtime
-ownership cleanup.
+preflights the largest retained object against `RLIMIT_FSIZE`, accounts every
+retained descriptor against `RLIMIT_NOFILE`, creates exact-sized sparse
+owner-only files, unlinks each name before publication, and maps them
+`MAP_SHARED`. A bounded export clones only checked descriptor, offset, and
+length metadata; debug and errors do not expose a pathname, descriptor number,
+or host address. When virtio-mem is configured, startup selects this profile
+even without an initial vhost device and reserves the complete deterministic,
+pmem-aware aperture as one additional shared object. The reservation does not
+enter the active region list, current total, byte access, dirty metadata, FDT,
+or initial HVF mappings. Plugged blocks are exact offset views that retain the
+reservation owner. All mappings and descriptors close with runtime ownership
+cleanup.
 
 Both profiles use the same HVF map/protect/unmap, dirty bitmap, byte access,
 balloon, virtio-mem, and native snapshot streaming paths without a copy shadow.
@@ -1684,7 +1688,7 @@ Darwin anonymous discard retains `MADV_ZERO` followed by `MADV_FREE`; shared
 file mappings use `F_PUNCHHOLE`, which tests require to produce immediate zero
 reads while deallocating the range. The native image loader has an explicit
 internal shared-profile entry point, while public native-v1 restore remains
-anonymous. macOS provides no `memfd` sealing equivalent, so a future external
+anonymous. macOS provides no `memfd` sealing equivalent, so an external
 recipient of a writable descriptor is an explicit trusted capability boundary.
 A separate `bangbang-vhost-user` crate implements the closed Firecracker v1.16
 block frontend request set over an already connected Unix stream:
@@ -1692,16 +1696,24 @@ owner/feature negotiation, CONFIG and optional REPLY_ACK, exact memory-table
 and vring setup, native-endian bounded framing, first-header-byte SCM_RIGHTS,
 absolute deadlines, terminal synchronization failure, and directional
 eight-byte nonblocking pipe notifications with Darwin kqueue evidence. Direct
-startup owns the path connector, discovers every configured backend before VM
-construction, and selects descriptor-backed shared RAM whenever at least one
-socket drive exists. Guest activation transfers every exact current RAM region
-and one validated queue, then routes backend calls through the same GIC/MSI
-interrupt abstraction as file-backed block. The selected backend is trusted
-with complete guest RAM; the strict regular-file peer used by tests is not a
-shipped storage backend. Ordinary-only VMs remain anonymous, dynamic memory
-hotplug is rejected with vhost, and native-v1 capture rejects before artifact
-staging. Direct pmem remains a separate classified host mapping. The runtime
-does not use Firecracker's `vm-memory` or `vhost` crates.
+startup owns the path connector and discovers every configured backend before
+VM construction. Guest activation transfers one guest-address-ordered
+immutable table containing boot RAM plus, when configured, the complete
+virtio-mem aperture, followed by one validated queue. The arm64 topology has at
+most three regions and contains no unrelated mapping. Online virtio-mem blocks
+remain the only aperture ranges mapped into HVF or admitted to current/dirty
+accounting, but the backend can read or write offline bytes through the full
+reservation. Grow/shrink never sends a second vhost memory table; exact
+best-effort shared discard uses each view's file offset after mutation commit.
+Backend calls use the same GIC/MSI interrupt abstraction as file-backed block.
+The selected backend is trusted with initial RAM plus the configured maximum
+aperture; the strict regular-file peer used by tests is not a shipped storage
+backend, and backend policy/jailing remains operator-owned. Ordinary-only VMs
+remain anonymous, both pre-boot configuration orders are accepted, eligible
+dynamic-memory PCI VMs support runtime insertion, and native-v1 capture still
+rejects vhost before artifact staging. Direct pmem remains a separate
+classified host mapping. The runtime does not use Firecracker's `vm-memory` or
+`vhost` crates.
 
 Guest memory byte access validates the whole requested guest address range
 before copying. Overflow, unmapped holes, and the aarch64 MMIO64 gap fail
@@ -1857,21 +1869,26 @@ quiesce or discard only the selected generation while releasing global task and
 buffer leases. This preserves Firecracker's observable Sync/Async choice on
 macOS without claiming Linux io_uring or timerfd/eventfd identity.
 
-When any startup drive uses vhost-user, startup selects shared guest RAM
-before allocation, carries every connected frontend as a move-only resource,
-and activates the existing concrete block device over MMIO or PCI. Only after
-guest feature and full ring-range validation does it send the final feature
-mask, every shared-memory region, vring state, call/kick descriptors, and queue
-enable. Backend calls wake a blocked vCPU and raise the normal queue interrupt;
-backend closure terminalizes only that device path, records a per-drive event
-failure, and leaves the process API responsive. Vhost-user and dynamic memory
-hotplug are mutually rejected because the memory table is one-time, and
-native-v1 capture rejects vhost before artifact staging. Runtime insertion
-reuses this constructor only after an already-shared live owner
-preflights all deterministic publication capacity; it never converts anonymous
-RAM or copies a shadow. Active ID-only refresh polls repeated CONFIG requests,
-publishes only a complete validated reply, and records optional
-`config_change_time_us` after successful guest notification.
+When any startup drive uses vhost-user, startup selects shared guest RAM before
+allocation, carries every connected frontend as a move-only resource, and
+activates the existing concrete block device over MMIO or PCI. Virtio-mem also
+selects shared RAM and reserves its complete aperture before block preparation,
+so either configuration order and a later eligible PCI insertion use the same
+topology. Only after guest feature and full ring-range validation does the
+frontend send the final feature mask, the immutable boot-RAM-plus-aperture
+table, vring state, call/kick descriptors, and queue enable. Offline aperture
+bytes remain outside guest CPU/HVF/current accounting but inside the trusted
+backend's writable authority. Plug/unplug changes active views, dirty metadata,
+HVF mappings, and exact shared discard without changing the table. Backend
+calls wake a blocked vCPU and raise the normal queue interrupt; backend closure
+terminalizes only that device path, records a per-drive event failure, and
+leaves the process API responsive. Native-v1 capture rejects vhost before
+artifact staging. Runtime insertion reuses this constructor only after an
+already-shared live owner preflights all deterministic publication capacity; it
+never converts anonymous RAM or copies a shadow. DELETE/backend death releases
+frontend clones without removing the VM-owned aperture. Active ID-only refresh
+polls repeated CONFIG requests, publishes only a complete validated reply, and
+records optional `config_change_time_us` after successful guest notification.
 
 Contained mode additionally recognizes only an exact private grant tag during
 successful drive `PUT`/path-changing live `PATCH`. It binds exact ID,

@@ -379,6 +379,7 @@ pub enum GuestMemoryBacking {
 #[derive(Debug)]
 pub struct GuestMemory {
     regions: Vec<GuestMemoryRegion>,
+    shared_reservations: Vec<GuestMemoryRegion>,
     dirty_tracker: Option<Arc<GuestMemoryDirtyTracker>>,
     backing: GuestMemoryBacking,
 }
@@ -424,12 +425,15 @@ impl GuestMemory {
             let host_size = allocation_host_size(range)?;
             regions.push(GuestMemoryRegion {
                 range,
-                mapping: mapper.map(host_size)?,
+                mapping: Arc::new(mapper.map(host_size)?),
+                mapping_offset: 0,
+                host_size,
             });
         }
 
         Ok(Self {
             regions,
+            shared_reservations: Vec::new(),
             dirty_tracker: None,
             backing,
         })
@@ -475,7 +479,27 @@ impl GuestMemory {
         range: GuestMemoryRange,
     ) -> Result<(), GuestMemoryAllocationError> {
         let page_size = host_page_size()?;
-        self.validate_insert_region(range, page_size)?;
+        let insert_index = self.validate_insert_region(range, page_size)?;
+        if let Some(reservation) = self.shared_reservation_containing(range) {
+            let mapping_offset = usize::try_from(
+                range.start().raw_value() - reservation.range().start().raw_value(),
+            )
+            .map_err(|_| GuestMemoryAllocationError::SizeTooLarge { range })?;
+            let host_size = allocation_host_size(range)?;
+            let mapping_end = mapping_offset
+                .checked_add(host_size)
+                .ok_or(GuestMemoryAllocationError::SizeTooLarge { range })?;
+            if mapping_end > reservation.mapping.size() {
+                return Err(GuestMemoryAllocationError::SizeTooLarge { range });
+            }
+            let region = GuestMemoryRegion {
+                range,
+                mapping: Arc::clone(&reservation.mapping),
+                mapping_offset,
+                host_size,
+            };
+            return self.insert_prepared_region(insert_index, region);
+        }
         let mut mapper = match self.backing {
             GuestMemoryBacking::Anonymous => SystemGuestMemoryMapper::anonymous(),
             GuestMemoryBacking::Shared => {
@@ -496,11 +520,20 @@ impl GuestMemory {
         mapper: &mut impl GuestMemoryMapper,
     ) -> Result<(), GuestMemoryAllocationError> {
         let insert_index = self.validate_insert_region(range, page_size)?;
+        let region = allocate_region_with_mapper(range, page_size, mapper)?;
+        self.insert_prepared_region(insert_index, region)
+    }
+
+    fn insert_prepared_region(
+        &mut self,
+        insert_index: usize,
+        region: GuestMemoryRegion,
+    ) -> Result<(), GuestMemoryAllocationError> {
         self.regions.try_reserve_exact(1).map_err(|source| {
             GuestMemoryAllocationError::RegionMetadataAllocationFailed { source }
         })?;
 
-        let region = allocate_region_with_mapper(range, page_size, mapper)?;
+        let range = region.range();
         if let Some(tracker) = self.dirty_tracker.as_ref() {
             tracker
                 .insert_region(range, true)
@@ -517,6 +550,7 @@ impl GuestMemory {
     ) -> Result<usize, GuestMemoryAllocationError> {
         validate_allocation_range(range, page_size)?;
 
+        let mut insert_index = self.regions.len();
         for (index, region) in self.regions.iter().enumerate() {
             let existing_range = region.range();
             if existing_range.overlaps(range) {
@@ -525,12 +559,136 @@ impl GuestMemory {
                 ));
             }
 
-            if range.start() < existing_range.start() {
-                return Ok(index);
+            if insert_index == self.regions.len() && range.start() < existing_range.start() {
+                insert_index = index;
             }
         }
 
-        Ok(self.regions.len())
+        for reservation in &self.shared_reservations {
+            let reservation_range = reservation.range();
+            if reservation_range.overlaps(range)
+                && !guest_memory_range_contains(reservation_range, range)
+            {
+                return Err(GuestMemoryAllocationError::InvalidLayout(
+                    overlapping_ranges_error(reservation_range, range),
+                ));
+            }
+        }
+
+        Ok(insert_index)
+    }
+
+    /// Reserve one descriptor-backed guest-physical aperture without making
+    /// any byte in it active guest RAM.
+    ///
+    /// Dynamically inserted ranges wholly contained by this aperture become
+    /// bounded views of the retained mapping. The reservation itself is
+    /// excluded from [`Self::regions`], byte access, dirty tracking, and
+    /// [`Self::total_size`].
+    pub fn reserve_shared_region(
+        &mut self,
+        range: GuestMemoryRange,
+    ) -> Result<(), GuestMemoryAllocationError> {
+        if self.backing != GuestMemoryBacking::Shared {
+            return Err(
+                GuestMemoryAllocationError::SharedReservationRequiresSharedBacking { range },
+            );
+        }
+
+        let page_size = host_page_size()?;
+        let host_size = validate_allocation_range(range, page_size)?;
+        for region in &self.regions {
+            if region.range().overlaps(range) {
+                return Err(GuestMemoryAllocationError::InvalidLayout(
+                    overlapping_ranges_error(region.range(), range),
+                ));
+            }
+        }
+
+        let mut insert_index = self.shared_reservations.len();
+        for (index, reservation) in self.shared_reservations.iter().enumerate() {
+            if reservation.range().overlaps(range) {
+                return Err(GuestMemoryAllocationError::InvalidLayout(
+                    overlapping_ranges_error(reservation.range(), range),
+                ));
+            }
+            if insert_index == self.shared_reservations.len()
+                && range.start() < reservation.range().start()
+            {
+                insert_index = index;
+            }
+        }
+
+        let retained_descriptors = self.shared_export_regions().count().saturating_add(1);
+        let largest_region = self
+            .regions
+            .iter()
+            .chain(self.shared_reservations.iter())
+            .map(|region| region.range().size())
+            .chain(std::iter::once(range.size()))
+            .max()
+            .unwrap_or(0);
+        preflight_shared_memory_resource_values(retained_descriptors, largest_region)?;
+
+        self.shared_reservations
+            .try_reserve_exact(1)
+            .map_err(
+                |source| GuestMemoryAllocationError::RegionMetadataAllocationFailed { source },
+            )?;
+        let file = match create_shared_memory_file(host_size) {
+            Err(GuestMemoryAllocationError::SharedBackingCreateFailed { source })
+                if source.raw_os_error() == Some(libc::EMFILE) =>
+            {
+                return Err(
+                    GuestMemoryAllocationError::SharedFileDescriptorLimitExceeded {
+                        regions: retained_descriptors,
+                    },
+                );
+            }
+            result => result?,
+        };
+        let mapping = Arc::new(GuestMemoryMapping::map_shared(host_size, file)?);
+        self.shared_reservations.insert(
+            insert_index,
+            GuestMemoryRegion {
+                range,
+                mapping,
+                mapping_offset: 0,
+                host_size,
+            },
+        );
+        Ok(())
+    }
+
+    fn shared_reservation_containing(&self, range: GuestMemoryRange) -> Option<&GuestMemoryRegion> {
+        self.shared_reservations
+            .iter()
+            .find(|reservation| guest_memory_range_contains(reservation.range(), range))
+    }
+
+    pub(crate) fn shared_export_regions(&self) -> impl Iterator<Item = &GuestMemoryRegion> {
+        let mut active = self
+            .regions
+            .iter()
+            .filter(|region| self.shared_reservation_containing(region.range()).is_none())
+            .peekable();
+        let mut reservations = self.shared_reservations.iter().peekable();
+
+        std::iter::from_fn(move || {
+            let take_active = match (active.peek(), reservations.peek()) {
+                (Some(active), Some(reservation)) => {
+                    active.range().start() < reservation.range().start()
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => return None,
+            };
+            if take_active {
+                active.next()
+            } else {
+                reservations.next()
+            }
+        })
     }
 
     /// Remove and drop one exactly matching process-owned guest memory region.
@@ -678,10 +836,19 @@ impl GuestMemory {
                     continue;
                 }
             }
-            let mapping_offset = advice_start_address - mapping_start.addr();
-            if let Err(kind) =
-                adviser.reclaim(&region.mapping, mapping_offset, advice_address, advice_size)
-            {
+            let Some(mapping_offset) = region
+                .mapping_offset
+                .checked_add(advice_start_address - mapping_start.addr())
+            else {
+                outcome.record_failed(advice_size_u64, GuestMemoryDiscardFailureKind::HostAddress);
+                continue;
+            };
+            if let Err(kind) = adviser.reclaim(
+                region.mapping.as_ref(),
+                mapping_offset,
+                advice_address,
+                advice_size,
+            ) {
                 outcome.record_failed(advice_size_u64, kind);
                 continue;
             }
@@ -722,8 +889,7 @@ impl GuestMemory {
             let segment = access_segment(region, current, range.end_exclusive())?;
             let (source_segment, next_remaining) = remaining.split_at(segment.size);
             let destination = region
-                .mapping
-                .address()
+                .host_address()
                 .as_ptr()
                 .cast::<u8>()
                 .wrapping_add(segment.offset);
@@ -768,8 +934,7 @@ impl GuestMemory {
             let segment = access_segment(region, current, range.end_exclusive())?;
             let (destination_segment, next_remaining) = remaining.split_at_mut(segment.size);
             let source = region
-                .mapping
-                .address()
+                .host_address()
                 .as_ptr()
                 .cast::<u8>()
                 .wrapping_add(segment.offset);
@@ -816,7 +981,9 @@ impl GuestMemory {
 
 pub struct GuestMemoryRegion {
     range: GuestMemoryRange,
-    mapping: GuestMemoryMapping,
+    mapping: Arc<GuestMemoryMapping>,
+    mapping_offset: usize,
+    host_size: usize,
 }
 
 impl GuestMemoryRegion {
@@ -825,15 +992,25 @@ impl GuestMemoryRegion {
     }
 
     pub fn host_address(&self) -> NonNull<c_void> {
-        self.mapping.address()
+        let address = self
+            .mapping
+            .address()
+            .as_ptr()
+            .cast::<u8>()
+            .wrapping_add(self.mapping_offset)
+            .cast::<c_void>();
+        // SAFETY: every mapping has a non-null live base and construction
+        // validates `mapping_offset + host_size` within that mapping. The
+        // resulting view start therefore remains inside the same mapping.
+        unsafe { NonNull::new_unchecked(address) }
     }
 
     pub const fn host_size(&self) -> usize {
-        self.mapping.size()
+        self.host_size
     }
 
     /// Return the backing profile for this region.
-    pub const fn backing(&self) -> GuestMemoryBacking {
+    pub fn backing(&self) -> GuestMemoryBacking {
         self.mapping.backing()
     }
 
@@ -842,7 +1019,8 @@ impl GuestMemoryRegion {
     /// Returns `false` for anonymous regions and `true` for a valid shared
     /// region whose descriptor still has the exact mapping length.
     pub fn validate_shared_backing(&self) -> Result<bool, GuestMemorySharedBackingError> {
-        self.mapping.validate_shared_backing()
+        self.mapping
+            .validate_shared_backing(self.mapping_offset, self.host_size)
     }
 
     /// Clone the descriptor-backed export metadata for a shared region.
@@ -852,7 +1030,8 @@ impl GuestMemoryRegion {
     pub fn try_clone_shared_backing(
         &self,
     ) -> Result<Option<GuestMemorySharedBacking>, GuestMemorySharedBackingError> {
-        self.mapping.try_clone_shared_backing()
+        self.mapping
+            .try_clone_shared_backing(self.mapping_offset, self.host_size)
     }
 }
 
@@ -860,7 +1039,8 @@ impl fmt::Debug for GuestMemoryRegion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GuestMemoryRegion")
             .field("range", &self.range)
-            .field("host_size", &self.mapping.size())
+            .field("host_size", &self.host_size)
+            .field("mapping_offset", &self.mapping_offset)
             .finish_non_exhaustive()
     }
 }
@@ -906,10 +1086,24 @@ impl fmt::Debug for GuestMemorySharedBacking {
 
 #[derive(Debug)]
 pub enum GuestMemorySharedBackingError {
-    DuplicateDescriptor { source: io::Error },
-    InspectDescriptor { source: io::Error },
-    UnexpectedLength { expected: u64, actual: u64 },
-    LengthTooLarge { size: usize },
+    DuplicateDescriptor {
+        source: io::Error,
+    },
+    InspectDescriptor {
+        source: io::Error,
+    },
+    UnexpectedLength {
+        expected: u64,
+        actual: u64,
+    },
+    LengthTooLarge {
+        size: usize,
+    },
+    InvalidRange {
+        offset: usize,
+        len: usize,
+        mapping_size: usize,
+    },
 }
 
 impl fmt::Display for GuestMemorySharedBackingError {
@@ -935,6 +1129,15 @@ impl fmt::Display for GuestMemorySharedBackingError {
                 f,
                 "shared guest-memory descriptor length {size} bytes cannot be represented"
             ),
+            Self::InvalidRange {
+                offset,
+                len,
+                mapping_size,
+            } => write!(
+                f,
+                "shared guest-memory export [{offset}..{}) exceeds its {mapping_size}-byte mapping",
+                offset.saturating_add(*len)
+            ),
         }
     }
 }
@@ -945,7 +1148,9 @@ impl std::error::Error for GuestMemorySharedBackingError {
             Self::DuplicateDescriptor { source } | Self::InspectDescriptor { source } => {
                 Some(source)
             }
-            Self::UnexpectedLength { .. } | Self::LengthTooLarge { .. } => None,
+            Self::UnexpectedLength { .. }
+            | Self::LengthTooLarge { .. }
+            | Self::InvalidRange { .. } => None,
         }
     }
 }
@@ -998,6 +1203,9 @@ pub enum GuestMemoryAllocationError {
     },
     SharedBackingReservationMissing {
         size: usize,
+    },
+    SharedReservationRequiresSharedBacking {
+        range: GuestMemoryRange,
     },
     SharedMmapFailed {
         size: usize,
@@ -1098,6 +1306,10 @@ impl fmt::Display for GuestMemoryAllocationError {
                 f,
                 "shared guest-memory backing reservation is missing for {size} bytes"
             ),
+            Self::SharedReservationRequiresSharedBacking { range } => write!(
+                f,
+                "guest memory range {range} cannot be reserved without shared backing"
+            ),
             Self::SharedMmapFailed { size, source } => write!(
                 f,
                 "failed to map {size} bytes of descriptor-backed shared guest memory: {source}"
@@ -1130,6 +1342,7 @@ impl std::error::Error for GuestMemoryAllocationError {
             | Self::SharedFileDescriptorLimitExceeded { .. }
             | Self::SharedBackingSizeTooLarge { .. }
             | Self::SharedBackingReservationMissing { .. }
+            | Self::SharedReservationRequiresSharedBacking { .. }
             | Self::SharedMmapReturnedNull { .. } => None,
         }
     }
@@ -1539,7 +1752,9 @@ fn allocate_region_with_mapper(
 
     Ok(GuestMemoryRegion {
         range,
-        mapping: mapper.map(host_size)?,
+        mapping: Arc::new(mapper.map(host_size)?),
+        mapping_offset: 0,
+        host_size,
     })
 }
 
@@ -1555,6 +1770,10 @@ fn overlapping_ranges_error(first: GuestMemoryRange, second: GuestMemoryRange) -
             next: first,
         }
     }
+}
+
+fn guest_memory_range_contains(outer: GuestMemoryRange, inner: GuestMemoryRange) -> bool {
+    outer.start() <= inner.start() && inner.end_exclusive() <= outer.end_exclusive()
 }
 
 fn system_host_page_size() -> Option<u64> {
@@ -1602,6 +1821,22 @@ fn preflight_shared_memory_resources_with_limits(
     limits: SharedMemoryResourceLimits,
 ) -> Result<(), GuestMemoryAllocationError> {
     let largest_region = ranges.iter().map(|range| range.size()).max().unwrap_or(0);
+    preflight_shared_memory_resource_values_with_limits(region_count, largest_region, limits)
+}
+
+fn preflight_shared_memory_resource_values(
+    region_count: usize,
+    largest_region: u64,
+) -> Result<(), GuestMemoryAllocationError> {
+    let limits = query_shared_memory_resource_limits()?;
+    preflight_shared_memory_resource_values_with_limits(region_count, largest_region, limits)
+}
+
+fn preflight_shared_memory_resource_values_with_limits(
+    region_count: usize,
+    largest_region: u64,
+    limits: SharedMemoryResourceLimits,
+) -> Result<(), GuestMemoryAllocationError> {
     if limits.file_size != libc::RLIM_INFINITY && largest_region > limits.file_size {
         return Err(GuestMemoryAllocationError::SharedFileSizeLimitExceeded {
             size: largest_region,
@@ -2116,23 +2351,53 @@ impl GuestMemoryMapping {
 
     fn try_clone_shared_backing(
         &self,
+        offset: usize,
+        len: usize,
     ) -> Result<Option<GuestMemorySharedBacking>, GuestMemorySharedBackingError> {
-        let Some((file, expected)) = self.validated_shared_file()? else {
+        let Some((file, _expected)) = self.validated_shared_file()? else {
             return Ok(None);
         };
+        let Some(end) = offset.checked_add(len) else {
+            return Err(GuestMemorySharedBackingError::InvalidRange {
+                offset,
+                len,
+                mapping_size: self.size,
+            });
+        };
+        if end > self.size {
+            return Err(GuestMemorySharedBackingError::InvalidRange {
+                offset,
+                len,
+                mapping_size: self.size,
+            });
+        }
+        let offset = u64::try_from(offset)
+            .map_err(|_| GuestMemorySharedBackingError::LengthTooLarge { size: offset })?;
+        let len = u64::try_from(len)
+            .map_err(|_| GuestMemorySharedBackingError::LengthTooLarge { size: len })?;
         let file = file
             .try_clone()
             .map_err(|source| GuestMemorySharedBackingError::DuplicateDescriptor { source })?;
 
-        Ok(Some(GuestMemorySharedBacking {
-            file,
-            offset: 0,
-            len: expected,
-        }))
+        Ok(Some(GuestMemorySharedBacking { file, offset, len }))
     }
 
-    fn validate_shared_backing(&self) -> Result<bool, GuestMemorySharedBackingError> {
-        Ok(self.validated_shared_file()?.is_some())
+    fn validate_shared_backing(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<bool, GuestMemorySharedBackingError> {
+        let Some((_file, _expected)) = self.validated_shared_file()? else {
+            return Ok(false);
+        };
+        if offset.checked_add(len).is_none_or(|end| end > self.size) {
+            return Err(GuestMemorySharedBackingError::InvalidRange {
+                offset,
+                len,
+                mapping_size: self.size,
+            });
+        }
+        Ok(true)
     }
 
     fn validated_shared_file(&self) -> Result<Option<(&File, u64)>, GuestMemorySharedBackingError> {
@@ -2209,6 +2474,7 @@ mod tests {
         GuestMemoryError, GuestMemoryLayout, GuestMemoryMapper, GuestMemoryMapping,
         GuestMemoryMappingKind, GuestMemoryRange, GuestMemoryRegion, GuestMemorySharedBackingError,
         SharedMemoryResourceLimits, aarch64, host_page_size,
+        preflight_shared_memory_resource_values_with_limits,
         preflight_shared_memory_resources_with_limits,
     };
 
@@ -2324,6 +2590,41 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestSharedReclaimAdviser {
+        page_size: u64,
+        calls: Vec<(usize, usize)>,
+    }
+
+    impl GuestMemoryDiscardAdviser for TestSharedReclaimAdviser {
+        fn host_page_size(&mut self) -> Result<u64, GuestMemoryDiscardFailureKind> {
+            Ok(self.page_size)
+        }
+
+        fn zero(&mut self, _address: NonNull<c_void>, _size: usize) -> io::Result<()> {
+            Err(io::Error::other(
+                "shared reclaim test must use descriptor reclaim",
+            ))
+        }
+
+        fn free(&mut self, _address: NonNull<c_void>, _size: usize) -> io::Result<()> {
+            Err(io::Error::other(
+                "shared reclaim test must use descriptor reclaim",
+            ))
+        }
+
+        fn reclaim(
+            &mut self,
+            _mapping: &GuestMemoryMapping,
+            offset: usize,
+            _address: NonNull<c_void>,
+            size: usize,
+        ) -> Result<(), GuestMemoryDiscardFailureKind> {
+            self.calls.push((offset, size));
+            Ok(())
         }
     }
 
@@ -2631,14 +2932,17 @@ mod tests {
         let memory = GuestMemory {
             regions: vec![GuestMemoryRegion {
                 range: range(0, PAGE_SIZE),
-                mapping: GuestMemoryMapping {
+                mapping: Arc::new(GuestMemoryMapping {
                     address: host_address,
                     size: page_size,
                     kind: GuestMemoryMappingKind::Test {
                         drop_count: Arc::clone(&drop_count),
                     },
-                },
+                }),
+                mapping_offset: 0,
+                host_size: page_size,
             }],
+            shared_reservations: Vec::new(),
             dirty_tracker: None,
             backing: super::GuestMemoryBacking::Anonymous,
         };
@@ -3940,6 +4244,225 @@ mod tests {
     }
 
     #[test]
+    fn shared_reservation_stays_out_of_active_guest_memory_and_exports_once() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let boot_range = range(0, page_size);
+        let reservation_range = range(page_size * 2, page_size * 4);
+        let online_range = range(page_size * 3, page_size);
+        let layout =
+            GuestMemoryLayout::new(vec![boot_range]).expect("page-aligned layout should be valid");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared allocation should succeed");
+
+        memory
+            .reserve_shared_region(reservation_range)
+            .expect("shared reservation should succeed");
+
+        assert_eq!(memory_ranges(&memory), vec![boot_range]);
+        assert_eq!(memory.total_size(), page_size);
+        assert_eq!(
+            memory
+                .shared_export_regions()
+                .map(GuestMemoryRegion::range)
+                .collect::<Vec<_>>(),
+            vec![boot_range, reservation_range]
+        );
+        let mut offline_byte = [0xff];
+        assert_eq!(
+            memory.read_slice(&mut offline_byte, reservation_range.start()),
+            Err(GuestMemoryAccessError::UnmappedRange {
+                range: range(reservation_range.start().raw_value(), 1)
+            })
+        );
+        assert_eq!(offline_byte, [0xff]);
+
+        let reservation = memory
+            .shared_reservations
+            .first()
+            .expect("reservation should remain owned");
+        let reservation_address = reservation.host_address().as_ptr().addr();
+        let reservation_export = reservation
+            .try_clone_shared_backing()
+            .expect("reservation export should clone")
+            .expect("reservation should be shared");
+        let reservation_metadata = reservation_export
+            .file
+            .metadata()
+            .expect("reservation descriptor should be inspectable");
+
+        let tracker = memory
+            .enable_dirty_tracking()
+            .expect("dirty tracking should enable for active RAM");
+        memory
+            .insert_region(online_range)
+            .expect("online range should become a reservation view");
+
+        assert_eq!(memory_ranges(&memory), vec![boot_range, online_range]);
+        assert_eq!(memory.total_size(), page_size * 2);
+        assert_eq!(
+            memory
+                .shared_export_regions()
+                .map(GuestMemoryRegion::range)
+                .collect::<Vec<_>>(),
+            vec![boot_range, reservation_range]
+        );
+        let online = memory
+            .regions()
+            .iter()
+            .find(|region| region.range() == online_range)
+            .expect("online view should be active");
+        assert_eq!(
+            online.host_address().as_ptr().addr(),
+            reservation_address + usize::try_from(page_size).expect("page size should fit usize")
+        );
+        let online_export = online
+            .try_clone_shared_backing()
+            .expect("online view export should clone")
+            .expect("online view should retain shared backing");
+        let online_metadata = online_export
+            .file
+            .metadata()
+            .expect("online descriptor should be inspectable");
+        assert_eq!(online_export.offset(), page_size);
+        assert_eq!(online_export.len(), page_size);
+        assert_eq!(online_metadata.dev(), reservation_metadata.dev());
+        assert_eq!(online_metadata.ino(), reservation_metadata.ino());
+        let online_address = online.host_address();
+
+        memory
+            .write_slice(&[0x5a], online_range.start())
+            .expect("online view should be writable");
+        let mut descriptor_byte = [0];
+        reservation_export
+            .file
+            .read_exact_at(&mut descriptor_byte, page_size)
+            .expect("reservation descriptor should observe the view write");
+        assert_eq!(descriptor_byte, [0x5a]);
+        assert_eq!(
+            tracker.dirty_pages().expect("dirty pages should query"),
+            vec![online_range.start()]
+        );
+
+        memory
+            .remove_region(online_range)
+            .expect("online view should be removable");
+        assert_eq!(memory_ranges(&memory), vec![boot_range]);
+        assert_eq!(memory.total_size(), page_size);
+        assert!(
+            tracker
+                .dirty_pages()
+                .expect("dirty pages should query after removal")
+                .is_empty()
+        );
+        memory
+            .insert_region(online_range)
+            .expect("removed range should reuse the retained reservation");
+        assert_eq!(
+            memory
+                .regions()
+                .iter()
+                .find(|region| region.range() == online_range)
+                .expect("reinserted view should be active")
+                .host_address(),
+            online_address
+        );
+    }
+
+    #[test]
+    fn shared_export_regions_merge_active_memory_and_reservations_by_guest_address() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let reservation_range = range(0, page_size * 2);
+        let boot_range = range(page_size * 4, page_size);
+        let layout =
+            GuestMemoryLayout::new(vec![boot_range]).expect("page-aligned layout should be valid");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared allocation should succeed");
+
+        memory
+            .reserve_shared_region(reservation_range)
+            .expect("lower reservation should succeed");
+
+        assert_eq!(
+            memory
+                .shared_export_regions()
+                .map(GuestMemoryRegion::range)
+                .collect::<Vec<_>>(),
+            vec![reservation_range, boot_range]
+        );
+    }
+
+    #[test]
+    fn shared_reservation_rejects_anonymous_and_overlapping_ranges() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let boot_range = range(0, page_size);
+        let reservation_range = range(page_size * 2, page_size * 2);
+        let layout =
+            GuestMemoryLayout::new(vec![boot_range]).expect("page-aligned layout should be valid");
+        let mut anonymous =
+            GuestMemory::allocate(&layout).expect("anonymous memory should allocate");
+
+        assert!(matches!(
+            anonymous
+                .reserve_shared_region(reservation_range)
+                .expect_err("anonymous reservation should fail"),
+            GuestMemoryAllocationError::SharedReservationRequiresSharedBacking { range }
+                if range == reservation_range
+        ));
+
+        let mut shared = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared memory should allocate");
+        shared
+            .reserve_shared_region(reservation_range)
+            .expect("first reservation should succeed");
+        assert!(matches!(
+            shared
+                .reserve_shared_region(range(page_size * 3, page_size * 2))
+                .expect_err("overlapping reservation should fail"),
+            GuestMemoryAllocationError::InvalidLayout(GuestMemoryError::OverlappingRange { .. })
+        ));
+        assert!(matches!(
+            shared
+                .insert_region(range(page_size, page_size * 2))
+                .expect_err("partially overlapping online range should fail"),
+            GuestMemoryAllocationError::InvalidLayout(GuestMemoryError::OverlappingRange { .. })
+        ));
+        assert_eq!(memory_ranges(&shared), vec![boot_range]);
+        assert_eq!(shared.shared_reservations.len(), 1);
+    }
+
+    #[test]
+    fn shared_reservation_discard_uses_the_view_backing_offset() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+            .expect("page-aligned layout should be valid");
+        let reservation_range = range(page_size * 2, page_size * 4);
+        let online_range = range(page_size * 4, page_size);
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared allocation should succeed");
+        memory
+            .reserve_shared_region(reservation_range)
+            .expect("shared reservation should succeed");
+        memory
+            .insert_region(online_range)
+            .expect("online range should become a reservation view");
+        let mut adviser = TestSharedReclaimAdviser {
+            page_size,
+            calls: Vec::new(),
+        };
+
+        let outcome = memory.discard_range_with_adviser(online_range, &mut adviser);
+
+        assert!(outcome.is_complete(), "discard outcome: {outcome:?}");
+        assert_eq!(
+            adviser.calls,
+            vec![(
+                usize::try_from(page_size * 2).expect("view offset should fit usize"),
+                usize::try_from(page_size).expect("view size should fit usize")
+            )]
+        );
+    }
+
+    #[test]
     fn shared_guest_memory_writes_participate_in_dirty_tracking() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
@@ -4019,6 +4542,39 @@ mod tests {
         assert!(matches!(
             error,
             GuestMemoryAllocationError::SharedFileDescriptorLimitExceeded { regions: 2 }
+        ));
+    }
+
+    #[test]
+    fn shared_aperture_preflight_uses_complete_size_and_retained_table_count() {
+        let aperture_size = 128 * 1024 * 1024;
+        let error = preflight_shared_memory_resource_values_with_limits(
+            3,
+            aperture_size,
+            SharedMemoryResourceLimits {
+                file_size: aperture_size - 1,
+                file_descriptors: libc::RLIM_INFINITY,
+            },
+        )
+        .expect_err("full aperture must fit the file-size limit");
+        assert!(matches!(
+            error,
+            GuestMemoryAllocationError::SharedFileSizeLimitExceeded { size }
+                if size == aperture_size
+        ));
+
+        let error = preflight_shared_memory_resource_values_with_limits(
+            3,
+            aperture_size,
+            SharedMemoryResourceLimits {
+                file_size: libc::RLIM_INFINITY,
+                file_descriptors: 2,
+            },
+        )
+        .expect_err("boot regions plus aperture must fit the descriptor limit");
+        assert!(matches!(
+            error,
+            GuestMemoryAllocationError::SharedFileDescriptorLimitExceeded { regions: 3 }
         ));
     }
 

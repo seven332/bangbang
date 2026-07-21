@@ -94,25 +94,39 @@ single-link socket relative to its retained directory descriptor and returns
 only the nonblocking stream over a dedicated authenticated broker facet.
 Startup switches guest RAM to descriptor-backed shared mappings, negotiates the
 reviewed CONFIG and virtio feature set, and transfers one queue plus the
-complete current memory table to the selected backend. The same device works
-over default MMIO or all-virtio PCI, including root/partuuid/read-only/writeback
-behavior, backend-call interrupts, metrics, and redacted terminal disconnects.
-Every external backend is therefore a trusted complete-guest-memory capability.
+complete bounded memory table to the selected backend. When virtio-mem is
+configured, startup also creates one sparse unlinked shared reservation for its
+complete deterministic aperture before device preparation, even if no vhost
+device is initially present. The reservation is not current guest RAM: offline
+bytes remain outside CPU/HVF mappings, FDT RAM, dirty metadata, byte access,
+`total_size`, and the public plugged size. Online blocks are exact views into
+that retained mapping. A vhost backend receives boot RAM plus that one aperture
+in an immutable table before queue activation (at most three regions on arm64),
+so it can access currently unplugged bytes but no unrelated mapping. The same
+device works over default MMIO or all-virtio PCI, including
+root/partuuid/read-only/writeback behavior, backend-call interrupts, metrics,
+and redacted terminal disconnects. Every external backend is therefore a
+trusted confidentiality, integrity, and availability capability. Darwin offers
+no Linux `memfd` seal parity, and bangbang ships no production vhost backend;
+backend implementation, policy, and isolation remain operator-owned.
 An ID-only PATCH refreshes an active MMIO or PCI frontend without reconnecting.
-In an all-PCI VM whose startup profile is already shared, Running or Paused
-requests may also attach a new non-root direct or contained socket drive after
-a no-side-effect owner preflight and remove an eligible device after manual
-guest-side PCI removal. A contained directory is adopted once per session and
-may authorize multiple exact children, retries, and reinsertion after DELETE;
-each drive retains only its child lease. Duplicate IDs, anonymous RAM, root
-insertion, and exhausted capacity reject before any broker request or direct
-socket connection. DELETE releases the frontend, shared-memory descriptor
-clones, metrics generation, BAR, MSI-X, and PCI slot for deterministic reuse.
-Ambient contained socket paths, dynamic-memory coexistence, automatic guest PCI
-notification, same-ID vhost replacement without DELETE, and vhost snapshot
-state remain explicit limits. Snapshot preflight scans the complete live vhost
-inventory first and returns one typed, path-redacted unsupported result before
-Async mutation, contained grant claims, or artifact staging.
+Both pre-boot configuration orders are accepted. In an eligible all-PCI
+dynamic-memory or otherwise shared VM, Running or Paused requests may also
+attach a new non-root direct or contained socket drive after a no-side-effect
+owner preflight and remove it after manual guest-side PCI removal. Every
+initial or runtime frontend receives the same stable export topology;
+grow/shrink never sends a second memory table. A contained directory is adopted
+once per session and may authorize multiple exact children, retries, and
+reinsertion after DELETE; each drive retains only its child lease. Duplicate
+IDs, anonymous RAM, root insertion, and exhausted capacity reject before any
+broker request or direct socket connection. DELETE or backend death releases
+the frontend's descriptor clones and device resources without dropping the
+VM-owned aperture; final shutdown drops it after online views are gone.
+Automatic guest PCI notification, same-ID vhost replacement without DELETE,
+and vhost snapshot state remain explicit limits. Snapshot preflight scans the
+complete live vhost inventory first and returns one typed, path-redacted
+unsupported result before Async mutation, contained grant claims, or artifact
+staging.
 
 ## Layout
 

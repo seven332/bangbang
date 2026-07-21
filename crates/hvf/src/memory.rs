@@ -876,6 +876,7 @@ impl HvfGuestMemoryMappingState {
         };
 
         if let Err(source) = self.mapper.map_region(request, effective_permissions) {
+            let _ = memory.discard_range(range);
             let owner_cleanup = memory.remove_region(range).err();
             return Err(HvfGuestMemoryMappingError::DynamicRegionMapFailed {
                 range,
@@ -893,9 +894,84 @@ impl HvfGuestMemoryMappingState {
         Ok(())
     }
 
+    fn map_existing_dynamic_region(
+        &mut self,
+        memory: &GuestMemory,
+        range: GuestMemoryRange,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.validate_dirty_write_mutation_state()?;
+        if permissions.is_empty() {
+            return Err(HvfGuestMemoryMappingError::EmptyPermissions);
+        }
+        if !guest_memory_contains_region(memory, range) {
+            return Err(HvfGuestMemoryMappingError::DynamicRegionOwnerMissing { range });
+        }
+
+        let page_size = host_page_size()?;
+        let insert_index = self.validate_dynamic_map_range(range)?;
+        self.mapped_regions.try_reserve_exact(1).map_err(|source| {
+            HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source }
+        })?;
+        self.dynamic_regions
+            .try_reserve_exact(1)
+            .map_err(
+                |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
+            )?;
+
+        let tracker = self.dirty_write_tracker.as_ref().map(Arc::clone);
+        let mut mutation = tracker
+            .as_ref()
+            .map(|tracker| tracker.begin_mapping_mutation())
+            .transpose()
+            .map_err(|source| HvfGuestMemoryMappingError::DirtyWriteMappingMutation { source })?;
+        let prepared_tracking = mutation
+            .as_mut()
+            .map(|mutation| mutation.prepare_add(range, permissions))
+            .transpose()
+            .map_err(|source| HvfGuestMemoryMappingError::DirtyWriteMappingMutation { source })?
+            .flatten();
+
+        let request = dynamic_region_map_request(memory, range, page_size)?;
+        let mapped_region = request.mapped_region(permissions);
+        let effective_permissions = if prepared_tracking.is_some() {
+            permissions.without(HvfMemoryPermissions::WRITE)
+        } else {
+            permissions
+        };
+        self.mapper
+            .map_region(request, effective_permissions)
+            .map_err(
+                |source| HvfGuestMemoryMappingError::DynamicRegionMapFailed {
+                    range,
+                    source,
+                    owner_cleanup: None,
+                },
+            )?;
+
+        if let (Some(mutation), Some(prepared_tracking)) = (mutation.as_mut(), prepared_tracking) {
+            mutation.commit_add(prepared_tracking);
+        }
+        self.mapped_regions.insert(insert_index, mapped_region);
+        self.dynamic_regions.push(range);
+        Ok(())
+    }
+
     fn unmap_dynamic_region(
         &mut self,
         memory: &mut GuestMemory,
+        range: GuestMemoryRange,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.unmap_dynamic_region_preserving_owner(memory, range)?;
+        let _ = memory.discard_range(range);
+        memory.remove_region(range).map_err(|source| {
+            HvfGuestMemoryMappingError::DynamicRegionRemovalFailed { range, source }
+        })
+    }
+
+    fn unmap_dynamic_region_preserving_owner(
+        &mut self,
+        memory: &GuestMemory,
         range: GuestMemoryRange,
     ) -> Result<(), HvfGuestMemoryMappingError> {
         self.validate_dirty_write_mutation_state()?;
@@ -942,9 +1018,7 @@ impl HvfGuestMemoryMappingState {
 
         self.mapped_regions.remove(mapped_index);
         self.dynamic_regions.remove(dynamic_index);
-        memory.remove_region(range).map_err(|source| {
-            HvfGuestMemoryMappingError::DynamicRegionRemovalFailed { range, source }
-        })
+        Ok(())
     }
 
     fn validate_dynamic_map_range(
@@ -1064,6 +1138,7 @@ impl HvfGuestMemoryMappingState {
         memory: &mut GuestMemory,
         range: GuestMemoryRange,
     ) -> Result<(), HvfGuestMemoryMappingError> {
+        let _ = memory.discard_range(range);
         memory.remove_region(range).map_err(|source| {
             HvfGuestMemoryMappingError::DynamicRegionRemovalFailed { range, source }
         })
@@ -1199,7 +1274,7 @@ impl<'a> HvfVirtioMemMutationExecutor<'a> {
         range: GuestMemoryRange,
     ) -> Result<(), VirtioMemMutationError> {
         self.state
-            .unmap_dynamic_region(memory, range)
+            .unmap_dynamic_region_preserving_owner(memory, range)
             .map_err(hvf_mutation_error)
     }
 
@@ -1219,7 +1294,7 @@ impl<'a> HvfVirtioMemMutationExecutor<'a> {
         range: GuestMemoryRange,
     ) -> Result<(), VirtioMemMutationRollbackError> {
         self.state
-            .map_dynamic_region(memory, range, self.permissions)
+            .map_existing_dynamic_region(memory, range, self.permissions)
             .map_err(hvf_mutation_rollback_error)
     }
 
@@ -1344,6 +1419,23 @@ impl VirtioMemMutationExecutor for HvfVirtioMemMutationExecutor<'_> {
             VirtioMemMutationKind::Unplug(ranges) | VirtioMemMutationKind::UnplugAll(ranges) => {
                 self.rollback_unplug(memory, ranges)
             }
+        }
+    }
+
+    fn commit(&mut self, memory: &mut GuestMemory, applied: &VirtioMemAppliedMutation) {
+        let ranges = match applied.mutation().kind() {
+            VirtioMemMutationKind::Plug(_) => return,
+            VirtioMemMutationKind::Unplug(ranges) | VirtioMemMutationKind::UnplugAll(ranges) => {
+                ranges
+            }
+        };
+        for range in ranges.iter().copied() {
+            let _ = memory.discard_range(range);
+            let removal = memory.remove_region(range);
+            debug_assert!(
+                removal.is_ok(),
+                "committed virtio-mem unplug must retain its owner view until finalization"
+            );
         }
     }
 }
@@ -1867,7 +1959,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bangbang_runtime::memory::{
-        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
+        GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange,
     };
     use bangbang_runtime::memory_hotplug::{
         VirtioMemMutation, VirtioMemMutationExecutor, VirtioMemMutationKind,
@@ -2768,7 +2860,13 @@ mod tests {
         let base_range = range(0, page_size);
         let first_dynamic = range(page_size, page_size);
         let second_dynamic = range(page_size * 2, page_size);
-        let memory = memory_for_ranges(vec![base_range]);
+        let layout =
+            GuestMemoryLayout::new(vec![base_range]).expect("shared base layout should validate");
+        let mut memory = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
+            .expect("shared base memory should allocate");
+        memory
+            .reserve_shared_region(range(page_size, page_size * 2))
+            .expect("dynamic memory aperture should reserve");
         let mapper = Arc::new(RecordingMapper::default());
         let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
             memory,
@@ -2790,6 +2888,19 @@ mod tests {
                 )
                 .expect("multi-block plug should create exact block owners");
         }
+        mapping
+            .memory_mut()
+            .expect("guest memory owner should exist")
+            .write_slice(&[0x5a], second_dynamic.start())
+            .expect("online reservation view should be writable");
+        let second_host_address = mapping
+            .memory()
+            .expect("guest memory owner should exist")
+            .regions()
+            .iter()
+            .find(|region| region.range() == second_dynamic)
+            .expect("second dynamic owner should exist")
+            .host_address();
 
         let applied = {
             let (memory, mut executor) = mapping
@@ -2800,14 +2911,21 @@ mod tests {
                     memory,
                     VirtioMemMutation::new(VirtioMemMutationKind::Unplug(vec![second_dynamic])),
                 )
-                .expect("partial unplug should remove one block owner")
+                .expect("partial unplug should stage one block owner for removal")
         };
 
         assert_eq!(
             memory_ranges(mapping.memory().expect("guest memory owner should exist")),
-            vec![base_range, first_dynamic]
+            vec![base_range, first_dynamic, second_dynamic]
         );
         assert_eq!(mapping.state.dynamic_regions, vec![first_dynamic]);
+        let mut retained_byte = [0];
+        mapping
+            .memory()
+            .expect("guest memory owner should exist")
+            .read_slice(&mut retained_byte, second_dynamic.start())
+            .expect("staged unplug must retain bytes for rollback");
+        assert_eq!(retained_byte, [0x5a]);
 
         {
             let (memory, mut executor) = mapping
@@ -2826,8 +2944,54 @@ mod tests {
             mapping.state.dynamic_regions,
             vec![first_dynamic, second_dynamic]
         );
+        assert_eq!(
+            mapping
+                .memory()
+                .expect("guest memory owner should exist")
+                .regions()
+                .iter()
+                .find(|region| region.range() == second_dynamic)
+                .expect("rolled-back owner should exist")
+                .host_address(),
+            second_host_address
+        );
         assert_eq!(mapper.map_count(), 4);
         assert_eq!(mapper.unmap_count(), 1);
+
+        let committed = {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            executor
+                .apply(
+                    memory,
+                    VirtioMemMutation::new(VirtioMemMutationKind::Unplug(vec![second_dynamic])),
+                )
+                .expect("retried unplug should stage the exact owner")
+        };
+        {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            executor.commit(memory, &committed);
+        }
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range, first_dynamic]
+        );
+        assert_eq!(mapping.state.dynamic_regions, vec![first_dynamic]);
+        let mut removed_byte = [0xff];
+        assert!(
+            mapping
+                .memory()
+                .expect("guest memory owner should exist")
+                .read_slice(&mut removed_byte, second_dynamic.start())
+                .is_err(),
+            "committed unplug must remove the active reservation view"
+        );
+        assert_eq!(removed_byte, [0xff]);
+        assert_eq!(mapper.map_count(), 4);
+        assert_eq!(mapper.unmap_count(), 2);
     }
 
     #[test]
@@ -2869,12 +3033,12 @@ mod tests {
                         second_dynamic,
                     ])),
                 )
-                .expect("combined unplug should remove adjacent exact owners")
+                .expect("combined unplug should stage adjacent exact owners")
         };
 
         assert_eq!(
             memory_ranges(mapping.memory().expect("guest memory owner should exist")),
-            vec![base_range]
+            vec![base_range, first_dynamic, second_dynamic]
         );
         assert!(!mapping.has_dynamic_regions());
         assert_eq!(mapper.unmap_count(), 2);
@@ -2932,12 +3096,12 @@ mod tests {
                         second_dynamic,
                     ])),
                 )
-                .expect("unplug-all should remove dynamic memory")
+                .expect("unplug-all should stage dynamic memory removal")
         };
 
         assert_eq!(
             memory_ranges(mapping.memory().expect("guest memory owner should exist")),
-            vec![base_range]
+            vec![base_range, first_dynamic, second_dynamic]
         );
         assert!(!mapping.has_dynamic_regions());
 

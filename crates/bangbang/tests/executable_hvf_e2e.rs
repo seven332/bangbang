@@ -70,7 +70,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_MARKER: &[u8] = b"BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
     const DIRECT_ROOTFS_BLOCK_LIFECYCLE_THREE_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-backing-lifecycle=three bangbang.expect-block-limiter-patch=1";
-    const DIRECT_ROOTFS_VHOST_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1 bangbang.expect-vhost-resize=1";
+    const DIRECT_ROOTFS_VHOST_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1 bangbang.expect-vhost-resize=1";
     const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
     const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
     const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
@@ -265,6 +265,7 @@ mod macos_arm64 {
         partitioned_root: bool,
         retry_rejected_discovery: bool,
         refresh_scratch_config: bool,
+        memory_hotplug: bool,
         success_marker: &'static [u8],
     }
 
@@ -1777,6 +1778,7 @@ mod macos_arm64 {
             partitioned_root: false,
             retry_rejected_discovery: true,
             refresh_scratch_config: true,
+            memory_hotplug: true,
             success_marker: VHOST_USER_BLOCK_RO_MARKER,
         });
     }
@@ -1790,6 +1792,7 @@ mod macos_arm64 {
             partitioned_root: true,
             retry_rejected_discovery: false,
             refresh_scratch_config: false,
+            memory_hotplug: false,
             success_marker: VHOST_USER_BLOCK_RW_MARKER,
         });
     }
@@ -1898,6 +1901,9 @@ mod macos_arm64 {
         if case.refresh_scratch_config {
             boot_args.push_str(" bangbang.expect-vhost-resize=1");
         }
+        if case.memory_hotplug {
+            boot_args.push_str(" memhp_default_state=online_movable");
+        }
         assert_no_content_response(
             &http_put_json(
                 &socket_path,
@@ -1939,6 +1945,16 @@ mod macos_arm64 {
             &http_put_json(&socket_path, "/drives/scratch", &scratch_body),
             "PUT /drives/scratch vhost-user block",
         );
+        if case.memory_hotplug {
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/hotplug/memory",
+                    r#"{"total_size_mib":128,"block_size_mib":2,"slot_size_mib":128}"#,
+                ),
+                "PUT /hotplug/memory after vhost-user drives",
+            );
+        }
 
         let before_start = http_get(&socket_path, "/vm/config");
         assert_exact_vhost_user_vm_config(
@@ -2059,6 +2075,28 @@ mod macos_arm64 {
                 case.mode, output.status, output.stdout, output.stderr
             );
         }
+        if case.memory_hotplug {
+            assert_no_content_response(
+                &http_json_with_io_timeout(
+                    &socket_path,
+                    "PATCH",
+                    "/hotplug/memory",
+                    r#"{"requested_size_mib":128}"#,
+                    GUEST_EXECUTION_TIMEOUT,
+                ),
+                "PATCH /hotplug/memory grow with active vhost-user block",
+            );
+            let grown = wait_for_http_response_fragment(
+                &socket_path,
+                "/hotplug/memory",
+                r#""plugged_size_mib":128"#,
+                GUEST_EXECUTION_TIMEOUT,
+            )
+            .expect("guest should complete memory grow with active vhost-user block");
+            assert_ok_response(&grown, "GET grown memory with active vhost-user block");
+            assert_vhost_user_memory_aperture(&root_backend.report(), "root");
+            assert_vhost_user_memory_aperture(&scratch_backend.report(), "scratch");
+        }
         if case.refresh_scratch_config {
             fs::OpenOptions::new()
                 .write(true)
@@ -2166,6 +2204,28 @@ mod macos_arm64 {
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
             "PATCH /vm Resumed vhost-user block",
         );
+        if case.memory_hotplug {
+            assert_no_content_response(
+                &http_json_with_io_timeout(
+                    &socket_path,
+                    "PATCH",
+                    "/hotplug/memory",
+                    r#"{"requested_size_mib":0}"#,
+                    GUEST_EXECUTION_TIMEOUT,
+                ),
+                "PATCH /hotplug/memory shrink with active vhost-user block",
+            );
+            let shrunk = wait_for_http_response_fragment(
+                &socket_path,
+                "/hotplug/memory",
+                r#""plugged_size_mib":0"#,
+                GUEST_EXECUTION_TIMEOUT,
+            )
+            .expect("guest should complete memory shrink with active vhost-user block");
+            assert_ok_response(&shrunk, "GET shrunk memory with active vhost-user block");
+            assert_vhost_user_memory_aperture(&root_backend.report(), "root after shrink");
+            assert_vhost_user_memory_aperture(&scratch_backend.report(), "scratch after shrink");
+        }
 
         scratch_backend
             .disconnect()
@@ -2280,6 +2340,7 @@ mod macos_arm64 {
         assert_eq!(report.owner_requests, 1);
         assert_eq!(report.config_requests, expected_config_requests);
         assert!(report.memory_regions > 0);
+        assert_eq!(report.memory_table_requests, 1);
         assert_eq!(report.queue_size, Some(256));
         assert!(report.activated);
         assert!(report.kicks > 0, "{context} backend should receive kicks");
@@ -2288,6 +2349,39 @@ mod macos_arm64 {
             report.requests > 0,
             "{context} backend should serve requests"
         );
+    }
+
+    fn assert_vhost_user_memory_aperture(report: &VhostUserBlockBackendReport, context: &str) {
+        const MIB: u64 = 1024 * 1024;
+        let geometry = report
+            .memory_region_geometry
+            .iter()
+            .map(|region| {
+                (
+                    region.guest_phys_addr,
+                    region.memory_size,
+                    region.mmap_offset,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            geometry,
+            vec![
+                (
+                    bangbang_runtime::memory::aarch64::DRAM_MEM_START,
+                    256 * MIB,
+                    0
+                ),
+                (
+                    bangbang_runtime::memory_hotplug::VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value(),
+                    128 * MIB,
+                    0,
+                ),
+            ],
+            "{context} backend must receive boot RAM plus one complete stable aperture"
+        );
+        assert_eq!(report.memory_regions, geometry.len());
+        assert_eq!(report.memory_table_requests, 1);
     }
 
     fn wait_for_block_event_failure(
@@ -4746,6 +4840,14 @@ mod macos_arm64 {
         assert_no_content_response(
             &http_put_json(
                 &socket_path,
+                "/hotplug/memory",
+                r#"{"total_size_mib":128,"block_size_mib":2,"slot_size_mib":128}"#,
+            ),
+            "PUT /hotplug/memory with runtime vhost-user lifecycle",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
                 "/actions",
                 r#"{"action_type":"InstanceStart"}"#,
             ),
@@ -4769,6 +4871,24 @@ mod macos_arm64 {
         control_backend
             .wait_for_activation(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
             .expect("control vhost-user backend should activate");
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":128}"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            ),
+            "grow memory before runtime vhost-user insertion",
+        );
+        wait_for_http_response_fragment(
+            &socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":128"#,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("guest should complete memory grow before runtime vhost-user insertion");
+        assert_vhost_user_memory_aperture(&control_backend.report(), "runtime control");
 
         fs::OpenOptions::new()
             .write(true)
@@ -4879,6 +4999,7 @@ mod macos_arm64 {
         first_backend
             .wait_for_activation(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
             .expect("first runtime vhost-user backend should activate");
+        assert_vhost_user_memory_aperture(&first_backend.report(), "first runtime block");
         if let Err(error) = wait_for_file_prefix_marker(
             &first_backing_path,
             BLOCK_HOTPLUG_GUEST_ONE_MARKER,
@@ -4933,6 +5054,7 @@ mod macos_arm64 {
         second_backend
             .wait_for_activation(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
             .expect("reused runtime vhost-user backend should activate");
+        assert_vhost_user_memory_aperture(&second_backend.report(), "reused runtime block");
         if let Err(error) = wait_for_file_prefix_marker(
             &second_backing_path,
             BLOCK_HOTPLUG_GUEST_TWO_MARKER,
@@ -4960,6 +5082,27 @@ mod macos_arm64 {
         second_backend
             .wait_for_frontend_close(PCI_ALL_VIRTIO_GUEST_TIMEOUT)
             .expect("reused runtime vhost-user frontend should close after DELETE");
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":0}"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            ),
+            "shrink memory after runtime vhost-user reuse",
+        );
+        wait_for_http_response_fragment(
+            &socket_path,
+            "/hotplug/memory",
+            r#""plugged_size_mib":0"#,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("guest should complete memory shrink after runtime vhost-user reuse");
+        assert_vhost_user_memory_aperture(
+            &control_backend.report(),
+            "runtime control after shrink",
+        );
 
         assert_clean_shutdown(
             bangbang.terminate(),

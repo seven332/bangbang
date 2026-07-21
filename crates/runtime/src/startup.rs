@@ -3764,6 +3764,12 @@ pub enum Arm64BootResourceError {
     PrepareMemoryHotplugDevice {
         source: VirtioMemPrepareError,
     },
+    MemoryHotplugReservationRange {
+        source: GuestMemoryError,
+    },
+    MemoryHotplugReservation {
+        source: GuestMemoryAllocationError,
+    },
     RegisterBlockMmio {
         source: Box<BlockMmioRegistrationError>,
     },
@@ -3934,6 +3940,15 @@ impl fmt::Display for Arm64BootResourceError {
             Self::PrepareMemoryHotplugDevice { source } => {
                 write!(f, "failed to prepare memory hotplug device: {source}")
             }
+            Self::MemoryHotplugReservationRange { source } => {
+                write!(
+                    f,
+                    "failed to build memory hotplug reservation range: {source}"
+                )
+            }
+            Self::MemoryHotplugReservation { source } => {
+                write!(f, "failed to reserve memory hotplug aperture: {source}")
+            }
             Self::RegisterBlockMmio { source } => {
                 write!(f, "failed to register block MMIO devices: {source}")
             }
@@ -4073,6 +4088,8 @@ impl std::error::Error for Arm64BootResourceError {
             Self::PrepareVsockDevice { source } => Some(source),
             Self::PrepareBalloonDevice { source } => Some(source),
             Self::PrepareMemoryHotplugDevice { source } => Some(source),
+            Self::MemoryHotplugReservationRange { source } => Some(source),
+            Self::MemoryHotplugReservation { source } => Some(source),
             Self::RegisterBlockMmio { source } => Some(source.as_ref()),
             Self::RegisterPmemMmio { source } => Some(source.as_ref()),
             Self::RegisterNetworkMmio { source } => Some(source.as_ref()),
@@ -4324,8 +4341,63 @@ impl Arm64BootResources {
         let memory_size = memory_size_bytes(machine_config)?;
         let layout = aarch64::dram_layout(memory_size)
             .map_err(|source| Arm64BootResourceError::MemoryLayout { source })?;
+        validate_root_device_configuration(controller.drive_configs(), controller.pmem_configs())?;
+        let prepared_pmems = PreparedPmemDevices::from_config_slice_with_layout_and_backings(
+            controller.pmem_configs(),
+            &layout,
+            pmem_backings,
+        )
+        .map_err(|source| Arm64BootResourceError::PreparePmemDevices { source })?;
+        let prepared_memory_hotplug = match controller.memory_hotplug_config() {
+            Some(config) => {
+                let mut reserved_ranges = Vec::new();
+                reserved_ranges
+                    .try_reserve_exact(layout.ranges().len())
+                    .map_err(|source| {
+                        Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
+                    })?;
+                reserved_ranges.extend_from_slice(layout.ranges());
+                reserved_ranges
+                    .try_reserve_exact(prepared_pmems.len())
+                    .map_err(|source| {
+                        Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
+                    })?;
+                reserved_ranges.extend(
+                    prepared_pmems
+                        .as_slice()
+                        .iter()
+                        .map(PreparedPmemDevice::guest_range),
+                );
+                Some(
+                    PreparedVirtioMemDevice::from_config_with_reserved_ranges(
+                        config,
+                        &reserved_ranges,
+                    )
+                    .map_err(|source| {
+                        Arm64BootResourceError::PrepareMemoryHotplugDevice { source }
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let guest_memory_backing = if prepared_memory_hotplug.is_some() {
+            GuestMemoryBacking::Shared
+        } else {
+            guest_memory_backing
+        };
         let mut memory = GuestMemory::allocate_with_backing(&layout, guest_memory_backing)
             .map_err(|source| Arm64BootResourceError::GuestMemoryAllocation { source })?;
+        if let Some(prepared) = prepared_memory_hotplug {
+            let config_space = prepared.config_space();
+            let range = GuestMemoryRange::new(
+                GuestAddress::new(config_space.addr()),
+                config_space.region_size(),
+            )
+            .map_err(|source| Arm64BootResourceError::MemoryHotplugReservationRange { source })?;
+            memory
+                .reserve_shared_region(range)
+                .map_err(|source| Arm64BootResourceError::MemoryHotplugReservation { source })?;
+        }
         if machine_config.track_dirty_pages() {
             memory
                 .enable_dirty_tracking()
@@ -4347,13 +4419,6 @@ impl Arm64BootResources {
             controller.pmem_configs(),
             &vhost_user_block_frontends,
         )?;
-        let prepared_pmems = PreparedPmemDevices::from_config_slice_with_layout_and_backings(
-            controller.pmem_configs(),
-            &layout,
-            pmem_backings,
-        )
-        .map_err(|source| Arm64BootResourceError::PreparePmemDevices { source })?;
-
         let block_async_runtime = SharedBlockAsyncRuntime::new();
         let mut prepared_blocks = PreparedBlockDevices::from_config_slice_with_resources(
             controller.drive_configs(),
@@ -4525,33 +4590,6 @@ impl Arm64BootResources {
                 }
             };
 
-        let prepared_memory_hotplug = match controller.memory_hotplug_config() {
-            Some(config) => {
-                let mut reserved_ranges = Vec::new();
-                reserved_ranges
-                    .try_reserve_exact(layout.ranges().len())
-                    .map_err(|source| {
-                        Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
-                    })?;
-                reserved_ranges.extend_from_slice(layout.ranges());
-                reserved_ranges
-                    .try_reserve_exact(pmem_devices.len())
-                    .map_err(|source| {
-                        Arm64BootResourceError::MemoryHotplugRangeMetadataAllocation { source }
-                    })?;
-                reserved_ranges.extend(pmem_devices.iter().map(PreparedPmemDevice::guest_range));
-                Some(
-                    PreparedVirtioMemDevice::from_config_with_reserved_ranges(
-                        config,
-                        &reserved_ranges,
-                    )
-                    .map_err(|source| {
-                        Arm64BootResourceError::PrepareMemoryHotplugDevice { source }
-                    })?,
-                )
-            }
-            None => None,
-        };
         let (memory_hotplug_device, pci_memory_hotplug_device) = match (
             prepared_memory_hotplug,
             memory_hotplug_device,
@@ -4931,21 +4969,12 @@ fn append_root_device_command_line(
     pmem_configs: &[PmemConfig],
     vhost_user_frontends: &BTreeMap<String, PreparedVhostUserBlockFrontend>,
 ) -> Result<(), Arm64BootResourceError> {
-    let mut root_drives = drive_configs
-        .iter()
-        .filter(|config| config.is_root_device());
-    let root_drive = root_drives.next();
-    let mut root_pmems = pmem_configs
+    validate_root_device_configuration(drive_configs, pmem_configs)?;
+    let root_drive = drive_configs.iter().find(|config| config.is_root_device());
+    let root_pmem = pmem_configs
         .iter()
         .enumerate()
-        .filter(|(_, config)| config.root_device());
-    let root_pmem = root_pmems.next();
-    if (root_drive.is_some() && root_pmem.is_some())
-        || root_drives.next().is_some()
-        || root_pmems.next().is_some()
-    {
-        return Err(Arm64BootResourceError::RootDeviceConflict);
-    }
+        .find(|(_, config)| config.root_device());
 
     let root = root_drive
         .map(|root_drive| {
@@ -4974,6 +5003,27 @@ fn append_root_device_command_line(
     }
 
     Ok(())
+}
+
+fn validate_root_device_configuration(
+    drive_configs: &[DriveConfig],
+    pmem_configs: &[PmemConfig],
+) -> Result<(), Arm64BootResourceError> {
+    let root_count = drive_configs
+        .iter()
+        .filter(|config| config.is_root_device())
+        .count()
+        .saturating_add(
+            pmem_configs
+                .iter()
+                .filter(|config| config.root_device())
+                .count(),
+        );
+    if root_count > 1 {
+        Err(Arm64BootResourceError::RootDeviceConflict)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_block_interrupt_line_count(
@@ -10190,6 +10240,33 @@ mod tests {
         assert_eq!(config_space.usable_region_size(), 0);
         assert_eq!(config_space.plugged_size(), 0);
         assert_eq!(config_space.requested_size(), 0);
+        assert_eq!(resources.memory.backing(), GuestMemoryBacking::Shared);
+        assert_eq!(
+            resources
+                .memory
+                .regions()
+                .iter()
+                .map(|region| region.range())
+                .collect::<Vec<_>>(),
+            resources.layout.ranges()
+        );
+        assert_eq!(resources.memory.total_size(), resources.layout.total_size());
+        let export_ranges = resources
+            .memory
+            .shared_export_regions()
+            .map(|region| region.range())
+            .collect::<Vec<_>>();
+        assert_eq!(export_ranges.len(), resources.layout.ranges().len() + 1);
+        assert_eq!(
+            export_ranges.last().copied(),
+            Some(
+                GuestMemoryRange::new(
+                    GuestAddress::new(config_space.addr()),
+                    config_space.region_size(),
+                )
+                .expect("memory hotplug reservation range should validate")
+            )
+        );
 
         let tree = read_fdt(&resources);
         assert!(tree.find("/virtio_mmio@4000a000").is_some());
@@ -10226,10 +10303,15 @@ mod tests {
             .mmio_dispatcher
             .handler_mut::<VirtioMemMmioHandler>(region_id)
             .expect("virtio-mem handler should be registered");
+        let hotplug_address = handler.device_config_handler().addr();
         assert_eq!(
-            handler.device_config_handler().addr(),
+            hotplug_address,
             VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value() + 128 * MIB
         );
+        assert!(resources.memory.shared_export_regions().any(|region| {
+            region.range().start() == GuestAddress::new(hotplug_address)
+                && region.range().size() == 1024 * MIB
+        }));
     }
 
     #[test]
