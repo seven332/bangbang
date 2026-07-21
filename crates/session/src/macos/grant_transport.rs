@@ -333,6 +333,7 @@ mod tests {
                 inode: 2,
             },
             status_flags: 0,
+            block_device: None,
         };
         GrantFrame {
             session: SessionId::from_bytes([1; 32]),

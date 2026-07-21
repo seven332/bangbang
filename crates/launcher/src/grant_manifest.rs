@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 use bangbang_session::macos::bookmark::create_implicit_bookmark;
 use bangbang_session::{
-    BatchId, GRANT_HEADER_BYTES, GrantAccess, GrantFrame, GrantId, GrantObjectKind, GrantRecord,
-    MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES, MAX_GRANT_DATAGRAM_BYTES, MAX_GRANT_RECORDS,
-    MAX_GRANTS, ObjectIdentity, ResourceRole, SessionId,
+    BatchId, BlockDeviceGrant, GRANT_HEADER_BYTES, GrantAccess, GrantFrame, GrantId,
+    GrantObjectKind, GrantRecord, MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES,
+    MAX_GRANT_DATAGRAM_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS, ObjectIdentity, ResourceRole,
+    SessionId,
 };
 use serde::Deserialize;
 
@@ -253,6 +254,16 @@ pub(crate) struct SnapshotDirectoryAnchor {
     identity: ObjectIdentity,
 }
 
+/// Borrowed exact launcher authority for one block-special drive grant.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockDriveAnchor {
+    descriptor: RawFd,
+    access: GrantAccess,
+    identity: ObjectIdentity,
+    status_flags: u32,
+    block_device: BlockDeviceGrant,
+}
+
 impl std::fmt::Debug for SocketDirectoryAnchor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -291,6 +302,19 @@ impl std::fmt::Debug for SnapshotDirectoryAnchor {
     }
 }
 
+impl std::fmt::Debug for BlockDriveAnchor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlockDriveAnchor")
+            .field("descriptor", &"<borrowed>")
+            .field("access", &self.access)
+            .field("identity", &"<redacted>")
+            .field("status_flags", &"<redacted>")
+            .field("block_device", &"<redacted>")
+            .finish()
+    }
+}
+
 impl SnapshotDirectoryAnchor {
     pub(crate) const fn descriptor(self) -> RawFd {
         self.descriptor
@@ -298,6 +322,45 @@ impl SnapshotDirectoryAnchor {
 
     pub(crate) const fn identity(self) -> ObjectIdentity {
         self.identity
+    }
+}
+
+impl BlockDriveAnchor {
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        descriptor: RawFd,
+        access: GrantAccess,
+        identity: ObjectIdentity,
+        status_flags: u32,
+        block_device: BlockDeviceGrant,
+    ) -> Self {
+        Self {
+            descriptor,
+            access,
+            identity,
+            status_flags,
+            block_device,
+        }
+    }
+
+    pub(crate) const fn descriptor(self) -> RawFd {
+        self.descriptor
+    }
+
+    pub(crate) const fn access(self) -> GrantAccess {
+        self.access
+    }
+
+    pub(crate) const fn identity(self) -> ObjectIdentity {
+        self.identity
+    }
+
+    pub(crate) const fn status_flags(self) -> u32 {
+        self.status_flags
+    }
+
+    pub(crate) const fn block_device(self) -> BlockDeviceGrant {
+        self.block_device
     }
 }
 
@@ -376,9 +439,10 @@ impl PreparedGrantBatch {
                         id: grant.id,
                         role: grant.role,
                         access: grant.access,
-                        kind: GrantObjectKind::RegularFile,
+                        kind: prepared.kind,
                         identity: prepared.identity,
                         status_flags: prepared.status_flags,
+                        block_device: prepared.block_device,
                     },
                     descriptor: Some(prepared.descriptor),
                 });
@@ -531,6 +595,35 @@ impl PreparedGrantBatch {
                 _ => None,
             })
     }
+
+    /// Borrows one exact retained block-special drive descriptor by grant ID.
+    pub(crate) fn block_drive_anchor(&self, requested_id: &GrantId) -> Option<BlockDriveAnchor> {
+        self.records
+            .iter()
+            .find_map(|prepared| match &prepared.record {
+                GrantRecord::Descriptor {
+                    id,
+                    role: ResourceRole::DriveBacking,
+                    access,
+                    kind: GrantObjectKind::BlockDevice,
+                    identity,
+                    status_flags,
+                    block_device: Some(block_device),
+                } if id == requested_id => {
+                    prepared
+                        .descriptor
+                        .as_ref()
+                        .map(|descriptor| BlockDriveAnchor {
+                            descriptor: descriptor.as_raw_fd(),
+                            access: *access,
+                            identity: *identity,
+                            status_flags: *status_flags,
+                            block_device: *block_device,
+                        })
+                }
+                _ => None,
+            })
+    }
 }
 
 /// One borrowed outbound record. The owning batch must remain live while sent.
@@ -551,8 +644,10 @@ impl std::fmt::Debug for OutboundGrant {
 
 struct PreparedResource {
     descriptor: OwnedFd,
+    kind: GrantObjectKind,
     identity: ObjectIdentity,
     status_flags: u32,
+    block_device: Option<BlockDeviceGrant>,
 }
 
 fn open_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherError> {
@@ -579,41 +674,75 @@ fn open_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherErro
         descriptor = unsafe { OwnedFd::from_raw_fd(opened) };
     }
     let stat = descriptor_stat(descriptor.as_raw_fd())?;
-    if grant.role.is_scoped_directory() {
-        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+    let object_kind = stat.st_mode & libc::S_IFMT;
+    let (kind, block_device) = if grant.role.is_scoped_directory() {
+        if object_kind != libc::S_IFDIR {
             return Err(LauncherError::GrantPreparation);
         }
-    } else if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(LauncherError::GrantPreparation);
-    }
+        (GrantObjectKind::Directory, None)
+    } else {
+        match object_kind {
+            libc::S_IFREG => (GrantObjectKind::RegularFile, None),
+            libc::S_IFBLK
+                if grant.role == ResourceRole::DriveBacking
+                    && matches!(grant.access, GrantAccess::ReadOnly | GrantAccess::ReadWrite) =>
+            {
+                let target_device = normalized_device(stat.st_rdev);
+                if target_device == 0 {
+                    return Err(LauncherError::GrantPreparation);
+                }
+                let block =
+                    crate::macos::block_device::inspect(descriptor.as_raw_fd(), target_device)
+                        .map_err(|_| LauncherError::GrantPreparation)?;
+                (GrantObjectKind::BlockDevice, Some(block))
+            }
+            _ => return Err(LauncherError::GrantPreparation),
+        }
+    };
     // The nonblocking probe prevents a malicious special file from stalling
-    // preparation. It is removed before the exact status flags are recorded.
+    // preparation. Regular files and directories remove it before recording;
+    // Darwin block descriptors retain it because F_SETFL rejects the change.
     // SAFETY: F_GETFL inspects the live owned descriptor.
     let probe_flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
-    // SAFETY: F_SETFL updates status flags on the same live descriptor.
-    let set_flags = unsafe {
-        libc::fcntl(
-            descriptor.as_raw_fd(),
-            libc::F_SETFL,
-            probe_flags & !libc::O_NONBLOCK,
-        )
-    };
-    if probe_flags < 0 || set_flags < 0 {
+    if probe_flags < 0 {
         return Err(LauncherError::GrantPreparation);
+    }
+    if kind != GrantObjectKind::BlockDevice {
+        // SAFETY: F_SETFL updates status flags on the same live descriptor.
+        if unsafe {
+            libc::fcntl(
+                descriptor.as_raw_fd(),
+                libc::F_SETFL,
+                probe_flags & !libc::O_NONBLOCK,
+            )
+        } < 0
+        {
+            return Err(LauncherError::GrantPreparation);
+        }
     }
     // SAFETY: F_GETFL reads status flags from the same live descriptor.
     let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 || !access_matches(flags, grant.access) {
+    if flags < 0
+        || !access_matches(flags, grant.access)
+        || (kind == GrantObjectKind::BlockDevice && flags & libc::O_NONBLOCK == 0)
+    {
         return Err(LauncherError::GrantPreparation);
     }
-    let status_flags = u32::try_from(flags).map_err(|_| LauncherError::GrantPreparation)?;
+    let status_flags = if kind == GrantObjectKind::BlockDevice {
+        bangbang_session::macos::normalized_block_status_flags(flags)
+            .ok_or(LauncherError::GrantPreparation)?
+    } else {
+        u32::try_from(flags).map_err(|_| LauncherError::GrantPreparation)?
+    };
     Ok(PreparedResource {
         descriptor,
+        kind,
         identity: ObjectIdentity {
             device: normalized_device(stat.st_dev),
             inode: stat.st_ino,
         },
         status_flags,
+        block_device,
     })
 }
 

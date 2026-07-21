@@ -131,7 +131,8 @@ use crate::contained_session::{
     VhostUserBrokerAuthority, socket_directory_reference,
 };
 use crate::contained_session::{
-    GrantAuthority, GrantClaimError, PreparedFileGrantClaim, grant_reference_id,
+    GrantAuthority, GrantClaimError, PreparedDriveBackingClaim, PreparedFileGrantClaim,
+    grant_reference_id,
 };
 use crate::direct_vhost_user;
 use crate::host_network::virtio_vmnet::{
@@ -2309,25 +2310,30 @@ where
             } else {
                 None
             };
-        let backing = match (&self.grant_authority, config.backend()) {
-            (
-                Some(authority),
-                DriveBackendConfig::File {
-                    path_on_host,
-                    is_read_only,
-                    ..
-                },
-            ) => authority
-                .claim_file(
-                    path_on_host,
-                    ResourceRole::DriveBacking,
-                    grant_access_for_read_only(*is_read_only),
-                )
-                .map_err(|_| VmmActionError::ResourceGrant)?
-                .map(|file| BlockFileBacking::from_file(file, *is_read_only))
-                .transpose()
-                .map_err(|_| VmmActionError::ResourceGrant)?,
-            (None, _) | (Some(_), DriveBackendConfig::VhostUser { .. }) => None,
+        let mut grant_claim: Option<PreparedDriveBackingClaim> =
+            match (&self.grant_authority, config.backend()) {
+                (
+                    Some(authority),
+                    DriveBackendConfig::File {
+                        path_on_host,
+                        is_read_only,
+                        ..
+                    },
+                ) => authority
+                    .prepare_drive_backing_claim(
+                        path_on_host,
+                        grant_access_for_read_only(*is_read_only),
+                    )
+                    .map_err(|_| VmmActionError::ResourceGrant)?,
+                (None, _) | (Some(_), DriveBackendConfig::VhostUser { .. }) => None,
+            };
+        let backing = match (grant_claim.as_mut(), config.backend()) {
+            (Some(claim), DriveBackendConfig::File { is_read_only, .. }) => Some(
+                claim
+                    .take_backing(*is_read_only)
+                    .map_err(|_| VmmActionError::ResourceGrant)?,
+            ),
+            _ => None,
         };
         let drive_id = config.drive_id().to_string();
         let is_vhost_user = config.is_vhost_user();
@@ -2360,6 +2366,9 @@ where
             self.grant_authority.is_none()
                 || is_vhost_user == self.vhost_user_grant_states.contains_key(&drive_id)
         );
+        if let Some(claim) = grant_claim {
+            claim.commit();
+        }
         Ok(VmmData::Empty)
     }
 
@@ -2378,11 +2387,10 @@ where
                 DriveUpdateError::UnsupportedBackend,
             ));
         };
-        let mut grant_claim: Option<PreparedFileGrantClaim> = match &self.grant_authority {
+        let mut grant_claim: Option<PreparedDriveBackingClaim> = match &self.grant_authority {
             Some(authority) => authority
-                .prepare_file_claim(
+                .prepare_drive_backing_claim(
                     path_on_host,
-                    ResourceRole::DriveBacking,
                     grant_access_for_read_only(*is_read_only),
                 )
                 .map_err(|_| VmmActionError::ResourceGrant)?,
@@ -2390,13 +2398,9 @@ where
         };
         let backing_update = match grant_claim.as_mut() {
             Some(claim) => BlockBackingUpdate::Provided(
-                BlockFileBacking::from_file(
-                    claim
-                        .take_file()
-                        .map_err(|_| VmmActionError::ResourceGrant)?,
-                    *is_read_only,
-                )
-                .map_err(|_| VmmActionError::ResourceGrant)?,
+                claim
+                    .take_backing(*is_read_only)
+                    .map_err(|_| VmmActionError::ResourceGrant)?,
             ),
             None => BlockBackingUpdate::ConfiguredPath,
         };
@@ -2543,12 +2547,12 @@ where
                 is_read_only,
                 ..
             } => {
-                let mut grant_claim: Option<PreparedFileGrantClaim> = match &self.grant_authority {
+                let mut grant_claim: Option<PreparedDriveBackingClaim> = match &self.grant_authority
+                {
                     Some(authority) => Some(
                         authority
-                            .prepare_file_claim(
+                            .prepare_drive_backing_claim(
                                 path_on_host,
-                                ResourceRole::DriveBacking,
                                 grant_access_for_read_only(*is_read_only),
                             )
                             .map_err(|_| VmmActionError::ResourceGrant)?
@@ -2558,13 +2562,9 @@ where
                 };
                 let backing = match grant_claim.as_mut() {
                     Some(claim) => Some(
-                        BlockFileBacking::from_file(
-                            claim
-                                .take_file()
-                                .map_err(|_| VmmActionError::ResourceGrant)?,
-                            *is_read_only,
-                        )
-                        .map_err(|_| VmmActionError::ResourceGrant)?,
+                        claim
+                            .take_backing(*is_read_only)
+                            .map_err(|_| VmmActionError::ResourceGrant)?,
                     ),
                     None => None,
                 };
@@ -2949,7 +2949,7 @@ where
         let refresh_backing = input.path_on_host().is_some();
         let rate_limiter_update = input.rate_limiter();
         let updated_config = self.controller.updated_drive_config(input)?;
-        let mut grant_claim: Option<PreparedFileGrantClaim> = None;
+        let mut grant_claim: Option<PreparedDriveBackingClaim> = None;
         match updated_config.backend() {
             DriveBackendConfig::VhostUser { .. } => {
                 debug_assert!(!refresh_backing);
@@ -2984,21 +2984,16 @@ where
                     match &self.grant_authority {
                         Some(authority) => {
                             grant_claim = authority
-                                .prepare_file_claim(
+                                .prepare_drive_backing_claim(
                                     path_on_host,
-                                    ResourceRole::DriveBacking,
                                     grant_access_for_read_only(*is_read_only),
                                 )
                                 .map_err(|_| VmmActionError::ResourceGrant)?;
                             match grant_claim.as_mut() {
                                 Some(claim) => BlockBackingUpdate::Provided(
-                                    BlockFileBacking::from_file(
-                                        claim
-                                            .take_file()
-                                            .map_err(|_| VmmActionError::ResourceGrant)?,
-                                        *is_read_only,
-                                    )
-                                    .map_err(|_| VmmActionError::ResourceGrant)?,
+                                    claim
+                                        .take_backing(*is_read_only)
+                                        .map_err(|_| VmmActionError::ResourceGrant)?,
                                 ),
                                 None => BlockBackingUpdate::ConfiguredPath,
                             }
@@ -3428,10 +3423,16 @@ where
         .map_err(NativeV1SnapshotLoadError::Artifact)?;
         let state = PreparedHvfSnapshotV1State::from_prepared_state(state)
             .map_err(NativeV1SnapshotLoadError::Prepare)?;
-        let root_id = grant_reference_id(state.root_backing_path())
+        let mut root_claim = authority
+            .prepare_drive_backing_claim(state.root_backing_path(), GrantAccess::ReadOnly)
+            .map_err(NativeV1SnapshotLoadError::Resource)?;
+        let root = root_claim
+            .as_mut()
+            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
+            .transpose()
             .map_err(NativeV1SnapshotLoadError::Resource)?;
 
-        let mut requests = Vec::with_capacity(3);
+        let mut requests = Vec::with_capacity(2);
         if let Some(id) = &state_id {
             requests.push((
                 id.clone(),
@@ -3443,13 +3444,6 @@ where
             requests.push((
                 id.clone(),
                 ResourceRole::SnapshotMemoryInput,
-                GrantAccess::ReadOnly,
-            ));
-        }
-        if let Some(id) = &root_id {
-            requests.push((
-                id.clone(),
-                ResourceRole::DriveBacking,
                 GrantAccess::ReadOnly,
             ));
         }
@@ -3469,11 +3463,6 @@ where
             .map(|_| claimed.next().ok_or(GrantClaimError))
             .transpose()
             .map_err(NativeV1SnapshotLoadError::Resource)?;
-        let root = root_id
-            .as_ref()
-            .map(|_| claimed.next().ok_or(GrantClaimError))
-            .transpose()
-            .map_err(NativeV1SnapshotLoadError::Resource)?;
         debug_assert!(claimed.next().is_none());
 
         let prepared = match memory {
@@ -3481,10 +3470,13 @@ where
             None => state.load_memory_path(Path::new(memory_path)),
         }
         .map_err(NativeV1SnapshotLoadError::Artifact)?;
-        prepared
+        let prepared = prepared
             .finish(root, Instant::now())
-            .map(Some)
-            .map_err(NativeV1SnapshotLoadError::Prepare)
+            .map_err(NativeV1SnapshotLoadError::Prepare)?;
+        if let Some(claim) = root_claim {
+            claim.commit();
+        }
+        Ok(Some(prepared))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -19959,9 +19951,8 @@ mod tests {
         assert_eq!(vmm.drive_configs()[0].path_on_host(), Some(original.path()));
 
         let restored = observer
-            .prepare_file_claim(
+            .prepare_drive_backing_claim(
                 Path::new(REPLACEMENT),
-                bangbang_session::ResourceRole::DriveBacking,
                 bangbang_session::GrantAccess::ReadWrite,
             )
             .expect("failed patch should restore the exact grant")
@@ -19981,9 +19972,8 @@ mod tests {
         );
         assert!(
             observer
-                .claim_file(
+                .prepare_drive_backing_claim(
                     Path::new(REPLACEMENT),
-                    bangbang_session::ResourceRole::DriveBacking,
                     bangbang_session::GrantAccess::ReadWrite,
                 )
                 .is_err(),

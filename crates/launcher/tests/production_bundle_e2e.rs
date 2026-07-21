@@ -5,6 +5,8 @@
     clippy::unwrap_used
 )]
 
+#[path = "../../../tests/support/macos_virtual_block.rs"]
+mod macos_virtual_block;
 #[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
 
@@ -29,9 +31,11 @@ use bangbang_launcher::{
     OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 use bangbang_session::{
-    Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD,
-    SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy, encode_frame,
+    BLOCK_CONTROL_BROKER_FD, Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY,
+    SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy,
+    encode_frame,
 };
+use macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess};
 use vhost_user_block::{VhostUserBlockBackend, VhostUserBlockBackendOptions};
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
@@ -45,6 +49,11 @@ const GRANT_DELAY_OPTION: &str = "--bangbang-internal-grant-delay-v1";
 const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
 const GRANT_PROBE_MARKER: &str = "grant-integration-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
+const BLOCK_CONTROL_GRANT_ID: &str = "probe-block-control";
+const BLOCK_CONTROL_GRANT_REF: &str = "bangbang-grant:probe-block-control";
+const BLOCK_CONTROL_INITIAL_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_INITIAL";
+const BLOCK_CONTROL_WRITTEN_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_WRITTEN";
+const BLOCK_CONTROL_WRITE_BLOCK: u64 = 8;
 const STARTUP_CONFIG_ID: &str = "grant-config-1360";
 const STARTUP_METADATA_ID: &str = "grant-metadata-1360";
 const KERNEL_ID: &str = "grant-kernel-1360";
@@ -3906,6 +3915,127 @@ fn signed_grants_authorize_only_typed_read_write_and_directory_operations() {
 }
 
 #[test]
+fn signed_contained_block_device_uses_launcher_control_broker() {
+    let bundle = grant_test_bundle();
+    let launcher_entitlements = codesign_entitlements(&bundle);
+    let worker_entitlements = codesign_entitlements(&worker_bundle(&bundle));
+    assert!(!launcher_entitlements.contains("com.apple.security.app-sandbox"));
+    assert!(!launcher_entitlements.contains("com.apple.security.hypervisor"));
+    assert_eq!(worker_entitlements.matches("<key>").count(), 2);
+    assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
+    assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+    let mut media = MacosVirtualBlock::create(MacosVirtualBlockAccess::ReadWrite)
+        .expect("temporary block media should attach read-write");
+    let logical_block_size = usize::try_from(
+        media
+            .logical_block_size()
+            .expect("temporary media should report logical geometry"),
+    )
+    .expect("logical block size should fit usize");
+    let block_count = media
+        .block_count()
+        .expect("temporary media should report a block count");
+    let identity = media
+        .identity()
+        .expect("temporary media should report exact identity");
+    assert_ne!(identity.device(), 0);
+    assert_ne!(identity.inode(), 0);
+    assert_ne!(identity.target_device(), 0);
+    assert_eq!(
+        media.len().expect("temporary media should report capacity"),
+        u64::try_from(logical_block_size)
+            .expect("block size should fit u64")
+            .checked_mul(block_count)
+            .expect("temporary media capacity should not overflow")
+    );
+    assert!(logical_block_size >= BLOCK_CONTROL_INITIAL_MARKER.len());
+    assert!(logical_block_size >= BLOCK_CONTROL_WRITTEN_MARKER.len());
+
+    let mut initial_block = vec![0_u8; logical_block_size];
+    initial_block[..BLOCK_CONTROL_INITIAL_MARKER.len()]
+        .copy_from_slice(BLOCK_CONTROL_INITIAL_MARKER);
+    media
+        .write_at(0, &initial_block)
+        .expect("initial block marker should persist before launch");
+
+    let root = TestDir::new("block-control-grant");
+    let manifest = fs::canonicalize(root.path())
+        .expect("block-control fixture should canonicalize")
+        .join("grant-manifest.json");
+    let device_path = media
+        .device_path()
+        .expect("attached media should expose a device path")
+        .to_path_buf();
+    let manifest_json = serde_json::json!({
+        "version": 1,
+        "grants": [{
+            "id": BLOCK_CONTROL_GRANT_ID,
+            "role": "drive-backing",
+            "access": "read-write",
+            "source": path_text(&device_path),
+        }],
+    });
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&manifest_json).expect("block-control manifest should serialize"),
+    )
+    .expect("block-control manifest should write");
+
+    let output = run_with_timeout(
+        Command::new(launcher(&bundle))
+            .arg(GRANT_MANIFEST_OPTION)
+            .arg(&manifest)
+            .arg("--")
+            .arg(GRANT_PROBE_OPTION)
+            .arg("block-control"),
+        PROCESS_TIMEOUT,
+        "signed block-control grant probe",
+    );
+    assert_output_success(&output, "signed block-control grant probe");
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for sensitive in [
+        path_text(&device_path),
+        path_text(&manifest),
+        BLOCK_CONTROL_GRANT_ID,
+        BLOCK_CONTROL_GRANT_REF,
+    ] {
+        assert!(!diagnostics.contains(sensitive));
+    }
+
+    media
+        .reattach(MacosVirtualBlockAccess::ReadOnly)
+        .expect("completed broker session should release media for read-only reattach");
+    assert_eq!(
+        media
+            .read_at(0, logical_block_size)
+            .expect("initial block should remain readable"),
+        initial_block
+    );
+    let mut expected_written = vec![0_u8; logical_block_size];
+    expected_written[..BLOCK_CONTROL_WRITTEN_MARKER.len()]
+        .copy_from_slice(BLOCK_CONTROL_WRITTEN_MARKER);
+    assert_eq!(
+        media
+            .read_at(
+                u64::try_from(logical_block_size)
+                    .expect("block size should fit u64")
+                    .checked_mul(BLOCK_CONTROL_WRITE_BLOCK)
+                    .expect("marker offset should not overflow"),
+                logical_block_size,
+            )
+            .expect("broker-synchronized block should persist"),
+        expected_written
+    );
+    media
+        .cleanup()
+        .expect("temporary block media should detach and clean up");
+}
+
+#[test]
 fn contained_worker_maps_unlinked_shared_guest_memory_with_hvf() {
     let bundle = grant_test_bundle();
     let fixture = GrantProbeFixture::new("shared-memory", false);
@@ -4108,6 +4238,8 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
         UnixDatagram::pair().expect("broker socketpair should open");
     let (_vhost_broker_parent, vhost_broker_child_endpoint) =
         UnixDatagram::pair().expect("vhost broker socketpair should open");
+    let (_block_control_parent, block_control_child_endpoint) =
+        UnixDatagram::pair().expect("block-control socketpair should open");
     parent
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bootstrap read timeout should set");
@@ -4115,6 +4247,7 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
     let grant_child_fd = grant_child_endpoint.as_raw_fd();
     let broker_child_fd = broker_child_endpoint.as_raw_fd();
     let vhost_broker_child_fd = vhost_broker_child_endpoint.as_raw_fd();
+    let block_control_child_fd = block_control_child_endpoint.as_raw_fd();
     let mut command = Command::new(worker_executable(&bundle));
     command
         .env_clear()
@@ -4139,6 +4272,9 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
             if libc::dup2(vhost_broker_child_fd, VHOST_USER_BROKER_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if libc::dup2(block_control_child_fd, BLOCK_CONTROL_BROKER_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -4149,6 +4285,7 @@ fn worker_rejects_malformed_forged_bootstrap_before_public_processing() {
     drop(grant_child_endpoint);
     drop(broker_child_endpoint);
     drop(vhost_broker_child_endpoint);
+    drop(block_control_child_endpoint);
 
     let mut hello_bytes = vec![0_u8; 56];
     parent

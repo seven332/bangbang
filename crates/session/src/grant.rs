@@ -21,8 +21,8 @@ pub const MAX_BOOKMARK_BYTES: u32 = 64 * 1024;
 /// Maximum bookmark bytes across one batch.
 pub const MAX_BATCH_BOOKMARK_BYTES: u32 = 256 * 1024;
 
-const GRANT_MAGIC: [u8; 4] = *b"BBG1";
-const GRANT_VERSION: u16 = 1;
+const GRANT_MAGIC: [u8; 4] = *b"BBG2";
+const GRANT_VERSION: u16 = 2;
 const GRANT_MAX_PAYLOAD_BYTES: usize = MAX_GRANT_DATAGRAM_BYTES - GRANT_HEADER_BYTES;
 
 /// Random identity bound to one startup grant batch.
@@ -307,6 +307,8 @@ pub enum GrantObjectKind {
     RegularFile = 1,
     /// Existing directory.
     Directory = 2,
+    /// Existing macOS block-special device.
+    BlockDevice = 3,
 }
 
 impl GrantObjectKind {
@@ -314,6 +316,7 @@ impl GrantObjectKind {
         match value {
             1 => Ok(Self::RegularFile),
             2 => Ok(Self::Directory),
+            3 => Ok(Self::BlockDevice),
             _ => Err(ProtocolError::InvalidFrame),
         }
     }
@@ -331,6 +334,79 @@ pub struct ObjectIdentity {
 impl fmt::Debug for ObjectIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ObjectIdentity(<redacted>)")
+    }
+}
+
+/// Checked block-special descriptor metadata authenticated by one grant.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockDeviceGrant {
+    target_device: u64,
+    logical_block_size: u32,
+    block_count: u64,
+    capacity: u64,
+}
+
+impl BlockDeviceGrant {
+    /// Builds one internally consistent, virtio-sector-aligned block tuple.
+    pub fn new(target_device: u64, logical_block_size: u32, block_count: u64) -> Option<Self> {
+        let block_size = u64::from(logical_block_size);
+        if target_device == 0
+            || block_size == 0
+            || block_count == 0
+            || !block_size.is_multiple_of(512)
+        {
+            return None;
+        }
+        let capacity = block_size.checked_mul(block_count)?;
+        if capacity == 0 || !capacity.is_multiple_of(512) || i64::try_from(capacity).is_err() {
+            return None;
+        }
+        Some(Self {
+            target_device,
+            logical_block_size,
+            block_count,
+            capacity,
+        })
+    }
+
+    fn from_wire(
+        target_device: u64,
+        logical_block_size: u32,
+        block_count: u64,
+        capacity: u64,
+    ) -> Option<Self> {
+        let value = Self::new(target_device, logical_block_size, block_count)?;
+        (value.capacity == capacity).then_some(value)
+    }
+
+    /// Returns the normalized target-device identity (`st_rdev`).
+    #[must_use]
+    pub const fn target_device(self) -> u64 {
+        self.target_device
+    }
+
+    /// Returns the logical media block size.
+    #[must_use]
+    pub const fn logical_block_size(self) -> u32 {
+        self.logical_block_size
+    }
+
+    /// Returns the logical media block count.
+    #[must_use]
+    pub const fn block_count(self) -> u64 {
+        self.block_count
+    }
+
+    /// Returns the checked byte capacity.
+    #[must_use]
+    pub const fn capacity(self) -> u64 {
+        self.capacity
+    }
+}
+
+impl fmt::Debug for BlockDeviceGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BlockDeviceGrant(<redacted>)")
     }
 }
 
@@ -360,6 +436,8 @@ pub enum GrantRecord {
         identity: ObjectIdentity,
         /// Expected file status flags after masking mutable noise.
         status_flags: u32,
+        /// Authenticated block-special metadata, absent for regular files.
+        block_device: Option<BlockDeviceGrant>,
     },
     /// Transfers a directory anchor and declares its bookmark fragments.
     ScopedDirectory {
@@ -531,15 +609,29 @@ fn encode_record(record: &GrantRecord) -> Result<(u16, Vec<u8>), ProtocolError> 
             kind,
             identity,
             status_flags,
+            block_device,
         } => {
             if role.is_scoped_directory()
                 || !role.permits(*access)
-                || *kind != GrantObjectKind::RegularFile
+                || !valid_descriptor_kind(*role, *access, *kind, *block_device)
             {
                 return Err(ProtocolError::InvalidFrame);
             }
             let mut payload = encode_grant_prefix(id, *role, *access, *kind, *identity)?;
             payload.extend_from_slice(&status_flags.to_be_bytes());
+            let (target_device, logical_block_size, block_count, capacity) =
+                block_device.map_or((0, 0, 0, 0), |block| {
+                    (
+                        block.target_device(),
+                        block.logical_block_size(),
+                        block.block_count(),
+                        block.capacity(),
+                    )
+                });
+            payload.extend_from_slice(&target_device.to_be_bytes());
+            payload.extend_from_slice(&logical_block_size.to_be_bytes());
+            payload.extend_from_slice(&block_count.to_be_bytes());
+            payload.extend_from_slice(&capacity.to_be_bytes());
             Ok((2, payload))
         }
         GrantRecord::ScopedDirectory {
@@ -621,11 +713,34 @@ fn decode_record(kind: u16, payload: &[u8]) -> Result<GrantRecord, ProtocolError
         }
         2 => {
             let (id, role, access, object_kind, identity, offset) = decode_grant_prefix(payload)?;
-            if payload.len() != offset.saturating_add(4)
+            if payload.len() != offset.saturating_add(32)
                 || role.is_scoped_directory()
                 || !role.permits(access)
-                || object_kind != GrantObjectKind::RegularFile
             {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            let target_device = read_u64(payload, offset.saturating_add(4))?;
+            let logical_block_size = read_u32(payload, offset.saturating_add(12))?;
+            let block_count = read_u64(payload, offset.saturating_add(16))?;
+            let capacity = read_u64(payload, offset.saturating_add(24))?;
+            let block_device = if target_device == 0
+                && logical_block_size == 0
+                && block_count == 0
+                && capacity == 0
+            {
+                None
+            } else {
+                Some(
+                    BlockDeviceGrant::from_wire(
+                        target_device,
+                        logical_block_size,
+                        block_count,
+                        capacity,
+                    )
+                    .ok_or(ProtocolError::InvalidFrame)?,
+                )
+            };
+            if !valid_descriptor_kind(role, access, object_kind, block_device) {
                 return Err(ProtocolError::InvalidFrame);
             }
             Ok(GrantRecord::Descriptor {
@@ -635,6 +750,7 @@ fn decode_record(kind: u16, payload: &[u8]) -> Result<GrantRecord, ProtocolError
                 kind: object_kind,
                 identity,
                 status_flags: read_u32(payload, offset)?,
+                block_device,
             })
         }
         3 => {
@@ -690,6 +806,22 @@ fn decode_record(kind: u16, payload: &[u8]) -> Result<GrantRecord, ProtocolError
             })
         }
         _ => Err(ProtocolError::InvalidFrame),
+    }
+}
+
+fn valid_descriptor_kind(
+    role: ResourceRole,
+    access: GrantAccess,
+    kind: GrantObjectKind,
+    block_device: Option<BlockDeviceGrant>,
+) -> bool {
+    match (kind, block_device) {
+        (GrantObjectKind::RegularFile, None) => true,
+        (GrantObjectKind::BlockDevice, Some(_)) => {
+            role == ResourceRole::DriveBacking
+                && matches!(access, GrantAccess::ReadOnly | GrantAccess::ReadWrite)
+        }
+        _ => false,
     }
 }
 
@@ -836,6 +968,21 @@ mod tests {
                     inode: 5,
                 },
                 status_flags: 0,
+                block_device: None,
+            },
+            GrantRecord::Descriptor {
+                id: id("block"),
+                role: ResourceRole::DriveBacking,
+                access: GrantAccess::ReadWrite,
+                kind: GrantObjectKind::BlockDevice,
+                identity: ObjectIdentity {
+                    device: 10,
+                    inode: 11,
+                },
+                status_flags: 4,
+                block_device: Some(
+                    BlockDeviceGrant::new(12, 512, 8).expect("block tuple should be valid"),
+                ),
             },
             GrantRecord::ScopedDirectory {
                 id: id("api"),
@@ -920,6 +1067,7 @@ mod tests {
                 inode: 2,
             },
             status_flags: 0,
+            block_device: None,
         });
         assert_eq!(
             encode_grant_frame(&invalid),
@@ -945,6 +1093,144 @@ mod tests {
             encode_grant_frame(&invalid),
             Err(ProtocolError::InvalidFrame)
         );
+    }
+
+    #[test]
+    fn block_descriptor_geometry_and_role_are_closed() {
+        let valid = BlockDeviceGrant::new(3, 4096, 8).expect("geometry should validate");
+        assert_eq!(valid.target_device(), 3);
+        assert_eq!(valid.logical_block_size(), 4096);
+        assert_eq!(valid.block_count(), 8);
+        assert_eq!(valid.capacity(), 32_768);
+        assert_eq!(format!("{valid:?}"), "BlockDeviceGrant(<redacted>)");
+        assert!(BlockDeviceGrant::new(0, 512, 8).is_none());
+        assert!(BlockDeviceGrant::new(3, 0, 8).is_none());
+        assert!(BlockDeviceGrant::new(3, 768, 8).is_none());
+        assert!(BlockDeviceGrant::new(3, 512, 0).is_none());
+        assert!(BlockDeviceGrant::new(3, 4096, u64::MAX).is_none());
+
+        for (role, access, kind, block_device) in [
+            (
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+                GrantObjectKind::BlockDevice,
+                Some(valid),
+            ),
+            (
+                ResourceRole::DriveBacking,
+                GrantAccess::ReadOnly,
+                GrantObjectKind::RegularFile,
+                Some(valid),
+            ),
+            (
+                ResourceRole::DriveBacking,
+                GrantAccess::ReadOnly,
+                GrantObjectKind::BlockDevice,
+                None,
+            ),
+        ] {
+            let invalid = frame(GrantRecord::Descriptor {
+                id: id("invalid-block"),
+                role,
+                access,
+                kind,
+                identity: ObjectIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+                status_flags: 0,
+                block_device,
+            });
+            assert_eq!(
+                encode_grant_frame(&invalid),
+                Err(ProtocolError::InvalidFrame)
+            );
+        }
+    }
+
+    #[test]
+    fn block_descriptor_wire_rejects_noncanonical_and_inconsistent_tuples() {
+        let block_id = id("block-wire");
+        let block = frame(GrantRecord::Descriptor {
+            id: block_id.clone(),
+            role: ResourceRole::DriveBacking,
+            access: GrantAccess::ReadWrite,
+            kind: GrantObjectKind::BlockDevice,
+            identity: ObjectIdentity {
+                device: 21,
+                inode: 22,
+            },
+            status_flags: 4,
+            block_device: Some(
+                BlockDeviceGrant::new(23, 512, 16).expect("block tuple should validate"),
+            ),
+        });
+        let encoded = encode_grant_frame(&block).expect("block record should encode");
+        let record_offset = GRANT_HEADER_BYTES + 20 + block_id.as_bytes().len();
+        let target_offset = record_offset + 4;
+        let capacity_offset = record_offset + 24;
+
+        let mut inconsistent_capacity = encoded.clone();
+        inconsistent_capacity[capacity_offset + 7] ^= 1;
+        assert_eq!(
+            decode_grant_frame(&inconsistent_capacity),
+            Err(ProtocolError::InvalidFrame)
+        );
+
+        let mut zero_geometry = encoded.clone();
+        zero_geometry[target_offset..record_offset + 32].fill(0);
+        assert_eq!(
+            decode_grant_frame(&zero_geometry),
+            Err(ProtocolError::InvalidFrame)
+        );
+
+        let regular_id = id("regular-wire");
+        let regular = frame(GrantRecord::Descriptor {
+            id: regular_id.clone(),
+            role: ResourceRole::DriveBacking,
+            access: GrantAccess::ReadOnly,
+            kind: GrantObjectKind::RegularFile,
+            identity: ObjectIdentity {
+                device: 31,
+                inode: 32,
+            },
+            status_flags: 0,
+            block_device: None,
+        });
+        let regular = encode_grant_frame(&regular).expect("regular record should encode");
+        let regular_record_offset = GRANT_HEADER_BYTES + 20 + regular_id.as_bytes().len();
+        assert!(
+            regular[regular_record_offset + 4..regular_record_offset + 32]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        let mut noncanonical_regular = regular;
+        noncanonical_regular[regular_record_offset + 11] = 1;
+        assert_eq!(
+            decode_grant_frame(&noncanonical_regular),
+            Err(ProtocolError::InvalidFrame)
+        );
+
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert_eq!(
+            decode_grant_frame(&truncated),
+            Err(ProtocolError::InvalidFrame)
+        );
+        let mut surplus = encoded.clone();
+        surplus.push(0);
+        assert_eq!(
+            decode_grant_frame(&surplus),
+            Err(ProtocolError::InvalidFrame)
+        );
+        for index in [0, 4, 5, 12, 13] {
+            let mut corrupted = encoded.clone();
+            corrupted[index] ^= 1;
+            assert_eq!(
+                decode_grant_frame(&corrupted),
+                Err(ProtocolError::InvalidFrame)
+            );
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ use bangbang_session::{
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
 
+use super::block_control::LauncherBlockControlBroker;
 use super::daemon::{DaemonNotifier, NotifierEvent};
 use super::socket_broker::LauncherSocketBroker;
 use super::spawn::OwnedWorker;
@@ -191,6 +192,9 @@ pub(crate) fn wait_session(
         let _ = auxiliary
             .vhost_user_broker
             .shutdown(std::net::Shutdown::Both);
+        let _ = auxiliary
+            .block_control_broker
+            .shutdown(std::net::Shutdown::Both);
         worker.terminate_and_reap();
     }
 
@@ -354,6 +358,7 @@ pub(crate) struct AuxiliaryChannels<'a> {
     grant_socket: &'a mut UnixDatagram,
     socket_broker: &'a mut UnixDatagram,
     vhost_user_broker: &'a mut UnixDatagram,
+    block_control_broker: &'a mut UnixDatagram,
 }
 
 impl<'a> AuxiliaryChannels<'a> {
@@ -361,11 +366,13 @@ impl<'a> AuxiliaryChannels<'a> {
         grant_socket: &'a mut UnixDatagram,
         socket_broker: &'a mut UnixDatagram,
         vhost_user_broker: &'a mut UnixDatagram,
+        block_control_broker: &'a mut UnixDatagram,
     ) -> Self {
         Self {
             grant_socket,
             socket_broker,
             vhost_user_broker,
+            block_control_broker,
         }
     }
 }
@@ -387,6 +394,7 @@ fn wait_session_inner(
     let grant_socket = &mut *auxiliary.grant_socket;
     let socket_broker = &mut *auxiliary.socket_broker;
     let vhost_user_broker = &mut *auxiliary.vhost_user_broker;
+    let block_control_broker = &mut *auxiliary.block_control_broker;
     let SessionHooks {
         observation,
         mut notifier,
@@ -403,6 +411,9 @@ fn wait_session_inner(
     vhost_user_broker
         .set_nonblocking(true)
         .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
+    block_control_broker
+        .set_nonblocking(true)
+        .map_err(|err| LauncherError::SessionSetup(err.kind()))?;
     let kqueue = create_kqueue()?;
     let child_pid = usize::try_from(worker.pid())
         .map_err(|_| LauncherError::WorkerWait(io::ErrorKind::InvalidInput))?;
@@ -413,6 +424,8 @@ fn wait_session_inner(
     let broker_fd = usize::try_from(socket_broker.as_raw_fd())
         .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
     let vhost_broker_fd = usize::try_from(vhost_user_broker.as_raw_fd())
+        .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
+    let block_control_fd = usize::try_from(block_control_broker.as_raw_fd())
         .map_err(|_| LauncherError::SessionSetup(io::ErrorKind::InvalidInput))?;
     let mut changes = vec![
         event(
@@ -459,6 +472,12 @@ fn wait_session_inner(
             libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
             0,
         ),
+        event(
+            block_control_fd,
+            libc::EVFILT_READ,
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            0,
+        ),
     ];
     let notifier_fd = notifier
         .as_ref()
@@ -480,9 +499,11 @@ fn wait_session_inner(
     let mut cancellation_deadline: Option<Instant> = None;
     let mut exit_deadline: Option<Instant> = None;
     let mut session_closed = false;
+    let mut block_control_closed = false;
     let mut grant_send = GrantSendState::new(grants, lifecycle.session());
     let mut broker = LauncherSocketBroker::new(lifecycle.session());
     let mut vhost_broker = LauncherVhostUserBroker::new(lifecycle.session());
+    let mut block_control = LauncherBlockControlBroker::new(lifecycle.session());
     loop {
         let notifier_deadline = notifier.as_ref().and_then(|notifier| notifier.deadline());
         let deadline = [
@@ -526,6 +547,15 @@ fn wait_session_inner(
         if observation.terminal.is_some() {
             exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
         }
+        if session_closed || observation.terminal.is_some() {
+            BlockControlShutdown {
+                kqueue: kqueue.as_raw_fd(),
+                descriptor: block_control_fd,
+                socket: block_control_broker,
+                closed: &mut block_control_closed,
+            }
+            .close()?;
+        }
 
         if observation.readiness.is_some()
             && let Some(notifier) = notifier.as_deref_mut()
@@ -566,6 +596,12 @@ fn wait_session_inner(
                             session,
                             &mut grant_send,
                             grant_socket,
+                            BlockControlShutdown {
+                                kqueue: kqueue.as_raw_fd(),
+                                descriptor: block_control_fd,
+                                socket: block_control_broker,
+                                closed: &mut block_control_closed,
+                            },
                             &mut cancellation_deadline,
                             CancelSignal::Terminate,
                         )?;
@@ -581,6 +617,21 @@ fn wait_session_inner(
         {
             broker.drain(
                 socket_broker,
+                worker.pid(),
+                lifecycle.state(),
+                lifecycle.is_cancelled(),
+                grants,
+            )?;
+        }
+
+        if !child_exited
+            && !block_control_closed
+            && events.iter().any(|queued| {
+                queued.filter == libc::EVFILT_READ && queued.ident == block_control_fd
+            })
+        {
+            block_control.drain(
+                block_control_broker,
                 worker.pid(),
                 lifecycle.state(),
                 lifecycle.is_cancelled(),
@@ -624,6 +675,12 @@ fn wait_session_inner(
                         session,
                         &mut grant_send,
                         grant_socket,
+                        BlockControlShutdown {
+                            kqueue: kqueue.as_raw_fd(),
+                            descriptor: block_control_fd,
+                            socket: block_control_broker,
+                            closed: &mut block_control_closed,
+                        },
                         &mut cancellation_deadline,
                         signal,
                     )?;
@@ -696,6 +753,7 @@ fn request_cancellation(
     session: &mut UnixStream,
     grant_send: &mut GrantSendState,
     grant_socket: &UnixDatagram,
+    block_control: BlockControlShutdown<'_>,
     cancellation_deadline: &mut Option<Instant>,
     signal: CancelSignal,
 ) -> Result<(), LauncherError> {
@@ -705,8 +763,36 @@ fn request_cancellation(
     write_frame(session, frame)?;
     grant_send.cancel();
     shutdown_grants(grant_socket);
+    block_control.close()?;
     *cancellation_deadline = Some(Instant::now() + CANCELLATION_GRACE);
     Ok(())
+}
+
+struct BlockControlShutdown<'a> {
+    kqueue: RawFd,
+    descriptor: usize,
+    socket: &'a UnixDatagram,
+    closed: &'a mut bool,
+}
+
+impl BlockControlShutdown<'_> {
+    fn close(self) -> Result<(), LauncherError> {
+        if *self.closed {
+            return Ok(());
+        }
+        register_events(
+            self.kqueue,
+            &[event(
+                self.descriptor,
+                libc::EVFILT_READ,
+                libc::EV_DELETE,
+                0,
+            )],
+        )?;
+        shutdown_grants(self.socket);
+        *self.closed = true;
+        Ok(())
+    }
 }
 
 fn timeout_until(deadline: Option<Instant>) -> Option<Duration> {

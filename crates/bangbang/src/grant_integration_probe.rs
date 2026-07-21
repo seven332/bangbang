@@ -4,20 +4,25 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bangbang_hvf::{HvfBackend, HvfMemoryPermissions};
 use bangbang_runtime::VmBackend;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryBacking, aarch64};
-use bangbang_session::{GrantAccess, GrantId, ResourceRole};
+use bangbang_session::{GrantAccess, GrantId, GrantObjectKind, ResourceRole};
 
 use crate::contained_session::{ContainedSession, ContainedSessionError};
 
 const OPTION: &str = "--bangbang-internal-grant-probe-v1";
 const READY_LINE: &str = "status: grant integration probe ready";
 const OUTSIDE_FILE: &str = "bangbang-grant-probe-outside";
+const BLOCK_CONTROL_GRANT_REF: &str = "bangbang-grant:probe-block-control";
+const BLOCK_CONTROL_INITIAL_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_INITIAL";
+const BLOCK_CONTROL_WRITTEN_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_WRITTEN";
+const BLOCK_CONTROL_WRITE_BLOCK: u64 = 8;
 const SNAPSHOT_STAGING_HOLD_OPTION: &str = "--bangbang-internal-snapshot-staging-hold-v1";
 static SNAPSHOT_STAGING_HOLD: AtomicBool = AtomicBool::new(false);
 
@@ -52,6 +57,9 @@ pub(crate) fn run(
     let probe = ProbeCase::parse(probe_args(args).ok_or(ContainedSessionError)?)?;
     session.verify_launch_policy(probe.expected_no_file, probe.expected_file_size, false)?;
     let authority = session.grant_authority().ok_or(ContainedSessionError)?;
+    if probe.verifies_block_control() {
+        return verify_block_control_in_containment(&authority);
+    }
 
     let read_id =
         GrantId::parse(&format!("probe-read-{}", probe.name)).map_err(|_| ContainedSessionError)?;
@@ -165,6 +173,93 @@ pub(crate) fn run(
             }
         }
     }
+    Ok(())
+}
+
+fn verify_block_control_in_containment(
+    authority: &crate::contained_session::GrantAuthority,
+) -> Result<(), ContainedSessionError> {
+    let grant_id = GrantId::parse("probe-block-control").map_err(|_| ContainedSessionError)?;
+    let granted = authority.with_registry(|registry| {
+        registry
+            .duplicate_drive_backing(&grant_id, GrantAccess::ReadWrite)
+            .map_err(|_| ContainedSessionError)
+    })?;
+    if granted.kind() != GrantObjectKind::BlockDevice {
+        return Err(ContainedSessionError);
+    }
+    let authenticated = granted.block_device().ok_or(ContainedSessionError)?;
+    let block_size =
+        usize::try_from(authenticated.logical_block_size()).map_err(|_| ContainedSessionError)?;
+    if block_size < BLOCK_CONTROL_INITIAL_MARKER.len()
+        || block_size < BLOCK_CONTROL_WRITTEN_MARKER.len()
+        || authenticated.capacity()
+            < u64::from(authenticated.logical_block_size())
+                .saturating_mul(BLOCK_CONTROL_WRITE_BLOCK.saturating_add(1))
+    {
+        return Err(ContainedSessionError);
+    }
+    let direct = File::from(granted.into_owned_fd());
+    let mut initial = vec![0_u8; block_size];
+    direct
+        .read_exact_at(&mut initial, 0)
+        .map_err(|_| ContainedSessionError)?;
+    if initial.get(..BLOCK_CONTROL_INITIAL_MARKER.len()) != Some(BLOCK_CONTROL_INITIAL_MARKER)
+        || initial
+            .get(BLOCK_CONTROL_INITIAL_MARKER.len()..)
+            .is_none_or(|remainder| remainder.iter().any(|byte| *byte != 0))
+    {
+        return Err(ContainedSessionError);
+    }
+    let mut written = vec![0_u8; block_size];
+    written
+        .get_mut(..BLOCK_CONTROL_WRITTEN_MARKER.len())
+        .ok_or(ContainedSessionError)?
+        .copy_from_slice(BLOCK_CONTROL_WRITTEN_MARKER);
+    let write_offset = u64::from(authenticated.logical_block_size())
+        .checked_mul(BLOCK_CONTROL_WRITE_BLOCK)
+        .ok_or(ContainedSessionError)?;
+    direct
+        .write_all_at(&written, write_offset)
+        .map_err(|_| ContainedSessionError)?;
+    drop(direct);
+
+    let mut claim = authority
+        .prepare_drive_backing_claim(Path::new(BLOCK_CONTROL_GRANT_REF), GrantAccess::ReadWrite)
+        .map_err(|_| ContainedSessionError)?
+        .ok_or(ContainedSessionError)?;
+    let backing = claim
+        .take_backing(false)
+        .map_err(|_| ContainedSessionError)?;
+    let geometry = backing
+        .kind()
+        .block_geometry()
+        .ok_or(ContainedSessionError)?;
+    let block_size =
+        usize::try_from(geometry.logical_block_size()).map_err(|_| ContainedSessionError)?;
+    if geometry.logical_block_size() != authenticated.logical_block_size()
+        || geometry.block_count() != authenticated.block_count()
+        || backing.len() != authenticated.capacity()
+    {
+        return Err(ContainedSessionError);
+    }
+
+    let mut observed = vec![0_u8; block_size];
+    backing
+        .read_at(write_offset, &mut observed)
+        .map_err(|_| ContainedSessionError)?;
+    if observed != written {
+        return Err(ContainedSessionError);
+    }
+
+    backing
+        .snapshot_identity()
+        .map_err(|_| ContainedSessionError)?;
+    backing.flush().map_err(|_| ContainedSessionError)?;
+    backing
+        .snapshot_identity()
+        .map_err(|_| ContainedSessionError)?;
+    claim.commit();
     Ok(())
 }
 
@@ -371,6 +466,12 @@ impl ProbeCase {
                 expected_no_file: 2048,
                 expected_file_size: None,
             }),
+            Some("block-control") => Ok(Self {
+                name: "block-control",
+                hold: false,
+                expected_no_file: 2048,
+                expected_file_size: None,
+            }),
             _ => Err(ContainedSessionError),
         }
     }
@@ -385,6 +486,10 @@ impl ProbeCase {
 
     fn verifies_shared_memory(self) -> bool {
         self.name == "shared-memory"
+    }
+
+    fn verifies_block_control(self) -> bool {
+        self.name == "block-control"
     }
 }
 

@@ -123,6 +123,7 @@ fn launch_prepared(
             &mut spawned.grants,
             &mut spawned.socket_broker,
             &mut spawned.vhost_user_broker,
+            &mut spawned.block_control_broker,
         ),
         lifecycle,
         wakeups,
