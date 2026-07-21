@@ -23,6 +23,7 @@ signal-hook-registry = "1"
 
 [dev-dependencies]
 crc64 = "2.0.0"
+plist = "1"
 
 [[test]]
 name = "executable_hvf_e2e"

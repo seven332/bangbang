@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v55"
+direct_boot_variant="direct-boot-v59"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -437,6 +437,32 @@ report_block_serial() {
   emit_line BANGBANG_BLOCK_SERIAL_END
 }
 
+report_block_serial_phase() {
+  device=$1
+  phase=$2
+  serial_path="/sys/block/$device/serial"
+  if [ ! -r "$serial_path" ]; then
+    emit_line "BANGBANG_${phase}_SERIAL_FAIL_NO_SERIAL"
+    return 1
+  fi
+
+  block_serial=$(cat "$serial_path" 2>/dev/null || true)
+  case "$block_serial" in
+    ''|*[!0-9]*)
+      emit_line "BANGBANG_${phase}_SERIAL_FAIL_INVALID"
+      return 1
+      ;;
+  esac
+  if [ "${#block_serial}" -gt 20 ]; then
+    emit_line "BANGBANG_${phase}_SERIAL_FAIL_TOO_LONG"
+    return 1
+  fi
+
+  emit_line "BANGBANG_${phase}_SERIAL_BEGIN"
+  emit_line "$block_serial"
+  emit_line "BANGBANG_${phase}_SERIAL_END"
+}
+
 write_vdb_marker_at_sector() {
   marker=$1
   sector=$2
@@ -500,12 +526,156 @@ vdc_starts_with_marker() {
   [ "$actual" = "$marker" ]
 }
 
+vdd_starts_with_marker() {
+  marker=$1
+  [ -b /dev/vdd ] || return 1
+  actual=$(dd if=/dev/vdd bs=1 count="${#marker}" 2>/dev/null || true)
+  [ "$actual" = "$marker" ]
+}
+
 block_hotplug_fail() {
   reason=$1
   marker="BANGBANG_BLOCK_HOTPLUG_FAIL_$reason"
   emit_line "$marker"
   write_vdb_marker "$marker"
   sync /dev/vdb 2>/dev/null || sync
+}
+
+block_device_sectors() {
+  device=$1
+  cat "/sys/class/block/$device/size" 2>/dev/null || true
+}
+
+block_device_write_cache() {
+  device=$1
+  cat "/sys/class/block/$device/queue/write_cache" 2>/dev/null || true
+}
+
+wait_for_block_sectors() {
+  device=$1
+  expected=$2
+  attempts=0
+  while [ "$(block_device_sectors "$device")" != "$expected" ]; do
+    if [ "$attempts" -ge 30 ]; then
+      return 1
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+}
+
+block_lifecycle_fail() {
+  reason=$1
+  emit_line "BANGBANG_BLOCK_LIFECYCLE_FAIL_$reason"
+}
+
+run_block_lifecycle_phase() {
+  expected=$1
+  written=$2
+  phase=$3
+
+  if ! vdb_starts_with_marker "$expected"; then
+    block_lifecycle_fail "${phase}_READ"
+    return 1
+  fi
+  if ! write_vdb_sector_marker "$written" 2; then
+    block_lifecycle_fail "${phase}_WRITE"
+    return 1
+  fi
+  if ! vdb_sector_starts_with_marker "$written" 2; then
+    block_lifecycle_fail "${phase}_VERIFY"
+    return 1
+  fi
+}
+
+check_block_backing_lifecycle() {
+  mode=$1
+  emit_line BANGBANG_BLOCK_LIFECYCLE_ENTER
+  if [ ! -b /dev/vdb ] || [ ! -b /dev/vdc ] || [ ! -b /dev/vdd ]; then
+    block_lifecycle_fail PREREQUISITES
+    return
+  fi
+  if [ "$(block_device_sectors vdb)" != 8192 ]; then
+    block_lifecycle_fail INITIAL_CAPACITY
+    return
+  fi
+  emit_line BANGBANG_BLOCK_LIFECYCLE_CAPACITY_OK
+  if [ "$(block_device_write_cache vdb)" != "write back" ]; then
+    block_lifecycle_fail WRITEBACK_FEATURE
+    return
+  fi
+  emit_line BANGBANG_BLOCK_LIFECYCLE_WRITEBACK_OK
+  if [ "$(cat /sys/class/block/vdc/ro 2>/dev/null || true)" != 1 ]; then
+    block_lifecycle_fail READ_ONLY_FLAG
+    return
+  fi
+  if [ "$(block_device_write_cache vdc)" != "write through" ]; then
+    block_lifecycle_fail UNSAFE_FEATURE
+    return
+  fi
+  emit_line BANGBANG_BLOCK_LIFECYCLE_READ_ONLY_CONFIG_OK
+  if ! vdc_starts_with_marker BANGBANG_BLOCK_LIFECYCLE_READ_ONLY; then
+    block_lifecycle_fail READ_ONLY_READ
+    return
+  fi
+  emit_line BANGBANG_BLOCK_LIFECYCLE_READ_ONLY_READ_OK
+  if printf '%-512s' BANGBANG_BLOCK_LIFECYCLE_READ_ONLY_BAD \
+    | dd of=/dev/vdc bs=512 count=1 conv=notrunc,fsync 2>/dev/null; then
+    block_lifecycle_fail READ_ONLY_WRITE
+    return
+  fi
+  emit_line BANGBANG_BLOCK_LIFECYCLE_READ_ONLY_WRITE_OK
+  if ! report_block_serial_phase vdb BLOCK_LIFECYCLE_INITIAL; then
+    block_lifecycle_fail INITIAL_GET_ID
+    return
+  fi
+  emit_line BANGBANG_BLOCK_LIFECYCLE_GET_ID_OK
+  if cmdline_has bangbang.expect-block-limiter-patch=1; then
+    emit_line BANGBANG_BLOCK_LIFECYCLE_LIMITER_READY
+    attempts=0
+    while ! vdd_starts_with_marker BANGBANG_BLOCK_LIFECYCLE_LIMITER_CONTINUE; do
+      if [ "$attempts" -ge 60 ]; then
+        block_lifecycle_fail LIMITER_PATCH
+        return
+      fi
+      sleep 1
+      attempts=$((attempts + 1))
+    done
+    emit_line BANGBANG_BLOCK_LIFECYCLE_LIMITER_CONTINUE
+  fi
+  if ! run_block_lifecycle_phase \
+    BANGBANG_BLOCK_LIFECYCLE_HOST_ONE \
+    BANGBANG_BLOCK_LIFECYCLE_GUEST_ONE \
+    FIRST; then
+    return
+  fi
+  emit_line BANGBANG_BLOCK_LIFECYCLE_PHASE_ONE
+
+  if [ "$mode" = three ]; then
+    if ! wait_for_block_sectors vdb 12288; then
+      block_lifecycle_fail REGULAR_CAPACITY
+      return
+    fi
+    if ! run_block_lifecycle_phase \
+      BANGBANG_BLOCK_LIFECYCLE_HOST_TWO \
+      BANGBANG_BLOCK_LIFECYCLE_GUEST_TWO \
+      SECOND; then
+      return
+    fi
+    emit_line BANGBANG_BLOCK_LIFECYCLE_PHASE_TWO
+  fi
+
+  if ! wait_for_block_sectors vdb 16384; then
+    block_lifecycle_fail FINAL_CAPACITY
+    return
+  fi
+  if ! run_block_lifecycle_phase \
+    BANGBANG_BLOCK_LIFECYCLE_HOST_THREE \
+    BANGBANG_BLOCK_LIFECYCLE_GUEST_THREE \
+    THIRD; then
+    return
+  fi
+  emit_line BANGBANG_BLOCK_LIFECYCLE_SUCCESS
 }
 
 wait_for_runtime_block() {
@@ -550,6 +720,47 @@ run_runtime_block_round() {
   if ! wait_for_runtime_block; then
     block_hotplug_fail "${phase}_RESCAN"
     return 1
+  fi
+  if cmdline_has bangbang.expect-block-special-hotplug=1; then
+    case "$phase" in
+      FIRST)
+        expected_sectors=8192
+        serial_phase=BLOCK_HOTPLUG_FIRST
+        ;;
+      SECOND)
+        expected_sectors=16384
+        serial_phase=BLOCK_HOTPLUG_SECOND
+        ;;
+      *)
+        block_hotplug_fail "${phase}_PROFILE"
+        return 1
+        ;;
+    esac
+    if [ "$(block_device_sectors vdc)" != "$expected_sectors" ]; then
+      block_hotplug_fail "${phase}_CAPACITY"
+      return 1
+    fi
+    expected_cache=
+    if cmdline_has bangbang.block-hotplug-cache-order=writeback-unsafe; then
+      case "$phase" in
+        FIRST) expected_cache="write back" ;;
+        SECOND) expected_cache="write through" ;;
+      esac
+    elif cmdline_has bangbang.block-hotplug-cache-order=unsafe-writeback; then
+      case "$phase" in
+        FIRST) expected_cache="write through" ;;
+        SECOND) expected_cache="write back" ;;
+      esac
+    fi
+    if [ -n "$expected_cache" ] \
+      && [ "$(block_device_write_cache vdc)" != "$expected_cache" ]; then
+      block_hotplug_fail "${phase}_CACHE"
+      return 1
+    fi
+    if ! report_block_serial_phase vdc "$serial_phase"; then
+      block_hotplug_fail "${phase}_GET_ID"
+      return 1
+    fi
   fi
   if ! vdc_starts_with_marker "$expected"; then
     block_hotplug_fail "${phase}_READ"
@@ -2905,6 +3116,10 @@ elif cmdline_has bangbang.pmem-hotplug=1; then
   check_pmem_hotplug_marker
 elif cmdline_has bangbang.block-hotplug=1; then
   check_block_hotplug_marker
+elif cmdline_has bangbang.block-backing-lifecycle=three; then
+  check_block_backing_lifecycle three
+elif cmdline_has bangbang.block-backing-lifecycle=two; then
+  check_block_backing_lifecycle two
 elif cmdline_has bangbang.pci-all-virtio=1; then
   check_all_virtio_pci_marker
 elif cmdline_has bangbang.cpu-template-report=1; then

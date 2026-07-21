@@ -19,8 +19,9 @@ cross-device certification.
 
 - Pre-boot `PUT /drives/{drive_id}` retains its existing configuration
   behavior.
-- After startup, `PUT` may attach a non-root file-backed drive only when the
-  process was started with public all-virtio PCI (`--enable-pci`).
+- After startup, `PUT` may attach a non-root regular-file or exact macOS
+  block-special drive only when the process was started with public all-virtio
+  PCI (`--enable-pci`).
 - Bodyless `DELETE /drives/{drive_id}` may remove only an existing non-root
   drive in that same PCI profile. A DELETE body still fails at parsing.
 - After startup, `PUT /pmem/{id}` may attach a non-root, nonzero regular-file

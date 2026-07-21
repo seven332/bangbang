@@ -274,8 +274,9 @@ and the broad vhost/storage aggregates remained nonterminal, so the inventory
 counts were unchanged.
 
 #1446 promotes exactly `api-property:Drive.io_engine` and
-`corpus:block-io-engine`. File-backed drives now accept default `Sync` or
-explicit `Async` over MMIO/PCI with direct paths or contained opened grants.
+`corpus:block-io-engine`. Regular-file and exact macOS block-special drives now
+accept default `Sync` or explicit `Async` over MMIO/PCI with direct paths or
+contained opened grants.
 One lazy bounded portable executor per VM session supplies generation-safe
 owner-thread completion, limiter/dirty/status/used/interrupt/metrics
 publication, live path and same-ID backing/engine replacement, PCI
@@ -297,6 +298,20 @@ Native-v1 bytes/load, PCI/dynamic persistence, migration, and vhost snapshot
 support remain Wave 6 work, so the overlay remains 86
 `implemented-and-verified`, 312 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` records.
+
+#1461 extends the already implemented drive operation to an existing regular
+file or exact macOS block-special descriptor. Direct control uses public disk
+geometry/cache ioctls; contained BBG2 grants bind exact identity/access/status/
+geometry and descriptor 7 exposes only fixed, session-bound fresh inspect and
+cache-sync operations on the launcher's retained descriptor because App
+Sandbox denies those ioctls in the worker. Four signed direct/contained MMIO/PCI
+scenarios certify complementary Sync/Async, Unsafe/Writeback,
+read-only/read-write, limiter retry, 4/6/8-MiB configuration refresh, GET_ID,
+regular/block replacement, guest persistence, capture rejection, DELETE/reuse,
+unchanged entitlements, and exact fixture cleanup. Native-v1 remains
+regular-only. The broad `semantic.storage:block-sync-async-vhost-and-limits`
+record is still `audit-required` for #1450, so disposition counts remain
+unchanged.
 
 ## Commands
 

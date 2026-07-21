@@ -63,15 +63,22 @@ rejects PCI before native-state capture or artifact work. Load keeps its
 pre-file/grant/controller/VM-mutation PCI rejection, while the default MMIO
 snapshot profile is unchanged.
 
-File-backed drives accept omitted/default `Sync` or explicit `Async` over MMIO
-and PCI. `Async` uses one lazy bounded portable worker pool per VM session and
-one completion wakeup watched by the owner thread; completion, not submission,
-publishes descriptor status, used entries, dirty ranges, interrupts, and
-metrics. Multiple drives use generation-bound routing so live path PATCH,
-same-ID backing/engine/limiter PUT, PCI hotplug/DELETE/reuse, reset, and shutdown
-quiesce only the intended work. Direct paths and contained preopened grants use
-the same transaction. This is the Firecracker-shaped public engine behavior,
-not a claim that macOS supplies Linux io_uring. A paused snapshot-create
+File-backed drives accept an existing regular file or, on macOS, one exact
+block-special descriptor over MMIO and PCI with omitted/default `Sync` or
+explicit `Async`. Direct block media obtains checked capacity and persistence
+through public `DKIOCGETBLOCKSIZE`, `DKIOCGETBLOCKCOUNT`, and
+`DKIOCSYNCHRONIZECACHE`; contained media uses the launcher's retained exact
+grant descriptor for those App-Sandbox-denied operations through a fixed
+session/sequence/grant-bound control facet. The worker receives no path lookup,
+device enumeration, generic ioctl, or added entitlement. `Async` uses one lazy
+bounded portable worker pool per VM session and one completion wakeup watched
+by the owner thread; completion, not submission, publishes descriptor status,
+used entries, dirty ranges, interrupts, and metrics. Multiple drives use
+generation-bound routing so live path PATCH, same-ID backing/engine/limiter PUT,
+PCI hotplug/DELETE/reuse, reset, and shutdown quiesce only the intended work.
+Regular-to-block, block-to-regular, and block-to-block replacements use the same
+failure-atomic transaction. This is the Firecracker-shaped public engine
+behavior, not a claim that macOS supplies Linux io_uring. A paused snapshot-create
 preflight now asks the live boot owner to traverse every startup or runtime
 block and pmem endpoint across MMIO and PCI. It closes all Async admissions,
 drains and publishes all entered work, captures exact continuation and
@@ -466,15 +473,17 @@ the fixed bundle layout, nested signatures, identifiers, and required worker
 entitlements. It then starts the fixed worker suspended with a default-close
 descriptor policy: only open standard streams, one private lifecycle endpoint,
 one private startup-grant endpoint, one dormant private vsock-broker endpoint,
-and one dedicated private vhost-user-broker endpoint survive. The exec
+one dedicated private vhost-user-broker endpoint, and one dedicated private
+retained-descriptor block-control endpoint survive. The exec
 environment contains only the private lifecycle
 marker; ambient launcher variables, including loader/debug controls, are not
 forwarded. The launcher validates the live worker code before resuming it and
 again after the worker has used the endpoint and sent the bounded pre-session
 greeting.
 
-Each launch uses unnamed lifecycle stream, grant datagram, vsock-broker, and
-vhost-user-broker socketpairs plus a random 256-bit session identity. Lifecycle
+Each launch uses unnamed lifecycle stream, grant datagram, vsock-broker,
+vhost-user-broker, and block-control socketpairs plus a random 256-bit session
+identity. Lifecycle
 protocol v5 has a
 4-KiB frame limit, exact per-direction sequence numbers, closed message
 variants, a fixed 96-byte reserved-zero `Start(WorkerPolicy)` payload, and monotonic
@@ -647,6 +656,17 @@ one-time even if a later consumer step fails; retry requires a fresh same-ID
 configuration with unused authority. Authorized configuration responses may
 return submitted tags, while logs, faults, errors, and derived debug output stay
 value-redacted.
+
+A `DriveBacking` grant is either a regular file or one exact macOS
+block-special node. The BBG2 grant record binds kind, device/inode/rdev, exact
+access and normalized status flags, logical block size, block count, checked
+capacity, and the transferred descriptor. The worker independently rechecks
+fstat/fcntl identity and never reopens the tag. Because App Sandbox rejects the
+disk geometry and cache-sync ioctls, descriptor 7 carries only fixed 256-byte
+`BBC1` `Inspect` and `SynchronizeCache` exchanges for the launcher's retained
+copy. Each exchange is lifecycle-session, monotonic-sequence, grant, role,
+access, identity, and geometry bound, has a two-second worker deadline, contains
+no descriptor rights, and poisons the facet on ambiguous protocol state.
 
 Logger and metrics validate before claiming, normalize the transferred regular
 file to append/nonblocking behavior without upgrading its kernel-enforced
