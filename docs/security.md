@@ -230,7 +230,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
 | Network and vmnet | Implemented virtio-MMIO/all-PCI startup plus PCI-only runtime PUT/DELETE; direct vmnet conditional; contained lifecycle-v5 authority and closed networkless/vmnet signing profiles enforced | Keep supported `host_dev_name` forms, exact mode/bridge/actual-live-count admission, per-entry cleanup, MMDS-only behavior, entitlement/profile requirements, and non-goals documented when network behavior changes. |
 | macOS App Sandbox | Production nested worker implemented for container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, API-socket, vsock-socket, and connect-only vhost-user-socket resources | Keep the ordinary CLI explicitly uncontained and prove package identity plus real ungranted denial and granted operation behavior without adding ambient network authority. |
-| Launcher and resource broker | Authenticated lifecycle v5 credential/resource-limit/vmnet policy, closed exec environment and descriptor set, bounded atomic startup grants, signed daemon handoff, adopted file and directory consumers, and separate fixed session-bound vsock and vhost-user connection facets implemented; general-purpose brokerage missing | Require exact policy/profile/role/access/anchor/identity checks, retained session authority with per-device leases, closed session/sequence/rights framing, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
+| Launcher and resource broker | Authenticated lifecycle v5 credential/resource-limit/vmnet policy, closed exec environment and descriptor set, bounded atomic startup grants, signed daemon handoff, adopted file/directory/block-special consumers, and separate fixed session-bound vsock, vhost-user, and retained-descriptor block-control facets implemented; general-purpose brokerage missing | Require exact policy/profile/role/access/anchor/identity checks, retained session authority with per-device leases, closed session/sequence/rights framing, redaction, and cooperative lifetime. Do not describe sender close as revocation or let consumers fall back to ambient paths. |
 
 ## Native Snapshot Composite and Device Boundary
 
@@ -350,7 +350,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | Operator-owned private directories | Required for API sockets, vsock sockets, vhost-user sockets, observability sinks, and other configured paths that should not be shared. Contained API/vsock use requires one exact preauthorized create-children directory and safe child; contained vhost-user use requires one exact preauthorized connect-only directory and safe child; direct paths remain operator-owned. | Cross-launcher name allocation and sharing policy remain operator responsibilities. |
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
 | macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, and connect-only vhost-user-socket authority form the current contained mode. Lifecycle v5 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; general dynamic delivery still requires explicit design. |
-| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory consumers, offers signed daemon detach, and exposes separate fixed vsock and vhost-user connection facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
+| Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory/block-special consumers, offers signed daemon detach, and exposes separate fixed vsock, vhost-user, and retained-descriptor block-control facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
 | Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope. | Keep arbitrary uid/gid, configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
@@ -370,8 +370,11 @@ config/metadata, kernel/initrd and snapshot inputs; read-only or read-write
 repeatable drive/pmem backing; write-only logger/metrics/serial sinks; and
 create-children API/vsock/snapshot-output directories. Unknown or duplicate
 fields, IDs, singleton roles, invalid access pairs, nonabsolute or ambiguous
-paths, aliases, special files, missing objects, symlinks, and excessive input
-fail before spawn without exposing paths or IDs.
+paths, aliases, missing objects, symlinks, and excessive input fail before spawn
+without exposing paths or IDs. Every file role requires a regular file except
+`DriveBacking`, which additionally accepts one exact macOS block-special node;
+directories, FIFOs, sockets, character devices, and unsupported object kinds
+remain rejected for that role.
 
 Resource paths are walked from an owned root descriptor with one-component
 `openat` calls, `O_NOFOLLOW`, no creation, and a temporary nonblocking probe so
@@ -384,17 +387,27 @@ per datagram, 64 KiB per bookmark, and 256 KiB aggregate bookmark material.
 
 Lifecycle protocol v5 uses descriptor 3 and carries one fixed reserved-zero
 worker policy only after peer authentication. A separate connected unnamed Darwin
-datagram socket at descriptor 4 carries grant-channel v1 records. A third
+datagram socket at descriptor 4 carries BBG2 grant-channel records. A third
 connected unnamed datagram socket at descriptor 5 carries the dormant closed
 vsock broker protocol. Descriptor 6 carries the independent closed vhost-user
 connection protocol; neither broker is a general grant channel. Every grant record
 binds the random lifecycle SessionId, an independent random BatchId, exact
 sequence, closed kind, payload length, reserved fields, and declared descriptor
-count. `Begin` declares exact batch bounds; regular-file and directory records
-carry one SCM_RIGHTS descriptor; bookmark fragments are contiguous and bounded;
+count. `Begin` declares exact batch bounds; regular-file, block-special, and
+directory records carry one SCM_RIGHTS descriptor; bookmark fragments are contiguous and bounded;
 and `Commit` must reproduce the declaration. The launcher sends nonblocking in
 the same kqueue that observes signals, lifecycle input, worker exit, and one
 absolute five-second send-plus-acknowledgment deadline.
+
+Descriptor 7 carries the independent fixed 256-byte `BBC1` block-control
+protocol. It accepts only `Inspect` and `SynchronizeCache` for a block-special
+`DriveBacking` already present in the immutable grant batch. Requests and
+responses bind the lifecycle SessionId, a nonzero monotonic sequence, exact
+grant ID, access, normalized status flags, device/inode/rdev, and adopted
+geometry. The worker applies a two-second deadline and accepts no ancillary
+rights; stale sequence/session/identity, malformed framing, unexpected rights,
+timeout, disconnect, or ambiguous reply poisons the facet. This is not a path
+service or generic ioctl broker.
 
 The worker receives each datagram with fixed payload/control buffers, immediately
 owns every delivered fd, rejects payload/control truncation and malformed or
@@ -407,7 +420,11 @@ send an exact redacted `GrantsAccepted`; `Proceed` is invalid before that ack,
 including for an empty batch. Cancellation remains valid throughout staging and
 the acknowledgment wait.
 
-Regular-file grants expose descriptors only. A scoped-directory grant combines
+Regular-file grants expose descriptors only. A block-special drive grant uses
+the BBG2 record to carry its exact rdev, access/status, logical block size,
+block count, checked capacity, and descriptor; the worker independently rechecks
+fstat/fcntl identity and accepts geometry only from the authenticated atomic
+batch. A scoped-directory grant combines
 a read-only anchor descriptor with a freshly minted ordinary implicit bookmark.
 The worker resolves it without UI or mounting, explicitly starts scope, reopens
 the directory without following symlinks, checks exact anchor identity and
@@ -472,6 +489,19 @@ updates retain the active backing and claim nothing. Pmem has no live backing
 replacement surface. Owner-authorized configuration responses may return tag
 values; errors, faults, logs, and debug output redact tags, IDs, paths,
 descriptor identities, and contents.
+
+Direct drive preparation uses public macOS `DKIOCGETBLOCKSIZE` and
+`DKIOCGETBLOCKCOUNT` on the exact opened block descriptor and
+`DKIOCSYNCHRONIZECACHE` for Writeback flush. The signed App Sandbox worker can
+pread/pwrite the transferred descriptor but receives `EPERM` for those disk
+ioctls, so contained drive ownership delegates only fresh geometry inspection
+and cache synchronization to the launcher's retained copy through descriptor
+7. The launcher re-fstats and rechecks access/status before every operation,
+acts only on the exact grant identity, and never reopens or enumerates a device
+path. Capture performs a fresh broker inspection and compares the complete
+adopted tuple; mismatch, timeout, peer failure, or ioctl failure is fail-closed.
+Native-v1 remains regular-file-only and rejects block-special capture before
+artifact publication.
 
 Logger, metrics, and serial references use the same exact grammar but require
 their singleton role and `WriteOnly` access. Complete input and lifecycle
@@ -626,9 +656,11 @@ sandboxed VMM therefore needs either container/sealed resources or a separately
 designed launcher/broker that transfers authorized resources. The production
 bundle now includes the bounded startup transfer described above; the public
 build wrapper still embeds no guest resources. The production worker adopts
-grants for config, metadata, kernel, initrd, block, pmem, logger, metrics, and
-serial; remaining path consumers have not adopted the registry, and no dynamic
-broker or hard revocation is claimed.
+grants for config, metadata, kernel, initrd, regular or block-special drives,
+pmem, logger, metrics, and serial. The exact retained-descriptor block-control
+facet above exists only because App Sandbox denies the required public disk
+ioctls; remaining path consumers have not adopted the registry, and no general
+dynamic broker or hard revocation is claimed.
 
 ## Production Bundle and Signed Worker Boundary
 
@@ -919,7 +951,8 @@ is resource-specific:
   inaccessible, non-regular, or empty payload files, and API-facing errors must
   not echo the configured path or tag.
 - `/drives/{drive_id}` stores block backing paths during configuration. Direct
-  files are opened later during `InstanceStart`. In contained mode an exact
+  regular files or macOS block-special nodes are opened later during
+  `InstanceStart`. In contained mode an exact
   drive grant tag is claimed during a successful pre-boot `PUT` with access
   matching `is_read_only`, retained by drive ID, and handed to startup without
   reopening the tag. Same-ID replacement is failure-atomic. Runtime
@@ -931,7 +964,11 @@ is resource-specific:
   successfully claimed replacement grant remains consumed. Limiter-only
   runtime updates do not reopen host backing paths; configured limiter buckets
   update only process-local active device state and stored drive configuration.
-  PCI-mode post-start PUT prepares a non-root backing before entering the
+  Accepted opened objects are only regular files or exact block-special drive
+  descriptors; final-component symlinks and every other object kind fail
+  closed. Regular capacity is metadata length. Block capacity is checked
+  `logical_block_size * block_count`, refreshed on replacement, and never
+  inferred from `st_size`. PCI-mode post-start PUT prepares a non-root backing before entering the
   owner-thread command and commits public configuration only after the live
   endpoint publishes. Direct mode opens the proposed regular file on the API
   thread. Contained mode instead requires an exact still-unused initial

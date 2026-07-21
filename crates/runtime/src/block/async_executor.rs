@@ -3692,6 +3692,36 @@ mod tests {
         temporary_backing_with_len(initial, 64 * 1024)
     }
 
+    fn duplicate_completion_reader(descriptor: RawFd) -> OwnedFd {
+        // SAFETY: F_DUPFD_CLOEXEC duplicates one live descriptor without
+        // borrowing any pointer arguments. The successful result is adopted
+        // exactly once below.
+        let duplicated = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 0) };
+        assert!(duplicated >= 0, "completion reader should duplicate");
+        // SAFETY: The successful fcntl call returned one new owned descriptor.
+        unsafe { OwnedFd::from_raw_fd(duplicated) }
+    }
+
+    fn assert_completion_writer_closed(reader: &OwnedFd) {
+        let mut buffer = [0_u8; NOTIFICATION_BYTES * NOTIFICATION_DRAIN_UNITS];
+        loop {
+            // SAFETY: The duplicated reader remains live and the fixed buffer
+            // is writable for its complete declared length.
+            let result =
+                unsafe { libc::read(reader.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if result == 0 {
+                return;
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("completion writer should close instead of returning {error}");
+            }
+        }
+    }
+
     fn temporary_backing_with_len(
         initial: &[u8],
         len: u64,
@@ -5995,6 +6025,7 @@ mod tests {
         let descriptor = executor
             .completion_fd()
             .expect("running executor should expose completion fd");
+        let completion_reader = duplicate_completion_reader(descriptor);
         let mut readiness = libc::pollfd {
             fd: descriptor,
             events: libc::POLLIN,
@@ -6015,8 +6046,7 @@ mod tests {
         assert_eq!(executor.reserved_buffer_bytes(), 0);
         assert_eq!(executor.completion_fd(), None);
         assert!(!handle.is_accepting());
-        // SAFETY: F_GETFD only probes whether the formerly owned number is live.
-        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+        assert_completion_writer_closed(&completion_reader);
         assert!(matches!(
             drive
                 .apply_completion(
@@ -6194,12 +6224,12 @@ mod tests {
         let descriptor = executor
             .completion_fd()
             .expect("running executor should expose completion fd");
+        let completion_reader = duplicate_completion_reader(descriptor);
         drop(drive);
         assert!(weak_backing.upgrade().is_none());
         drop(executor);
         assert!(!handle.is_accepting());
-        // SAFETY: F_GETFD only probes whether the formerly owned number is live.
-        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+        assert_completion_writer_closed(&completion_reader);
     }
 
     #[cfg(target_vendor = "apple")]

@@ -7,6 +7,8 @@
     clippy::unwrap_used
 )]
 
+#[path = "../../../tests/support/macos_virtual_block.rs"]
+mod macos_virtual_block;
 mod support;
 #[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
@@ -21,6 +23,9 @@ mod macos_arm64 {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use crate::macos_virtual_block::{
+        MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize,
+    };
     use crate::support::{
         BangbangProcess, CompletedProcess, TestDir, assert_bad_request_response,
         assert_clean_shutdown, assert_no_content_response, assert_ok_response,
@@ -64,6 +69,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.pci-all-virtio=1";
     const DIRECT_ROOTFS_PCI_ALL_VIRTIO_MARKER: &[u8] = b"BANGBANG_PCI_ALL_VIRTIO_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
+    const DIRECT_ROOTFS_BLOCK_LIFECYCLE_THREE_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-backing-lifecycle=three bangbang.expect-block-limiter-patch=1";
     const DIRECT_ROOTFS_VHOST_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1 bangbang.expect-vhost-resize=1";
     const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
     const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
@@ -75,6 +81,32 @@ mod macos_arm64 {
     const BLOCK_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_TWO";
     const BLOCK_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_TWO";
     const BLOCK_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_SUCCESS";
+    const BLOCK_HOTPLUG_FIRST_SERIAL_BEGIN_MARKER: &[u8] =
+        b"BANGBANG_BLOCK_HOTPLUG_FIRST_SERIAL_BEGIN";
+    const BLOCK_HOTPLUG_FIRST_SERIAL_END_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_FIRST_SERIAL_END";
+    const BLOCK_HOTPLUG_SECOND_SERIAL_BEGIN_MARKER: &[u8] =
+        b"BANGBANG_BLOCK_HOTPLUG_SECOND_SERIAL_BEGIN";
+    const BLOCK_HOTPLUG_SECOND_SERIAL_END_MARKER: &[u8] =
+        b"BANGBANG_BLOCK_HOTPLUG_SECOND_SERIAL_END";
+    const BLOCK_LIFECYCLE_INITIAL_SERIAL_BEGIN_MARKER: &[u8] =
+        b"BANGBANG_BLOCK_LIFECYCLE_INITIAL_SERIAL_BEGIN";
+    const BLOCK_LIFECYCLE_INITIAL_SERIAL_END_MARKER: &[u8] =
+        b"BANGBANG_BLOCK_LIFECYCLE_INITIAL_SERIAL_END";
+    const BLOCK_LIFECYCLE_HOST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_HOST_ONE";
+    const BLOCK_LIFECYCLE_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_GUEST_ONE";
+    const BLOCK_LIFECYCLE_PHASE_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_PHASE_ONE";
+    const BLOCK_LIFECYCLE_LIMITER_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_LIMITER_READY";
+    const BLOCK_LIFECYCLE_LIMITER_CONTINUE_MARKER: &[u8] =
+        b"BANGBANG_BLOCK_LIFECYCLE_LIMITER_CONTINUE";
+    const BLOCK_LIFECYCLE_HOST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_HOST_TWO";
+    const BLOCK_LIFECYCLE_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_GUEST_TWO";
+    const BLOCK_LIFECYCLE_PHASE_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_PHASE_TWO";
+    const BLOCK_LIFECYCLE_HOST_THREE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_HOST_THREE";
+    const BLOCK_LIFECYCLE_GUEST_THREE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_GUEST_THREE";
+    const BLOCK_LIFECYCLE_READ_ONLY_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_READ_ONLY";
+    const BLOCK_LIFECYCLE_SUCCESS_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_SUCCESS";
+    const BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET: u64 =
+        2 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
     const VHOST_CONFIG_RESIZED_MARKER: &[u8] = b"BANGBANG_VHOST_CONFIG_RESIZED";
     const PMEM_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_READY";
     const PMEM_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_HOST_ONE";
@@ -3381,6 +3413,345 @@ mod macos_arm64 {
     }
 
     #[test]
+    fn signed_executable_replaces_macos_block_special_backings_over_product_mmio() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let regular_backing_path = test_dir.path().join("middle-regular.img");
+        let control_backing_path = test_dir.path().join("lifecycle-control.img");
+        let serial_output_path = test_dir.path().join("serial.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        let mut first_media = MacosVirtualBlock::create(MacosVirtualBlockAccess::ReadWrite)
+            .expect("first direct MMIO block media should attach");
+        let mut final_media = MacosVirtualBlock::create_sized(
+            MacosVirtualBlockAccess::ReadWrite,
+            MacosVirtualBlockSize::EightMib,
+        )
+        .expect("final direct MMIO block media should attach");
+        let mut read_only_media = MacosVirtualBlock::create_sized(
+            MacosVirtualBlockAccess::ReadWrite,
+            MacosVirtualBlockSize::FourMib,
+        )
+        .expect("read-only audit media should attach for seeding");
+        write_virtual_block_marker_at(&first_media, 0, BLOCK_LIFECYCLE_HOST_ONE_MARKER);
+        write_virtual_block_marker_at(&final_media, 0, BLOCK_LIFECYCLE_HOST_THREE_MARKER);
+        write_virtual_block_marker_at(&read_only_media, 0, BLOCK_LIFECYCLE_READ_ONLY_MARKER);
+        read_only_media
+            .reattach(MacosVirtualBlockAccess::ReadOnly)
+            .expect("audit media should reattach read-only before launch");
+        create_block_backing_with_prefix(
+            &regular_backing_path,
+            12_288,
+            BLOCK_LIFECYCLE_HOST_TWO_MARKER,
+        );
+        create_zeroed_block_backing(&control_backing_path);
+        create_empty_file(&serial_output_path);
+
+        let first_path = first_media
+            .device_path()
+            .expect("first media should expose its exact node")
+            .to_path_buf();
+        let final_path = final_media
+            .device_path()
+            .expect("final media should expose its exact node")
+            .to_path_buf();
+        let read_only_path = read_only_media
+            .device_path()
+            .expect("read-only media should expose its exact node")
+            .to_path_buf();
+        let expected_initial_device_id = expected_block_device_id(&first_path);
+        let first_identity = first_media
+            .identity()
+            .expect("first direct MMIO media should expose exact identity");
+        assert_ne!(first_identity.device(), 0);
+        assert_ne!(first_identity.inode(), 0);
+        assert_ne!(first_identity.target_device(), 0);
+        assert_eq!(
+            first_media
+                .logical_block_size()
+                .expect("first direct MMIO media should expose block size") as u64
+                * first_media
+                    .block_count()
+                    .expect("first direct MMIO media should expose block count"),
+            first_media
+                .len()
+                .expect("first direct MMIO media should expose checked capacity"),
+        );
+
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT direct MMIO block-special machine config",
+        );
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(DIRECT_ROOTFS_BLOCK_LIFECYCLE_THREE_BOOT_ARGS),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/boot-source", &boot_body),
+            "PUT direct MMIO block-special boot source",
+        );
+        for (route, body, context) in [
+            (
+                "/drives/rootfs",
+                format!(
+                    r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+                    json_string(path_text(&rootfs_path))
+                ),
+                "PUT direct MMIO block-special rootfs",
+            ),
+            (
+                "/drives/data",
+                format!(
+                    r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}}"#,
+                    json_string(path_text(&first_path))
+                ),
+                "PUT direct MMIO first block-special data drive",
+            ),
+            (
+                "/drives/auditro",
+                format!(
+                    r#"{{"drive_id":"auditro","path_on_host":{},"is_root_device":false,"is_read_only":true,"cache_type":"Unsafe","io_engine":"Async"}}"#,
+                    json_string(path_text(&read_only_path))
+                ),
+                "PUT direct MMIO read-only block-special audit drive",
+            ),
+            (
+                "/drives/control",
+                format!(
+                    r#"{{"drive_id":"control","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+                    json_string(path_text(&control_backing_path))
+                ),
+                "PUT direct MMIO lifecycle control drive",
+            ),
+        ] {
+            assert_no_content_response(&http_put_json(&socket_path, route, &body), context);
+        }
+        let serial_body = format!(
+            r#"{{"serial_out_path":{}}}"#,
+            json_string(path_text(&serial_output_path))
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/serial", &serial_body),
+            "PUT direct MMIO block-special serial output",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "start direct MMIO block-special lifecycle guest",
+        );
+
+        wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_LIFECYCLE_LIMITER_READY_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .expect("direct MMIO guest should become ready for the live limiter patch");
+        assert_no_content_response(
+            &http_json(
+                &socket_path,
+                "PATCH",
+                "/drives/data",
+                r#"{"drive_id":"data","rate_limiter":{"ops":{"size":1,"refill_time":100}}}"#,
+            ),
+            "PATCH direct MMIO block-special limiter after guest probe",
+        );
+        write_block_marker_at(
+            &control_backing_path,
+            0,
+            BLOCK_LIFECYCLE_LIMITER_CONTINUE_MARKER,
+        );
+
+        if let Err(error) = wait_for_virtual_block_marker(
+            &first_media,
+            BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET,
+            BLOCK_LIFECYCLE_GUEST_ONE_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let serial_tail = file_tail_lossy(&serial_output_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct MMIO guest did not complete the first block-special phase: {error}; serial tail:\n{serial_tail}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_LIFECYCLE_PHASE_ONE_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .expect("direct MMIO guest should publish phase one");
+        assert_phase_block_serial_report(
+            &serial_output_path,
+            BLOCK_LIFECYCLE_INITIAL_SERIAL_BEGIN_MARKER,
+            BLOCK_LIFECYCLE_INITIAL_SERIAL_END_MARKER,
+            &expected_initial_device_id,
+            "direct MMIO startup block-special drive",
+        );
+
+        let invalid_regular = format!(
+            r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Async"}}"#,
+            json_string(path_text(test_dir.path()))
+        );
+        assert_bad_request_response(
+            &http_put_json(&socket_path, "/drives/data", &invalid_regular),
+            "reject direct MMIO directory replacement",
+        );
+        let before_regular = http_get(&socket_path, "/vm/config");
+        assert_ok_response(
+            &before_regular,
+            "GET config after failed block-to-regular replacement",
+        );
+        assert_response_contains(
+            &before_regular,
+            &format!(r#""path_on_host":{}"#, json_string(path_text(&first_path))),
+            "failed block-to-regular replacement keeps the first block media",
+        );
+
+        let regular_replacement = format!(
+            r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Async"}}"#,
+            json_string(path_text(&regular_backing_path))
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/data", &regular_replacement),
+            "replace direct MMIO block backing with regular backing",
+        );
+        wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_LIFECYCLE_PHASE_TWO_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .expect("guest should observe the regular replacement capacity");
+        assert_eq!(
+            file_bytes_at(
+                &regular_backing_path,
+                BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET,
+                BLOCK_LIFECYCLE_GUEST_TWO_MARKER.len(),
+            ),
+            BLOCK_LIFECYCLE_GUEST_TWO_MARKER,
+        );
+
+        let invalid_block = format!(
+            r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Async"}}"#,
+            json_string(path_text(&read_only_path))
+        );
+        assert_bad_request_response(
+            &http_put_json(&socket_path, "/drives/data", &invalid_block),
+            "reject direct MMIO access-mismatched block replacement",
+        );
+        let before_final = http_get(&socket_path, "/vm/config");
+        assert_ok_response(
+            &before_final,
+            "GET config after failed regular-to-block replacement",
+        );
+        assert_response_contains(
+            &before_final,
+            &format!(
+                r#""path_on_host":{}"#,
+                json_string(path_text(&regular_backing_path))
+            ),
+            "failed regular-to-block replacement keeps the regular backing",
+        );
+
+        let final_replacement = format!(
+            r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Async"}}"#,
+            json_string(path_text(&final_path))
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/data", &final_replacement),
+            "replace direct MMIO regular backing with final block backing",
+        );
+        if let Err(error) = wait_for_virtual_block_marker(
+            &final_media,
+            BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET,
+            BLOCK_LIFECYCLE_GUEST_THREE_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let serial_tail = file_tail_lossy(&serial_output_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct MMIO guest did not complete the final block-special phase: {error}; serial tail:\n{serial_tail}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_LIFECYCLE_SUCCESS_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .expect("direct MMIO guest should complete block-special lifecycle");
+        let final_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&final_config, "GET final direct MMIO block-special config");
+        for expected in [
+            r#""drive_id":"data""#,
+            r#""cache_type":"Writeback""#,
+            r#""io_engine":"Async""#,
+        ] {
+            assert_response_contains(&final_config, expected, "final direct MMIO data drive");
+        }
+        assert_response_contains(
+            &final_config,
+            &format!(r#""path_on_host":{}"#, json_string(path_text(&final_path))),
+            "final direct MMIO block path",
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "direct MMIO block-special lifecycle",
+        );
+        first_media
+            .reattach(MacosVirtualBlockAccess::ReadOnly)
+            .expect("first direct MMIO media should release for persistence inspection");
+        final_media
+            .reattach(MacosVirtualBlockAccess::ReadOnly)
+            .expect("final direct MMIO media should release for persistence inspection");
+        assert_eq!(
+            first_media
+                .read_at(
+                    BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET,
+                    BLOCK_LIFECYCLE_GUEST_ONE_MARKER.len(),
+                )
+                .expect("first guest marker should persist"),
+            BLOCK_LIFECYCLE_GUEST_ONE_MARKER,
+        );
+        assert_eq!(
+            final_media
+                .read_at(
+                    BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET,
+                    BLOCK_LIFECYCLE_GUEST_THREE_MARKER.len(),
+                )
+                .expect("final guest marker should persist"),
+            BLOCK_LIFECYCLE_GUEST_THREE_MARKER,
+        );
+        assert_eq!(
+            read_only_media
+                .read_at(0, BLOCK_LIFECYCLE_READ_ONLY_MARKER.len())
+                .expect("read-only audit marker should remain readable"),
+            BLOCK_LIFECYCLE_READ_ONLY_MARKER,
+        );
+        first_media
+            .cleanup()
+            .expect("first direct MMIO media should clean up exactly");
+        final_media
+            .cleanup()
+            .expect("final direct MMIO media should clean up exactly");
+        read_only_media
+            .cleanup()
+            .expect("read-only direct MMIO media should clean up exactly");
+    }
+
+    #[test]
     fn signed_executable_reads_entropy_from_direct_rootfs_guest() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
@@ -4050,6 +4421,267 @@ mod macos_arm64 {
             &socket_path,
             "bangbang runtime block hotplug product PCI",
         );
+    }
+
+    #[test]
+    fn signed_executable_hotplugs_macos_block_special_media_over_product_pci() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let control_backing_path = test_dir.path().join("block-special-control.img");
+        let serial_output_path = test_dir.path().join("serial.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+        let mut first_media = MacosVirtualBlock::create_sized(
+            MacosVirtualBlockAccess::ReadWrite,
+            MacosVirtualBlockSize::FourMib,
+        )
+        .expect("first direct PCI block media should attach");
+        let mut second_media = MacosVirtualBlock::create_sized(
+            MacosVirtualBlockAccess::ReadWrite,
+            MacosVirtualBlockSize::EightMib,
+        )
+        .expect("second direct PCI block media should attach");
+        write_virtual_block_marker_at(&first_media, 0, BLOCK_HOTPLUG_HOST_ONE_MARKER);
+        write_virtual_block_marker_at(&second_media, 0, BLOCK_HOTPLUG_HOST_TWO_MARKER);
+        let first_path = first_media
+            .device_path()
+            .expect("first direct PCI media should expose its exact node")
+            .to_path_buf();
+        let second_path = second_media
+            .device_path()
+            .expect("second direct PCI media should expose its exact node")
+            .to_path_buf();
+        let first_device_id = expected_block_device_id(&first_path);
+        let second_device_id = expected_block_device_id(&second_path);
+        create_block_backing_with_prefix(&control_backing_path, 2, &[]);
+        create_empty_file(&serial_output_path);
+
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"]);
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT direct PCI block-special machine config",
+        );
+        let boot_args = format!(
+            "{DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS} bangbang.expect-block-special-hotplug=1 bangbang.block-hotplug-cache-order=writeback-unsafe"
+        );
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(&boot_args),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/boot-source", &boot_body),
+            "PUT direct PCI block-special boot source",
+        );
+        for (route, body, context) in [
+            (
+                "/drives/rootfs",
+                format!(
+                    r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+                    json_string(path_text(&rootfs_path))
+                ),
+                "PUT direct PCI block-special rootfs",
+            ),
+            (
+                "/drives/control",
+                format!(
+                    r#"{{"drive_id":"control","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+                    json_string(path_text(&control_backing_path))
+                ),
+                "PUT direct PCI block-special control drive",
+            ),
+        ] {
+            assert_no_content_response(&http_put_json(&socket_path, route, &body), context);
+        }
+        let serial_body = format!(
+            r#"{{"serial_out_path":{}}}"#,
+            json_string(path_text(&serial_output_path))
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/serial", &serial_body),
+            "PUT direct PCI block-special serial output",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "start direct PCI block-special hotplug guest",
+        );
+        wait_for_file_prefix_marker(
+            &control_backing_path,
+            BLOCK_HOTPLUG_READY_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("direct PCI block-special guest should become ready");
+
+        let first_body = format!(
+            r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync","rate_limiter":{{"ops":{{"size":1,"refill_time":100}}}}}}"#,
+            json_string(path_text(&first_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/hotdata", &first_body),
+            "runtime PUT direct first block-special PCI drive",
+        );
+        let first_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&first_config, "GET first direct block-special PCI config");
+        for expected in [
+            r#""drive_id":"hotdata""#,
+            r#""cache_type":"Writeback""#,
+            r#""io_engine":"Sync""#,
+            r#""refill_time":100"#,
+        ] {
+            assert_response_contains(
+                &first_config,
+                expected,
+                "first direct block-special PCI drive",
+            );
+        }
+        if let Err(error) = wait_for_virtual_block_marker(
+            &first_media,
+            0,
+            BLOCK_HOTPLUG_GUEST_ONE_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct first PCI block-special round failed: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        wait_for_file_prefix_marker(
+            &control_backing_path,
+            BLOCK_HOTPLUG_FIRST_REMOVED_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("guest should manually remove first direct block-special function");
+        wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_HOTPLUG_FIRST_SERIAL_END_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .expect("guest should report first direct hotplug GET_ID");
+        assert_phase_block_serial_report(
+            &serial_output_path,
+            BLOCK_HOTPLUG_FIRST_SERIAL_BEGIN_MARKER,
+            BLOCK_HOTPLUG_FIRST_SERIAL_END_MARKER,
+            &first_device_id,
+            "first direct PCI block-special drive",
+        );
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause direct block-special guest before DELETE",
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/drives/hotdata"),
+            "DELETE first direct block-special PCI drive",
+        );
+        let removed = http_get(&socket_path, "/vm/config");
+        assert_ok_response(
+            &removed,
+            "GET config after first direct block-special DELETE",
+        );
+        assert!(!removed.contains(r#""drive_id":"hotdata""#));
+
+        let second_body = format!(
+            r#"{{"drive_id":"hotdata","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Unsafe","io_engine":"Async"}}"#,
+            json_string(path_text(&second_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/hotdata", &second_body),
+            "paused PUT reused direct block-special PCI drive",
+        );
+        let reused = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&reused, "GET reused direct block-special PCI config");
+        for expected in [
+            r#""drive_id":"hotdata""#,
+            r#""cache_type":"Unsafe""#,
+            r#""io_engine":"Async""#,
+        ] {
+            assert_response_contains(&reused, expected, "reused direct block-special PCI drive");
+        }
+        write_block_marker_at(
+            &control_backing_path,
+            bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+            BLOCK_HOTPLUG_CONTINUE_MARKER,
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume direct block-special guest after slot reuse",
+        );
+        if let Err(error) = wait_for_virtual_block_marker(
+            &second_media,
+            0,
+            BLOCK_HOTPLUG_GUEST_TWO_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct second PCI block-special round failed: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        wait_for_file_prefix_marker(
+            &control_backing_path,
+            BLOCK_HOTPLUG_SUCCESS_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("guest should manually remove reused direct block-special function");
+        wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_HOTPLUG_SECOND_SERIAL_END_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .expect("guest should report second direct hotplug GET_ID");
+        assert_phase_block_serial_report(
+            &serial_output_path,
+            BLOCK_HOTPLUG_SECOND_SERIAL_BEGIN_MARKER,
+            BLOCK_HOTPLUG_SECOND_SERIAL_END_MARKER,
+            &second_device_id,
+            "second direct PCI block-special drive",
+        );
+        assert_no_content_response(
+            &http_no_body(&socket_path, "DELETE", "/drives/hotdata"),
+            "final DELETE reused direct block-special PCI drive",
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "direct block-special PCI lifecycle",
+        );
+        first_media
+            .reattach(MacosVirtualBlockAccess::ReadOnly)
+            .expect("first direct PCI media should release for read-only inspection");
+        second_media
+            .reattach(MacosVirtualBlockAccess::ReadOnly)
+            .expect("second direct PCI media should release for read-only inspection");
+        assert_eq!(
+            first_media
+                .read_at(0, BLOCK_HOTPLUG_GUEST_ONE_MARKER.len())
+                .expect("first direct PCI marker should persist"),
+            BLOCK_HOTPLUG_GUEST_ONE_MARKER,
+        );
+        assert_eq!(
+            second_media
+                .read_at(0, BLOCK_HOTPLUG_GUEST_TWO_MARKER.len())
+                .expect("second direct PCI marker should persist"),
+            BLOCK_HOTPLUG_GUEST_TWO_MARKER,
+        );
+        first_media
+            .cleanup()
+            .expect("first direct PCI media should clean up exactly");
+        second_media
+            .cleanup()
+            .expect("second direct PCI media should clean up exactly");
     }
 
     #[test]
@@ -8125,6 +8757,14 @@ mod macos_arm64 {
         file.sync_all().expect("guest block marker should fsync");
     }
 
+    fn write_virtual_block_marker_at(media: &MacosVirtualBlock, offset: u64, marker: &[u8]) {
+        let mut sector = vec![0_u8; bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE as usize];
+        sector[..marker.len()].copy_from_slice(marker);
+        media
+            .write_at(offset, &sector)
+            .expect("virtual block marker should persist");
+    }
+
     fn create_pmem_backing(path: &Path, marker: &[u8]) {
         let mut file = fs::OpenOptions::new()
             .read(true)
@@ -8917,6 +9557,29 @@ mod macos_arm64 {
         }
     }
 
+    fn wait_for_virtual_block_marker(
+        media: &MacosVirtualBlock,
+        offset: u64,
+        marker: &[u8],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match media.read_at(offset, marker.len()) {
+                Ok(bytes) if bytes == marker => return Ok(()),
+                Ok(_) | Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(bytes) => {
+                    return Err(format!(
+                        "timed out waiting for virtual block marker; observed {bytes:?}"
+                    ));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
     fn fill_deterministic_vsock_stream_chunk(chunk: &mut [u8], stream_offset: usize, seed: u8) {
         for (index, byte) in chunk.iter_mut().enumerate() {
             let absolute_offset = stream_offset
@@ -9218,6 +9881,26 @@ mod macos_arm64 {
         assert!(
             normalized.contains(&expected_report),
             "guest block serial must equal the exact host backing metadata identity"
+        );
+    }
+
+    fn assert_phase_block_serial_report(
+        path: &Path,
+        begin: &[u8],
+        end: &[u8],
+        expected: &str,
+        context: &str,
+    ) {
+        let output = fs::read(path).expect("block serial output should be readable");
+        let normalized = String::from_utf8_lossy(&output).replace('\r', "");
+        let expected_report = format!(
+            "{}\n{expected}\n{}",
+            String::from_utf8_lossy(begin),
+            String::from_utf8_lossy(end),
+        );
+        assert!(
+            normalized.contains(&expected_report),
+            "{context} guest block serial must equal the exact current backing identity"
         );
     }
 

@@ -2682,6 +2682,7 @@ impl VirtioBlockRuntimeState {
             input.device_id,
             active_queue,
             rate_limiter,
+            input.has_retry,
         );
         let activation_is_active = device.is_activated();
         let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
@@ -5756,6 +5757,7 @@ enum VhostUserBlockState {
 pub struct VirtioBlockDevice {
     backend: VirtioBlockBackend,
     device_id: VirtioBlockDeviceId,
+    pending_rate_limited_queue: bool,
 }
 
 impl VirtioBlockDevice {
@@ -5768,6 +5770,7 @@ impl VirtioBlockDevice {
                 io_engine: VirtioBlockFileIoEngine::Sync,
             },
             device_id,
+            pending_rate_limited_queue: false,
         }
     }
 
@@ -5792,6 +5795,7 @@ impl VirtioBlockDevice {
                 },
             }),
             device_id,
+            pending_rate_limited_queue: false,
         })
     }
 
@@ -5811,6 +5815,7 @@ impl VirtioBlockDevice {
         device_id: VirtioBlockDeviceId,
         active_queue: Option<VirtioBlockQueue>,
         rate_limiter: Option<VirtioBlockRateLimiter>,
+        pending_rate_limited_queue: bool,
     ) -> Self {
         Self {
             backend: VirtioBlockBackend::File {
@@ -5820,6 +5825,7 @@ impl VirtioBlockDevice {
                 io_engine: VirtioBlockFileIoEngine::Sync,
             },
             device_id,
+            pending_rate_limited_queue,
         }
     }
 
@@ -6211,6 +6217,10 @@ impl VirtioBlockDevice {
         }
     }
 
+    pub const fn has_pending_rate_limited_queue(&self) -> bool {
+        self.pending_rate_limited_queue
+    }
+
     pub fn snapshot_rate_limiter_state_at(
         &self,
         config: Option<DriveRateLimiterConfig>,
@@ -6326,6 +6336,7 @@ impl VirtioBlockDevice {
                 io_engine,
             } => {
                 if drained_notifications.is_empty()
+                    && !self.pending_rate_limited_queue
                     && matches!(io_engine, VirtioBlockFileIoEngine::Sync)
                 {
                     return Ok(VirtioBlockDeviceNotificationDispatch::new(
@@ -6370,7 +6381,7 @@ impl VirtioBlockDevice {
                         }
                     }
                 };
-                match dispatch {
+                let result = match dispatch {
                     Ok(dispatch) => Ok(VirtioBlockDeviceNotificationDispatch::new(
                         drained_notifications,
                         Some(dispatch),
@@ -6381,7 +6392,17 @@ impl VirtioBlockDevice {
                         drained_notifications,
                         source,
                     }),
+                };
+                self.pending_rate_limited_queue = match &result {
+                    Ok(dispatch) => dispatch
+                        .queue_dispatch()
+                        .and_then(VirtioBlockQueueDispatch::rate_limiter_retry_after),
+                    Err(source) => source
+                        .completed_dispatch()
+                        .and_then(VirtioBlockQueueDispatch::rate_limiter_retry_after),
                 }
+                .is_some();
+                result
             }
             VirtioBlockBackend::VhostUser(backend) => {
                 backend.dispatch_notifications(drained_notifications)
@@ -6441,6 +6462,7 @@ impl VirtioBlockDevice {
     }
 
     pub fn reset(&mut self) {
+        self.pending_rate_limited_queue = false;
         match &mut self.backend {
             VirtioBlockBackend::File {
                 backing,
@@ -7834,6 +7856,7 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
                 .queue_notifications
                 .pending_queue_notifications()
                 .is_empty()
+                || core.activation.has_pending_rate_limited_queue()
         })
     }
 
@@ -15673,6 +15696,73 @@ mod tests {
             &written_file[VIRTIO_BLOCK_SECTOR_SIZE as usize..],
             vec![0; VIRTIO_BLOCK_SECTOR_SIZE as usize].as_slice()
         );
+    }
+
+    #[test]
+    fn block_device_retries_rate_limited_sync_queue_without_another_notification() {
+        let now = Instant::now();
+        let mut memory = request_memory();
+        let second_header = HEADER_ADDR
+            .checked_add(0x100)
+            .expect("second header address should not overflow");
+        let second_status = STATUS_ADDR
+            .checked_add(0x100)
+            .expect("second status address should not overflow");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            HEADER_ADDR,
+            None,
+            STATUS_ADDR,
+        );
+        write_queued_request(
+            &mut memory,
+            2,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            second_header,
+            None,
+            second_status,
+        );
+        write_available_heads(&mut memory, &[0, 2]);
+
+        let file = temp_file("device-rate-limited-retry.img", &sector_payload(0x53));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let rate_limiter = VirtioBlockRateLimiter::new_at(
+            DriveRateLimiterConfig::new(None, Some(DriveTokenBucketConfig::new(1, None, 60_000))),
+            now,
+        )
+        .expect("rate limiter should be enabled");
+        let mut device =
+            VirtioBlockDevice::new(backing, TEST_DEVICE_ID).with_rate_limiter(rate_limiter);
+        let VirtioBlockBackend::File { active_queue, .. } = &mut device.backend else {
+            panic!("test device should use a file backend");
+        };
+        *active_queue = Some(block_queue());
+
+        let first = device
+            .dispatch_drained_queue_notifications(&mut memory, vec![0])
+            .expect("first notification should dispatch and throttle the second request");
+        let first_queue = first
+            .queue_dispatch()
+            .expect("first notification should include a queue dispatch");
+        assert_eq!(first_queue.processed_requests(), 1);
+        assert!(first_queue.rate_limiter_retry_after().is_some());
+        assert!(device.has_pending_rate_limited_queue());
+
+        let retry = device
+            .dispatch_drained_queue_notifications(&mut memory, Vec::new())
+            .expect("pending queue should retry without another guest notification");
+        let retry_queue = retry
+            .queue_dispatch()
+            .expect("empty-notification retry should include a queue dispatch");
+        assert!(retry.drained_notifications().is_empty());
+        assert_eq!(retry_queue.processed_requests(), 0);
+        assert!(retry_queue.rate_limiter_retry_after().is_some());
+        assert!(device.has_pending_rate_limited_queue());
+        assert_eq!(read_used_index(&memory), 1);
     }
 
     #[test]

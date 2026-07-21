@@ -151,6 +151,40 @@ and slot/BAR/vector/dispatcher reuse.
 The guest/operator rescan and sysfs-removal handshake is part of this gate; it
 is not an automatic notification claim.
 
+macOS block-special drive changes additionally require all four signed owner
+gates through `scripts/run-integration-tests.sh`:
+
+- `macos_arm64::signed_executable_replaces_macos_block_special_backings_over_product_mmio`;
+- `macos_arm64::signed_executable_hotplugs_macos_block_special_media_over_product_pci`;
+- `normal_bundle_replaces_contained_macos_block_special_media_over_mmio`; and
+- `normal_bundle_hotplugs_contained_macos_block_special_media_over_pci`.
+
+Together they must cover direct and normal-production ownership, MMIO startup
+and PCI runtime attach, complementary Sync/Async plus Unsafe/Writeback order,
+read-only/read-write enforcement, live limiter retry without another guest
+notification, 4/6/8-MiB capacity/config refresh, exact current
+backing-derived GET_ID, real guest read/write/flush/readback persistence,
+regular-to-block, block-to-regular, and block-to-block replacement, failed
+directory/access candidates without mutation, manual guest removal, DELETE,
+same-ID and PCI-slot reuse, and native-v1 capture rejection before artifact
+publication. The contained cases must capture twice through fresh launcher
+inspection, prove source-path replacements are irrelevant, retain exactly App
+Sandbox plus Hypervisor worker entitlements, and drop every worker, broker,
+descriptor, and session owner before cleanup.
+
+These tests may use only `tests/support/macos_virtual_block.rs`. That fixture
+creates one repository-owned unmounted image with `hdiutil -plist`, accepts only
+the single returned node, and freshly verifies the canonical image-to-node
+mapping, fstat identity, access, logical block size, block count, and exact
+capacity before every detach, including forced cleanup. It must never enumerate
+or select existing `/dev` media and must remove only its own image. Real disk
+ioctls, App Sandbox behavior, signing, persistence after read-only reattach, and
+detach ownership cannot run in the unsigned workspace suite. Unit companions
+must still cover block geometry/identity/access rejection, grant and fixed
+block-control codec/session/sequence poisoning, direct versus broker control,
+capture mismatch, live-update rollback, and the synchronous rate-limited queue
+pending state that permits an empty-notification timer retry.
+
 Runtime pmem hotplug changes additionally require both
 `macos_arm64::signed_executable_hotplugs_flushes_and_reuses_runtime_pmem_over_product_pci`
 and
@@ -1157,6 +1191,10 @@ truncation, malformed ancillary data, and value-redacted formatting. The
 separate fixed 256-byte `BBU1` vhost-user broker codec covers exact
 session/sequence/grant/child/status correlation, one-stream rights, retryable
 failures, stale or malformed response rejection, and facet poisoning. Darwin
+tests also cover the fixed 256-byte `BBC1` block-control codec's exact
+session/sequence/grant/access/status/identity/geometry correlation, closed
+inspect/cache-sync operations, no-rights replies, bounded failure classes,
+stale or malformed response rejection, and facet poisoning. Darwin
 unit tests cover SCM_RIGHTS and FD_CLOEXEC, payload/control truncation, malformed
 ancillary cleanup, exact descriptor access/type/identity, sequence/session/batch
 poisoning and rollback, fragmented bookmark scope, kernel peer acceptance and
@@ -1560,7 +1598,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v35.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v59.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test

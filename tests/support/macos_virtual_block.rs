@@ -15,8 +15,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use plist::{Dictionary, Value};
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
-const IMAGE_SIZE_ARGUMENT: &str = "4m";
-const EXPECTED_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 const DEVICE_PREFIX: &str = "/dev/disk";
 const VIRTIO_SECTOR_BYTES: u64 = 512;
 const DARWIN_IOC_OUT: libc::c_ulong = 0x4000_0000;
@@ -58,6 +56,38 @@ impl std::error::Error for MacosVirtualBlockError {}
 pub(crate) enum MacosVirtualBlockAccess {
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MacosVirtualBlockSize {
+    FourMib,
+    EightMib,
+}
+
+impl MacosVirtualBlockSize {
+    const fn hdiutil_argument(self) -> &'static str {
+        match self {
+            Self::FourMib => "4m",
+            Self::EightMib => "8m",
+        }
+    }
+
+    const fn bytes(self) -> u64 {
+        match self {
+            Self::FourMib => 4 * 1024 * 1024,
+            Self::EightMib => 8 * 1024 * 1024,
+        }
+    }
+}
+
+#[test]
+fn virtual_block_size_profiles_are_exact_and_distinct() {
+    assert_eq!(MacosVirtualBlockSize::FourMib.bytes(), 4 * 1024 * 1024);
+    assert_eq!(MacosVirtualBlockSize::EightMib.bytes(), 8 * 1024 * 1024);
+    assert_ne!(
+        MacosVirtualBlockSize::FourMib.hdiutil_argument(),
+        MacosVirtualBlockSize::EightMib.hdiutil_argument(),
+    );
 }
 
 impl MacosVirtualBlockAccess {
@@ -114,6 +144,7 @@ impl Attachment {
 pub(crate) struct MacosVirtualBlock {
     directory: PathBuf,
     image: PathBuf,
+    expected_image_bytes: u64,
     attachment: Option<Attachment>,
     attachment_uncertain: bool,
     cleaned: bool,
@@ -134,12 +165,19 @@ impl fmt::Debug for MacosVirtualBlock {
 
 impl MacosVirtualBlock {
     pub(crate) fn create(access: MacosVirtualBlockAccess) -> Result<Self, MacosVirtualBlockError> {
+        Self::create_sized(access, MacosVirtualBlockSize::FourMib)
+    }
+
+    pub(crate) fn create_sized(
+        access: MacosVirtualBlockAccess,
+        size: MacosVirtualBlockSize,
+    ) -> Result<Self, MacosVirtualBlockError> {
         let directory = unique_fixture_directory()?;
         let image = directory.join("media.dmg");
         let output = run_hdiutil(&[
             OsString::from("create"),
             OsString::from("-size"),
-            OsString::from(IMAGE_SIZE_ARGUMENT),
+            OsString::from(size.hdiutil_argument()),
             OsString::from("-layout"),
             OsString::from("NONE"),
             image.as_os_str().to_os_string(),
@@ -152,6 +190,7 @@ impl MacosVirtualBlock {
         let mut media = Self {
             directory,
             image,
+            expected_image_bytes: size.bytes(),
             attachment: None,
             attachment_uncertain: false,
             cleaned: false,
@@ -202,7 +241,7 @@ impl MacosVirtualBlock {
                 return Err(error);
             }
         };
-        let valid_length = attachment.len() == Some(EXPECTED_IMAGE_BYTES);
+        let valid_length = attachment.len() == Some(self.expected_image_bytes);
         self.attachment = Some(attachment);
         self.attachment_uncertain = false;
         if !valid_length {

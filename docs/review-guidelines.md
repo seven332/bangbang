@@ -94,7 +94,11 @@ paths each need their own missing-path, empty-path, non-regular-file, and
 redacted-error coverage when those surfaces are introduced.
 
 File-backed inputs should reject directories and special files before payload
-reads. If a path may reference a FIFO, device node, socket, or replaced inode,
+reads unless the resource has an explicit descriptor-kind contract. The macOS
+drive exception accepts only an exact block-special descriptor with checked
+access, identity, geometry, and cache-control ownership; it does not generalize
+to FIFOs, character devices, sockets, ambient device lookup, or physical-media
+selection. If a path may reference any special object or a replaced inode,
 review whether open/read behavior can block, follow an unsafe replacement, or
 leak the path through errors.
 

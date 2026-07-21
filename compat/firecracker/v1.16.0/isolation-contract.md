@@ -65,7 +65,8 @@ timing once and rejects conflicting forwarded singletons. The Darwin wrapper in
 each open standard stream, and duplicates only an unnamed lifecycle stream
 endpoint to descriptor 3, an unnamed startup-grant datagram endpoint to
 descriptor 4, one dormant vsock-broker datagram endpoint to descriptor 5, and
-one dedicated vhost-user-broker datagram endpoint to descriptor 6.
+one dedicated vhost-user-broker datagram endpoint to descriptor 6 plus one
+dedicated retained-descriptor block-control endpoint to descriptor 7.
 It constructs the exec environment from only the private lifecycle marker;
 ambient parent, loader, and debug variables are not forwarded. Darwin may add
 runtime-owned entries, but none carries caller authority.
@@ -111,7 +112,7 @@ successful disposable current-host authorization launch. This contract does
 not claim repository-owned Apple credentials, `vmnet_start_interface` success,
 or real production connectivity.
 
-Grant-channel v1 uses one complete AF_UNIX datagram per record with a 1024-byte
+The BBG2 grant channel uses one complete AF_UNIX datagram per record with a 1024-byte
 application cap, independent random 128-bit BatchId, exact lifecycle SessionId
 and sequence, closed record kind, payload length, reserved fields, and declared
 descriptor count. `Begin` declares exact counts, file/directory records carry at
@@ -164,16 +165,19 @@ grant envelope is position one for an ordinary launch or immediately follows
 the jailer-policy delimiter; otherwise worker argument bytes remain unchanged.
 The launcher reads the manifest once, walks every
 absolute source path component without following symlinks or accepting
-`.`/`..`, opens existing regular files/directories with exact access, records
-type/device/inode/status, rejects aliases, and prepares the entire RAII batch
-before spawn. Paths, IDs, identity values, bookmark bytes, and contents remain
-out of diagnostics.
+`.`/`..`, opens existing regular files/directories plus exact macOS
+block-special `DriveBacking` nodes with exact access, records
+type/device/inode/rdev/status, rejects aliases, and prepares the entire RAII
+batch before spawn. Paths, IDs, identity values, bookmark bytes, and contents
+remain out of diagnostics.
 
 The closed roles cover read-only startup config/metadata, kernel/initrd and
 snapshot inputs; repeatable read-only/read-write drive and pmem backing;
 write-only logger/metrics/serial sinks; create-children API/vsock/snapshot
 output directories; and repeatable connect-only vhost-user socket directories.
-Regular-file authority is descriptor-only. Each mutable
+Regular-file authority is descriptor-only. Block-special drive authority uses
+one BBG2 record binding the descriptor, exact access/status, rdev, logical block
+size, block count, and checked capacity. Each mutable
 directory combines an anchor descriptor with a bounded freshly minted ordinary
 implicit bookmark. The worker explicitly starts scope, requires exact resolved
 anchor identity and access, and balances scope on every exit. The platform stale
@@ -230,6 +234,19 @@ same-ID reinsertion. Malformed framing, stale correlation, unexpected rights,
 peer replacement, lifecycle cancellation, or cwd-integrity failure poisons the
 facet. There is no ambient path fallback or steady-state helper.
 
+Contained block-special drive control uses descriptor 7 and a separate fixed
+256-byte `BBC1` request/reply protocol. The signed App Sandbox worker can use
+positional I/O on the transferred block descriptor but receives `EPERM` for
+the public geometry and cache-synchronization disk ioctls. It therefore asks
+only for `Inspect` or `SynchronizeCache` on an exact block-special
+`DriveBacking` already fixed by the startup batch. Every message binds lifecycle
+SessionId, nonzero monotonic sequence, grant ID, role/access/status,
+device/inode/rdev, and adopted geometry; the launcher re-fstats and rechecks the
+retained exact descriptor before the public ioctl. Responses carry no rights,
+the worker enforces one two-second deadline, and stale/malformed/ambiguous
+traffic poisons the facet. No path, enumeration, physical-media selector,
+generic ioctl, or new entitlement crosses this boundary.
+
 Drive and pmem roles are repeatable, so their explicit grant ID is the only
 selection key; no role-based or device-name lookup exists. A contained
 pre-boot `PUT` first validates complete action, lifecycle, device ID, root and
@@ -241,6 +258,18 @@ plus private per-ID ownership. Mismatch, malformed/missing/consumed references,
 backing validation, or candidate validation preserve the previous config and
 backing. A successful same-ID ordinary-path `PUT` deliberately drops prepared
 grant ownership and retains deferred path opening.
+
+Only `DriveBacking` may be regular or block-special; every pmem and other file
+role stays regular-only. The worker independently validates fstat kind,
+device/inode/rdev, access/status, and CLOEXEC on receipt. Regular geometry is
+canonical zero metadata on the wire and capacity comes from file length.
+Block-special geometry must be nonzero, aligned, multiplication-safe, and equal
+to the launcher's authenticated tuple. Direct mode performs the same public
+ioctls locally. Capture re-fstats the worker descriptor and obtains a fresh
+launcher observation, failing closed on any tuple, timeout, peer, or ioctl
+mismatch. Native-v1 accepts only its existing regular read-only root profile;
+block-special capture-ready state remains in memory and is rejected before
+artifact publication.
 
 Startup uses one move-only aggregate for boot files and exact-ID block/pmem
 backings. It preflights every private entry for prior consumption before moving
@@ -418,7 +447,7 @@ execution proves:
 - rejection before worker output when a private bundle copy has a missing or
   modified worker;
 - default-close removal of a deliberately inheritable unexpected descriptor,
-  retention of only lifecycle/grant/dormant-broker endpoints, and malformed/incompatible
+  retention of only lifecycle/grant/fixed broker endpoints, and malformed/incompatible
   bootstrap rejection before public processing;
 - path-redacted App Sandbox denial for an outside config file;
 - structured container API/no-API readiness, one-session `SIGINT`/`SIGTERM`
@@ -449,6 +478,16 @@ execution proves:
 - source pathname replacement after launcher preparation followed by real guest
   writable block I/O and pmem marker read/flush persistence only in the
   launcher-opened objects;
+- a strict plist-created virtual-media fixture that freshly verifies its exact
+  canonical image/node/fstat/rdev/geometry mapping before each detach, never
+  enumerates `/dev`, and removes only its repository-owned image;
+- complementary contained MMIO and PCI block-special lifecycles covering
+  read-only/read-write, Sync/Async, Unsafe/Writeback, limiter retry, exact
+  4/6/8-MiB capacity refresh, backing-derived GET_ID, real guest
+  read/write/flush/readback, regular/block replacements, failed access and
+  capture rollback, capture twice without artifacts, DELETE, same-ID/slot
+  reuse, persistence after read-only reattach, unchanged exact entitlements,
+  complete owner drop, and exact media cleanup;
 - a read-only transferred block backing rejecting a real guest write while its
   opened file remains unchanged; and
 - preauthorized after-start block replacement synchronized by guest

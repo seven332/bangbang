@@ -70,6 +70,7 @@ dependencies = [
  "crc64",
  "dispatch2",
  "libc",
+ "plist",
  "serde",
  "serde_json",
  "signal-hook",

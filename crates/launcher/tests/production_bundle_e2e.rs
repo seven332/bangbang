@@ -35,7 +35,7 @@ use bangbang_session::{
     SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy,
     encode_frame,
 };
-use macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess};
+use macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize};
 use vhost_user_block::{VhostUserBlockBackend, VhostUserBlockBackendOptions};
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
@@ -54,6 +54,7 @@ const BLOCK_CONTROL_GRANT_REF: &str = "bangbang-grant:probe-block-control";
 const BLOCK_CONTROL_INITIAL_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_INITIAL";
 const BLOCK_CONTROL_WRITTEN_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_WRITTEN";
 const BLOCK_CONTROL_WRITE_BLOCK: u64 = 8;
+const VIRTIO_BLOCK_SECTOR_BYTES: u64 = 512;
 const STARTUP_CONFIG_ID: &str = "grant-config-1360";
 const STARTUP_METADATA_ID: &str = "grant-metadata-1360";
 const KERNEL_ID: &str = "grant-kernel-1360";
@@ -87,6 +88,18 @@ const GUEST_PMEM_REUSE_REF: &str = "bangbang-grant:grant-guest-pmem-reuse-1421";
 const GUEST_PMEM_ROOT_REF: &str = "bangbang-grant:grant-guest-pmem-root-1444";
 const GUEST_READ_ONLY_DATA_REF: &str = "bangbang-grant:grant-guest-read-only-data-1362";
 const GUEST_MISSING_REF: &str = "bangbang-grant:grant-guest-missing-1362";
+const BLOCK_SPECIAL_ROOT_ID: &str = "grant-block-special-root-1466";
+const BLOCK_SPECIAL_CONTROL_ID: &str = "grant-block-special-control-1466";
+const BLOCK_SPECIAL_FIRST_ID: &str = "grant-block-special-first-1466";
+const BLOCK_SPECIAL_SECOND_ID: &str = "grant-block-special-second-1466";
+const BLOCK_SPECIAL_READ_ONLY_ID: &str = "grant-block-special-read-only-1466";
+const BLOCK_SPECIAL_SERIAL_ID: &str = "grant-block-special-serial-1466";
+const BLOCK_SPECIAL_ROOT_REF: &str = "bangbang-grant:grant-block-special-root-1466";
+const BLOCK_SPECIAL_CONTROL_REF: &str = "bangbang-grant:grant-block-special-control-1466";
+const BLOCK_SPECIAL_FIRST_REF: &str = "bangbang-grant:grant-block-special-first-1466";
+const BLOCK_SPECIAL_SECOND_REF: &str = "bangbang-grant:grant-block-special-second-1466";
+const BLOCK_SPECIAL_READ_ONLY_REF: &str = "bangbang-grant:grant-block-special-read-only-1466";
+const BLOCK_SPECIAL_SERIAL_REF: &str = "bangbang-grant:grant-block-special-serial-1466";
 const OUTPUT_LOGGER_ID: &str = "grant-logger-sink-1364";
 const OUTPUT_METRICS_ID: &str = "grant-metrics-sink-1364";
 const OUTPUT_SERIAL_ID: &str = "grant-serial-sink-1364";
@@ -182,6 +195,7 @@ const DIRECT_ROOTFS_WRITEBACK_FLUSH_BOOT_ARGS: &str = "console=ttyS0 reboot=k pa
 const BLOCK_SERIAL_BEGIN_MARKER: &[u8] = b"BANGBANG_BLOCK_SERIAL_BEGIN";
 const BLOCK_SERIAL_END_MARKER: &[u8] = b"BANGBANG_BLOCK_SERIAL_END";
 const DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-hotplug=1";
+const DIRECT_ROOTFS_BLOCK_LIFECYCLE_TWO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.block-backing-lifecycle=two bangbang.expect-block-limiter-patch=1";
 const DIRECT_ROOTFS_PMEM_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-hotplug=1";
 const DIRECT_ROOTFS_NETWORK_HOTPLUG_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.network-hotplug=1";
 const BLOCK_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_READY";
@@ -192,6 +206,25 @@ const BLOCK_HOTPLUG_CONTINUE_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_CONTINUE";
 const BLOCK_HOTPLUG_HOST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_HOST_TWO";
 const BLOCK_HOTPLUG_GUEST_TWO_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_GUEST_TWO";
 const BLOCK_HOTPLUG_SUCCESS_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_SUCCESS";
+const BLOCK_HOTPLUG_FIRST_SERIAL_BEGIN_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_FIRST_SERIAL_BEGIN";
+const BLOCK_HOTPLUG_FIRST_SERIAL_END_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_FIRST_SERIAL_END";
+const BLOCK_HOTPLUG_SECOND_SERIAL_BEGIN_MARKER: &[u8] =
+    b"BANGBANG_BLOCK_HOTPLUG_SECOND_SERIAL_BEGIN";
+const BLOCK_HOTPLUG_SECOND_SERIAL_END_MARKER: &[u8] = b"BANGBANG_BLOCK_HOTPLUG_SECOND_SERIAL_END";
+const BLOCK_LIFECYCLE_INITIAL_SERIAL_BEGIN_MARKER: &[u8] =
+    b"BANGBANG_BLOCK_LIFECYCLE_INITIAL_SERIAL_BEGIN";
+const BLOCK_LIFECYCLE_INITIAL_SERIAL_END_MARKER: &[u8] =
+    b"BANGBANG_BLOCK_LIFECYCLE_INITIAL_SERIAL_END";
+const BLOCK_LIFECYCLE_HOST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_HOST_ONE";
+const BLOCK_LIFECYCLE_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_GUEST_ONE";
+const BLOCK_LIFECYCLE_PHASE_ONE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_PHASE_ONE";
+const BLOCK_LIFECYCLE_LIMITER_READY_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_LIMITER_READY";
+const BLOCK_LIFECYCLE_LIMITER_CONTINUE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_LIMITER_CONTINUE";
+const BLOCK_LIFECYCLE_HOST_THREE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_HOST_THREE";
+const BLOCK_LIFECYCLE_GUEST_THREE_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_GUEST_THREE";
+const BLOCK_LIFECYCLE_READ_ONLY_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_READ_ONLY";
+const BLOCK_LIFECYCLE_SUCCESS_MARKER: &[u8] = b"BANGBANG_BLOCK_LIFECYCLE_SUCCESS";
+const BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET: u64 = 2 * VIRTIO_BLOCK_SECTOR_BYTES;
 const PMEM_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_READY";
 const PMEM_HOTPLUG_HOST_ONE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_HOST_ONE";
 const PMEM_HOTPLUG_GUEST_ONE_MARKER: &[u8] = b"BANGBANG_PMEM_HOTPLUG_GUEST_ONE";
@@ -3062,6 +3095,274 @@ fn normal_bundle_live_async_block_grant_swap_uses_preauthorized_open_file() {
 }
 
 #[test]
+fn normal_bundle_replaces_contained_macos_block_special_media_over_mmio() {
+    let bundle = production_bundle();
+    let outer_display = codesign_display(&bundle);
+    let worker_display = codesign_display(&worker_bundle(&bundle));
+    assert!(outer_display.contains(&format!("Identifier={LAUNCHER_BUNDLE_IDENTIFIER}")));
+    assert!(worker_display.contains(&format!("Identifier={WORKER_BUNDLE_IDENTIFIER}")));
+    let launcher_entitlements = codesign_entitlements(&bundle);
+    let worker_entitlements = codesign_entitlements(&worker_bundle(&bundle));
+    assert!(!launcher_entitlements.contains("com.apple.security.app-sandbox"));
+    assert!(!launcher_entitlements.contains("com.apple.security.hypervisor"));
+    assert_eq!(worker_entitlements.matches("<key>").count(), 2);
+    assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
+    assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+
+    let fixture = BlockSpecialGrantFixture::new("mmio-replacement");
+    write_virtual_block_marker_at(&fixture.first_media, 0, BLOCK_LIFECYCLE_HOST_ONE_MARKER);
+    write_virtual_block_marker_at(&fixture.second_media, 0, BLOCK_LIFECYCLE_HOST_THREE_MARKER);
+    let expected_initial_device_id = expected_block_device_id(fixture.first_path());
+    let mut running =
+        spawn_ready_block_special_grant_api_launcher(&bundle, &fixture, "block-mmio", &[]);
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT contained MMIO block-special machine config",
+    );
+    let sealed_kernel = worker_bundle(&bundle).join("Contents/Resources/guest-kernel");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&sealed_kernel),
+        "boot_args": DIRECT_ROOTFS_BLOCK_LIFECYCLE_TWO_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source)
+                .expect("contained MMIO boot request should serialize"),
+        ),
+        204,
+        "PUT contained MMIO block-special boot source",
+    );
+    for (route, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": BLOCK_SPECIAL_ROOT_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT contained MMIO block-special rootfs",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": BLOCK_SPECIAL_FIRST_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+                "io_engine": "Async",
+            }),
+            "PUT contained MMIO first block-special data drive",
+        ),
+        (
+            "/drives/auditro",
+            serde_json::json!({
+                "drive_id": "auditro",
+                "path_on_host": BLOCK_SPECIAL_READ_ONLY_REF,
+                "is_root_device": false,
+                "is_read_only": true,
+                "cache_type": "Unsafe",
+                "io_engine": "Sync",
+            }),
+            "PUT contained MMIO read-only block-special audit drive",
+        ),
+        (
+            "/drives/control",
+            serde_json::json!({
+                "drive_id": "control",
+                "path_on_host": BLOCK_SPECIAL_CONTROL_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+            }),
+            "PUT contained MMIO lifecycle control drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                route,
+                &serde_json::to_string(&body).expect("contained MMIO drive should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    let serial = serde_json::json!({"serial_out_path": BLOCK_SPECIAL_SERIAL_REF});
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/serial",
+            &serde_json::to_string(&serial).expect("contained MMIO serial should serialize"),
+        ),
+        204,
+        "PUT contained MMIO block-special serial output",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start contained MMIO block-special lifecycle guest",
+    );
+    wait_for_file_contains(
+        &fixture.serial,
+        BLOCK_LIFECYCLE_LIMITER_READY_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained MMIO guest should become ready for the live limiter patch");
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/drives/data",
+            r#"{"drive_id":"data","rate_limiter":{"ops":{"size":1,"refill_time":100}}}"#,
+        ),
+        204,
+        "PATCH contained MMIO block-special limiter after guest probe",
+    );
+    resize_and_write_file_marker_at(
+        &fixture.control,
+        2 * VIRTIO_BLOCK_SECTOR_BYTES,
+        0,
+        BLOCK_LIFECYCLE_LIMITER_CONTINUE_MARKER,
+    );
+    wait_for_virtual_block_marker(
+        &fixture.first_media,
+        BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET,
+        BLOCK_LIFECYCLE_GUEST_ONE_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        stop_running_launcher(&mut running, "failed contained MMIO first block phase");
+        panic!("contained MMIO first block-special phase failed: {error}")
+    });
+    wait_for_file_contains(
+        &fixture.serial,
+        BLOCK_LIFECYCLE_PHASE_ONE_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained MMIO guest should publish phase one");
+    assert_phase_block_serial_report(
+        &fixture.serial,
+        BLOCK_LIFECYCLE_INITIAL_SERIAL_BEGIN_MARKER,
+        BLOCK_LIFECYCLE_INITIAL_SERIAL_END_MARKER,
+        &expected_initial_device_id,
+        "contained MMIO startup block-special drive",
+    );
+
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause contained MMIO block-special guest",
+    );
+    let first_capture = http_put(&running.socket, "/snapshot/create", &snapshot_create_body());
+    assert_http_status(
+        &first_capture,
+        400,
+        "first contained block-special native-v1 rejection",
+    );
+    fixture.assert_no_snapshot_artifacts();
+    let second_capture = http_put(
+        &running.socket,
+        "/snapshot/create",
+        &repeated_snapshot_create_body(),
+    );
+    assert_http_status(
+        &second_capture,
+        400,
+        "second contained block-special native-v1 rejection",
+    );
+    fixture.assert_no_snapshot_artifacts();
+
+    let failed_patch = http_request(
+        &running.socket,
+        "PATCH",
+        "/drives/data",
+        &serde_json::json!({
+            "drive_id": "data",
+            "path_on_host": BLOCK_SPECIAL_READ_ONLY_REF,
+        })
+        .to_string(),
+    );
+    assert_http_status(
+        &failed_patch,
+        400,
+        "reject contained MMIO access-mismatched block grant",
+    );
+    let unchanged = http_get(&running.socket, "/vm/config");
+    assert_http_status(&unchanged, 200, "GET config after failed block grant claim");
+    assert!(unchanged.contains(BLOCK_SPECIAL_FIRST_REF));
+    assert!(!unchanged.contains(BLOCK_SPECIAL_SECOND_REF));
+
+    let replacement = serde_json::json!({
+        "drive_id": "data",
+        "path_on_host": BLOCK_SPECIAL_SECOND_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+        "cache_type": "Writeback",
+        "io_engine": "Sync",
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/data",
+            &serde_json::to_string(&replacement)
+                .expect("contained block replacement should serialize"),
+        ),
+        204,
+        "replace contained MMIO block-special backing and engine",
+    );
+    let replaced = http_get(&running.socket, "/vm/config");
+    assert_http_status(&replaced, 200, "GET replaced contained MMIO config");
+    assert!(replaced.contains(BLOCK_SPECIAL_SECOND_REF));
+    assert!(!replaced.contains(BLOCK_SPECIAL_FIRST_REF));
+    assert!(replaced.contains(r#""io_engine":"Sync""#));
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume contained MMIO block-special guest",
+    );
+    wait_for_virtual_block_marker(
+        &fixture.second_media,
+        BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET,
+        BLOCK_LIFECYCLE_GUEST_THREE_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        stop_running_launcher(&mut running, "failed contained MMIO final block phase");
+        panic!("contained MMIO final block-special phase failed: {error}")
+    });
+    wait_for_file_contains(
+        &fixture.serial,
+        BLOCK_LIFECYCLE_SUCCESS_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained MMIO guest should complete block-special lifecycle");
+
+    stop_running_launcher(&mut running, "contained MMIO block-special lifecycle");
+    fixture.assert_no_snapshot_artifacts();
+    drop(running);
+    fixture.verify_persistence_and_cleanup(
+        BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET,
+        BLOCK_LIFECYCLE_GUEST_ONE_MARKER,
+        BLOCK_LIFECYCLE_GUEST_MARKER_OFFSET,
+        BLOCK_LIFECYCLE_GUEST_THREE_MARKER,
+    );
+}
+
+#[test]
 fn normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants() {
     let bundle = production_bundle();
     let fixture = GuestDeviceGrantFixture::new("runtime-block-hotplug");
@@ -3322,6 +3623,294 @@ fn normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants() {
     }
 
     stop_running_launcher(&mut running, "contained runtime block hotplug guest");
+}
+
+#[test]
+fn normal_bundle_hotplugs_contained_macos_block_special_media_over_pci() {
+    let bundle = production_bundle();
+    let launcher_entitlements = codesign_entitlements(&bundle);
+    let worker_entitlements = codesign_entitlements(&worker_bundle(&bundle));
+    assert!(!launcher_entitlements.contains("com.apple.security.app-sandbox"));
+    assert!(!launcher_entitlements.contains("com.apple.security.hypervisor"));
+    assert_eq!(worker_entitlements.matches("<key>").count(), 2);
+    assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
+    assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+
+    let fixture = BlockSpecialGrantFixture::new("pci-hotplug");
+    write_virtual_block_marker_at(&fixture.first_media, 0, BLOCK_HOTPLUG_HOST_ONE_MARKER);
+    write_virtual_block_marker_at(&fixture.second_media, 0, BLOCK_HOTPLUG_HOST_TWO_MARKER);
+    let first_device_id = expected_block_device_id(fixture.first_path());
+    let second_device_id = expected_block_device_id(fixture.second_path());
+    let mut running = spawn_ready_block_special_grant_api_launcher(
+        &bundle,
+        &fixture,
+        "block-pci",
+        &["--enable-pci"],
+    );
+
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT contained PCI block-special machine config",
+    );
+    let sealed_kernel = worker_bundle(&bundle).join("Contents/Resources/guest-kernel");
+    let boot_args = format!(
+        "{DIRECT_ROOTFS_BLOCK_HOTPLUG_BOOT_ARGS} bangbang.expect-block-special-hotplug=1 bangbang.block-hotplug-cache-order=unsafe-writeback"
+    );
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&sealed_kernel),
+        "boot_args": boot_args,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source)
+                .expect("contained PCI boot request should serialize"),
+        ),
+        204,
+        "PUT contained PCI block-special boot source",
+    );
+    for (route, body, context) in [
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": BLOCK_SPECIAL_ROOT_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+            }),
+            "PUT contained PCI block-special rootfs",
+        ),
+        (
+            "/drives/control",
+            serde_json::json!({
+                "drive_id": "control",
+                "path_on_host": BLOCK_SPECIAL_CONTROL_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+            }),
+            "PUT contained PCI block-special control drive",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                route,
+                &serde_json::to_string(&body).expect("contained PCI drive should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    let serial = serde_json::json!({"serial_out_path": BLOCK_SPECIAL_SERIAL_REF});
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/serial",
+            &serde_json::to_string(&serial).expect("contained PCI serial should serialize"),
+        ),
+        204,
+        "PUT contained PCI block-special serial output",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start contained PCI block-special guest",
+    );
+    wait_for_file_prefix(
+        &fixture.control,
+        BLOCK_HOTPLUG_READY_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("contained PCI block-special guest should become ready");
+
+    let wrong_access = serde_json::json!({
+        "drive_id": "hotdata",
+        "path_on_host": BLOCK_SPECIAL_FIRST_REF,
+        "is_root_device": false,
+        "is_read_only": true,
+        "cache_type": "Unsafe",
+        "io_engine": "Async",
+    });
+    let denied = http_put(
+        &running.socket,
+        "/drives/hotdata",
+        &serde_json::to_string(&wrong_access).expect("wrong-access drive should serialize"),
+    );
+    assert_http_status(&denied, 400, "contained PCI block grant access mismatch");
+    assert!(!http_get(&running.socket, "/vm/config").contains(r#""drive_id":"hotdata""#));
+
+    let first = serde_json::json!({
+        "drive_id": "hotdata",
+        "path_on_host": BLOCK_SPECIAL_FIRST_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+        "cache_type": "Unsafe",
+        "io_engine": "Async",
+        "rate_limiter": {
+            "ops": {
+                "size": 1,
+                "refill_time": 100,
+            },
+        },
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/hotdata",
+            &serde_json::to_string(&first).expect("first contained PCI drive should serialize"),
+        ),
+        204,
+        "runtime PUT first contained block-special PCI drive",
+    );
+    let first_config = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &first_config,
+        200,
+        "GET first contained block-special PCI config",
+    );
+    assert!(first_config.contains(BLOCK_SPECIAL_FIRST_REF));
+    assert!(first_config.contains(r#""cache_type":"Unsafe""#));
+    assert!(first_config.contains(r#""io_engine":"Async""#));
+    assert!(first_config.contains(r#""refill_time":100"#));
+    wait_for_virtual_block_marker(
+        &fixture.first_media,
+        0,
+        BLOCK_HOTPLUG_GUEST_ONE_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        stop_running_launcher(&mut running, "failed contained PCI first block round");
+        panic!("contained first PCI block-special round failed: {error}")
+    });
+    wait_for_file_prefix(
+        &fixture.control,
+        BLOCK_HOTPLUG_FIRST_REMOVED_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should manually remove first contained block-special function");
+    wait_for_file_contains(
+        &fixture.serial,
+        BLOCK_HOTPLUG_FIRST_SERIAL_END_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should report first contained hotplug GET_ID");
+    assert_phase_block_serial_report(
+        &fixture.serial,
+        BLOCK_HOTPLUG_FIRST_SERIAL_BEGIN_MARKER,
+        BLOCK_HOTPLUG_FIRST_SERIAL_END_MARKER,
+        &first_device_id,
+        "first contained PCI block-special drive",
+    );
+
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause contained block-special guest before DELETE",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/drives/hotdata", ""),
+        204,
+        "DELETE first contained block-special PCI drive",
+    );
+    let removed = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &removed,
+        200,
+        "GET config after contained block-special DELETE",
+    );
+    assert!(!removed.contains(r#""drive_id":"hotdata""#));
+
+    let second = serde_json::json!({
+        "drive_id": "hotdata",
+        "path_on_host": BLOCK_SPECIAL_SECOND_REF,
+        "is_root_device": false,
+        "is_read_only": false,
+        "cache_type": "Writeback",
+        "io_engine": "Sync",
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/drives/hotdata",
+            &serde_json::to_string(&second).expect("second contained PCI drive should serialize"),
+        ),
+        204,
+        "paused PUT reused contained block-special PCI drive",
+    );
+    let reused = http_get(&running.socket, "/vm/config");
+    assert_http_status(
+        &reused,
+        200,
+        "GET reused contained block-special PCI config",
+    );
+    assert!(reused.contains(BLOCK_SPECIAL_SECOND_REF));
+    assert!(reused.contains(r#""cache_type":"Writeback""#));
+    assert!(reused.contains(r#""io_engine":"Sync""#));
+    resize_and_write_file_marker_at(
+        &fixture.control,
+        2 * VIRTIO_BLOCK_SECTOR_BYTES,
+        VIRTIO_BLOCK_SECTOR_BYTES,
+        BLOCK_HOTPLUG_CONTINUE_MARKER,
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume contained block-special guest after slot reuse",
+    );
+    wait_for_virtual_block_marker(
+        &fixture.second_media,
+        0,
+        BLOCK_HOTPLUG_GUEST_TWO_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .unwrap_or_else(|error| {
+        stop_running_launcher(&mut running, "failed contained PCI second block round");
+        panic!("contained second PCI block-special round failed: {error}")
+    });
+    wait_for_file_prefix(
+        &fixture.control,
+        BLOCK_HOTPLUG_SUCCESS_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should manually remove reused contained block-special function");
+    wait_for_file_contains(
+        &fixture.serial,
+        BLOCK_HOTPLUG_SECOND_SERIAL_END_MARKER,
+        PROCESS_TIMEOUT,
+    )
+    .expect("guest should report second contained hotplug GET_ID");
+    assert_phase_block_serial_report(
+        &fixture.serial,
+        BLOCK_HOTPLUG_SECOND_SERIAL_BEGIN_MARKER,
+        BLOCK_HOTPLUG_SECOND_SERIAL_END_MARKER,
+        &second_device_id,
+        "second contained PCI block-special drive",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "DELETE", "/drives/hotdata", ""),
+        204,
+        "final DELETE contained block-special PCI drive",
+    );
+
+    stop_running_launcher(&mut running, "contained block-special PCI lifecycle");
+    drop(running);
+    fixture.verify_persistence_and_cleanup(
+        0,
+        BLOCK_HOTPLUG_GUEST_ONE_MARKER,
+        0,
+        BLOCK_HOTPLUG_GUEST_TWO_MARKER,
+    );
 }
 
 #[test]
@@ -4994,6 +5583,253 @@ impl StartupGrantFixture {
 }
 
 #[derive(Debug)]
+struct BlockSpecialGrantFixture {
+    _root: TestDir,
+    rootfs: PathBuf,
+    control: PathBuf,
+    serial: PathBuf,
+    state_directory: PathBuf,
+    memory_directory: PathBuf,
+    first_media: MacosVirtualBlock,
+    second_media: MacosVirtualBlock,
+    read_only_media: MacosVirtualBlock,
+    manifest: PathBuf,
+}
+
+impl BlockSpecialGrantFixture {
+    fn new(case: &str) -> Self {
+        let root = TestDir::new(&format!("block-special-grant-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("block-special grant root should canonicalize");
+        let rootfs = canonical_root.join("rootfs.ext4");
+        let control = canonical_root.join("control.img");
+        let serial = canonical_root.join("serial.out");
+        let state_directory = canonical_root.join("state-output");
+        let memory_directory = canonical_root.join("memory-output");
+        let manifest = canonical_root.join("grant-manifest.json");
+        fs::copy(guest_ext4_rootfs(), &rootfs).expect("block-special rootfs grant should copy");
+        create_sized_file(&control, 2 * VIRTIO_BLOCK_SECTOR_BYTES);
+        fs::write(&serial, b"").expect("block-special serial sink should create");
+        fs::create_dir(&state_directory).expect("block-special state output should create");
+        fs::create_dir(&memory_directory).expect("block-special memory output should create");
+
+        let first_media = MacosVirtualBlock::create_sized(
+            MacosVirtualBlockAccess::ReadWrite,
+            MacosVirtualBlockSize::FourMib,
+        )
+        .expect("first contained block-special media should attach");
+        let second_media = MacosVirtualBlock::create_sized(
+            MacosVirtualBlockAccess::ReadWrite,
+            MacosVirtualBlockSize::EightMib,
+        )
+        .expect("second contained block-special media should attach");
+        let mut read_only_media = MacosVirtualBlock::create_sized(
+            MacosVirtualBlockAccess::ReadWrite,
+            MacosVirtualBlockSize::FourMib,
+        )
+        .expect("contained read-only block-special media should attach for seeding");
+        write_virtual_block_marker_at(&read_only_media, 0, BLOCK_LIFECYCLE_READ_ONLY_MARKER);
+        read_only_media
+            .reattach(MacosVirtualBlockAccess::ReadOnly)
+            .expect("contained audit media should reattach read-only");
+        let first_path = first_media
+            .device_path()
+            .expect("first contained media should expose its exact node")
+            .to_path_buf();
+        let second_path = second_media
+            .device_path()
+            .expect("second contained media should expose its exact node")
+            .to_path_buf();
+        let read_only_path = read_only_media
+            .device_path()
+            .expect("contained audit media should expose its exact node")
+            .to_path_buf();
+
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": BLOCK_SPECIAL_ROOT_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&rootfs),
+                },
+                {
+                    "id": BLOCK_SPECIAL_CONTROL_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&control),
+                },
+                {
+                    "id": BLOCK_SPECIAL_FIRST_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&first_path),
+                },
+                {
+                    "id": BLOCK_SPECIAL_SECOND_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&second_path),
+                },
+                {
+                    "id": BLOCK_SPECIAL_READ_ONLY_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&read_only_path),
+                },
+                {
+                    "id": BLOCK_SPECIAL_SERIAL_ID,
+                    "role": "serial-sink",
+                    "access": "write-only",
+                    "source": path_text(&serial),
+                },
+                {
+                    "id": SNAPSHOT_STATE_OUTPUT_ID,
+                    "role": "snapshot-output-directory",
+                    "access": "create-children",
+                    "source": path_text(&state_directory),
+                },
+                {
+                    "id": SNAPSHOT_MEMORY_OUTPUT_ID,
+                    "role": "snapshot-output-directory",
+                    "access": "create-children",
+                    "source": path_text(&memory_directory),
+                },
+            ],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json)
+                .expect("block-special grant manifest should serialize"),
+        )
+        .expect("block-special grant manifest should write");
+
+        Self {
+            _root: root,
+            rootfs,
+            control,
+            serial,
+            state_directory,
+            memory_directory,
+            first_media,
+            second_media,
+            read_only_media,
+            manifest,
+        }
+    }
+
+    fn first_path(&self) -> &Path {
+        self.first_media
+            .device_path()
+            .expect("first contained block-special media should remain attached")
+    }
+
+    fn second_path(&self) -> &Path {
+        self.second_media
+            .device_path()
+            .expect("second contained block-special media should remain attached")
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.rootfs),
+            path_text(&self.control),
+            path_text(&self.serial),
+            path_text(&self.state_directory),
+            path_text(&self.memory_directory),
+            path_text(self.first_path()),
+            path_text(self.second_path()),
+            path_text(
+                self.read_only_media
+                    .device_path()
+                    .expect("contained audit media should remain attached"),
+            ),
+            path_text(&self.manifest),
+            BLOCK_SPECIAL_ROOT_ID,
+            BLOCK_SPECIAL_CONTROL_ID,
+            BLOCK_SPECIAL_FIRST_ID,
+            BLOCK_SPECIAL_SECOND_ID,
+            BLOCK_SPECIAL_READ_ONLY_ID,
+            BLOCK_SPECIAL_SERIAL_ID,
+            BLOCK_SPECIAL_ROOT_REF,
+            BLOCK_SPECIAL_CONTROL_REF,
+            BLOCK_SPECIAL_FIRST_REF,
+            BLOCK_SPECIAL_SECOND_REF,
+            BLOCK_SPECIAL_READ_ONLY_REF,
+            BLOCK_SPECIAL_SERIAL_REF,
+            SNAPSHOT_STATE_OUTPUT_ID,
+            SNAPSHOT_MEMORY_OUTPUT_ID,
+            SNAPSHOT_STATE_OUTPUT_REF,
+            SNAPSHOT_MEMORY_OUTPUT_REF,
+            SNAPSHOT_REPEAT_STATE_OUTPUT_REF,
+            SNAPSHOT_REPEAT_MEMORY_OUTPUT_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn assert_no_snapshot_artifacts(&self) {
+        for artifact in [
+            self.state_directory.join(SNAPSHOT_STATE_CHILD),
+            self.memory_directory.join(SNAPSHOT_MEMORY_CHILD),
+            self.state_directory.join(SNAPSHOT_REPEAT_STATE_CHILD),
+            self.memory_directory.join(SNAPSHOT_REPEAT_MEMORY_CHILD),
+        ] {
+            assert!(
+                !artifact.exists(),
+                "block-special native-v1 rejection must not publish an artifact"
+            );
+        }
+        assert_no_snapshot_staging(&self.state_directory);
+        assert_no_snapshot_staging(&self.memory_directory);
+    }
+
+    fn verify_persistence_and_cleanup(
+        mut self,
+        first_offset: u64,
+        first_marker: &[u8],
+        second_offset: u64,
+        second_marker: &[u8],
+    ) {
+        self.first_media
+            .reattach(MacosVirtualBlockAccess::ReadOnly)
+            .expect("first contained media should release for read-only inspection");
+        self.second_media
+            .reattach(MacosVirtualBlockAccess::ReadOnly)
+            .expect("second contained media should release for read-only inspection");
+        assert_eq!(
+            self.first_media
+                .read_at(first_offset, first_marker.len())
+                .expect("first contained guest marker should persist"),
+            first_marker,
+        );
+        assert_eq!(
+            self.second_media
+                .read_at(second_offset, second_marker.len())
+                .expect("second contained guest marker should persist"),
+            second_marker,
+        );
+        assert_eq!(
+            self.read_only_media
+                .read_at(0, BLOCK_LIFECYCLE_READ_ONLY_MARKER.len())
+                .expect("contained read-only audit marker should remain readable"),
+            BLOCK_LIFECYCLE_READ_ONLY_MARKER,
+        );
+        self.first_media
+            .cleanup()
+            .expect("first contained media should clean up exactly");
+        self.second_media
+            .cleanup()
+            .expect("second contained media should clean up exactly");
+        self.read_only_media
+            .cleanup()
+            .expect("contained audit media should clean up exactly");
+    }
+}
+
+#[derive(Debug)]
 struct GuestDeviceGrantFixture {
     _root: TestDir,
     rootfs: PathBuf,
@@ -6157,6 +6993,48 @@ fn spawn_ready_device_grant_api_launcher_with_extra_args(
     }
 }
 
+fn spawn_ready_block_special_grant_api_launcher(
+    bundle: &Path,
+    fixture: &BlockSpecialGrantFixture,
+    name: &str,
+    worker_args: &[&str],
+) -> RunningApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket = container_tmp_dir().join(format!("bbb-{:x}-{test_id:x}.sock", std::process::id()));
+    let mut child = Command::new(launcher(bundle))
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .args(worker_args)
+        .args(["--api-sock", path_text(&socket)])
+        .args(["--id", &format!("{name}-{test_id}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("block-special grant launcher should start");
+    let (ready, stdout_reader) = read_stdout_until_ready(&mut child);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "block-special grant API should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningApiLauncher {
+        child,
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive: fixture.sensitive_strings(),
+        completed: false,
+    }
+}
+
 fn spawn_ready_socket_grant_api_launcher(
     bundle: &Path,
     fixture: &SocketDirectoryGrantFixture,
@@ -7154,6 +8032,35 @@ fn file_bytes_at(path: &Path, offset: u64, len: usize) -> Vec<u8> {
     bytes
 }
 
+fn write_virtual_block_marker_at(media: &MacosVirtualBlock, offset: u64, marker: &[u8]) {
+    let mut sector = vec![0_u8; VIRTIO_BLOCK_SECTOR_BYTES as usize];
+    sector[..marker.len()].copy_from_slice(marker);
+    media
+        .write_at(offset, &sector)
+        .expect("contained virtual block marker should persist");
+}
+
+fn wait_for_virtual_block_marker(
+    media: &MacosVirtualBlock,
+    offset: u64,
+    marker: &[u8],
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match media.read_at(offset, marker.len()) {
+            Ok(bytes) if bytes == marker => return Ok(()),
+            Ok(_) | Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(bytes) => {
+                return Err(format!(
+                    "timed out waiting for contained virtual block marker; observed {bytes:?}"
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
 fn wait_for_file_prefix(path: &Path, marker: &[u8], timeout: Duration) -> Result<(), String> {
     let started = Instant::now();
     loop {
@@ -7209,6 +8116,26 @@ fn assert_block_serial_report(path: &Path, expected: &str, context: &str) {
     assert!(
         normalized.contains(&expected_report),
         "{context} guest block serial must equal the exact launcher-opened backing metadata identity"
+    );
+}
+
+fn assert_phase_block_serial_report(
+    path: &Path,
+    begin: &[u8],
+    end: &[u8],
+    expected: &str,
+    context: &str,
+) {
+    let output = fs::read(path).expect("phase block serial output should be readable");
+    let normalized = String::from_utf8_lossy(&output).replace('\r', "");
+    let expected_report = format!(
+        "{}\n{expected}\n{}",
+        String::from_utf8_lossy(begin),
+        String::from_utf8_lossy(end),
+    );
+    assert!(
+        normalized.contains(&expected_report),
+        "{context} guest block serial must equal the exact current grant descriptor identity"
     );
 }
 

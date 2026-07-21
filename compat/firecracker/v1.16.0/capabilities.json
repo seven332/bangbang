@@ -515,7 +515,7 @@
     {
       "id": "api-operation:PUT /drives/{drive_id}",
       "family": "api-contract",
-      "summary": "Configure a validated Sync or Async file-backed virtio-block drive before startup, transactionally replace an existing file drive's backing, engine, and limiter in Running or Paused state, or attach one new non-root drive when public all-virtio PCI transport is enabled. Candidates open or adopt the exact backing before owner-thread publication; Async generations bind to one session executor and old generations quiesce before replacement. Configuration and contained-grant consumption commit only after the live endpoint publishes. Default-MMIO hotplug, vhost same-ID replacement, root mutation, invalid backing, grant, and capacity failures are stable, redacted, and nonmutating.",
+      "summary": "Configure a validated Sync or Async regular-file or macOS block-special virtio-block drive before startup, transactionally replace regular/block backing kind, engine, cache policy, limiter, capacity/config, and backing-derived GET_ID in Running or Paused state, or attach one new non-root drive when public all-virtio PCI transport is enabled. Direct block control uses checked public disk ioctls; contained BBG2 grants bind exact identity/access/status/geometry and permit only fresh inspect/cache-sync on the launcher's retained descriptor through a fixed session-bound facet. Candidates prepare before owner-thread publication, Async generations quiesce before replacement, and configuration/grant consumption commits last. Default-MMIO hotplug, vhost same-ID replacement, root mutation, invalid kind/access/geometry/grant/capacity, and broker failures are stable, redacted, and nonmutating. Native-v1 remains regular-only.",
       "source_refs": [
         "api-operation:PUT /drives/{drive_id}"
       ],
@@ -533,8 +533,13 @@
         },
         {
           "kind": "local",
+          "path": "crates/launcher/src/macos/block_control.rs",
+          "anchor": "retained exact-grant descriptor inspection and cache synchronization"
+        },
+        {
+          "kind": "local",
           "path": "crates/runtime/src/block.rs",
-          "anchor": "DriveConfigs runtime insertion and same-ID replacement preparation"
+          "anchor": "regular and macOS block-special backing inspection, I/O, limiter retry, capture, runtime insertion, and same-ID replacement"
         },
         {
           "kind": "local",
@@ -545,6 +550,11 @@
           "kind": "local",
           "path": "crates/runtime/src/virtio_pci.rs",
           "anchor": "PublishedVirtioPciEndpoint::publish"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/block_control.rs",
+          "anchor": "fixed session/sequence/grant-bound contained block-control protocol"
         }
       ],
       "validation": [
@@ -556,12 +566,12 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
-          "anchor": "signed_executable_hotplugs_replaces_and_reuses_async_block_over_product_pci"
+          "anchor": "signed regular/Async and direct macOS block-special MMIO/PCI replacement, limiter, persistence, hotplug, delete, and reuse scenarios"
         },
         {
           "kind": "local",
           "path": "crates/launcher/tests/production_bundle_e2e.rs",
-          "anchor": "normal_bundle_live_async_block_grant_swap_uses_preauthorized_open_file and normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants"
+          "anchor": "signed contained regular/Async and block-special MMIO/PCI lifecycle, broker, capture rejection, entitlement, and exact-cleanup scenarios"
         },
         {
           "kind": "local",
@@ -2128,7 +2138,7 @@
     {
       "id": "api-property:Drive.io_engine",
       "family": "api-contract",
-      "summary": "Accept and exactly report Sync or Async for file-backed drives, default omission to Sync, and require the field to be absent for vhost-user block. Async uses one lazy bounded portable executor per VM session with generation-safe completion routing, queue status/used-ring/dirty publication, limiter and interrupt integration, pressure metrics, live path or same-ID engine replacement, PCI hotplug/delete reuse, and shutdown quiescence. Native-v1 remains deliberately Sync-only and rejects Async before artifact creation.",
+      "summary": "Accept and exactly report Sync or Async for regular-file or exact macOS block-special drives, default omission to Sync, and require the field to be absent for vhost-user block. Async uses one lazy bounded portable executor per VM session with generation-safe completion routing, queue status/used-ring/dirty publication, limiter and interrupt integration, pressure metrics, live regular/block same-ID engine replacement, PCI hotplug/delete reuse, and shutdown quiescence. Signed direct/contained MMIO/PCI block-special lifecycles exercise both engines with capacity refresh, limiter retry, persistence, and exact cleanup. Native-v1 remains deliberately Sync-only and rejects Async or block-special state before artifact creation.",
       "source_refs": [
         "api-property:Drive.io_engine"
       ],
@@ -2164,7 +2174,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
-          "anchor": "signed MMIO, config-file, root/data, and product-PCI Async guest scenarios"
+          "anchor": "signed regular-file and direct macOS block-special MMIO/PCI Sync/Async guest scenarios"
         },
         {
           "kind": "local",
@@ -2174,7 +2184,7 @@
         {
           "kind": "local",
           "path": "crates/launcher/tests/production_bundle_e2e.rs",
-          "anchor": "signed contained Async grant replacement and runtime hotplug/delete/reuse scenarios"
+          "anchor": "signed contained regular-file and macOS block-special MMIO/PCI Sync/Async replacement and hotplug/delete/reuse scenarios"
         },
         {
           "kind": "local",
@@ -6098,7 +6108,7 @@
     {
       "id": "non-swagger-route:DELETE /drives/{drive_id}",
       "family": "storage",
-      "summary": "Remove one non-root live Sync, Async, or vhost-user virtio-block endpoint through the pinned bodyless Firecracker route when public all-virtio PCI transport is enabled. Owner-thread teardown first removes MMIO and ECAM reachability, drains work and interrupt admission while retaining exact leases, quiesces and unbinds any Async generation, then irreversibly releases device, MSI-X, BAR, function, dispatcher, backing or frontend, metrics, and configuration ownership. Recoverable preparation failures restore a usable endpoint; failed restoration or post-boundary corruption is terminal. Missing, root, and default-MMIO requests are nonmutating.",
+      "summary": "Remove one non-root live regular-file, exact macOS block-special, or vhost-user virtio-block endpoint through the pinned bodyless Firecracker route when public all-virtio PCI transport is enabled. Owner-thread teardown first removes MMIO and ECAM reachability, drains work and interrupt admission while retaining exact leases, quiesces and unbinds any Async generation, then irreversibly releases device, MSI-X, BAR, function, dispatcher, backing/control owner or frontend, metrics, and configuration ownership. Signed direct/contained two-round block-special lifecycles prove manual guest removal, API DELETE, descriptor/session release, persistence, and same-ID/exact-slot reuse. Recoverable preparation failures restore a usable endpoint; failed restoration or post-boundary corruption is terminal. Missing, root, and default-MMIO requests are nonmutating.",
       "source_refs": [
         "non-swagger-route:DELETE /drives/{drive_id}"
       ],
@@ -6139,12 +6149,12 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
-          "anchor": "signed_executable_hotplugs_replaces_and_reuses_async_block_over_product_pci"
+          "anchor": "signed regular-file and macOS block-special two-round PCI hotplug/delete/reuse scenarios"
         },
         {
           "kind": "local",
           "path": "crates/launcher/tests/production_bundle_e2e.rs",
-          "anchor": "normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants"
+          "anchor": "signed contained regular-file and macOS block-special two-round PCI hotplug/delete/reuse scenarios"
         },
         {
           "kind": "local",
@@ -6931,7 +6941,7 @@
     {
       "id": "semantic.storage:block-sync-async-vhost-and-limits",
       "family": "storage",
-      "summary": "File-backed Sync and portable Async startup/runtime behavior plus direct or contained vhost-user block cover selected MMIO/PCI transports, root/partuuid/cache/flush semantics, bounded session-level asynchronous execution, limiter/dirty/status/used/interrupt publication, metrics, cleanup, failure-atomic live backing or engine replacement, PCI hotplug/delete/reuse, shared-memory vring transfer, exact active vhost config refresh, and explicit snapshot rejection. Capture-ready traversal now retains exact config/backing/queue/limiter/retry/MMIO-or-PCI state and runs one stop-all/drain-all/publish-all/capture-all/resume-all Async transaction with continuation counters, pressure, zero-work proof, metrics, and interrupt effects; live vhost owners reject first without mutation. Vhost same-ID runtime PUT remains duplicate rejection as in pinned v1.16; file-backed same-ID PUT quiesces the old generation and commits a validated replacement. Contained mode uses exact file grants or connect-only directory authority without ambient access or a steady-state helper. Continue auditing complete caching, limiter, backend, snapshot serialization/restore, performance, and remaining aggregate storage outcomes before promotion.",
+      "summary": "Regular-file and macOS block-special Sync/portable-Async startup/runtime behavior plus direct or contained vhost-user block cover selected MMIO/PCI transports, root/partuuid/cache/flush semantics, bounded session-level asynchronous execution, limiter/dirty/status/used/interrupt publication, metrics, cleanup, failure-atomic live regular/block backing or engine replacement, PCI hotplug/delete/reuse, shared-memory vring transfer, exact active vhost config refresh, and explicit snapshot rejection. Direct block-special control uses public geometry/cache ioctls; contained BBG2 grants and the fixed retained-descriptor facet preserve exact identity/access/geometry without ambient paths or added entitlements. Four signed block-special owner scenarios cover 4/6/8-MiB capacity, GET_ID, guest persistence, rollback, capture-twice rejection, and exact cleanup. Capture-ready traversal retains exact config/backing/queue/limiter/retry/MMIO-or-PCI state and runs one stop-all/drain-all/publish-all/capture-all/resume-all Async transaction; live vhost owners reject first without mutation, and block-special native-v1 rejects after fresh inspection but before artifacts. Vhost same-ID runtime PUT remains duplicate rejection; file-backed same-ID PUT quiesces the old generation and commits a validated replacement. Continue auditing complete caching, limiter, backend, snapshot serialization/restore, performance, and remaining aggregate storage outcomes under #1450 before promotion.",
       "source_refs": [
         "corpus:block-caching",
         "corpus:block-io-engine",
