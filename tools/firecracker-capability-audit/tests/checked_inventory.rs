@@ -183,6 +183,17 @@ fn delivery_closure_policy_is_stable() {
         "corpus:memory-hotplug",
         "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
     ];
+    const ENTROPY_TERMINAL: [&str; 5] = [
+        "api-operation:PUT /entropy",
+        "api-path:/entropy",
+        "api-property:EntropyDevice.rate_limiter",
+        "api-property:FullVmConfiguration.entropy",
+        "api-schema:EntropyDevice",
+    ];
+    const ENTROPY_WAVE_6: [&str; 2] = [
+        "corpus:entropy",
+        "semantic.device:entropy-queues-limits-metrics-and-state",
+    ];
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -231,8 +242,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 181);
-    assert_eq!(count(Disposition::AuditRequired), 217);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 186);
+    assert_eq!(count(Disposition::AuditRequired), 212);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -455,6 +466,60 @@ fn delivery_closure_policy_is_stable() {
                 .count(),
             1,
             "checked memory-hotplug contract row must be unique: {id}"
+        );
+    }
+
+    let entropy_ids = ENTROPY_TERMINAL
+        .into_iter()
+        .chain(ENTROPY_WAVE_6)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        entropy_ids.len(),
+        7,
+        "entropy closure ledger must stay exact"
+    );
+    for id in ENTROPY_TERMINAL {
+        let capability = by_id.get(id).expect("terminal entropy record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "entropy record must remain implemented: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "terminal entropy record must retain concrete evidence: {id}"
+        );
+    }
+    for id in ENTROPY_WAVE_6 {
+        let capability = by_id.get(id).expect("Wave 6 entropy record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "Wave 6 entropy handoff must remain audit-owned: {id}"
+        );
+        assert!(
+            capability.summary.contains("Wave 6"),
+            "Wave 6 entropy handoff must name its owner: {id}"
+        );
+    }
+
+    let entropy_contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/entropy-contract.md"),
+    )
+    .expect("checked entropy contract must be readable");
+    assert_eq!(
+        entropy_contract
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .count(),
+        7,
+        "checked entropy contract must contain each exact ledger row once"
+    );
+    for id in entropy_ids {
+        assert_eq!(
+            entropy_contract.matches(&format!("| `{id}` |")).count(),
+            1,
+            "checked entropy contract row must be unique: {id}"
         );
     }
 

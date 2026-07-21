@@ -60,6 +60,11 @@ claims mechanically visible.
   API/path/property/schema leaves, records singleton metrics and exact
   shared-aperture/HVF/dirty capture ownership, and hands exactly two
   serialization/restore aggregates to Wave 6.
+- [`entropy-contract.md`](entropy-contract.md) is the #1475 virtio-rng ledger.
+  It pins all seven records, promotes the five complete
+  API/path/property/schema leaves, records dual-bucket retry and exact
+  MMIO/PCI capture-ready ownership, and hands exactly two
+  serialization/restore aggregates to Wave 6.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -397,6 +402,29 @@ operation/path/property/schema leaves. Exactly `corpus:memory-hotplug` and
 `audit-required`; Wave 6 owns encoding, artifact integration, restore,
 migration/clone behavior, portability, and signed restored-guest outcomes. The
 current overlay is therefore 181 `implemented-and-verified`, 217
+`audit-required`, three `missing-platform-feasible`, and 17
+`proven-platform-impossible` records.
+
+#1475 completes the live, observable, and capture-ready entropy slice under
+#1440. Request processing caps each writable chain at 64 KiB, obtains bytes
+from the host operating system, and exposes seven Firecracker-shaped entropy
+metrics. Optional operations and bandwidth buckets retain exactly one
+throttled descriptor, wake it at the earliest deadline, and roll back exact
+budget/burst/refill-origin state when a post-consumption host-memory or
+used-ring failure prevents publication. Detached MMIO/PCI state validates
+feature negotiation, activation, exact queue geometry/ranges/cursors, external
+limiter configuration, redacted bucket state, the pending descriptor, and
+host-time-free retry agreement with the quiesced HVF scheduler. The public
+native-v1 create path traverses this state before optional-profile rejection
+without claiming an encoding. Signed Linux guests prove marker-gated first and
+repeated `/dev/hwrng` reads, real throttling, pause/capture/resume, retry
+metrics, and cleanup over both selected transports. The checked
+[`entropy-contract.md`](entropy-contract.md) promotes all five API
+operation/path/property/schema leaves. Exactly `corpus:entropy` and
+`semantic.device:entropy-queues-limits-metrics-and-state` remain
+`audit-required`; Wave 6 owns encoding, artifact integration, restore,
+migration/clone behavior, portability, and signed restored-guest outcomes. The
+current overlay is therefore 186 `implemented-and-verified`, 212
 `audit-required`, three `missing-platform-feasible`, and 17
 `proven-platform-impossible` records.
 

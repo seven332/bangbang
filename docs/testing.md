@@ -974,6 +974,16 @@ identities, count arithmetic, and removal of stale future-#1388 summaries. The
 records the corresponding evidence and later-wave boundaries. Generic source,
 reference, and disposition invariants remain owned by the validator itself.
 
+After the checked storage, balloon, memory-hotplug, and entropy delivery
+closures, the same 418-record overlay contains 186
+`implemented-and-verified`, 212 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. The
+[entropy closure ledger](../compat/firecracker/v1.16.0/entropy-contract.md)
+pins five terminal API leaves and exactly two Wave 6 optional-device
+serialization/restore handoffs. When changing entropy code or evidence, run
+the focused runtime tests, both signed MMIO/PCI lifecycle cases, the capability
+validator, and the ordinary workspace gates.
+
 Run the offline compiler's focused surface with:
 
 ```sh
@@ -1417,10 +1427,17 @@ interface, fetch a deterministic MMDS value from the guest through
 The API-driven v1 case also configures a nondefault `1280` MTU and requires the
 guest's selected Linux interface to report that value before the MMDS fetch can
 write its success marker.
-It also includes a direct-rootfs entropy scenario that configures `/entropy`,
-checks that the guest selected `virtio_rng` as the current hardware RNG, reads
-from `/dev/hwrng`, and writes a host-observable marker only after a non-empty
-read succeeds.
+It also includes paired direct-rootfs entropy lifecycle scenarios over default
+MMIO and product PCI. Each configures both limiter buckets, checks that Linux
+selected `virtio_rng`, completes one nonempty `/dev/hwrng` read, and then waits
+on a scratch-sector host continuation marker. The host establishes a metrics
+baseline, releases the guest, waits for a new limiter throttle, pauses the VM,
+and invokes public native-v1 creation. The expected optional-profile rejection
+occurs only after capture-ready entropy traversal and creates no artifacts.
+After resume, the guest completes eight additional nonempty reads and publishes
+a terminal marker; the host requires a retry-event metric and clean shutdown.
+The marker gate and two-second refill window make the pending retry observation
+causal rather than sleep-based.
 It also includes a direct-rootfs balloon scenario that configures `/balloon`,
 enables free-page reporting, checks that the guest bound a virtio-balloon driver
 and negotiated reporting feature bit 5, observes periodic optional statistics,
@@ -1698,6 +1715,14 @@ When the boot args include
 init script checks `/sys/class/misc/hw_random/rng_current` for `virtio_rng`,
 reads bytes from `/dev/hwrng`, and writes
 `BANGBANG_ENTROPY_GUEST_READ_OK` only after the read returns non-empty data.
+When the boot args include `bangbang.entropy-lifecycle=1`, it performs the
+marker-gated lifecycle used by #1475: validate `virtio_rng`, publish
+`BANGBANG_ENTROPY_LIFECYCLE_READY` after the first nonempty read, wait for
+`BANGBANG_ENTROPY_HOST_CONTINUE` in the next scratch sector, perform eight
+additional bounded nonempty reads, and publish
+`BANGBANG_ENTROPY_LIFECYCLE_OK`. Static failure markers classify driver,
+first-read, control, and repeated-read failures without copying entropy bytes
+into diagnostics.
 When the boot args include `bangbang.balloon-check=1`, the same init script
 checks the virtio bus for a device bound to the `virtio_balloon` driver and
 requires the device's negotiated feature bitmap to include free-page reporting
@@ -1780,7 +1805,8 @@ waits for distinct host replies, and writes
 `BANGBANG_VSOCK_HOST_MULTISTREAM_OK` only after both streams complete. These
 checks prove the kernel mounted the virtio-block root drive as `/`, give
 executable-boundary MMDS fetch coverage through the process-local MMDS-only
-packet path, prove guest-visible virtio-rng reads through `/dev/hwrng`, prove
+packet path, prove guest-visible virtio-rng reads plus limiter retry and
+capture-ready MMIO/PCI ownership through `/dev/hwrng`, prove
 guest virtio-balloon driver binding, prove guest-visible virtio-mem driver
 binding plus a guest-completed and public-API-observed requested/plugged
 `0 -> 128 MiB -> 0` lifecycle, prove guest-visible PL031 RTC
@@ -1794,6 +1820,8 @@ default init, that full networking compatibility is complete, that RTC alarm
 interrupts, mutable VMClock restore signaling or guest observation,
 or broader RTC-adjacent time/identity behavior is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
+Entropy optional-device encoding, restore, migration/clone, and cross-host
+token-clock portability remain the exact Wave 6 handoff.
 
 For vsock specifically, this evidence validates the **implemented supported live MMIO-or-PCI startup/Unix-socket subset**:
 dynamic 64-KiB credit windows with wrapping

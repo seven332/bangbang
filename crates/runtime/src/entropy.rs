@@ -6,15 +6,22 @@ use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemo
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
 };
-use crate::token_bucket::{TokenBucket, TokenBucketConfig, TokenBucketSnapshot};
+use crate::token_bucket::{
+    PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
+    TokenBucketSnapshot,
+};
 use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
-    UnsupportedVirtioMmioDeviceConfig, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
-    VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
-    VirtioMmioQueueRegisterError, VirtioMmioQueueState, VirtioMmioRegisterHandler,
-    VirtioMmioRegisterHandlerError,
+    UnsupportedVirtioMmioDeviceConfig, VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+    VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+    VirtioMmioDeviceActivationHandler, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError,
+    VirtioMmioQueueRegisters, VirtioMmioQueueState, VirtioMmioRegisterHandler,
+    VirtioMmioRegisterHandlerError, VirtioMmioTransportState,
 };
-use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
+use crate::virtio_pci::{
+    VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError,
+    VirtioPciTransportState,
+};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
@@ -151,6 +158,10 @@ impl EntropyTokenBucketConfig {
 
     const fn token_bucket_config(self) -> TokenBucketConfig {
         TokenBucketConfig::new(self.size, self.one_time_burst, self.refill_time)
+    }
+
+    const fn is_enabled(self) -> bool {
+        self.token_bucket_config().is_enabled()
     }
 }
 
@@ -486,6 +497,12 @@ pub struct VirtioRngRateLimiter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtioRngRateLimiterSnapshot {
+    bandwidth: Option<TokenBucketSnapshot>,
+    ops: Option<TokenBucketSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VirtioRngRateLimiterReduction {
     Allowed,
     Throttled { retry_after: Duration },
@@ -508,8 +525,7 @@ impl VirtioRngRateLimiter {
     }
 
     fn reduce_with_retry_at(&mut self, bytes: u64, now: Instant) -> VirtioRngRateLimiterReduction {
-        let bandwidth_snapshot = self.bandwidth.as_ref().map(TokenBucket::snapshot);
-        let ops_snapshot = self.ops.as_ref().map(TokenBucket::snapshot);
+        let snapshot = self.snapshot();
 
         if let Some(ops) = self.ops.as_mut()
             && let Some(retry_after) = ops.reduce_with_retry_at(1, now).retry_after()
@@ -521,26 +537,336 @@ impl VirtioRngRateLimiter {
                 .reduce_allow_overconsumption_with_retry_at(bytes, now)
                 .retry_after()
         {
-            self.restore(bandwidth_snapshot, ops_snapshot);
+            self.restore(snapshot);
             return VirtioRngRateLimiterReduction::Throttled { retry_after };
         }
 
         VirtioRngRateLimiterReduction::Allowed
     }
 
-    fn restore(
-        &mut self,
-        bandwidth_snapshot: Option<TokenBucketSnapshot>,
-        ops_snapshot: Option<TokenBucketSnapshot>,
-    ) {
-        if let (Some(bandwidth), Some(snapshot)) = (self.bandwidth.as_mut(), bandwidth_snapshot) {
+    fn snapshot(&self) -> VirtioRngRateLimiterSnapshot {
+        VirtioRngRateLimiterSnapshot {
+            bandwidth: self.bandwidth.as_ref().map(TokenBucket::snapshot),
+            ops: self.ops.as_ref().map(TokenBucket::snapshot),
+        }
+    }
+
+    fn restore(&mut self, snapshot: VirtioRngRateLimiterSnapshot) {
+        if let (Some(bandwidth), Some(snapshot)) = (self.bandwidth.as_mut(), snapshot.bandwidth) {
             bandwidth.restore(snapshot);
         }
-        if let (Some(ops), Some(snapshot)) = (self.ops.as_mut(), ops_snapshot) {
+        if let (Some(ops), Some(snapshot)) = (self.ops.as_mut(), snapshot.ops) {
             ops.restore(snapshot);
         }
     }
 }
+
+fn restore_rng_rate_limiter_snapshot(
+    limiter: &mut Option<&mut VirtioRngRateLimiter>,
+    snapshot: Option<VirtioRngRateLimiterSnapshot>,
+) {
+    if let (Some(limiter), Some(snapshot)) = (limiter.as_deref_mut(), snapshot) {
+        limiter.restore(snapshot);
+    }
+}
+
+/// Detached token-bucket state used by the entropy capture contract.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioRngTokenBucketCaptureState {
+    config: EntropyTokenBucketConfig,
+    budget: u64,
+    one_time_burst: u64,
+    age_nanos: u64,
+}
+
+impl VirtioRngTokenBucketCaptureState {
+    const fn from_persisted(
+        config: EntropyTokenBucketConfig,
+        state: PersistedTokenBucketState,
+    ) -> Self {
+        Self {
+            config,
+            budget: state.budget(),
+            one_time_burst: state.one_time_burst(),
+            age_nanos: state.age_nanos(),
+        }
+    }
+
+    pub const fn config(self) -> EntropyTokenBucketConfig {
+        self.config
+    }
+
+    pub const fn budget(self) -> u64 {
+        self.budget
+    }
+
+    pub const fn one_time_burst(self) -> u64 {
+        self.one_time_burst
+    }
+
+    pub const fn age_nanos(self) -> u64 {
+        self.age_nanos
+    }
+}
+
+impl fmt::Debug for VirtioRngTokenBucketCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioRngTokenBucketCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Detached bandwidth and operations limiter state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioRngRateLimiterCaptureState {
+    bandwidth: Option<VirtioRngTokenBucketCaptureState>,
+    ops: Option<VirtioRngTokenBucketCaptureState>,
+}
+
+impl VirtioRngRateLimiterCaptureState {
+    pub const fn bandwidth(self) -> Option<VirtioRngTokenBucketCaptureState> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<VirtioRngTokenBucketCaptureState> {
+        self.ops
+    }
+
+    pub const fn is_configured(self) -> bool {
+        self.bandwidth.is_some() || self.ops.is_some()
+    }
+}
+
+impl fmt::Debug for VirtioRngRateLimiterCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioRngRateLimiterCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioRngRateLimiterCaptureError {
+    MissingRateLimiter,
+    UnexpectedRateLimiter,
+    MissingBandwidthBucket,
+    UnexpectedBandwidthBucket,
+    InvalidBandwidthBucket,
+    MissingOpsBucket,
+    UnexpectedOpsBucket,
+    InvalidOpsBucket,
+}
+
+impl fmt::Display for VirtioRngRateLimiterCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRateLimiter => {
+                formatter.write_str("configured entropy rate limiter is missing")
+            }
+            Self::UnexpectedRateLimiter => {
+                formatter.write_str("unconfigured entropy rate limiter is present")
+            }
+            Self::MissingBandwidthBucket => {
+                formatter.write_str("configured entropy bandwidth bucket is missing")
+            }
+            Self::UnexpectedBandwidthBucket => {
+                formatter.write_str("unconfigured entropy bandwidth bucket is present")
+            }
+            Self::InvalidBandwidthBucket => {
+                formatter.write_str("entropy bandwidth bucket state is invalid")
+            }
+            Self::MissingOpsBucket => {
+                formatter.write_str("configured entropy operations bucket is missing")
+            }
+            Self::UnexpectedOpsBucket => {
+                formatter.write_str("unconfigured entropy operations bucket is present")
+            }
+            Self::InvalidOpsBucket => {
+                formatter.write_str("entropy operations bucket state is invalid")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngRateLimiterCaptureError {}
+
+fn capture_rng_token_bucket_state_at(
+    config: Option<EntropyTokenBucketConfig>,
+    bucket: Option<&TokenBucket>,
+    now: Instant,
+    missing: VirtioRngRateLimiterCaptureError,
+    unexpected: VirtioRngRateLimiterCaptureError,
+    invalid: VirtioRngRateLimiterCaptureError,
+) -> Result<Option<VirtioRngTokenBucketCaptureState>, VirtioRngRateLimiterCaptureError> {
+    match (config, bucket) {
+        (Some(config), Some(bucket)) => bucket
+            .persisted_state_at(config.token_bucket_config(), now)
+            .map(|state| {
+                Some(VirtioRngTokenBucketCaptureState::from_persisted(
+                    config, state,
+                ))
+            })
+            .map_err(|_: PersistedTokenBucketStateError| invalid),
+        (Some(_), None) => Err(missing),
+        (None, Some(_)) => Err(unexpected),
+        (None, None) => Ok(None),
+    }
+}
+
+fn capture_rng_rate_limiter_state_at(
+    config: Option<EntropyRateLimiterConfig>,
+    limiter: Option<&VirtioRngRateLimiter>,
+    now: Instant,
+) -> Result<VirtioRngRateLimiterCaptureState, VirtioRngRateLimiterCaptureError> {
+    let config = config.and_then(|config| {
+        let bandwidth = config.bandwidth().filter(|bucket| bucket.is_enabled());
+        let ops = config.ops().filter(|bucket| bucket.is_enabled());
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(EntropyRateLimiterConfig::new(bandwidth, ops))
+        }
+    });
+    let (config, limiter) = match (config, limiter) {
+        (Some(config), Some(limiter)) => (config, limiter),
+        (Some(_), None) => return Err(VirtioRngRateLimiterCaptureError::MissingRateLimiter),
+        (None, Some(_)) => return Err(VirtioRngRateLimiterCaptureError::UnexpectedRateLimiter),
+        (None, None) => {
+            return Ok(VirtioRngRateLimiterCaptureState {
+                bandwidth: None,
+                ops: None,
+            });
+        }
+    };
+
+    let bandwidth = capture_rng_token_bucket_state_at(
+        config.bandwidth(),
+        limiter.bandwidth.as_ref(),
+        now,
+        VirtioRngRateLimiterCaptureError::MissingBandwidthBucket,
+        VirtioRngRateLimiterCaptureError::UnexpectedBandwidthBucket,
+        VirtioRngRateLimiterCaptureError::InvalidBandwidthBucket,
+    )?;
+    let ops = capture_rng_token_bucket_state_at(
+        config.ops(),
+        limiter.ops.as_ref(),
+        now,
+        VirtioRngRateLimiterCaptureError::MissingOpsBucket,
+        VirtioRngRateLimiterCaptureError::UnexpectedOpsBucket,
+        VirtioRngRateLimiterCaptureError::InvalidOpsBucket,
+    )?;
+
+    Ok(VirtioRngRateLimiterCaptureState { bandwidth, ops })
+}
+
+/// Host-time-free retry disposition captured by an owning backend.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VirtioRngRetryCaptureState {
+    None,
+    Immediate,
+    After { remaining_nanos: u64 },
+}
+
+impl VirtioRngRetryCaptureState {
+    pub const fn has_retry(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub const fn remaining_nanos(self) -> Option<u64> {
+        match self {
+            Self::None | Self::Immediate => None,
+            Self::After { remaining_nanos } => Some(remaining_nanos),
+        }
+    }
+}
+
+impl fmt::Debug for VirtioRngRetryCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let disposition = match self {
+            Self::None => "none",
+            Self::Immediate => "immediate",
+            Self::After { .. } => "delayed",
+        };
+        formatter
+            .debug_tuple("VirtioRngRetryCaptureState")
+            .field(&disposition)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioRngQueueCaptureState {
+    next_available: u16,
+    next_used: u16,
+}
+
+impl VirtioRngQueueCaptureState {
+    pub const fn next_available(self) -> u16 {
+        self.next_available
+    }
+
+    pub const fn next_used(self) -> u16 {
+        self.next_used
+    }
+}
+
+impl fmt::Debug for VirtioRngQueueCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioRngQueueCaptureState")
+            .field("cursors", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioRngQueueCaptureError {
+    TransportMismatch,
+    AvailableRingInvalid,
+    UsedRingInvalid,
+    QueueRangeInvalid,
+    QueueRangesOverlap,
+    UsedCursorMismatch,
+    AvailableCursorOutOfBounds,
+    UnpublishedDescriptorCountMismatch { actual: u16 },
+    PendingDescriptorMissing,
+    PendingDescriptorDuplicated,
+}
+
+impl fmt::Display for VirtioRngQueueCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TransportMismatch => {
+                formatter.write_str("active queue does not match transport queue state")
+            }
+            Self::AvailableRingInvalid => formatter.write_str("available ring is invalid"),
+            Self::UsedRingInvalid => formatter.write_str("used ring is invalid"),
+            Self::QueueRangeInvalid => formatter.write_str("queue range is invalid"),
+            Self::QueueRangesOverlap => formatter.write_str("queue ranges overlap"),
+            Self::UsedCursorMismatch => {
+                formatter.write_str("used cursor does not match guest memory")
+            }
+            Self::AvailableCursorOutOfBounds => {
+                formatter.write_str("available cursor is inconsistent with guest memory")
+            }
+            Self::UnpublishedDescriptorCountMismatch { actual } => write!(
+                formatter,
+                "queue has {actual} consumed-but-unpublished descriptors"
+            ),
+            Self::PendingDescriptorMissing => {
+                formatter.write_str("rate-limited queue does not retain an available descriptor")
+            }
+            Self::PendingDescriptorDuplicated => {
+                formatter.write_str("rate-limited queue retains its descriptor more than once")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngQueueCaptureError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioRngQueue {
@@ -578,6 +904,96 @@ impl VirtioRngQueue {
 
     pub const fn used_ring(&self) -> &VirtqueueUsedRing {
         &self.used
+    }
+
+    fn capture_state(
+        &self,
+        transport: &VirtioMmioQueueState,
+        memory: &GuestMemory,
+        pending_rate_limited_queue: bool,
+    ) -> Result<VirtioRngQueueCaptureState, VirtioRngQueueCaptureError> {
+        if !transport.ready()
+            || transport.size() != self.available.queue_size()
+            || transport.descriptor_table() != self.available.descriptor_table()
+            || transport.driver_ring() != self.available.available_ring()
+            || transport.device_ring() != self.used.used_ring()
+            || self.available.queue_size() != self.used.queue_size()
+        {
+            return Err(VirtioRngQueueCaptureError::TransportMismatch);
+        }
+        self.available
+            .validate_mapped(memory)
+            .map_err(|_| VirtioRngQueueCaptureError::AvailableRingInvalid)?;
+        self.used
+            .validate_mapped(memory)
+            .map_err(|_| VirtioRngQueueCaptureError::UsedRingInvalid)?;
+        let descriptor_range = self
+            .available
+            .descriptor_table_range()
+            .map_err(|_| VirtioRngQueueCaptureError::QueueRangeInvalid)?;
+        let available_range = self
+            .available
+            .available_ring_range()
+            .map_err(|_| VirtioRngQueueCaptureError::QueueRangeInvalid)?;
+        let used_range = self
+            .used
+            .used_ring_range()
+            .map_err(|_| VirtioRngQueueCaptureError::QueueRangeInvalid)?;
+        if descriptor_range.overlaps(available_range)
+            || descriptor_range.overlaps(used_range)
+            || available_range.overlaps(used_range)
+        {
+            return Err(VirtioRngQueueCaptureError::QueueRangesOverlap);
+        }
+
+        let used_index = self
+            .used
+            .used_index(memory)
+            .map_err(|_| VirtioRngQueueCaptureError::UsedRingInvalid)?;
+        if used_index != self.used.next_used() {
+            return Err(VirtioRngQueueCaptureError::UsedCursorMismatch);
+        }
+        let available_index = self
+            .available
+            .available_index(memory)
+            .map_err(|_| VirtioRngQueueCaptureError::AvailableRingInvalid)?;
+        let available_count = available_index.wrapping_sub(self.available.next_avail());
+        if available_count > self.available.queue_size() {
+            return Err(VirtioRngQueueCaptureError::AvailableCursorOutOfBounds);
+        }
+        let unpublished = self
+            .available
+            .next_avail()
+            .wrapping_sub(self.used.next_used());
+        if unpublished != 0 {
+            return Err(
+                VirtioRngQueueCaptureError::UnpublishedDescriptorCountMismatch {
+                    actual: unpublished,
+                },
+            );
+        }
+        if pending_rate_limited_queue {
+            let mut available = self.available.clone();
+            let pending = available
+                .pop_descriptor_chain(memory)
+                .map_err(|_| VirtioRngQueueCaptureError::AvailableRingInvalid)?
+                .ok_or(VirtioRngQueueCaptureError::PendingDescriptorMissing)?;
+            let pending_head = descriptor_chain_head(&pending)
+                .ok_or(VirtioRngQueueCaptureError::PendingDescriptorMissing)?;
+            while let Some(chain) = available
+                .pop_descriptor_chain(memory)
+                .map_err(|_| VirtioRngQueueCaptureError::AvailableRingInvalid)?
+            {
+                if descriptor_chain_head(&chain) == Some(pending_head) {
+                    return Err(VirtioRngQueueCaptureError::PendingDescriptorDuplicated);
+                }
+            }
+        }
+
+        Ok(VirtioRngQueueCaptureState {
+            next_available: self.available.next_avail(),
+            next_used: self.used.next_used(),
+        })
     }
 
     pub fn dispatch_with_source(
@@ -618,6 +1034,7 @@ impl VirtioRngQueue {
                 }
             };
 
+            let mut consumed_limiter_snapshot = None;
             let (bytes_written_to_guest, outcome) = match VirtioRngBuffer::parse(memory, &chain) {
                 Ok(buffer) => {
                     let requested_len = match entropy_request_len_from_buffer_len(buffer.len()) {
@@ -630,8 +1047,11 @@ impl VirtioRngQueue {
                         }
                     };
                     if let Some(limiter) = rate_limiter.as_deref_mut() {
+                        let snapshot = limiter.snapshot();
                         match limiter.reduce_with_retry_at(requested_len as u64, now) {
-                            VirtioRngRateLimiterReduction::Allowed => {}
+                            VirtioRngRateLimiterReduction::Allowed => {
+                                consumed_limiter_snapshot = Some(snapshot);
+                            }
                             VirtioRngRateLimiterReduction::Throttled { retry_after } => {
                                 if let Err(source) = self.available.undo_pop_descriptor_chain() {
                                     return Err(VirtioRngQueueDispatchError::AvailableRing {
@@ -656,6 +1076,10 @@ impl VirtioRngQueue {
                             requested_len,
                             source,
                         }) => {
+                            restore_rng_rate_limiter_snapshot(
+                                &mut rate_limiter,
+                                consumed_limiter_snapshot,
+                            );
                             return Err(VirtioRngQueueDispatchError::EntropyBufferAllocation {
                                 completed_dispatch: Box::new(dispatch),
                                 requested_len,
@@ -663,6 +1087,10 @@ impl VirtioRngQueue {
                             });
                         }
                         Err(VirtioRngFillError::CompletedLengthTooLarge { len }) => {
+                            restore_rng_rate_limiter_snapshot(
+                                &mut rate_limiter,
+                                consumed_limiter_snapshot,
+                            );
                             return Err(VirtioRngQueueDispatchError::CompletedLengthTooLarge {
                                 completed_dispatch: Box::new(dispatch),
                                 len,
@@ -672,6 +1100,10 @@ impl VirtioRngQueue {
                             (0, VirtioRngQueueDispatchOutcome::SourceError(source))
                         }
                         Err(VirtioRngFillError::BufferWrite(source)) => {
+                            restore_rng_rate_limiter_snapshot(
+                                &mut rate_limiter,
+                                consumed_limiter_snapshot,
+                            );
                             return Err(VirtioRngQueueDispatchError::BufferWrite {
                                 completed_dispatch: Box::new(dispatch),
                                 descriptor_head,
@@ -691,6 +1123,7 @@ impl VirtioRngQueue {
             ) {
                 Ok(publication) => publication,
                 Err(source) => {
+                    restore_rng_rate_limiter_snapshot(&mut rate_limiter, consumed_limiter_snapshot);
                     return Err(VirtioRngQueueDispatchError::UsedRing {
                         completed_dispatch: Box::new(dispatch),
                         descriptor_head,
@@ -704,6 +1137,199 @@ impl VirtioRngQueue {
         }
 
         Ok(dispatch)
+    }
+}
+
+/// Encoding-independent, detached virtio-rng device state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioRngDeviceCaptureState {
+    config: EntropyConfig,
+    available_features: u64,
+    negotiated_features: u64,
+    active_queue: Option<VirtioRngQueueCaptureState>,
+    rate_limiter: VirtioRngRateLimiterCaptureState,
+    pending_rate_limited_queue: bool,
+}
+
+impl VirtioRngDeviceCaptureState {
+    pub const fn config(&self) -> EntropyConfig {
+        self.config
+    }
+
+    pub const fn available_features(&self) -> u64 {
+        self.available_features
+    }
+
+    pub const fn negotiated_features(&self) -> u64 {
+        self.negotiated_features
+    }
+
+    pub const fn active_queue(&self) -> Option<VirtioRngQueueCaptureState> {
+        self.active_queue
+    }
+
+    pub const fn rate_limiter(&self) -> VirtioRngRateLimiterCaptureState {
+        self.rate_limiter
+    }
+
+    pub const fn has_pending_rate_limited_queue(&self) -> bool {
+        self.pending_rate_limited_queue
+    }
+}
+
+impl fmt::Debug for VirtioRngDeviceCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioRngDeviceCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioRngMmioCaptureState {
+    device: VirtioRngDeviceCaptureState,
+    transport: VirtioMmioTransportState,
+}
+
+impl VirtioRngMmioCaptureState {
+    pub const fn device(&self) -> &VirtioRngDeviceCaptureState {
+        &self.device
+    }
+
+    pub const fn transport(&self) -> &VirtioMmioTransportState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for VirtioRngMmioCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioRngMmioCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioRngPciCaptureState {
+    device: VirtioRngDeviceCaptureState,
+    transport: VirtioPciTransportState,
+}
+
+impl VirtioRngPciCaptureState {
+    pub const fn device(&self) -> &VirtioRngDeviceCaptureState {
+        &self.device
+    }
+
+    pub const fn transport(&self) -> &VirtioPciTransportState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for VirtioRngPciCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioRngPciCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioRngDeviceCaptureError {
+    DeviceIdMismatch,
+    AvailableFeaturesMismatch,
+    NegotiatedFeaturesUnsupported,
+    RequiredFeatureNotAcknowledged,
+    ActivationMismatch,
+    QueueCountMismatch,
+    Queue {
+        source: VirtioRngQueueCaptureError,
+    },
+    RateLimiter {
+        source: VirtioRngRateLimiterCaptureError,
+    },
+    PendingRetryWithoutActiveQueue,
+    PendingRetryWithoutRateLimiter,
+}
+
+impl fmt::Display for VirtioRngDeviceCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceIdMismatch => {
+                formatter.write_str("virtio-rng transport has the wrong device id")
+            }
+            Self::AvailableFeaturesMismatch => formatter
+                .write_str("virtio-rng transport available features do not match the device"),
+            Self::NegotiatedFeaturesUnsupported => {
+                formatter.write_str("virtio-rng negotiated unsupported features")
+            }
+            Self::RequiredFeatureNotAcknowledged => {
+                formatter.write_str("active virtio-rng transport did not acknowledge VERSION_1")
+            }
+            Self::ActivationMismatch => {
+                formatter.write_str("virtio-rng device and transport activation state disagree")
+            }
+            Self::QueueCountMismatch => {
+                formatter.write_str("virtio-rng transport must contain exactly one queue")
+            }
+            Self::Queue { source } => {
+                write!(formatter, "virtio-rng queue is not capture-ready: {source}")
+            }
+            Self::RateLimiter { source } => {
+                write!(
+                    formatter,
+                    "virtio-rng rate limiter is not capture-ready: {source}"
+                )
+            }
+            Self::PendingRetryWithoutActiveQueue => {
+                formatter.write_str("virtio-rng pending retry does not have an active queue")
+            }
+            Self::PendingRetryWithoutRateLimiter => formatter
+                .write_str("virtio-rng pending retry does not have a configured rate limiter"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngDeviceCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Queue { source } => Some(source),
+            Self::RateLimiter { source } => Some(source),
+            Self::DeviceIdMismatch
+            | Self::AvailableFeaturesMismatch
+            | Self::NegotiatedFeaturesUnsupported
+            | Self::RequiredFeatureNotAcknowledged
+            | Self::ActivationMismatch
+            | Self::QueueCountMismatch
+            | Self::PendingRetryWithoutActiveQueue
+            | Self::PendingRetryWithoutRateLimiter => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioRngPciCaptureError {
+    Device(VirtioRngDeviceCaptureError),
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Display for VirtioRngPciCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Device(_) => formatter.write_str("PCI virtio-rng device capture failed"),
+            Self::Endpoint(_) => formatter.write_str("PCI virtio-rng transport capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngPciCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Device(source) => Some(source),
+            Self::Endpoint(source) => Some(source),
+        }
     }
 }
 
@@ -751,6 +1377,73 @@ impl VirtioRngDevice {
 
     pub const fn has_pending_rate_limited_queue(&self) -> bool {
         self.pending_rate_limited_queue
+    }
+
+    fn capture_state_at(
+        &self,
+        config: EntropyConfig,
+        device_registers: &VirtioMmioDeviceRegisters,
+        queue_registers: &VirtioMmioQueueRegisters,
+        transport_activated: bool,
+        memory: &GuestMemory,
+        now: Instant,
+    ) -> Result<VirtioRngDeviceCaptureState, VirtioRngDeviceCaptureError> {
+        if device_registers.device_id() != VIRTIO_RNG_DEVICE_ID {
+            return Err(VirtioRngDeviceCaptureError::DeviceIdMismatch);
+        }
+        let available_features = device_registers.device_features();
+        if available_features != VIRTIO_MMIO_VERSION_1_FEATURE {
+            return Err(VirtioRngDeviceCaptureError::AvailableFeaturesMismatch);
+        }
+        let negotiated_features = device_registers.driver_features();
+        if negotiated_features & !available_features != 0 {
+            return Err(VirtioRngDeviceCaptureError::NegotiatedFeaturesUnsupported);
+        }
+        if self.active_queue.is_some() != transport_activated {
+            return Err(VirtioRngDeviceCaptureError::ActivationMismatch);
+        }
+        if transport_activated && negotiated_features & VIRTIO_MMIO_VERSION_1_FEATURE == 0 {
+            return Err(VirtioRngDeviceCaptureError::RequiredFeatureNotAcknowledged);
+        }
+        if queue_registers.queue_count() != VIRTIO_RNG_QUEUE_COUNT {
+            return Err(VirtioRngDeviceCaptureError::QueueCountMismatch);
+        }
+        if self.pending_rate_limited_queue && self.active_queue.is_none() {
+            return Err(VirtioRngDeviceCaptureError::PendingRetryWithoutActiveQueue);
+        }
+
+        let rate_limiter = capture_rng_rate_limiter_state_at(
+            config.rate_limiter(),
+            self.rate_limiter.as_ref(),
+            now,
+        )
+        .map_err(|source| VirtioRngDeviceCaptureError::RateLimiter { source })?;
+        if self.pending_rate_limited_queue && !rate_limiter.is_configured() {
+            return Err(VirtioRngDeviceCaptureError::PendingRetryWithoutRateLimiter);
+        }
+
+        let active_queue = match self.active_queue.as_ref() {
+            Some(queue) => {
+                let transport = queue_registers
+                    .queue(VIRTIO_RNG_QUEUE_INDEX_U32)
+                    .map_err(|_| VirtioRngDeviceCaptureError::QueueCountMismatch)?;
+                Some(
+                    queue
+                        .capture_state(transport, memory, self.pending_rate_limited_queue)
+                        .map_err(|source| VirtioRngDeviceCaptureError::Queue { source })?,
+                )
+            }
+            None => None,
+        };
+
+        Ok(VirtioRngDeviceCaptureState {
+            config,
+            available_features,
+            negotiated_features,
+            active_queue,
+            rate_limiter,
+            pending_rate_limited_queue: self.pending_rate_limited_queue,
+        })
     }
 
     pub fn activate_rng(
@@ -864,6 +1557,26 @@ impl VirtioRngDevice {
 }
 
 impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice> {
+    pub fn capture_entropy_state_at(
+        &self,
+        config: EntropyConfig,
+        memory: &GuestMemory,
+        now: Instant,
+    ) -> Result<VirtioRngMmioCaptureState, VirtioRngDeviceCaptureError> {
+        let device = self.activation_handler().capture_state_at(
+            config,
+            self.device_registers(),
+            self.queue_registers(),
+            self.is_device_activated(),
+            memory,
+            now,
+        )?;
+        Ok(VirtioRngMmioCaptureState {
+            device,
+            transport: self.transport_state(),
+        })
+    }
+
     pub fn has_pending_rng_queue_work(&self) -> bool {
         self.has_pending_queue_notifications()
             || self.activation_handler().has_pending_rate_limited_queue()
@@ -912,6 +1625,23 @@ impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevic
 }
 
 impl VirtioPciEndpoint<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice> {
+    pub fn capture_entropy_state_at(
+        &self,
+        config: EntropyConfig,
+        memory: &GuestMemory,
+        now: Instant,
+    ) -> Result<VirtioRngPciCaptureState, VirtioRngPciCaptureError> {
+        let (device, transport) = self
+            .capture_transport_with(|registers, queues, _, device, transport_activated| {
+                device.capture_state_at(config, registers, queues, transport_activated, memory, now)
+            })
+            .map_err(VirtioRngPciCaptureError::Endpoint)?;
+        Ok(VirtioRngPciCaptureState {
+            device: device.map_err(VirtioRngPciCaptureError::Device)?,
+            transport,
+        })
+    }
+
     pub fn has_pending_rng_queue_work(&self) -> Result<bool, VirtioPciEndpointError> {
         let work = self.admit_device_work()?;
         work.with_core_mut(|core| {
@@ -1732,9 +2462,10 @@ mod tests {
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
-        VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
-        VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
-        VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
+        VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_VERSION_1_FEATURE,
+        VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+        VirtioMmioDeviceActivationHandler, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters,
+        VirtioMmioRegister,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -1746,10 +2477,11 @@ mod tests {
         EntropyMmioLayout, EntropyMmioRegistrationError, GuestAddress, GuestMemory,
         PreparedEntropyDevice, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_MAX_REQUEST_BYTES,
         VIRTIO_RNG_QUEUE_SIZES, VirtioRngBufferParseError, VirtioRngDevice,
-        VirtioRngDeviceActivationError, VirtioRngDeviceNotificationError, VirtioRngEntropySource,
-        VirtioRngEntropySourceError, VirtioRngMmioHandler, VirtioRngOsEntropySource,
-        VirtioRngQueue, VirtioRngQueueBuildError, VirtioRngQueueDispatch,
-        VirtioRngQueueDispatchError, VirtioRngRateLimiter, VirtioRngRateLimiterReduction,
+        VirtioRngDeviceActivationError, VirtioRngDeviceCaptureError,
+        VirtioRngDeviceNotificationError, VirtioRngEntropySource, VirtioRngEntropySourceError,
+        VirtioRngMmioHandler, VirtioRngOsEntropySource, VirtioRngQueue, VirtioRngQueueBuildError,
+        VirtioRngQueueCaptureError, VirtioRngQueueDispatch, VirtioRngQueueDispatchError,
+        VirtioRngRateLimiter, VirtioRngRateLimiterCaptureError, VirtioRngRateLimiterReduction,
     };
 
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
@@ -1958,6 +2690,12 @@ mod tests {
                 VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
             )
             .expect("DRIVER status should write");
+        handler
+            .write_register(VirtioMmioRegister::DriverFeaturesSel, 1)
+            .expect("VERSION_1 feature selector should write");
+        handler
+            .write_register(VirtioMmioRegister::DriverFeatures, 1)
+            .expect("VERSION_1 feature should negotiate");
         handler
             .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
             .expect("FEATURES_OK status should write");
@@ -2942,6 +3680,198 @@ mod tests {
     }
 
     #[test]
+    fn rng_mmio_capture_is_detached_and_repeatable_while_inactive() {
+        let now = Instant::now();
+        let config = EntropyConfig::new();
+        let handler = rng_mmio_handler_with_entropy_config(config, now);
+        let memory = memory();
+
+        let first = handler
+            .capture_entropy_state_at(config, &memory, now)
+            .expect("inactive entropy device should be capture-ready");
+        let second = handler
+            .capture_entropy_state_at(config, &memory, now)
+            .expect("repeat inactive capture should succeed");
+
+        assert_eq!(first, second);
+        assert_eq!(first.device().config(), config);
+        assert_eq!(
+            first.device().available_features(),
+            VIRTIO_MMIO_VERSION_1_FEATURE
+        );
+        assert_eq!(first.device().negotiated_features(), 0);
+        assert_eq!(first.device().active_queue(), None);
+        assert!(!first.device().rate_limiter().is_configured());
+        assert!(!first.device().has_pending_rate_limited_queue());
+        assert!(!first.transport().is_device_activated());
+        assert_eq!(
+            format!("{first:?}"),
+            "VirtioRngMmioCaptureState { state: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
+    fn rng_mmio_capture_retains_one_throttled_descriptor_and_limiter_state() {
+        let now = Instant::now();
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, 1);
+        set_available_index(&mut memory, 2);
+        let rate_limiter = EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(4, Some(2), 100)),
+            Some(EntropyTokenBucketConfig::new(1, Some(1), 100)),
+        );
+        let config = EntropyConfig::new().with_rate_limiter(rate_limiter);
+        let mut handler = rng_mmio_handler_with_entropy_config(config, now);
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+        notify_rng_queue(&mut handler, 0);
+
+        let mut source = TestEntropySource::default();
+        let dispatch = handler
+            .dispatch_rng_queue_notifications_at(&mut memory, &mut source, now)
+            .expect("first request should complete and second should throttle");
+        let first = handler
+            .capture_entropy_state_at(config, &memory, now)
+            .expect("throttled device should be capture-ready");
+        let second = handler
+            .capture_entropy_state_at(config, &memory, now)
+            .expect("repeat throttled capture should succeed");
+
+        assert_eq!(dispatch.queue_dispatch().unwrap().processed_requests(), 1);
+        assert_eq!(
+            dispatch
+                .queue_dispatch()
+                .unwrap()
+                .rate_limiter_throttled_requests(),
+            1
+        );
+        assert_eq!(first, second);
+        assert_eq!(first.device().config(), config);
+        assert_eq!(
+            first
+                .device()
+                .active_queue()
+                .map(|queue| (queue.next_available(), queue.next_used())),
+            Some((1, 1))
+        );
+        assert!(first.device().has_pending_rate_limited_queue());
+        assert_eq!(
+            first.device().rate_limiter().bandwidth().unwrap().config(),
+            rate_limiter.bandwidth().unwrap()
+        );
+        assert_eq!(
+            first.device().rate_limiter().ops().unwrap().config(),
+            rate_limiter.ops().unwrap()
+        );
+        assert!(first.transport().is_device_activated());
+        assert_eq!(first.transport().pending_notifications(), [false]);
+        assert_ne!(
+            first.transport().interrupt_status().bits()
+                & DeviceInterruptKind::Queue.status().bits(),
+            0
+        );
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(source.calls(), &[4]);
+
+        queue_head(&mut memory, 2, 1);
+        set_available_index(&mut memory, 3);
+        assert!(matches!(
+            handler.capture_entropy_state_at(config, &memory, now),
+            Err(VirtioRngDeviceCaptureError::Queue {
+                source: VirtioRngQueueCaptureError::PendingDescriptorDuplicated
+            })
+        ));
+    }
+
+    #[test]
+    fn rng_mmio_capture_rejects_external_limiter_mismatch() {
+        let now = Instant::now();
+        let live = EntropyConfig::new().with_rate_limiter(EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(4, None, 100)),
+            None,
+        ));
+        let external = EntropyConfig::new().with_rate_limiter(EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(8, None, 100)),
+            None,
+        ));
+        let handler = rng_mmio_handler_with_entropy_config(live, now);
+        let memory = memory();
+
+        assert!(matches!(
+            handler.capture_entropy_state_at(external, &memory, now),
+            Err(VirtioRngDeviceCaptureError::RateLimiter {
+                source: VirtioRngRateLimiterCaptureError::InvalidBandwidthBucket
+            })
+        ));
+    }
+
+    #[test]
+    fn rng_mmio_capture_rejects_overlapping_queue_ranges() {
+        let now = Instant::now();
+        let config = EntropyConfig::new();
+        let memory = memory();
+        let mut handler = rng_mmio_handler_with_entropy_config(config, now);
+        configure_rng_mmio_handler_queue(&mut handler, TEST_AVAILABLE_RING);
+        activate_rng_mmio_handler(&mut handler);
+
+        assert!(matches!(
+            handler.capture_entropy_state_at(config, &memory, now),
+            Err(VirtioRngDeviceCaptureError::Queue {
+                source: VirtioRngQueueCaptureError::QueueRangesOverlap
+            })
+        ));
+    }
+
+    #[test]
+    fn rng_mmio_capture_accepts_disabled_external_limiter_buckets() {
+        let now = Instant::now();
+        let memory = memory();
+        let disabled = EntropyTokenBucketConfig::new(0, Some(7), 100);
+        let also_disabled = EntropyTokenBucketConfig::new(8, Some(3), 0);
+        let disabled_config = EntropyConfig::new().with_rate_limiter(
+            EntropyRateLimiterConfig::new(Some(disabled), Some(also_disabled)),
+        );
+        let disabled_handler = rng_mmio_handler_with_entropy_config(disabled_config, now);
+
+        let disabled_capture = disabled_handler
+            .capture_entropy_state_at(disabled_config, &memory, now)
+            .expect("disabled limiter buckets should match an absent live limiter");
+        assert_eq!(disabled_capture.device().config(), disabled_config);
+        assert!(!disabled_capture.device().rate_limiter().is_configured());
+
+        let enabled_ops = EntropyTokenBucketConfig::new(2, Some(1), 100);
+        let partial_config = EntropyConfig::new().with_rate_limiter(EntropyRateLimiterConfig::new(
+            Some(disabled),
+            Some(enabled_ops),
+        ));
+        let partial_handler = rng_mmio_handler_with_entropy_config(partial_config, now);
+
+        let partial_capture = partial_handler
+            .capture_entropy_state_at(partial_config, &memory, now)
+            .expect("disabled bucket should not hide the enabled peer bucket");
+        assert_eq!(partial_capture.device().config(), partial_config);
+        assert_eq!(partial_capture.device().rate_limiter().bandwidth(), None);
+        assert_eq!(
+            partial_capture
+                .device()
+                .rate_limiter()
+                .ops()
+                .map(|bucket| bucket.config()),
+            Some(enabled_ops)
+        );
+    }
+
+    #[test]
     fn rng_queue_dispatch_fills_single_writable_descriptor() {
         let mut memory = memory();
         write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
@@ -3463,6 +4393,7 @@ mod tests {
 
     #[test]
     fn rng_queue_dispatch_records_source_failure_with_zero_len() {
+        let now = Instant::now();
         let mut memory = memory();
         write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
         queue_head(&mut memory, 0, 0);
@@ -3470,8 +4401,10 @@ mod tests {
 
         let mut source = TestEntropySource::failing();
         let mut queue = rng_queue();
+        let mut limiter = bandwidth_limiter(8, 100, now);
+        let before = limiter.snapshot();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source, None)
+            .dispatch_with_source_at(&mut memory, &mut source, Some(&mut limiter), now)
             .expect("rng queue dispatch should complete source failure");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -3485,6 +4418,7 @@ mod tests {
         assert_eq!(read_guest_bytes(&memory, TEST_DATA, 8), vec![0; 8]);
         assert_eq!(read_used_index(&memory), 1);
         assert_eq!(read_used_len(&memory, 0), 0);
+        assert_ne!(limiter.snapshot(), before);
     }
 
     #[test]
@@ -3513,6 +4447,8 @@ mod tests {
 
     #[test]
     fn rng_queue_dispatch_returns_used_ring_error_with_completed_dispatch() {
+        let started = Instant::now();
+        let now = started + Duration::from_millis(50);
         let mut memory = memory();
         write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
         queue_head(&mut memory, 0, 0);
@@ -3528,9 +4464,16 @@ mod tests {
             .expect("used ring metadata should build");
         let mut queue = VirtioRngQueue::new(available, used);
         let mut source = TestEntropySource::default();
+        let config = EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(8, Some(4), 100)),
+            Some(EntropyTokenBucketConfig::new(1, Some(1), 100)),
+        );
+        let mut limiter = VirtioRngRateLimiter::new_at(config, started)
+            .expect("test rate limiter should be enabled");
+        let before = limiter.snapshot();
 
         let error = queue
-            .dispatch_with_source(&mut memory, &mut source, None)
+            .dispatch_with_source_at(&mut memory, &mut source, Some(&mut limiter), now)
             .expect_err("unmapped used ring should fail");
 
         match &error {
@@ -3548,5 +4491,75 @@ mod tests {
         }
         assert_eq!(error.completed_dispatch().processed_requests(), 0);
         assert_eq!(source.calls(), &[8]);
+        assert_eq!(limiter.snapshot(), before);
+    }
+
+    #[test]
+    fn rng_used_ring_failure_restores_only_the_unpublished_request_limiter_state() {
+        let started = Instant::now();
+        let now = started + Duration::from_millis(50);
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, 1);
+        set_available_index(&mut memory, 2);
+
+        let available = VirtqueueAvailableRing::new(
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let used_ring = TEST_USED_RING;
+        let used = VirtqueueUsedRing::new(used_ring, 1)
+            .expect("single-entry used ring metadata should build");
+        let mut queue = VirtioRngQueue::new(available, used);
+        let mut source = TestEntropySource::default();
+        let config = EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(8, Some(4), 100)),
+            Some(EntropyTokenBucketConfig::new(2, Some(1), 100)),
+        );
+        let mut limiter = VirtioRngRateLimiter::new_at(config, started)
+            .expect("test rate limiter should be enabled");
+        let mut expected_after_prefix = limiter.clone();
+        assert_eq!(
+            expected_after_prefix.reduce_with_retry_at(4, now),
+            VirtioRngRateLimiterReduction::Allowed
+        );
+
+        let error = queue
+            .dispatch_with_source_at(&mut memory, &mut source, Some(&mut limiter), now)
+            .expect_err("second descriptor head should exceed the used queue size");
+
+        assert!(matches!(
+            error,
+            VirtioRngQueueDispatchError::UsedRing {
+                descriptor_head: 1,
+                bytes_written_to_guest: 4,
+                ..
+            }
+        ));
+        assert_eq!(error.completed_dispatch().processed_requests(), 1);
+        assert_eq!(error.completed_dispatch().successful_requests(), 1);
+        assert_eq!(source.calls(), &[4, 4]);
+        assert_eq!(
+            read_u16(&memory, used_ring.checked_add(2).unwrap()),
+            1,
+            "the committed prefix must remain published"
+        );
+        assert_eq!(
+            read_u32(&memory, used_ring.checked_add(4).unwrap()),
+            0,
+            "the committed prefix must retain its descriptor head"
+        );
+        assert_eq!(limiter.snapshot(), expected_after_prefix.snapshot());
     }
 }
