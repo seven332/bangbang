@@ -1187,11 +1187,35 @@
     {
       "id": "api-operation:PUT /serial",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /serial.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:PUT /serial; strict API/model behavior, default stdio and configured-output ownership, limiting, live RX dispatch, metrics, cleanup, and capture-ready evidence are mapped in the checked serial closure contract.",
       "source_refs": [
         "api-operation:PUT /serial"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "serial request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "serial configuration, stdio ownership, limiting, UART RX, metrics, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed default stdio, configured output, limiting, pause-capture-resume, EOF, and process-isolation evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production launcher and App Sandbox worker serial stdio lifecycle evidence"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /snapshot/create",
@@ -1782,11 +1806,35 @@
     {
       "id": "api-path:/serial",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /serial.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-path:/serial PUT surface; strict API/model behavior, default stdio and configured-output ownership, limiting, live RX dispatch, metrics, cleanup, and capture-ready evidence are mapped in the checked serial closure contract.",
       "source_refs": [
         "api-path:/serial"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "serial request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "serial configuration, stdio ownership, limiting, UART RX, metrics, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed default stdio, configured output, limiting, pause-capture-resume, EOF, and process-isolation evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production launcher and App Sandbox worker serial stdio lifecycle evidence"
+        }
+      ]
     },
     {
       "id": "api-path:/snapshot/create",
@@ -5592,20 +5640,68 @@
     {
       "id": "api-property:SerialDevice.rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SerialDevice.rate_limiter.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:SerialDevice.rate_limiter; strict API/model behavior, default stdio and configured-output ownership, limiting, live RX dispatch, metrics, cleanup, and capture-ready evidence are mapped in the checked serial closure contract.",
       "source_refs": [
         "api-property:SerialDevice.rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "serial request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "serial configuration, stdio ownership, limiting, UART RX, metrics, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed default stdio, configured output, limiting, pause-capture-resume, EOF, and process-isolation evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production launcher and App Sandbox worker serial stdio lifecycle evidence"
+        }
+      ]
     },
     {
       "id": "api-property:SerialDevice.serial_out_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SerialDevice.serial_out_path.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:SerialDevice.serial_out_path; strict API/model behavior, default stdio and configured-output ownership, limiting, live RX dispatch, metrics, cleanup, and capture-ready evidence are mapped in the checked serial closure contract.",
       "source_refs": [
         "api-property:SerialDevice.serial_out_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "serial request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "serial configuration, stdio ownership, limiting, UART RX, metrics, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed default stdio, configured output, limiting, pause-capture-resume, EOF, and process-isolation evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production launcher and App Sandbox worker serial stdio lifecycle evidence"
+        }
+      ]
     },
     {
       "id": "api-property:SnapshotCreateParams.mem_file_path",
@@ -7031,11 +7127,35 @@
     {
       "id": "api-schema:SerialDevice",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema SerialDevice.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-schema:SerialDevice; strict API/model behavior, default stdio and configured-output ownership, limiting, live RX dispatch, metrics, cleanup, and capture-ready evidence are mapped in the checked serial closure contract.",
       "source_refs": [
         "api-schema:SerialDevice"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "serial request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "serial configuration, stdio ownership, limiting, UART RX, metrics, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed default stdio, configured output, limiting, pause-capture-resume, EOF, and process-isolation evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production launcher and App Sandbox worker serial stdio lifecycle evidence"
+        }
+      ]
     },
     {
       "id": "api-schema:SnapshotCreateParams",
@@ -9059,7 +9179,7 @@
     {
       "id": "semantic.device:serial-stdin-stdout-rx-and-restore",
       "family": "serial-and-time",
-      "summary": "Audit serial default stdout, configured output, stdin/RX, TX/RX queues, limiting, metrics, buffering, cleanup, and in-flight restore.",
+      "summary": "Live serial default stdout, configured output, terminal/FIFO stdin, bounded RX dispatch, TX limiting, metrics, Running/Paused behavior, MMIO ownership, capture-ready state, endpoint restoration, and cleanup are implemented and verified. Wave 6 retains this semantic aggregate solely for optional-device state encoding, artifact integration, live endpoint and UART restore construction, migration/clone and portability outcomes, and signed restored-guest certification; those missing outcomes must not be inferred from capture-ready state.",
       "source_refs": [
         "corpus:device-api",
         "corpus:snapshot-support"

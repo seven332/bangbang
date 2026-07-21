@@ -65,6 +65,11 @@ claims mechanically visible.
   API/path/property/schema leaves, records dual-bucket retry and exact
   MMIO/PCI capture-ready ownership, and hands exactly two
   serialization/restore aggregates to Wave 6.
+- [`serial-contract.md`](serial-contract.md) is the #1479 serial stdio ledger.
+  It pins all six records, promotes the five complete API/path/property/schema
+  leaves, records default stdout, configured-output stdin exclusion, bounded
+  terminal/FIFO RX and exact MMIO capture-ready ownership, and hands the one
+  serialization/endpoint-reconstruction aggregate to Wave 6.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -423,10 +428,35 @@ metrics, and cleanup over both selected transports. The checked
 operation/path/property/schema leaves. Exactly `corpus:entropy` and
 `semantic.device:entropy-queues-limits-metrics-and-state` remain
 `audit-required`; Wave 6 owns encoding, artifact integration, restore,
-migration/clone behavior, portability, and signed restored-guest outcomes. The
-current overlay is therefore 186 `implemented-and-verified`, 212
+migration/clone behavior, portability, and signed restored-guest outcomes. At
+that checkpoint the overlay was 186 `implemented-and-verified`, 212
 `audit-required`, three `missing-platform-feasible`, and 17
 `proven-platform-impossible` records.
+
+#1479 completes the live, observable, and capture-ready serial stdio slice
+under #1440. With no configured output path the production process now owns
+nonblocking stdout and supported terminal/FIFO stdin; a configured direct or
+contained output disables stdin. The owner run loop reads only current UART
+capacity, disarms a full 64-byte FIFO, rearms after guest drain, detaches on
+EOF/error, retries interrupt delivery, and consumes no input while Paused.
+Shared descriptor ownership restores original flags and terminal attributes
+only after the final endpoint drops. Detached state pairs exact external
+configuration with complete UART registers, RX bytes, status, and pending
+intents while excluding host descriptors, pipe buffers, and terminal state.
+The public native-v1 create path traverses this state before publication
+without claiming a new encoding. Signed direct processes prove default stdout,
+greater-than-FIFO stdin, configured-output exclusion, rate limiting,
+pause/capture/resume, EOF, concurrency isolation, metrics, and cleanup; the
+signed production bundle repeats the default stdio flow across the launcher
+and App Sandbox worker boundary. The checked
+[`serial-contract.md`](serial-contract.md) promotes all five API
+operation/path/property/schema leaves. Exactly
+`semantic.device:serial-stdin-stdout-rx-and-restore` remains
+`audit-required`; Wave 6 owns optional-device encoding, endpoint
+reconstruction, restore, migration/clone behavior, portability, and signed
+restored-guest outcomes. The current overlay is therefore 191
+`implemented-and-verified`, 207 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` records.
 
 ## Commands
 

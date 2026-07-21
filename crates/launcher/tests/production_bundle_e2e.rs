@@ -20,9 +20,10 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt as _, PermissionsExt, symlink};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -195,6 +196,11 @@ const GRANTED_HOST_VSOCK_CHUNK_BYTES: usize = 16 * 1024;
 const GRANTED_HOST_VSOCK_GUEST_SEED: u8 = 0x3d;
 const GRANTED_HOST_VSOCK_HOST_SEED: u8 = 0xa7;
 const GUEST_SERIAL_MARKER: &[u8] = b"Linux version";
+const GUEST_SERIAL_RX_BOOT_ARGS: &str =
+    "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rdinit=/serial-rx-init";
+const GUEST_SERIAL_RX_READY_MARKER: &str = "BANGBANG_SERIAL_RX_READY";
+const GUEST_SERIAL_RX_SUCCESS_MARKER: &str = "BANGBANG_SERIAL_RX_OK";
+const GUEST_SERIAL_RX_FAILURE_MARKER: &str = "BANGBANG_SERIAL_RX_FAIL";
 const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
 const DIRECT_ROOTFS_PMEM_ROOT_RO_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.pmem-root=ro";
 const DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER: &[u8] = b"BANGBANG_PMEM_ROOT_RO_OK";
@@ -3180,6 +3186,85 @@ fn normal_bundle_adopts_delayed_output_grants_by_descriptor_identity() {
 
     fixture.assert_original_outputs();
     fixture.assert_replacement_outputs_unchanged();
+}
+
+#[test]
+fn normal_bundle_streams_default_serial_stdio_across_launcher_worker_boundary() {
+    let bundle = production_bundle();
+    let mut running = spawn_ready_serial_api_launcher(&bundle, "serial-stdio");
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        ),
+        204,
+        "PUT bundle serial stdio machine config",
+    );
+    let resources = worker_bundle(&bundle).join("Contents/Resources");
+    let boot_source = serde_json::json!({
+        "kernel_image_path": path_text(&resources.join("guest-kernel")),
+        "initrd_path": path_text(&resources.join("guest-initrd")),
+        "boot_args": GUEST_SERIAL_RX_BOOT_ARGS,
+    });
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/boot-source",
+            &serde_json::to_string(&boot_source)
+                .expect("bundle serial boot source should serialize"),
+        ),
+        204,
+        "PUT bundle serial stdio boot source",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start bundle serial stdio guest",
+    );
+    running
+        .wait_for_stdout_marker(GUEST_SERIAL_RX_READY_MARKER, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| panic!("bundle serial receiver should become ready: {error}"));
+
+    let mut serial_input = b"BANGBANG_SERIAL_RX_".to_vec();
+    serial_input.extend(std::iter::repeat_n(b'A', 80));
+    serial_input.extend_from_slice(b"_END\n");
+    running.write_stdin(&serial_input);
+    running
+        .wait_for_stdout_marker(GUEST_SERIAL_RX_SUCCESS_MARKER, PROCESS_TIMEOUT)
+        .unwrap_or_else(|error| {
+            panic!("bundle worker should receive the full launcher stdin stream: {error}")
+        });
+    assert!(
+        !running
+            .stdout_snapshot()
+            .contains(GUEST_SERIAL_RX_FAILURE_MARKER)
+    );
+    running.close_stdin();
+    thread::sleep(Duration::from_millis(100));
+    assert_http_status(
+        &http_get(&running.socket, "/"),
+        200,
+        "bundle API after serial stdin EOF",
+    );
+
+    let launcher_pid = i32::try_from(running.child.id()).expect("launcher PID should fit");
+    // SAFETY: This targets the live unreaped launcher owned by the test.
+    assert_eq!(unsafe { libc::kill(launcher_pid, libc::SIGTERM) }, 0);
+    let (status, stdout, stderr) = running.wait("bundle serial stdio graceful stop");
+    assert!(
+        status.success(),
+        "bundle serial stdio should stop cleanly: {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains(GUEST_SERIAL_RX_READY_MARKER));
+    assert!(stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
+    assert!(!stdout.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
+    assert!(!running.socket.exists());
+    assert!(session_entries().is_empty());
 }
 
 #[test]
@@ -7670,6 +7755,100 @@ struct RunningApiLauncher {
     completed: bool,
 }
 
+#[derive(Debug)]
+struct RunningSerialApiLauncher {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    socket: PathBuf,
+    stdout_reader: Option<JoinHandle<String>>,
+    stdout: Arc<Mutex<String>>,
+    stderr_reader: Option<JoinHandle<String>>,
+    completed: bool,
+}
+
+impl RunningSerialApiLauncher {
+    fn write_stdin(&mut self, bytes: &[u8]) {
+        self.stdin
+            .as_mut()
+            .expect("launcher stdin should remain open")
+            .write_all(bytes)
+            .expect("launcher stdin should accept serial bytes");
+    }
+
+    fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    fn stdout_snapshot(&self) -> String {
+        self.stdout
+            .lock()
+            .expect("launcher stdout snapshot should lock")
+            .clone()
+    }
+
+    fn wait_for_stdout_marker(&self, marker: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let output = self.stdout_snapshot();
+            if output.contains(marker) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "stdout did not contain {marker:?} before {timeout:?}; stdout:\n{output}"
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait(&mut self, context: &str) -> (ExitStatus, String, String) {
+        let status = if wait_for_child_exit(&self.child, PROCESS_TIMEOUT) {
+            self.child
+                .wait()
+                .expect("serial launcher wait should succeed")
+        } else {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+            panic!("timed out waiting for {context}");
+        };
+        self.completed = true;
+        let stdout = self
+            .stdout_reader
+            .take()
+            .expect("serial stdout reader should exist")
+            .join()
+            .expect("serial stdout reader should join");
+        let stderr = self
+            .stderr_reader
+            .take()
+            .expect("serial stderr reader should exist")
+            .join()
+            .expect("serial stderr reader should join");
+        (status, stdout, stderr)
+    }
+}
+
+impl Drop for RunningSerialApiLauncher {
+    fn drop(&mut self) {
+        if !self.completed {
+            let pid = i32::try_from(self.child.id()).expect("serial launcher PID should fit");
+            // SAFETY: The unreaped test child owns this PID.
+            let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+            if !wait_for_child_exit(&self.child, DROP_CLEANUP_TIMEOUT) {
+                kill_child_group(&mut self.child);
+            }
+            let _ = self.child.wait();
+            if let Some(reader) = self.stdout_reader.take() {
+                let _ = reader.join();
+            }
+            if let Some(reader) = self.stderr_reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+}
+
 impl RunningApiLauncher {
     fn wait(&mut self, context: &str) -> ExitStatus {
         let status = if wait_for_child_exit(&self.child, PROCESS_TIMEOUT) {
@@ -7707,6 +7886,43 @@ impl RunningApiLauncher {
             );
         }
         status
+    }
+}
+
+fn spawn_ready_serial_api_launcher(bundle: &Path, name: &str) -> RunningSerialApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket = container_tmp_dir().join(format!("bbs-{:x}-{test_id:x}.sock", std::process::id()));
+    let mut child = Command::new(launcher(bundle))
+        .args(["--api-sock", path_text(&socket), "--id"])
+        .arg(format!("{name}-{}", std::process::id()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("production serial launcher should start");
+    let stdin = child.stdin.take().expect("launcher stdin should be piped");
+    let (ready, stdout_reader, stdout) =
+        read_stdout_until_line_shared(&mut child, "status: API server listening");
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "serial launcher should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningSerialApiLauncher {
+        child,
+        stdin: Some(stdin),
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stdout,
+        stderr_reader: Some(stderr_reader),
+        completed: false,
     }
 }
 
@@ -8669,6 +8885,37 @@ fn read_stdout_until_line(
         collected
     });
     (ready_receiver, reader)
+}
+
+fn read_stdout_until_line_shared(
+    child: &mut Child,
+    expected_line: &'static str,
+) -> (Receiver<()>, JoinHandle<String>, Arc<Mutex<String>>) {
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    let output = Arc::new(Mutex::new(String::new()));
+    let shared_output = Arc::clone(&output);
+    let reader = thread::spawn(move || {
+        let mut collected = String::new();
+        let mut ready_sender = Some(ready_sender);
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("launcher stdout should be readable");
+            if line == expected_line
+                && let Some(sender) = ready_sender.take()
+            {
+                let _ = sender.send(());
+            }
+            collected.push_str(&line);
+            collected.push('\n');
+            let mut output = shared_output
+                .lock()
+                .expect("launcher stdout snapshot should lock");
+            output.push_str(&line);
+            output.push('\n');
+        }
+        collected
+    });
+    (ready_receiver, reader, output)
 }
 
 fn read_stream<R>(mut stream: R) -> JoinHandle<String>

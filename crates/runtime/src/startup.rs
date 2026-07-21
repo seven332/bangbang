@@ -83,8 +83,10 @@ use crate::pmem::{
 };
 use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use crate::serial::{
-    SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialMmioCaptureError, SerialMmioCaptureState,
-    SerialMmioDevice, SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
+    CaptureReadySerialState, SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialInputReadyIntent,
+    SerialInterruptIntent, SerialMmioCaptureError, SerialMmioCaptureState, SerialMmioDevice,
+    SerialOutputFile, SerialReceiveInjectionError, SerialReceiveInjectionOutcome, SerialStdioInput,
+    SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use crate::snapshot_device::{
     SnapshotV1BlockRetryState, SnapshotV1DeviceCaptureInput, SnapshotV1DeviceState,
@@ -121,6 +123,7 @@ pub struct VmStartupResources {
     vhost_user_block_frontends: BTreeMap<String, PreparedVhostUserBlockFrontend>,
     pmem_backings: BTreeMap<String, PmemFileBacking>,
     serial_output: Option<SerialOutputFile>,
+    serial_input: Option<SerialStdioInput>,
     supplied_vsock_listener: Option<SuppliedVsockListener>,
     guest_memory_backing: GuestMemoryBacking,
 }
@@ -156,6 +159,10 @@ impl fmt::Debug for VmStartupResources {
                 &self.serial_output.as_ref().map(|_| "<owned>"),
             )
             .field(
+                "serial_input",
+                &self.serial_input.as_ref().map(|_| "<owned>"),
+            )
+            .field(
                 "supplied_vsock_listener",
                 &self.supplied_vsock_listener.as_ref().map(|_| "<owned>"),
             )
@@ -177,6 +184,7 @@ impl VmStartupResources {
             vhost_user_block_frontends: BTreeMap::new(),
             pmem_backings,
             serial_output: None,
+            serial_input: None,
             supplied_vsock_listener: None,
             guest_memory_backing: GuestMemoryBacking::Anonymous,
         }
@@ -197,6 +205,18 @@ impl VmStartupResources {
     /// Takes the already-opened serial output, if one was supplied.
     pub fn take_serial_output(&mut self) -> Option<SerialOutputFile> {
         self.serial_output.take()
+    }
+
+    /// Adds an already-prepared process serial input for this startup attempt.
+    #[must_use]
+    pub fn with_serial_input(mut self, serial_input: SerialStdioInput) -> Self {
+        self.serial_input = Some(serial_input);
+        self
+    }
+
+    /// Takes the prepared process serial input, if one was supplied.
+    pub fn take_serial_input(&mut self) -> Option<SerialStdioInput> {
+        self.serial_input.take()
     }
 
     /// Adds an already-bound vsock listener for this startup attempt.
@@ -235,12 +255,14 @@ impl VmStartupResources {
             && self.vhost_user_block_frontends.is_empty()
             && self.pmem_backings.is_empty()
             && self.serial_output.is_none()
+            && self.serial_input.is_none()
             && self.supplied_vsock_listener.is_none()
             && self.guest_memory_backing == GuestMemoryBacking::Anonymous
     }
 
     fn into_parts(self) -> VmStartupResourceParts {
         debug_assert!(self.serial_output.is_none());
+        debug_assert!(self.serial_input.is_none());
         VmStartupResourceParts {
             boot_files: self.boot_files,
             block_backings: self.block_backings,
@@ -2565,6 +2587,104 @@ pub fn capture_serial_state_for_device(
         .map_err(|source| Arm64BootSerialCaptureError::HandlerLookup { source })?
         .capture_state()
         .map_err(|source| Arm64BootSerialCaptureError::Device { source })
+}
+
+pub fn capture_ready_serial_state_for_device(
+    device: &Arm64BootSerialDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: &SerialConfig,
+) -> Result<CaptureReadySerialState, Arm64BootSerialCaptureError> {
+    capture_serial_state_for_device(device, mmio_dispatcher)
+        .map(|state| CaptureReadySerialState::new(config.clone(), state))
+}
+
+pub fn serial_receive_capacity_for_device(
+    device: &Arm64BootSerialDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<usize, Arm64BootSerialRuntimeError> {
+    serial_handler_for_device(device, mmio_dispatcher)
+        .map(|handler| handler.receive_fifo_capacity())
+}
+
+pub fn inject_serial_receive_bytes_for_device(
+    device: &Arm64BootSerialDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    bytes: &[u8],
+) -> Result<SerialReceiveInjectionOutcome, Arm64BootSerialRuntimeError> {
+    serial_handler_for_device(device, mmio_dispatcher)?
+        .inject_receive_bytes(bytes)
+        .map_err(|source| Arm64BootSerialRuntimeError::Injection { source })
+}
+
+pub fn pending_serial_interrupt_intent_for_device(
+    device: &Arm64BootSerialDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<Option<SerialInterruptIntent>, Arm64BootSerialRuntimeError> {
+    serial_handler_for_device(device, mmio_dispatcher)
+        .map(|handler| handler.pending_interrupt_intent())
+}
+
+pub fn take_serial_interrupt_intent_for_device(
+    device: &Arm64BootSerialDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<Option<SerialInterruptIntent>, Arm64BootSerialRuntimeError> {
+    serial_handler_for_device(device, mmio_dispatcher)
+        .map(|handler| handler.take_interrupt_intent())
+}
+
+pub fn take_serial_input_ready_intent_for_device(
+    device: &Arm64BootSerialDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<Option<SerialInputReadyIntent>, Arm64BootSerialRuntimeError> {
+    serial_handler_for_device(device, mmio_dispatcher)
+        .map(|handler| handler.take_input_ready_intent())
+}
+
+pub fn record_serial_host_input_error_for_device(
+    device: &Arm64BootSerialDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<(), Arm64BootSerialRuntimeError> {
+    serial_handler_for_device(device, mmio_dispatcher)?
+        .output()
+        .record_host_input_error();
+    Ok(())
+}
+
+fn serial_handler_for_device<'a>(
+    device: &Arm64BootSerialDevice,
+    mmio_dispatcher: &'a mut MmioDispatcher,
+) -> Result<&'a mut SerialMmioDevice<SharedSerialOutput>, Arm64BootSerialRuntimeError> {
+    mmio_dispatcher
+        .handler_mut::<SerialMmioDevice<SharedSerialOutput>>(device.region.id())
+        .map_err(|source| Arm64BootSerialRuntimeError::HandlerLookup { source })
+}
+
+#[derive(Debug)]
+pub enum Arm64BootSerialRuntimeError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    Injection { source: SerialReceiveInjectionError },
+}
+
+impl fmt::Display for Arm64BootSerialRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HandlerLookup { .. } => {
+                formatter.write_str("failed to locate the boot serial MMIO handler")
+            }
+            Self::Injection { .. } => {
+                formatter.write_str("failed to inject boot serial receive bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootSerialRuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::Injection { source } => Some(source),
+        }
+    }
 }
 
 #[derive(Debug)]

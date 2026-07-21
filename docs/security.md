@@ -2090,26 +2090,44 @@ hinting queue. These control-plane paths do not trust guest config-space writes
 as host commands or themselves perform host advice; only accepted runtime queue
 ranges reach the bounded discard owner.
 
-The current serial device is a TX-only MMIO output path. By default, guest
-serial bytes go to a bounded internal capture buffer; when `/serial` configures
-`serial_out_path`, startup opens that host path with nonblocking output
-semantics and routes guest TX bytes there. The default is not stdout, and there
-is no public RX/stdin or streaming surface. A configured serial `rate_limiter`
-must remain nonblocking: exhausted guest TX bytes are dropped instead of
-sleeping the VM thread or propagating a host-output backpressure error. Metrics
-may report the number of rate-limited dropped bytes, but must not include the
-dropped guest byte values. Treat serial output as untrusted guest data. Reviews
-for serial-output changes must preserve explicit host-observation behavior,
-bounded internal buffering where used, path redaction, limiter state scoped to
-one process output, and per-process ownership.
+The serial device has process-owned TX and RX boundaries. With no configured
+`serial_out_path`, guest TX uses nonblocking process stdout and a terminal or
+FIFO/pipe process stdin becomes guest RX. A configured direct or contained
+output instead disables stdin, so one submitted path cannot silently retain an
+unrelated ambient input authority. Closed, invalid, regular-file, socket, and
+other nonpollable stdin kinds are ignored. Production daemon mode supplies
+`/dev/null`, so default TX is discarded and RX is absent there by explicit
+launcher policy.
 
-Bangbang-native v1 accepts only default serial configuration and captures the
-serial MMIO metadata plus its six mutable register bytes. Restore constructs a
-fresh bounded internal buffer with empty UART metrics. A public output path,
-buffered or in-flight TX bytes, limiter configuration or budget, and UART
-counters are not snapshot state. This prevents a restore from silently
-reopening an old observability path or inheriting an old output budget and is
-not a Firecracker artifact-compatibility claim.
+Preparing default stdio duplicates close-on-exec owners but changes status
+flags on the shared open-file descriptions. Terminal stdin is also made raw for
+byte-exact input. The original input/output flags and terminal attributes are
+therefore retained as sensitive process state and restored only after the final
+split endpoint owner drops. Failures and debug output identify neither paths
+nor descriptors. Reviews must preserve final-owner restoration, exact
+per-process ownership, and cleanup on ordinary shutdown, terminal backend
+failure, partial startup, and launcher/worker teardown.
+
+Host stdin bytes are untrusted guest-control input. The owner run loop reads at
+most the current capacity of the 64-byte UART FIFO, unregisters a full FIFO,
+rearms only after guest drain, consumes no input while Paused, and detaches on
+EOF or error. It uses the existing readiness owner rather than a side thread.
+Anyone who can write the supplying terminal/FIFO can influence guest console
+input; Bangbang adds no authentication above the operating-system descriptor
+authority. Guest serial output is likewise untrusted data. A serial
+`rate_limiter` stays nonblocking: exhausted TX bytes are dropped instead of
+sleeping the VM thread or propagating host backpressure. Metrics may expose
+counts, including input, errors, overruns, and dropped bytes, but never serial
+byte values.
+
+Capture-ready traversal pairs reconstructible serial configuration with the
+complete guest-visible UART state while excluding stdout/stdin descriptors,
+terminal settings, pipe buffers, TX bytes, metrics, locks, and wakeup handles.
+Bangbang-native v1 still accepts only its representable baseline and encodes
+the legacy six mutable register bytes; restore constructs fresh default output
+with empty metrics. It does not preserve a public output path, limiter budget,
+RX bytes/intents, or any host endpoint. This prevents silent inheritance of
+source-process authority and is not a Firecracker artifact-compatibility claim.
 
 Block devices can expose host file contents to the guest and can write to the
 backing file when configured read-write. Operators should use dedicated disk
@@ -2378,8 +2396,8 @@ The current scaffold does not implement:
   gating remain #543 exclusions.
 - log rotation, syslog, journald, tracing, remote telemetry, or process-global
   panic/fatal observability durability
-- public run-loop control or serial RX/stdin, default stdout, and streaming
-  policy
+- a public serial streaming API, generalized serial artifact encoding/restore,
+  and destination-authorized endpoint reconstruction/portability policy
 
 These are future security design and implementation topics. PRs that add new
 host-facing resources should update this document and include resource-specific

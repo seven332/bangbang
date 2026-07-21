@@ -1102,18 +1102,21 @@ does not. Bangbang does not claim process-global panic/fatal durability,
 rotation, syslog, journald, tracing, or remote telemetry.
 
 Serial output is independently configured before boot with `PUT /serial`.
-Omitting or clearing `serial_out_path` keeps TX in a bounded 64-KiB internal
-buffer instead of stdout; a configured file/FIFO is opened nonblocking with
-path-redacted errors. An optional token bucket drops exhausted bytes without
-sleeping or failing the guest write and reports the drop count in `uart`
-metrics. The backend-neutral UART also owns a 64-byte RX FIFO, DR/OE/RDA and
-FIFO-clear behavior, typed interrupt/drain intents, and complete redacted
-capture-ready state. There is still no public serial RX source, stdin route,
-default stdout, or streaming API; host fd and GIC delivery remain separate
-work. The bangbang-native v1 profile keeps its six-register encoding, rejects
-live RX/status/intent state that it cannot represent, restores a fresh output
-buffer, and does not capture a public path, TX bytes, limiter state, or UART
-counters.
+Omitting or clearing `serial_out_path` sends TX to nonblocking process stdout
+and attaches terminal/FIFO process stdin as RX; configuring a direct file/FIFO
+or contained output grant disables stdin. An optional token bucket drops
+exhausted TX bytes without sleeping or failing the guest write and reports the
+drop count in `uart` metrics. The owner run loop reads only the available
+capacity of the backend-neutral 64-byte RX FIFO, disarms full input, rearms it
+after guest drain, and detaches on EOF/error. Input is consumed only while
+Running; Paused capture excludes run-loop mutation and returns reconstructible
+configuration plus complete UART state without host descriptors. Terminal raw
+mode and descriptor flags are restored when the final shared endpoint owner
+drops. There is no public streaming API. The bangbang-native v1 profile keeps
+its six-register encoding, rejects live RX/status/intent state that it cannot
+represent, restores a fresh output buffer, and does not capture a public path,
+host endpoint, TX/RX bytes, limiter state, or UART counters; complete encoding
+and endpoint reconstruction remain a Wave 6 handoff.
 
 The exact field classes, failure semantics, and native-v1 boundary are in
 [Firecracker Compatibility Scope](docs/firecracker-compatibility.md#firecracker-v1160-observability-contract).
@@ -1134,7 +1137,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 186 implemented-and-verified, 212 audit-required, three
+delivery overlay with 191 implemented-and-verified, 207 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1147,7 +1150,9 @@ records its exact 50-terminal/two-Wave-6 split, the
 [memory-hotplug closure ledger](compat/firecracker/v1.16.0/memory-hotplug-contract.md)
 records its exact 17-terminal/two-Wave-6 split, and the
 [entropy closure ledger](compat/firecracker/v1.16.0/entropy-contract.md)
-records its exact five-terminal/two-Wave-6 split.
+records its exact five-terminal/two-Wave-6 split, and the
+[serial closure ledger](compat/firecracker/v1.16.0/serial-contract.md) records
+its exact five-terminal/one-Wave-6 split.
 
 ## Build And Test
 
