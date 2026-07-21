@@ -1125,14 +1125,16 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 114 implemented-and-verified, 284 audit-required, three
+delivery overlay with 164 implemented-and-verified, 234 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
 tooling/specification, and Wave 8 final-certification handoffs. Nonterminal
 entries do not make new runtime claims. The
 [storage closure ledger](compat/firecracker/v1.16.0/storage-contract.md)
-records its exact 38-terminal/two-Wave-6 split.
+records its exact 38-terminal/two-Wave-6 split, and the
+[balloon closure ledger](compat/firecracker/v1.16.0/balloon-contract.md)
+records its exact 50-terminal/two-Wave-6 split.
 
 ## Build And Test
 

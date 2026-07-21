@@ -16,6 +16,7 @@ use bangbang_runtime::balloon::{
     BalloonHintingStatusError, BalloonMmioLayout, BalloonStats, BalloonStatsError,
     BalloonStatsUpdateInput, BalloonUpdateError, VIRTIO_BALLOON_DEVICE_ID,
     VirtioBalloonConfigSpace, VirtioBalloonDevice, VirtioBalloonDeviceNotificationError,
+    VirtioBalloonMmioCaptureState, VirtioBalloonPciCaptureError, VirtioBalloonPciCaptureState,
     VirtioBalloonQueueLayout,
 };
 use bangbang_runtime::block::async_executor::{BlockAsyncRuntimeError, SharedBlockAsyncRuntime};
@@ -52,7 +53,7 @@ use bangbang_runtime::metrics::{
     SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
     SharedVsockDeviceMetrics,
 };
-use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegionId};
+use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId};
 use bangbang_runtime::network::{
     NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioLayout,
     NetworkRuntimeMutationError, PreparedNetworkDevice, VIRTIO_NET_DEVICE_ID,
@@ -61,7 +62,7 @@ use bangbang_runtime::network::{
 };
 use bangbang_runtime::pci::{
     PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE, PciBarAddressSpace, PciBarAllocator,
-    PciClassCode, PciType0Configuration,
+    PciClassCode, PciSbdf, PciType0Configuration,
 };
 use bangbang_runtime::pmem::{
     PmemConfig, PmemFileBacking, PmemMmioLayout, PmemRuntimeMutationError, PmemUpdate,
@@ -93,7 +94,7 @@ use bangbang_runtime::startup::{
     Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
     Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
     Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, OpenedBlockDeviceLiveUpdate,
-    VmStartupResources, memory_hotplug_status_for_device,
+    VmStartupResources, capture_balloon_state_for_device, memory_hotplug_status_for_device,
     refresh_vhost_user_block_config_for_devices_with_signal, replace_arm64_boot_vmgenid,
     update_live_block_device_for_devices_with_opened, update_memory_hotplug_config_for_device,
 };
@@ -3723,6 +3724,134 @@ impl fmt::Display for HvfArm64BootStorageCaptureError {
 
 impl std::error::Error for HvfArm64BootStorageCaptureError {}
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum HvfArm64BootBalloonTransportState {
+    Mmio {
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        state: Box<VirtioBalloonMmioCaptureState>,
+    },
+    Pci {
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+        state: Box<VirtioBalloonPciCaptureState>,
+    },
+}
+
+impl HvfArm64BootBalloonTransportState {
+    pub fn mmio_state(&self) -> Option<&VirtioBalloonMmioCaptureState> {
+        match self {
+            Self::Mmio { state, .. } => Some(state.as_ref()),
+            Self::Pci { .. } => None,
+        }
+    }
+
+    pub fn pci_state(&self) -> Option<&VirtioBalloonPciCaptureState> {
+        match self {
+            Self::Pci { state, .. } => Some(state.as_ref()),
+            Self::Mmio { .. } => None,
+        }
+    }
+}
+
+impl fmt::Debug for HvfArm64BootBalloonTransportState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mmio { .. } => formatter.write_str("BalloonTransportState::Mmio(<redacted>)"),
+            Self::Pci { .. } => formatter.write_str("BalloonTransportState::Pci(<redacted>)"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64BootBalloonCaptureState {
+    config: BalloonConfig,
+    transport: HvfArm64BootBalloonTransportState,
+}
+
+impl HvfArm64BootBalloonCaptureState {
+    pub const fn config(&self) -> BalloonConfig {
+        self.config
+    }
+
+    pub const fn transport(&self) -> &HvfArm64BootBalloonTransportState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for HvfArm64BootBalloonCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfArm64BootBalloonCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootBalloonCaptureError {
+    OwnerUnavailable,
+    WrongQuiescenceGuard,
+    OwnershipMismatch {
+        configured: bool,
+        mmio_owner: bool,
+        pci_owner: bool,
+    },
+    GuestMemory,
+    MmioDispatcherBusy,
+    MmioDispatcherPoisoned,
+    MmioCapture,
+    PciPlacement,
+    PciCapture {
+        source: VirtioBalloonPciCaptureError,
+    },
+}
+
+impl fmt::Display for HvfArm64BootBalloonCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OwnerUnavailable => formatter.write_str("balloon capture owner is unavailable"),
+            Self::WrongQuiescenceGuard => {
+                formatter.write_str("balloon capture quiescence guard belongs to another session")
+            }
+            Self::OwnershipMismatch {
+                configured,
+                mmio_owner,
+                pci_owner,
+            } => write!(
+                formatter,
+                "balloon capture ownership mismatch: configured={configured}, mmio_owner={mmio_owner}, pci_owner={pci_owner}"
+            ),
+            Self::GuestMemory => formatter.write_str("balloon guest memory is unavailable"),
+            Self::MmioDispatcherBusy => formatter.write_str("balloon MMIO dispatcher is busy"),
+            Self::MmioDispatcherPoisoned => {
+                formatter.write_str("balloon MMIO dispatcher is poisoned")
+            }
+            Self::MmioCapture => formatter.write_str("MMIO balloon state capture failed"),
+            Self::PciPlacement => formatter.write_str("PCI balloon placement is unavailable"),
+            Self::PciCapture { source } => {
+                write!(formatter, "PCI balloon state capture failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootBalloonCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PciCapture { source } => Some(source),
+            Self::OwnerUnavailable
+            | Self::WrongQuiescenceGuard
+            | Self::OwnershipMismatch { .. }
+            | Self::GuestMemory
+            | Self::MmioDispatcherBusy
+            | Self::MmioDispatcherPoisoned
+            | Self::MmioCapture
+            | Self::PciPlacement => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureReadyBlockOwner {
     Mmio {
@@ -3969,6 +4098,92 @@ impl HvfArm64BootSnapshotV1DeviceCaptureOwners<'_> {
             )
             .map_err(|_| HvfArm64BootSnapshotV1DeviceCaptureError::RuntimeCapture)
     }
+}
+
+fn capture_ready_balloon_state(
+    backend: &HvfBackend,
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &Arm64BootRuntimeResources,
+    pci_data_devices: &Option<HvfArm64BootPciDataDevices>,
+    block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    config: Option<BalloonConfig>,
+    guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+) -> Result<Option<HvfArm64BootBalloonCaptureState>, HvfArm64BootBalloonCaptureError> {
+    if !Arc::ptr_eq(&guard.block.shared, &block_retry_wakeup_scheduler.shared) {
+        return Err(HvfArm64BootBalloonCaptureError::WrongQuiescenceGuard);
+    }
+
+    let mmio = runtime_resources.balloon_device.as_ref();
+    let pci = pci_data_devices
+        .as_ref()
+        .and_then(|devices| devices.balloon.as_ref());
+    let Some(config) = config else {
+        if mmio.is_none() && pci.is_none() {
+            return Ok(None);
+        }
+        return Err(HvfArm64BootBalloonCaptureError::OwnershipMismatch {
+            configured: false,
+            mmio_owner: mmio.is_some(),
+            pci_owner: pci.is_some(),
+        });
+    };
+    if mmio.is_some() == pci.is_some() {
+        return Err(HvfArm64BootBalloonCaptureError::OwnershipMismatch {
+            configured: true,
+            mmio_owner: mmio.is_some(),
+            pci_owner: pci.is_some(),
+        });
+    }
+
+    let memory = backend
+        .mapped_guest_memory()
+        .map_err(|_| HvfArm64BootBalloonCaptureError::GuestMemory)?;
+    let transport = if let Some(device) = mmio {
+        let mut dispatcher =
+            lock_boot_mmio_dispatcher(mmio_dispatcher).map_err(|error| match error {
+                HvfArm64BootMmioDispatcherError::Busy => {
+                    HvfArm64BootBalloonCaptureError::MmioDispatcherBusy
+                }
+                HvfArm64BootMmioDispatcherError::Poisoned => {
+                    HvfArm64BootBalloonCaptureError::MmioDispatcherPoisoned
+                }
+            })?;
+        let state = capture_balloon_state_for_device(device, &mut dispatcher, config, memory)
+            .map_err(|_| HvfArm64BootBalloonCaptureError::MmioCapture)?;
+        HvfArm64BootBalloonTransportState::Mmio {
+            region: device.registration.region(),
+            interrupt_line: device.fdt_device.interrupt_line,
+            state: Box::new(state),
+        }
+    } else {
+        let Some(device) = pci else {
+            return Err(HvfArm64BootBalloonCaptureError::OwnershipMismatch {
+                configured: true,
+                mmio_owner: false,
+                pci_owner: false,
+            });
+        };
+        let sbdf = device
+            .published
+            .sbdf()
+            .ok_or(HvfArm64BootBalloonCaptureError::PciPlacement)?;
+        let bar_range = device
+            .published
+            .bar_range()
+            .ok_or(HvfArm64BootBalloonCaptureError::PciPlacement)?;
+        let state = device
+            .published
+            .endpoint()
+            .capture_balloon_state(config, memory)
+            .map_err(|source| HvfArm64BootBalloonCaptureError::PciCapture { source })?;
+        HvfArm64BootBalloonTransportState::Pci {
+            sbdf,
+            bar_range,
+            state: Box::new(state),
+        }
+    };
+
+    Ok(Some(HvfArm64BootBalloonCaptureState { config, transport }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5418,6 +5633,22 @@ impl HvfArm64BootSession<'_> {
                 &self.entropy_retry_wakeup,
                 &self.entropy_retry_wakeup_scheduler,
             ),
+        )
+    }
+
+    pub fn capture_ready_balloon_state(
+        &self,
+        config: Option<BalloonConfig>,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<HvfArm64BootBalloonCaptureState>, HvfArm64BootBalloonCaptureError> {
+        capture_ready_balloon_state(
+            self.backend,
+            &self.mmio_dispatcher,
+            &self.runtime_resources,
+            &self.pci_data_devices,
+            &self.block_retry_wakeup_scheduler,
+            config,
+            guard,
         )
     }
 
@@ -7566,6 +7797,22 @@ impl OwnedHvfArm64BootSession {
                 &self.entropy_retry_wakeup,
                 &self.entropy_retry_wakeup_scheduler,
             ),
+        )
+    }
+
+    pub fn capture_ready_balloon_state(
+        &self,
+        config: Option<BalloonConfig>,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<HvfArm64BootBalloonCaptureState>, HvfArm64BootBalloonCaptureError> {
+        capture_ready_balloon_state(
+            &self.backend,
+            &self.mmio_dispatcher,
+            &self.runtime_resources,
+            &self.pci_data_devices,
+            &self.block_retry_wakeup_scheduler,
+            config,
+            guard,
         )
     }
 

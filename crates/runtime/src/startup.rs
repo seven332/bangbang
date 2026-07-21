@@ -12,8 +12,8 @@ use crate::balloon::{
     BalloonHintingStatusError, BalloonMmioDeviceRegistration, BalloonMmioLayout,
     BalloonMmioRegistrationError, BalloonPageCountOverflow, BalloonStats, BalloonStatsError,
     BalloonStatsUpdateInput, BalloonUpdateError, PreparedBalloonDevice,
-    VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError,
-    VirtioBalloonMmioHandler,
+    VirtioBalloonDeviceCaptureError, VirtioBalloonDeviceNotificationDispatch,
+    VirtioBalloonDeviceNotificationError, VirtioBalloonMmioCaptureState, VirtioBalloonMmioHandler,
 };
 use crate::block::async_executor::{
     BlockAsyncDriveGeneration, BlockAsyncRuntimeError, SharedBlockAsyncRuntime,
@@ -3627,6 +3627,45 @@ pub fn update_balloon_config_for_device(
         .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
         .map_err(BalloonUpdateError::HandlerLookup)?
         .update_balloon_config(config)
+}
+
+pub fn capture_balloon_state_for_device(
+    device: &Arm64BootBalloonDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: BalloonConfig,
+    memory: &GuestMemory,
+) -> Result<VirtioBalloonMmioCaptureState, Arm64BootBalloonCaptureError> {
+    mmio_dispatcher
+        .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+        .map_err(|source| Arm64BootBalloonCaptureError::HandlerLookup { source })?
+        .capture_balloon_state(config, memory)
+        .map_err(Arm64BootBalloonCaptureError::Device)
+}
+
+#[derive(Debug)]
+pub enum Arm64BootBalloonCaptureError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    Device(VirtioBalloonDeviceCaptureError),
+}
+
+impl fmt::Display for Arm64BootBalloonCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HandlerLookup { .. } => {
+                formatter.write_str("failed to locate the boot balloon MMIO handler")
+            }
+            Self::Device(_) => formatter.write_str("boot balloon MMIO capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootBalloonCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::Device(source) => Some(source),
+        }
+    }
 }
 
 pub fn update_memory_hotplug_config_for_device(

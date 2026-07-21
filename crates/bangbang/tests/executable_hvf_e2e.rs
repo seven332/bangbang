@@ -2783,7 +2783,7 @@ mod macos_arm64 {
         let balloon_response = http_put_json(
             &socket_path,
             "/balloon",
-            r#"{"amount_mib":8,"deflate_on_oom":false,"free_page_hinting":true,"free_page_reporting":true}"#,
+            r#"{"amount_mib":8,"deflate_on_oom":false,"stats_polling_interval_s":1,"free_page_hinting":true,"free_page_reporting":true}"#,
         );
         assert_no_content_response(&balloon_response, "PUT /balloon direct rootfs");
 
@@ -2792,6 +2792,7 @@ mod macos_arm64 {
         for expected in [
             r#""amount_mib":8"#,
             r#""deflate_on_oom":false"#,
+            r#""stats_polling_interval_s":1"#,
             r#""free_page_hinting":true"#,
             r#""free_page_reporting":true"#,
         ] {
@@ -2813,6 +2814,11 @@ mod macos_arm64 {
         assert_response_contains(
             &vm_config,
             r#""deflate_on_oom":false"#,
+            "GET /vm/config after PUT /balloon",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""stats_polling_interval_s":1"#,
             "GET /vm/config after PUT /balloon",
         );
         assert_response_contains(
@@ -2910,6 +2916,44 @@ mod macos_arm64 {
             );
         }
 
+        let optional_statistics = match wait_for_balloon_optional_statistics(
+            &socket_path,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            Ok(statistics) => statistics,
+            Err(err) => {
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "direct rootfs guest did not publish optional balloon statistics: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+        };
+        let polling_update = http_json(
+            &socket_path,
+            "PATCH",
+            "/balloon/statistics",
+            r#"{"stats_polling_interval_s":2}"#,
+        );
+        assert_no_content_response(&polling_update, "PATCH /balloon/statistics direct rootfs");
+        let updated_balloon = http_get(&socket_path, "/balloon");
+        assert_ok_response(
+            &updated_balloon,
+            "GET /balloon after statistics polling update direct rootfs",
+        );
+        assert_response_contains(
+            &updated_balloon,
+            r#""stats_polling_interval_s":2"#,
+            "GET /balloon after statistics polling update direct rootfs",
+        );
+        let statistics_after_polling_update = http_get(&socket_path, "/balloon/statistics");
+        assert_eq!(
+            balloon_optional_statistics(&statistics_after_polling_update)
+                .expect("updated balloon statistics response should be valid"),
+            optional_statistics,
+            "updating the polling interval must preserve exactly the optional fields already reported by the guest"
+        );
+
         let hinting_status = http_get(&socket_path, "/balloon/hinting/status");
         assert_ok_response(&hinting_status, "GET /balloon/hinting/status direct rootfs");
         for expected in [r#""host_cmd":0"#, r#""guest_cmd":null"#] {
@@ -2924,21 +2968,26 @@ mod macos_arm64 {
             &socket_path,
             "PATCH",
             "/balloon/hinting/start",
-            r#"{"acknowledge_on_stop":false}"#,
+            r#"{"acknowledge_on_stop":true}"#,
         );
         assert_no_content_response(&hinting_start, "PATCH /balloon/hinting/start direct rootfs");
-        let started_hinting_status = http_get(&socket_path, "/balloon/hinting/status");
-        assert_ok_response(
-            &started_hinting_status,
-            "GET /balloon/hinting/status after start direct rootfs",
-        );
-        for expected in [r#""host_cmd":2"#, r#""guest_cmd":null"#] {
-            assert_response_contains(
-                &started_hinting_status,
-                expected,
-                "GET /balloon/hinting/status after start direct rootfs",
+        let automatically_acknowledged_hinting = wait_for_balloon_hinting_status(
+            &socket_path,
+            1,
+            Some(0),
+            GUEST_EXECUTION_TIMEOUT,
+        )
+        .unwrap_or_else(|err| {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not complete the acknowledged hinting run: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
             );
-        }
+        });
+        assert_ok_response(
+            &automatically_acknowledged_hinting,
+            "GET /balloon/hinting/status after automatic acknowledgement direct rootfs",
+        );
 
         let hinting_stop = http_no_body(&socket_path, "PATCH", "/balloon/hinting/stop");
         assert_no_content_response(&hinting_stop, "PATCH /balloon/hinting/stop direct rootfs");
@@ -2947,7 +2996,7 @@ mod macos_arm64 {
             &stopped_hinting_status,
             "GET /balloon/hinting/status after stop direct rootfs",
         );
-        for expected in [r#""host_cmd":1"#, r#""guest_cmd":null"#] {
+        for expected in [r#""host_cmd":1"#, r#""guest_cmd":0"#] {
             assert_response_contains(
                 &stopped_hinting_status,
                 expected,
@@ -2981,6 +3030,34 @@ mod macos_arm64 {
                 output.status, output.stdout, output.stderr
             );
         }
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause before balloon capture-ready preflight",
+        );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused MMIO balloon capture-ready preflight",
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume after balloon capture-ready preflight",
+        );
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/balloon", r#"{"amount_mib":0}"#),
+            "PATCH /balloon target to zero direct rootfs",
+        );
+        wait_for_balloon_page_counts(&socket_path, 0, 0, GUEST_EXECUTION_TIMEOUT).unwrap_or_else(
+            |err| {
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "direct rootfs guest did not deflate the balloon to zero: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            },
+        );
 
         assert_clean_shutdown(
             bangbang.terminate(),
@@ -4310,6 +4387,32 @@ mod macos_arm64 {
         );
         wait_for_nonzero_balloon_actual_pages(&socket_path, PCI_ALL_VIRTIO_GUEST_TIMEOUT)
             .expect("product PCI balloon should inflate through queue interrupts");
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "pause before product PCI balloon capture-ready preflight",
+        );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused product PCI balloon capture-ready preflight",
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "resume after product PCI balloon capture-ready preflight",
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &socket_path,
+                "PATCH",
+                "/balloon",
+                r#"{"amount_mib":0}"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            ),
+            "PATCH /balloon target to zero product PCI",
+        );
+        wait_for_balloon_page_counts(&socket_path, 0, 0, PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("product PCI balloon should deflate to zero through queue interrupts");
 
         assert_no_content_response(
             &http_json(
@@ -10266,7 +10369,12 @@ mod macos_arm64 {
         let started_at = Instant::now();
 
         loop {
-            let response = http_get(socket_path, "/balloon/statistics");
+            let response =
+                concurrent_mmds_http_request(socket_path, "GET", "/balloon/statistics", None)
+                    .map_err(|()| {
+                        "balloon statistics endpoint became unavailable while waiting for inflation"
+                            .to_string()
+                    })?;
             let actual_pages = response
                 .strip_prefix("HTTP/1.1 200 OK\r\n")
                 .and_then(|_| response.split_once("\r\n\r\n"))
@@ -10284,6 +10392,150 @@ mod macos_arm64 {
 
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn wait_for_balloon_page_counts(
+        socket_path: &Path,
+        expected_target_pages: u64,
+        expected_actual_pages: u64,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let started_at = Instant::now();
+
+        loop {
+            let response = concurrent_mmds_http_request(
+                socket_path,
+                "GET",
+                "/balloon/statistics",
+                None,
+            )
+            .map_err(|()| {
+                "balloon statistics endpoint became unavailable while waiting for page counts"
+                    .to_string()
+            })?;
+            let body = balloon_response_json(&response);
+            let target_pages = body
+                .as_ref()
+                .and_then(|body| body.get("target_pages"))
+                .and_then(serde_json::Value::as_u64);
+            let actual_pages = body
+                .as_ref()
+                .and_then(|body| body.get("actual_pages"))
+                .and_then(serde_json::Value::as_u64);
+            if target_pages == Some(expected_target_pages)
+                && actual_pages == Some(expected_actual_pages)
+            {
+                return Ok(response);
+            }
+            if started_at.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for /balloon/statistics target_pages={expected_target_pages} and actual_pages={expected_actual_pages}; latest target_pages={target_pages:?}; latest actual_pages={actual_pages:?}; latest response:\n{response}"
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_balloon_optional_statistics(
+        socket_path: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<&'static str>, String> {
+        let started_at = Instant::now();
+
+        loop {
+            let response = concurrent_mmds_http_request(
+                socket_path,
+                "GET",
+                "/balloon/statistics",
+                None,
+            )
+            .map_err(|()| {
+                "balloon statistics endpoint became unavailable while waiting for optional fields"
+                    .to_string()
+            })?;
+            let statistics = balloon_optional_statistics(&response)?;
+            if !statistics.is_empty() {
+                return Ok(statistics);
+            }
+            if started_at.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for guest-provided optional balloon statistics; latest response:\n{response}"
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn balloon_optional_statistics(response: &str) -> Result<Vec<&'static str>, String> {
+        let body = balloon_response_json(response)
+            .ok_or_else(|| format!("invalid balloon statistics response:\n{response}"))?;
+        Ok([
+            "swap_in",
+            "swap_out",
+            "major_faults",
+            "minor_faults",
+            "free_memory",
+            "total_memory",
+            "available_memory",
+            "disk_caches",
+            "hugetlb_allocations",
+            "hugetlb_failures",
+            "oom_kill",
+            "alloc_stall",
+            "async_scan",
+            "direct_scan",
+            "async_reclaim",
+            "direct_reclaim",
+        ]
+        .into_iter()
+        .filter(|field| body.get(*field).is_some())
+        .collect())
+    }
+
+    fn wait_for_balloon_hinting_status(
+        socket_path: &Path,
+        expected_host_cmd: u64,
+        expected_guest_cmd: Option<u64>,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let started_at = Instant::now();
+
+        loop {
+            let response =
+                concurrent_mmds_http_request(socket_path, "GET", "/balloon/hinting/status", None)
+                    .map_err(|()| {
+                    "balloon hinting endpoint became unavailable while waiting for guest status"
+                        .to_string()
+                })?;
+            let body = balloon_response_json(&response);
+            let host_cmd = body
+                .as_ref()
+                .and_then(|body| body.get("host_cmd"))
+                .and_then(serde_json::Value::as_u64);
+            let guest_cmd = body
+                .as_ref()
+                .and_then(|body| body.get("guest_cmd"))
+                .and_then(serde_json::Value::as_u64);
+            if host_cmd == Some(expected_host_cmd) && guest_cmd == expected_guest_cmd {
+                return Ok(response);
+            }
+            if started_at.elapsed() >= timeout {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for balloon hinting host_cmd={expected_host_cmd} and guest_cmd={expected_guest_cmd:?}; latest host_cmd={host_cmd:?}; latest guest_cmd={guest_cmd:?}; latest response:\n{response}"
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn balloon_response_json(response: &str) -> Option<serde_json::Value> {
+        response
+            .strip_prefix("HTTP/1.1 200 OK\r\n")
+            .and_then(|_| response.split_once("\r\n\r\n"))
+            .and_then(|(_, body)| serde_json::from_str(body).ok())
     }
 
     fn wait_for_nonzero_balloon_free_page_report_count(

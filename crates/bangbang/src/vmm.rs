@@ -15,6 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bangbang_hvf::{
+    HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonCaptureState,
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
     HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugDeviceConfig,
     HvfArm64BootPciBalloonDeviceUpdater, HvfArm64BootPciBlockDeviceUpdater,
@@ -210,6 +211,14 @@ pub(crate) trait InstanceStartExecutor {
         Ok(())
     }
 
+    fn preflight_snapshot_v1_balloon(
+        &mut self,
+        _session: &mut Self::Session,
+        _config: Option<BalloonConfig>,
+    ) -> Result<(), HvfArm64BootBalloonCaptureError> {
+        Ok(())
+    }
+
     fn publish_snapshot_v1(
         &mut self,
         session: &mut Self::Session,
@@ -319,6 +328,7 @@ impl std::error::Error for NativeV1SnapshotPublicationProducerError {
 pub(crate) enum NativeV1SnapshotPublicationError {
     Preflight(VmmActionError),
     StoragePreflight(HvfArm64BootStorageCaptureError),
+    BalloonPreflight(HvfArm64BootBalloonCaptureError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -333,6 +343,9 @@ impl fmt::Display for NativeV1SnapshotPublicationError {
             }
             Self::StoragePreflight(source) => {
                 write!(f, "native-v1 storage preflight failed: {source}")
+            }
+            Self::BalloonPreflight(source) => {
+                write!(f, "native-v1 balloon preflight failed: {source}")
             }
             Self::Resource(source) => {
                 write!(
@@ -354,6 +367,7 @@ impl std::error::Error for NativeV1SnapshotPublicationError {
         match self {
             Self::Preflight(source) => Some(source),
             Self::StoragePreflight(source) => Some(source),
+            Self::BalloonPreflight(source) => Some(source),
             Self::Resource(source) => Some(source),
             Self::Transaction(source) => Some(source),
             Self::SessionUnavailable | Self::ConfigurationUnavailable => None,
@@ -3579,6 +3593,10 @@ where
         self.starter
             .preflight_snapshot_v1_storage(session, storage_configs, cancellation.clone())
             .map_err(NativeV1SnapshotPublicationError::StoragePreflight)?;
+        let balloon_config = self.controller.balloon_config();
+        self.starter
+            .preflight_snapshot_v1_balloon(session, balloon_config)
+            .map_err(NativeV1SnapshotPublicationError::BalloonPreflight)?;
 
         self.controller
             .preflight_create_snapshot_profile()
@@ -3869,6 +3887,14 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<(), HvfArm64BootStorageCaptureError> {
         session.preflight_capture_ready_storage(configs, cancellation)
+    }
+
+    fn preflight_snapshot_v1_balloon(
+        &mut self,
+        session: &mut Self::Session,
+        config: Option<BalloonConfig>,
+    ) -> Result<(), HvfArm64BootBalloonCaptureError> {
+        session.capture_ready_balloon_state(config).map(|_| ())
     }
 
     fn publish_snapshot_v1(
@@ -4313,6 +4339,14 @@ where
 }
 
 impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
+    fn capture_ready_balloon_state(
+        &self,
+        config: Option<BalloonConfig>,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<HvfArm64BootBalloonCaptureState>, HvfArm64BootBalloonCaptureError> {
+        self.session.capture_ready_balloon_state(config, guard)
+    }
+
     fn capture_ready_storage_state_at_with_cancel(
         &mut self,
         configs: &CaptureReadyStorageConfigs,
@@ -7180,6 +7214,24 @@ fn storage_capture_error_from_boot_run_loop_command<C>(
     }
 }
 
+fn balloon_capture_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, HvfArm64BootBalloonCaptureError>,
+) -> HvfArm64BootBalloonCaptureError {
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::WorkerNotPaused
+        | BootRunLoopCommandError::SnapshotQuiescenceActive
+        | BootRunLoopCommandError::AdmissionClosed
+        | BootRunLoopCommandError::QueueFull
+        | BootRunLoopCommandError::QueueClosed
+        | BootRunLoopCommandError::Wakeup { .. }
+        | BootRunLoopCommandError::ResponseClosed => {
+            HvfArm64BootBalloonCaptureError::OwnerUnavailable
+        }
+    }
+}
+
 pub(crate) struct BootRunLoopCommandHandle<S>
 where
     S: BootRunLoopSession,
@@ -8105,6 +8157,21 @@ impl
         ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider>,
     >
 {
+    pub(crate) fn capture_ready_balloon_state(
+        &self,
+        config: Option<BalloonConfig>,
+    ) -> Result<Option<HvfArm64BootBalloonCaptureState>, HvfArm64BootBalloonCaptureError> {
+        self.run_snapshot_quiesced(move |session| {
+            let guard = session
+                .quiesce_snapshot_auxiliary_work()
+                .map_err(|_| HvfArm64BootBalloonCaptureError::OwnerUnavailable)?;
+            let result = session.capture_ready_balloon_state(config, &guard);
+            drop(guard);
+            result
+        })
+        .map_err(balloon_capture_error_from_boot_run_loop_command)
+    }
+
     fn preflight_capture_ready_storage(
         &self,
         configs: CaptureReadyStorageConfigs,
@@ -8929,18 +8996,19 @@ mod tests {
         DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_PMEM_MMIO_BASE,
         DEFAULT_PMEM_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
-        HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootStorageCaptureError,
-        HvfInstanceStartExecutor, InstanceStartExecutor, NativeV1SnapshotCaptureCancellation,
-        NativeV1SnapshotCaptureError, NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
-        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
-        NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
-        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
-        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
-        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
-        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
-        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
-        ProcessVmm, ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
-        SnapshotCreateSession, SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        HvfArm64BootBalloonCaptureError, HvfArm64BootSnapshotV1CaptureStage,
+        HvfArm64BootStorageCaptureError, HvfInstanceStartExecutor, InstanceStartExecutor,
+        NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
+        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
+        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
+        NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
+        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
+        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
+        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
+        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
+        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
+        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
         require_native_v1_composite_record, snapshot_destination_machine_config,
     };
@@ -10014,6 +10082,9 @@ mod tests {
         snapshot_storage_preflight_calls: usize,
         last_snapshot_storage_configs: Option<CaptureReadyStorageConfigs>,
         snapshot_storage_preflight_failure: Option<HvfArm64BootStorageCaptureError>,
+        snapshot_balloon_preflight_calls: usize,
+        last_snapshot_balloon_config: Option<Option<BalloonConfig>>,
+        snapshot_balloon_preflight_failure: bool,
         snapshot_publication_failure: bool,
     }
 
@@ -10031,6 +10102,9 @@ mod tests {
                 snapshot_storage_preflight_calls: 0,
                 last_snapshot_storage_configs: None,
                 snapshot_storage_preflight_failure: None,
+                snapshot_balloon_preflight_calls: 0,
+                last_snapshot_balloon_config: None,
+                snapshot_balloon_preflight_failure: false,
                 snapshot_publication_failure: false,
             }
         }
@@ -10048,6 +10122,11 @@ mod tests {
             self
         }
 
+        fn with_snapshot_balloon_preflight_failure(mut self) -> Self {
+            self.snapshot_balloon_preflight_failure = true;
+            self
+        }
+
         const fn failure(source: BackendError) -> Self {
             Self {
                 result: FakeStartResult::Failure(source),
@@ -10057,6 +10136,9 @@ mod tests {
                 snapshot_storage_preflight_calls: 0,
                 last_snapshot_storage_configs: None,
                 snapshot_storage_preflight_failure: None,
+                snapshot_balloon_preflight_calls: 0,
+                last_snapshot_balloon_config: None,
+                snapshot_balloon_preflight_failure: false,
                 snapshot_publication_failure: false,
             }
         }
@@ -10105,6 +10187,20 @@ mod tests {
             match self.snapshot_storage_preflight_failure {
                 Some(error) => Err(error),
                 None => Ok(()),
+            }
+        }
+
+        fn preflight_snapshot_v1_balloon(
+            &mut self,
+            _session: &mut Self::Session,
+            config: Option<BalloonConfig>,
+        ) -> Result<(), HvfArm64BootBalloonCaptureError> {
+            self.snapshot_balloon_preflight_calls += 1;
+            self.last_snapshot_balloon_config = Some(config);
+            if self.snapshot_balloon_preflight_failure {
+                Err(HvfArm64BootBalloonCaptureError::OwnerUnavailable)
+            } else {
+                Ok(())
             }
         }
 
@@ -11976,6 +12072,8 @@ mod tests {
             Err(VmmActionError::SnapshotUnsupported)
         );
         assert_eq!(create_vmm.starter.snapshot_storage_preflight_calls, 1);
+        assert_eq!(create_vmm.starter.snapshot_balloon_preflight_calls, 1);
+        assert_eq!(create_vmm.starter.last_snapshot_balloon_config, Some(None));
         let session = create_vmm
             .started_session
             .as_ref()
@@ -17505,6 +17603,13 @@ mod tests {
             "/private/pmem",
         )))
         .expect("broad snapshot pmem should configure");
+        vmm.handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(8, true)
+                .with_stats_polling_interval_s(1)
+                .with_free_page_hinting(true)
+                .with_free_page_reporting(true),
+        ))
+        .expect("broad snapshot balloon should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("broad snapshot fake session should start");
         vmm.handle_action(VmmAction::Pause)
@@ -17527,12 +17632,72 @@ mod tests {
             .expect("storage preflight should receive the complete config inventory");
         assert_eq!(captured_configs.drives(), vmm.controller.drive_configs());
         assert_eq!(captured_configs.pmem(), vmm.controller.pmem_configs());
+        assert_eq!(vmm.starter.snapshot_balloon_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_balloon_config,
+            Some(vmm.controller.balloon_config())
+        );
         let session = vmm
             .started_session
             .as_ref()
             .expect("rejected broad snapshot should retain its paused session");
         assert_eq!(session.native_snapshot_publication_count, 0);
         assert_eq!(session.native_snapshot_producer_count, 0);
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn balloon_preflight_failure_is_typed_and_precedes_publication() {
+        let state_path = missing_temp_child_path("balloon-preflight.state");
+        let memory_path = state_path.with_file_name("balloon-preflight.memory");
+        let parent = state_path
+            .parent()
+            .expect("missing balloon preflight path should have a parent");
+        let mut vmm = snapshot_profile_vmm(
+            FakeStarter::success(162).with_snapshot_balloon_preflight_failure(),
+        );
+        vmm.handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(8, true)
+                .with_stats_polling_interval_s(1)
+                .with_free_page_hinting(true)
+                .with_free_page_reporting(true),
+        ))
+        .expect("balloon preflight fixture should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("balloon preflight fake session should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("balloon preflight fake session should pause");
+
+        let error = vmm
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                &state_path,
+                &memory_path,
+            )))
+            .expect_err("balloon preflight failure should stop before publication");
+
+        assert_eq!(
+            error,
+            VmmActionError::SnapshotCreate(BackendError::Hypervisor(
+                "native-v1 balloon preflight failed: balloon capture owner is unavailable"
+                    .to_string()
+            ))
+        );
+        assert_eq!(vmm.starter.snapshot_storage_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_balloon_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_balloon_config,
+            Some(vmm.controller.balloon_config())
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("balloon preflight failure should retain the paused session");
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
         assert!(!state_path.exists());
         assert!(!memory_path.exists());
         assert!(!parent.exists());

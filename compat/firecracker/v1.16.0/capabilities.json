@@ -39,29 +39,101 @@
     {
       "id": "api-operation:GET /balloon",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation GET /balloon.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:GET /balloon; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-operation:GET /balloon"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:GET /balloon/hinting/status",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation GET /balloon/hinting/status.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:GET /balloon/hinting/status; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-operation:GET /balloon/hinting/status"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:GET /balloon/statistics",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation GET /balloon/statistics.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:GET /balloon/statistics; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-operation:GET /balloon/statistics"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:GET /hotplug/memory",
@@ -155,38 +227,134 @@
     {
       "id": "api-operation:PATCH /balloon",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /balloon.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:PATCH /balloon; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-operation:PATCH /balloon"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /balloon/hinting/start",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /balloon/hinting/start.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:PATCH /balloon/hinting/start; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-operation:PATCH /balloon/hinting/start"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /balloon/hinting/stop",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /balloon/hinting/stop.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:PATCH /balloon/hinting/stop; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-operation:PATCH /balloon/hinting/stop"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /balloon/statistics",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /balloon/statistics.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:PATCH /balloon/statistics; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-operation:PATCH /balloon/statistics"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /drives/{drive_id}",
@@ -438,11 +606,35 @@
     {
       "id": "api-operation:PUT /balloon",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /balloon.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-operation:PUT /balloon; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-operation:PUT /balloon"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /boot-source",
@@ -923,47 +1115,167 @@
     {
       "id": "api-path:/balloon",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /balloon.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-path:/balloon; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-path:/balloon"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-path:/balloon/hinting/start",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /balloon/hinting/start.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-path:/balloon/hinting/start; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-path:/balloon/hinting/start"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-path:/balloon/hinting/status",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /balloon/hinting/status.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-path:/balloon/hinting/status; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-path:/balloon/hinting/status"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-path:/balloon/hinting/stop",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /balloon/hinting/stop.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-path:/balloon/hinting/stop; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-path:/balloon/hinting/stop"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-path:/balloon/statistics",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /balloon/statistics.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-path:/balloon/statistics; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-path:/balloon/statistics"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-path:/boot-source",
@@ -1504,272 +1816,992 @@
     {
       "id": "api-property:Balloon.amount_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Balloon.amount_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:Balloon.amount_mib; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:Balloon.amount_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:Balloon.deflate_on_oom",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Balloon.deflate_on_oom.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:Balloon.deflate_on_oom; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:Balloon.deflate_on_oom"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:Balloon.free_page_hinting",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Balloon.free_page_hinting.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:Balloon.free_page_hinting; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:Balloon.free_page_hinting"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:Balloon.free_page_reporting",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Balloon.free_page_reporting.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:Balloon.free_page_reporting; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:Balloon.free_page_reporting"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:Balloon.stats_polling_interval_s",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Balloon.stats_polling_interval_s.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:Balloon.stats_polling_interval_s; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:Balloon.stats_polling_interval_s"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonHintingStatus.guest_cmd",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonHintingStatus.guest_cmd.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonHintingStatus.guest_cmd; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonHintingStatus.guest_cmd"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonHintingStatus.host_cmd",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonHintingStatus.host_cmd.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonHintingStatus.host_cmd; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonHintingStatus.host_cmd"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStartCmd.acknowledge_on_stop",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStartCmd.acknowledge_on_stop.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStartCmd.acknowledge_on_stop; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStartCmd.acknowledge_on_stop"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.actual_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.actual_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.actual_mib; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.actual_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.actual_pages",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.actual_pages.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.actual_pages; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.actual_pages"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.alloc_stall",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.alloc_stall.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.alloc_stall; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.alloc_stall"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.async_reclaim",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.async_reclaim.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.async_reclaim; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.async_reclaim"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.async_scan",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.async_scan.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.async_scan; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.async_scan"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.available_memory",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.available_memory.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.available_memory; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.available_memory"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.direct_reclaim",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.direct_reclaim.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.direct_reclaim; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.direct_reclaim"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.direct_scan",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.direct_scan.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.direct_scan; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.direct_scan"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.disk_caches",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.disk_caches.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.disk_caches; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.disk_caches"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.free_memory",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.free_memory.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.free_memory; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.free_memory"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.hugetlb_allocations",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.hugetlb_allocations.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.hugetlb_allocations; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.hugetlb_allocations"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.hugetlb_failures",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.hugetlb_failures.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.hugetlb_failures; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.hugetlb_failures"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.major_faults",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.major_faults.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.major_faults; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.major_faults"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.minor_faults",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.minor_faults.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.minor_faults; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.minor_faults"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.oom_kill",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.oom_kill.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.oom_kill; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.oom_kill"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.swap_in",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.swap_in.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.swap_in; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.swap_in"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.swap_out",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.swap_out.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.swap_out; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.swap_out"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.target_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.target_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.target_mib; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.target_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.target_pages",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.target_pages.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.target_pages; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.target_pages"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStats.total_memory",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStats.total_memory.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStats.total_memory; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStats.total_memory"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonStatsUpdate.stats_polling_interval_s",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonStatsUpdate.stats_polling_interval_s.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonStatsUpdate.stats_polling_interval_s; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonStatsUpdate.stats_polling_interval_s"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BalloonUpdate.amount_mib",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property BalloonUpdate.amount_mib.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:BalloonUpdate.amount_mib; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:BalloonUpdate.amount_mib"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:BootSource.boot_args",
@@ -2601,11 +3633,35 @@
     {
       "id": "api-property:FullVmConfiguration.balloon",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.balloon.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-property:FullVmConfiguration.balloon; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-property:FullVmConfiguration.balloon"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.boot-source",
@@ -4541,56 +5597,200 @@
     {
       "id": "api-schema:Balloon",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema Balloon.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-schema:Balloon; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-schema:Balloon"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:BalloonHintingStatus",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema BalloonHintingStatus.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-schema:BalloonHintingStatus; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-schema:BalloonHintingStatus"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:BalloonStartCmd",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema BalloonStartCmd.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-schema:BalloonStartCmd; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-schema:BalloonStartCmd"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:BalloonStats",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema BalloonStats.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-schema:BalloonStats; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-schema:BalloonStats"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:BalloonStatsUpdate",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema BalloonStatsUpdate.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-schema:BalloonStatsUpdate; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-schema:BalloonStatsUpdate"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:BalloonUpdate",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema BalloonUpdate.",
+      "summary": "Implements and verifies the exact Firecracker v1.16 api-schema:BalloonUpdate; strict API/model behavior, live MMIO/PCI execution, failure ordering, and field-specific evidence are mapped in the checked balloon closure contract.",
       "source_refs": [
         "api-schema:BalloonUpdate"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "balloon request parsing and response serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "live queue, feature, statistics, hinting, reporting, accounting, and capture-ready implementation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI balloon guest, pause-capture-resume, and zero-target convergence evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/balloon.rs",
+          "anchor": "focused parser, queue, failure-order, accounting, optional-statistics, hinting, reporting, and capture tests"
+        }
+      ]
     },
     {
       "id": "api-schema:BootSource",
@@ -5391,7 +6591,7 @@
     {
       "id": "corpus:ballooning",
       "family": "memory-devices",
-      "summary": "Audit all applicable capability claims owned by the pinned ballooning source corpus.",
+      "summary": "Live Firecracker v1.16 balloon configuration, MMIO/PCI queue execution, DEFLATE_ON_OOM negotiation, compact paired PFN accounting, statistics polling and optional-field handling, hinting/reporting, Darwin discard, metrics, failure diagnostics, cleanup, and bounded capture-ready ownership are implemented and verified. Wave 6 retains this broad corpus because its complete upstream claim also requires optional-device state encoding, artifact integration, MMIO/PCI restore construction, migration/clone behavior, portability policy, and signed restored-guest outcomes.",
       "source_refs": [
         "corpus:ballooning"
       ],
@@ -7448,7 +8648,7 @@
     {
       "id": "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
       "family": "memory-devices",
-      "summary": "Audit balloon inflate/deflate, deflate-on-OOM, statistics transitions, hinting/reporting, host reclaim, metrics, and snapshot state.",
+      "summary": "Live inflate/deflate, DEFLATE_ON_OOM, publication-safe paired PFN accounting, polling and optional statistics, hinting/reporting, best-effort host reclaim, metrics, exact MMIO/PCI owner traversal, detached state validation, failures, and cleanup are implemented and verified. Wave 6 retains the aggregate until balloon state is encoded, integrated into artifacts, restored into live owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
       "source_refs": [
         "corpus:ballooning"
       ],

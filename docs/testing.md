@@ -1423,21 +1423,30 @@ from `/dev/hwrng`, and writes a host-observable marker only after a non-empty
 read succeeds.
 It also includes a direct-rootfs balloon scenario that configures `/balloon`,
 enables free-page reporting, checks that the guest bound a virtio-balloon driver
-and negotiated reporting feature bit 5, exercises the minimal hinting start/stop
-command-state APIs, requires the public statistics response to reach nonzero
-`actual_pages`, and flushes public metrics until
-`balloon.free_page_report_count` is nonzero. The guest writes a host-observable
-marker only after driver binding and reporting negotiation are visible. This
-proves signed guest inflation and reporting reach the runtime discard owner; it
-does not impose a process-footprint threshold.
+and negotiated reporting feature bit 5, observes periodic optional statistics,
+updates the polling interval from 1 to 2 seconds without losing the exact
+reported optional-field set, observes guest STOP plus automatic host DONE and
+an explicit hinting stop, and flushes public metrics until
+`balloon.free_page_report_count` is nonzero. While paused, the public snapshot
+path traverses the capture-ready MMIO owner before the guest resumes. The test
+then changes the target from 8 MiB to zero and requires exact target/actual page
+convergence before shutdown. The product-PCI aggregate scenario independently
+proves paused capture traversal, resume, and target-to-zero convergence for the
+selected PCI owner. The guest writes a host-observable marker only after driver
+binding and reporting negotiation are visible. These scenarios prove signed
+guest inflation, deflation, statistics, hinting, reporting, MMIO/PCI capture
+ownership, and cleanup; they do not impose a process-footprint threshold.
 Runtime `PATCH /balloon` target-size updates are covered by unit, API socket,
 and process-session tests that verify stored config updates, active config-space
 generation changes, and config interrupt signaling. Guest-reported statistics
 queue records are covered by runtime unit, API response, and process-session
-tests. Runtime statistics interval updates are covered by unit, API socket, and
-process-session tests because they update stored/active interval state without
-timer-driven guest
-polling. Hinting queue guest-command acknowledgement, automatic host DONE
+tests. Runtime statistics interval updates are covered by unit, API socket,
+process-session, and signed guest tests. The signed guest observes timer-driven
+polling and exact optional-statistics preservation across a live interval
+change. Linux's statistics notification after `FEATURES_OK` but before
+`DRIVER_OK` is accepted by virtio-MMIO and retained by the balloon handler until
+activation; focused tests cover both admission and deferred dispatch. Hinting
+queue guest-command acknowledgement, automatic host DONE
 acknowledgement, active/stale range selection, best-effort advice outcomes, and
 inflate/hint metrics are covered by runtime unit and MMIO handler tests.
 Reporting queue tests cover compact queue-index routing with hinting enabled,

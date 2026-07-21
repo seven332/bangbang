@@ -2038,9 +2038,22 @@ page produces no host advice. On Darwin, isolated checked wrappers issue
 independent segments remain best effort, and diagnostics expose requested,
 actual advised, skipped, and failed bytes plus stage classes without host
 pointers. Unsupported targets report failure instead of substituting a
-different operation or simulating success. The non-paired operation retains no
-reusable ledger, so deflate/reset/pause/teardown has no cleanup transaction and
-no synchronous RSS or footprint reduction is promised.
+different operation or simulating success. Each validated inflate or deflate
+descriptor fallibly prepares the next compact paired PFN-accounting value
+before publishing its used entry, then commits that value by move only after
+publication succeeds. Preparation or publication failure preserves the prior
+accounting value, while a later descriptor failure preserves only the already
+committed prefix. Deflate removes overlapping ranges and reset clears the
+ledger. This logical guest-cooperation state does not prove that host advice
+succeeded, and no synchronous RSS or footprint reduction is promised.
+
+Paused balloon capture validates the negotiated feature/layout relationship,
+active queue cursors, pending statistics head, hinting state, and compact PFN
+ranges against mapped guest memory. Guest config `actual_pages` remains a
+separate captured fact from host paired accounting so an untrusted or transient
+guest mismatch is not promoted to host truth. The detached value retains no
+guest-memory borrow, lock, endpoint, host handle, or wall-clock value. Capture
+readiness does not yet define a serialization or restore contract.
 
 Free-page hinting command descriptors remain limited to 4-byte command
 identifiers stored in active device state. Range descriptors are accepted for

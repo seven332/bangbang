@@ -528,25 +528,24 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
     /// Clones the complete canonical transport state under the endpoint lock.
     pub fn transport_state(&self) -> Result<VirtioPciTransportState, VirtioPciEndpointError> {
         let state = self.lock_active()?;
-        Ok(VirtioPciTransportState {
-            phase: state.phase,
-            configuration: state.configuration.clone(),
-            pci_cfg_cap_offset: state.pci_cfg_cap_offset,
-            msix_cap_offset: state.msix_cap_offset,
-            pci_cfg_bar: state.pci_cfg_bar,
-            pci_cfg_offset: state.pci_cfg_offset,
-            pci_cfg_length: state.pci_cfg_length,
-            device_feature_select: state.device_feature_select,
-            driver_feature_select: state.driver_feature_select,
-            queue_select: state.queue_select,
-            device: state.core.device,
-            queues: state.core.queues.clone(),
-            queue_notifications: state.core.queue_notifications.clone(),
-            device_activated: state.core.device_activated,
-            requires_device_config_write_status: state.core.requires_device_config_write_status,
-            interrupt_intents: state.core.interrupt_intents.clone(),
-            msix: state.msix.clone(),
-        })
+        Ok(clone_transport_state(&state))
+    }
+
+    /// Captures device and transport state from one canonical endpoint observation.
+    pub(crate) fn capture_transport_with<R>(
+        &self,
+        capture: impl FnOnce(&VirtioMmioDeviceRegisters, &VirtioQueues, &C, &A, bool) -> R,
+    ) -> Result<(R, VirtioPciTransportState), VirtioPciEndpointError> {
+        let state = self.lock_active()?;
+        let device = capture(
+            &state.core.device,
+            &state.core.queues,
+            &state.core.device_config,
+            &state.core.activation,
+            state.core.device_activated,
+        );
+        let transport = clone_transport_state(&state);
+        Ok((device, transport))
     }
 
     pub fn admit_device_work(
@@ -737,6 +736,28 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             return Err(VirtioPciEndpointError::NotActive { phase: state.phase });
         }
         Ok(state)
+    }
+}
+
+fn clone_transport_state<C, A>(state: &VirtioPciEndpointState<C, A>) -> VirtioPciTransportState {
+    VirtioPciTransportState {
+        phase: state.phase,
+        configuration: state.configuration.clone(),
+        pci_cfg_cap_offset: state.pci_cfg_cap_offset,
+        msix_cap_offset: state.msix_cap_offset,
+        pci_cfg_bar: state.pci_cfg_bar,
+        pci_cfg_offset: state.pci_cfg_offset,
+        pci_cfg_length: state.pci_cfg_length,
+        device_feature_select: state.device_feature_select,
+        driver_feature_select: state.driver_feature_select,
+        queue_select: state.queue_select,
+        device: state.core.device,
+        queues: state.core.queues.clone(),
+        queue_notifications: state.core.queue_notifications.clone(),
+        device_activated: state.core.device_activated,
+        requires_device_config_write_status: state.core.requires_device_config_write_status,
+        interrupt_intents: state.core.interrupt_intents.clone(),
+        msix: state.msix.clone(),
     }
 }
 
