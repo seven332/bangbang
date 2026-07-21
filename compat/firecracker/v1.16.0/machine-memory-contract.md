@@ -41,8 +41,9 @@ vCPU ownership. Guest CPU faults and all bounded boot, VMM, device, discard,
 and dynamic-memory mutations feed the same epoch. A visibly committed Full
 snapshot transactionally re-protects pages and advances the epoch; load-time
 tracking instead starts after image population, so the restored baseline is
-clean and the required VMGenID replacement is the first dirty write. This
-tracking contract does not admit `Diff` snapshot artifacts.
+clean and the ordered VMGenID replacement followed by VMClock update are its
+first dirty writes. This tracking contract does not admit `Diff` snapshot
+artifacts.
 
 Rejected numeric candidates use unit-like errors and do not retain or echo the
 submitted value. PUT and PATCH validate a complete candidate before changing

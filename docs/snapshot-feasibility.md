@@ -113,8 +113,10 @@ path.
   metric readiness checkpoint, creates through the public API, terminates the
   source, restores the immutable pair in two fresh processes, and proves both
   explicit and automatic resume. Guest shutdown is reachable only after it
-  observes VMGenID replacement, so clean exit also proves continuation from the
-  captured execution point.
+  observes both changed VMGenID halves, a stable even VMClock sequence with
+  changed disruption/generation counters, and non-regressing destination RTC,
+  so clean exit also proves ordered time/identity restore and continuation from
+  the captured execution point.
 - Signed production-bundle coverage repeats that continuity with external
   granted kernel/root/metrics, separate state/memory output directories,
   granted early description, two fresh state/memory/root grant loads, explicit
@@ -315,7 +317,13 @@ order; it does not skip unknown future components:
 | 2 | compatibility/platform | Baseline and conditional optional CPU IDs, primary MPIDR, one atomic default-vCPU cache feature/geometry manifest, exact GIC metadata, fixed PL031 MMIO metadata, and explicit fresh-system-RTC policy. |
 | 3 | mutable vCPU | General, core-system, exception, execution-control, cache-selection, debug-control/trap, system-context, translation, pointer-authentication, thread-context, and SIMD/FP state. |
 | 4 | timer/interrupt/GIC | Normalized timer state, CPU IRQ/FIQ levels, bounded opaque Hypervisor.framework GIC bytes, and all ten EL1 ICC registers. |
-| 5 | baseline device | The exact nested `BANGDEV\0` profile for one read-only root block device, UART, limiter/retry time, VMGenID metadata/policy, and VMClock metadata/policy. |
+| 5 | baseline device | The exact nested `BANGDEV\0` profile for one read-only root block device, UART, limiter/retry time, VMGenID metadata/policy, and VMClock metadata plus complete ABI state. |
+
+New capture writes nested `BANGDEV\0` semantic version `1.1.0` with the exact
+validated 112-byte VMClock ABI. Load also accepts the historical nested 1.0.0
+shape and derives that typed value from the independently bound memory page;
+1.1.0 requires both copies to agree. This nested evolution does not change the
+outer `BANGHVF\0` 1.0.0 component contract.
 
 The no-template machine/profile rule covers both static and custom selection.
 An effective custom ID-register template may start, but native-v1 snapshot
@@ -1049,7 +1057,7 @@ incomplete stop blocks further execution/mapping mutation until cleanup or VM
 unmap. One backend-neutral atomic bitmap is shared with `GuestMemory`: normal
 boot installs it before kernel/initrd/FDT/device population, while snapshot load
 installs it after baseline image population and before mapping, owners, and
-VMGenID replacement. Bounded host/device writes and conservative discard
+VMGenID/VMClock updates. Bounded host/device writes and conservative discard
 attempts mark it directly; CPU faults mark it through a separate HVF
 restored-WRITE overlay. A different vCPU may consume only one stale exit already
 raised for the same page. Dirty handling does not advance PC, dispatch MMIO, or
@@ -1080,18 +1088,23 @@ validation:
 6. restore normalized physical and virtual timers, taking timer-PPI state from
    the compatible GIC image rather than replaying TVAL or ISTATUS;
 7. restore CPU IRQ/FIQ pending injection last among runner-owned state;
-8. replace the guest VMGenID buffer and inject its SPI only after every GIC
-   restore, so the notification cannot be overwritten; and
-9. commit a paused session and permit resume only after every step succeeds.
+8. preflight mapped memory and both time/identity SPI lines, replace the complete
+   guest VMGenID buffer with a fresh value, and inject its SPI only after every
+   GIC restore, so the notification cannot be overwritten;
+9. publish the VMClock odd/release/disruption-plus-generation/release/even
+   sequence and inject its SPI; and
+10. commit a paused session and permit resume only after every step succeeds.
 
 The runner-owned portion is one command rather than a transaction: an HVF write
 failure may leave a prefix applied, so the destination is torn down and explicit
 cleanup evidence decides whether the process may retry. VMGenID replacement,
-session assembly, and initially paused worker handoff remain in the same cleanup
-ledger until controller commit. `PUT /snapshot/load` invokes this sequence only
-after pristine-request and committed-pair validation, commits `Paused`, and
-optionally invokes ordinary resume. VMClock generation and mutable time restore
-remain separate deferred policy.
+VMClock update, session assembly, and initially paused worker handoff remain in
+the same cleanup ledger until controller commit. A completely cleaned failure
+before either identity mutation may retry; any VMGenID/VMClock guest-memory or
+notification commit is terminal even after complete resource cleanup.
+`PUT /snapshot/load` invokes this sequence only after pristine-request and
+committed-pair validation, commits `Paused`, and optionally invokes ordinary
+resume.
 
 ## Native-v1 Snapshot-Ready Ownership
 
@@ -1364,7 +1377,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Runner thread-context register capture and restore (fifth bidirectional subset implemented) | #1176 adds typed immutable raw TPIDR_EL0, TPIDRRO_EL0, and TPIDR_EL1 state plus one owner-thread capture. #1236 adds ordered owner-thread restore of that complete value through the reusable typed system-register failure with the exact failed register and completed prefix. Hypervisor.framework does not make the three writes transactional, so callers must retry the complete value or discard the vCPU before execution. Both boot-session forms expose capture and restore under shared core-operation admission, but the snapshot lease invokes neither. TPIDR2 is captured separately with SME system registers, SCXTNUM_EL0/EL1 use the separate system-context value, and CONTEXTIDR_EL1 remains in translation state; address/destination validation, wider context ordering, persistence, schema, rollback, orchestration, and multi-vCPU coordination remain deferred. | Exact three-field read/write order; every read and write failure; typed partial-write context; complete retry; thirty-four-way conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed guest-written capture/restore/recapture without post-restore guest execution or value logging. |
 | Runner physical-timer capture (raw subset implemented) | #1188 adds typed immutable raw CNTKCTL_EL1, CNTP_CTL_EL0, and CNTP_CVAL_EL0 state plus one failure-atomic owner-thread command; #1212 extends the same value and command with raw CNTP_TVAL_EL0. It generalizes timer admission so physical capture and every virtual-timer operation reject each other. Both boot-session forms expose capture without involving the snapshot lease. CNTP requires macOS 15 and GIC creation before the vCPU; CVAL/TVAL are separately timed absolute/relative views, and elapsed-time adjustment, writable-bit filtering, interrupt delivery, persistence, orchestration, schema, and restore remain deferred. | Exact SDK ids and availability; deterministic four-field order, every failure point and retry, bidirectional timer conflicts, abandonment, channel, queued destruction, unwind, panic, shutdown, signed disabled/masked guest-written capture, and signed idle TVAL observation without raw-value or stability assumptions. |
 | Runner virtual-timer capture (raw subset implemented) | #1166 adds typed immutable mask/offset state and #1168 extends it with raw control/CVAL values. Timer-specific owner-thread get/set commands and one serialized four-field capture share generalized timer admission with physical-timer capture. Both boot-session forms expose capture, but the snapshot lease does not invoke it. CPU pending levels, the opaque GIC device blob, and EL1 ICC state are captured separately; restore-time offset/control policy, orchestration, and restore remain deferred. | Deterministic four-field order, conflict, abandon, channel, panic, and retry tests plus signed known-value capture that safely restores the original stable values and writable control bits. |
-| Native arm64 timer and VMGenID restore policy (internal primitives implemented) | #1261 normalizes virtual count and physical CVAL distance around one host-counter sample, filters writable controls, strips ISTATUS, ignores TVAL, and applies a ten-write never-run restore after complete preflight. It also rejects active native-v1 SVE/SME/debug optional state and replaces the retained 16-byte VMGenID before injecting its edge-rising SPI. Both boot-session forms delegate timer and VMGenID operations, but no cross-step lease, payload schema, supervisor, or public path invokes them. VMClock and timer EOI policy remain deferred. | Wrapping arithmetic and control filtering; every preflight/write failure and completed prefix; fresh-sample retry; all runner conflicts/lifecycle cleanup; random/zero/duplicate/write/signal VMGenID stages and redaction; signed fresh-VM timer restore, armed/masked controls, both session delegates, guest-buffer/metadata equality, and successful SPI injection before run. |
+| Native arm64 timer and VMGenID restore policy (internal primitives implemented) | #1261 normalizes virtual count and physical CVAL distance around one host-counter sample, filters writable controls, strips ISTATUS, ignores TVAL, and applies a ten-write never-run restore after complete preflight. It also rejects active native-v1 SVE/SME/debug optional state and replaces the retained 16-byte VMGenID before injecting its edge-rising SPI. Both boot-session forms delegate timer and VMGenID operations; #1477 later composes VMGenID with typed VMClock restore under the public aggregate. Timer EOI policy remains deferred. | Wrapping arithmetic and control filtering; every preflight/write failure and completed prefix; fresh-sample retry; all runner conflicts/lifecycle cleanup; random/zero/duplicate/write/signal VMGenID stages and redaction; signed fresh-VM timer restore, armed/masked controls, both session delegates, guest-buffer/metadata equality, and successful SPI injection before run. |
 | Runner pending-interrupt capture and restore (first bidirectional interrupt subset implemented) | #1174 adds typed IRQ/FIQ owner-thread get/set commands and one failure-atomic IRQ-then-FIQ capture. #1248 adds ordered owner-thread restore of that complete value through a dedicated value-free failure with the exact failed type and completed prefix. The two writes are nontransactional, so callers must retry the complete value or discard the vCPU before execution. CPU pending levels and validated GIC PPI mutations share generalized interrupt-operation admission but remain distinct state models. Both boot-session forms expose capture and restore, but the snapshot lease invokes neither. HVF clears both levels after a run, so automatic pre-run reassertion, the separately captured opaque GIC blob and EL1 ICC value, routing, delivery/EOI, persistence, schema, orchestration, and multi-vCPU association remain deferred. | Exact IRQ-then-FIQ read/write order; both read and write failures; typed value-free partial-write context; complete retry; bidirectional conflicts; abandonment, channels, queued destruction, unwind, panic, shutdown; and signed IRQ-only restore/recapture twice after a FIQ-only mutation, followed by explicit clear, without a guest run or GIC/delivery claims. |
 | Runner opaque GIC device-state capture and restore (second bidirectional interrupt subset implemented) | #1178 adds a redacted immutable byte value and owner-loop capture for Hypervisor.framework's stable, versioned GIC device blob, with fallible allocation and retained-object cleanup. #1255 adds an independently loaded setter and command-owned pre-first-run apply of the complete value. Both operations share generalized interrupt admission; restore checks the sticky run lifetime atomically, preserves exact HVF failure provenance, and clones no bytes into diagnostics. Both boot-session forms expose capture and apply without involving the snapshot lease. EL1 ICC state is separate; parsing, persistence, compatibility preflight, cross-step lease, schema, orchestration, and multi-vCPU stopping remain deferred. | Capture create/size/data/release order and cleanup; restore exact pointer/`usize` length, empty/no-call and backend failure; sticky run gate; every forward/reverse conflict; abandonment, channels, queued destruction, unwind, panic, shutdown; redacted debug; and signed non-empty same-VM capture/reapply before run without parsing, comparison, logging, or guest execution. |
 | Runner EL1 GIC ICC register capture and restore (third bidirectional interrupt subset implemented) | #1180 adds a typed immutable ten-register value and owner-thread capture for PMR, BPR0, AP0R0, AP1R0, RPR, BPR1, CTLR, SRE, IGRPEN0, and IGRPEN1. #1258 adds a pre-first-run owner command that independently preloads getter and setter capabilities, writes the nine architecturally mutable fields in capture order, and validates the derived read-only RPR at its original position. A typed value-free error distinguishes write from derived-value validation and reports the exact register and completed write prefix. The operation is nontransactional, so callers must retry the complete value or discard the vCPU before execution. It shares generalized interrupt admission and complements, but is not embedded in, the opaque GIC blob; callers apply that compatible blob first without receiving a cross-step lease. Both boot-session forms expose capture and restore without involving the snapshot lease. `ICC_SRE_EL2`, ICH/ICV, destination validation, host-update preflight, persistence, composite orchestration, and multi-vCPU association remain deferred. | Exact SDK ids and ten-position read/write-or-validate order; every capture read failure, every mutable write failure, RPR read failure and mismatch; typed value-free partial-write context; complete retry; sticky never-run gate; bidirectional conflicts, abandonment, channels, queued destruction, unwind, panic, shutdown, and both boot-session delegates; signed guest-written PMR/BPR/SRE/group-enable capture plus same-idle-vCPU opaque-blob/ICC capture, ordered restore, and two exact recaptures without guest execution or value logging. |
@@ -1377,6 +1390,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Native-v1 composite publication transaction (implemented) | #1274 added the process create seam and #1276 activated it. #1390 moves the entire direct or anchored publisher under the paused worker lease, seals cancellation before commit, preserves post-seal typed visibility through shutdown, and invokes the explicit no-op post-publication hook before releasing all four retry guards and admission. Capture failure/cancellation removes only private staging and leaves recoverable sources paused; worker panic remains terminal. | Runtime callback/close/output/ordering/failure tests; ProcessVmm preflight/config/no-mutation tests; supervisor collision/cancellation/seal/shutdown/retry/panic tests; synchronous API/MMDS/periodic serialization; and signed production publication followed by distinct-destination load/restore/continuation. |
 | External resource policy | Define disk, vmnet, and vsock metadata, buffering boundary, disconnect/reconnect behavior, and restore overrides. | Resource-policy unit/process tests and focused signed network/vsock coverage. |
 | Public snapshot endpoint activation (implemented) | #1276 routes create and load only for the admitted native-v1 profile, preserves Firecracker-shaped response/latency/deprecation behavior, commits load as `Paused` before applying `resume_vm`, and exposes typed redacted execution faults. | Runtime/process/API tests plus signed fresh-process public create, no-clobber, retryable load, explicit resume, automatic resume, guest-observed VMGenID replacement, and continuation coverage. |
+| Native-v1 PL031, VMGenID, and VMClock restore (implemented) | #1477 adds the exact validated 112-byte VMClock ABI to nested `BANGDEV\0` 1.1.0 while loading legacy 1.0.0 from bound memory, reconstructs PL031 from destination wall clock with no alarm state, and performs VMGenID replacement/notification before the fenced VMClock counter update/notification after aggregate restore and before resume. Any failure after the first identity commit is terminal. | ABI/codec/memory-agreement and legacy unit tests; every VMClock write and signal disposition; aggregate ordering and cleanup terminality; PL031 destination-time/no-alarm tests; signed two-destination guest polling of both VMGenID halves, stable sequence and both VMClock counters, RTC monotonicity, and continuation. |
 
 Shared dirty epochs are complete; Diff artifacts and optional resources remain
 their own issue-sized areas. The public create and restore transactions are

@@ -97,6 +97,7 @@ use crate::storage_capture::{
     CaptureReadyBlockDeviceState, CaptureReadyPmemDeviceState, StorageMmioTransportState,
     StorageRetryState, StorageTransportState,
 };
+use crate::vmclock::VmClockAbi;
 use crate::vsock::{
     PreparedVsockDevice, PreparedVsockDeviceError, SuppliedVsockListener,
     VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError,
@@ -109,10 +110,6 @@ pub const ARM64_BOOT_VMGENID_SIZE: usize = ARM64_FDT_VMGENID_SIZE as usize;
 const ARM64_BOOT_VMGENID_ALIGNMENT: u64 = ARM64_FDT_VMGENID_SIZE;
 pub const ARM64_BOOT_VMCLOCK_SIZE: usize = ARM64_FDT_VMCLOCK_SIZE as usize;
 const ARM64_BOOT_VMCLOCK_ALIGNMENT: u64 = ARM64_FDT_VMCLOCK_SIZE;
-const ARM64_BOOT_VMCLOCK_ABI_SIZE: usize = 112;
-const ARM64_BOOT_VMCLOCK_MAGIC: u32 = 1_263_289_174;
-const ARM64_BOOT_VMCLOCK_VERSION: u16 = 1;
-const ARM64_BOOT_VMCLOCK_COUNTER_INVALID: u8 = 255;
 const ARM64_BOOT_PCI_ECAM_REGION_ID: MmioRegionId = MmioRegionId::new(u64::MAX);
 
 /// Move-only files supplied by an authority owner for one VM startup attempt.
@@ -273,11 +270,6 @@ impl VmStartupResources {
         }
     }
 }
-const ARM64_BOOT_VMCLOCK_STATUS_UNKNOWN: u8 = 0;
-const ARM64_BOOT_VMCLOCK_FLAG_VM_GEN_COUNTER_PRESENT: u64 = 256;
-const ARM64_BOOT_VMCLOCK_FLAG_NOTIFICATION_PRESENT: u64 = 512;
-const ARM64_BOOT_VMCLOCK_FLAGS: u64 =
-    ARM64_BOOT_VMCLOCK_FLAG_VM_GEN_COUNTER_PRESENT | ARM64_BOOT_VMCLOCK_FLAG_NOTIFICATION_PRESENT;
 const ARM64_BOOT_VMGENID_ADDRESS: GuestAddress = GuestAddress::new(
     aarch64::SYSTEM_MEM_START + aarch64::SYSTEM_MEM_SIZE
         - ARM64_FDT_VMCLOCK_SIZE
@@ -765,6 +757,7 @@ fn replace_arm64_boot_vmgenid_with(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arm64BootVmClockDevice {
     pub range: GuestMemoryRange,
+    pub abi: VmClockAbi,
     pub fdt_device: Arm64FdtVmClockDevice,
 }
 
@@ -884,6 +877,9 @@ pub enum PrepareSnapshotV1DeviceProfileError {
     BlockRuntime,
     InvalidRetry,
     ReadVmGenId,
+    ReadVmClock,
+    InvalidVmClockAbi,
+    VmClockStateMismatch,
 }
 
 impl fmt::Display for PrepareSnapshotV1DeviceProfileError {
@@ -921,6 +917,11 @@ impl fmt::Display for PrepareSnapshotV1DeviceProfileError {
             Self::BlockRuntime => f.write_str("native-v1 block runtime restore is invalid"),
             Self::InvalidRetry => f.write_str("native-v1 block retry state is invalid"),
             Self::ReadVmGenId => f.write_str("native-v1 source VMGenID could not be retained"),
+            Self::ReadVmClock => f.write_str("native-v1 source VMClock could not be retained"),
+            Self::InvalidVmClockAbi => f.write_str("native-v1 source VMClock ABI is invalid"),
+            Self::VmClockStateMismatch => {
+                f.write_str("native-v1 VMClock state does not match guest memory")
+            }
         }
     }
 }
@@ -1027,8 +1028,22 @@ pub fn prepare_snapshot_v1_device_profile_with_root_backing(
             interrupt_line: state.vmgenid().interrupt_line(),
         },
     };
+    let mut vmclock_bytes = [0; crate::vmclock::VMCLOCK_ABI_SIZE];
+    memory
+        .read_slice(&mut vmclock_bytes, state.vmclock().range().start())
+        .map_err(|_| PrepareSnapshotV1DeviceProfileError::ReadVmClock)?;
+    let observed_vmclock = VmClockAbi::from_bytes(vmclock_bytes)
+        .map_err(|_| PrepareSnapshotV1DeviceProfileError::InvalidVmClockAbi)?;
+    let vmclock_abi = match state.vmclock_abi() {
+        Some(captured) if captured != observed_vmclock => {
+            return Err(PrepareSnapshotV1DeviceProfileError::VmClockStateMismatch);
+        }
+        Some(captured) => captured,
+        None => observed_vmclock,
+    };
     let vmclock_device = Arm64BootVmClockDevice {
         range: state.vmclock().range(),
+        abi: vmclock_abi,
         fdt_device: Arm64FdtVmClockDevice {
             region: state.vmclock().fdt_region(),
             interrupt_line: state.vmclock().interrupt_line(),
@@ -5185,7 +5200,8 @@ fn create_initial_vmclock_device(
     interrupt_line: GuestInterruptLine,
 ) -> Result<Arm64BootVmClockDevice, Arm64BootResourceError> {
     let range = initial_vmclock_range()?;
-    let backing_page = initial_vmclock_backing_page();
+    let abi = VmClockAbi::initial();
+    let backing_page = initial_vmclock_backing_page(abi);
     memory
         .write_slice(&backing_page, range.start())
         .map_err(|source| Arm64BootResourceError::VmClockGuestMemoryWrite { source })?;
@@ -5197,7 +5213,11 @@ fn create_initial_vmclock_device(
         interrupt_line,
     };
 
-    Ok(Arm64BootVmClockDevice { range, fdt_device })
+    Ok(Arm64BootVmClockDevice {
+        range,
+        abi,
+        fdt_device,
+    })
 }
 
 fn initial_vmgenid_range() -> Result<GuestMemoryRange, Arm64BootResourceError> {
@@ -5230,33 +5250,26 @@ fn ensure_distinct_vmgenid_generation_id(
     candidate: &mut [u8; ARM64_BOOT_VMGENID_SIZE],
     retained: &[u8; ARM64_BOOT_VMGENID_SIZE],
 ) {
-    if candidate == retained
-        && let Some(first_byte) = candidate.first_mut()
+    for (candidate_half, retained_half) in candidate
+        .chunks_exact_mut(std::mem::size_of::<u64>())
+        .zip(retained.chunks_exact(std::mem::size_of::<u64>()))
     {
-        *first_byte = first_byte.wrapping_add(1);
-        ensure_nonzero_vmgenid_generation_id(candidate);
+        if candidate_half == retained_half
+            && let Some(first_byte) = candidate_half.first_mut()
+        {
+            *first_byte = if *first_byte == u8::MAX {
+                1
+            } else {
+                *first_byte + 1
+            };
+        }
     }
+    ensure_nonzero_vmgenid_generation_id(candidate);
 }
 
-fn initial_vmclock_backing_page() -> Vec<u8> {
-    let mut bytes = initial_vmclock_abi_bytes();
+fn initial_vmclock_backing_page(abi: VmClockAbi) -> Vec<u8> {
+    let mut bytes = abi.to_bytes().to_vec();
     bytes.resize(ARM64_BOOT_VMCLOCK_SIZE, 0);
-    bytes
-}
-
-fn initial_vmclock_abi_bytes() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(ARM64_BOOT_VMCLOCK_ABI_SIZE);
-    bytes.extend_from_slice(&ARM64_BOOT_VMCLOCK_MAGIC.to_le_bytes());
-    bytes.extend_from_slice(&(ARM64_FDT_VMCLOCK_SIZE as u32).to_le_bytes());
-    bytes.extend_from_slice(&ARM64_BOOT_VMCLOCK_VERSION.to_le_bytes());
-    bytes.push(ARM64_BOOT_VMCLOCK_COUNTER_INVALID);
-    bytes.push(0);
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    bytes.extend_from_slice(&0u64.to_le_bytes());
-    bytes.extend_from_slice(&ARM64_BOOT_VMCLOCK_FLAGS.to_le_bytes());
-    bytes.extend_from_slice(&[0; 2]);
-    bytes.push(ARM64_BOOT_VMCLOCK_STATUS_UNKNOWN);
-    bytes.resize(ARM64_BOOT_VMCLOCK_ABI_SIZE, 0);
     bytes
 }
 
@@ -5728,8 +5741,8 @@ mod tests {
         arm64_boot_network_device_metadata, balloon_hinting_status_for_device,
         balloon_stats_for_device, block_device_metadata, capture_entropy_state_for_device_at,
         capture_serial_state_for_device, ensure_nonzero_vmgenid_generation_id,
-        initial_vmclock_abi_bytes, initial_vmclock_range, initial_vmgenid_range,
-        prepare_pci_validation, replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
+        initial_vmclock_range, initial_vmgenid_range, prepare_pci_validation,
+        replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
         stop_balloon_hinting_for_device, update_balloon_config_for_device,
         update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
     };
@@ -5807,6 +5820,10 @@ mod tests {
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
+    };
+    use crate::vmclock::{
+        VMCLOCK_ABI_SIZE, VMCLOCK_COUNTER_INVALID, VMCLOCK_MAGIC, VMCLOCK_REQUIRED_FLAGS,
+        VMCLOCK_STATUS_UNKNOWN, VMCLOCK_VERSION, VmClockAbi,
     };
     use crate::vsock::{
         SuppliedVsockListener, VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
@@ -8981,7 +8998,7 @@ mod tests {
             device.range.start(),
             ARM64_BOOT_VMCLOCK_SIZE,
         );
-        let abi = initial_vmclock_abi_bytes();
+        let abi = device.abi.to_bytes();
         assert!(page.starts_with(&abi));
         assert!(page.iter().skip(abi.len()).all(|byte| *byte == 0));
 
@@ -9036,12 +9053,12 @@ mod tests {
 
     #[test]
     fn vmclock_abi_uses_firecracker_startup_defaults() {
-        let abi = initial_vmclock_abi_bytes();
+        let abi = VmClockAbi::initial().to_bytes();
 
-        assert_eq!(abi.len(), super::ARM64_BOOT_VMCLOCK_ABI_SIZE);
+        assert_eq!(abi.len(), VMCLOCK_ABI_SIZE);
         assert_eq!(
             u32::from_le_bytes(abi[0..4].try_into().unwrap()),
-            super::ARM64_BOOT_VMCLOCK_MAGIC
+            VMCLOCK_MAGIC
         );
         assert_eq!(
             u32::from_le_bytes(abi[4..8].try_into().unwrap()),
@@ -9049,16 +9066,16 @@ mod tests {
         );
         assert_eq!(
             u16::from_le_bytes(abi[8..10].try_into().unwrap()),
-            super::ARM64_BOOT_VMCLOCK_VERSION
+            VMCLOCK_VERSION
         );
-        assert_eq!(abi[10], super::ARM64_BOOT_VMCLOCK_COUNTER_INVALID);
+        assert_eq!(abi[10], VMCLOCK_COUNTER_INVALID);
         assert_eq!(u32::from_le_bytes(abi[12..16].try_into().unwrap()), 0);
         assert_eq!(u64::from_le_bytes(abi[16..24].try_into().unwrap()), 0);
         assert_eq!(
             u64::from_le_bytes(abi[24..32].try_into().unwrap()),
-            super::ARM64_BOOT_VMCLOCK_FLAGS
+            VMCLOCK_REQUIRED_FLAGS
         );
-        assert_eq!(abi[34], super::ARM64_BOOT_VMCLOCK_STATUS_UNKNOWN);
+        assert_eq!(abi[34], VMCLOCK_STATUS_UNKNOWN);
         assert!(abi[35..].iter().all(|byte| *byte == 0));
     }
 
@@ -9150,7 +9167,7 @@ mod tests {
     }
 
     #[test]
-    fn vmgenid_replacement_normalizes_zero_and_forces_a_distinct_generation() {
+    fn vmgenid_replacement_normalizes_zero_and_forces_both_halves_distinct() {
         let mut memory = vmgenid_replacement_test_memory();
         let mut device = vmgenid_replacement_test_device([0x22; ARM64_BOOT_VMGENID_SIZE]);
 
@@ -9165,11 +9182,36 @@ mod tests {
         })
         .expect("same candidate should be made distinct");
         assert_ne!(device.generation_id, retained);
+        assert!(
+            device
+                .generation_id
+                .chunks_exact(std::mem::size_of::<u64>())
+                .zip(retained.chunks_exact(std::mem::size_of::<u64>()))
+                .all(|(candidate_half, retained_half)| candidate_half != retained_half)
+        );
         assert!(device.generation_id.iter().any(|byte| *byte != 0));
         assert_eq!(
             read_guest_bytes(&memory, device.range.start(), ARM64_BOOT_VMGENID_SIZE),
             device.generation_id
         );
+
+        let mut retained = [0; ARM64_BOOT_VMGENID_SIZE];
+        retained[0] = 1;
+        retained[8] = u8::MAX;
+        device.generation_id = retained;
+        replace_arm64_boot_vmgenid_with(&mut memory, &mut device, |candidate| {
+            candidate[8] = u8::MAX;
+            Ok(())
+        })
+        .expect("wrapping half should stay distinct without zero renormalization");
+        assert!(
+            device
+                .generation_id
+                .chunks_exact(std::mem::size_of::<u64>())
+                .zip(retained.chunks_exact(std::mem::size_of::<u64>()))
+                .all(|(candidate_half, retained_half)| candidate_half != retained_half)
+        );
+        assert!(device.generation_id.iter().any(|byte| *byte != 0));
     }
 
     #[test]

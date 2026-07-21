@@ -38,6 +38,7 @@ pub mod virtio;
 pub mod virtio_mmio;
 pub mod virtio_pci;
 pub mod virtio_queue;
+pub mod vmclock;
 pub mod vsock;
 
 use std::fmt;

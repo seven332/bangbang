@@ -70,6 +70,12 @@ claims mechanically visible.
   leaves, records default stdout, configured-output stdin exclusion, bounded
   terminal/FIFO RX and exact MMIO capture-ready ownership, and hands the one
   serialization/endpoint-reconstruction aggregate to Wave 6.
+- [`time-identity-contract.md`](time-identity-contract.md) is the #1477 PL031,
+  VMGenID, and VMClock restore ledger. It records complete typed VMClock capture,
+  backward-compatible native-v1 state, ordered destination notifications,
+  postcommit terminality, fresh destination PL031 time, and signed guest proof,
+  while leaving the one aggregate record open for PVTime and final
+  clone/portability certification.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -457,6 +463,24 @@ reconstruction, restore, migration/clone behavior, portability, and signed
 restored-guest outcomes. The current overlay is therefore 191
 `implemented-and-verified`, 207 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` records.
+
+#1477 completes the native-v1 PL031, VMGenID, and VMClock restore slice under
+#1440. New captures append the exact validated 112-byte VMClock ABI in nested
+`BANGDEV\0` 1.1.0 state; loaders continue to accept 1.0.0 by deriving the same
+typed value from the independently checked memory image. A 1.1.0 encoded value
+must exactly equal that image. Restore completes aggregate device, vCPU, GIC,
+ICC, timer, and pending-interrupt state first, then writes and notifies a fresh
+VMGenID, publishes the odd/fenced/counter/fenced/even VMClock update, and
+notifies it before any resume. A completely cleaned precommit failure remains
+retryable; any guest-memory or notification commit is terminal. Destination
+PL031 reconstruction uses destination wall clock with every unsupported alarm
+register clear. Signed cross-process guest code observes both VMGenID halves,
+stable VMClock sequence/counters, and non-regressing RTC time. The checked
+[`time-identity-contract.md`](time-identity-contract.md) retains
+`semantic.device:rtc-vmclock-vmgenid-and-pvtime` as `audit-required` solely for
+#1478 PVTime ABI, #1480 PVTime accounting, and #1481 final aggregate
+clone/portability certification. No disposition changes, so the overlay remains
+191/207/3/17.
 
 ## Commands
 

@@ -1521,6 +1521,7 @@ pub(crate) mod tests {
             original.serial_state(),
             platform(aarch64::DRAM_MEM_START + 0x1000, 16, 34),
             platform(aarch64::DRAM_MEM_START + 0x2000, 4096, 35),
+            original.vmclock_abi(),
         )
     }
 
