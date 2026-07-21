@@ -18,6 +18,7 @@ use crate::psci::{
     PsciCpuOnToken, PsciCpuOnWork, PsciCpuPowerCoordinator, PsciCpuSuspendResponse,
     PsciCpuSuspendToken,
 };
+use crate::pvtime::HvfArm64PvTimeCaptureState;
 use crate::runner::{HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::vcpu::HvfArm64SecondaryBootRegisters;
 
@@ -185,6 +186,18 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
 
     pub(crate) fn control(&self) -> HvfVcpuRunControl {
         self.coordinator.control()
+    }
+
+    pub(crate) fn capture_arm64_pvtime(
+        &self,
+    ) -> Result<HvfArm64PvTimeCaptureState, HvfVcpuRunCoordinatorError> {
+        self.coordinator.capture_arm64_pvtime()
+    }
+
+    pub(crate) fn pause_idle_for_arm64_pvtime_capture(
+        &self,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        self.coordinator.pause_idle_for_arm64_pvtime_capture()
     }
 
     pub(crate) fn singular_runner(&self) -> Result<&HvfVcpuRunner<'vm>, HvfVcpuRunnerError> {

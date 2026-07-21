@@ -1,13 +1,13 @@
 # Firecracker v1.16.0 time and identity contract
 
-This ledger is the checked closure record through #1478, the seventh delivery
+This ledger is the checked closure record through #1480, the eighth delivery
 slice of #1440 under #1348. It covers the delivered aarch64 PL031 RTC, VMGenID,
-VMClock, and hidden PVTime ABI/measurement foundation portions of exactly one
+VMClock, and public live/capture-ready PVTime portions of exactly one
 aggregate identity:
 `semantic.device:rtc-vmclock-vmgenid-and-pvtime`. That identity remains
-`audit-required` because public ARM PVTime accounting, guest certification,
-clone/portability policy, and final aggregate certification remain under #1480
-and #1481. #1478 therefore changes no inventory disposition or global count.
+`audit-required` because aggregate clone/portability policy and final combined
+certification remain under #1481. #1480 therefore changes no inventory
+disposition or global count.
 
 ## Evidence keys
 
@@ -37,15 +37,23 @@ and #1481. #1478 therefore changes no inventory disposition or global count.
 - **PVTime ABI and placement** — `crates/runtime/src/pvtime.rs` owns the exact
   64-byte little-endian revision-0/attributes-0 stolen-time structure and plans
   one aligned, nonoverlapping record per topology-ordered vCPU. Ordinary boot
-  initializes those hidden records below VMGenID, retains their exact IPAs, and
-  deliberately emits no guest discovery contract.
-- **HVF measurement and firmware-call gate** — the HVF `ffi`, `pvtime`,
+  initializes those records below VMGenID and retains their exact IPAs. No FDT
+  node is required by the standard SMCCC discovery contract.
+- **HVF measurement, accounting, and firmware gate** — the HVF `ffi`, `pvtime`,
   `runner`, and `psci` modules runtime-resolve the macOS 11
-  `hv_vcpu_get_exec_time`
-  primitive, converts Mach absolute units with checked integer arithmetic on
-  the permanent owner thread, and models exact 64-bit `PV_TIME_FEATURES` and
-  `PV_TIME_ST` dispatch. The production runner injects a disabled policy, so
-  discovery, direct calls, and both 32-bit aliases return not-supported.
+  `hv_vcpu_get_exec_time` primitive and sample it with monotonic wall time on
+  the permanent owner thread. Each admitted runnable run publishes the prior
+  value, then commits saturated `wall - execution` time; canceled and virtual-
+  timer-idle windows are discarded. A retained aligned atomic writer performs
+  dirty-aware little-endian release stores. Exact 64-bit `PV_TIME_FEATURES` and
+  `PV_TIME_ST` dispatch is enabled only after complete topology configuration;
+  missing measurement support remains fail-closed and 32-bit aliases remain
+  unsupported.
+- **Capture continuity** — a completed pause barrier publishes and returns only
+  topology-ordered cumulative per-vCPU values. No source clock or execution
+  baseline crosses the boundary, so a future destination starts a fresh run
+  window and cannot charge destination downtime. Wave 6 still owns artifact
+  encoding and restore orchestration.
 - **Focused and signed validation** — runtime and HVF unit tests cover ABI
   bytes, validation, wrapping counters, partial writes, legacy decode, encoded
   memory mismatch, destination RTC reconstruction, ordering, and retryability.
@@ -54,14 +62,18 @@ and #1481. #1478 therefore changes no inventory disposition or global count.
   change, a stable even VMClock sequence with changed disruption/generation
   counters, and a destination RTC value no earlier than its captured value.
   Signed `hvf_lifecycle` tests additionally prove the public HVF execution-time
-  symbol on Apple Silicon, owner-thread cumulative measurements across real
-  guest execution, and unchanged guest-visible PVTime denial.
+  symbol on Apple Silicon and owner-thread cumulative measurements across real
+  guest execution. Signed `guest_boot` certification proves Linux emits
+  `stolen time PV`, aggregate `/proc/stat` steal ticks become nonzero and
+  monotonic under a hidden real-delay contention probe, stay unchanged after
+  the probe is disabled, and topology capture values stay unchanged across a
+  completed pause interval.
 
 ## Exact one-record ledger
 
 | Identity | Current disposition | Exact contract and remaining handoff |
 | --- | --- | --- |
-| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, same-host repeated-load behavior, failure classification, redaction, signed guest observation, and the hidden per-vCPU PVTime ABI/owner-thread measurement foundation are implemented and verified. **#1480** owns stolen-time accounting, public enablement, capture continuity, and focused guest certification; **#1481** owns final aggregate clone/portability reconciliation and terminal disposition. |
+| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, same-host repeated-load behavior, failure classification, redaction, signed guest observation, and public per-vCPU PVTime measurement/accounting/publication/discovery plus capture-ready continuity are implemented and verified. **#1481** owns final aggregate clone/portability reconciliation and terminal disposition. |
 
 ## VMClock state and version contract
 
@@ -115,10 +127,8 @@ it is not a claim of alarm delivery or source-wall-clock freezing.
 
 ## Explicit remaining handoff
 
-This ledger does not claim KVM's ARM steal-time device attribute, public
-PVTime discovery, stolen-time accounting, capture continuity, Linux guest
-certification, or cross-host time-source portability. #1480 must build and
-certify those guest-visible behaviors on #1478's disabled internal foundation,
-and #1481 must reconcile repeated clone and portability outcomes across the
-complete remaining-device family before the aggregate inventory record can
-become terminal.
+This ledger does not claim KVM's ARM steal-time device attribute, PVTime
+artifact serialization/restore orchestration, repeated clone behavior, or
+cross-host time-source portability. #1481 must reconcile those applicable
+clone and portability outcomes across the complete remaining-device family
+before the aggregate inventory record can become terminal.

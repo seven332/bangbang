@@ -373,28 +373,35 @@ steps and a bounded watchdog, never fixed sleeps. Retain the Firecracker
 `arm,psci-0.2` FDT binding and do not infer host mitigation, KVM PV/vendor,
 TRNG, PSCI 1.1+, or optional power-service support from this gate.
 
-The disabled ARM PVTime foundation extends that firmware-call gate without
-changing the public contract. Runtime tests must prove the exact 64-byte
+The ARM PVTime gate starts with the exact standard firmware and memory contract.
+Runtime tests must prove the exact 64-byte
 little-endian revision-0/attributes-0 structure, zero padding, one aligned and
 nonoverlapping record per vCPU, deterministic topology ordering, bounded arena
 exhaustion, committed-prefix rollback, and no FDT advertisement. HVF unit tests
 must cover checked Mach-to-nanosecond conversion, missing-symbol and error
-redaction, owner-thread admission and cleanup, per-vCPU IPA isolation, exact
+redaction, retained aligned atomic publication and dirty marking, owner-thread
+admission and cleanup, per-vCPU IPA and counter isolation, exact
 64-bit `PV_TIME_FEATURES` self/`PV_TIME_ST` queries and `PV_TIME_ST` results,
-unknown-feature denial, and both 32-bit aliases. The ordinary runner must always
-use the disabled policy until
-#1480 certifies accounting and Linux discovery. Signed `hvf_lifecycle` proof
-must query the real public macOS 11 execution-time primitive on the permanent
-owner thread before and after bounded guest execution and must separately prove
-that production PSCI/SMCCC discovery and direct PVTime calls remain unsupported:
+unknown-feature denial, both 32-bit aliases, publish-before-run ordering,
+saturating runnable wall-minus-execution deltas, canceled/virtual-timer discard,
+clock regression and sampling stages, topology-ordered pause-gated capture, and
+fresh-baseline continuation. Production enables the per-owner policy only after
+the runtime measurement symbol, every publisher, and the exact topology are
+configured; missing support remains undiscoverable and partial setup aborts.
+Signed `hvf_lifecycle` proof queries the real public macOS 11 execution-time
+primitive on the permanent owner thread. Signed `guest_boot` then uses a hidden
+real-delay admission probe and the production calculator to require Linux's
+`stolen time PV` discovery message, nonzero monotonic aggregate `/proc/stat`
+steal ticks under contention, unchanged ticks after disabling the probe, and
+unchanged captures across a completed pause interval:
 
 ```sh
 scripts/run-integration-tests.sh --test hvf_lifecycle -- measures_real_hvf_vcpu_execution_time_on_owner_thread --exact
-scripts/run-integration-tests.sh --test hvf_lifecycle -- psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract --exact
+scripts/run-integration-tests.sh --test guest_boot -- certifies_linux_pvtime_contention_idle_and_paused_accounting --exact
 ```
 
-These gates do not claim stolen-time accounting, periodic record publication,
-snapshot continuity, guest discovery, or Linux driver certification.
+These gates do not claim KVM's ARM device attribute, PVTime artifact encoding,
+restore orchestration, repeated clone behavior, or cross-host clock portability.
 
 Validation for internal PSCI secondary-power changes must cover both CPU_ON calling
 conventions, exact X1-X3 reads and 32-bit truncation, MPIDR reserved-bit
@@ -1717,7 +1724,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v67.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v69.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -1875,9 +1882,8 @@ connection exchange through the signed executable, including sustained
 bidirectional streams and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, that RTC alarm
-interrupts, public ARM PVTime accounting/discovery, cross-host clock
-portability, or broader
-RTC-adjacent behavior beyond the checked PL031/VMGenID/VMClock contract is
+interrupts, PVTime artifact restore or cross-host clock portability, or broader
+RTC-adjacent behavior beyond the checked PL031/VMGenID/VMClock/PVTime contract is
 supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 Entropy optional-device encoding, restore, migration/clone, and cross-host

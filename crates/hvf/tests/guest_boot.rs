@@ -45,6 +45,14 @@ const SMP_HOTPLUG_DONE_MARKER: &[u8] = b"BBHOTDONE";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const DIRECT_ROOTFS_BOOT_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PVTIME_DISCOVERY_MARKER: &[u8] = b"BANGBANG_PVTIME_DISCOVERY_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PVTIME_CONTENTION_MARKER: &[u8] = b"BANGBANG_PVTIME_CONTENTION_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PVTIME_IDLE_MARKER: &[u8] = b"BANGBANG_PVTIME_IDLE_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PVTIME_FAILURE_MARKER: &[u8] = b"BANGBANG_PVTIME_FAIL_";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VMGENID_GUEST_CHECK_MARKER: &[u8] = b"BANGBANG_VMGENID_GUEST_CHECK_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
@@ -643,6 +651,77 @@ fn boots_firecracker_kernel_from_ext4_rootfs() {
         "direct rootfs boot should not rely on the tiny initrd: {}",
         String::from_utf8_lossy(cmdline)
     );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn certifies_linux_pvtime_contention_idle_and_paused_accounting() {
+    use std::time::Duration;
+
+    use bangbang_hvf::HvfArm64PvTimeContentionProbe;
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let boot_args = format!("{DIRECT_ROOTFS_BOOT_ARGS} bangbang.pvtime-check=1");
+    let probe = HvfArm64PvTimeContentionProbe::new(Duration::from_millis(1));
+    let observation = run_guest_pvtime_certification(
+        "guest-pvtime-certification",
+        PVTIME_IDLE_MARKER,
+        &boot_args,
+        probe,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("PVTime certification rootfs drive should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(&observation, PVTIME_IDLE_MARKER, "PVTime idle marker");
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, PVTIME_DISCOVERY_MARKER),
+        "pinned Linux did not confirm PVTime discovery\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, b"stolen time PV"),
+        "pinned Linux did not emit its PVTime discovery message\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, PVTIME_FAILURE_MARKER),
+        "PVTime guest certification emitted a failure marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+
+    let before = decimal_marker_value(&observation.serial_bytes, b"BANGBANG_PVTIME_BEFORE=");
+    let after = decimal_marker_value(&observation.serial_bytes, b"BANGBANG_PVTIME_AFTER=");
+    let idle_before =
+        decimal_marker_value(&observation.serial_bytes, b"BANGBANG_PVTIME_IDLE_BEFORE=");
+    let idle_after =
+        decimal_marker_value(&observation.serial_bytes, b"BANGBANG_PVTIME_IDLE_AFTER=");
+    assert!(
+        after > before,
+        "Linux steal ticks should increase under contention"
+    );
+    assert!(after > 0, "Linux steal ticks should become nonzero");
+    assert_eq!(
+        idle_after, idle_before,
+        "idle steal ticks should not change"
+    );
+
+    let (capture_before_pause, capture_after_pause) = observation
+        .pvtime_captures
+        .expect("PVTime certification should retain paused captures");
+    assert_eq!(capture_before_pause, capture_after_pause);
+    assert_eq!(capture_before_pause.vcpus().len(), 1);
+    assert!(capture_before_pause.vcpus()[0].stolen_time_ns() > 0);
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1469,9 +1548,36 @@ fn run_guest_boot_with_boot_source_gic_msi_and_pci_validation(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_guest_pvtime_certification(
+    instance_id: &str,
+    marker: &[u8],
+    boot_args: &str,
+    probe: bangbang_hvf::HvfArm64PvTimeContentionProbe,
+    configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
+) -> GuestBootObservation {
+    run_guest_boot_with_boot_source_gic_msi_pci_validation_and_packet_io(
+        instance_id,
+        marker,
+        None,
+        boot_args,
+        None,
+        GuestBootPciIoSetup::new(None, |_: &bangbang_runtime::VmmController| {
+            None::<bangbang_runtime::mmds_network::MmdsOnlyVirtioNetworkPacketIoProvider>
+        })
+        .with_pvtime_certification(GuestBootPvTimeCertification {
+            probe,
+            contention_marker: PVTIME_CONTENTION_MARKER,
+            contention_disabled: false,
+        }),
+        configure_controller,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct GuestBootPciIoSetup<F> {
     validation: Option<bangbang_runtime::startup::Arm64BootPciValidationConfig>,
     packet_io_factory: F,
+    pvtime_certification: Option<GuestBootPvTimeCertification>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1483,8 +1589,21 @@ impl<F> GuestBootPciIoSetup<F> {
         Self {
             validation,
             packet_io_factory,
+            pvtime_certification: None,
         }
     }
+
+    fn with_pvtime_certification(mut self, certification: GuestBootPvTimeCertification) -> Self {
+        self.pvtime_certification = Some(certification);
+        self
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct GuestBootPvTimeCertification {
+    probe: bangbang_hvf::HvfArm64PvTimeContentionProbe,
+    contention_marker: &'static [u8],
+    contention_disabled: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1521,6 +1640,7 @@ where
     let GuestBootPciIoSetup {
         validation: pci_validation,
         packet_io_factory,
+        mut pvtime_certification,
     } = pci_io;
 
     let kernel_path = env_path("BANGBANG_GUEST_KERNEL_PATH");
@@ -1559,8 +1679,18 @@ where
         Some(validation) => config.with_pci_validation(validation),
         None => config,
     };
+    let config = match pvtime_certification.as_ref() {
+        Some(certification) => config.with_pvtime_contention_probe(certification.probe.clone()),
+        None => config,
+    };
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
         .expect("guest boot test session should prepare");
+    if pvtime_certification.is_some() {
+        assert!(
+            session.runtime_resources().pvtime_state.advertised(),
+            "PVTime certification requires complete production owner configuration"
+        );
+    }
     let cache_hierarchy = session
         .arm64_fdt_cache_hierarchy()
         .expect("ordinary boot session should retain its cache hierarchy")
@@ -1598,6 +1728,13 @@ where
                 .expect("guest boot test run-loop should not fail before marker"),
         };
         run_diagnostics.record_loop_outcome(&outcome);
+        if let Some(certification) = pvtime_certification.as_mut()
+            && !certification.contention_disabled
+            && serial_contains_marker(&serial_output, certification.contention_marker)
+        {
+            certification.probe.set_enabled(false);
+            certification.contention_disabled = true;
+        }
         session
             .dispatch_pci_validation_notifications()
             .expect("PCI validation device dispatch should succeed");
@@ -1637,6 +1774,26 @@ where
         &serial_bytes,
         terminal_outcome.as_ref(),
     );
+    let pvtime_captures =
+        if let (true, Some(certification)) = (marker_observed, pvtime_certification.as_ref()) {
+            assert!(
+                certification.contention_disabled,
+                "PVTime contention probe should be disabled before idle certification"
+            );
+            session
+                .pause_idle_for_arm64_pvtime_capture()
+                .expect("PVTime certification should establish an idle pause barrier");
+            let before = session
+                .capture_arm64_pvtime()
+                .expect("first paused PVTime capture should succeed");
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let after = session
+                .capture_arm64_pvtime()
+                .expect("second paused PVTime capture should succeed");
+            Some((before, after))
+        } else {
+            None
+        };
     let pci_validation = session
         .pci_validation_diagnostics()
         .map(|diagnostics| diagnostics.expect("PCI validation diagnostics should be available"));
@@ -1665,6 +1822,7 @@ where
         pci_data_devices,
         pci_data_device_teardown,
         data_mmio_device_counts,
+        pvtime_captures,
     }
 }
 
@@ -1744,6 +1902,10 @@ struct GuestBootObservation {
     pci_data_devices: Option<Vec<bangbang_hvf::HvfArm64BootPciDataDeviceDiagnostics>>,
     pci_data_device_teardown: bool,
     data_mmio_device_counts: (usize, usize, usize),
+    pvtime_captures: Option<(
+        bangbang_hvf::HvfArm64PvTimeCaptureState,
+        bangbang_hvf::HvfArm64PvTimeCaptureState,
+    )>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2688,6 +2850,24 @@ fn serial_contains_marker(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn bytes_contain_marker(bytes: &[u8], marker: &[u8]) -> bool {
     bytes.windows(marker.len()).any(|window| window == marker)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn decimal_marker_value(bytes: &[u8], prefix: &[u8]) -> u64 {
+    let line = bytes
+        .split(|byte| matches!(byte, b'\n' | b'\r' | 0))
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| {
+            panic!(
+                "guest serial output did not contain decimal marker {:?}\nserial output:\n{}",
+                String::from_utf8_lossy(prefix),
+                String::from_utf8_lossy(bytes)
+            )
+        });
+    let value = std::str::from_utf8(line).expect("decimal marker should be UTF-8");
+    value
+        .parse::<u64>()
+        .expect("decimal marker should contain one u64")
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
