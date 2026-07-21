@@ -1536,14 +1536,17 @@ preservation, idempotent finalization, and independent process ownership. The
 60-second rule is checked with injected `Instant` values and due schedulers;
 tests do not sleep for a production interval.
 
-Serial unit tests cover nullable output, the bounded 64-KiB internal buffer,
-nonblocking file/FIFO behavior, path redaction, TX register behavior, exact
-token-bucket refill/drop decisions, and saturating UART counters. Snapshot
-device tests prove that bangbang-native v1 accepts only default serial config,
-round-trips serial MMIO metadata and six mutable register bytes, and constructs
-a fresh empty output buffer with empty UART metrics. It does not preserve
-public output configuration, buffered/in-flight TX bytes, limiter state, or
-counters.
+Serial unit tests cover nullable output, the bounded 64-KiB internal TX buffer,
+nonblocking file/FIFO behavior, path redaction, exact token-bucket refill/drop
+decisions, the 64-byte RX FIFO, DR/OE/RDA/FCR transitions, coalesced typed
+interrupt/drain intents, prefix acceptance and recovery, malformed MMIO metrics,
+fallible redacted capture/restore, and exhaustive short state-machine sequences.
+Focused vectors compare the shared FIFO/DR/RDA/IIR/drain surface against pinned
+vm-superio 0.8.1. Snapshot tests prove that bangbang-native v1 keeps its six-byte
+UART encoding, constructs a fresh output pipeline with empty metrics, and
+rejects nonrepresentable live RX/status/intent state rather than silently
+discarding it. It does not preserve public output configuration, TX bytes,
+limiter state, counters, or the complete capture-ready UART state.
 
 Contained output tests separately cover transferred regular files: the shared
 adoption helper rejects non-regular or non-`O_WRONLY` descriptors, verifies

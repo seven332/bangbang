@@ -83,8 +83,8 @@ use crate::pmem::{
 };
 use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use crate::serial::{
-    SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialMmioDevice, SerialOutputFile,
-    SharedSerialOutput, SharedSerialOutputBuffer,
+    SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfig, SerialMmioCaptureError, SerialMmioCaptureState,
+    SerialMmioDevice, SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use crate::snapshot_device::{
     SnapshotV1BlockRetryState, SnapshotV1DeviceCaptureInput, SnapshotV1DeviceState,
@@ -988,7 +988,10 @@ pub fn prepare_snapshot_v1_device_profile_with_root_backing(
 
     let serial_output_buffer = SharedSerialOutputBuffer::default();
     let serial_output = SharedSerialOutput::from(serial_output_buffer.clone());
-    let serial_handler = SerialMmioDevice::from_state(serial_output.clone(), state.serial_state());
+    let serial_handler = SerialMmioDevice::from_state_with_shared_output(
+        serial_output.clone(),
+        state.serial_state(),
+    );
 
     let mut generation_id = [0; ARM64_BOOT_VMGENID_SIZE];
     memory
@@ -2553,11 +2556,49 @@ pub struct Arm64BootSerialDevice {
     pub fdt_device: Arm64FdtSerialDevice,
 }
 
+pub fn capture_serial_state_for_device(
+    device: &Arm64BootSerialDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<SerialMmioCaptureState, Arm64BootSerialCaptureError> {
+    mmio_dispatcher
+        .handler_mut::<SerialMmioDevice<SharedSerialOutput>>(device.region.id())
+        .map_err(|source| Arm64BootSerialCaptureError::HandlerLookup { source })?
+        .capture_state()
+        .map_err(|source| Arm64BootSerialCaptureError::Device { source })
+}
+
+#[derive(Debug)]
+pub enum Arm64BootSerialCaptureError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    Device { source: SerialMmioCaptureError },
+}
+
+impl fmt::Display for Arm64BootSerialCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HandlerLookup { .. } => {
+                formatter.write_str("failed to locate the boot serial MMIO handler")
+            }
+            Self::Device { .. } => formatter.write_str("boot serial MMIO capture failed"),
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootSerialCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::Device { source } => Some(source),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm64BootSnapshotV1DeviceCaptureError {
     UnsupportedInventory,
     BlockMetadataMismatch,
     SerialMetadataMismatch,
+    SerialStateUnsupported,
     HandlerLookup,
     Capture,
 }
@@ -2571,6 +2612,9 @@ impl fmt::Display for Arm64BootSnapshotV1DeviceCaptureError {
             Self::BlockMetadataMismatch => f.write_str("arm64 boot block metadata is inconsistent"),
             Self::SerialMetadataMismatch => {
                 f.write_str("arm64 boot serial metadata is inconsistent")
+            }
+            Self::SerialStateUnsupported => {
+                f.write_str("arm64 boot serial receive state is unsupported by native-v1")
             }
             Self::HandlerLookup => f.write_str("arm64 boot snapshot device handler lookup failed"),
             Self::Capture => f.write_str("arm64 boot snapshot device capture failed"),
@@ -2914,7 +2958,8 @@ impl Arm64BootRuntimeResources {
         let serial_state = mmio_dispatcher
             .handler_mut::<SerialMmioDevice<SharedSerialOutput>>(serial.region.id())
             .map_err(|_| Arm64BootSnapshotV1DeviceCaptureError::HandlerLookup)?
-            .state();
+            .legacy_state()
+            .map_err(|_| Arm64BootSnapshotV1DeviceCaptureError::SerialStateUnsupported)?;
 
         let block_handler = mmio_dispatcher
             .handler_mut::<VirtioBlockMmioHandler>(block.registration.region_id())
@@ -5513,7 +5558,7 @@ fn register_serial_mmio(
     dispatcher
         .register_handler(
             config.region_id,
-            SerialMmioDevice::new(config.output.clone()),
+            SerialMmioDevice::with_shared_output(config.output.clone()),
         )
         .map_err(|source| Arm64BootResourceError::RegisterSerialMmio {
             source: Box::new(Arm64BootSerialMmioRegistrationError::RegisterHandler {
@@ -5557,15 +5602,16 @@ mod tests {
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
         Arm64BootPciValidationConfig, Arm64BootResourceConfig, Arm64BootResourceError,
         Arm64BootResources, Arm64BootRtcDeviceConfig, Arm64BootRtcMmioRegistrationError,
-        Arm64BootSerialDeviceConfig, Arm64BootSerialMmioRegistrationError, Arm64BootVmGenIdDevice,
-        Arm64BootVmGenIdReplacementError, MIB, VmStartupResources,
+        Arm64BootSerialCaptureError, Arm64BootSerialDeviceConfig,
+        Arm64BootSerialMmioRegistrationError, Arm64BootSnapshotV1DeviceCaptureError,
+        Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError, MIB, VmStartupResources,
         arm64_boot_network_device_metadata, balloon_hinting_status_for_device,
         balloon_stats_for_device, block_device_metadata, capture_entropy_state_for_device_at,
-        ensure_nonzero_vmgenid_generation_id, initial_vmclock_abi_bytes, initial_vmclock_range,
-        initial_vmgenid_range, prepare_pci_validation, replace_arm64_boot_vmgenid_with,
-        start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
-        update_balloon_config_for_device, update_balloon_statistics_for_device,
-        update_block_device_for_devices_with_opened,
+        capture_serial_state_for_device, ensure_nonzero_vmgenid_generation_id,
+        initial_vmclock_abi_bytes, initial_vmclock_range, initial_vmgenid_range,
+        prepare_pci_validation, replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
+        stop_balloon_hinting_for_device, update_balloon_config_for_device,
+        update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
     };
     use crate::VmmAction;
     use crate::balloon::{
@@ -5630,8 +5676,9 @@ mod tests {
     };
     use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
     use crate::serial::{
-        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice,
-        SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
+        SERIAL_LINE_STATUS_DATA_READY, SERIAL_MMIO_DEVICE_WINDOW_SIZE,
+        SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice, SerialOutputFile, SharedSerialOutput,
+        SharedSerialOutputBuffer,
     };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -10569,6 +10616,97 @@ mod tests {
             .find("/uart@40002000")
             .expect("serial node should be in assembled FDT");
         assert_eq!(serial_node.prop_str("compatible").unwrap(), "ns16550a");
+    }
+
+    #[test]
+    fn captures_complete_serial_state_through_boot_device_metadata() {
+        let kernel = temp_file("kernel-capture-serial", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let (serial, _output) =
+            serial_config(TEST_SERIAL_MMIO_BASE, MmioRegionId::new(9), line(32));
+        let config = Arm64BootResourceConfig {
+            serial_device: Some(serial),
+            ..valid_config(&[])
+        };
+        let mut resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with serial device");
+        let serial = resources
+            .serial_device
+            .clone()
+            .expect("serial metadata should be returned");
+
+        let initial = capture_serial_state_for_device(&serial, &mut resources.mmio_dispatcher)
+            .expect("initial serial state should capture");
+        assert!(initial.receive_bytes().is_empty());
+
+        resources
+            .mmio_dispatcher
+            .handler_mut::<SerialMmioDevice<SharedSerialOutput>>(serial.region.id())
+            .expect("serial handler should be registered")
+            .inject_receive_bytes(b"rx")
+            .expect("serial receive bytes should inject");
+        let captured = capture_serial_state_for_device(&serial, &mut resources.mmio_dispatcher)
+            .expect("serial receive state should capture");
+        assert_eq!(captured.receive_bytes(), b"rx");
+        assert_ne!(captured.line_status() & SERIAL_LINE_STATUS_DATA_READY, 0);
+
+        let error = capture_serial_state_for_device(&serial, &mut MmioDispatcher::new())
+            .expect_err("missing serial handler should be typed");
+        assert!(matches!(
+            error,
+            Arm64BootSerialCaptureError::HandlerLookup { .. }
+        ));
+    }
+
+    #[test]
+    fn native_v1_capture_rejects_nonrepresentable_serial_receive_state() {
+        let kernel = temp_file("kernel-native-v1-serial-rx", &arm64_image());
+        let block = temp_file("block-native-v1-serial-rx", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let drive_config = controller.drive_configs()[0].clone();
+        let snapshot_serial_config = controller.serial_config().clone();
+        let (serial, _output) =
+            serial_config(TEST_SERIAL_MMIO_BASE, MmioRegionId::new(9), line(33));
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                serial_device: Some(serial),
+                ..valid_config(&[line(32)])
+            },
+        )
+        .expect("boot resources should assemble");
+        let mut parts = resources.into_parts();
+        let serial_region_id = parts
+            .runtime
+            .serial_device
+            .as_ref()
+            .expect("serial metadata should be retained")
+            .region
+            .id();
+        parts
+            .mmio_dispatcher
+            .handler_mut::<SerialMmioDevice<SharedSerialOutput>>(serial_region_id)
+            .expect("serial handler should be registered")
+            .inject_receive_bytes(b"pending")
+            .expect("serial receive bytes should inject");
+
+        let error = parts
+            .runtime
+            .capture_snapshot_v1_device_state_at(
+                &parts.memory,
+                &mut parts.mmio_dispatcher,
+                &drive_config,
+                &snapshot_serial_config,
+                super::SnapshotV1BlockRetryState::None,
+                Instant::now(),
+            )
+            .expect_err("native-v1 must not silently discard serial receive state");
+
+        assert_eq!(
+            error,
+            Arm64BootSnapshotV1DeviceCaptureError::SerialStateUnsupported
+        );
     }
 
     #[test]
