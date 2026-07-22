@@ -2,12 +2,13 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
-use bangbang_runtime::memory::{GuestMemory, GuestMemoryAccessError};
+use bangbang_runtime::memory::GuestMemory;
 #[cfg(test)]
 pub(crate) use bangbang_runtime::mmds_network::{
     DEFAULT_MMDS_REQUEST_BUFFER_CAPACITY, DEFAULT_MMDS_REQUEST_BUFFER_LEN_LIMIT,
@@ -23,23 +24,25 @@ pub(crate) use bangbang_runtime::mmds_network::{
 };
 use bangbang_runtime::mmds_network::{MmdsPacketDetourError, MmdsResponseQueueError};
 use bangbang_runtime::network::{
-    VIRTIO_NET_MAX_BUFFER_SIZE, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketCommit,
-    VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
-    VirtioNetworkTxPacketStage,
+    GuestMacAddress, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_TX_HEADER_SIZE,
+    VirtioNetworkBackendMetrics, VirtioNetworkPacketEnvelope, VirtioNetworkRxPacket,
+    VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
+    VirtioNetworkTxPacketCommit, VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+    VirtioNetworkTxPacketSinkError, VirtioNetworkTxPacketStage,
 };
+use bangbang_runtime::network_packet::VirtioNetworkPacketPlan;
 use bangbang_runtime::startup::{
     Arm64BootNetworkInterface, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
     Arm64BootNetworkPacketIoProvider,
 };
 
-#[cfg(test)]
-use crate::host_network::vmnet::VmnetReadPacket;
 use crate::host_network::vmnet::{
     StartedVmnetPacketIoBackend, VMNET_MAX_BYTES_PER_OPERATION, VMNET_MAX_PACKETS_PER_OPERATION,
-    VmnetError, VmnetInterfaceBackend, VmnetPacketAvailableCallback, VmnetPacketDescriptorError,
-    VmnetPacketIoBackend, VmnetPacketIoError, VmnetWritePacket,
+    VmnetError, VmnetInterfaceBackend, VmnetPacketAvailableCallback, VmnetPacketIoBackend,
+    VmnetPacketIoError,
 };
+#[cfg(test)]
+use crate::host_network::vmnet::{VmnetReadPacket, VmnetWritePacket};
 
 pub const DEFAULT_VMNET_VIRTIO_NETWORK_RX_BUFFER_LEN: usize = VIRTIO_NET_MAX_BUFFER_SIZE as usize;
 const VMNET_READINESS_READY_BIT: u64 = 1;
@@ -409,6 +412,27 @@ impl VmnetVirtioNetworkBatchLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VmnetVirtioNetworkPacketProfile {
+    limits: VmnetVirtioNetworkBatchLimits,
+    packet_envelope: VirtioNetworkPacketEnvelope,
+    guest_mac: Option<GuestMacAddress>,
+}
+
+impl VmnetVirtioNetworkPacketProfile {
+    pub(crate) const fn new(
+        limits: VmnetVirtioNetworkBatchLimits,
+        packet_envelope: VirtioNetworkPacketEnvelope,
+        guest_mac: Option<GuestMacAddress>,
+    ) -> Self {
+        Self {
+            limits,
+            packet_envelope,
+            guest_mac,
+        }
+    }
+}
+
 impl fmt::Debug for PreparedVmnetVirtioNetworkRxBuffer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PreparedVmnetVirtioNetworkRxBuffer(<owned>)")
@@ -506,10 +530,32 @@ where
         mmds_detour: Option<MmdsPacketDetour>,
         readiness_lease: Option<VmnetPacketReadinessLease>,
     ) -> Result<Self, VmnetVirtioNetworkPacketIoBuildError> {
+        Self::with_prepared_batch_envelope_and_mmds_detour(
+            backend,
+            interface,
+            prepared,
+            VmnetVirtioNetworkPacketProfile::new(
+                limits,
+                VirtioNetworkPacketEnvelope::RawEthernet,
+                None,
+            ),
+            mmds_detour,
+            readiness_lease,
+        )
+    }
+
+    pub(crate) fn with_prepared_batch_envelope_and_mmds_detour(
+        backend: B,
+        interface: B::Interface,
+        prepared: PreparedVmnetVirtioNetworkRxBuffer,
+        profile: VmnetVirtioNetworkPacketProfile,
+        mmds_detour: Option<MmdsPacketDetour>,
+        readiness_lease: Option<VmnetPacketReadinessLease>,
+    ) -> Result<Self, VmnetVirtioNetworkPacketIoBuildError> {
         let parts = prepared.into_batch_parts(
-            limits.packet_capacity,
-            limits.read_batch_size,
-            limits.write_batch_size,
+            profile.limits.packet_capacity,
+            profile.limits.read_batch_size,
+            profile.limits.write_batch_size,
         )?;
         let readiness = readiness_lease
             .as_ref()
@@ -520,24 +566,40 @@ where
         }));
         let mmds_response_queue = mmds_detour.as_ref().map(MmdsPacketDetour::response_queue);
 
+        let tx_sink = VmnetVirtioNetworkTxPacketSink {
+            shared: Arc::clone(&shared),
+            mmds_detour,
+            staging_buffer: parts.tx_buffer,
+            committed_ranges: parts.packet_ranges,
+            committed_frames: Vec::new(),
+            committed_packet_count: 0,
+            committed_emitted_len: 0,
+            staged_frame: None,
+            maximum_packet_size: parts.packet_capacity,
+            maximum_batch_size: parts.write_batch_size,
+            packet_envelope: profile.packet_envelope,
+            guest_mac: profile.guest_mac,
+            backend_metrics: VirtioNetworkBackendMetrics::default(),
+        };
+        let rx_source = VmnetVirtioNetworkRxPacketSource {
+            shared,
+            read_buffer: parts.rx_buffer,
+            packet_lengths: parts.packet_lengths,
+            packet_capacity: parts.packet_capacity,
+            read_batch_size: parts.read_batch_size,
+            cached_packet_index: 0,
+            cached_packet_count: 0,
+            cached_packet_source: None,
+            host_batch_attempted: None,
+            mmds_response_queue,
+            readiness,
+            packet_envelope: profile.packet_envelope,
+            backend_metrics: VirtioNetworkBackendMetrics::default(),
+        };
+
         Ok(Self {
-            tx_sink: VmnetVirtioNetworkTxPacketSink::new(
-                Arc::clone(&shared),
-                mmds_detour,
-                parts.tx_buffer,
-                parts.packet_ranges,
-                parts.packet_capacity,
-                parts.write_batch_size,
-            ),
-            rx_source: VmnetVirtioNetworkRxPacketSource::new(
-                shared,
-                parts.rx_buffer,
-                parts.packet_lengths,
-                parts.packet_capacity,
-                parts.read_batch_size,
-                mmds_response_queue,
-                readiness,
-            ),
+            tx_sink,
+            rx_source,
             readiness_lease,
         })
     }
@@ -775,9 +837,15 @@ where
     mmds_detour: Option<MmdsPacketDetour>,
     staging_buffer: Vec<u8>,
     committed_ranges: Vec<Range<usize>>,
-    staged_packet: Option<StagedVmnetTxPacket>,
+    committed_frames: Vec<StagedVmnetTxFrame>,
+    committed_packet_count: usize,
+    committed_emitted_len: usize,
+    staged_frame: Option<StagedVmnetTxFrame>,
     maximum_packet_size: usize,
     maximum_batch_size: usize,
+    packet_envelope: VirtioNetworkPacketEnvelope,
+    guest_mac: Option<GuestMacAddress>,
+    backend_metrics: VirtioNetworkBackendMetrics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -787,8 +855,10 @@ enum StagedVmnetTxPacketKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StagedVmnetTxPacket {
-    range: Range<usize>,
+struct StagedVmnetTxFrame {
+    packet: VirtioNetworkPacketPlan,
+    packet_count: usize,
+    emitted_len: usize,
     kind: StagedVmnetTxPacketKind,
 }
 
@@ -804,8 +874,11 @@ where
                 "mmds_detour",
                 &self.mmds_detour.as_ref().map(|_| "<configured>"),
             )
-            .field("committed_packets", &self.committed_ranges.len())
-            .field("staged_packet", &self.staged_packet.is_some())
+            .field("committed_packets", &self.committed_packet_count)
+            .field("committed_frames", &self.committed_frames.len())
+            .field("staged_frame", &self.staged_frame.is_some())
+            .field("packet_envelope", &self.packet_envelope)
+            .field("guest_mac", &self.guest_mac.map(|_| "<configured>"))
             .finish()
     }
 }
@@ -814,40 +887,330 @@ impl<B> VmnetVirtioNetworkTxPacketSink<B>
 where
     B: VmnetPacketIoBackend,
 {
-    fn new(
-        shared: Arc<Mutex<VmnetVirtioNetworkPacketIoState<B>>>,
-        mmds_detour: Option<MmdsPacketDetour>,
-        staging_buffer: Vec<u8>,
-        committed_ranges: Vec<Range<usize>>,
-        maximum_packet_size: usize,
-        maximum_batch_size: usize,
-    ) -> Self {
-        Self {
-            shared,
-            mmds_detour,
-            staging_buffer,
-            committed_ranges,
-            staged_packet: None,
-            maximum_packet_size,
-            maximum_batch_size,
+    fn prepare_packet_plan(
+        &self,
+        memory: &GuestMemory,
+        frame: &VirtioNetworkTxFrame,
+    ) -> Result<VirtioNetworkPacketPlan, VirtioNetworkTxPacketSinkError> {
+        frame
+            .prepare_packet(memory)
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))
+    }
+
+    fn preflight_packet_plan(
+        &self,
+        plan: &VirtioNetworkPacketPlan,
+    ) -> Result<(usize, usize, StagedVmnetTxPacketKind), VirtioNetworkTxPacketSinkError> {
+        let packet_count = plan
+            .emitted_packet_count()
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        let emitted_len = plan
+            .emitted_len(self.packet_envelope)
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        let mut kind = None;
+        let visit = plan
+            .visit_packets(self.packet_envelope, |packet| {
+                if packet.is_empty() || packet.len() > self.maximum_packet_size {
+                    return ControlFlow::Break(VirtioNetworkTxPacketSinkError::new(
+                        "vmnet TX normalized packet exceeds the realized per-packet bound",
+                    ));
+                }
+                let packet = match ethernet_packet_for_envelope(self.packet_envelope, packet) {
+                    Ok(packet) => packet,
+                    Err(source) => return ControlFlow::Break(source),
+                };
+                let current = if self
+                    .mmds_detour
+                    .as_ref()
+                    .is_some_and(|detour| detour.would_detour_packet(packet))
+                {
+                    StagedVmnetTxPacketKind::MmdsDetour
+                } else {
+                    StagedVmnetTxPacketKind::External
+                };
+                if kind.is_some_and(|previous| previous != current) {
+                    return ControlFlow::Break(VirtioNetworkTxPacketSinkError::new(
+                        "MMDS classification changed within one normalized TX frame",
+                    ));
+                }
+                kind = Some(current);
+                ControlFlow::Continue(())
+            })
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        if let ControlFlow::Break(source) = visit {
+            return Err(source);
+        }
+        let kind = kind.ok_or_else(|| {
+            VirtioNetworkTxPacketSinkError::new("vmnet TX normalization emitted no packet")
+        })?;
+        Ok((packet_count, emitted_len, kind))
+    }
+
+    fn should_flush_before_staging(
+        &self,
+        packet_count: usize,
+        emitted_len: usize,
+    ) -> Result<bool, VirtioNetworkTxPacketSinkError> {
+        let required_packets = self
+            .committed_packet_count
+            .checked_add(packet_count)
+            .ok_or_else(|| {
+                VirtioNetworkTxPacketSinkError::new("vmnet TX batch count overflowed")
+            })?;
+        let required_len = self
+            .committed_emitted_len
+            .checked_add(emitted_len)
+            .ok_or_else(|| VirtioNetworkTxPacketSinkError::new("vmnet TX batch size overflowed"))?;
+        Ok(!self.committed_frames.is_empty()
+            && (required_packets > self.maximum_batch_size
+                || required_len > VMNET_MAX_BYTES_PER_OPERATION))
+    }
+
+    fn install_staged_plan(
+        &mut self,
+        packet: VirtioNetworkPacketPlan,
+        packet_count: usize,
+        emitted_len: usize,
+        kind: StagedVmnetTxPacketKind,
+    ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+        if kind == StagedVmnetTxPacketKind::External {
+            self.committed_frames.try_reserve(1).map_err(|source| {
+                VirtioNetworkTxPacketSinkError::new(format!(
+                    "failed to reserve vmnet TX frame metadata: {source}"
+                ))
+            })?;
+        }
+        if let (Some(expected), Some(observed)) = (self.guest_mac, packet.source_mac())
+            && expected.octets() != observed
+        {
+            self.backend_metrics.record_spoofed_mac();
+        }
+        self.staged_frame = Some(StagedVmnetTxFrame {
+            packet,
+            packet_count,
+            emitted_len,
+            kind,
+        });
+        Ok(VirtioNetworkTxPacketStage::Staged {
+            flush_before_commit: kind == StagedVmnetTxPacketKind::MmdsDetour,
+        })
+    }
+
+    fn stage_owned_plan(
+        &mut self,
+        packet: VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+        if self.staged_frame.is_some() {
+            return Err(VirtioNetworkTxPacketSinkError::new(
+                "vmnet TX staging already owns an uncommitted frame",
+            ));
+        }
+        let (packet_count, emitted_len, kind) = self.preflight_packet_plan(&packet)?;
+        if self.should_flush_before_staging(packet_count, emitted_len)? {
+            return Ok(VirtioNetworkTxPacketStage::FlushRequired);
+        }
+        self.install_staged_plan(packet, packet_count, emitted_len, kind)
+    }
+
+    fn stage_borrowed_plan(
+        &mut self,
+        packet: &VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+        if self.staged_frame.is_some() {
+            return Err(VirtioNetworkTxPacketSinkError::new(
+                "vmnet TX staging already owns an uncommitted frame",
+            ));
+        }
+        let (packet_count, emitted_len, kind) = self.preflight_packet_plan(packet)?;
+        if self.should_flush_before_staging(packet_count, emitted_len)? {
+            return Ok(VirtioNetworkTxPacketStage::FlushRequired);
+        }
+        let packet = packet
+            .try_clone_owned()
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        self.install_staged_plan(packet, packet_count, emitted_len, kind)
+    }
+
+    fn detour_packet_plan(
+        &mut self,
+        packet: &VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        let Some(detour) = self.mmds_detour.as_mut() else {
+            return Err(VirtioNetworkTxPacketSinkError::new(
+                "vmnet TX MMDS staging lost its detour owner",
+            ));
+        };
+        let envelope = self.packet_envelope;
+        let visit = packet
+            .visit_packets(envelope, |packet| {
+                let packet = match ethernet_packet_for_envelope(envelope, packet) {
+                    Ok(packet) => packet,
+                    Err(source) => return ControlFlow::Break(source),
+                };
+                match detour.detour_packet(packet).map_err(tx_mmds_detour_error) {
+                    Ok(true) => ControlFlow::Continue(()),
+                    Ok(false) => ControlFlow::Break(VirtioNetworkTxPacketSinkError::new(
+                        "MMDS side-effect classification changed at commit",
+                    )),
+                    Err(source) => ControlFlow::Break(source),
+                }
+            })
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        match visit {
+            ControlFlow::Continue(()) => Ok(VirtioNetworkTxPacketDisposition::Detoured),
+            ControlFlow::Break(source) => Err(source),
         }
     }
 
-    fn validate_frame_packet_len(
-        &self,
-        frame: &VirtioNetworkTxFrame,
-    ) -> Result<usize, VirtioNetworkTxPacketSinkError> {
-        let packet_len = usize::try_from(frame.payload_len()).map_err(|_| {
-            tx_error(VmnetVirtioNetworkTxCopyError::PayloadLengthTooLarge {
-                len: frame.payload_len(),
-            })
-        })?;
-        if packet_len == 0 || packet_len > self.maximum_packet_size {
+    fn transmit_owned_plan(
+        &mut self,
+        packet: VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        if self.staged_frame.is_some() || !self.committed_frames.is_empty() {
             return Err(VirtioNetworkTxPacketSinkError::new(
-                "vmnet TX frame exceeds the realized per-packet bound",
+                "vmnet immediate TX cannot overlap staged batch ownership",
             ));
         }
-        Ok(packet_len)
+        match self.stage_owned_plan(packet)? {
+            VirtioNetworkTxPacketStage::Staged { .. } => {}
+            VirtioNetworkTxPacketStage::FlushRequired => {
+                return Err(VirtioNetworkTxPacketSinkError::new(
+                    "vmnet immediate TX unexpectedly required a prior flush",
+                ));
+            }
+        }
+        match self.commit_staged_frame() {
+            VirtioNetworkTxPacketCommit::Immediate(result) => result,
+            VirtioNetworkTxPacketCommit::Deferred => {
+                let mut results = Vec::new();
+                results.try_reserve_exact(1).map_err(|source| {
+                    VirtioNetworkTxPacketSinkError::new(format!(
+                        "failed to reserve vmnet TX immediate result: {source}"
+                    ))
+                })?;
+                self.flush_staged_frames(&mut results);
+                results.into_iter().next().unwrap_or_else(|| {
+                    Err(VirtioNetworkTxPacketSinkError::new(
+                        "vmnet immediate TX produced no frame result",
+                    ))
+                })
+            }
+        }
+    }
+}
+
+struct VmnetTxBatchWriter<'a, B>
+where
+    B: VmnetPacketIoBackend,
+{
+    backend: &'a mut B,
+    interface: &'a mut B::Interface,
+    buffer: &'a mut Vec<u8>,
+    ranges: &'a mut Vec<Range<usize>>,
+    maximum_packet_size: usize,
+    maximum_batch_size: usize,
+    completed_packets: usize,
+    metrics: VirtioNetworkBackendMetrics,
+}
+
+impl<B> VmnetTxBatchWriter<'_, B>
+where
+    B: VmnetPacketIoBackend,
+{
+    fn push_packet(&mut self, packet: &[u8]) -> Result<(), VirtioNetworkTxPacketSinkError> {
+        if packet.is_empty() || packet.len() > self.maximum_packet_size {
+            return Err(VirtioNetworkTxPacketSinkError::new(
+                "vmnet TX normalized packet exceeds the realized per-packet bound",
+            ));
+        }
+        let required_len =
+            self.buffer.len().checked_add(packet.len()).ok_or_else(|| {
+                VirtioNetworkTxPacketSinkError::new("vmnet TX batch size overflowed")
+            })?;
+        if !self.ranges.is_empty()
+            && (self.ranges.len() == self.maximum_batch_size
+                || required_len > VMNET_MAX_BYTES_PER_OPERATION)
+        {
+            self.flush()?;
+        }
+        if packet.len() > VMNET_MAX_BYTES_PER_OPERATION {
+            return Err(VirtioNetworkTxPacketSinkError::new(
+                "vmnet TX normalized packet exceeds the operation byte bound",
+            ));
+        }
+        self.buffer.try_reserve(packet.len()).map_err(|source| {
+            VirtioNetworkTxPacketSinkError::new(format!(
+                "failed to reserve vmnet TX batch bytes: {source}"
+            ))
+        })?;
+        self.ranges.try_reserve(1).map_err(|source| {
+            VirtioNetworkTxPacketSinkError::new(format!(
+                "failed to reserve vmnet TX batch metadata: {source}"
+            ))
+        })?;
+        let start = self.buffer.len();
+        let end = start.checked_add(packet.len()).ok_or_else(|| {
+            VirtioNetworkTxPacketSinkError::new("vmnet TX packet range overflowed")
+        })?;
+        self.buffer.extend_from_slice(packet);
+        self.ranges.push(start..end);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), VirtioNetworkTxPacketSinkError> {
+        if self.ranges.is_empty() {
+            return Ok(());
+        }
+        let requested = self.ranges.len();
+        let started = Instant::now();
+        let write_result =
+            self.backend
+                .write_packet_batch(self.interface, self.buffer, self.ranges);
+        let duration = started.elapsed();
+        let completed = match write_result {
+            Ok(completed) if completed <= requested => {
+                self.metrics
+                    .record_vmnet_write(requested, Ok(completed), duration);
+                completed
+            }
+            Ok(_) => {
+                self.metrics
+                    .record_vmnet_write(requested, Err(()), duration);
+                self.buffer.clear();
+                self.ranges.clear();
+                return Err(VirtioNetworkTxPacketSinkError::new(
+                    "vmnet TX batch returned an out-of-range completed count",
+                ));
+            }
+            Err(source) => {
+                self.metrics
+                    .record_vmnet_write(requested, Err(()), duration);
+                self.buffer.clear();
+                self.ranges.clear();
+                return Err(tx_vmnet_error(source));
+            }
+        };
+        self.buffer.clear();
+        self.ranges.clear();
+        self.completed_packets =
+            self.completed_packets
+                .checked_add(completed)
+                .ok_or_else(|| {
+                    VirtioNetworkTxPacketSinkError::new(
+                        "vmnet TX completed packet count overflowed",
+                    )
+                })?;
+        if completed != requested {
+            return Err(VirtioNetworkTxPacketSinkError::new(
+                "vmnet TX batch completed only a prefix; the suffix was not retried",
+            ));
+        }
+        Ok(())
+    }
+
+    fn discard_pending(&mut self) {
+        self.buffer.clear();
+        self.ranges.clear();
     }
 }
 
@@ -860,24 +1223,20 @@ where
         memory: &GuestMemory,
         frame: &VirtioNetworkTxFrame,
     ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
-        self.validate_frame_packet_len(frame)?;
-        let packet = copy_tx_frame_payload(memory, frame).map_err(tx_error)?;
-        if let Some(mmds_detour) = &mut self.mmds_detour
-            && mmds_detour
-                .detour_packet(&packet)
-                .map_err(tx_mmds_detour_error)?
-        {
-            return Ok(VirtioNetworkTxPacketDisposition::Detoured);
-        }
+        let packet = self.prepare_packet_plan(memory, frame)?;
+        self.transmit_owned_plan(packet)
+    }
 
-        let mut packet = VmnetWritePacket::new(&packet).map_err(tx_descriptor_error)?;
-        let mut state = lock_state_for_tx(&self.shared)?;
-        let VmnetVirtioNetworkPacketIoState { backend, interface } = &mut *state;
-
-        backend
-            .write_packet(interface, &mut packet)
-            .map(|()| VirtioNetworkTxPacketDisposition::Forwarded)
-            .map_err(tx_vmnet_error)
+    fn transmit_prepared_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+        packet: &VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        let packet = packet
+            .try_clone_owned()
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        self.transmit_owned_plan(packet)
     }
 
     fn supports_staged_batch(&self) -> bool {
@@ -889,154 +1248,141 @@ where
         memory: &GuestMemory,
         frame: &VirtioNetworkTxFrame,
     ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
-        if self.staged_packet.is_some() {
-            return Err(VirtioNetworkTxPacketSinkError::new(
-                "vmnet TX staging already owns an uncommitted frame",
-            ));
-        }
-        let packet_len = self.validate_frame_packet_len(frame)?;
-        let required_len = self
-            .staging_buffer
-            .len()
-            .checked_add(packet_len)
-            .ok_or_else(|| VirtioNetworkTxPacketSinkError::new("vmnet TX batch size overflowed"))?;
-        if !self.committed_ranges.is_empty()
-            && (self.committed_ranges.len() == self.maximum_batch_size
-                || required_len > VMNET_MAX_BYTES_PER_OPERATION)
-        {
-            return Ok(VirtioNetworkTxPacketStage::FlushRequired);
-        }
-        if required_len > VMNET_MAX_BYTES_PER_OPERATION
-            || required_len > self.staging_buffer.capacity()
-        {
-            return Err(VirtioNetworkTxPacketSinkError::new(
-                "vmnet TX frame exceeds the empty aggregate byte bound",
-            ));
-        }
+        let packet = self.prepare_packet_plan(memory, frame)?;
+        self.stage_owned_plan(packet)
+    }
 
-        let start = self.staging_buffer.len();
-        if let Err(source) = copy_tx_frame_payload_into(memory, frame, &mut self.staging_buffer) {
-            self.staging_buffer.truncate(start);
-            return Err(tx_error(source));
-        }
-        let range = start..self.staging_buffer.len();
-        let packet = self.staging_buffer.get(range.clone()).ok_or_else(|| {
-            VirtioNetworkTxPacketSinkError::new("vmnet TX staged packet range became invalid")
-        })?;
-        let kind = if self
-            .mmds_detour
-            .as_ref()
-            .is_some_and(|detour| detour.would_detour_packet(packet))
-        {
-            StagedVmnetTxPacketKind::MmdsDetour
-        } else {
-            StagedVmnetTxPacketKind::External
-        };
-        self.staged_packet = Some(StagedVmnetTxPacket { range, kind });
-        Ok(VirtioNetworkTxPacketStage::Staged {
-            flush_before_commit: kind == StagedVmnetTxPacketKind::MmdsDetour,
-        })
+    fn stage_prepared_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+        packet: &VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+        self.stage_borrowed_plan(packet)
     }
 
     fn commit_staged_frame(&mut self) -> VirtioNetworkTxPacketCommit {
-        let Some(staged) = self.staged_packet.take() else {
+        let Some(staged) = self.staged_frame.take() else {
             return VirtioNetworkTxPacketCommit::Immediate(Err(
                 VirtioNetworkTxPacketSinkError::new("vmnet TX commit has no staged frame"),
             ));
         };
         match staged.kind {
             StagedVmnetTxPacketKind::External => {
-                self.committed_ranges.push(staged.range);
-                VirtioNetworkTxPacketCommit::Deferred
-            }
-            StagedVmnetTxPacketKind::MmdsDetour => {
-                let Some(packet) = self.staging_buffer.get(staged.range.clone()) else {
-                    self.staging_buffer.truncate(staged.range.start);
+                let Some(committed_packet_count) =
+                    self.committed_packet_count.checked_add(staged.packet_count)
+                else {
                     return VirtioNetworkTxPacketCommit::Immediate(Err(
                         VirtioNetworkTxPacketSinkError::new(
-                            "vmnet TX staged MMDS packet range became invalid",
+                            "vmnet TX committed packet count overflowed",
                         ),
                     ));
                 };
-                let result = self
-                    .mmds_detour
-                    .as_mut()
-                    .ok_or_else(|| {
+                let Some(committed_emitted_len) =
+                    self.committed_emitted_len.checked_add(staged.emitted_len)
+                else {
+                    return VirtioNetworkTxPacketCommit::Immediate(Err(
                         VirtioNetworkTxPacketSinkError::new(
-                            "vmnet TX MMDS staging lost its detour owner",
-                        )
-                    })
-                    .and_then(|detour| {
-                        detour
-                            .detour_packet(packet)
-                            .map_err(tx_mmds_detour_error)
-                            .and_then(|detoured| {
-                                if detoured {
-                                    Ok(VirtioNetworkTxPacketDisposition::Detoured)
-                                } else {
-                                    Err(VirtioNetworkTxPacketSinkError::new(
-                                        "MMDS side-effect classification changed at commit",
-                                    ))
-                                }
-                            })
-                    });
-                self.staging_buffer.truncate(staged.range.start);
+                            "vmnet TX committed byte count overflowed",
+                        ),
+                    ));
+                };
+                self.committed_packet_count = committed_packet_count;
+                self.committed_emitted_len = committed_emitted_len;
+                self.committed_frames.push(staged);
+                VirtioNetworkTxPacketCommit::Deferred
+            }
+            StagedVmnetTxPacketKind::MmdsDetour => {
+                let result = self.detour_packet_plan(&staged.packet);
                 VirtioNetworkTxPacketCommit::Immediate(result)
             }
         }
     }
 
     fn discard_staged_frame(&mut self) {
-        if let Some(staged) = self.staged_packet.take() {
-            self.staging_buffer.truncate(staged.range.start);
-        }
+        self.staged_frame = None;
     }
 
     fn flush_staged_frames(
         &mut self,
         results: &mut Vec<Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>>,
     ) {
-        let packet_count = self.committed_ranges.len();
-        if packet_count == 0 {
+        if self.committed_frames.is_empty() {
             return;
         }
-        let write_result = lock_state_for_tx(&self.shared).and_then(|mut state| {
+        let shared = Arc::clone(&self.shared);
+        let mut completed_packets = 0_usize;
+        let mut backend_metrics = VirtioNetworkBackendMetrics::default();
+        let write_result = lock_state_for_tx(&shared).and_then(|mut state| {
             let VmnetVirtioNetworkPacketIoState { backend, interface } = &mut *state;
-            backend
-                .write_packet_batch(interface, &self.staging_buffer, &self.committed_ranges)
-                .map_err(tx_vmnet_error)
-        });
-        match write_result {
-            Ok(completed) if completed <= packet_count => {
-                for packet_index in 0..packet_count {
-                    if packet_index < completed {
-                        results.push(Ok(VirtioNetworkTxPacketDisposition::Forwarded));
-                    } else {
-                        results.push(Err(VirtioNetworkTxPacketSinkError::new(
-                            "vmnet TX batch completed only a prefix; the suffix was not retried",
-                        )));
+            let mut writer = VmnetTxBatchWriter {
+                backend,
+                interface,
+                buffer: &mut self.staging_buffer,
+                ranges: &mut self.committed_ranges,
+                maximum_packet_size: self.maximum_packet_size,
+                maximum_batch_size: self.maximum_batch_size,
+                completed_packets: 0,
+                metrics: VirtioNetworkBackendMetrics::default(),
+            };
+            let mut result = Ok(());
+            for frame in &self.committed_frames {
+                let visit =
+                    frame.packet.visit_packets(self.packet_envelope, |packet| {
+                        match writer.push_packet(packet) {
+                            Ok(()) => ControlFlow::Continue(()),
+                            Err(source) => ControlFlow::Break(source),
+                        }
+                    });
+                match visit {
+                    Ok(ControlFlow::Continue(())) => {}
+                    Ok(ControlFlow::Break(source)) => {
+                        result = Err(source);
+                        break;
+                    }
+                    Err(source) => {
+                        result = Err(VirtioNetworkTxPacketSinkError::new(source.to_string()));
+                        break;
                     }
                 }
             }
-            Ok(_) => {
-                let source = VirtioNetworkTxPacketSinkError::new(
-                    "vmnet TX batch returned an out-of-range completed count",
-                );
-                results.extend((0..packet_count).map(|_| Err(source.clone())));
+            if result.is_ok()
+                && let Err(source) = writer.flush()
+            {
+                result = Err(source);
             }
-            Err(source) => {
-                results.extend((0..packet_count).map(|_| Err(source.clone())));
+            if result.is_err() {
+                writer.discard_pending();
+            }
+            completed_packets = writer.completed_packets;
+            backend_metrics = writer.metrics;
+            result
+        });
+        self.backend_metrics = self.backend_metrics.merged_with(backend_metrics);
+        let first_failure = write_result.err();
+        let mut frame_end = 0_usize;
+        for frame in &self.committed_frames {
+            frame_end = frame_end.saturating_add(frame.packet_count);
+            let succeeded = frame_end <= completed_packets;
+            if succeeded {
+                results.push(Ok(VirtioNetworkTxPacketDisposition::Forwarded));
+            } else {
+                results.push(Err(first_failure.clone().unwrap_or_else(|| {
+                    VirtioNetworkTxPacketSinkError::new(
+                        "vmnet TX normalized frame did not complete",
+                    )
+                })));
             }
         }
+        self.committed_frames.clear();
+        self.committed_packet_count = 0;
+        self.committed_emitted_len = 0;
+        self.staging_buffer.clear();
         self.committed_ranges.clear();
-        if let Some(staged) = self.staged_packet.as_mut() {
-            let retained_len = staged.range.len();
-            self.staging_buffer.copy_within(staged.range.clone(), 0);
-            self.staging_buffer.truncate(retained_len);
-            staged.range = 0..retained_len;
-        } else {
-            self.staging_buffer.clear();
-        }
+    }
+
+    fn take_backend_metrics(&mut self) -> VirtioNetworkBackendMetrics {
+        std::mem::take(&mut self.backend_metrics)
     }
 }
 
@@ -1055,6 +1401,8 @@ where
     host_batch_attempted: Option<bool>,
     mmds_response_queue: Option<MmdsResponseQueue>,
     readiness: Option<VmnetPacketReadinessConsumer>,
+    packet_envelope: VirtioNetworkPacketEnvelope,
+    backend_metrics: VirtioNetworkBackendMetrics,
 }
 
 impl<B> fmt::Debug for VmnetVirtioNetworkRxPacketSource<B>
@@ -1076,6 +1424,7 @@ where
                 "mmds_response_queue",
                 &self.mmds_response_queue.as_ref().map(|_| "<configured>"),
             )
+            .field("packet_envelope", &self.packet_envelope)
             .finish()
     }
 }
@@ -1084,42 +1433,25 @@ impl<B> VmnetVirtioNetworkRxPacketSource<B>
 where
     B: VmnetPacketIoBackend,
 {
-    fn new(
-        shared: Arc<Mutex<VmnetVirtioNetworkPacketIoState<B>>>,
-        read_buffer: Vec<u8>,
-        packet_lengths: Vec<usize>,
-        packet_capacity: usize,
-        read_batch_size: usize,
-        mmds_response_queue: Option<MmdsResponseQueue>,
-        readiness: Option<VmnetPacketReadinessConsumer>,
-    ) -> Self {
-        Self {
-            shared,
-            read_buffer,
-            packet_lengths,
-            packet_capacity,
-            read_batch_size,
-            cached_packet_index: 0,
-            cached_packet_count: 0,
-            cached_packet_source: None,
-            host_batch_attempted: None,
-            mmds_response_queue,
-            readiness,
-        }
-    }
-
     fn cached_packet(&self) -> Option<VirtioNetworkRxPacket<'_>> {
         if self.cached_packet_index >= self.cached_packet_count {
             return None;
         }
         let len = *self.packet_lengths.get(self.cached_packet_index)?;
-        let start = match self.cached_packet_source? {
+        let source = self.cached_packet_source?;
+        let packet_start = match source {
             CachedRxPacketSource::MmdsResponse => 0,
             CachedRxPacketSource::Vmnet => {
                 self.cached_packet_index.checked_mul(self.packet_capacity)?
             }
         };
-        let end = start.checked_add(len)?;
+        let envelope_len = if source == CachedRxPacketSource::Vmnet {
+            self.packet_envelope.header_len()
+        } else {
+            0
+        };
+        let start = packet_start.checked_add(envelope_len)?;
+        let end = packet_start.checked_add(len)?;
         self.read_buffer
             .get(start..end)
             .map(VirtioNetworkRxPacket::new)
@@ -1210,23 +1542,60 @@ where
                 .load(Ordering::Acquire)
                 .clamp(1, self.read_batch_size)
         });
-        let packet_count = {
+        let started = Instant::now();
+        let read_result = {
             let mut state = lock_state_for_rx(&self.shared)?;
             let VmnetVirtioNetworkPacketIoState { backend, interface } = &mut *state;
 
-            backend
-                .read_packet_batch(
-                    interface,
-                    &mut self.read_buffer,
-                    self.packet_capacity,
-                    estimated_packets,
-                    &mut self.packet_lengths,
-                )
-                .map_err(rx_vmnet_error)?
+            backend.read_packet_batch(
+                interface,
+                &mut self.read_buffer,
+                self.packet_capacity,
+                estimated_packets,
+                &mut self.packet_lengths,
+            )
         };
-        for packet_len in self.packet_lengths.iter().copied().take(packet_count) {
-            validate_rx_packet_len(packet_len, self.packet_capacity)?;
+        let duration = started.elapsed();
+        let packet_count = match read_result {
+            Ok(packet_count) => packet_count,
+            Err(source) => {
+                self.backend_metrics
+                    .record_vmnet_read(estimated_packets, Err(()), duration);
+                return Err(rx_vmnet_error(source));
+            }
+        };
+        let validation = (|| {
+            if packet_count > estimated_packets {
+                return Err(rx_vmnet_error(VmnetPacketIoError::InvalidBatch {
+                    message: "read backend returned more packets than requested",
+                }));
+            }
+            for (packet_index, packet_len) in self
+                .packet_lengths
+                .iter()
+                .copied()
+                .take(packet_count)
+                .enumerate()
+            {
+                validate_rx_packet_len(packet_len, self.packet_capacity)?;
+                if self.packet_envelope == VirtioNetworkPacketEnvelope::DirectVirtioHeader {
+                    validate_direct_rx_packet(
+                        &self.read_buffer,
+                        self.packet_capacity,
+                        packet_index,
+                        packet_len,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(source) = validation {
+            self.backend_metrics
+                .record_vmnet_read(estimated_packets, Err(()), duration);
+            return Err(source);
         }
+        self.backend_metrics
+            .record_vmnet_read(estimated_packets, Ok(packet_count), duration);
         if let Some(readiness) = &self.readiness {
             if packet_count < estimated_packets {
                 readiness.state.clear_if_unchanged(event_snapshot);
@@ -1274,130 +1643,37 @@ where
             }
         }
     }
-}
 
-#[derive(Debug)]
-enum VmnetVirtioNetworkTxCopyError {
-    PayloadLengthTooLarge {
-        len: u64,
-    },
-    PacketAllocation {
-        len: usize,
-        source: TryReserveError,
-    },
-    SegmentLengthTooLarge {
-        descriptor_index: u16,
-        len: u32,
-    },
-    SegmentRead {
-        descriptor_index: u16,
-        source: GuestMemoryAccessError,
-    },
-}
-
-impl fmt::Display for VmnetVirtioNetworkTxCopyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PayloadLengthTooLarge { len } => {
-                write!(
-                    f,
-                    "virtio-net TX payload length {len} does not fit host usize"
-                )
-            }
-            Self::PacketAllocation { len, source } => {
-                write!(
-                    f,
-                    "failed to reserve vmnet TX packet buffer of {len} bytes: {source}"
-                )
-            }
-            Self::SegmentLengthTooLarge {
-                descriptor_index,
-                len,
-            } => write!(
-                f,
-                "virtio-net TX payload descriptor {descriptor_index} length {len} does not fit host usize"
-            ),
-            Self::SegmentRead {
-                descriptor_index,
-                source,
-            } => write!(
-                f,
-                "failed to read virtio-net TX payload descriptor {descriptor_index}: {source}"
-            ),
-        }
+    fn take_backend_metrics(&mut self) -> VirtioNetworkBackendMetrics {
+        std::mem::take(&mut self.backend_metrics)
     }
 }
 
-impl std::error::Error for VmnetVirtioNetworkTxCopyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PacketAllocation { source, .. } => Some(source),
-            Self::SegmentRead { source, .. } => Some(source),
-            Self::PayloadLengthTooLarge { .. } | Self::SegmentLengthTooLarge { .. } => None,
-        }
-    }
-}
-
-fn copy_tx_frame_payload(
-    memory: &GuestMemory,
-    frame: &VirtioNetworkTxFrame,
-) -> Result<Vec<u8>, VmnetVirtioNetworkTxCopyError> {
-    let packet_len = usize::try_from(frame.payload_len()).map_err(|_| {
-        VmnetVirtioNetworkTxCopyError::PayloadLengthTooLarge {
-            len: frame.payload_len(),
-        }
-    })?;
-    let mut packet = Vec::new();
-    packet.try_reserve_exact(packet_len).map_err(|source| {
-        VmnetVirtioNetworkTxCopyError::PacketAllocation {
-            len: packet_len,
-            source,
-        }
-    })?;
-
-    copy_tx_frame_payload_into(memory, frame, &mut packet)?;
-    Ok(packet)
-}
-
-fn copy_tx_frame_payload_into(
-    memory: &GuestMemory,
-    frame: &VirtioNetworkTxFrame,
-    packet: &mut Vec<u8>,
-) -> Result<(), VmnetVirtioNetworkTxCopyError> {
-    let initial_len = packet.len();
-
-    for segment in frame.payload_segments() {
-        let segment_len = usize::try_from(segment.len()).map_err(|_| {
-            VmnetVirtioNetworkTxCopyError::SegmentLengthTooLarge {
-                descriptor_index: segment.descriptor_index(),
-                len: segment.len(),
-            }
-        })?;
-        let start = packet.len();
-        let end = start.checked_add(segment_len).ok_or(
-            VmnetVirtioNetworkTxCopyError::PayloadLengthTooLarge {
-                len: frame.payload_len(),
-            },
-        )?;
-        packet.resize(end, 0);
-        let segment_buffer = packet.get_mut(start..end).ok_or(
-            VmnetVirtioNetworkTxCopyError::PayloadLengthTooLarge {
-                len: frame.payload_len(),
-            },
-        )?;
-        memory
-            .read_slice(segment_buffer, segment.address())
-            .map_err(|source| VmnetVirtioNetworkTxCopyError::SegmentRead {
-                descriptor_index: segment.descriptor_index(),
-                source,
+fn ethernet_packet_for_envelope(
+    envelope: VirtioNetworkPacketEnvelope,
+    packet: &[u8],
+) -> Result<&[u8], VirtioNetworkTxPacketSinkError> {
+    match envelope {
+        VirtioNetworkPacketEnvelope::RawEthernet => Ok(packet),
+        VirtioNetworkPacketEnvelope::DirectVirtioHeader => {
+            let header_len = VIRTIO_NET_TX_HEADER_SIZE as usize;
+            let header = packet.get(..header_len).ok_or_else(|| {
+                VirtioNetworkTxPacketSinkError::new(
+                    "vmnet direct TX packet is missing its virtio header",
+                )
             })?;
+            if header.iter().any(|byte| *byte != 0) {
+                return Err(VirtioNetworkTxPacketSinkError::new(
+                    "vmnet direct TX packet has a noncanonical virtio header",
+                ));
+            }
+            packet.get(header_len..).ok_or_else(|| {
+                VirtioNetworkTxPacketSinkError::new(
+                    "vmnet direct TX packet is missing its Ethernet frame",
+                )
+            })
+        }
     }
-
-    debug_assert_eq!(
-        packet.len().saturating_sub(initial_len) as u64,
-        frame.payload_len()
-    );
-    Ok(())
 }
 
 fn lock_state_for_tx<B>(
@@ -1424,16 +1700,6 @@ where
     })
 }
 
-fn tx_error(source: VmnetVirtioNetworkTxCopyError) -> VirtioNetworkTxPacketSinkError {
-    VirtioNetworkTxPacketSinkError::new(source.to_string())
-}
-
-fn tx_descriptor_error(source: VmnetPacketDescriptorError) -> VirtioNetworkTxPacketSinkError {
-    VirtioNetworkTxPacketSinkError::new(format!(
-        "failed to build vmnet TX packet descriptor: {source}"
-    ))
-}
-
 fn tx_vmnet_error(source: VmnetPacketIoError) -> VirtioNetworkTxPacketSinkError {
     VirtioNetworkTxPacketSinkError::new(format!("vmnet TX packet write failed: {source}"))
 }
@@ -1456,6 +1722,11 @@ fn validate_rx_packet_len(
     packet_len: usize,
     buffer_len: usize,
 ) -> Result<(), VirtioNetworkRxPacketSourceError> {
+    if packet_len == 0 {
+        return Err(rx_vmnet_error(VmnetPacketIoError::InvalidBatch {
+            message: "read backend returned an empty packet",
+        }));
+    }
     if packet_len <= buffer_len {
         return Ok(());
     }
@@ -1466,6 +1737,35 @@ fn validate_rx_packet_len(
             buffer_len,
         },
     ))
+}
+
+fn validate_direct_rx_packet(
+    buffer: &[u8],
+    packet_capacity: usize,
+    packet_index: usize,
+    packet_len: usize,
+) -> Result<(), VirtioNetworkRxPacketSourceError> {
+    let header_len = VIRTIO_NET_TX_HEADER_SIZE as usize;
+    if packet_len <= header_len {
+        return Err(VirtioNetworkRxPacketSourceError::new(
+            "vmnet direct RX packet does not contain an Ethernet frame",
+        ));
+    }
+    let start = packet_index.checked_mul(packet_capacity).ok_or_else(|| {
+        VirtioNetworkRxPacketSourceError::new("vmnet direct RX packet offset overflowed")
+    })?;
+    let header_end = start.checked_add(header_len).ok_or_else(|| {
+        VirtioNetworkRxPacketSourceError::new("vmnet direct RX header range overflowed")
+    })?;
+    let header = buffer.get(start..header_end).ok_or_else(|| {
+        VirtioNetworkRxPacketSourceError::new("vmnet direct RX header is outside its buffer")
+    })?;
+    if header.iter().any(|byte| *byte != 0) {
+        return Err(VirtioNetworkRxPacketSourceError::new(
+            "vmnet direct RX header requests unsupported offload semantics",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1488,11 +1788,14 @@ mod tests {
     };
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::{
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioLayout,
-        PreparedNetworkDevices, VIRTIO_NET_TX_HEADER_SIZE, VirtioNetworkRxPacketSource,
-        VirtioNetworkTxFrame, VirtioNetworkTxPacketCommit, VirtioNetworkTxPacketDisposition,
-        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketStage,
+        GuestMacAddress, NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioLayout,
+        PreparedNetworkDevices, VIRTIO_NET_F_CSUM, VIRTIO_NET_F_HOST_TSO4,
+        VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4, VIRTIO_NET_TX_HEADER_SIZE,
+        VirtioNetworkRxPacketSource, VirtioNetworkTxFrame, VirtioNetworkTxHeader,
+        VirtioNetworkTxPacketCommit, VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+        VirtioNetworkTxPacketStage,
     };
+    use bangbang_runtime::network_packet::VirtioNetworkPacketPlan;
     use bangbang_runtime::startup::{Arm64BootNetworkDevice, Arm64BootNetworkPacketIoProvider};
     use bangbang_runtime::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESCRIPTOR_SIZE, read_descriptor_chain,
@@ -1759,6 +2062,40 @@ mod tests {
             self.read_batch_calls += 1;
             self.readiness.publish(Some(1));
             Ok(0)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ExcessiveReadBatchCountBackend;
+
+    impl VmnetPacketIoBackend for ExcessiveReadBatchCountBackend {
+        type Interface = FakeInterface;
+
+        fn read_packet(
+            &mut self,
+            _interface: &mut Self::Interface,
+            _packet: &mut VmnetReadPacket<'_>,
+        ) -> Result<Option<usize>, VmnetPacketIoError> {
+            Ok(None)
+        }
+
+        fn write_packet(
+            &mut self,
+            _interface: &mut Self::Interface,
+            _packet: &mut VmnetWritePacket<'_>,
+        ) -> Result<(), VmnetPacketIoError> {
+            Ok(())
+        }
+
+        fn read_packet_batch(
+            &mut self,
+            _interface: &mut Self::Interface,
+            _buffer: &mut [u8],
+            _packet_capacity: usize,
+            requested_packets: usize,
+            _packet_lengths: &mut [usize],
+        ) -> Result<usize, VmnetPacketIoError> {
+            Ok(requested_packets.saturating_add(1))
         }
     }
 
@@ -2517,6 +2854,17 @@ mod tests {
             .expect("test packet state should lock");
         assert_eq!(shared.backend.read_batch_calls, 2);
         assert_eq!(shared.backend.read_batch_requests, [2, 2]);
+        drop(shared);
+        let backend_metrics = packet_io.rx_source().take_backend_metrics();
+        assert_eq!(backend_metrics.vmnet_read_count(), 2);
+        assert_eq!(backend_metrics.vmnet_read_fails(), 0);
+        assert_eq!(backend_metrics.vmnet_read_packets_count(), 3);
+        assert_eq!(backend_metrics.vmnet_read_partial_batches(), 1);
+        assert_eq!(backend_metrics.vmnet_read_latency().samples(), 2);
+        assert_eq!(
+            packet_io.rx_source().take_backend_metrics(),
+            super::VirtioNetworkBackendMetrics::default()
+        );
     }
 
     #[test]
@@ -2614,6 +2962,52 @@ mod tests {
             [vec![first_packet.to_vec(), second_packet.to_vec()]]
         );
         assert_eq!(shared.backend.written_packets, [first_packet.to_vec()]);
+        drop(shared);
+        let backend_metrics = packet_io.tx_sink().take_backend_metrics();
+        assert_eq!(backend_metrics.vmnet_write_count(), 1);
+        assert_eq!(backend_metrics.vmnet_write_fails(), 0);
+        assert_eq!(backend_metrics.vmnet_write_packets_count(), 1);
+        assert_eq!(backend_metrics.vmnet_write_partial_batches(), 1);
+        assert_eq!(backend_metrics.vmnet_write_latency().samples(), 1);
+        assert_eq!(
+            packet_io.tx_sink().take_backend_metrics(),
+            super::VirtioNetworkBackendMetrics::default()
+        );
+    }
+
+    #[test]
+    fn tx_sink_rejects_out_of_range_batch_count_as_backend_failure() {
+        let backend = FakeVmnetPacketIoBackend::default().with_write_batch_completed(2);
+        let mut packet_io = batch_packet_io(backend, 2_048, 1, 2, None, None);
+        let mut memory = tx_memory();
+        let packet = [0x10, 0x11, 0x12, 0x13];
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+
+        packet_io
+            .tx_sink()
+            .stage_frame(&memory, &frame)
+            .expect("packet should stage");
+        assert_eq!(
+            packet_io.tx_sink().commit_staged_frame(),
+            VirtioNetworkTxPacketCommit::Deferred
+        );
+        let mut results = Vec::new();
+        packet_io.tx_sink().flush_staged_frames(&mut results);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]
+                .as_ref()
+                .expect_err("out-of-range batch count should fail")
+                .message(),
+            "vmnet TX batch returned an out-of-range completed count"
+        );
+        let backend_metrics = packet_io.tx_sink().take_backend_metrics();
+        assert_eq!(backend_metrics.vmnet_write_count(), 1);
+        assert_eq!(backend_metrics.vmnet_write_fails(), 1);
+        assert_eq!(backend_metrics.vmnet_write_packets_count(), 0);
+        assert_eq!(backend_metrics.vmnet_write_partial_batches(), 0);
+        assert_eq!(backend_metrics.vmnet_write_latency().samples(), 1);
     }
 
     #[test]
@@ -2830,7 +3224,7 @@ mod tests {
 
         assert_eq!(
             error.message(),
-            "vmnet TX frame exceeds the realized per-packet bound"
+            "vmnet TX normalized packet exceeds the realized per-packet bound"
         );
         let state = packet_io
             .tx_sink()
@@ -2839,6 +3233,115 @@ mod tests {
             .expect("test state lock should succeed");
         assert_eq!(state.backend.write_calls, 0);
         assert!(state.backend.written_packets.is_empty());
+    }
+
+    #[test]
+    fn tx_sink_streams_large_tso_plan_through_bounded_batches() {
+        let mut memory = tx_memory();
+        let dummy_frame = tx_frame(&mut memory, &[(&[0xaa], PAYLOAD_ADDRESS)]);
+        let payload = vec![0x5a; 60_000];
+        let packet = tcp_ipv4_packet(Ipv4Addr::new(198, 51, 100, 2), 443, &payload);
+        let header = VirtioNetworkTxHeader::new()
+            .with_flags(VIRTIO_NET_HDR_F_NEEDS_CSUM)
+            .with_gso_type(VIRTIO_NET_HDR_GSO_TCPV4)
+            .with_gso_size(16)
+            .with_checksum_start((ETHERNET_HEADER_LEN + IPV4_HEADER_LEN) as u16)
+            .with_checksum_offset(16);
+        let plan = VirtioNetworkPacketPlan::prepare(
+            header,
+            (1_u64 << VIRTIO_NET_F_CSUM) | (1_u64 << VIRTIO_NET_F_HOST_TSO4),
+            packet,
+        )
+        .expect("large TSO plan should validate");
+        let expected_packets = plan
+            .emitted_packet_count()
+            .expect("large TSO packet count should fit");
+        assert!(
+            plan.emitted_len(super::VirtioNetworkPacketEnvelope::RawEthernet)
+                .expect("large TSO emitted length should fit")
+                > crate::host_network::vmnet::VMNET_MAX_BYTES_PER_OPERATION
+        );
+        let mut packet_io = batch_packet_io(
+            FakeVmnetPacketIoBackend::default(),
+            2_048,
+            1,
+            200,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            packet_io
+                .tx_sink()
+                .stage_prepared_frame(&memory, &dummy_frame, &plan)
+                .expect("large TSO plan should stage without expansion"),
+            VirtioNetworkTxPacketStage::Staged {
+                flush_before_commit: false
+            }
+        );
+        assert_eq!(
+            packet_io.tx_sink().commit_staged_frame(),
+            VirtioNetworkTxPacketCommit::Deferred
+        );
+        let mut results = Vec::new();
+        packet_io.tx_sink().flush_staged_frames(&mut results);
+
+        assert_eq!(results, [Ok(VirtioNetworkTxPacketDisposition::Forwarded)]);
+        let state = packet_io
+            .tx_sink
+            .shared
+            .lock()
+            .expect("test packet state should lock");
+        assert_eq!(state.backend.written_packets.len(), expected_packets);
+        assert!(
+            state
+                .backend
+                .write_batch_requests
+                .iter()
+                .all(|requested| *requested <= 200)
+        );
+        assert!(state.backend.write_batch_calls > 1);
+    }
+
+    #[test]
+    fn tx_sink_observes_spoofed_source_mac_without_filtering() {
+        let mut memory = tx_memory();
+        let packet = tcp_ipv4_packet(Ipv4Addr::new(198, 51, 100, 2), 443, b"payload");
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let prepared = super::PreparedVmnetVirtioNetworkRxBuffer::supported_maximum()
+            .expect("test packet buffers should prepare");
+        let mut packet_io =
+            VmnetVirtioNetworkPacketIo::with_prepared_batch_envelope_and_mmds_detour(
+                FakeVmnetPacketIoBackend::default(),
+                fake_interface(),
+                prepared,
+                super::VmnetVirtioNetworkPacketProfile::new(
+                    super::VmnetVirtioNetworkBatchLimits::new(2_048, 1, 1),
+                    super::VirtioNetworkPacketEnvelope::RawEthernet,
+                    Some(GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 1])),
+                ),
+                None,
+                None,
+            )
+            .expect("profiled packet I/O should build");
+
+        assert_eq!(
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("spoof observation must not filter TX"),
+            VirtioNetworkTxPacketDisposition::Forwarded
+        );
+        let state = packet_io
+            .tx_sink
+            .shared
+            .lock()
+            .expect("test packet state should lock");
+        assert_eq!(state.backend.written_packets, [packet]);
+        drop(state);
+        let metrics = packet_io.tx_sink().take_backend_metrics();
+        assert_eq!(metrics.tx_spoofed_mac_count(), 1);
+        assert_eq!(metrics.vmnet_write_packets_count(), 1);
     }
 
     #[test]
@@ -5478,6 +5981,53 @@ mod tests {
                 "vmnet RX packet read failed: vmnet_read returned a packet larger than the validated read buffer"
             )
         );
+        let backend_metrics = packet_io.rx_source().take_backend_metrics();
+        assert_eq!(backend_metrics.vmnet_read_count(), 1);
+        assert_eq!(backend_metrics.vmnet_read_fails(), 1);
+        assert_eq!(backend_metrics.vmnet_read_packets_count(), 0);
+        assert_eq!(backend_metrics.vmnet_read_partial_batches(), 0);
+        assert_eq!(backend_metrics.vmnet_read_latency().samples(), 1);
+    }
+
+    #[test]
+    fn rx_source_rejects_empty_backend_packet_as_backend_failure() {
+        let backend = FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![])));
+        let mut packet_io = packet_io(backend);
+
+        let error = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect_err("empty backend packet should fail");
+
+        assert!(error.message().contains(
+            "vmnet RX packet read failed: invalid vmnet packet batch: read backend returned an empty packet"
+        ));
+        let backend_metrics = packet_io.rx_source().take_backend_metrics();
+        assert_eq!(backend_metrics.vmnet_read_count(), 1);
+        assert_eq!(backend_metrics.vmnet_read_fails(), 1);
+        assert_eq!(backend_metrics.vmnet_read_packets_count(), 0);
+        assert_eq!(backend_metrics.vmnet_read_latency().samples(), 1);
+    }
+
+    #[test]
+    fn rx_source_rejects_out_of_range_batch_count_as_backend_failure() {
+        let mut packet_io =
+            batch_packet_io(ExcessiveReadBatchCountBackend, 2_048, 2, 1, None, None);
+
+        let error = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect_err("out-of-range batch count should fail");
+
+        assert!(error.message().contains(
+            "vmnet RX packet read failed: invalid vmnet packet batch: read backend returned more packets than requested"
+        ));
+        let backend_metrics = packet_io.rx_source().take_backend_metrics();
+        assert_eq!(backend_metrics.vmnet_read_count(), 1);
+        assert_eq!(backend_metrics.vmnet_read_fails(), 1);
+        assert_eq!(backend_metrics.vmnet_read_packets_count(), 0);
+        assert_eq!(backend_metrics.vmnet_read_partial_batches(), 0);
+        assert_eq!(backend_metrics.vmnet_read_latency().samples(), 1);
     }
 
     #[test]

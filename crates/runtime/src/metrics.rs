@@ -16,9 +16,9 @@ use crate::entropy::{
 };
 use crate::logger::SharedLoggerMetrics;
 use crate::network::{
-    VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkDeviceNotificationDispatch,
-    VirtioNetworkDeviceNotificationError, VirtioNetworkRxQueueDispatch,
-    VirtioNetworkTxQueueDispatch,
+    VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkBackendMetrics,
+    VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError,
+    VirtioNetworkLatencyAggregate, VirtioNetworkRxQueueDispatch, VirtioNetworkTxQueueDispatch,
 };
 use crate::pmem::{
     VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError,
@@ -3001,53 +3001,202 @@ fn lock_pmem_metrics_registry(
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetworkInterfaceMetrics {
+    activate_fails: u64,
+    cfg_fails: u64,
     event_fails: u64,
+    no_rx_avail_buffer: u64,
+    no_tx_avail_buffer: u64,
     rx_queue_event_count: u64,
     rx_bytes_count: u64,
     rx_packets_count: u64,
     rx_fails: u64,
     rx_count: u64,
+    rx_rate_limiter_event_count: u64,
+    rx_rate_limiter_throttled: u64,
     tx_bytes_count: u64,
     tx_malformed_frames: u64,
     tx_fails: u64,
     tx_count: u64,
     tx_packets_count: u64,
     tx_queue_event_count: u64,
+    tx_rate_limiter_event_count: u64,
+    tx_rate_limiter_throttled: u64,
+    tx_remaining_reqs_count: u64,
+    tx_spoofed_mac_count: u64,
+    vmnet_read_count: u64,
+    vmnet_read_fails: u64,
+    vmnet_read_packets_count: u64,
+    vmnet_read_partial_batches: u64,
+    vmnet_write_count: u64,
+    vmnet_write_fails: u64,
+    vmnet_write_packets_count: u64,
+    vmnet_write_partial_batches: u64,
+    vmnet_read_latency: VirtioNetworkLatencyAggregate,
+    vmnet_write_latency: VirtioNetworkLatencyAggregate,
 }
 
-impl_incremental_delta!(NetworkInterfaceMetrics {
-    event_fails,
-    rx_queue_event_count,
-    rx_bytes_count,
-    rx_packets_count,
-    rx_fails,
-    rx_count,
-    tx_bytes_count,
-    tx_malformed_frames,
-    tx_fails,
-    tx_count,
-    tx_packets_count,
-    tx_queue_event_count,
-});
+impl NetworkInterfaceMetrics {
+    const fn delta_since(self, previous: Self) -> Self {
+        Self {
+            activate_fails: incremental_delta(self.activate_fails, previous.activate_fails),
+            cfg_fails: incremental_delta(self.cfg_fails, previous.cfg_fails),
+            event_fails: incremental_delta(self.event_fails, previous.event_fails),
+            no_rx_avail_buffer: incremental_delta(
+                self.no_rx_avail_buffer,
+                previous.no_rx_avail_buffer,
+            ),
+            no_tx_avail_buffer: incremental_delta(
+                self.no_tx_avail_buffer,
+                previous.no_tx_avail_buffer,
+            ),
+            rx_queue_event_count: incremental_delta(
+                self.rx_queue_event_count,
+                previous.rx_queue_event_count,
+            ),
+            rx_bytes_count: incremental_delta(self.rx_bytes_count, previous.rx_bytes_count),
+            rx_packets_count: incremental_delta(self.rx_packets_count, previous.rx_packets_count),
+            rx_fails: incremental_delta(self.rx_fails, previous.rx_fails),
+            rx_count: incremental_delta(self.rx_count, previous.rx_count),
+            rx_rate_limiter_event_count: incremental_delta(
+                self.rx_rate_limiter_event_count,
+                previous.rx_rate_limiter_event_count,
+            ),
+            rx_rate_limiter_throttled: incremental_delta(
+                self.rx_rate_limiter_throttled,
+                previous.rx_rate_limiter_throttled,
+            ),
+            tx_bytes_count: incremental_delta(self.tx_bytes_count, previous.tx_bytes_count),
+            tx_malformed_frames: incremental_delta(
+                self.tx_malformed_frames,
+                previous.tx_malformed_frames,
+            ),
+            tx_fails: incremental_delta(self.tx_fails, previous.tx_fails),
+            tx_count: incremental_delta(self.tx_count, previous.tx_count),
+            tx_packets_count: incremental_delta(self.tx_packets_count, previous.tx_packets_count),
+            tx_queue_event_count: incremental_delta(
+                self.tx_queue_event_count,
+                previous.tx_queue_event_count,
+            ),
+            tx_rate_limiter_event_count: incremental_delta(
+                self.tx_rate_limiter_event_count,
+                previous.tx_rate_limiter_event_count,
+            ),
+            tx_rate_limiter_throttled: incremental_delta(
+                self.tx_rate_limiter_throttled,
+                previous.tx_rate_limiter_throttled,
+            ),
+            tx_remaining_reqs_count: incremental_delta(
+                self.tx_remaining_reqs_count,
+                previous.tx_remaining_reqs_count,
+            ),
+            tx_spoofed_mac_count: incremental_delta(
+                self.tx_spoofed_mac_count,
+                previous.tx_spoofed_mac_count,
+            ),
+            vmnet_read_count: incremental_delta(self.vmnet_read_count, previous.vmnet_read_count),
+            vmnet_read_fails: incremental_delta(self.vmnet_read_fails, previous.vmnet_read_fails),
+            vmnet_read_packets_count: incremental_delta(
+                self.vmnet_read_packets_count,
+                previous.vmnet_read_packets_count,
+            ),
+            vmnet_read_partial_batches: incremental_delta(
+                self.vmnet_read_partial_batches,
+                previous.vmnet_read_partial_batches,
+            ),
+            vmnet_write_count: incremental_delta(
+                self.vmnet_write_count,
+                previous.vmnet_write_count,
+            ),
+            vmnet_write_fails: incremental_delta(
+                self.vmnet_write_fails,
+                previous.vmnet_write_fails,
+            ),
+            vmnet_write_packets_count: incremental_delta(
+                self.vmnet_write_packets_count,
+                previous.vmnet_write_packets_count,
+            ),
+            vmnet_write_partial_batches: incremental_delta(
+                self.vmnet_write_partial_batches,
+                previous.vmnet_write_partial_batches,
+            ),
+            vmnet_read_latency: network_latency_delta(
+                self.vmnet_read_latency,
+                previous.vmnet_read_latency,
+            ),
+            vmnet_write_latency: network_latency_delta(
+                self.vmnet_write_latency,
+                previous.vmnet_write_latency,
+            ),
+        }
+    }
+}
+
+const fn network_latency_delta(
+    current: VirtioNetworkLatencyAggregate,
+    previous: VirtioNetworkLatencyAggregate,
+) -> VirtioNetworkLatencyAggregate {
+    VirtioNetworkLatencyAggregate::new(
+        current.min_us(),
+        current.max_us(),
+        incremental_delta(current.sum_us(), previous.sum_us()),
+        incremental_delta(current.samples(), previous.samples()),
+    )
+}
 
 impl NetworkInterfaceMetrics {
     pub const fn is_empty(self) -> bool {
-        self.event_fails == 0
+        self.activate_fails == 0
+            && self.cfg_fails == 0
+            && self.event_fails == 0
+            && self.no_rx_avail_buffer == 0
+            && self.no_tx_avail_buffer == 0
             && self.rx_queue_event_count == 0
             && self.rx_bytes_count == 0
             && self.rx_packets_count == 0
             && self.rx_fails == 0
             && self.rx_count == 0
+            && self.rx_rate_limiter_event_count == 0
+            && self.rx_rate_limiter_throttled == 0
             && self.tx_bytes_count == 0
             && self.tx_malformed_frames == 0
             && self.tx_fails == 0
             && self.tx_count == 0
             && self.tx_packets_count == 0
             && self.tx_queue_event_count == 0
+            && self.tx_rate_limiter_event_count == 0
+            && self.tx_rate_limiter_throttled == 0
+            && self.tx_remaining_reqs_count == 0
+            && self.tx_spoofed_mac_count == 0
+            && self.vmnet_read_count == 0
+            && self.vmnet_read_fails == 0
+            && self.vmnet_read_packets_count == 0
+            && self.vmnet_read_partial_batches == 0
+            && self.vmnet_write_count == 0
+            && self.vmnet_write_fails == 0
+            && self.vmnet_write_packets_count == 0
+            && self.vmnet_write_partial_batches == 0
+            && self.vmnet_read_latency.samples() == 0
+            && self.vmnet_write_latency.samples() == 0
+    }
+
+    pub const fn activate_fails(self) -> u64 {
+        self.activate_fails
+    }
+
+    pub const fn cfg_fails(self) -> u64 {
+        self.cfg_fails
     }
 
     pub const fn event_fails(self) -> u64 {
         self.event_fails
+    }
+
+    pub const fn no_rx_avail_buffer(self) -> u64 {
+        self.no_rx_avail_buffer
+    }
+
+    pub const fn no_tx_avail_buffer(self) -> u64 {
+        self.no_tx_avail_buffer
     }
 
     pub const fn rx_queue_event_count(self) -> u64 {
@@ -3068,6 +3217,18 @@ impl NetworkInterfaceMetrics {
 
     pub const fn rx_count(self) -> u64 {
         self.rx_count
+    }
+
+    pub const fn rx_rate_limiter_event_count(self) -> u64 {
+        self.rx_rate_limiter_event_count
+    }
+
+    pub const fn rx_event_rate_limiter_count(self) -> u64 {
+        self.rx_rate_limiter_event_count
+    }
+
+    pub const fn rx_rate_limiter_throttled(self) -> u64 {
+        self.rx_rate_limiter_throttled
     }
 
     pub const fn tx_bytes_count(self) -> u64 {
@@ -3094,8 +3255,84 @@ impl NetworkInterfaceMetrics {
         self.tx_queue_event_count
     }
 
+    pub const fn tx_rate_limiter_event_count(self) -> u64 {
+        self.tx_rate_limiter_event_count
+    }
+
+    pub const fn tx_rate_limiter_throttled(self) -> u64 {
+        self.tx_rate_limiter_throttled
+    }
+
+    pub const fn tx_remaining_reqs_count(self) -> u64 {
+        self.tx_remaining_reqs_count
+    }
+
+    pub const fn tx_spoofed_mac_count(self) -> u64 {
+        self.tx_spoofed_mac_count
+    }
+
+    pub const fn vmnet_read_count(self) -> u64 {
+        self.vmnet_read_count
+    }
+
+    pub const fn vmnet_read_fails(self) -> u64 {
+        self.vmnet_read_fails
+    }
+
+    pub const fn vmnet_read_packets_count(self) -> u64 {
+        self.vmnet_read_packets_count
+    }
+
+    pub const fn vmnet_read_partial_batches(self) -> u64 {
+        self.vmnet_read_partial_batches
+    }
+
+    pub const fn vmnet_write_count(self) -> u64 {
+        self.vmnet_write_count
+    }
+
+    pub const fn vmnet_write_fails(self) -> u64 {
+        self.vmnet_write_fails
+    }
+
+    pub const fn vmnet_write_packets_count(self) -> u64 {
+        self.vmnet_write_packets_count
+    }
+
+    pub const fn vmnet_write_partial_batches(self) -> u64 {
+        self.vmnet_write_partial_batches
+    }
+
+    pub const fn vmnet_read_latency(self) -> VirtioNetworkLatencyAggregate {
+        self.vmnet_read_latency
+    }
+
+    pub const fn vmnet_write_latency(self) -> VirtioNetworkLatencyAggregate {
+        self.vmnet_write_latency
+    }
+
+    pub const fn with_activate_fails(mut self, activate_fails: u64) -> Self {
+        self.activate_fails = activate_fails;
+        self
+    }
+
+    pub const fn with_cfg_fails(mut self, cfg_fails: u64) -> Self {
+        self.cfg_fails = cfg_fails;
+        self
+    }
+
     pub const fn with_event_fails(mut self, event_fails: u64) -> Self {
         self.event_fails = event_fails;
+        self
+    }
+
+    pub const fn with_no_rx_avail_buffer(mut self, no_rx_avail_buffer: u64) -> Self {
+        self.no_rx_avail_buffer = no_rx_avail_buffer;
+        self
+    }
+
+    pub const fn with_no_tx_avail_buffer(mut self, no_tx_avail_buffer: u64) -> Self {
+        self.no_tx_avail_buffer = no_tx_avail_buffer;
         self
     }
 
@@ -3121,6 +3358,23 @@ impl NetworkInterfaceMetrics {
 
     pub const fn with_rx_count(mut self, rx_count: u64) -> Self {
         self.rx_count = rx_count;
+        self
+    }
+
+    pub const fn with_rx_rate_limiter_event_count(
+        mut self,
+        rx_rate_limiter_event_count: u64,
+    ) -> Self {
+        self.rx_rate_limiter_event_count = rx_rate_limiter_event_count;
+        self
+    }
+
+    pub const fn with_rx_event_rate_limiter_count(self, rx_event_rate_limiter_count: u64) -> Self {
+        self.with_rx_rate_limiter_event_count(rx_event_rate_limiter_count)
+    }
+
+    pub const fn with_rx_rate_limiter_throttled(mut self, rx_rate_limiter_throttled: u64) -> Self {
+        self.rx_rate_limiter_throttled = rx_rate_limiter_throttled;
         self
     }
 
@@ -3154,9 +3408,102 @@ impl NetworkInterfaceMetrics {
         self
     }
 
+    pub const fn with_tx_rate_limiter_event_count(
+        mut self,
+        tx_rate_limiter_event_count: u64,
+    ) -> Self {
+        self.tx_rate_limiter_event_count = tx_rate_limiter_event_count;
+        self
+    }
+
+    pub const fn with_tx_rate_limiter_throttled(mut self, tx_rate_limiter_throttled: u64) -> Self {
+        self.tx_rate_limiter_throttled = tx_rate_limiter_throttled;
+        self
+    }
+
+    pub const fn with_tx_remaining_reqs_count(mut self, tx_remaining_reqs_count: u64) -> Self {
+        self.tx_remaining_reqs_count = tx_remaining_reqs_count;
+        self
+    }
+
+    pub const fn with_tx_spoofed_mac_count(mut self, tx_spoofed_mac_count: u64) -> Self {
+        self.tx_spoofed_mac_count = tx_spoofed_mac_count;
+        self
+    }
+
+    pub const fn with_vmnet_read_count(mut self, vmnet_read_count: u64) -> Self {
+        self.vmnet_read_count = vmnet_read_count;
+        self
+    }
+
+    pub const fn with_vmnet_read_fails(mut self, vmnet_read_fails: u64) -> Self {
+        self.vmnet_read_fails = vmnet_read_fails;
+        self
+    }
+
+    pub const fn with_vmnet_read_packets_count(mut self, vmnet_read_packets_count: u64) -> Self {
+        self.vmnet_read_packets_count = vmnet_read_packets_count;
+        self
+    }
+
+    pub const fn with_vmnet_read_partial_batches(
+        mut self,
+        vmnet_read_partial_batches: u64,
+    ) -> Self {
+        self.vmnet_read_partial_batches = vmnet_read_partial_batches;
+        self
+    }
+
+    pub const fn with_vmnet_write_count(mut self, vmnet_write_count: u64) -> Self {
+        self.vmnet_write_count = vmnet_write_count;
+        self
+    }
+
+    pub const fn with_vmnet_write_fails(mut self, vmnet_write_fails: u64) -> Self {
+        self.vmnet_write_fails = vmnet_write_fails;
+        self
+    }
+
+    pub const fn with_vmnet_write_packets_count(mut self, vmnet_write_packets_count: u64) -> Self {
+        self.vmnet_write_packets_count = vmnet_write_packets_count;
+        self
+    }
+
+    pub const fn with_vmnet_write_partial_batches(
+        mut self,
+        vmnet_write_partial_batches: u64,
+    ) -> Self {
+        self.vmnet_write_partial_batches = vmnet_write_partial_batches;
+        self
+    }
+
+    pub const fn with_vmnet_read_latency(
+        mut self,
+        vmnet_read_latency: VirtioNetworkLatencyAggregate,
+    ) -> Self {
+        self.vmnet_read_latency = vmnet_read_latency;
+        self
+    }
+
+    pub const fn with_vmnet_write_latency(
+        mut self,
+        vmnet_write_latency: VirtioNetworkLatencyAggregate,
+    ) -> Self {
+        self.vmnet_write_latency = vmnet_write_latency;
+        self
+    }
+
     const fn merged_with(self, other: Self) -> Self {
         Self {
+            activate_fails: self.activate_fails.saturating_add(other.activate_fails),
+            cfg_fails: self.cfg_fails.saturating_add(other.cfg_fails),
             event_fails: self.event_fails.saturating_add(other.event_fails),
+            no_rx_avail_buffer: self
+                .no_rx_avail_buffer
+                .saturating_add(other.no_rx_avail_buffer),
+            no_tx_avail_buffer: self
+                .no_tx_avail_buffer
+                .saturating_add(other.no_tx_avail_buffer),
             rx_queue_event_count: self
                 .rx_queue_event_count
                 .saturating_add(other.rx_queue_event_count),
@@ -3164,6 +3511,12 @@ impl NetworkInterfaceMetrics {
             rx_packets_count: self.rx_packets_count.saturating_add(other.rx_packets_count),
             rx_fails: self.rx_fails.saturating_add(other.rx_fails),
             rx_count: self.rx_count.saturating_add(other.rx_count),
+            rx_rate_limiter_event_count: self
+                .rx_rate_limiter_event_count
+                .saturating_add(other.rx_rate_limiter_event_count),
+            rx_rate_limiter_throttled: self
+                .rx_rate_limiter_throttled
+                .saturating_add(other.rx_rate_limiter_throttled),
             tx_bytes_count: self.tx_bytes_count.saturating_add(other.tx_bytes_count),
             tx_malformed_frames: self
                 .tx_malformed_frames
@@ -3174,6 +3527,44 @@ impl NetworkInterfaceMetrics {
             tx_queue_event_count: self
                 .tx_queue_event_count
                 .saturating_add(other.tx_queue_event_count),
+            tx_rate_limiter_event_count: self
+                .tx_rate_limiter_event_count
+                .saturating_add(other.tx_rate_limiter_event_count),
+            tx_rate_limiter_throttled: self
+                .tx_rate_limiter_throttled
+                .saturating_add(other.tx_rate_limiter_throttled),
+            tx_remaining_reqs_count: self
+                .tx_remaining_reqs_count
+                .saturating_add(other.tx_remaining_reqs_count),
+            tx_spoofed_mac_count: self
+                .tx_spoofed_mac_count
+                .saturating_add(other.tx_spoofed_mac_count),
+            vmnet_read_count: self.vmnet_read_count.saturating_add(other.vmnet_read_count),
+            vmnet_read_fails: self.vmnet_read_fails.saturating_add(other.vmnet_read_fails),
+            vmnet_read_packets_count: self
+                .vmnet_read_packets_count
+                .saturating_add(other.vmnet_read_packets_count),
+            vmnet_read_partial_batches: self
+                .vmnet_read_partial_batches
+                .saturating_add(other.vmnet_read_partial_batches),
+            vmnet_write_count: self
+                .vmnet_write_count
+                .saturating_add(other.vmnet_write_count),
+            vmnet_write_fails: self
+                .vmnet_write_fails
+                .saturating_add(other.vmnet_write_fails),
+            vmnet_write_packets_count: self
+                .vmnet_write_packets_count
+                .saturating_add(other.vmnet_write_packets_count),
+            vmnet_write_partial_batches: self
+                .vmnet_write_partial_batches
+                .saturating_add(other.vmnet_write_partial_batches),
+            vmnet_read_latency: self
+                .vmnet_read_latency
+                .merged_with(other.vmnet_read_latency),
+            vmnet_write_latency: self
+                .vmnet_write_latency
+                .merged_with(other.vmnet_write_latency),
         }
     }
 }
@@ -3266,6 +3657,18 @@ impl SharedNetworkInterfaceMetrics {
             .count();
         self.record_rx_queue_events(usize_to_u64_saturating(rx_queue_events));
         self.record_tx_queue_events(usize_to_u64_saturating(tx_queue_events));
+        if dispatch.rx_rate_limiter_event() {
+            record_atomic_metric(&self.inner.rx_rate_limiter_event_count, 1);
+        }
+        if dispatch.tx_rate_limiter_event() {
+            record_atomic_metric(&self.inner.tx_rate_limiter_event_count, 1);
+        }
+        if dispatch
+            .tx_queue_dispatch()
+            .is_some_and(|dispatch| dispatch.processed_frames() == 0)
+        {
+            record_atomic_metric(&self.inner.no_tx_avail_buffer, 1);
+        }
         if let Some(dispatch) = dispatch.rx_queue_dispatch() {
             self.record_rx_queue_dispatch(dispatch);
         }
@@ -3291,17 +3694,39 @@ impl SharedNetworkInterfaceMetrics {
                 .saturating_add(dispatch.buffer_too_small_failures())
                 .saturating_add(dispatch.source_failures()),
         ));
+        record_atomic_metric(
+            &self.inner.no_rx_avail_buffer,
+            usize_to_u64_saturating(dispatch.no_available_buffers()),
+        );
+        let throttled = usize_to_u64_saturating(dispatch.rate_limiter_throttled_packets());
+        record_atomic_metric(&self.inner.rx_rate_limiter_throttled, throttled);
+        self.record_backend_metrics(dispatch.backend_metrics());
     }
 
     pub fn record_tx_queue_dispatch(&self, dispatch: &VirtioNetworkTxQueueDispatch) {
         let successful_frames = usize_to_u64_saturating(dispatch.sink_successful_frames());
         self.record_tx_packets(successful_frames, dispatch.sink_successful_bytes());
-        self.record_tx_malformed_frames(usize_to_u64_saturating(dispatch.parse_failures()));
+        self.record_tx_malformed_frames(usize_to_u64_saturating(dispatch.malformed_frames()));
         self.record_tx_failures(usize_to_u64_saturating(dispatch.sink_failures()));
+        let throttled = usize_to_u64_saturating(dispatch.rate_limiter_throttled_frames());
+        record_atomic_metric(&self.inner.tx_rate_limiter_throttled, throttled);
+        record_atomic_metric(
+            &self.inner.tx_remaining_reqs_count,
+            dispatch.remaining_requests(),
+        );
+        self.record_backend_metrics(dispatch.backend_metrics());
     }
 
     pub fn record_event_failure(&self) {
         record_atomic_metric(&self.inner.event_fails, 1);
+    }
+
+    pub fn record_activation_failure(&self) {
+        record_atomic_metric(&self.inner.activate_fails, 1);
+    }
+
+    pub fn record_config_failure(&self) {
+        record_atomic_metric(&self.inner.cfg_fails, 1);
     }
 
     pub fn record_rx_queue_events(&self, count: u64) {
@@ -3318,18 +3743,50 @@ impl SharedNetworkInterfaceMetrics {
 
     pub fn snapshot(&self) -> NetworkInterfaceMetrics {
         NetworkInterfaceMetrics {
+            activate_fails: self.inner.activate_fails.load(Ordering::Relaxed),
+            cfg_fails: self.inner.cfg_fails.load(Ordering::Relaxed),
             event_fails: self.inner.event_fails.load(Ordering::Relaxed),
+            no_rx_avail_buffer: self.inner.no_rx_avail_buffer.load(Ordering::Relaxed),
+            no_tx_avail_buffer: self.inner.no_tx_avail_buffer.load(Ordering::Relaxed),
             rx_queue_event_count: self.inner.rx_queue_event_count.load(Ordering::Relaxed),
             rx_bytes_count: self.inner.rx_bytes_count.load(Ordering::Relaxed),
             rx_packets_count: self.inner.rx_packets_count.load(Ordering::Relaxed),
             rx_fails: self.inner.rx_fails.load(Ordering::Relaxed),
             rx_count: self.inner.rx_count.load(Ordering::Relaxed),
+            rx_rate_limiter_event_count: self
+                .inner
+                .rx_rate_limiter_event_count
+                .load(Ordering::Relaxed),
+            rx_rate_limiter_throttled: self.inner.rx_rate_limiter_throttled.load(Ordering::Relaxed),
             tx_bytes_count: self.inner.tx_bytes_count.load(Ordering::Relaxed),
             tx_malformed_frames: self.inner.tx_malformed_frames.load(Ordering::Relaxed),
             tx_fails: self.inner.tx_fails.load(Ordering::Relaxed),
             tx_count: self.inner.tx_count.load(Ordering::Relaxed),
             tx_packets_count: self.inner.tx_packets_count.load(Ordering::Relaxed),
             tx_queue_event_count: self.inner.tx_queue_event_count.load(Ordering::Relaxed),
+            tx_rate_limiter_event_count: self
+                .inner
+                .tx_rate_limiter_event_count
+                .load(Ordering::Relaxed),
+            tx_rate_limiter_throttled: self.inner.tx_rate_limiter_throttled.load(Ordering::Relaxed),
+            tx_remaining_reqs_count: self.inner.tx_remaining_reqs_count.load(Ordering::Relaxed),
+            tx_spoofed_mac_count: self.inner.tx_spoofed_mac_count.load(Ordering::Relaxed),
+            vmnet_read_count: self.inner.vmnet_read_count.load(Ordering::Relaxed),
+            vmnet_read_fails: self.inner.vmnet_read_fails.load(Ordering::Relaxed),
+            vmnet_read_packets_count: self.inner.vmnet_read_packets_count.load(Ordering::Relaxed),
+            vmnet_read_partial_batches: self
+                .inner
+                .vmnet_read_partial_batches
+                .load(Ordering::Relaxed),
+            vmnet_write_count: self.inner.vmnet_write_count.load(Ordering::Relaxed),
+            vmnet_write_fails: self.inner.vmnet_write_fails.load(Ordering::Relaxed),
+            vmnet_write_packets_count: self.inner.vmnet_write_packets_count.load(Ordering::Relaxed),
+            vmnet_write_partial_batches: self
+                .inner
+                .vmnet_write_partial_batches
+                .load(Ordering::Relaxed),
+            vmnet_read_latency: snapshot_network_latency(&self.inner.vmnet_read_latency),
+            vmnet_write_latency: snapshot_network_latency(&self.inner.vmnet_write_latency),
         }
     }
 
@@ -3370,22 +3827,93 @@ impl SharedNetworkInterfaceMetrics {
             record_atomic_metric(&self.inner.tx_fails, count);
         }
     }
+
+    fn record_backend_metrics(&self, metrics: VirtioNetworkBackendMetrics) {
+        record_atomic_metric(&self.inner.vmnet_read_count, metrics.vmnet_read_count());
+        record_atomic_metric(&self.inner.vmnet_read_fails, metrics.vmnet_read_fails());
+        record_atomic_metric(
+            &self.inner.vmnet_read_packets_count,
+            metrics.vmnet_read_packets_count(),
+        );
+        record_atomic_metric(
+            &self.inner.vmnet_read_partial_batches,
+            metrics.vmnet_read_partial_batches(),
+        );
+        record_atomic_metric(&self.inner.vmnet_write_count, metrics.vmnet_write_count());
+        record_atomic_metric(&self.inner.vmnet_write_fails, metrics.vmnet_write_fails());
+        record_atomic_metric(
+            &self.inner.vmnet_write_packets_count,
+            metrics.vmnet_write_packets_count(),
+        );
+        record_atomic_metric(
+            &self.inner.vmnet_write_partial_batches,
+            metrics.vmnet_write_partial_batches(),
+        );
+        record_atomic_metric(
+            &self.inner.tx_spoofed_mac_count,
+            metrics.tx_spoofed_mac_count(),
+        );
+        record_network_latency(&self.inner.vmnet_read_latency, metrics.vmnet_read_latency());
+        record_network_latency(
+            &self.inner.vmnet_write_latency,
+            metrics.vmnet_write_latency(),
+        );
+    }
+}
+
+#[derive(Debug)]
+struct NetworkLatencyAtomicMetrics {
+    min_us: AtomicU64,
+    max_us: AtomicU64,
+    sum_us: AtomicU64,
+    samples: AtomicU64,
+}
+
+impl Default for NetworkLatencyAtomicMetrics {
+    fn default() -> Self {
+        Self {
+            min_us: AtomicU64::new(u64::MAX),
+            max_us: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+            samples: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct SharedNetworkInterfaceMetricsInner {
+    activate_fails: AtomicU64,
+    cfg_fails: AtomicU64,
     event_fails: AtomicU64,
+    no_rx_avail_buffer: AtomicU64,
+    no_tx_avail_buffer: AtomicU64,
     rx_queue_event_count: AtomicU64,
     rx_bytes_count: AtomicU64,
     rx_packets_count: AtomicU64,
     rx_fails: AtomicU64,
     rx_count: AtomicU64,
+    rx_rate_limiter_event_count: AtomicU64,
+    rx_rate_limiter_throttled: AtomicU64,
     tx_bytes_count: AtomicU64,
     tx_malformed_frames: AtomicU64,
     tx_fails: AtomicU64,
     tx_count: AtomicU64,
     tx_packets_count: AtomicU64,
     tx_queue_event_count: AtomicU64,
+    tx_rate_limiter_event_count: AtomicU64,
+    tx_rate_limiter_throttled: AtomicU64,
+    tx_remaining_reqs_count: AtomicU64,
+    tx_spoofed_mac_count: AtomicU64,
+    vmnet_read_count: AtomicU64,
+    vmnet_read_fails: AtomicU64,
+    vmnet_read_packets_count: AtomicU64,
+    vmnet_read_partial_batches: AtomicU64,
+    vmnet_write_count: AtomicU64,
+    vmnet_write_fails: AtomicU64,
+    vmnet_write_packets_count: AtomicU64,
+    vmnet_write_partial_batches: AtomicU64,
+    vmnet_read_latency: NetworkLatencyAtomicMetrics,
+    vmnet_write_latency: NetworkLatencyAtomicMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -3455,6 +3983,10 @@ impl fmt::Debug for NetworkInterfaceMetricsLease {
 }
 
 impl PreparedNetworkInterfaceMetrics {
+    pub fn metrics(&self) -> SharedNetworkInterfaceMetrics {
+        self.metrics.clone()
+    }
+
     pub fn publish(mut self) -> NetworkInterfaceMetricsLease {
         let mut state = lock_network_metrics_registry(&self.registry.per_interface);
         let reservation_count = state.reservations.len();
@@ -3773,6 +4305,20 @@ impl SharedNetworkInterfaceMetricsRegistry {
         self.aggregate.record_event_failure();
         if let Some(metrics) = self.per_interface(iface_id) {
             metrics.record_event_failure();
+        }
+    }
+
+    pub fn record_activation_failure_for_interface(&self, iface_id: &str) {
+        self.aggregate.record_activation_failure();
+        if let Some(metrics) = self.per_interface(iface_id) {
+            metrics.record_activation_failure();
+        }
+    }
+
+    pub fn record_config_failure_for_interface(&self, iface_id: &str) {
+        self.aggregate.record_config_failure();
+        if let Some(metrics) = self.per_interface(iface_id) {
+            metrics.record_config_failure();
         }
     }
 
@@ -6054,6 +6600,35 @@ fn record_atomic_max_metric(metric: &AtomicU64, value: u64) {
     }
 }
 
+fn record_network_latency(
+    metrics: &NetworkLatencyAtomicMetrics,
+    aggregate: VirtioNetworkLatencyAggregate,
+) {
+    if aggregate.samples() == 0 {
+        return;
+    }
+    record_atomic_min_metric(&metrics.min_us, aggregate.min_us());
+    record_atomic_max_metric(&metrics.max_us, aggregate.max_us());
+    record_atomic_metric(&metrics.sum_us, aggregate.sum_us());
+    record_atomic_metric_release(&metrics.samples, aggregate.samples());
+}
+
+fn snapshot_network_latency(
+    metrics: &NetworkLatencyAtomicMetrics,
+) -> VirtioNetworkLatencyAggregate {
+    let samples = metrics.samples.load(Ordering::Acquire);
+    if samples == 0 {
+        VirtioNetworkLatencyAggregate::default()
+    } else {
+        VirtioNetworkLatencyAggregate::new(
+            metrics.min_us.load(Ordering::Relaxed),
+            metrics.max_us.load(Ordering::Relaxed),
+            metrics.sum_us.load(Ordering::Relaxed),
+            samples,
+        )
+    }
+}
+
 fn record_latency_aggregate(
     latency_aggregate: VirtioBlockLatencyAggregate,
     min_us: &AtomicU64,
@@ -6647,8 +7222,24 @@ fn network_interface_metrics_json_object(
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut net = serde_json::Map::new();
     net.insert(
+        "activate_fails".to_string(),
+        serde_json::Value::Number(metrics.activate_fails().into()),
+    );
+    net.insert(
+        "cfg_fails".to_string(),
+        serde_json::Value::Number(metrics.cfg_fails().into()),
+    );
+    net.insert(
         "event_fails".to_string(),
         serde_json::Value::Number(metrics.event_fails().into()),
+    );
+    net.insert(
+        "no_rx_avail_buffer".to_string(),
+        serde_json::Value::Number(metrics.no_rx_avail_buffer().into()),
+    );
+    net.insert(
+        "no_tx_avail_buffer".to_string(),
+        serde_json::Value::Number(metrics.no_tx_avail_buffer().into()),
     );
     net.insert(
         "rx_bytes_count".to_string(),
@@ -6669,6 +7260,14 @@ fn network_interface_metrics_json_object(
     net.insert(
         "rx_queue_event_count".to_string(),
         serde_json::Value::Number(metrics.rx_queue_event_count().into()),
+    );
+    net.insert(
+        "rx_event_rate_limiter_count".to_string(),
+        serde_json::Value::Number(metrics.rx_event_rate_limiter_count().into()),
+    );
+    net.insert(
+        "rx_rate_limiter_throttled".to_string(),
+        serde_json::Value::Number(metrics.rx_rate_limiter_throttled().into()),
     );
     net.insert(
         "tx_bytes_count".to_string(),
@@ -6694,7 +7293,90 @@ fn network_interface_metrics_json_object(
         "tx_queue_event_count".to_string(),
         serde_json::Value::Number(metrics.tx_queue_event_count().into()),
     );
+    net.insert(
+        "tx_rate_limiter_event_count".to_string(),
+        serde_json::Value::Number(metrics.tx_rate_limiter_event_count().into()),
+    );
+    net.insert(
+        "tx_rate_limiter_throttled".to_string(),
+        serde_json::Value::Number(metrics.tx_rate_limiter_throttled().into()),
+    );
+    net.insert(
+        "tx_remaining_reqs_count".to_string(),
+        serde_json::Value::Number(metrics.tx_remaining_reqs_count().into()),
+    );
+    net.insert(
+        "tx_spoofed_mac_count".to_string(),
+        serde_json::Value::Number(metrics.tx_spoofed_mac_count().into()),
+    );
+    net.insert(
+        "vmnet_read_count".to_string(),
+        serde_json::Value::Number(metrics.vmnet_read_count().into()),
+    );
+    net.insert(
+        "vmnet_read_fails".to_string(),
+        serde_json::Value::Number(metrics.vmnet_read_fails().into()),
+    );
+    net.insert(
+        "vmnet_read_packets_count".to_string(),
+        serde_json::Value::Number(metrics.vmnet_read_packets_count().into()),
+    );
+    net.insert(
+        "vmnet_read_partial_batches".to_string(),
+        serde_json::Value::Number(metrics.vmnet_read_partial_batches().into()),
+    );
+    net.insert(
+        "vmnet_read_latency_us".to_string(),
+        serde_json::Value::Object(network_latency_metrics_json_object(
+            metrics.vmnet_read_latency(),
+        )),
+    );
+    net.insert(
+        "vmnet_write_count".to_string(),
+        serde_json::Value::Number(metrics.vmnet_write_count().into()),
+    );
+    net.insert(
+        "vmnet_write_fails".to_string(),
+        serde_json::Value::Number(metrics.vmnet_write_fails().into()),
+    );
+    net.insert(
+        "vmnet_write_packets_count".to_string(),
+        serde_json::Value::Number(metrics.vmnet_write_packets_count().into()),
+    );
+    net.insert(
+        "vmnet_write_partial_batches".to_string(),
+        serde_json::Value::Number(metrics.vmnet_write_partial_batches().into()),
+    );
+    net.insert(
+        "vmnet_write_latency_us".to_string(),
+        serde_json::Value::Object(network_latency_metrics_json_object(
+            metrics.vmnet_write_latency(),
+        )),
+    );
     net
+}
+
+fn network_latency_metrics_json_object(
+    metrics: VirtioNetworkLatencyAggregate,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut latency = serde_json::Map::new();
+    latency.insert(
+        "min_us".to_string(),
+        serde_json::Value::Number(metrics.min_us().into()),
+    );
+    latency.insert(
+        "max_us".to_string(),
+        serde_json::Value::Number(metrics.max_us().into()),
+    );
+    latency.insert(
+        "sum_us".to_string(),
+        serde_json::Value::Number(metrics.sum_us().into()),
+    );
+    latency.insert(
+        "samples".to_string(),
+        serde_json::Value::Number(metrics.samples().into()),
+    );
+    latency
 }
 
 fn mmds_metrics_json_object(metrics: MmdsMetrics) -> serde_json::Map<String, serde_json::Value> {
@@ -7724,7 +8406,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
         BalloonDeviceMetrics, BalloonDiscardMetrics, BalloonFreePageReportMetrics,
@@ -7739,10 +8421,12 @@ mod tests {
         SharedMemoryHotplugDeviceMetrics, SharedMemoryHotplugLatencyMetricsInner,
         SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
         SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
-        SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
+        SharedSignalMetrics, SharedVsockDeviceMetrics, SignalMetrics,
+        VirtioNetworkLatencyAggregate, VsockDeviceMetrics, network_interface_metrics_json_object,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::logger::SharedLoggerMetrics;
+    use crate::network::VirtioNetworkBackendMetrics;
     use crate::serial::SerialOutputMetrics;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -7847,18 +8531,38 @@ mod tests {
 
     fn network_metrics_with_all_fields() -> NetworkInterfaceMetrics {
         NetworkInterfaceMetrics::default()
-            .with_event_fails(1)
-            .with_rx_queue_event_count(2)
-            .with_rx_bytes_count(3)
-            .with_rx_packets_count(4)
-            .with_rx_fails(5)
-            .with_rx_count(6)
-            .with_tx_bytes_count(7)
-            .with_tx_malformed_frames(8)
-            .with_tx_fails(9)
-            .with_tx_count(10)
-            .with_tx_packets_count(11)
-            .with_tx_queue_event_count(12)
+            .with_activate_fails(1)
+            .with_cfg_fails(2)
+            .with_event_fails(3)
+            .with_no_rx_avail_buffer(4)
+            .with_no_tx_avail_buffer(5)
+            .with_rx_queue_event_count(6)
+            .with_rx_bytes_count(7)
+            .with_rx_packets_count(8)
+            .with_rx_fails(9)
+            .with_rx_count(10)
+            .with_rx_event_rate_limiter_count(11)
+            .with_rx_rate_limiter_throttled(12)
+            .with_tx_bytes_count(13)
+            .with_tx_malformed_frames(14)
+            .with_tx_fails(15)
+            .with_tx_count(16)
+            .with_tx_packets_count(17)
+            .with_tx_queue_event_count(18)
+            .with_tx_rate_limiter_event_count(19)
+            .with_tx_rate_limiter_throttled(20)
+            .with_tx_remaining_reqs_count(21)
+            .with_tx_spoofed_mac_count(22)
+            .with_vmnet_read_count(23)
+            .with_vmnet_read_fails(24)
+            .with_vmnet_read_packets_count(25)
+            .with_vmnet_read_partial_batches(26)
+            .with_vmnet_write_count(27)
+            .with_vmnet_write_fails(28)
+            .with_vmnet_write_packets_count(29)
+            .with_vmnet_write_partial_batches(30)
+            .with_vmnet_read_latency(VirtioNetworkLatencyAggregate::new(31, 32, 63, 2))
+            .with_vmnet_write_latency(VirtioNetworkLatencyAggregate::new(33, 34, 67, 2))
     }
 
     fn mmds_metrics_with_all_fields() -> MmdsMetrics {
@@ -9117,7 +9821,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"net":{"event_fails":1,"rx_bytes_count":3,"rx_count":6,"rx_fails":5,"rx_packets_count":4,"rx_queue_event_count":2,"tx_bytes_count":7,"tx_count":10,"tx_fails":9,"tx_malformed_frames":8,"tx_packets_count":11,"tx_queue_event_count":12},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"net":{"activate_fails":1,"cfg_fails":2,"event_fails":3,"no_rx_avail_buffer":4,"no_tx_avail_buffer":5,"rx_bytes_count":7,"rx_count":10,"rx_event_rate_limiter_count":11,"rx_fails":9,"rx_packets_count":8,"rx_queue_event_count":6,"rx_rate_limiter_throttled":12,"tx_bytes_count":13,"tx_count":16,"tx_fails":15,"tx_malformed_frames":14,"tx_packets_count":17,"tx_queue_event_count":18,"tx_rate_limiter_event_count":19,"tx_rate_limiter_throttled":20,"tx_remaining_reqs_count":21,"tx_spoofed_mac_count":22,"vmnet_read_count":23,"vmnet_read_fails":24,"vmnet_read_latency_us":{"max_us":32,"min_us":31,"samples":2,"sum_us":63},"vmnet_read_packets_count":25,"vmnet_read_partial_batches":26,"vmnet_write_count":27,"vmnet_write_fails":28,"vmnet_write_latency_us":{"max_us":34,"min_us":33,"samples":2,"sum_us":67},"vmnet_write_packets_count":29,"vmnet_write_partial_batches":30},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
@@ -9159,11 +9863,33 @@ mod tests {
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
+        let lines = output.lines();
+        let line = lines.first().expect("one metrics line should be written");
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("metrics line should be valid JSON");
+        assert_eq!(lines.len(), 1);
         assert_eq!(
-            output.lines(),
-            [
-                r#"{"net":{"event_fails":0,"rx_bytes_count":128,"rx_count":1,"rx_fails":0,"rx_packets_count":1,"rx_queue_event_count":1,"tx_bytes_count":64,"tx_count":1,"tx_fails":0,"tx_malformed_frames":0,"tx_packets_count":1,"tx_queue_event_count":1},"net_eth0":{"event_fails":0,"rx_bytes_count":128,"rx_count":1,"rx_fails":0,"rx_packets_count":1,"rx_queue_event_count":1,"tx_bytes_count":0,"tx_count":0,"tx_fails":0,"tx_malformed_frames":0,"tx_packets_count":0,"tx_queue_event_count":0},"net_eth1":{"event_fails":0,"rx_bytes_count":0,"rx_count":0,"rx_fails":0,"rx_packets_count":0,"rx_queue_event_count":0,"tx_bytes_count":64,"tx_count":1,"tx_fails":0,"tx_malformed_frames":0,"tx_packets_count":1,"tx_queue_event_count":1},"vmm":{"metrics_flush_count":1}}"#
-            ]
+            value.get("net"),
+            Some(&serde_json::Value::Object(
+                network_interface_metrics_json_object(eth0_metrics.merged_with(eth1_metrics))
+            ))
+        );
+        assert_eq!(
+            value.get("net_eth0"),
+            Some(&serde_json::Value::Object(
+                network_interface_metrics_json_object(eth0_metrics)
+            ))
+        );
+        assert_eq!(
+            value.get("net_eth1"),
+            Some(&serde_json::Value::Object(
+                network_interface_metrics_json_object(eth1_metrics)
+            ))
+        );
+        assert!(value.get("net_noop").is_none());
+        assert_eq!(
+            value.get("vmm"),
+            Some(&serde_json::json!({ "metrics_flush_count": 1 }))
         );
     }
 
@@ -9184,6 +9910,37 @@ mod tests {
                 .with_tx_queue_event_count(3)
         );
         assert_eq!(second.snapshot(), NetworkInterfaceMetrics::default());
+    }
+
+    #[test]
+    fn network_backend_metrics_preserve_exact_attempt_result_and_latency_counts() {
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        let mut backend = VirtioNetworkBackendMetrics::default();
+        backend.record_vmnet_read(4, Ok(2), Duration::from_micros(5));
+        backend.record_vmnet_read(4, Ok(0), Duration::from_micros(7));
+        backend.record_vmnet_read(4, Err(()), Duration::from_micros(11));
+        backend.record_vmnet_write(3, Ok(3), Duration::from_micros(13));
+        backend.record_vmnet_write(3, Ok(1), Duration::from_micros(17));
+        backend.record_vmnet_write(3, Err(()), Duration::from_micros(19));
+        backend.record_spoofed_mac();
+
+        metrics.record_backend_metrics(backend);
+
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_tx_spoofed_mac_count(1)
+                .with_vmnet_read_count(3)
+                .with_vmnet_read_fails(1)
+                .with_vmnet_read_packets_count(2)
+                .with_vmnet_read_partial_batches(1)
+                .with_vmnet_write_count(3)
+                .with_vmnet_write_fails(1)
+                .with_vmnet_write_packets_count(4)
+                .with_vmnet_write_partial_batches(1)
+                .with_vmnet_read_latency(VirtioNetworkLatencyAggregate::new(5, 11, 23, 3))
+                .with_vmnet_write_latency(VirtioNetworkLatencyAggregate::new(13, 19, 49, 3))
+        );
     }
 
     #[test]
@@ -9353,7 +10110,7 @@ mod tests {
         assert_eq!(
             base.merged_with(additional).network_interface_metrics(),
             Some(
-                NetworkInterfaceMetrics::default()
+                network_metrics_with_all_fields()
                     .with_event_fails(u64::MAX)
                     .with_rx_queue_event_count(u64::MAX)
                     .with_rx_bytes_count(u64::MAX)
@@ -9391,19 +10148,9 @@ mod tests {
         let expected = NetworkInterfaceMetricsByInterface::new()
             .with_interface_metrics(
                 "eth0",
-                NetworkInterfaceMetrics::default()
+                network_metrics_with_all_fields()
                     .with_event_fails(u64::MAX)
-                    .with_rx_queue_event_count(2)
-                    .with_rx_bytes_count(3)
-                    .with_rx_packets_count(4)
-                    .with_rx_fails(5)
-                    .with_rx_count(u64::MAX)
-                    .with_tx_bytes_count(7)
-                    .with_tx_malformed_frames(8)
-                    .with_tx_fails(9)
-                    .with_tx_count(10)
-                    .with_tx_packets_count(11)
-                    .with_tx_queue_event_count(12),
+                    .with_rx_count(u64::MAX),
             )
             .with_interface_metrics("eth1", NetworkInterfaceMetrics::default().with_tx_count(3));
         let merged = base.merged_with(additional);

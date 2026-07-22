@@ -70,7 +70,7 @@ use bangbang_runtime::network::{
     GuestMacAddress, NetworkDeviceProfile, NetworkInterfaceConfig, NetworkInterfaceConfigError,
     NetworkInterfaceConfigInput, NetworkInterfaceUpdate, NetworkInterfaceUpdateError,
     NetworkInterfaceUpdateInput, NetworkMmioLayout, NetworkRuntimeMutationError,
-    PreparedNetworkDevice, validate_network_interface_count,
+    PreparedNetworkDevice, VirtioNetworkPacketEnvelope, validate_network_interface_count,
 };
 #[cfg(test)]
 use bangbang_runtime::network::{
@@ -143,6 +143,7 @@ use crate::host_network::virtio_vmnet::{
     MmdsResponseQueue, PreparedVmnetVirtioNetworkRxBuffer, VmnetPacketReadinessLease,
     VmnetVirtioNetworkBatchLimits, VmnetVirtioNetworkPacketIo,
     VmnetVirtioNetworkPacketIoBuildError, VmnetVirtioNetworkPacketIoStopError,
+    VmnetVirtioNetworkPacketProfile,
 };
 use crate::host_network::vmnet::{
     StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VmnetHostDeviceNameConfigError,
@@ -4731,8 +4732,8 @@ enum ProcessNetworkPacketIo<B>
 where
     B: ProcessVmnetBackend,
 {
-    MmdsOnly(MmdsOnlyVirtioNetworkPacketIo),
-    Vmnet(VmnetVirtioNetworkPacketIo<StartedVmnetPacketIoBackend<B>>),
+    MmdsOnly(Box<MmdsOnlyVirtioNetworkPacketIo>),
+    Vmnet(Box<VmnetVirtioNetworkPacketIo<StartedVmnetPacketIoBackend<B>>>),
 }
 
 impl<B> fmt::Debug for ProcessNetworkPacketIo<B>
@@ -4754,7 +4755,7 @@ where
     fn as_packet_io(&mut self) -> Arm64BootNetworkPacketIo<'_> {
         match self {
             Self::MmdsOnly(packet_io) => {
-                let MmdsOnlyVirtioNetworkPacketIo { tx_sink, rx_source } = packet_io;
+                let MmdsOnlyVirtioNetworkPacketIo { tx_sink, rx_source } = packet_io.as_mut();
                 Arm64BootNetworkPacketIo::new(tx_sink, rx_source)
             }
             Self::Vmnet(packet_io) => packet_io.as_packet_io(),
@@ -5257,12 +5258,16 @@ where
                 else {
                     return Err(ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour);
                 };
-                let packet_io = MmdsOnlyVirtioNetworkPacketIo::new(detour).map_err(|source| {
-                    ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { source }
-                })?;
+                let packet_io =
+                    MmdsOnlyVirtioNetworkPacketIo::with_guest_mac(detour, config.guest_mac())
+                        .map_err(|source| {
+                            ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild {
+                                source,
+                            }
+                        })?;
                 let device_profile = NetworkDeviceProfile::from_config(config);
                 (
-                    ProcessNetworkPacketIo::MmdsOnly(packet_io),
+                    ProcessNetworkPacketIo::MmdsOnly(Box::new(packet_io)),
                     device_profile,
                     None,
                     !explicit_mac_pre_reserved && device_profile.guest_mac().is_some(),
@@ -5304,18 +5309,31 @@ where
                     .mmds_detour
                     .as_ref()
                     .and_then(|detour| detour.detour_for_interface(iface_id));
-                let rx_buffer_len = backend.parameters().maximum_packet_size();
+                let packet_envelope = if parameters.direct_virtio_header_enabled() {
+                    VirtioNetworkPacketEnvelope::DirectVirtioHeader
+                } else {
+                    VirtioNetworkPacketEnvelope::RawEthernet
+                };
+                let rx_buffer_len = parameters.packet_buffer_size().ok_or(
+                    ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
+                        source: VmnetVirtioNetworkPacketIoBuildError::RxBufferTooSmall,
+                    },
+                )?;
                 let read_batch_size = usize::from(parameters.read_max_packets().unwrap_or(1));
                 let write_batch_size = usize::from(parameters.write_max_packets().unwrap_or(1));
                 let mut packet_io =
-                    VmnetVirtioNetworkPacketIo::with_prepared_batch_and_mmds_detour(
+                    VmnetVirtioNetworkPacketIo::with_prepared_batch_envelope_and_mmds_detour(
                         backend,
                         interface,
                         prepared_rx,
-                        VmnetVirtioNetworkBatchLimits::new(
-                            rx_buffer_len,
-                            read_batch_size,
-                            write_batch_size,
+                        VmnetVirtioNetworkPacketProfile::new(
+                            VmnetVirtioNetworkBatchLimits::new(
+                                rx_buffer_len,
+                                read_batch_size,
+                                write_batch_size,
+                            ),
+                            packet_envelope,
+                            Some(realized_mac),
                         ),
                         detour,
                         Some(readiness_lease),
@@ -5340,8 +5358,9 @@ where
                     };
                 }
                 (
-                    ProcessNetworkPacketIo::Vmnet(packet_io),
-                    NetworkDeviceProfile::new(Some(realized_mac), config.mtu()),
+                    ProcessNetworkPacketIo::Vmnet(Box::new(packet_io)),
+                    NetworkDeviceProfile::new(Some(realized_mac), config.mtu())
+                        .with_packet_envelope(packet_envelope),
                     Some(parameters),
                     !explicit_mac_pre_reserved,
                 )
@@ -6128,6 +6147,15 @@ impl VirtioNetworkTxPacketSink for NoopProcessNetworkTxPacketSink {
         &mut self,
         _memory: &GuestMemory,
         _frame: &VirtioNetworkTxFrame,
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        Ok(VirtioNetworkTxPacketDisposition::Forwarded)
+    }
+
+    fn transmit_prepared_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+        _packet: &bangbang_runtime::network_packet::VirtioNetworkPacketPlan,
     ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
         Ok(VirtioNetworkTxPacketDisposition::Forwarded)
     }

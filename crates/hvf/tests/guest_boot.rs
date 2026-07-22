@@ -71,6 +71,12 @@ const MMDS_FETCH_MARKER: &[u8] = b"BANGBANG_MMDS_FETCH_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PCI_NETWORK_IDENTITIES_MARKER: &[u8] = b"BANGBANG_PCI_NETWORK_IDENTITIES_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_NETWORK_LARGE_TX_MARKER: &[u8] = b"BANGBANG_VIRTIO_NET_LARGE_TX_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_NETWORK_LARGE_RX_MARKER: &[u8] = b"BANGBANG_VIRTIO_NET_LARGE_RX_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VIRTIO_NETWORK_SEMANTICS_MARKER: &[u8] = b"BANGBANG_VIRTIO_NET_SEMANTICS_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
@@ -124,6 +130,215 @@ const PMEM_MMIO_BASE: u64 = 0x5800_0000;
 const NETWORK_MMIO_BASE: u64 = 0x6000_0000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VSOCK_MMIO_BASE: u64 = 0x7000_0000;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+struct SignedGuestNetworkSemanticEvidence {
+    maximum_emitted_packets: std::sync::atomic::AtomicUsize,
+    errors: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl SignedGuestNetworkSemanticEvidence {
+    fn observe(
+        &self,
+        packet: &bangbang_runtime::network_packet::VirtioNetworkPacketPlan,
+    ) -> Result<(), bangbang_runtime::network::VirtioNetworkTxPacketSinkError> {
+        let packet_count = packet.emitted_packet_count().map_err(|source| {
+            bangbang_runtime::network::VirtioNetworkTxPacketSinkError::new(source.to_string())
+        })?;
+        self.maximum_emitted_packets
+            .fetch_max(packet_count, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn maximum_emitted_packets(&self) -> usize {
+        self.maximum_emitted_packets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record_error(&self, source: &bangbang_runtime::network::VirtioNetworkTxPacketSinkError) {
+        let mut errors = self
+            .errors
+            .lock()
+            .expect("signed network evidence lock should not be poisoned");
+        if errors.len() < 8 {
+            errors.push(source.to_string());
+        }
+    }
+
+    fn errors(&self) -> Vec<String> {
+        self.errors
+            .lock()
+            .expect("signed network evidence lock should not be poisoned")
+            .clone()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct SignedGuestMmdsTxPacketSink {
+    inner: bangbang_runtime::mmds_network::MmdsOnlyVirtioNetworkTxPacketSink,
+    evidence: std::sync::Arc<SignedGuestNetworkSemanticEvidence>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl bangbang_runtime::network::VirtioNetworkTxPacketSink for SignedGuestMmdsTxPacketSink {
+    fn transmit_frame(
+        &mut self,
+        memory: &bangbang_runtime::memory::GuestMemory,
+        frame: &bangbang_runtime::network::VirtioNetworkTxFrame,
+    ) -> Result<
+        bangbang_runtime::network::VirtioNetworkTxPacketDisposition,
+        bangbang_runtime::network::VirtioNetworkTxPacketSinkError,
+    > {
+        let packet = frame.prepare_packet(memory).map_err(|source| {
+            bangbang_runtime::network::VirtioNetworkTxPacketSinkError::new(source.to_string())
+        })?;
+        self.evidence.observe(&packet)?;
+        let result = self.inner.transmit_prepared_frame(memory, frame, &packet);
+        if let Err(source) = &result {
+            self.evidence.record_error(source);
+        }
+        result
+    }
+
+    fn transmit_prepared_frame(
+        &mut self,
+        memory: &bangbang_runtime::memory::GuestMemory,
+        frame: &bangbang_runtime::network::VirtioNetworkTxFrame,
+        packet: &bangbang_runtime::network_packet::VirtioNetworkPacketPlan,
+    ) -> Result<
+        bangbang_runtime::network::VirtioNetworkTxPacketDisposition,
+        bangbang_runtime::network::VirtioNetworkTxPacketSinkError,
+    > {
+        self.evidence.observe(packet)?;
+        let result = self.inner.transmit_prepared_frame(memory, frame, packet);
+        if let Err(source) = &result {
+            self.evidence.record_error(source);
+        }
+        result
+    }
+
+    fn supports_staged_batch(&self) -> bool {
+        true
+    }
+
+    fn stage_frame(
+        &mut self,
+        memory: &bangbang_runtime::memory::GuestMemory,
+        frame: &bangbang_runtime::network::VirtioNetworkTxFrame,
+    ) -> Result<
+        bangbang_runtime::network::VirtioNetworkTxPacketStage,
+        bangbang_runtime::network::VirtioNetworkTxPacketSinkError,
+    > {
+        let packet = frame.prepare_packet(memory).map_err(|source| {
+            bangbang_runtime::network::VirtioNetworkTxPacketSinkError::new(source.to_string())
+        })?;
+        self.evidence.observe(&packet)?;
+        let result = self.inner.stage_prepared_frame(memory, frame, &packet);
+        if let Err(source) = &result {
+            self.evidence.record_error(source);
+        }
+        result
+    }
+
+    fn stage_prepared_frame(
+        &mut self,
+        memory: &bangbang_runtime::memory::GuestMemory,
+        frame: &bangbang_runtime::network::VirtioNetworkTxFrame,
+        packet: &bangbang_runtime::network_packet::VirtioNetworkPacketPlan,
+    ) -> Result<
+        bangbang_runtime::network::VirtioNetworkTxPacketStage,
+        bangbang_runtime::network::VirtioNetworkTxPacketSinkError,
+    > {
+        self.evidence.observe(packet)?;
+        let result = self.inner.stage_prepared_frame(memory, frame, packet);
+        if let Err(source) = &result {
+            self.evidence.record_error(source);
+        }
+        result
+    }
+
+    fn commit_staged_frame(&mut self) -> bangbang_runtime::network::VirtioNetworkTxPacketCommit {
+        let result = self.inner.commit_staged_frame();
+        if let bangbang_runtime::network::VirtioNetworkTxPacketCommit::Immediate(Err(source)) =
+            &result
+        {
+            self.evidence.record_error(source);
+        }
+        result
+    }
+
+    fn discard_staged_frame(&mut self) {
+        self.inner.discard_staged_frame();
+    }
+
+    fn flush_staged_frames(
+        &mut self,
+        results: &mut Vec<
+            Result<
+                bangbang_runtime::network::VirtioNetworkTxPacketDisposition,
+                bangbang_runtime::network::VirtioNetworkTxPacketSinkError,
+            >,
+        >,
+    ) {
+        self.inner.flush_staged_frames(results);
+    }
+
+    fn take_backend_metrics(&mut self) -> bangbang_runtime::network::VirtioNetworkBackendMetrics {
+        self.inner.take_backend_metrics()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct SignedGuestNetworkPacketIoProvider {
+    tx_sink: SignedGuestMmdsTxPacketSink,
+    rx_source: bangbang_runtime::mmds_network::MmdsOnlyVirtioNetworkRxPacketSource,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl SignedGuestNetworkPacketIoProvider {
+    fn new(
+        packet_io: bangbang_runtime::mmds_network::MmdsOnlyVirtioNetworkPacketIo,
+        evidence: std::sync::Arc<SignedGuestNetworkSemanticEvidence>,
+    ) -> Self {
+        Self {
+            tx_sink: SignedGuestMmdsTxPacketSink {
+                inner: packet_io.tx_sink,
+                evidence,
+            },
+            rx_source: packet_io.rx_source,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl bangbang_runtime::startup::Arm64BootNetworkPacketIoProvider
+    for SignedGuestNetworkPacketIoProvider
+{
+    fn packet_io(
+        &mut self,
+        interface: bangbang_runtime::startup::Arm64BootNetworkInterface<'_>,
+    ) -> Result<
+        bangbang_runtime::startup::Arm64BootNetworkPacketIo<'_>,
+        bangbang_runtime::startup::Arm64BootNetworkPacketIoError,
+    > {
+        if interface.iface_id() != "eth0" {
+            return Err(
+                bangbang_runtime::startup::Arm64BootNetworkPacketIoError::new(format!(
+                    "missing signed guest packet I/O for interface {}",
+                    interface.iface_id()
+                )),
+            );
+        }
+        Ok(bangbang_runtime::startup::Arm64BootNetworkPacketIo::new(
+            &mut self.tx_sink,
+            &mut self.rx_source,
+        ))
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
@@ -1328,30 +1543,199 @@ fn boots_direct_rootfs_and_flushes_pmem_over_modern_virtio_pci() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn configure_signed_guest_network_semantics(
+    controller: &mut bangbang_runtime::VmmController,
+    rootfs_path: &std::path::Path,
+) {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+    use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput};
+    use bangbang_runtime::network::{
+        NetworkInterfaceConfigInput, NetworkRateLimiterConfig, NetworkTokenBucketConfig,
+    };
+
+    controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", rootfs_path, true).with_is_read_only(true),
+        ))
+        .expect("signed network rootfs drive should configure");
+    controller
+        .handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+                .with_mtu(50_000)
+                .with_rx_rate_limiter(NetworkRateLimiterConfig::new(
+                    None,
+                    Some(NetworkTokenBucketConfig::new(1, None, 20)),
+                )),
+        ))
+        .expect("signed MMDS network interface should configure");
+    controller
+        .handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+            "eth0".to_string(),
+        ])))
+        .expect("signed MMDS interface selection should configure");
+    controller
+        .handle_action(VmmAction::PutMmds(MmdsContentInput::new(
+            serde_json::json!({
+                "meta-data": {
+                    "bangbang-marker": "BANGBANG_MMDS_GUEST_VALUE",
+                    "bangbang-large": "z".repeat(48 * 1024)
+                }
+            }),
+        )))
+        .expect("signed MMDS semantic data should configure");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn signed_guest_network_packet_io(
+    controller: &bangbang_runtime::VmmController,
+    evidence: std::sync::Arc<SignedGuestNetworkSemanticEvidence>,
+) -> SignedGuestNetworkPacketIoProvider {
+    use bangbang_runtime::metrics::SharedMmdsMetrics;
+    use bangbang_runtime::mmds::DEFAULT_MMDS_IPV4_ADDRESS;
+    use bangbang_runtime::mmds_network::{
+        MmdsOnlyVirtioNetworkPacketIo, MmdsPacketDetour, MmdsResponseQueue,
+    };
+
+    let detour = MmdsPacketDetour::new(
+        controller.mmds_state_handle(),
+        DEFAULT_MMDS_IPV4_ADDRESS,
+        MmdsResponseQueue::default(),
+        SharedMmdsMetrics::default(),
+    );
+    let packet_io =
+        MmdsOnlyVirtioNetworkPacketIo::new(detour).expect("signed MMDS packet I/O should build");
+    SignedGuestNetworkPacketIoProvider::new(packet_io, evidence)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn expected_signed_guest_network_features() -> u64 {
+    use bangbang_runtime::network::{
+        VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_F_CSUM, VIRTIO_NET_F_GUEST_CSUM,
+        VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6, VIRTIO_NET_F_GUEST_UFO,
+        VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_HOST_TSO6, VIRTIO_NET_F_HOST_UFO,
+        VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC,
+    };
+
+    [
+        VIRTIO_NET_F_CSUM,
+        VIRTIO_NET_F_GUEST_CSUM,
+        VIRTIO_NET_F_MTU,
+        VIRTIO_NET_F_GUEST_TSO4,
+        VIRTIO_NET_F_GUEST_TSO6,
+        VIRTIO_NET_F_GUEST_UFO,
+        VIRTIO_NET_F_HOST_TSO4,
+        VIRTIO_NET_F_HOST_TSO6,
+        VIRTIO_NET_F_HOST_UFO,
+        VIRTIO_NET_F_MRG_RXBUF,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC,
+        VIRTIO_RING_FEATURE_EVENT_IDX,
+        VIRTIO_FEATURE_VERSION_1,
+    ]
+    .into_iter()
+    .fold(0, |features, feature| features | (1_u64 << feature))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_signed_guest_network_semantics(
+    observation: &GuestBootObservation,
+    evidence: &SignedGuestNetworkSemanticEvidence,
+    negotiated_features: u64,
+    transport: &str,
+) {
+    let metrics = observation
+        .network_interface_metrics
+        .expect("signed network proof should retain eth0 metrics");
+    assert_guest_boot_observed_marker(
+        observation,
+        DIRECT_ROOTFS_BOOT_MARKER,
+        &format!("{transport} network direct-rootfs boot marker"),
+    );
+    for (marker, description) in [
+        (MMDS_FETCH_MARKER, "baseline MMDS fetch"),
+        (VIRTIO_NETWORK_LARGE_TX_MARKER, "large guest TCP transmit"),
+        (VIRTIO_NETWORK_LARGE_RX_MARKER, "large merged receive"),
+        (VIRTIO_NETWORK_SEMANTICS_MARKER, "virtio-net semantic proof"),
+    ] {
+        assert!(
+            bytes_contain_marker(&observation.serial_bytes, marker),
+            "{transport} guest did not complete {description}; negotiated_features={negotiated_features:#x}, maximum_emitted_packets={}, sink_errors={:?}, metrics={metrics:?}\nserial output:\n{}",
+            evidence.maximum_emitted_packets(),
+            evidence.errors(),
+            String::from_utf8_lossy(&observation.serial_bytes)
+        );
+    }
+
+    let expected_features = expected_signed_guest_network_features();
+    assert_eq!(
+        negotiated_features, expected_features,
+        "{transport} Linux guest did not negotiate the complete published virtio-net feature set"
+    );
+    assert!(
+        evidence.maximum_emitted_packets() > 1,
+        "{transport} large guest TCP request did not exercise software segmentation"
+    );
+    assert!(metrics.tx_bytes_count() > 3000);
+    assert!(metrics.rx_bytes_count() > 48 * 1024);
+    assert!(metrics.rx_rate_limiter_throttled() > 0);
+    assert!(metrics.rx_rate_limiter_event_count() > 0);
+    assert_eq!(metrics.rx_fails(), 0);
+    assert_eq!(metrics.tx_fails(), 0);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn boots_direct_rootfs_and_fetches_mmds_over_modern_virtio_pci_network() {
+fn boots_signed_mmio_guest_with_complete_virtio_network_semantics() {
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let boot_args = format!("{DIRECT_ROOTFS_BOOT_ARGS} bangbang.virtio-net-semantics=1");
+    let evidence = std::sync::Arc::new(SignedGuestNetworkSemanticEvidence::default());
+    let provider_evidence = std::sync::Arc::clone(&evidence);
+    let observation = run_guest_boot_with_boot_source_gic_msi_pci_validation_and_packet_io(
+        "guest-mmio-network-semantics",
+        DIRECT_ROOTFS_BOOT_MARKER,
+        None,
+        &boot_args,
+        None,
+        GuestBootPciIoSetup::new(None, move |controller: &bangbang_runtime::VmmController| {
+            Some(signed_guest_network_packet_io(
+                controller,
+                provider_evidence,
+            ))
+        }),
+        |controller| configure_signed_guest_network_semantics(controller, rootfs_path.as_path()),
+    );
+
+    let negotiated_features = observation
+        .mmio_network_driver_features
+        .expect("MMIO network proof should retain negotiated features");
+    assert_signed_guest_network_semantics(&observation, &evidence, negotiated_features, "MMIO");
+    assert_eq!(observation.data_mmio_device_counts, (1, 0, 1));
+    assert!(observation.pci_data_devices.is_none());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_signed_pci_guest_with_complete_virtio_network_semantics() {
     use std::num::NonZeroU32;
 
     use bangbang_hvf::{HvfArm64BootPciDataDeviceKind, HvfGicMsiConfiguration};
-    use bangbang_runtime::VmmAction;
-    use bangbang_runtime::block::DriveConfigInput;
-    use bangbang_runtime::metrics::SharedMmdsMetrics;
-    use bangbang_runtime::mmds::{DEFAULT_MMDS_IPV4_ADDRESS, MmdsConfigInput, MmdsContentInput};
-    use bangbang_runtime::mmds_network::{
-        MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoProvider,
-        MmdsOnlyVirtioNetworkPacketIoProviderEntry, MmdsPacketDetour, MmdsResponseQueue,
-    };
-    use bangbang_runtime::network::NetworkInterfaceConfigInput;
     use bangbang_runtime::startup::Arm64BootPciValidationConfig;
 
     let _test_lock = GUEST_BOOT_TEST_LOCK
         .lock()
         .expect("guest boot integration test lock should not be poisoned");
     let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
-    let boot_args =
-        format!("{DIRECT_ROOTFS_BOOT_ARGS} bangbang.mmds-fetch=1 bangbang.expect-pci-data=1");
+    let boot_args = format!(
+        "{DIRECT_ROOTFS_BOOT_ARGS} bangbang.virtio-net-semantics=1 bangbang.expect-pci-data=1"
+    );
+    let evidence = std::sync::Arc::new(SignedGuestNetworkSemanticEvidence::default());
+    let provider_evidence = std::sync::Arc::clone(&evidence);
     let observation = run_guest_boot_with_boot_source_gic_msi_pci_validation_and_packet_io(
-        "guest-pci-network-mmds",
+        "guest-pci-network-semantics",
         DIRECT_ROOTFS_BOOT_MARKER,
         None,
         &boot_args,
@@ -1360,62 +1744,16 @@ fn boots_direct_rootfs_and_fetches_mmds_over_modern_virtio_pci_network() {
         ))),
         GuestBootPciIoSetup::new(
             Some(Arm64BootPciValidationConfig::data_devices()),
-            |controller: &bangbang_runtime::VmmController| {
-                let detour = MmdsPacketDetour::new(
-                    controller.mmds_state_handle(),
-                    DEFAULT_MMDS_IPV4_ADDRESS,
-                    MmdsResponseQueue::default(),
-                    SharedMmdsMetrics::default(),
-                );
-                let packet_io = MmdsOnlyVirtioNetworkPacketIo::new(detour)
-                    .expect("MMDS-only PCI packet I/O should build");
-                Some(
-                    MmdsOnlyVirtioNetworkPacketIoProvider::new(vec![
-                        MmdsOnlyVirtioNetworkPacketIoProviderEntry::new("eth0", packet_io),
-                    ])
-                    .expect("MMDS-only PCI packet provider should build"),
-                )
+            move |controller: &bangbang_runtime::VmmController| {
+                Some(signed_guest_network_packet_io(
+                    controller,
+                    provider_evidence,
+                ))
             },
         ),
-        |controller| {
-            controller
-                .handle_action(VmmAction::PutDrive(
-                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
-                        .with_is_read_only(true),
-                ))
-                .expect("PCI rootfs drive should configure");
-            controller
-                .handle_action(VmmAction::PutNetworkInterface(
-                    NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
-                ))
-                .expect("PCI MMDS network interface should configure");
-            controller
-                .handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
-                    "eth0".to_string(),
-                ])))
-                .expect("PCI MMDS interface selection should configure");
-            controller
-                .handle_action(VmmAction::PutMmds(MmdsContentInput::new(
-                    serde_json::json!({
-                        "meta-data": {
-                            "bangbang-marker": "BANGBANG_MMDS_GUEST_VALUE"
-                        }
-                    }),
-                )))
-                .expect("PCI MMDS data should configure");
-        },
+        |controller| configure_signed_guest_network_semantics(controller, rootfs_path.as_path()),
     );
 
-    assert_guest_boot_observed_marker(
-        &observation,
-        DIRECT_ROOTFS_BOOT_MARKER,
-        "PCI network direct-rootfs boot marker",
-    );
-    assert!(
-        bytes_contain_marker(&observation.serial_bytes, MMDS_FETCH_MARKER),
-        "PCI network guest did not fetch MMDS data\nserial output:\n{}",
-        String::from_utf8_lossy(&observation.serial_bytes)
-    );
     assert!(
         bytes_contain_marker(&observation.serial_bytes, PCI_NETWORK_IDENTITIES_MARKER),
         "pinned Linux did not expose modern PCI block and network identities in sysfs\nserial output:\n{}",
@@ -1438,6 +1776,8 @@ fn boots_direct_rootfs_and_fetches_mmds_over_modern_virtio_pci_network() {
         "eth0",
         2,
     );
+    let negotiated_features = diagnostics[1].transport.driver_features;
+    assert_signed_guest_network_semantics(&observation, &evidence, negotiated_features, "PCI");
     assert_eq!(observation.data_mmio_device_counts, (0, 0, 0));
     assert!(observation.pci_data_device_teardown);
 }
@@ -1794,6 +2134,11 @@ where
         } else {
             None
         };
+    let mmio_network_driver_features = first_mmio_network_driver_features(&session);
+    let network_interface_metrics = session
+        .shared_network_interface_metrics()
+        .per_interface("eth0")
+        .map(|metrics| metrics.snapshot());
     let pci_validation = session
         .pci_validation_diagnostics()
         .map(|diagnostics| diagnostics.expect("PCI validation diagnostics should be available"));
@@ -1823,7 +2168,29 @@ where
         pci_data_device_teardown,
         data_mmio_device_counts,
         pvtime_captures,
+        mmio_network_driver_features,
+        network_interface_metrics,
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn first_mmio_network_driver_features(
+    session: &bangbang_hvf::OwnedHvfArm64BootSession,
+) -> Option<u64> {
+    let region_id = session
+        .runtime_resources()
+        .network_devices
+        .first()?
+        .registration
+        .region_id();
+    let dispatcher = session.mmio_dispatcher();
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("signed network proof should lock the MMIO dispatcher");
+    Some(
+        bangbang_runtime::network::network_mmio_driver_features(&mut dispatcher, region_id)
+            .expect("signed network proof should find its MMIO network handler"),
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1906,6 +2273,8 @@ struct GuestBootObservation {
         bangbang_hvf::HvfArm64PvTimeCaptureState,
         bangbang_hvf::HvfArm64PvTimeCaptureState,
     )>,
+    mmio_network_driver_features: Option<u64>,
+    network_interface_metrics: Option<bangbang_runtime::metrics::NetworkInterfaceMetrics>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

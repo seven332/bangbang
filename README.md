@@ -980,16 +980,25 @@ the guest device. A vmnet-allocated MAC becomes guest-visible without rewriting
 the requested `GET /vm/config` projection, and explicit plus allocated MACs are
 reserved globally across startup and runtime insertion. Start and stop waits
 have finite deadlines; cleanup that cannot confirm stop makes the process
-terminal instead of allowing reuse. Packet I/O remains raw Ethernet. Direct
-vmnet registers packet-available callbacks into generation-scoped readiness
+terminal instead of allowing reuse. An immutable backend profile selects raw
+Ethernet on older systems or Apple's direct 12-byte virtio-header envelope when
+the SDK symbol is available; the envelope itself enables no guest offload bit.
+The portable runtime implements checksum completion, TCPv4/v6 segmentation,
+UDP fragmentation, guest receive-offload compatibility, and merged RX before
+either host envelope is used. Direct RX accepts only canonical zero-offload
+headers. Direct vmnet registers packet-available callbacks into generation-scoped readiness
 leases; the callbacks only coalesce an optional bounded packet-count hint and
 signal a capacity-one owner-loop bridge. The owner loop performs at most one
 realized host batch per pass, bounded by Apple's returned limits, 200 packets,
 256 KiB, packet size, and virtqueue capacity. RX retains packets until guest
-used-ring publication succeeds, while TX preserves descriptor and MMDS effect
-order and maps successful short writes to an exact forwarded prefix without
-retrying the suffix. Callback generations are retired, disabled, and drained
-before vmnet stop and reuse. Direct virtio headers and offloads remain disabled.
+used-ring publication succeeds, including transactional multi-chain merged
+delivery, while TX preserves descriptor and MMDS effect order and returns one
+ordered guest result for all packets normalized from a frame. Partial host
+batches fail the affected frame without retrying its completed prefix. Source
+MAC mismatches are measured without filtering; queue/limiter/backend call,
+packet, partial-batch, and latency producers feed bounded per-interface and
+aggregate metrics. Callback generations are retired, disabled, and drained
+before vmnet stop and reuse.
 
 Current signed Network/MMDS scenarios select every configured interface in MMDS
 config, so startup uses process-local MMDS-only packet I/O without opening
@@ -1075,7 +1084,9 @@ failures; a top-level aggregate `pmem` object and non-empty per-device
 `pmem_{id}` objects for implemented virtio-pmem queue activity and failures;
 top-level aggregate `net` and non-empty per-interface
 `net_{iface_id}` objects for implemented virtio-net RX/TX queue activity,
-packet counts, byte counts, and failures; a top-level `mmds` object for
+packet/byte counts, activation/config and queue failures, no-buffer and
+remaining-request facts, limiter events/throttles, source-MAC observations,
+vmnet read/write calls and partial batches, and bounded latency aggregates; a top-level `mmds` object for
 implemented guest MMDS packet detour and response queue activity; a top-level
 `vsock` object for implemented virtio-vsock RX/TX queue activity, packet
 counts, byte counts, connection cleanup counters, and classifiable queue/event

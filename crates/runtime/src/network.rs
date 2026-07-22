@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
 };
+use crate::metrics::SharedNetworkInterfaceMetrics;
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
-    MmioHandlerError, MmioRegion, MmioRegionId,
+    MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
 };
+pub use crate::network_packet::VirtioNetworkPacketEnvelope;
+use crate::network_packet::{VirtioNetworkPacketPlan, VirtioNetworkPacketPlanError};
 use crate::token_bucket::{TokenBucket, TokenBucketConfig, TokenBucketSnapshot};
 use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
@@ -40,15 +43,34 @@ pub const VIRTIO_NET_CONFIG_MTU_OFFSET: u64 = 10;
 pub const VIRTIO_NET_CONFIG_MTU_SIZE: usize = 2;
 pub const VIRTIO_NET_MIN_MTU: u16 = 68;
 pub const VIRTIO_NET_MAX_MTU: u16 = u16::MAX;
+pub const VIRTIO_NET_F_CSUM: u32 = 0;
+pub const VIRTIO_NET_F_GUEST_CSUM: u32 = 1;
 pub const VIRTIO_NET_F_MTU: u32 = 3;
 pub const VIRTIO_NET_F_MAC: u32 = 5;
+pub const VIRTIO_NET_F_GUEST_TSO4: u32 = 7;
+pub const VIRTIO_NET_F_GUEST_TSO6: u32 = 8;
+pub const VIRTIO_NET_F_GUEST_UFO: u32 = 10;
+pub const VIRTIO_NET_F_HOST_TSO4: u32 = 11;
+pub const VIRTIO_NET_F_HOST_TSO6: u32 = 12;
+pub const VIRTIO_NET_F_HOST_UFO: u32 = 14;
+pub const VIRTIO_NET_F_MRG_RXBUF: u32 = 15;
 pub const VIRTIO_RING_FEATURE_INDIRECT_DESC: u32 = 28;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_NET_TX_HEADER_SIZE: u32 = 12;
 pub const VIRTIO_NET_MAX_BUFFER_SIZE: u64 = 65_562;
 pub const VIRTIO_NET_RX_MIN_BUFFER_SIZE: u64 = 1_526;
+pub const VIRTIO_NET_RX_LARGE_BUFFER_SIZE: u64 = VIRTIO_NET_MAX_BUFFER_SIZE;
 pub const MAX_NETWORK_INTERFACE_COUNT: usize = 16;
+
+pub const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+pub const VIRTIO_NET_HDR_F_DATA_VALID: u8 = 2;
+pub const VIRTIO_NET_HDR_F_RSC_INFO: u8 = 4;
+pub const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+pub const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+pub const VIRTIO_NET_HDR_GSO_UDP: u8 = 3;
+pub const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+pub const VIRTIO_NET_HDR_GSO_ECN: u8 = 0x80;
 
 const VIRTIO_NET_RX_QUEUE_INDEX_U32: u32 = 0;
 const VIRTIO_NET_TX_QUEUE_INDEX_U32: u32 = 1;
@@ -57,6 +79,216 @@ pub type VirtioNetworkMmioHandler =
     VirtioMmioRegisterHandler<VirtioNetworkConfigSpace, VirtioNetworkDevice>;
 pub type VirtioNetworkPciEndpoint =
     VirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioNetworkFeatureCapabilities {
+    checksum: bool,
+    guest_checksum: bool,
+    guest_tso4: bool,
+    guest_tso6: bool,
+    guest_ufo: bool,
+    host_tso4: bool,
+    host_tso6: bool,
+    host_ufo: bool,
+    merged_rx_buffers: bool,
+}
+
+impl VirtioNetworkFeatureCapabilities {
+    pub const fn complete_software() -> Self {
+        Self {
+            checksum: true,
+            guest_checksum: true,
+            guest_tso4: true,
+            guest_tso6: true,
+            guest_ufo: true,
+            host_tso4: true,
+            host_tso6: true,
+            host_ufo: true,
+            merged_rx_buffers: true,
+        }
+    }
+
+    pub const fn none() -> Self {
+        Self {
+            checksum: false,
+            guest_checksum: false,
+            guest_tso4: false,
+            guest_tso6: false,
+            guest_ufo: false,
+            host_tso4: false,
+            host_tso6: false,
+            host_ufo: false,
+            merged_rx_buffers: false,
+        }
+    }
+
+    pub const fn checksum(self) -> bool {
+        self.checksum
+    }
+
+    pub const fn guest_checksum(self) -> bool {
+        self.guest_checksum
+    }
+
+    pub const fn guest_tso4(self) -> bool {
+        self.guest_tso4
+    }
+
+    pub const fn guest_tso6(self) -> bool {
+        self.guest_tso6
+    }
+
+    pub const fn guest_ufo(self) -> bool {
+        self.guest_ufo
+    }
+
+    pub const fn host_tso4(self) -> bool {
+        self.host_tso4
+    }
+
+    pub const fn host_tso6(self) -> bool {
+        self.host_tso6
+    }
+
+    pub const fn host_ufo(self) -> bool {
+        self.host_ufo
+    }
+
+    pub const fn merged_rx_buffers(self) -> bool {
+        self.merged_rx_buffers
+    }
+
+    pub const fn with_checksum(mut self, supported: bool) -> Self {
+        self.checksum = supported;
+        self
+    }
+
+    pub const fn with_guest_checksum(mut self, supported: bool) -> Self {
+        self.guest_checksum = supported;
+        self
+    }
+
+    pub const fn with_guest_tso4(mut self, supported: bool) -> Self {
+        self.guest_tso4 = supported;
+        self
+    }
+
+    pub const fn with_guest_tso6(mut self, supported: bool) -> Self {
+        self.guest_tso6 = supported;
+        self
+    }
+
+    pub const fn with_guest_ufo(mut self, supported: bool) -> Self {
+        self.guest_ufo = supported;
+        self
+    }
+
+    pub const fn with_host_tso4(mut self, supported: bool) -> Self {
+        self.host_tso4 = supported;
+        self
+    }
+
+    pub const fn with_host_tso6(mut self, supported: bool) -> Self {
+        self.host_tso6 = supported;
+        self
+    }
+
+    pub const fn with_host_ufo(mut self, supported: bool) -> Self {
+        self.host_ufo = supported;
+        self
+    }
+
+    pub const fn with_merged_rx_buffers(mut self, supported: bool) -> Self {
+        self.merged_rx_buffers = supported;
+        self
+    }
+
+    pub const fn feature_bits(self) -> u64 {
+        let mut features = 0;
+        if self.checksum {
+            features |= virtio_feature_bit(VIRTIO_NET_F_CSUM);
+        }
+        if self.guest_checksum {
+            features |= virtio_feature_bit(VIRTIO_NET_F_GUEST_CSUM);
+        }
+        if self.guest_tso4 && self.guest_checksum {
+            features |= virtio_feature_bit(VIRTIO_NET_F_GUEST_TSO4);
+        }
+        if self.guest_tso6 && self.guest_checksum {
+            features |= virtio_feature_bit(VIRTIO_NET_F_GUEST_TSO6);
+        }
+        if self.guest_ufo && self.guest_checksum {
+            features |= virtio_feature_bit(VIRTIO_NET_F_GUEST_UFO);
+        }
+        if self.host_tso4 && self.checksum {
+            features |= virtio_feature_bit(VIRTIO_NET_F_HOST_TSO4);
+        }
+        if self.host_tso6 && self.checksum {
+            features |= virtio_feature_bit(VIRTIO_NET_F_HOST_TSO6);
+        }
+        if self.host_ufo && self.checksum {
+            features |= virtio_feature_bit(VIRTIO_NET_F_HOST_UFO);
+        }
+        if self.merged_rx_buffers {
+            features |= virtio_feature_bit(VIRTIO_NET_F_MRG_RXBUF);
+        }
+        features
+    }
+
+    pub const fn is_dependency_complete(self) -> bool {
+        (!self.guest_tso4 && !self.guest_tso6 && !self.guest_ufo || self.guest_checksum)
+            && (!self.host_tso4 && !self.host_tso6 && !self.host_ufo || self.checksum)
+    }
+
+    pub const fn supports(self, feature: u32) -> bool {
+        self.feature_bits() & virtio_feature_bit(feature) != 0
+    }
+}
+
+impl Default for VirtioNetworkFeatureCapabilities {
+    fn default() -> Self {
+        Self::complete_software()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VirtioNetworkTransportMetrics {
+    interface: SharedNetworkInterfaceMetrics,
+    aggregate: Option<SharedNetworkInterfaceMetrics>,
+}
+
+impl VirtioNetworkTransportMetrics {
+    fn for_interface(interface: SharedNetworkInterfaceMetrics) -> Self {
+        Self {
+            interface,
+            aggregate: None,
+        }
+    }
+
+    fn with_aggregate(
+        interface: SharedNetworkInterfaceMetrics,
+        aggregate: SharedNetworkInterfaceMetrics,
+    ) -> Self {
+        Self {
+            interface,
+            aggregate: Some(aggregate),
+        }
+    }
+
+    fn record_activation_failure(&self) {
+        self.interface.record_activation_failure();
+        if let Some(aggregate) = &self.aggregate {
+            aggregate.record_activation_failure();
+        }
+    }
+
+    fn record_config_failure(&self) {
+        self.interface.record_config_failure();
+        if let Some(aggregate) = &self.aggregate {
+            aggregate.record_config_failure();
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetworkRateLimiterConfig {
@@ -664,29 +896,59 @@ impl NetworkInterfaceConfigs {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct VirtioNetworkConfigSpace {
     guest_mac: Option<GuestMacAddress>,
     mtu: Option<u16>,
+    network_features: u64,
+    metrics: Option<VirtioNetworkTransportMetrics>,
 }
+
+impl PartialEq for VirtioNetworkConfigSpace {
+    fn eq(&self, other: &Self) -> bool {
+        self.guest_mac == other.guest_mac
+            && self.mtu == other.mtu
+            && self.network_features == other.network_features
+    }
+}
+
+impl Eq for VirtioNetworkConfigSpace {}
 
 impl VirtioNetworkConfigSpace {
     pub const fn new(guest_mac: Option<GuestMacAddress>, mtu: Option<u16>) -> Self {
-        Self { guest_mac, mtu }
+        Self::with_feature_capabilities(
+            guest_mac,
+            mtu,
+            VirtioNetworkFeatureCapabilities::complete_software(),
+        )
     }
 
-    pub const fn guest_mac(self) -> Option<GuestMacAddress> {
+    pub const fn with_feature_capabilities(
+        guest_mac: Option<GuestMacAddress>,
+        mtu: Option<u16>,
+        capabilities: VirtioNetworkFeatureCapabilities,
+    ) -> Self {
+        Self {
+            guest_mac,
+            mtu,
+            network_features: capabilities.feature_bits(),
+            metrics: None,
+        }
+    }
+
+    pub const fn guest_mac(&self) -> Option<GuestMacAddress> {
         self.guest_mac
     }
 
-    pub const fn mtu(self) -> Option<u16> {
+    pub const fn mtu(&self) -> Option<u16> {
         self.mtu
     }
 
-    pub const fn available_features(self) -> u64 {
+    pub const fn available_features(&self) -> u64 {
         let mut features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
-            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
+            | self.network_features;
         if self.guest_mac.is_some() {
             features |= virtio_feature_bit(VIRTIO_NET_F_MAC);
         }
@@ -697,11 +959,25 @@ impl VirtioNetworkConfigSpace {
         features
     }
 
-    const fn mac_bytes(self) -> Option<[u8; VIRTIO_NET_CONFIG_MAC_SIZE]> {
+    const fn mac_bytes(&self) -> Option<[u8; VIRTIO_NET_CONFIG_MAC_SIZE]> {
         match self.guest_mac {
             Some(guest_mac) => Some(guest_mac.octets()),
             None => None,
         }
+    }
+
+    pub fn attach_metrics(&mut self, metrics: SharedNetworkInterfaceMetrics) {
+        self.metrics = Some(VirtioNetworkTransportMetrics::for_interface(metrics));
+    }
+
+    fn attach_metrics_with_aggregate(
+        &mut self,
+        interface: SharedNetworkInterfaceMetrics,
+        aggregate: SharedNetworkInterfaceMetrics,
+    ) {
+        self.metrics = Some(VirtioNetworkTransportMetrics::with_aggregate(
+            interface, aggregate,
+        ));
     }
 }
 
@@ -710,7 +986,13 @@ impl VirtioMmioDeviceConfigHandler for VirtioNetworkConfigSpace {
         &self,
         access: VirtioMmioDeviceConfigAccess,
     ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
-        read_virtio_network_config_bytes(self.mac_bytes(), self.mtu, access)
+        let result = read_virtio_network_config_bytes(self.mac_bytes(), self.mtu, access);
+        if result.is_err()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_config_failure();
+        }
+        result
     }
 
     fn write_device_config(
@@ -718,14 +1000,18 @@ impl VirtioMmioDeviceConfigHandler for VirtioNetworkConfigSpace {
         access: VirtioMmioDeviceConfigAccess,
         _data: MmioAccessBytes,
     ) -> Result<(), VirtioMmioDeviceConfigError> {
-        Err(VirtioMmioDeviceConfigError::UnsupportedWrite {
+        let error = VirtioMmioDeviceConfigError::UnsupportedWrite {
             offset: access.offset(),
             len: access.len(),
-        })
+        };
+        if let Some(metrics) = &self.metrics {
+            metrics.record_config_failure();
+        }
+        Err(error)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VirtioNetworkTxHeader {
     flags: u8,
     gso_type: u8,
@@ -737,6 +1023,53 @@ pub struct VirtioNetworkTxHeader {
 }
 
 impl VirtioNetworkTxHeader {
+    pub const fn new() -> Self {
+        Self {
+            flags: 0,
+            gso_type: VIRTIO_NET_HDR_GSO_NONE,
+            header_len: 0,
+            gso_size: 0,
+            checksum_start: 0,
+            checksum_offset: 0,
+            num_buffers: 0,
+        }
+    }
+
+    pub const fn with_flags(mut self, flags: u8) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    pub const fn with_gso_type(mut self, gso_type: u8) -> Self {
+        self.gso_type = gso_type;
+        self
+    }
+
+    pub const fn with_header_len(mut self, header_len: u16) -> Self {
+        self.header_len = header_len;
+        self
+    }
+
+    pub const fn with_gso_size(mut self, gso_size: u16) -> Self {
+        self.gso_size = gso_size;
+        self
+    }
+
+    pub const fn with_checksum_start(mut self, checksum_start: u16) -> Self {
+        self.checksum_start = checksum_start;
+        self
+    }
+
+    pub const fn with_checksum_offset(mut self, checksum_offset: u16) -> Self {
+        self.checksum_offset = checksum_offset;
+        self
+    }
+
+    pub const fn with_num_buffers(mut self, num_buffers: u16) -> Self {
+        self.num_buffers = num_buffers;
+        self
+    }
+
     pub const fn flags(self) -> u8 {
         self.flags
     }
@@ -805,12 +1138,21 @@ pub struct VirtioNetworkTxFrame {
     header: VirtioNetworkTxHeader,
     payload_segments: Vec<VirtioNetworkTxPayloadSegment>,
     payload_len: u64,
+    negotiated_features: u64,
 }
 
 impl VirtioNetworkTxFrame {
     pub fn parse(
         memory: &GuestMemory,
         chain: &VirtqueueDescriptorChain,
+    ) -> Result<Self, VirtioNetworkTxFrameParseError> {
+        Self::parse_with_features(memory, chain, 0)
+    }
+
+    pub fn parse_with_features(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+        negotiated_features: u64,
     ) -> Result<Self, VirtioNetworkTxFrameParseError> {
         let descriptor_head = chain.head_index();
         let header_descriptor = network_descriptor_at(chain, 0, 1)?;
@@ -853,6 +1195,7 @@ impl VirtioNetworkTxFrame {
             header,
             payload_segments,
             payload_len,
+            negotiated_features,
         })
     }
 
@@ -872,8 +1215,123 @@ impl VirtioNetworkTxFrame {
         self.payload_len
     }
 
+    pub const fn negotiated_features(&self) -> u64 {
+        self.negotiated_features
+    }
+
     pub fn frame_len(&self) -> u64 {
         u64::from(VIRTIO_NET_TX_HEADER_SIZE) + self.payload_len
+    }
+
+    pub fn prepare_packet(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<VirtioNetworkPacketPlan, VirtioNetworkTxPacketPrepareError> {
+        let packet_len = usize::try_from(self.payload_len).map_err(|_| {
+            VirtioNetworkTxPacketPrepareError::PayloadLengthTooLarge {
+                len: self.payload_len,
+            }
+        })?;
+        let mut packet = Vec::new();
+        packet.try_reserve_exact(packet_len).map_err(|source| {
+            VirtioNetworkTxPacketPrepareError::PacketAllocation {
+                len: packet_len,
+                source,
+            }
+        })?;
+        for segment in &self.payload_segments {
+            let segment_len = usize::try_from(segment.len()).map_err(|_| {
+                VirtioNetworkTxPacketPrepareError::SegmentLengthTooLarge {
+                    descriptor_index: segment.descriptor_index(),
+                    len: segment.len(),
+                }
+            })?;
+            let start = packet.len();
+            let end = start.checked_add(segment_len).ok_or(
+                VirtioNetworkTxPacketPrepareError::PayloadLengthTooLarge {
+                    len: self.payload_len,
+                },
+            )?;
+            packet.resize(end, 0);
+            let destination = packet.get_mut(start..end).ok_or(
+                VirtioNetworkTxPacketPrepareError::PayloadLengthTooLarge {
+                    len: self.payload_len,
+                },
+            )?;
+            memory
+                .read_slice(destination, segment.address())
+                .map_err(|source| VirtioNetworkTxPacketPrepareError::SegmentRead {
+                    descriptor_index: segment.descriptor_index(),
+                    source,
+                })?;
+        }
+        VirtioNetworkPacketPlan::prepare(self.header, self.negotiated_features, packet)
+            .map_err(VirtioNetworkTxPacketPrepareError::Semantic)
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioNetworkTxPacketPrepareError {
+    PayloadLengthTooLarge {
+        len: u64,
+    },
+    PacketAllocation {
+        len: usize,
+        source: TryReserveError,
+    },
+    SegmentLengthTooLarge {
+        descriptor_index: u16,
+        len: u32,
+    },
+    SegmentRead {
+        descriptor_index: u16,
+        source: GuestMemoryAccessError,
+    },
+    Semantic(VirtioNetworkPacketPlanError),
+}
+
+impl fmt::Display for VirtioNetworkTxPacketPrepareError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadLengthTooLarge { len } => {
+                write!(
+                    formatter,
+                    "virtio-net TX payload length {len} does not fit host usize"
+                )
+            }
+            Self::PacketAllocation { len, source } => write!(
+                formatter,
+                "failed to reserve virtio-net TX packet buffer of {len} bytes: {source}"
+            ),
+            Self::SegmentLengthTooLarge {
+                descriptor_index,
+                len,
+            } => write!(
+                formatter,
+                "virtio-net TX payload descriptor {descriptor_index} length {len} does not fit host usize"
+            ),
+            Self::SegmentRead {
+                descriptor_index,
+                source,
+            } => write!(
+                formatter,
+                "failed to read virtio-net TX payload descriptor {descriptor_index}: {source}"
+            ),
+            Self::Semantic(source) => {
+                write!(formatter, "invalid virtio-net TX semantics: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioNetworkTxPacketPrepareError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PacketAllocation { source, .. } => Some(source),
+            Self::SegmentRead { source, .. } => Some(source),
+            Self::Semantic(source) => Some(source),
+            Self::PayloadLengthTooLarge { .. } | Self::SegmentLengthTooLarge { .. } => None,
+        }
     }
 }
 
@@ -883,6 +1341,20 @@ pub trait VirtioNetworkTxPacketSink {
         memory: &GuestMemory,
         frame: &VirtioNetworkTxFrame,
     ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>;
+
+    /// Transmits a frame whose guest bytes and packet semantics were captured
+    /// before used-ring publication. Sinks that inspect packet bytes must
+    /// override this method and use `packet` instead of rereading guest memory.
+    fn transmit_prepared_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+        _packet: &VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        Err(VirtioNetworkTxPacketSinkError::new(
+            "virtio-net sink does not consume prevalidated packet plans",
+        ))
+    }
 
     /// Returns whether this sink implements the two-phase bounded batch seam.
     fn supports_staged_batch(&self) -> bool {
@@ -898,6 +1370,19 @@ pub trait VirtioNetworkTxPacketSink {
     ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
         Err(VirtioNetworkTxPacketSinkError::new(
             "virtio-net sink does not support staged batches",
+        ))
+    }
+
+    /// Stages a prevalidated, owned packet plan. Production sinks that inspect
+    /// packet bytes must override this method so guest memory is not reread.
+    fn stage_prepared_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+        _packet: &VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+        Err(VirtioNetworkTxPacketSinkError::new(
+            "virtio-net sink does not stage prevalidated packet plans",
         ))
     }
 
@@ -919,6 +1404,233 @@ pub trait VirtioNetworkTxPacketSink {
             Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>,
         >,
     ) {
+    }
+
+    fn take_backend_metrics(&mut self) -> VirtioNetworkBackendMetrics {
+        VirtioNetworkBackendMetrics::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtioNetworkLatencyAggregate {
+    min_us: u64,
+    max_us: u64,
+    sum_us: u64,
+    samples: u64,
+}
+
+impl VirtioNetworkLatencyAggregate {
+    pub const fn new(min_us: u64, max_us: u64, sum_us: u64, samples: u64) -> Self {
+        if samples == 0 {
+            return Self {
+                min_us: 0,
+                max_us: 0,
+                sum_us: 0,
+                samples: 0,
+            };
+        }
+        Self {
+            min_us,
+            max_us,
+            sum_us,
+            samples,
+        }
+    }
+
+    pub const fn min_us(self) -> u64 {
+        self.min_us
+    }
+
+    pub const fn max_us(self) -> u64 {
+        self.max_us
+    }
+
+    pub const fn sum_us(self) -> u64 {
+        self.sum_us
+    }
+
+    pub const fn samples(self) -> u64 {
+        self.samples
+    }
+
+    pub const fn from_sample(duration: Duration) -> Self {
+        let micros = duration.as_micros();
+        let value = if micros > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            micros as u64
+        };
+        Self::new(value, value, value, 1)
+    }
+
+    pub const fn merged_with(self, other: Self) -> Self {
+        if self.samples == 0 {
+            return other;
+        }
+        if other.samples == 0 {
+            return self;
+        }
+        Self {
+            min_us: if self.min_us < other.min_us {
+                self.min_us
+            } else {
+                other.min_us
+            },
+            max_us: if self.max_us > other.max_us {
+                self.max_us
+            } else {
+                other.max_us
+            },
+            sum_us: self.sum_us.saturating_add(other.sum_us),
+            samples: self.samples.saturating_add(other.samples),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtioNetworkBackendMetrics {
+    vmnet_read_count: u64,
+    vmnet_read_fails: u64,
+    vmnet_read_packets_count: u64,
+    vmnet_read_partial_batches: u64,
+    vmnet_write_count: u64,
+    vmnet_write_fails: u64,
+    vmnet_write_packets_count: u64,
+    vmnet_write_partial_batches: u64,
+    tx_spoofed_mac_count: u64,
+    vmnet_read_latency: VirtioNetworkLatencyAggregate,
+    vmnet_write_latency: VirtioNetworkLatencyAggregate,
+}
+
+impl VirtioNetworkBackendMetrics {
+    pub const fn vmnet_read_count(self) -> u64 {
+        self.vmnet_read_count
+    }
+
+    pub const fn vmnet_read_fails(self) -> u64 {
+        self.vmnet_read_fails
+    }
+
+    pub const fn vmnet_read_packets_count(self) -> u64 {
+        self.vmnet_read_packets_count
+    }
+
+    pub const fn vmnet_read_partial_batches(self) -> u64 {
+        self.vmnet_read_partial_batches
+    }
+
+    pub const fn vmnet_write_count(self) -> u64 {
+        self.vmnet_write_count
+    }
+
+    pub const fn vmnet_write_fails(self) -> u64 {
+        self.vmnet_write_fails
+    }
+
+    pub const fn vmnet_write_packets_count(self) -> u64 {
+        self.vmnet_write_packets_count
+    }
+
+    pub const fn vmnet_write_partial_batches(self) -> u64 {
+        self.vmnet_write_partial_batches
+    }
+
+    pub const fn tx_spoofed_mac_count(self) -> u64 {
+        self.tx_spoofed_mac_count
+    }
+
+    pub const fn vmnet_read_latency(self) -> VirtioNetworkLatencyAggregate {
+        self.vmnet_read_latency
+    }
+
+    pub const fn vmnet_write_latency(self) -> VirtioNetworkLatencyAggregate {
+        self.vmnet_write_latency
+    }
+
+    pub fn record_vmnet_read(
+        &mut self,
+        requested: usize,
+        completed: Result<usize, ()>,
+        duration: Duration,
+    ) {
+        self.vmnet_read_count = self.vmnet_read_count.saturating_add(1);
+        self.vmnet_read_latency = self
+            .vmnet_read_latency
+            .merged_with(VirtioNetworkLatencyAggregate::from_sample(duration));
+        match completed {
+            Ok(completed) => {
+                self.vmnet_read_packets_count = self
+                    .vmnet_read_packets_count
+                    .saturating_add(usize_to_u64_saturating(completed));
+                if completed != 0 && completed < requested {
+                    self.vmnet_read_partial_batches =
+                        self.vmnet_read_partial_batches.saturating_add(1);
+                }
+            }
+            Err(()) => self.vmnet_read_fails = self.vmnet_read_fails.saturating_add(1),
+        }
+    }
+
+    pub fn record_vmnet_write(
+        &mut self,
+        requested: usize,
+        completed: Result<usize, ()>,
+        duration: Duration,
+    ) {
+        self.vmnet_write_count = self.vmnet_write_count.saturating_add(1);
+        self.vmnet_write_latency = self
+            .vmnet_write_latency
+            .merged_with(VirtioNetworkLatencyAggregate::from_sample(duration));
+        match completed {
+            Ok(completed) => {
+                self.vmnet_write_packets_count = self
+                    .vmnet_write_packets_count
+                    .saturating_add(usize_to_u64_saturating(completed));
+                if completed < requested {
+                    self.vmnet_write_partial_batches =
+                        self.vmnet_write_partial_batches.saturating_add(1);
+                }
+            }
+            Err(()) => self.vmnet_write_fails = self.vmnet_write_fails.saturating_add(1),
+        }
+    }
+
+    pub fn record_spoofed_mac(&mut self) {
+        self.tx_spoofed_mac_count = self.tx_spoofed_mac_count.saturating_add(1);
+    }
+
+    pub const fn merged_with(self, other: Self) -> Self {
+        Self {
+            vmnet_read_count: self.vmnet_read_count.saturating_add(other.vmnet_read_count),
+            vmnet_read_fails: self.vmnet_read_fails.saturating_add(other.vmnet_read_fails),
+            vmnet_read_packets_count: self
+                .vmnet_read_packets_count
+                .saturating_add(other.vmnet_read_packets_count),
+            vmnet_read_partial_batches: self
+                .vmnet_read_partial_batches
+                .saturating_add(other.vmnet_read_partial_batches),
+            vmnet_write_count: self
+                .vmnet_write_count
+                .saturating_add(other.vmnet_write_count),
+            vmnet_write_fails: self
+                .vmnet_write_fails
+                .saturating_add(other.vmnet_write_fails),
+            vmnet_write_packets_count: self
+                .vmnet_write_packets_count
+                .saturating_add(other.vmnet_write_packets_count),
+            vmnet_write_partial_batches: self
+                .vmnet_write_partial_batches
+                .saturating_add(other.vmnet_write_partial_batches),
+            tx_spoofed_mac_count: self
+                .tx_spoofed_mac_count
+                .saturating_add(other.tx_spoofed_mac_count),
+            vmnet_read_latency: self
+                .vmnet_read_latency
+                .merged_with(other.vmnet_read_latency),
+            vmnet_write_latency: self
+                .vmnet_write_latency
+                .merged_with(other.vmnet_write_latency),
+        }
     }
 }
 
@@ -976,6 +1688,15 @@ impl VirtioNetworkTxPacketSink for NoopVirtioNetworkTxPacketSink {
         &mut self,
         _memory: &GuestMemory,
         _frame: &VirtioNetworkTxFrame,
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        Ok(VirtioNetworkTxPacketDisposition::Forwarded)
+    }
+
+    fn transmit_prepared_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+        _packet: &VirtioNetworkPacketPlan,
     ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
         Ok(VirtioNetworkTxPacketDisposition::Forwarded)
     }
@@ -1121,6 +1842,10 @@ pub trait VirtioNetworkRxPacketSource {
     ) -> Result<Option<VirtioNetworkRxPacket<'_>>, VirtioNetworkRxPacketSourceError>;
 
     fn consume_packet(&mut self);
+
+    fn take_backend_metrics(&mut self) -> VirtioNetworkBackendMetrics {
+        VirtioNetworkBackendMetrics::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1349,6 +2074,14 @@ impl VirtioNetworkRxBuffer {
         memory: &GuestMemory,
         chain: &VirtqueueDescriptorChain,
     ) -> Result<Self, VirtioNetworkRxBufferParseError> {
+        Self::parse_with_minimum(memory, chain, VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+    }
+
+    fn parse_with_minimum(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+        minimum_len: u64,
+    ) -> Result<Self, VirtioNetworkRxBufferParseError> {
         if chain.is_empty() {
             return Err(VirtioNetworkRxBufferParseError::DescriptorChainTooShort {
                 expected: 1,
@@ -1376,10 +2109,10 @@ impl VirtioNetworkRxBuffer {
             len = push_rx_buffer_segment(memory, &mut segments, len, segment)?;
         }
 
-        if len < VIRTIO_NET_RX_MIN_BUFFER_SIZE {
+        if len < minimum_len {
             return Err(VirtioNetworkRxBufferParseError::BufferTooSmall {
                 len,
-                min: VIRTIO_NET_RX_MIN_BUFFER_SIZE,
+                min: minimum_len,
             });
         }
 
@@ -1520,7 +2253,7 @@ impl std::error::Error for VirtioNetworkRxBufferParseError {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct VirtioNetworkDevice {
     active_rx_queue: Option<VirtioNetworkRxQueue>,
     active_tx_queue: Option<VirtioNetworkTxQueue>,
@@ -1528,7 +2261,21 @@ pub struct VirtioNetworkDevice {
     tx_rate_limiter: Option<VirtioNetworkRateLimiter>,
     pending_rate_limited_rx_queue: bool,
     pending_rate_limited_tx_queue: bool,
+    metrics: Option<VirtioNetworkTransportMetrics>,
 }
+
+impl PartialEq for VirtioNetworkDevice {
+    fn eq(&self, other: &Self) -> bool {
+        self.active_rx_queue == other.active_rx_queue
+            && self.active_tx_queue == other.active_tx_queue
+            && self.rx_rate_limiter == other.rx_rate_limiter
+            && self.tx_rate_limiter == other.tx_rate_limiter
+            && self.pending_rate_limited_rx_queue == other.pending_rate_limited_rx_queue
+            && self.pending_rate_limited_tx_queue == other.pending_rate_limited_tx_queue
+    }
+}
+
+impl Eq for VirtioNetworkDevice {}
 
 impl VirtioNetworkDevice {
     pub fn new() -> Self {
@@ -1556,7 +2303,22 @@ impl VirtioNetworkDevice {
                 .and_then(|rate_limiter| VirtioNetworkRateLimiter::new_at(rate_limiter, now)),
             pending_rate_limited_rx_queue: false,
             pending_rate_limited_tx_queue: false,
+            metrics: None,
         }
+    }
+
+    pub fn attach_metrics(&mut self, metrics: SharedNetworkInterfaceMetrics) {
+        self.metrics = Some(VirtioNetworkTransportMetrics::for_interface(metrics));
+    }
+
+    fn attach_metrics_with_aggregate(
+        &mut self,
+        interface: SharedNetworkInterfaceMetrics,
+        aggregate: SharedNetworkInterfaceMetrics,
+    ) {
+        self.metrics = Some(VirtioNetworkTransportMetrics::with_aggregate(
+            interface, aggregate,
+        ));
     }
 
     pub fn is_activated(&self) -> bool {
@@ -1645,6 +2407,7 @@ impl VirtioNetworkDevice {
                     queue,
                     event_idx_enabled,
                     indirect_descriptors_enabled,
+                    activation.driver_features(),
                 )
                 .map_err(|source| {
                     VirtioNetworkDeviceActivationError::RxQueueBuild {
@@ -1659,6 +2422,7 @@ impl VirtioNetworkDevice {
                     queue,
                     event_idx_enabled,
                     indirect_descriptors_enabled,
+                    activation.driver_features(),
                 )
                 .map_err(|source| {
                     VirtioNetworkDeviceActivationError::TxQueueBuild {
@@ -1747,6 +2511,9 @@ impl VirtioNetworkDevice {
                 drained_notifications,
             });
         }
+
+        let rx_rate_limiter_event = self.pending_rate_limited_rx_queue;
+        let tx_rate_limiter_event = self.pending_rate_limited_tx_queue;
 
         if let Some(queue_index) = drained_notifications.iter().copied().find(|queue_index| {
             *queue_index != VIRTIO_NET_RX_QUEUE_INDEX && *queue_index != VIRTIO_NET_TX_QUEUE_INDEX
@@ -1861,7 +2628,8 @@ impl VirtioNetworkDevice {
             rx_queue_dispatch,
             tx_queue_dispatch,
             post_tx_rx_queue_dispatch,
-        ))
+        )
+        .with_rate_limiter_events(rx_rate_limiter_event, tx_rate_limiter_event))
     }
 }
 
@@ -1871,19 +2639,21 @@ pub struct VirtioNetworkRxQueue {
     available: VirtqueueAvailableRing,
     used: VirtqueueUsedRing,
     event_idx_enabled: bool,
+    negotiated_features: u64,
 }
 
 impl VirtioNetworkRxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
     ) -> Result<Self, VirtioNetworkRxQueueBuildError> {
-        Self::from_mmio_queue_state_with_event_idx(queue, false, false)
+        Self::from_mmio_queue_state_with_event_idx(queue, false, false, 0)
     }
 
     fn from_mmio_queue_state_with_event_idx(
         queue: VirtioMmioQueueState,
         event_idx_enabled: bool,
         indirect_descriptors_enabled: bool,
+        negotiated_features: u64,
     ) -> Result<Self, VirtioNetworkRxQueueBuildError> {
         if !queue.ready() {
             return Err(VirtioNetworkRxQueueBuildError::QueueNotReady);
@@ -1907,6 +2677,7 @@ impl VirtioNetworkRxQueue {
             available,
             used,
             event_idx_enabled,
+            negotiated_features,
         })
     }
 
@@ -1924,6 +2695,10 @@ impl VirtioNetworkRxQueue {
 
     pub const fn event_idx_enabled(&self) -> bool {
         self.event_idx_enabled
+    }
+
+    pub const fn negotiated_features(&self) -> u64 {
+        self.negotiated_features
     }
 
     pub fn dispatch(
@@ -1960,173 +2735,132 @@ impl VirtioNetworkRxQueue {
         rate_limiter: Option<&mut VirtioNetworkRateLimiter>,
         now: Instant,
     ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
-        let mut dispatch =
-            VirtioNetworkRxQueueDispatch::with_capacity(self.available.queue_size())?;
-        let mut rate_limiter = rate_limiter;
-        rx_source.begin_rx_dispatch();
+        let mut result = (|| {
+            let mut dispatch =
+                VirtioNetworkRxQueueDispatch::with_capacity(self.available.queue_size())?;
+            let mut rate_limiter = rate_limiter;
+            rx_source.begin_rx_dispatch();
 
-        loop {
-            if require_ready_hint && !rx_source.retry_after_tx_hint() {
-                break;
-            }
-            let action = {
-                let packet = match rx_source.peek_packet() {
-                    Ok(Some(packet)) => packet,
-                    Ok(None) => break,
-                    Err(source) => {
-                        dispatch.record_source_failure(source.clone());
-                        return Err(VirtioNetworkRxQueueDispatchError::PacketSource {
-                            completed_dispatch: Box::new(dispatch),
-                            source,
-                        });
-                    }
-                };
-                let bytes_written_to_guest = match rx_packet_used_len(packet.len()) {
-                    Ok(bytes_written_to_guest) => bytes_written_to_guest,
-                    Err(error) => {
-                        return Err(VirtioNetworkRxQueueDispatchError::PacketTooLarge {
-                            completed_dispatch: Box::new(dispatch),
-                            len: error.len,
-                            max: error.max,
-                        });
-                    }
-                };
-                let packet_len = match u64::try_from(packet.len()) {
-                    Ok(packet_len) => packet_len,
-                    Err(_) => {
-                        return Err(VirtioNetworkRxQueueDispatchError::PacketTooLarge {
-                            completed_dispatch: Box::new(dispatch),
-                            len: u64::MAX,
-                            max: VIRTIO_NET_MAX_BUFFER_SIZE,
-                        });
-                    }
-                };
+            loop {
+                if require_ready_hint && !rx_source.retry_after_tx_hint() {
+                    break;
+                }
+                let action = {
+                    let packet = match rx_source.peek_packet() {
+                        Ok(Some(packet)) => packet,
+                        Ok(None) => break,
+                        Err(source) => {
+                            dispatch.record_source_failure(source.clone());
+                            dispatch.record_backend_metrics(rx_source.take_backend_metrics());
+                            return Err(VirtioNetworkRxQueueDispatchError::PacketSource {
+                                completed_dispatch: Box::new(dispatch),
+                                source,
+                            });
+                        }
+                    };
+                    let bytes_written_to_guest = match rx_packet_used_len(packet.len()) {
+                        Ok(bytes_written_to_guest) => bytes_written_to_guest,
+                        Err(error) => {
+                            return Err(VirtioNetworkRxQueueDispatchError::PacketTooLarge {
+                                completed_dispatch: Box::new(dispatch),
+                                len: error.len,
+                                max: error.max,
+                            });
+                        }
+                    };
+                    let packet_len = match u64::try_from(packet.len()) {
+                        Ok(packet_len) => packet_len,
+                        Err(_) => {
+                            return Err(VirtioNetworkRxQueueDispatchError::PacketTooLarge {
+                                completed_dispatch: Box::new(dispatch),
+                                len: u64::MAX,
+                                max: VIRTIO_NET_MAX_BUFFER_SIZE,
+                            });
+                        }
+                    };
 
-                let chain = match self.available.pop_descriptor_chain(memory) {
-                    Ok(Some(chain)) => chain,
-                    Ok(None) => break,
-                    Err(source) => {
-                        return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
-                            completed_dispatch: Box::new(dispatch),
-                            source,
-                        });
-                    }
-                };
-                let descriptor_head = match descriptor_chain_head(&chain) {
-                    Some(descriptor_head) => descriptor_head,
-                    None => {
-                        return Err(VirtioNetworkRxQueueDispatchError::EmptyDescriptorChain {
-                            completed_dispatch: Box::new(dispatch),
-                        });
-                    }
-                };
-
-                match VirtioNetworkRxBuffer::parse(memory, &chain) {
-                    Ok(buffer) => {
-                        if u64::from(bytes_written_to_guest) > buffer.len() {
-                            let notification_suppression = match self
-                                .notification_suppression(memory)
-                            {
-                                Ok(notification_suppression) => notification_suppression,
-                                Err(source) => {
-                                    return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
-                                        completed_dispatch: Box::new(dispatch),
-                                        source,
-                                    });
-                                }
-                            };
-                            let publication =
-                                match self.used.publish_used_element_with_notification(
-                                    memory,
-                                    descriptor_head,
-                                    0,
-                                    notification_suppression,
-                                ) {
-                                    Ok(publication) => publication,
-                                    Err(source) => {
-                                        return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
-                                            completed_dispatch: Box::new(dispatch),
-                                            descriptor_head,
-                                            bytes_written_to_guest: 0,
-                                            source,
-                                        });
-                                    }
-                                };
-                            VirtioNetworkRxQueueDispatchAction::Record(
-                                VirtioNetworkRxQueueDispatchOutcome::BufferTooSmall(
-                                    VirtioNetworkRxBufferTooSmall {
-                                        descriptor_head,
-                                        len: buffer.len(),
-                                        required_len: u64::from(bytes_written_to_guest),
-                                    },
-                                ),
-                                publication,
-                            )
-                        } else {
-                            if let Some(limiter) = rate_limiter.as_deref_mut()
-                                && let VirtioNetworkRateLimiterReduction::Throttled { retry_after } =
-                                    limiter.reduce_at(u64::from(bytes_written_to_guest), now)
-                            {
-                                if let Err(source) = self.available.undo_pop_descriptor_chain() {
-                                    return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
-                                        completed_dispatch: Box::new(dispatch),
-                                        source,
-                                    });
-                                }
+                    if self.merged_rx_buffers_enabled() {
+                        match self.dispatch_merged_packet(
+                            memory,
+                            packet,
+                            packet_len,
+                            bytes_written_to_guest,
+                            rate_limiter.as_deref_mut(),
+                            now,
+                        ) {
+                            Ok(VirtioNetworkMergedRxDispatch::Delivered(outcome, publication)) => {
+                                VirtioNetworkRxQueueDispatchAction::Consume(outcome, publication)
+                            }
+                            Ok(VirtioNetworkMergedRxDispatch::NoAvailableBuffers) => {
+                                dispatch.record_no_available_buffer();
+                                break;
+                            }
+                            Ok(VirtioNetworkMergedRxDispatch::RateLimited { retry_after }) => {
                                 dispatch.record_rate_limited_packet(retry_after);
                                 break;
                             }
-                            if let Err(source) = write_rx_packet_to_buffer(memory, &buffer, packet)
-                            {
+                            Err(VirtioNetworkMergedRxDispatchError::AvailableRing { source }) => {
+                                return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
+                                    completed_dispatch: Box::new(dispatch),
+                                    source,
+                                });
+                            }
+                            Err(VirtioNetworkMergedRxDispatchError::EmptyDescriptorChain) => {
+                                return Err(
+                                    VirtioNetworkRxQueueDispatchError::EmptyDescriptorChain {
+                                        completed_dispatch: Box::new(dispatch),
+                                    },
+                                );
+                            }
+                            Err(VirtioNetworkMergedRxDispatchError::BufferParse {
+                                descriptor_head,
+                                source,
+                            }) => {
+                                return Err(VirtioNetworkRxQueueDispatchError::BufferParse {
+                                    completed_dispatch: Box::new(dispatch),
+                                    descriptor_head,
+                                    source,
+                                });
+                            }
+                            Err(VirtioNetworkMergedRxDispatchError::BufferWrite {
+                                descriptor_head,
+                                source,
+                            }) => {
                                 return Err(VirtioNetworkRxQueueDispatchError::BufferWrite {
                                     completed_dispatch: Box::new(dispatch),
                                     descriptor_head,
                                     source,
                                 });
                             }
-                            let notification_suppression = match self
-                                .notification_suppression(memory)
-                            {
-                                Ok(notification_suppression) => notification_suppression,
-                                Err(source) => {
-                                    return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
-                                        completed_dispatch: Box::new(dispatch),
-                                        source,
-                                    });
-                                }
-                            };
-                            let publication =
-                                match self.used.publish_used_element_with_notification(
-                                    memory,
+                            Err(VirtioNetworkMergedRxDispatchError::UsedRing {
+                                descriptor_head,
+                                source,
+                            }) => {
+                                return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
+                                    completed_dispatch: Box::new(dispatch),
                                     descriptor_head,
                                     bytes_written_to_guest,
-                                    notification_suppression,
-                                ) {
-                                    Ok(publication) => publication,
-                                    Err(source) => {
-                                        return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
-                                            completed_dispatch: Box::new(dispatch),
-                                            descriptor_head,
-                                            bytes_written_to_guest,
-                                            source,
-                                        });
-                                    }
-                                };
-                            VirtioNetworkRxQueueDispatchAction::Consume(
-                                VirtioNetworkRxQueueDispatchOutcome::Delivered(
-                                    VirtioNetworkRxPacketDelivery {
-                                        descriptor_head,
-                                        packet_len,
-                                        bytes_written_to_guest,
+                                    source,
+                                });
+                            }
+                            Err(VirtioNetworkMergedRxDispatchError::MetadataAllocation {
+                                source,
+                            }) => {
+                                return Err(
+                                    VirtioNetworkRxQueueDispatchError::PacketMetadataAllocation {
+                                        completed_dispatch: Some(Box::new(dispatch)),
+                                        source,
                                     },
-                                ),
-                                publication,
-                            )
+                                );
+                            }
                         }
-                    }
-                    Err(source) => {
-                        let notification_suppression = match self.notification_suppression(memory) {
-                            Ok(notification_suppression) => notification_suppression,
+                    } else {
+                        let chain = match self.available.pop_descriptor_chain(memory) {
+                            Ok(Some(chain)) => chain,
+                            Ok(None) => {
+                                dispatch.record_no_available_buffer();
+                                break;
+                            }
                             Err(source) => {
                                 return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
                                     completed_dispatch: Box::new(dispatch),
@@ -2134,42 +2868,380 @@ impl VirtioNetworkRxQueue {
                                 });
                             }
                         };
-                        let publication = match self.used.publish_used_element_with_notification(
-                            memory,
-                            descriptor_head,
-                            0,
-                            notification_suppression,
-                        ) {
-                            Ok(publication) => publication,
-                            Err(used_source) => {
-                                return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
-                                    completed_dispatch: Box::new(dispatch),
-                                    descriptor_head,
-                                    bytes_written_to_guest: 0,
-                                    source: used_source,
-                                });
+                        let descriptor_head = match descriptor_chain_head(&chain) {
+                            Some(descriptor_head) => descriptor_head,
+                            None => {
+                                return Err(
+                                    VirtioNetworkRxQueueDispatchError::EmptyDescriptorChain {
+                                        completed_dispatch: Box::new(dispatch),
+                                    },
+                                );
                             }
                         };
-                        VirtioNetworkRxQueueDispatchAction::Record(
-                            VirtioNetworkRxQueueDispatchOutcome::BufferParseError(source),
-                            publication,
-                        )
+
+                        let minimum_len = self.non_merged_rx_minimum_buffer_size();
+                        match VirtioNetworkRxBuffer::parse_with_minimum(memory, &chain, minimum_len)
+                        {
+                            Ok(buffer) => {
+                                if u64::from(bytes_written_to_guest) > buffer.len() {
+                                    let notification_suppression = match self
+                                        .notification_suppression(memory)
+                                    {
+                                        Ok(notification_suppression) => notification_suppression,
+                                        Err(source) => {
+                                            return Err(
+                                                VirtioNetworkRxQueueDispatchError::AvailableRing {
+                                                    completed_dispatch: Box::new(dispatch),
+                                                    source,
+                                                },
+                                            );
+                                        }
+                                    };
+                                    let publication =
+                                        match self.used.publish_used_element_with_notification(
+                                            memory,
+                                            descriptor_head,
+                                            0,
+                                            notification_suppression,
+                                        ) {
+                                            Ok(publication) => publication,
+                                            Err(source) => {
+                                                return Err(
+                                                    VirtioNetworkRxQueueDispatchError::UsedRing {
+                                                        completed_dispatch: Box::new(dispatch),
+                                                        descriptor_head,
+                                                        bytes_written_to_guest: 0,
+                                                        source,
+                                                    },
+                                                );
+                                            }
+                                        };
+                                    VirtioNetworkRxQueueDispatchAction::Record(
+                                        VirtioNetworkRxQueueDispatchOutcome::BufferTooSmall(
+                                            VirtioNetworkRxBufferTooSmall {
+                                                descriptor_head,
+                                                len: buffer.len(),
+                                                required_len: u64::from(bytes_written_to_guest),
+                                            },
+                                        ),
+                                        publication,
+                                    )
+                                } else {
+                                    let notification_suppression = match self
+                                        .notification_suppression(memory)
+                                    {
+                                        Ok(notification_suppression) => notification_suppression,
+                                        Err(source) => {
+                                            return Err(
+                                                VirtioNetworkRxQueueDispatchError::AvailableRing {
+                                                    completed_dispatch: Box::new(dispatch),
+                                                    source,
+                                                },
+                                            );
+                                        }
+                                    };
+                                    let limiter_reservation = match rate_limiter.as_deref_mut() {
+                                        Some(limiter) => match limiter
+                                            .reduce_at(u64::from(bytes_written_to_guest), now)
+                                        {
+                                            VirtioNetworkRateLimiterReduction::Allowed(
+                                                reservation,
+                                            ) => Some(reservation),
+                                            VirtioNetworkRateLimiterReduction::Throttled {
+                                                retry_after,
+                                            } => {
+                                                if let Err(source) =
+                                                    self.available.undo_pop_descriptor_chain()
+                                                {
+                                                    return Err(
+                                                VirtioNetworkRxQueueDispatchError::AvailableRing {
+                                                    completed_dispatch: Box::new(dispatch),
+                                                    source,
+                                                },
+                                            );
+                                                }
+                                                dispatch.record_rate_limited_packet(retry_after);
+                                                break;
+                                            }
+                                        },
+                                        None => None,
+                                    };
+                                    if let Err(source) =
+                                        write_rx_packet_to_buffer(memory, &buffer, packet)
+                                    {
+                                        if let (Some(limiter), Some(reservation)) =
+                                            (rate_limiter.as_deref_mut(), limiter_reservation)
+                                        {
+                                            limiter.restore(reservation);
+                                        }
+                                        return Err(
+                                            VirtioNetworkRxQueueDispatchError::BufferWrite {
+                                                completed_dispatch: Box::new(dispatch),
+                                                descriptor_head,
+                                                source,
+                                            },
+                                        );
+                                    }
+                                    let publication = match self
+                                        .used
+                                        .publish_used_element_with_notification(
+                                            memory,
+                                            descriptor_head,
+                                            bytes_written_to_guest,
+                                            notification_suppression,
+                                        ) {
+                                        Ok(publication) => publication,
+                                        Err(source) => {
+                                            if let (Some(limiter), Some(reservation)) =
+                                                (rate_limiter.as_deref_mut(), limiter_reservation)
+                                            {
+                                                limiter.restore(reservation);
+                                            }
+                                            return Err(
+                                                VirtioNetworkRxQueueDispatchError::UsedRing {
+                                                    completed_dispatch: Box::new(dispatch),
+                                                    descriptor_head,
+                                                    bytes_written_to_guest,
+                                                    source,
+                                                },
+                                            );
+                                        }
+                                    };
+                                    VirtioNetworkRxQueueDispatchAction::Consume(
+                                        VirtioNetworkRxQueueDispatchOutcome::Delivered(
+                                            VirtioNetworkRxPacketDelivery {
+                                                descriptor_head,
+                                                packet_len,
+                                                bytes_written_to_guest,
+                                                buffer_count: 1,
+                                            },
+                                        ),
+                                        publication,
+                                    )
+                                }
+                            }
+                            Err(source) => {
+                                let notification_suppression =
+                                    match self.notification_suppression(memory) {
+                                        Ok(notification_suppression) => notification_suppression,
+                                        Err(source) => {
+                                            return Err(
+                                                VirtioNetworkRxQueueDispatchError::AvailableRing {
+                                                    completed_dispatch: Box::new(dispatch),
+                                                    source,
+                                                },
+                                            );
+                                        }
+                                    };
+                                let publication = match self
+                                    .used
+                                    .publish_used_element_with_notification(
+                                        memory,
+                                        descriptor_head,
+                                        0,
+                                        notification_suppression,
+                                    ) {
+                                    Ok(publication) => publication,
+                                    Err(used_source) => {
+                                        return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
+                                            completed_dispatch: Box::new(dispatch),
+                                            descriptor_head,
+                                            bytes_written_to_guest: 0,
+                                            source: used_source,
+                                        });
+                                    }
+                                };
+                                VirtioNetworkRxQueueDispatchAction::Record(
+                                    VirtioNetworkRxQueueDispatchOutcome::BufferParseError(source),
+                                    publication,
+                                )
+                            }
+                        }
+                    }
+                };
+
+                match action {
+                    VirtioNetworkRxQueueDispatchAction::Record(outcome, publication) => {
+                        dispatch.record(outcome, publication);
+                    }
+                    VirtioNetworkRxQueueDispatchAction::Consume(outcome, publication) => {
+                        rx_source.consume_packet();
+                        dispatch.record(outcome, publication);
                     }
                 }
-            };
-
-            match action {
-                VirtioNetworkRxQueueDispatchAction::Record(outcome, publication) => {
-                    dispatch.record(outcome, publication);
-                }
-                VirtioNetworkRxQueueDispatchAction::Consume(outcome, publication) => {
-                    rx_source.consume_packet();
-                    dispatch.record(outcome, publication);
-                }
             }
+
+            dispatch.record_backend_metrics(rx_source.take_backend_metrics());
+            Ok(dispatch)
+        })();
+        if let Err(source) = &mut result {
+            source.record_backend_metrics(rx_source.take_backend_metrics());
+        }
+        result
+    }
+
+    const fn merged_rx_buffers_enabled(&self) -> bool {
+        virtio_feature_enabled(self.negotiated_features, VIRTIO_NET_F_MRG_RXBUF)
+    }
+
+    const fn non_merged_rx_minimum_buffer_size(&self) -> u64 {
+        if virtio_feature_enabled(self.negotiated_features, VIRTIO_NET_F_GUEST_TSO4)
+            || virtio_feature_enabled(self.negotiated_features, VIRTIO_NET_F_GUEST_TSO6)
+            || virtio_feature_enabled(self.negotiated_features, VIRTIO_NET_F_GUEST_UFO)
+        {
+            VIRTIO_NET_RX_LARGE_BUFFER_SIZE
+        } else {
+            VIRTIO_NET_RX_MIN_BUFFER_SIZE
+        }
+    }
+
+    fn dispatch_merged_packet(
+        &mut self,
+        memory: &mut GuestMemory,
+        packet: VirtioNetworkRxPacket<'_>,
+        packet_len: u64,
+        bytes_written_to_guest: u32,
+        rate_limiter: Option<&mut VirtioNetworkRateLimiter>,
+        now: Instant,
+    ) -> Result<VirtioNetworkMergedRxDispatch, VirtioNetworkMergedRxDispatchError> {
+        let checkpoint = self.available.checkpoint();
+        let mut buffers = Vec::new();
+        buffers
+            .try_reserve_exact(usize::from(self.available.queue_size()))
+            .map_err(|source| VirtioNetworkMergedRxDispatchError::MetadataAllocation { source })?;
+        let mut capacity = 0_u64;
+        while capacity < u64::from(bytes_written_to_guest) {
+            let chain = match self.available.pop_descriptor_chain(memory) {
+                Ok(Some(chain)) => chain,
+                Ok(None) => {
+                    self.available.restore_checkpoint(checkpoint);
+                    return Ok(VirtioNetworkMergedRxDispatch::NoAvailableBuffers);
+                }
+                Err(source) => {
+                    self.available.restore_checkpoint(checkpoint);
+                    return Err(VirtioNetworkMergedRxDispatchError::AvailableRing { source });
+                }
+            };
+            let Some(descriptor_head) = descriptor_chain_head(&chain) else {
+                self.available.restore_checkpoint(checkpoint);
+                return Err(VirtioNetworkMergedRxDispatchError::EmptyDescriptorChain);
+            };
+            let buffer = match VirtioNetworkRxBuffer::parse_with_minimum(
+                memory,
+                &chain,
+                u64::from(VIRTIO_NET_TX_HEADER_SIZE),
+            ) {
+                Ok(buffer) => buffer,
+                Err(source) => {
+                    self.available.restore_checkpoint(checkpoint);
+                    return Err(VirtioNetworkMergedRxDispatchError::BufferParse {
+                        descriptor_head,
+                        source,
+                    });
+                }
+            };
+            capacity = capacity.checked_add(buffer.len()).ok_or_else(|| {
+                self.available.restore_checkpoint(checkpoint);
+                VirtioNetworkMergedRxDispatchError::BufferParse {
+                    descriptor_head,
+                    source: VirtioNetworkRxBufferParseError::BufferLengthOverflow {
+                        current: capacity,
+                        len: u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                    },
+                }
+            })?;
+            buffers.push(buffer);
         }
 
-        Ok(dispatch)
+        let buffer_count = u16::try_from(buffers.len()).map_err(|_| {
+            self.available.restore_checkpoint(checkpoint);
+            VirtioNetworkMergedRxDispatchError::EmptyDescriptorChain
+        })?;
+        let Some(first_buffer) = buffers.first() else {
+            self.available.restore_checkpoint(checkpoint);
+            return Err(VirtioNetworkMergedRxDispatchError::EmptyDescriptorChain);
+        };
+        let descriptor_head = first_buffer.descriptor_head();
+
+        let mut elements = Vec::new();
+        elements
+            .try_reserve_exact(buffers.len())
+            .map_err(|source| {
+                self.available.restore_checkpoint(checkpoint);
+                VirtioNetworkMergedRxDispatchError::MetadataAllocation { source }
+            })?;
+        let mut remaining = u64::from(bytes_written_to_guest);
+        for buffer in &buffers {
+            let used_len = remaining.min(buffer.len());
+            let used_len = u32::try_from(used_len).map_err(|_| {
+                self.available.restore_checkpoint(checkpoint);
+                VirtioNetworkMergedRxDispatchError::BufferWrite {
+                    descriptor_head,
+                    source: VirtioNetworkRxFrameWriteError::IncompleteFrame {
+                        remaining_bytes: usize::MAX,
+                    },
+                }
+            })?;
+            elements.push((buffer.descriptor_head(), used_len));
+            remaining = remaining.saturating_sub(u64::from(used_len));
+        }
+        let notification_suppression = match self.notification_suppression(memory) {
+            Ok(notification_suppression) => notification_suppression,
+            Err(source) => {
+                self.available.restore_checkpoint(checkpoint);
+                return Err(VirtioNetworkMergedRxDispatchError::AvailableRing { source });
+            }
+        };
+
+        let mut rate_limiter = rate_limiter;
+        let limiter_reservation = match rate_limiter.as_deref_mut() {
+            Some(limiter) => match limiter.reduce_at(u64::from(bytes_written_to_guest), now) {
+                VirtioNetworkRateLimiterReduction::Allowed(reservation) => Some(reservation),
+                VirtioNetworkRateLimiterReduction::Throttled { retry_after } => {
+                    self.available.restore_checkpoint(checkpoint);
+                    return Ok(VirtioNetworkMergedRxDispatch::RateLimited { retry_after });
+                }
+            },
+            None => None,
+        };
+
+        if let Err(source) = write_rx_packet_to_buffers(memory, &buffers, packet, buffer_count) {
+            if let (Some(limiter), Some(reservation)) = (rate_limiter, limiter_reservation) {
+                limiter.restore(reservation);
+            }
+            self.available.restore_checkpoint(checkpoint);
+            return Err(VirtioNetworkMergedRxDispatchError::BufferWrite {
+                descriptor_head,
+                source,
+            });
+        }
+
+        let publication = match self.used.publish_used_elements_with_notification(
+            memory,
+            &elements,
+            notification_suppression,
+        ) {
+            Ok(publication) => publication,
+            Err(source) => {
+                if let (Some(limiter), Some(reservation)) = (rate_limiter, limiter_reservation) {
+                    limiter.restore(reservation);
+                }
+                self.available.restore_checkpoint(checkpoint);
+                return Err(VirtioNetworkMergedRxDispatchError::UsedRing {
+                    descriptor_head,
+                    source,
+                });
+            }
+        };
+        Ok(VirtioNetworkMergedRxDispatch::Delivered(
+            VirtioNetworkRxQueueDispatchOutcome::Delivered(VirtioNetworkRxPacketDelivery {
+                descriptor_head,
+                packet_len,
+                bytes_written_to_guest,
+                buffer_count,
+            }),
+            publication,
+        ))
     }
 
     fn notification_suppression(
@@ -2185,6 +3257,41 @@ impl VirtioNetworkRxQueue {
             Ok(VirtqueueNotificationSuppression::Disabled)
         }
     }
+}
+
+#[derive(Debug)]
+enum VirtioNetworkMergedRxDispatch {
+    Delivered(
+        VirtioNetworkRxQueueDispatchOutcome,
+        VirtqueueUsedRingPublication,
+    ),
+    NoAvailableBuffers,
+    RateLimited {
+        retry_after: Duration,
+    },
+}
+
+#[derive(Debug)]
+enum VirtioNetworkMergedRxDispatchError {
+    MetadataAllocation {
+        source: TryReserveError,
+    },
+    AvailableRing {
+        source: VirtqueueAvailableRingError,
+    },
+    EmptyDescriptorChain,
+    BufferParse {
+        descriptor_head: u16,
+        source: VirtioNetworkRxBufferParseError,
+    },
+    BufferWrite {
+        descriptor_head: u16,
+        source: VirtioNetworkRxFrameWriteError,
+    },
+    UsedRing {
+        descriptor_head: u16,
+        source: VirtqueueUsedRingError,
+    },
 }
 
 #[derive(Debug)]
@@ -2223,6 +3330,7 @@ pub struct VirtioNetworkRxPacketDelivery {
     descriptor_head: u16,
     packet_len: u64,
     bytes_written_to_guest: u32,
+    buffer_count: u16,
 }
 
 impl VirtioNetworkRxPacketDelivery {
@@ -2236,6 +3344,10 @@ impl VirtioNetworkRxPacketDelivery {
 
     pub const fn bytes_written_to_guest(self) -> u32 {
         self.bytes_written_to_guest
+    }
+
+    pub const fn buffer_count(self) -> u16 {
+        self.buffer_count
     }
 }
 
@@ -2271,6 +3383,7 @@ pub struct VirtioNetworkRxQueueDispatch {
     buffer_parse_failures: usize,
     buffer_too_small_failures: usize,
     source_failures: usize,
+    no_available_buffers: usize,
     rate_limiter_throttled_packets: usize,
     rate_limiter_retry_after: Option<Duration>,
     deliveries: Vec<VirtioNetworkRxPacketDelivery>,
@@ -2278,6 +3391,7 @@ pub struct VirtioNetworkRxQueueDispatch {
     first_buffer_too_small: Option<VirtioNetworkRxBufferTooSmall>,
     first_source_failure: Option<VirtioNetworkRxPacketSourceError>,
     needs_queue_interrupt: bool,
+    backend_metrics: VirtioNetworkBackendMetrics,
 }
 
 impl VirtioNetworkRxQueueDispatch {
@@ -2286,7 +3400,10 @@ impl VirtioNetworkRxQueueDispatch {
         deliveries
             .try_reserve_exact(usize::from(queue_size))
             .map_err(
-                |source| VirtioNetworkRxQueueDispatchError::PacketMetadataAllocation { source },
+                |source| VirtioNetworkRxQueueDispatchError::PacketMetadataAllocation {
+                    completed_dispatch: None,
+                    source,
+                },
             )?;
 
         Ok(Self {
@@ -2295,6 +3412,7 @@ impl VirtioNetworkRxQueueDispatch {
             buffer_parse_failures: 0,
             buffer_too_small_failures: 0,
             source_failures: 0,
+            no_available_buffers: 0,
             rate_limiter_throttled_packets: 0,
             rate_limiter_retry_after: None,
             deliveries,
@@ -2302,6 +3420,7 @@ impl VirtioNetworkRxQueueDispatch {
             first_buffer_too_small: None,
             first_source_failure: None,
             needs_queue_interrupt: false,
+            backend_metrics: VirtioNetworkBackendMetrics::default(),
         })
     }
 
@@ -2323,6 +3442,10 @@ impl VirtioNetworkRxQueueDispatch {
 
     pub const fn source_failures(&self) -> usize {
         self.source_failures
+    }
+
+    pub const fn no_available_buffers(&self) -> usize {
+        self.no_available_buffers
     }
 
     pub const fn rate_limiter_throttled_packets(&self) -> usize {
@@ -2353,12 +3476,22 @@ impl VirtioNetworkRxQueueDispatch {
         self.needs_queue_interrupt
     }
 
+    pub const fn backend_metrics(&self) -> VirtioNetworkBackendMetrics {
+        self.backend_metrics
+    }
+
     fn record(
         &mut self,
         outcome: VirtioNetworkRxQueueDispatchOutcome,
         publication: VirtqueueUsedRingPublication,
     ) {
-        self.processed_buffers += 1;
+        self.processed_buffers += match &outcome {
+            VirtioNetworkRxQueueDispatchOutcome::Delivered(delivery) => {
+                usize::from(delivery.buffer_count())
+            }
+            VirtioNetworkRxQueueDispatchOutcome::BufferParseError(_)
+            | VirtioNetworkRxQueueDispatchOutcome::BufferTooSmall(_) => 1,
+        };
         self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         match outcome {
             VirtioNetworkRxQueueDispatchOutcome::Delivered(delivery) => {
@@ -2385,6 +3518,14 @@ impl VirtioNetworkRxQueueDispatch {
         if self.first_source_failure.is_none() {
             self.first_source_failure = Some(source);
         }
+    }
+
+    fn record_no_available_buffer(&mut self) {
+        self.no_available_buffers += 1;
+    }
+
+    fn record_backend_metrics(&mut self, metrics: VirtioNetworkBackendMetrics) {
+        self.backend_metrics = self.backend_metrics.merged_with(metrics);
     }
 
     fn record_rate_limited_packet(&mut self, retry_after: Duration) {
@@ -2494,6 +3635,7 @@ impl std::error::Error for VirtioNetworkRxFrameWriteError {
 #[derive(Debug)]
 pub enum VirtioNetworkRxQueueDispatchError {
     PacketMetadataAllocation {
+        completed_dispatch: Option<Box<VirtioNetworkRxQueueDispatch>>,
         source: TryReserveError,
     },
     PacketSource {
@@ -2512,6 +3654,11 @@ pub enum VirtioNetworkRxQueueDispatchError {
     EmptyDescriptorChain {
         completed_dispatch: Box<VirtioNetworkRxQueueDispatch>,
     },
+    BufferParse {
+        completed_dispatch: Box<VirtioNetworkRxQueueDispatch>,
+        descriptor_head: u16,
+        source: VirtioNetworkRxBufferParseError,
+    },
     UsedRing {
         completed_dispatch: Box<VirtioNetworkRxQueueDispatch>,
         descriptor_head: u16,
@@ -2528,6 +3675,12 @@ pub enum VirtioNetworkRxQueueDispatchError {
 impl VirtioNetworkRxQueueDispatchError {
     pub const fn completed_dispatch(&self) -> Option<&VirtioNetworkRxQueueDispatch> {
         match self {
+            Self::PacketMetadataAllocation {
+                completed_dispatch, ..
+            } => match completed_dispatch {
+                Some(completed_dispatch) => Some(completed_dispatch),
+                None => None,
+            },
             Self::PacketSource {
                 completed_dispatch, ..
             }
@@ -2540,13 +3693,15 @@ impl VirtioNetworkRxQueueDispatchError {
             | Self::EmptyDescriptorChain {
                 completed_dispatch, ..
             }
+            | Self::BufferParse {
+                completed_dispatch, ..
+            }
             | Self::UsedRing {
                 completed_dispatch, ..
             }
             | Self::BufferWrite {
                 completed_dispatch, ..
             } => Some(completed_dispatch),
-            Self::PacketMetadataAllocation { .. } => None,
         }
     }
 
@@ -2554,12 +3709,46 @@ impl VirtioNetworkRxQueueDispatchError {
         self.completed_dispatch()
             .and_then(VirtioNetworkRxQueueDispatch::rate_limiter_retry_after)
     }
+
+    fn record_backend_metrics(&mut self, metrics: VirtioNetworkBackendMetrics) {
+        match self {
+            Self::PacketMetadataAllocation {
+                completed_dispatch: Some(completed_dispatch),
+                ..
+            } => completed_dispatch.record_backend_metrics(metrics),
+            Self::PacketSource {
+                completed_dispatch, ..
+            }
+            | Self::PacketTooLarge {
+                completed_dispatch, ..
+            }
+            | Self::AvailableRing {
+                completed_dispatch, ..
+            }
+            | Self::EmptyDescriptorChain {
+                completed_dispatch, ..
+            }
+            | Self::BufferParse {
+                completed_dispatch, ..
+            }
+            | Self::UsedRing {
+                completed_dispatch, ..
+            }
+            | Self::BufferWrite {
+                completed_dispatch, ..
+            } => completed_dispatch.record_backend_metrics(metrics),
+            Self::PacketMetadataAllocation {
+                completed_dispatch: None,
+                ..
+            } => {}
+        }
+    }
 }
 
 impl fmt::Display for VirtioNetworkRxQueueDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PacketMetadataAllocation { source } => {
+            Self::PacketMetadataAllocation { source, .. } => {
                 write!(
                     f,
                     "failed to reserve virtio-net RX packet metadata: {source}"
@@ -2580,6 +3769,14 @@ impl fmt::Display for VirtioNetworkRxQueueDispatchError {
             Self::EmptyDescriptorChain { .. } => {
                 f.write_str("virtio-net RX queue produced an empty descriptor chain")
             }
+            Self::BufferParse {
+                descriptor_head,
+                source,
+                ..
+            } => write!(
+                f,
+                "failed to validate merged virtio-net RX descriptor head {descriptor_head}: {source}"
+            ),
             Self::UsedRing {
                 descriptor_head,
                 bytes_written_to_guest,
@@ -2608,9 +3805,10 @@ impl fmt::Display for VirtioNetworkRxQueueDispatchError {
 impl std::error::Error for VirtioNetworkRxQueueDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::PacketMetadataAllocation { source } => Some(source),
+            Self::PacketMetadataAllocation { source, .. } => Some(source),
             Self::PacketSource { source, .. } => Some(source),
             Self::AvailableRing { source, .. } => Some(source),
+            Self::BufferParse { source, .. } => Some(source),
             Self::UsedRing { source, .. } => Some(source),
             Self::BufferWrite { source, .. } => Some(source),
             Self::PacketTooLarge { .. } | Self::EmptyDescriptorChain { .. } => None,
@@ -2653,32 +3851,52 @@ fn write_rx_packet_to_buffer(
     buffer: &VirtioNetworkRxBuffer,
     packet: VirtioNetworkRxPacket<'_>,
 ) -> Result<(), VirtioNetworkRxFrameWriteError> {
-    let header = [0; VIRTIO_NET_TX_HEADER_SIZE as usize];
+    write_rx_packet_to_buffers(memory, std::slice::from_ref(buffer), packet, 1)
+}
+
+fn write_rx_packet_to_buffers(
+    memory: &mut GuestMemory,
+    buffers: &[VirtioNetworkRxBuffer],
+    packet: VirtioNetworkRxPacket<'_>,
+    buffer_count: u16,
+) -> Result<(), VirtioNetworkRxFrameWriteError> {
+    let mut header = [0; VIRTIO_NET_TX_HEADER_SIZE as usize];
+    let remaining_bytes = header.len().saturating_add(packet.len());
+    let num_buffers_offset = header.len().saturating_sub(2);
+    let num_buffers = header
+        .get_mut(num_buffers_offset..)
+        .ok_or(VirtioNetworkRxFrameWriteError::IncompleteFrame { remaining_bytes })?;
+    num_buffers.copy_from_slice(&buffer_count.to_le_bytes());
     let mut header_remaining = header.as_slice();
     let mut payload_remaining = packet.bytes();
 
-    for segment in buffer.segments() {
-        let mut segment_offset = 0;
-        let mut segment_remaining = segment.len() as usize;
+    for buffer in buffers {
+        for segment in buffer.segments() {
+            let mut segment_offset = 0;
+            let mut segment_remaining = segment.len() as usize;
 
-        if !header_remaining.is_empty() && segment_remaining != 0 {
-            let write_len = header_remaining.len().min(segment_remaining);
-            let (bytes, remaining) = header_remaining.split_at(write_len);
-            write_rx_segment_bytes(memory, *segment, segment_offset, bytes)?;
-            header_remaining = remaining;
-            segment_offset += write_len;
-            segment_remaining -= write_len;
-        }
+            if !header_remaining.is_empty() && segment_remaining != 0 {
+                let write_len = header_remaining.len().min(segment_remaining);
+                let (bytes, remaining) = header_remaining.split_at(write_len);
+                write_rx_segment_bytes(memory, *segment, segment_offset, bytes)?;
+                header_remaining = remaining;
+                segment_offset += write_len;
+                segment_remaining -= write_len;
+            }
 
-        if header_remaining.is_empty() && !payload_remaining.is_empty() && segment_remaining != 0 {
-            let write_len = payload_remaining.len().min(segment_remaining);
-            let (bytes, remaining) = payload_remaining.split_at(write_len);
-            write_rx_segment_bytes(memory, *segment, segment_offset, bytes)?;
-            payload_remaining = remaining;
-        }
+            if header_remaining.is_empty()
+                && !payload_remaining.is_empty()
+                && segment_remaining != 0
+            {
+                let write_len = payload_remaining.len().min(segment_remaining);
+                let (bytes, remaining) = payload_remaining.split_at(write_len);
+                write_rx_segment_bytes(memory, *segment, segment_offset, bytes)?;
+                payload_remaining = remaining;
+            }
 
-        if header_remaining.is_empty() && payload_remaining.is_empty() {
-            return Ok(());
+            if header_remaining.is_empty() && payload_remaining.is_empty() {
+                return Ok(());
+            }
         }
     }
 
@@ -2728,19 +3946,21 @@ pub struct VirtioNetworkTxQueue {
     available: VirtqueueAvailableRing,
     used: VirtqueueUsedRing,
     event_idx_enabled: bool,
+    negotiated_features: u64,
 }
 
 impl VirtioNetworkTxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
     ) -> Result<Self, VirtioNetworkTxQueueBuildError> {
-        Self::from_mmio_queue_state_with_event_idx(queue, false, false)
+        Self::from_mmio_queue_state_with_event_idx(queue, false, false, 0)
     }
 
     fn from_mmio_queue_state_with_event_idx(
         queue: VirtioMmioQueueState,
         event_idx_enabled: bool,
         indirect_descriptors_enabled: bool,
+        negotiated_features: u64,
     ) -> Result<Self, VirtioNetworkTxQueueBuildError> {
         if !queue.ready() {
             return Err(VirtioNetworkTxQueueBuildError::QueueNotReady);
@@ -2764,6 +3984,7 @@ impl VirtioNetworkTxQueue {
             available,
             used,
             event_idx_enabled,
+            negotiated_features,
         })
     }
 
@@ -2781,6 +4002,10 @@ impl VirtioNetworkTxQueue {
 
     pub const fn event_idx_enabled(&self) -> bool {
         self.event_idx_enabled
+    }
+
+    pub const fn negotiated_features(&self) -> u64 {
+        self.negotiated_features
     }
 
     pub fn dispatch(
@@ -2806,10 +4031,15 @@ impl VirtioNetworkTxQueue {
         rate_limiter: Option<&mut VirtioNetworkRateLimiter>,
         now: Instant,
     ) -> Result<VirtioNetworkTxQueueDispatch, VirtioNetworkTxQueueDispatchError> {
-        if tx_sink.supports_staged_batch() {
-            return self.dispatch_with_staged_sink_at(memory, tx_sink, rate_limiter, now);
+        let mut result = if tx_sink.supports_staged_batch() {
+            self.dispatch_with_staged_sink_at(memory, tx_sink, rate_limiter, now)
+        } else {
+            self.dispatch_with_single_sink_at(memory, tx_sink, rate_limiter, now)
+        };
+        if let Err(source) = &mut result {
+            source.record_backend_metrics(tx_sink.take_backend_metrics());
         }
-        self.dispatch_with_single_sink_at(memory, tx_sink, rate_limiter, now)
+        result
     }
 
     fn dispatch_with_single_sink_at(
@@ -2831,6 +4061,22 @@ impl VirtioNetworkTxQueue {
                 });
             }
         } {
+            let remaining_requests = match self.available.available_descriptor_count(memory) {
+                Ok(remaining_requests) => remaining_requests,
+                Err(source) => {
+                    if let Err(undo_source) = self.available.undo_pop_descriptor_chain() {
+                        return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                            completed_dispatch: Box::new(dispatch),
+                            source: undo_source,
+                        });
+                    }
+                    return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(dispatch),
+                        source,
+                    });
+                }
+            };
+            dispatch.record_remaining_requests(remaining_requests);
             let descriptor_head = match descriptor_chain_head(&chain) {
                 Some(descriptor_head) => descriptor_head,
                 None => {
@@ -2839,8 +4085,19 @@ impl VirtioNetworkTxQueue {
                     });
                 }
             };
-            let frame = VirtioNetworkTxFrame::parse(memory, &chain);
-            let reservation = if let Ok(frame) = &frame
+            let preparation = match VirtioNetworkTxFrame::parse_with_features(
+                memory,
+                &chain,
+                self.negotiated_features,
+            ) {
+                Ok(frame) => match frame.prepare_packet(memory) {
+                    Ok(packet) => VirtioNetworkTxFramePreparation::Ready { frame, packet },
+                    Err(source) => VirtioNetworkTxFramePreparation::PacketError(source),
+                },
+                Err(source) => VirtioNetworkTxFramePreparation::ParseError(source),
+            };
+            let reservation = if let VirtioNetworkTxFramePreparation::Ready { frame, .. } =
+                &preparation
                 && let Some(limiter) = rate_limiter.as_deref_mut()
             {
                 match limiter.reduce_at(frame.frame_len(), now) {
@@ -2862,6 +4119,11 @@ impl VirtioNetworkTxQueue {
             let notification_suppression = match self.notification_suppression(memory) {
                 Ok(notification_suppression) => notification_suppression,
                 Err(source) => {
+                    if let (Some(limiter), Some(reservation)) =
+                        (rate_limiter.as_deref_mut(), reservation)
+                    {
+                        limiter.restore(reservation);
+                    }
                     return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
                         completed_dispatch: Box::new(dispatch),
                         source,
@@ -2876,6 +4138,11 @@ impl VirtioNetworkTxQueue {
             ) {
                 Ok(publication) => publication,
                 Err(source) => {
+                    if let (Some(limiter), Some(reservation)) =
+                        (rate_limiter.as_deref_mut(), reservation)
+                    {
+                        limiter.restore(reservation);
+                    }
                     return Err(VirtioNetworkTxQueueDispatchError::UsedRing {
                         completed_dispatch: Box::new(dispatch),
                         descriptor_head,
@@ -2884,9 +4151,10 @@ impl VirtioNetworkTxQueue {
                     });
                 }
             };
-            let outcome = match frame {
-                Ok(frame) => {
-                    let sink_error = match tx_sink.transmit_frame(memory, &frame) {
+            let outcome = match preparation {
+                VirtioNetworkTxFramePreparation::Ready { frame, packet } => {
+                    let sink_error = match tx_sink.transmit_prepared_frame(memory, &frame, &packet)
+                    {
                         Ok(VirtioNetworkTxPacketDisposition::Detoured) => {
                             if let (Some(limiter), Some(reservation)) =
                                 (rate_limiter.as_deref_mut(), reservation)
@@ -2900,11 +4168,17 @@ impl VirtioNetworkTxQueue {
                     };
                     VirtioNetworkTxQueueDispatchOutcome::Ok { frame, sink_error }
                 }
-                Err(source) => VirtioNetworkTxQueueDispatchOutcome::ParseError(source),
+                VirtioNetworkTxFramePreparation::PacketError(source) => {
+                    VirtioNetworkTxQueueDispatchOutcome::PacketPrepareError(source)
+                }
+                VirtioNetworkTxFramePreparation::ParseError(source) => {
+                    VirtioNetworkTxQueueDispatchOutcome::ParseError(source)
+                }
             };
             dispatch.record(outcome, publication);
         }
 
+        dispatch.record_backend_metrics(tx_sink.take_backend_metrics());
         Ok(dispatch)
     }
 
@@ -2959,9 +4233,42 @@ impl VirtioNetworkTxQueue {
                     completed_dispatch: Box::new(dispatch),
                 });
             };
-            let frame = match VirtioNetworkTxFrame::parse(memory, &chain) {
-                Ok(frame) => frame,
+            let remaining_requests = match self.available.available_descriptor_count(memory) {
+                Ok(remaining_requests) => remaining_requests,
                 Err(source) => {
+                    flush_staged_tx_frames(
+                        tx_sink,
+                        &mut dispatch,
+                        &mut pending_frames,
+                        &mut flush_results,
+                    );
+                    if let Err(undo_source) = self.available.undo_pop_descriptor_chain() {
+                        return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                            completed_dispatch: Box::new(dispatch),
+                            source: undo_source,
+                        });
+                    }
+                    return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(dispatch),
+                        source,
+                    });
+                }
+            };
+            dispatch.record_remaining_requests(remaining_requests);
+            let preparation = match VirtioNetworkTxFrame::parse_with_features(
+                memory,
+                &chain,
+                self.negotiated_features,
+            ) {
+                Ok(frame) => match frame.prepare_packet(memory) {
+                    Ok(packet) => VirtioNetworkTxFramePreparation::Ready { frame, packet },
+                    Err(source) => VirtioNetworkTxFramePreparation::PacketError(source),
+                },
+                Err(source) => VirtioNetworkTxFramePreparation::ParseError(source),
+            };
+            let (frame, packet) = match preparation.into_ready() {
+                Ok(ready) => ready,
+                Err(outcome) => {
                     flush_staged_tx_frames(
                         tx_sink,
                         &mut dispatch,
@@ -2993,10 +4300,7 @@ impl VirtioNetworkTxQueue {
                             });
                         }
                     };
-                    dispatch.record(
-                        VirtioNetworkTxQueueDispatchOutcome::ParseError(source),
-                        publication,
-                    );
+                    dispatch.record(outcome, publication);
                     continue;
                 }
             };
@@ -3028,7 +4332,7 @@ impl VirtioNetworkTxQueue {
             let mut stage_error = None;
             let mut retried_after_flush = false;
             loop {
-                match tx_sink.stage_frame(memory, &frame) {
+                match tx_sink.stage_prepared_frame(memory, &frame, &packet) {
                     Ok(VirtioNetworkTxPacketStage::Staged {
                         flush_before_commit,
                     }) => {
@@ -3079,6 +4383,11 @@ impl VirtioNetworkTxQueue {
                     if staged {
                         tx_sink.discard_staged_frame();
                     }
+                    if let (Some(limiter), Some(reservation)) =
+                        (rate_limiter.as_deref_mut(), reservation)
+                    {
+                        limiter.restore(reservation);
+                    }
                     flush_staged_tx_frames(
                         tx_sink,
                         &mut dispatch,
@@ -3101,6 +4410,11 @@ impl VirtioNetworkTxQueue {
                 Err(source) => {
                     if staged {
                         tx_sink.discard_staged_frame();
+                    }
+                    if let (Some(limiter), Some(reservation)) =
+                        (rate_limiter.as_deref_mut(), reservation)
+                    {
+                        limiter.restore(reservation);
                     }
                     flush_staged_tx_frames(
                         tx_sink,
@@ -3157,6 +4471,7 @@ impl VirtioNetworkTxQueue {
             &mut pending_frames,
             &mut flush_results,
         );
+        dispatch.record_backend_metrics(tx_sink.take_backend_metrics());
         Ok(dispatch)
     }
 
@@ -3233,15 +4548,19 @@ pub struct VirtioNetworkTxQueueDispatch {
     processed_frames: usize,
     successful_frames: usize,
     parse_failures: usize,
+    packet_prepare_failures: usize,
     sink_successful_frames: usize,
     sink_failures: usize,
     sink_successful_bytes: u64,
     rate_limiter_throttled_frames: usize,
     rate_limiter_retry_after: Option<Duration>,
+    remaining_requests: u64,
     frames: Vec<VirtioNetworkTxFrame>,
     first_parse_failure: Option<VirtioNetworkTxFrameParseError>,
+    first_packet_prepare_failure: Option<VirtioNetworkTxPacketPrepareError>,
     first_sink_failure: Option<VirtioNetworkTxPacketSinkError>,
     needs_queue_interrupt: bool,
+    backend_metrics: VirtioNetworkBackendMetrics,
 }
 
 impl VirtioNetworkTxQueueDispatch {
@@ -3257,15 +4576,19 @@ impl VirtioNetworkTxQueueDispatch {
             processed_frames: 0,
             successful_frames: 0,
             parse_failures: 0,
+            packet_prepare_failures: 0,
             sink_successful_frames: 0,
             sink_failures: 0,
             sink_successful_bytes: 0,
             rate_limiter_throttled_frames: 0,
             rate_limiter_retry_after: None,
+            remaining_requests: 0,
             frames,
             first_parse_failure: None,
+            first_packet_prepare_failure: None,
             first_sink_failure: None,
             needs_queue_interrupt: false,
+            backend_metrics: VirtioNetworkBackendMetrics::default(),
         })
     }
 
@@ -3279,6 +4602,15 @@ impl VirtioNetworkTxQueueDispatch {
 
     pub const fn parse_failures(&self) -> usize {
         self.parse_failures
+    }
+
+    pub const fn packet_prepare_failures(&self) -> usize {
+        self.packet_prepare_failures
+    }
+
+    pub const fn malformed_frames(&self) -> usize {
+        self.parse_failures
+            .saturating_add(self.packet_prepare_failures)
     }
 
     pub const fn sink_successful_frames(&self) -> usize {
@@ -3301,8 +4633,16 @@ impl VirtioNetworkTxQueueDispatch {
         self.rate_limiter_retry_after
     }
 
+    pub const fn remaining_requests(&self) -> u64 {
+        self.remaining_requests
+    }
+
     pub const fn first_parse_failure(&self) -> Option<&VirtioNetworkTxFrameParseError> {
         self.first_parse_failure.as_ref()
+    }
+
+    pub const fn first_packet_prepare_failure(&self) -> Option<&VirtioNetworkTxPacketPrepareError> {
+        self.first_packet_prepare_failure.as_ref()
     }
 
     pub const fn first_sink_failure(&self) -> Option<&VirtioNetworkTxPacketSinkError> {
@@ -3315,6 +4655,14 @@ impl VirtioNetworkTxQueueDispatch {
 
     pub const fn needs_queue_interrupt(&self) -> bool {
         self.needs_queue_interrupt
+    }
+
+    pub const fn backend_metrics(&self) -> VirtioNetworkBackendMetrics {
+        self.backend_metrics
+    }
+
+    fn record_backend_metrics(&mut self, metrics: VirtioNetworkBackendMetrics) {
+        self.backend_metrics = self.backend_metrics.merged_with(metrics);
     }
 
     fn record(
@@ -3346,6 +4694,12 @@ impl VirtioNetworkTxQueueDispatch {
                 self.parse_failures += 1;
                 if self.first_parse_failure.is_none() {
                     self.first_parse_failure = Some(source);
+                }
+            }
+            VirtioNetworkTxQueueDispatchOutcome::PacketPrepareError(source) => {
+                self.packet_prepare_failures += 1;
+                if self.first_packet_prepare_failure.is_none() {
+                    self.first_packet_prepare_failure = Some(source);
                 }
             }
         }
@@ -3393,6 +4747,12 @@ impl VirtioNetworkTxQueueDispatch {
             None => retry_after,
         });
     }
+
+    fn record_remaining_requests(&mut self, remaining_requests: u16) {
+        self.remaining_requests = self
+            .remaining_requests
+            .saturating_add(u64::from(remaining_requests));
+    }
 }
 
 #[derive(Debug)]
@@ -3402,6 +4762,34 @@ enum VirtioNetworkTxQueueDispatchOutcome {
         sink_error: Option<VirtioNetworkTxPacketSinkError>,
     },
     ParseError(VirtioNetworkTxFrameParseError),
+    PacketPrepareError(VirtioNetworkTxPacketPrepareError),
+}
+
+#[derive(Debug)]
+enum VirtioNetworkTxFramePreparation {
+    Ready {
+        frame: VirtioNetworkTxFrame,
+        packet: VirtioNetworkPacketPlan,
+    },
+    ParseError(VirtioNetworkTxFrameParseError),
+    PacketError(VirtioNetworkTxPacketPrepareError),
+}
+
+impl VirtioNetworkTxFramePreparation {
+    fn into_ready(
+        self,
+    ) -> Result<(VirtioNetworkTxFrame, VirtioNetworkPacketPlan), VirtioNetworkTxQueueDispatchOutcome>
+    {
+        match self {
+            Self::Ready { frame, packet } => Ok((frame, packet)),
+            Self::ParseError(source) => {
+                Err(VirtioNetworkTxQueueDispatchOutcome::ParseError(source))
+            }
+            Self::PacketError(source) => Err(
+                VirtioNetworkTxQueueDispatchOutcome::PacketPrepareError(source),
+            ),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3443,6 +4831,21 @@ impl VirtioNetworkTxQueueDispatchError {
     pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
         self.completed_dispatch()
             .and_then(VirtioNetworkTxQueueDispatch::rate_limiter_retry_after)
+    }
+
+    fn record_backend_metrics(&mut self, metrics: VirtioNetworkBackendMetrics) {
+        match self {
+            Self::AvailableRing {
+                completed_dispatch, ..
+            }
+            | Self::EmptyDescriptorChain {
+                completed_dispatch, ..
+            }
+            | Self::UsedRing {
+                completed_dispatch, ..
+            } => completed_dispatch.record_backend_metrics(metrics),
+            Self::FrameMetadataAllocation { .. } => {}
+        }
     }
 }
 
@@ -3567,6 +4970,51 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
 
         dispatch
     }
+}
+
+impl VirtioNetworkMmioHandler {
+    pub fn attach_network_metrics(&mut self, metrics: SharedNetworkInterfaceMetrics) {
+        self.device_config_handler_mut()
+            .attach_metrics(metrics.clone());
+        self.activation_handler_mut().attach_metrics(metrics);
+    }
+
+    pub fn attach_network_metrics_with_aggregate(
+        &mut self,
+        interface: SharedNetworkInterfaceMetrics,
+        aggregate: SharedNetworkInterfaceMetrics,
+    ) {
+        self.device_config_handler_mut()
+            .attach_metrics_with_aggregate(interface.clone(), aggregate.clone());
+        self.activation_handler_mut()
+            .attach_metrics_with_aggregate(interface, aggregate);
+    }
+}
+
+pub fn attach_network_metrics_to_mmio_handler(
+    dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    interface: SharedNetworkInterfaceMetrics,
+    aggregate: SharedNetworkInterfaceMetrics,
+) -> Result<(), MmioHandlerLookupError> {
+    dispatcher
+        .handler_mut::<VirtioNetworkMmioHandler>(region_id)?
+        .attach_network_metrics_with_aggregate(interface, aggregate);
+    Ok(())
+}
+
+/// Returns the guest-acknowledged feature bitmap for one MMIO network device.
+///
+/// Signed transport conformance tests use this narrow diagnostic instead of
+/// exposing the dispatcher-owned concrete handler.
+pub fn network_mmio_driver_features(
+    mmio_dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+) -> Result<u64, MmioHandlerLookupError> {
+    Ok(mmio_dispatcher
+        .handler_mut::<VirtioNetworkMmioHandler>(region_id)?
+        .device_registers()
+        .driver_features())
 }
 
 impl VirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice> {
@@ -3715,7 +5163,13 @@ impl VirtioMmioDeviceActivationHandler for VirtioNetworkDevice {
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMmioDeviceActivationError> {
-        self.activate_network(activation).map_err(Into::into)
+        let result = self.activate_network(activation);
+        if result.is_err()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_activation_failure();
+        }
+        result.map_err(Into::into)
     }
 
     fn reset(&mut self) {
@@ -3727,11 +5181,18 @@ impl VirtioMmioDeviceActivationHandler for VirtioNetworkDevice {
 pub struct NetworkDeviceProfile {
     guest_mac: Option<GuestMacAddress>,
     mtu: Option<u16>,
+    packet_envelope: VirtioNetworkPacketEnvelope,
+    feature_capabilities: VirtioNetworkFeatureCapabilities,
 }
 
 impl NetworkDeviceProfile {
     pub const fn new(guest_mac: Option<GuestMacAddress>, mtu: Option<u16>) -> Self {
-        Self { guest_mac, mtu }
+        Self {
+            guest_mac,
+            mtu,
+            packet_envelope: VirtioNetworkPacketEnvelope::RawEthernet,
+            feature_capabilities: VirtioNetworkFeatureCapabilities::complete_software(),
+        }
     }
 
     pub const fn from_config(config: &NetworkInterfaceConfig) -> Self {
@@ -3745,6 +5206,30 @@ impl NetworkDeviceProfile {
     pub const fn mtu(&self) -> Option<u16> {
         self.mtu
     }
+
+    pub const fn packet_envelope(&self) -> VirtioNetworkPacketEnvelope {
+        self.packet_envelope
+    }
+
+    pub const fn feature_capabilities(&self) -> VirtioNetworkFeatureCapabilities {
+        self.feature_capabilities
+    }
+
+    pub const fn with_packet_envelope(
+        mut self,
+        packet_envelope: VirtioNetworkPacketEnvelope,
+    ) -> Self {
+        self.packet_envelope = packet_envelope;
+        self
+    }
+
+    pub const fn with_feature_capabilities(
+        mut self,
+        feature_capabilities: VirtioNetworkFeatureCapabilities,
+    ) -> Self {
+        self.feature_capabilities = feature_capabilities;
+        self
+    }
 }
 
 impl fmt::Debug for NetworkDeviceProfile {
@@ -3753,6 +5238,8 @@ impl fmt::Debug for NetworkDeviceProfile {
             .debug_struct("NetworkDeviceProfile")
             .field("guest_mac", &self.guest_mac.map(|_| "<configured>"))
             .field("mtu", &self.mtu.map(|_| "<configured>"))
+            .field("packet_envelope", &self.packet_envelope)
+            .field("feature_capabilities", &self.feature_capabilities)
             .finish()
     }
 }
@@ -3777,7 +5264,11 @@ impl PreparedNetworkDevice {
         Self {
             iface_id: config.iface_id().to_string(),
             host_dev_name: config.host_dev_name().to_string(),
-            config_space: VirtioNetworkConfigSpace::new(profile.guest_mac(), profile.mtu()),
+            config_space: VirtioNetworkConfigSpace::with_feature_capabilities(
+                profile.guest_mac(),
+                profile.mtu(),
+                profile.feature_capabilities(),
+            ),
             device: VirtioNetworkDevice::with_rate_limiters(
                 config.rx_rate_limiter(),
                 config.tx_rate_limiter(),
@@ -3793,12 +5284,28 @@ impl PreparedNetworkDevice {
         &self.host_dev_name
     }
 
-    pub const fn config_space(&self) -> VirtioNetworkConfigSpace {
-        self.config_space
+    pub fn config_space(&self) -> VirtioNetworkConfigSpace {
+        self.config_space.clone()
     }
 
     pub const fn device(&self) -> &VirtioNetworkDevice {
         &self.device
+    }
+
+    pub fn attach_metrics(&mut self, metrics: SharedNetworkInterfaceMetrics) {
+        self.config_space.attach_metrics(metrics.clone());
+        self.device.attach_metrics(metrics);
+    }
+
+    pub fn attach_metrics_with_aggregate(
+        &mut self,
+        interface: SharedNetworkInterfaceMetrics,
+        aggregate: SharedNetworkInterfaceMetrics,
+    ) {
+        self.config_space
+            .attach_metrics_with_aggregate(interface.clone(), aggregate.clone());
+        self.device
+            .attach_metrics_with_aggregate(interface, aggregate);
     }
 
     pub fn into_parts(
@@ -4394,6 +5901,8 @@ pub struct VirtioNetworkDeviceNotificationDispatch {
     rx_queue_dispatch: Option<VirtioNetworkRxQueueDispatch>,
     tx_queue_dispatch: Option<VirtioNetworkTxQueueDispatch>,
     post_tx_rx_queue_dispatch: Option<VirtioNetworkRxQueueDispatch>,
+    rx_rate_limiter_event: bool,
+    tx_rate_limiter_event: bool,
 }
 
 impl VirtioNetworkDeviceNotificationDispatch {
@@ -4408,7 +5917,19 @@ impl VirtioNetworkDeviceNotificationDispatch {
             rx_queue_dispatch,
             tx_queue_dispatch,
             post_tx_rx_queue_dispatch,
+            rx_rate_limiter_event: false,
+            tx_rate_limiter_event: false,
         }
+    }
+
+    const fn with_rate_limiter_events(
+        mut self,
+        rx_rate_limiter_event: bool,
+        tx_rate_limiter_event: bool,
+    ) -> Self {
+        self.rx_rate_limiter_event = rx_rate_limiter_event;
+        self.tx_rate_limiter_event = tx_rate_limiter_event;
+        self
     }
 
     pub fn drained_notifications(&self) -> &[usize] {
@@ -4425,6 +5946,14 @@ impl VirtioNetworkDeviceNotificationDispatch {
 
     pub const fn post_tx_rx_queue_dispatch(&self) -> Option<&VirtioNetworkRxQueueDispatch> {
         self.post_tx_rx_queue_dispatch.as_ref()
+    }
+
+    pub const fn rx_rate_limiter_event(&self) -> bool {
+        self.rx_rate_limiter_event
+    }
+
+    pub const fn tx_rate_limiter_event(&self) -> bool {
+        self.tx_rate_limiter_event
     }
 
     pub fn needs_queue_interrupt(&self) -> bool {
@@ -5018,8 +6547,16 @@ fn active_network_queue_state(
     Ok(queue)
 }
 
-fn virtio_feature_enabled(features: u64, feature: u32) -> bool {
+const fn virtio_feature_enabled(features: u64, feature: u32) -> bool {
     features & (1_u64 << feature) != 0
+}
+
+const fn usize_to_u64_saturating(value: usize) -> u64 {
+    if value > u64::MAX as usize {
+        u64::MAX
+    } else {
+        value as u64
+    }
 }
 
 impl FromStr for GuestMacAddress {
@@ -5398,17 +6935,21 @@ mod tests {
         NetworkRateLimiterConfig, NetworkRuntimeMutationError, NetworkTokenBucketConfig,
         PreparedNetworkDeviceError, PreparedNetworkDevices, VIRTIO_FEATURE_VERSION_1,
         VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_CONFIG_MTU_OFFSET, VIRTIO_NET_CONFIG_MTU_SIZE,
-        VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU, VIRTIO_NET_MAX_BUFFER_SIZE,
-        VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE,
-        VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX,
-        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace, VirtioNetworkDevice,
-        VirtioNetworkDeviceActivationError, VirtioNetworkDeviceNotificationError,
-        VirtioNetworkMmioHandler, VirtioNetworkRateLimiter, VirtioNetworkRxBuffer,
-        VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-        VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
-        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketCommit,
-        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+        VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_CSUM, VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_GUEST_TSO4,
+        VIRTIO_NET_F_GUEST_TSO6, VIRTIO_NET_F_GUEST_UFO, VIRTIO_NET_F_HOST_TSO4,
+        VIRTIO_NET_F_HOST_TSO6, VIRTIO_NET_F_HOST_UFO, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF,
+        VIRTIO_NET_F_MTU, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU,
+        VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES,
+        VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
+        VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkBackendMetrics, VirtioNetworkConfigSpace,
+        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
+        VirtioNetworkDeviceNotificationError, VirtioNetworkFeatureCapabilities,
+        VirtioNetworkLatencyAggregate, VirtioNetworkMmioHandler, VirtioNetworkPacketEnvelope,
+        VirtioNetworkRateLimiter, VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError,
+        VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
+        VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
+        VirtioNetworkTxPacketCommit, VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
         VirtioNetworkTxPacketSinkError, VirtioNetworkTxPacketStage, VirtioNetworkTxQueue,
         VirtioNetworkTxQueueDispatchError,
     };
@@ -5458,6 +6999,13 @@ mod tests {
 
     fn virtio_feature_bit(feature: u32) -> u64 {
         1_u64 << feature
+    }
+
+    #[test]
+    fn empty_network_latency_aggregate_is_canonical() {
+        let aggregate = VirtioNetworkLatencyAggregate::new(7, 11, 18, 0);
+
+        assert_eq!(aggregate, VirtioNetworkLatencyAggregate::default());
     }
 
     fn mmio_access(offset: u64, len: usize) -> MmioAccess {
@@ -5519,11 +7067,11 @@ mod tests {
     }
 
     fn read_network_config(
-        config: VirtioNetworkConfigSpace,
+        config: &VirtioNetworkConfigSpace,
         offset: u64,
         len: usize,
     ) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
-        network_handler(config)
+        network_handler(config.clone())
             .read_access(mmio_access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset, len))
     }
 
@@ -5763,6 +7311,41 @@ mod tests {
         );
     }
 
+    fn configure_network_handler_queues_with_features(
+        handler: &mut VirtioNetworkMmioHandler,
+        features: u32,
+    ) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("status should accept ACKNOWLEDGE");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("status should accept DRIVER");
+        handler
+            .write_register(VirtioMmioRegister::DriverFeatures, features)
+            .expect("network feature selection should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("status should accept FEATURES_OK");
+        configure_network_handler_queue(
+            handler,
+            VIRTIO_NET_RX_QUEUE_INDEX
+                .try_into()
+                .expect("RX queue index should fit"),
+            TEST_QUEUE_SIZE,
+        );
+        configure_network_handler_queue(
+            handler,
+            VIRTIO_NET_TX_QUEUE_INDEX
+                .try_into()
+                .expect("TX queue index should fit"),
+            TEST_QUEUE_SIZE,
+        );
+    }
+
     fn configure_network_handler_queues_with_event_idx(handler: &mut VirtioNetworkMmioHandler) {
         put_network_handler_in_queue_config_state_with_event_idx(handler);
         configure_network_handler_queue(
@@ -5855,26 +7438,29 @@ mod tests {
         detour_successes: bool,
         frame_heads: Vec<u16>,
         packets: Vec<Vec<u8>>,
+        backend_metrics: VirtioNetworkBackendMetrics,
     }
 
     impl RecordingTxPacketSink {
-        const fn failing_on(fail_on_call: usize) -> Self {
+        fn failing_on(fail_on_call: usize) -> Self {
             Self {
                 calls: 0,
                 fail_on_call: Some(fail_on_call),
                 detour_successes: false,
                 frame_heads: Vec::new(),
                 packets: Vec::new(),
+                backend_metrics: VirtioNetworkBackendMetrics::default(),
             }
         }
 
-        const fn detouring() -> Self {
+        fn detouring() -> Self {
             Self {
                 calls: 0,
                 fail_on_call: None,
                 detour_successes: true,
                 frame_heads: Vec::new(),
                 packets: Vec::new(),
+                backend_metrics: VirtioNetworkBackendMetrics::default(),
             }
         }
     }
@@ -5920,6 +7506,35 @@ mod tests {
             } else {
                 Ok(VirtioNetworkTxPacketDisposition::Forwarded)
             }
+        }
+
+        fn transmit_prepared_frame(
+            &mut self,
+            _memory: &GuestMemory,
+            frame: &VirtioNetworkTxFrame,
+            packet: &crate::network_packet::VirtioNetworkPacketPlan,
+        ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+            self.calls += 1;
+            self.frame_heads.push(frame.descriptor_head());
+            if self.fail_on_call == Some(self.calls) {
+                return Err(VirtioNetworkTxPacketSinkError::new(format!(
+                    "test sink failure on call {}",
+                    self.calls
+                )));
+            }
+            let emitted = packet
+                .emit(VirtioNetworkPacketEnvelope::RawEthernet)
+                .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+            self.packets.push(emitted.bytes().to_vec());
+            if self.detour_successes {
+                Ok(VirtioNetworkTxPacketDisposition::Detoured)
+            } else {
+                Ok(VirtioNetworkTxPacketDisposition::Forwarded)
+            }
+        }
+
+        fn take_backend_metrics(&mut self) -> VirtioNetworkBackendMetrics {
+            std::mem::take(&mut self.backend_metrics)
         }
     }
 
@@ -6009,6 +7624,27 @@ mod tests {
             })
         }
 
+        fn stage_prepared_frame(
+            &mut self,
+            _memory: &GuestMemory,
+            frame: &VirtioNetworkTxFrame,
+            packet: &crate::network_packet::VirtioNetworkPacketPlan,
+        ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+            assert!(self.staged.is_none(), "only one frame may be staged");
+            let emitted = packet
+                .emit(VirtioNetworkPacketEnvelope::RawEthernet)
+                .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+            let descriptor_head = frame.descriptor_head();
+            self.events.push(format!("stage:{descriptor_head}"));
+            self.staged = Some(StagedRecordingTxFrame {
+                descriptor_head,
+                packet: emitted.bytes().to_vec(),
+            });
+            Ok(VirtioNetworkTxPacketStage::Staged {
+                flush_before_commit: self.flush_before_heads.contains(&descriptor_head),
+            })
+        }
+
         fn commit_staged_frame(&mut self) -> VirtioNetworkTxPacketCommit {
             let staged = self.staged.take().expect("a test frame should be staged");
             self.events
@@ -6074,6 +7710,7 @@ mod tests {
         retry_after_tx_hint: bool,
         empty_peeks_before_packets: usize,
         empty_peeks_after_first_consume: usize,
+        backend_metrics: VirtioNetworkBackendMetrics,
     }
 
     impl RecordingRxPacketSource {
@@ -6087,6 +7724,7 @@ mod tests {
                 retry_after_tx_hint: false,
                 empty_peeks_before_packets: 0,
                 empty_peeks_after_first_consume: 0,
+                backend_metrics: VirtioNetworkBackendMetrics::default(),
             }
         }
 
@@ -6100,6 +7738,7 @@ mod tests {
                 retry_after_tx_hint: false,
                 empty_peeks_before_packets: 0,
                 empty_peeks_after_first_consume: 0,
+                backend_metrics: VirtioNetworkBackendMetrics::default(),
             }
         }
 
@@ -6153,6 +7792,10 @@ mod tests {
                 self.empty_peeks_after_first_consume = 0;
             }
         }
+
+        fn take_backend_metrics(&mut self) -> VirtioNetworkBackendMetrics {
+            std::mem::take(&mut self.backend_metrics)
+        }
     }
 
     fn tx_frame_memory() -> GuestMemory {
@@ -6165,6 +7808,12 @@ mod tests {
     }
 
     fn write_tx_header(memory: &mut GuestMemory, address: GuestAddress) {
+        memory
+            .write_slice(&[0; VIRTIO_NET_TX_HEADER_SIZE as usize], address)
+            .expect("virtio-net TX header should write");
+    }
+
+    fn write_nonzero_tx_header(memory: &mut GuestMemory, address: GuestAddress) {
         let mut bytes = [0; VIRTIO_NET_TX_HEADER_SIZE as usize];
         let (flags, tail) = bytes.split_at_mut(1);
         let (gso_type, tail) = tail.split_at_mut(1);
@@ -7761,7 +9410,8 @@ mod tests {
             .expect("prepared network device should exist");
         let base_features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
-            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
+            | VirtioNetworkFeatureCapabilities::complete_software().feature_bits();
 
         assert_eq!(devices.len(), 1);
         assert_eq!(device.iface_id(), "eth0");
@@ -7792,6 +9442,7 @@ mod tests {
             virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
                 | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
                 | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
+                | VirtioNetworkFeatureCapabilities::complete_software().feature_bits()
                 | virtio_feature_bit(VIRTIO_NET_F_MAC)
         );
         assert!(!device.device().is_activated());
@@ -7818,6 +9469,7 @@ mod tests {
             virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
                 | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
                 | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
+                | VirtioNetworkFeatureCapabilities::complete_software().feature_bits()
                 | virtio_feature_bit(VIRTIO_NET_F_MTU)
         );
         assert!(!device.device().is_activated());
@@ -7985,6 +9637,112 @@ mod tests {
                 .tx_rate_limiter()
                 .expect("second TX limiter should exist"),
             &initial
+        );
+    }
+
+    #[test]
+    fn virtio_network_feature_capabilities_support_independent_safe_downgrades() {
+        let complete = VirtioNetworkFeatureCapabilities::complete_software();
+        let downgraded = [
+            (
+                VIRTIO_NET_F_CSUM,
+                complete
+                    .with_checksum(false)
+                    .with_host_tso4(false)
+                    .with_host_tso6(false)
+                    .with_host_ufo(false),
+            ),
+            (
+                VIRTIO_NET_F_GUEST_CSUM,
+                complete
+                    .with_guest_checksum(false)
+                    .with_guest_tso4(false)
+                    .with_guest_tso6(false)
+                    .with_guest_ufo(false),
+            ),
+            (VIRTIO_NET_F_GUEST_TSO4, complete.with_guest_tso4(false)),
+            (VIRTIO_NET_F_GUEST_TSO6, complete.with_guest_tso6(false)),
+            (VIRTIO_NET_F_GUEST_UFO, complete.with_guest_ufo(false)),
+            (VIRTIO_NET_F_HOST_TSO4, complete.with_host_tso4(false)),
+            (VIRTIO_NET_F_HOST_TSO6, complete.with_host_tso6(false)),
+            (VIRTIO_NET_F_HOST_UFO, complete.with_host_ufo(false)),
+            (
+                VIRTIO_NET_F_MRG_RXBUF,
+                complete.with_merged_rx_buffers(false),
+            ),
+        ];
+
+        for (disabled_feature, capabilities) in downgraded {
+            assert!(capabilities.is_dependency_complete());
+            assert!(!capabilities.supports(disabled_feature));
+            let config =
+                VirtioNetworkConfigSpace::with_feature_capabilities(None, None, capabilities);
+            assert_eq!(
+                config.available_features() & virtio_feature_bit(disabled_feature),
+                0
+            );
+        }
+        assert!(complete.checksum());
+        assert!(complete.guest_checksum());
+        assert!(complete.guest_tso4());
+        assert!(complete.guest_tso6());
+        assert!(complete.guest_ufo());
+        assert!(complete.host_tso4());
+        assert!(complete.host_tso6());
+        assert!(complete.host_ufo());
+        assert!(complete.merged_rx_buffers());
+    }
+
+    #[test]
+    fn virtio_network_feature_capabilities_safely_downgrade_incomplete_dependencies() {
+        let missing_checksum = VirtioNetworkFeatureCapabilities::none().with_host_tso4(true);
+        let missing_guest_checksum = VirtioNetworkFeatureCapabilities::none().with_guest_ufo(true);
+
+        assert!(!missing_checksum.is_dependency_complete());
+        assert!(!missing_guest_checksum.is_dependency_complete());
+        assert_eq!(
+            VirtioNetworkConfigSpace::with_feature_capabilities(None, None, missing_checksum)
+                .available_features()
+                & virtio_feature_bit(VIRTIO_NET_F_HOST_TSO4),
+            0
+        );
+        let profile = NetworkDeviceProfile::new(Some(test_guest_mac()), None)
+            .with_feature_capabilities(missing_guest_checksum);
+        assert_eq!(
+            VirtioNetworkConfigSpace::with_feature_capabilities(
+                profile.guest_mac(),
+                profile.mtu(),
+                profile.feature_capabilities(),
+            )
+            .available_features()
+                & virtio_feature_bit(VIRTIO_NET_F_GUEST_UFO),
+            0
+        );
+    }
+
+    #[test]
+    fn network_device_profile_freezes_envelope_and_feature_matrix() {
+        let capabilities = VirtioNetworkFeatureCapabilities::complete_software()
+            .with_host_ufo(false)
+            .with_guest_ufo(false);
+        let profile = NetworkDeviceProfile::new(Some(test_guest_mac()), None)
+            .with_packet_envelope(VirtioNetworkPacketEnvelope::DirectVirtioHeader)
+            .with_feature_capabilities(capabilities);
+
+        assert_eq!(
+            profile.packet_envelope(),
+            VirtioNetworkPacketEnvelope::DirectVirtioHeader
+        );
+        assert_eq!(profile.feature_capabilities(), capabilities);
+        assert!(
+            !profile
+                .feature_capabilities()
+                .supports(VIRTIO_NET_F_HOST_UFO)
+        );
+        assert!(
+            !profile
+                .feature_capabilities()
+                .supports(VIRTIO_NET_F_GUEST_UFO)
         );
     }
 
@@ -8513,7 +10271,7 @@ mod tests {
     #[test]
     fn virtio_network_tx_frame_parser_accepts_single_descriptor_frame() {
         let mut memory = tx_frame_memory();
-        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_nonzero_tx_header(&mut memory, TEST_TX_HEADER);
         let chain = tx_descriptor_chain(
             &mut memory,
             &[TestDescriptor::readable(
@@ -9063,7 +10821,8 @@ mod tests {
     fn virtio_network_config_space_tracks_configured_features() {
         let base_features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
-            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
+            | VirtioNetworkFeatureCapabilities::complete_software().feature_bits();
         let without_mac = VirtioNetworkConfigSpace::new(None, None);
         let with_mac = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
         let with_mtu = VirtioNetworkConfigSpace::new(None, Some(1500));
@@ -9096,31 +10855,31 @@ mod tests {
         let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
 
         assert_eq!(
-            read_network_config(config, 0, 4)
+            read_network_config(&config, 0, 4)
                 .expect("low MAC config word should read")
                 .as_slice(),
             &[0x12, 0x34, 0x56, 0x78]
         );
         assert_eq!(
-            read_network_config(config, 4, 2)
+            read_network_config(&config, 4, 2)
                 .expect("high MAC config halfword should read")
                 .as_slice(),
             &[0x9a, 0xbc]
         );
         assert_eq!(
-            read_network_config(config, 1, 2)
+            read_network_config(&config, 1, 2)
                 .expect("partial MAC config read should succeed")
                 .as_slice(),
             &[0x34, 0x56]
         );
         assert_eq!(
-            read_network_config(config, 5, 1)
+            read_network_config(&config, 5, 1)
                 .expect("last MAC byte should read")
                 .as_slice(),
             &[0xbc]
         );
         assert_eq!(
-            read_network_config(config, 2, 4)
+            read_network_config(&config, 2, 4)
                 .expect("read ending at MAC boundary should succeed")
                 .as_slice(),
             &[0x56, 0x78, 0x9a, 0xbc]
@@ -9134,7 +10893,7 @@ mod tests {
 
         assert_eq!(
             read_network_config(
-                config,
+                &config,
                 VIRTIO_NET_CONFIG_MTU_OFFSET,
                 VIRTIO_NET_CONFIG_MTU_SIZE
             )
@@ -9143,13 +10902,13 @@ mod tests {
             &mtu_bytes
         );
         assert_eq!(
-            read_network_config(config, VIRTIO_NET_CONFIG_MTU_OFFSET, 1)
+            read_network_config(&config, VIRTIO_NET_CONFIG_MTU_OFFSET, 1)
                 .expect("low MTU byte should read")
                 .as_slice(),
             &mtu_bytes[0..1]
         );
         assert_eq!(
-            read_network_config(config, VIRTIO_NET_CONFIG_MTU_OFFSET + 1, 1)
+            read_network_config(&config, VIRTIO_NET_CONFIG_MTU_OFFSET + 1, 1)
                 .expect("high MTU byte should read")
                 .as_slice(),
             &mtu_bytes[1..2]
@@ -9161,20 +10920,20 @@ mod tests {
         let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
 
         assert_eq!(
-            read_network_config(VirtioNetworkConfigSpace::new(None, None), 0, 1),
+            read_network_config(&VirtioNetworkConfigSpace::new(None, None), 0, 1),
             Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 0, len: 1 })
         );
         assert_eq!(
-            read_network_config(config, 6, 1),
+            read_network_config(&config, 6, 1),
             Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 6, len: 1 })
         );
         assert_eq!(
-            read_network_config(config, 5, 2),
+            read_network_config(&config, 5, 2),
             Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 5, len: 2 })
         );
         assert_eq!(
             read_network_config(
-                config,
+                &config,
                 VIRTIO_NET_CONFIG_MTU_OFFSET,
                 VIRTIO_NET_CONFIG_MTU_SIZE
             ),
@@ -9187,7 +10946,7 @@ mod tests {
         );
         assert_eq!(
             read_network_config(
-                VirtioNetworkConfigSpace::new(None, Some(1500)),
+                &VirtioNetworkConfigSpace::new(None, Some(1500)),
                 VIRTIO_NET_CONFIG_MTU_OFFSET - 1,
                 VIRTIO_NET_CONFIG_MTU_SIZE,
             ),
@@ -9200,7 +10959,7 @@ mod tests {
         );
         assert_eq!(
             read_network_config(
-                VirtioNetworkConfigSpace::new(None, Some(1500)),
+                &VirtioNetworkConfigSpace::new(None, Some(1500)),
                 VIRTIO_NET_CONFIG_MTU_OFFSET,
                 VIRTIO_NET_CONFIG_MTU_SIZE + 2,
             ),
@@ -9226,9 +10985,52 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_transport_records_config_and_activation_failures_at_source() {
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
+        let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
+            VIRTIO_NET_DEVICE_ID,
+            config.available_features(),
+            &VIRTIO_NET_QUEUE_SIZES,
+            config,
+            VirtioNetworkDevice::new(),
+        )
+        .expect("instrumented network handler should build");
+        handler.attach_network_metrics(metrics.clone());
+
+        assert!(
+            handler
+                .read_access(mmio_access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 6, 1))
+                .is_err()
+        );
+        put_network_handler_in_queue_config_state(&mut handler);
+        assert!(
+            handler
+                .write_access(
+                    mmio_access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 1),
+                    MmioAccessBytes::new(&[1]).expect("one config byte should encode"),
+                )
+                .is_err()
+        );
+        assert!(
+            handler
+                .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+                .is_err(),
+            "missing queue configuration should fail activation"
+        );
+
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_cfg_fails(2)
+                .with_activate_fails(1)
+        );
+    }
+
+    #[test]
     fn virtio_network_config_space_runs_through_mmio_register_handler() {
         let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
-        let mut handler = network_handler(config);
+        let mut handler = network_handler(config.clone());
 
         assert_eq!(handler.device_registers().device_id(), VIRTIO_NET_DEVICE_ID);
         assert_eq!(
@@ -9686,7 +11488,7 @@ mod tests {
         assert_eq!(read_rx_used_element(&memory, 0), (0, rx_used_len(4)));
         assert_eq!(
             read_guest_bytes(&memory, TEST_RX_BUFFER, VIRTIO_NET_TX_HEADER_SIZE as usize),
-            vec![0; VIRTIO_NET_TX_HEADER_SIZE as usize]
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]
         );
         assert_eq!(
             read_guest_bytes(
@@ -9701,6 +11503,300 @@ mod tests {
         assert_eq!(
             read_interrupt_status(&handler),
             DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn virtio_network_merged_rx_publishes_complete_chain_set_with_exact_header() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let packet = (0_u8..20).collect::<Vec<_>>();
+        let mut source = RecordingRxPacketSource::with_packets(vec![packet.clone()]);
+
+        configure_network_handler_queues_with_features(
+            &mut handler,
+            (1_u32 << VIRTIO_NET_F_MRG_RXBUF) | (1_u32 << VIRTIO_RING_FEATURE_EVENT_IDX),
+        );
+        activate_network_handler(&mut handler);
+        write_rx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::writable(TEST_RX_BUFFER, 16, None),
+                TestDescriptor::writable(TEST_RX_SECOND_BUFFER, 16, None),
+            ],
+        );
+        write_rx_available_heads(&mut memory, &[0, 1]);
+        write_rx_available_used_event(&mut memory, 1);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_RX_QUEUE_INDEX
+                    .try_into()
+                    .expect("RX queue index should fit"),
+            )
+            .expect("RX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("merged RX packet should dispatch");
+        let dispatch = notification
+            .rx_queue_dispatch()
+            .expect("merged RX dispatch should be present");
+
+        assert_eq!(dispatch.processed_buffers(), 2);
+        assert_eq!(dispatch.delivered_packets(), 1);
+        let delivery = dispatch
+            .deliveries()
+            .first()
+            .expect("merged RX delivery should be recorded");
+        assert_eq!(delivery.buffer_count(), 2);
+        assert_eq!(delivery.bytes_written_to_guest(), 32);
+        assert_eq!(source.consume_calls, 1);
+        assert_eq!(read_rx_used_index(&memory), 2);
+        assert_eq!(read_rx_used_element(&memory, 0), (0, 16));
+        assert_eq!(read_rx_used_element(&memory, 1), (1, 16));
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_RX_BUFFER, 12),
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0]
+        );
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_RX_BUFFER
+                    .checked_add(12)
+                    .expect("first merged payload address should fit"),
+                4,
+            ),
+            packet
+                .get(..4)
+                .expect("first merged packet prefix should exist")
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_RX_SECOND_BUFFER, 16),
+            packet
+                .get(4..)
+                .expect("second merged packet suffix should exist")
+        );
+        assert!(dispatch.needs_queue_interrupt());
+        assert!(notification.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn virtio_network_merged_rx_delivers_maximum_packet_through_indirect_event_idx_chains() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let packet_len =
+            usize::try_from(VIRTIO_NET_MAX_BUFFER_SIZE - u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                .expect("maximum merged RX payload should fit usize");
+        let packet = vec![0xa5; packet_len];
+        let mut source = RecordingRxPacketSource::with_packets(vec![packet]);
+        let first_len = 32_781_u32;
+        let second_len = 32_781_u32;
+
+        configure_network_handler_queues_with_features(
+            &mut handler,
+            (1_u32 << VIRTIO_NET_F_MRG_RXBUF)
+                | (1_u32 << VIRTIO_RING_FEATURE_EVENT_IDX)
+                | (1_u32 << VIRTIO_RING_FEATURE_INDIRECT_DESC),
+        );
+        activate_network_handler(&mut handler);
+        write_indirect_descriptor_chain(
+            &mut memory,
+            TEST_RX_DESCRIPTOR_TABLE,
+            TEST_RX_INDIRECT_DESCRIPTOR_TABLE,
+            0,
+            &[TestDescriptor::writable(TEST_RX_BUFFER, first_len, None)],
+        );
+        write_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(TEST_RX_SECOND_BUFFER, second_len, None),
+        );
+        write_rx_available_heads(&mut memory, &[0, 1]);
+        write_rx_available_used_event(&mut memory, 1);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_RX_QUEUE_INDEX
+                    .try_into()
+                    .expect("RX queue index should fit"),
+            )
+            .expect("merged RX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("maximum indirect merged RX packet should dispatch");
+        let dispatch = notification
+            .rx_queue_dispatch()
+            .expect("maximum merged RX dispatch should be present");
+
+        assert_eq!(dispatch.processed_buffers(), 2);
+        assert_eq!(dispatch.delivered_packets(), 1);
+        assert_eq!(dispatch.deliveries()[0].buffer_count(), 2);
+        assert_eq!(
+            dispatch.deliveries()[0].bytes_written_to_guest(),
+            u32::try_from(VIRTIO_NET_MAX_BUFFER_SIZE).expect("RX maximum should fit u32")
+        );
+        assert_eq!(source.consume_calls, 1);
+        assert_eq!(read_rx_used_index(&memory), 2);
+        assert_eq!(read_rx_used_element(&memory, 0), (0, first_len));
+        assert_eq!(read_rx_used_element(&memory, 1), (1, second_len));
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_RX_BUFFER, 12),
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0]
+        );
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_RX_SECOND_BUFFER
+                    .checked_add(u64::from(second_len - 4))
+                    .expect("last merged RX bytes should fit"),
+                4,
+            ),
+            [0xa5; 4]
+        );
+        assert!(dispatch.needs_queue_interrupt());
+        assert!(notification.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn virtio_network_merged_rx_missing_capacity_restores_all_pops_and_retains_source() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source = RecordingRxPacketSource::with_packets(vec![vec![0x5a; 20]]);
+
+        configure_network_handler_queues_with_features(
+            &mut handler,
+            1_u32 << VIRTIO_NET_F_MRG_RXBUF,
+        );
+        activate_network_handler(&mut handler);
+        memory
+            .write_slice(&[0xa5; 16], TEST_RX_BUFFER)
+            .expect("RX sentinel should write");
+        write_rx_descriptors(
+            &mut memory,
+            &[TestDescriptor::writable(TEST_RX_BUFFER, 16, None)],
+        );
+        write_rx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_RX_QUEUE_INDEX
+                    .try_into()
+                    .expect("RX queue index should fit"),
+            )
+            .expect("RX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("missing merged RX capacity should remain retryable");
+        let dispatch = notification
+            .rx_queue_dispatch()
+            .expect("merged RX dispatch should be present");
+
+        assert_eq!(dispatch.processed_buffers(), 0);
+        assert_eq!(dispatch.delivered_packets(), 0);
+        assert_eq!(dispatch.no_available_buffers(), 1);
+        assert_eq!(source.consume_calls, 0);
+        assert_eq!(source.remaining_packets(), 1);
+        assert_eq!(read_rx_used_index(&memory), 0);
+        assert_eq!(read_guest_bytes(&memory, TEST_RX_BUFFER, 16), [0xa5; 16]);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .active_rx_dispatch_queue()
+                .expect("RX queue should remain active")
+                .available_ring()
+                .next_avail(),
+            0
+        );
+    }
+
+    #[test]
+    fn virtio_network_merged_rx_malformed_later_chain_rolls_back_before_guest_write() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source = RecordingRxPacketSource::with_packets(vec![vec![0x5a; 20]]);
+
+        configure_network_handler_queues_with_features(
+            &mut handler,
+            1_u32 << VIRTIO_NET_F_MRG_RXBUF,
+        );
+        activate_network_handler(&mut handler);
+        memory
+            .write_slice(&[0xa5; 16], TEST_RX_BUFFER)
+            .expect("first RX sentinel should write");
+        memory
+            .write_slice(&[0xb5; 8], TEST_RX_SECOND_BUFFER)
+            .expect("second RX sentinel should write");
+        write_rx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::writable(TEST_RX_BUFFER, 16, None),
+                TestDescriptor::writable(TEST_RX_SECOND_BUFFER, 8, None),
+            ],
+        );
+        write_rx_available_heads(&mut memory, &[0, 1]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_RX_QUEUE_INDEX
+                    .try_into()
+                    .expect("RX queue index should fit"),
+            )
+            .expect("RX notification should write");
+
+        let error = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect_err("malformed later merged chain should fail");
+
+        assert!(matches!(
+            &error,
+            VirtioNetworkDeviceNotificationError::RxQueueDispatch {
+                source: VirtioNetworkRxQueueDispatchError::BufferParse {
+                    descriptor_head: 1,
+                    source: VirtioNetworkRxBufferParseError::BufferTooSmall { len: 8, min: 12 },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(source.consume_calls, 0);
+        assert_eq!(source.remaining_packets(), 1);
+        assert_eq!(read_rx_used_index(&memory), 0);
+        assert_eq!(read_guest_bytes(&memory, TEST_RX_BUFFER, 16), [0xa5; 16]);
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_RX_SECOND_BUFFER, 8),
+            [0xb5; 8]
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .active_rx_dispatch_queue()
+                .expect("RX queue should remain active")
+                .available_ring()
+                .next_avail(),
+            0
         );
     }
 
@@ -9747,9 +11843,76 @@ mod tests {
         assert_eq!(read_guest_bytes(&memory, TEST_RX_BUFFER, 8), vec![0; 8]);
         assert_eq!(
             read_guest_bytes(&memory, TEST_RX_SECOND_BUFFER, 7),
-            vec![0, 0, 0, 0, 0xa1, 0xa2, 0xa3]
+            vec![0, 0, 1, 0, 0xa1, 0xa2, 0xa3]
         );
         assert!(notification.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn virtio_network_non_merged_guest_offloads_require_large_rx_buffer() {
+        for guest_feature in [
+            VIRTIO_NET_F_GUEST_TSO4,
+            VIRTIO_NET_F_GUEST_TSO6,
+            VIRTIO_NET_F_GUEST_UFO,
+        ] {
+            let mut memory = tx_frame_memory();
+            let mut handler = network_activation_handler();
+            let mut sink = RecordingTxPacketSink::default();
+            let mut source = RecordingRxPacketSource::with_packets(vec![vec![0x5a; 4]]);
+
+            configure_network_handler_queues_with_features(
+                &mut handler,
+                (1_u32 << VIRTIO_NET_F_GUEST_CSUM) | (1_u32 << guest_feature),
+            );
+            activate_network_handler(&mut handler);
+            write_rx_descriptors(
+                &mut memory,
+                &[TestDescriptor::writable(
+                    TEST_RX_BUFFER,
+                    u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+                        .expect("legacy RX minimum should fit u32"),
+                    None,
+                )],
+            );
+            write_rx_available_heads(&mut memory, &[0]);
+            handler
+                .write_register(
+                    VirtioMmioRegister::QueueNotify,
+                    VIRTIO_NET_RX_QUEUE_INDEX
+                        .try_into()
+                        .expect("RX queue index should fit"),
+                )
+                .expect("large-minimum RX notification should write");
+
+            let notification = handler
+                .dispatch_network_queue_notifications_with_packet_io(
+                    &mut memory,
+                    &mut sink,
+                    &mut source,
+                )
+                .expect("undersized non-merged buffer should be recorded");
+            let dispatch = notification
+                .rx_queue_dispatch()
+                .expect("large-minimum RX dispatch should be present");
+
+            assert_eq!(dispatch.delivered_packets(), 0, "feature {guest_feature}");
+            assert_eq!(
+                dispatch.buffer_parse_failures(),
+                1,
+                "feature {guest_feature}"
+            );
+            assert!(matches!(
+                dispatch.first_buffer_parse_failure(),
+                Some(VirtioNetworkRxBufferParseError::BufferTooSmall {
+                    len: VIRTIO_NET_RX_MIN_BUFFER_SIZE,
+                    min: VIRTIO_NET_MAX_BUFFER_SIZE,
+                })
+            ));
+            assert_eq!(source.consume_calls, 0, "feature {guest_feature}");
+            assert_eq!(source.remaining_packets(), 1, "feature {guest_feature}");
+            assert_eq!(read_rx_used_index(&memory), 1, "feature {guest_feature}");
+            assert_eq!(read_rx_used_element(&memory, 0), (0, 0));
+        }
     }
 
     #[test]
@@ -9812,7 +11975,7 @@ mod tests {
         );
         assert_eq!(
             read_guest_bytes(&memory, TEST_RX_BUFFER, VIRTIO_NET_TX_HEADER_SIZE as usize),
-            vec![0; VIRTIO_NET_TX_HEADER_SIZE as usize]
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]
         );
         assert_eq!(
             read_guest_bytes(
@@ -10063,6 +12226,7 @@ mod tests {
             metrics.snapshot(),
             NetworkInterfaceMetrics::default()
                 .with_rx_queue_event_count(1)
+                .with_no_rx_avail_buffer(1)
                 .with_rx_fails(1)
         );
         assert_eq!(source.consume_calls, 0);
@@ -10130,6 +12294,7 @@ mod tests {
             metrics.snapshot(),
             NetworkInterfaceMetrics::default()
                 .with_rx_queue_event_count(1)
+                .with_no_rx_avail_buffer(1)
                 .with_rx_fails(1)
         );
         assert_eq!(source.consume_calls, 0);
@@ -10148,6 +12313,9 @@ mod tests {
             usize::try_from(VIRTIO_NET_MAX_BUFFER_SIZE).expect("max packet size should fit usize");
         let mut source =
             RecordingRxPacketSource::with_packets(vec![vec![0x99; oversized_packet_len]]);
+        let mut expected_backend_metrics = VirtioNetworkBackendMetrics::default();
+        expected_backend_metrics.record_vmnet_read(1, Ok(1), Duration::from_micros(11));
+        source.backend_metrics = expected_backend_metrics;
 
         configure_network_handler_queues(&mut handler);
         activate_network_handler(&mut handler);
@@ -10195,6 +12363,12 @@ mod tests {
             .expect("oversized packet error should preserve RX dispatch metadata");
         assert_eq!(completed.processed_buffers(), 0);
         assert_eq!(completed.delivered_packets(), 0);
+        assert_eq!(completed.backend_metrics(), expected_backend_metrics);
+        assert_eq!(
+            source.backend_metrics,
+            VirtioNetworkBackendMetrics::default(),
+            "backend metrics must be consumed by the failing dispatch"
+        );
         assert_eq!(source.consume_calls, 0);
         assert_eq!(source.remaining_packets(), 1);
         assert_eq!(read_rx_used_index(&memory), 0);
@@ -10564,6 +12738,8 @@ mod tests {
                 .with_rx_bytes_count(32)
                 .with_rx_packets_count(2)
                 .with_rx_count(2)
+                .with_rx_rate_limiter_event_count(2)
+                .with_rx_rate_limiter_throttled(2)
         );
     }
 
@@ -10686,10 +12862,14 @@ mod tests {
         assert_eq!(
             metrics.snapshot(),
             NetworkInterfaceMetrics::default()
+                .with_no_tx_avail_buffer(1)
                 .with_tx_queue_event_count(1)
                 .with_tx_bytes_count(32)
                 .with_tx_packets_count(2)
                 .with_tx_count(2)
+                .with_tx_rate_limiter_event_count(2)
+                .with_tx_rate_limiter_throttled(2)
+                .with_tx_remaining_reqs_count(1)
         );
     }
 
@@ -11423,6 +13603,9 @@ mod tests {
         let mut memory = tx_frame_memory();
         let mut handler = network_activation_handler();
         let mut sink = RecordingTxPacketSink::default();
+        let mut expected_backend_metrics = VirtioNetworkBackendMetrics::default();
+        expected_backend_metrics.record_vmnet_write(1, Ok(1), Duration::from_micros(7));
+        sink.backend_metrics = expected_backend_metrics;
 
         configure_network_handler_queues_with_event_idx(&mut handler);
         activate_network_handler(&mut handler);
@@ -11462,6 +13645,12 @@ mod tests {
             .expect("completed TX dispatch metadata should be preserved");
         assert_eq!(completed.processed_frames(), 1);
         assert_eq!(completed.successful_frames(), 1);
+        assert_eq!(completed.backend_metrics(), expected_backend_metrics);
+        assert_eq!(
+            sink.backend_metrics,
+            VirtioNetworkBackendMetrics::default(),
+            "backend metrics must be consumed by the failing dispatch"
+        );
         assert!(!completed.needs_queue_interrupt());
         assert_eq!(read_interrupt_status(&handler), 0);
         assert_eq!(read_tx_used_index(&memory), 1);
@@ -11618,6 +13807,7 @@ mod tests {
                 .with_tx_fails(1)
                 .with_tx_packets_count(2)
                 .with_tx_count(2)
+                .with_tx_remaining_reqs_count(3)
         );
         assert!(notification.needs_queue_interrupt());
         assert_eq!(

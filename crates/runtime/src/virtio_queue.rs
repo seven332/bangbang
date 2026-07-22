@@ -380,6 +380,11 @@ pub struct VirtqueueAvailableRing {
     descriptor_chain_options: VirtqueueDescriptorChainOptions,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VirtqueueAvailableRingCheckpoint {
+    next_avail: u16,
+}
+
 impl VirtqueueAvailableRing {
     pub fn new(
         descriptor_table: GuestAddress,
@@ -424,6 +429,17 @@ impl VirtqueueAvailableRing {
 
     pub const fn next_avail(&self) -> u16 {
         self.next_avail
+    }
+
+    pub(crate) const fn checkpoint(&self) -> VirtqueueAvailableRingCheckpoint {
+        VirtqueueAvailableRingCheckpoint {
+            next_avail: self.next_avail,
+        }
+    }
+
+    pub(crate) fn restore_checkpoint(&mut self, checkpoint: VirtqueueAvailableRingCheckpoint) {
+        self.next_avail = checkpoint.next_avail;
+        self.can_undo_pop = false;
     }
 
     pub const fn descriptor_chain_options(&self) -> VirtqueueDescriptorChainOptions {
@@ -483,6 +499,21 @@ impl VirtqueueAvailableRing {
             self.queue_size,
             used_event_address,
         )
+    }
+
+    pub(crate) fn available_descriptor_count(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<u16, VirtqueueAvailableRingError> {
+        let available_index = self.available_index(memory)?;
+        let available_len = available_index.wrapping_sub(self.next_avail);
+        if available_len > self.queue_size {
+            return Err(VirtqueueAvailableRingError::AvailableRingLengthTooLarge {
+                queue_size: self.queue_size,
+                available_len,
+            });
+        }
+        Ok(available_len)
     }
 
     pub fn pop_descriptor_chain(
@@ -664,22 +695,57 @@ impl VirtqueueUsedRing {
         len: u32,
         notification_suppression: VirtqueueNotificationSuppression,
     ) -> Result<VirtqueueUsedRingPublication, VirtqueueUsedRingError> {
-        validate_used_ring_descriptor_head(descriptor_head, self.queue_size)?;
+        self.publish_used_elements_with_notification(
+            memory,
+            &[(descriptor_head, len)],
+            notification_suppression,
+        )
+    }
+
+    pub(crate) fn publish_used_elements_with_notification(
+        &mut self,
+        memory: &mut GuestMemory,
+        elements: &[(u16, u32)],
+        notification_suppression: VirtqueueNotificationSuppression,
+    ) -> Result<VirtqueueUsedRingPublication, VirtqueueUsedRingError> {
+        if elements.is_empty() || elements.len() > usize::from(self.queue_size) {
+            return Err(VirtqueueUsedRingError::InvalidElementCount {
+                element_count: elements.len(),
+                queue_size: self.queue_size,
+            });
+        }
+        for (descriptor_head, _) in elements {
+            validate_used_ring_descriptor_head(*descriptor_head, self.queue_size)?;
+        }
         validate_used_ring_range(memory, self.used_ring, self.queue_size)?;
 
         let old_used = self.next_used;
-        let ring_index = self.next_used % self.queue_size;
-        let entry_address = used_ring_entry_address(self.used_ring, self.queue_size, ring_index)?;
-        let next_used = self.next_used.wrapping_add(1);
-
-        write_used_ring_element(
-            memory,
-            self.used_ring,
-            self.queue_size,
-            entry_address,
-            descriptor_head,
-            len,
-        )?;
+        for (element_index, (descriptor_head, len)) in elements.iter().copied().enumerate() {
+            let element_index = u16::try_from(element_index).map_err(|_| {
+                VirtqueueUsedRingError::InvalidElementCount {
+                    element_count: elements.len(),
+                    queue_size: self.queue_size,
+                }
+            })?;
+            let ring_index = self.next_used.wrapping_add(element_index) % self.queue_size;
+            let entry_address =
+                used_ring_entry_address(self.used_ring, self.queue_size, ring_index)?;
+            write_used_ring_element(
+                memory,
+                self.used_ring,
+                self.queue_size,
+                entry_address,
+                descriptor_head,
+                len,
+            )?;
+        }
+        let element_count = u16::try_from(elements.len()).map_err(|_| {
+            VirtqueueUsedRingError::InvalidElementCount {
+                element_count: elements.len(),
+                queue_size: self.queue_size,
+            }
+        })?;
+        let next_used = self.next_used.wrapping_add(element_count);
 
         let needs_queue_interrupt = match notification_suppression {
             VirtqueueNotificationSuppression::Disabled => true,
@@ -738,6 +804,10 @@ pub enum VirtqueueUsedRingError {
         descriptor_head: u16,
         queue_size: u16,
     },
+    InvalidElementCount {
+        element_count: usize,
+        queue_size: u16,
+    },
     UsedRingRangeOverflow {
         used_ring: GuestAddress,
         queue_size: u16,
@@ -776,6 +846,13 @@ impl fmt::Display for VirtqueueUsedRingError {
                     "virtqueue used descriptor head {descriptor_head} is outside queue size {queue_size}"
                 )
             }
+            Self::InvalidElementCount {
+                element_count,
+                queue_size,
+            } => write!(
+                f,
+                "virtqueue used publication element count {element_count} is outside queue size {queue_size}"
+            ),
             Self::UsedRingRangeOverflow {
                 used_ring,
                 queue_size,
@@ -806,6 +883,7 @@ impl std::error::Error for VirtqueueUsedRingError {
             Self::InvalidQueueSize { .. }
             | Self::UnalignedUsedRing { .. }
             | Self::InvalidDescriptorHead { .. }
+            | Self::InvalidElementCount { .. }
             | Self::UsedRingRangeOverflow { .. } => None,
         }
     }

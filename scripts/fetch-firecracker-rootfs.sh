@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v72"
+direct_boot_variant="direct-boot-v77"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -1869,6 +1869,147 @@ fetch_mmds_marker() {
     emit_line BANGBANG_MMDS_FETCH_FAIL_RESPONSE
     write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
   fi
+}
+
+prove_virtio_network_semantics() {
+  if ! prepare_mmds_network BANGBANG_VIRTIO_NET_SEMANTICS_FAIL BANGBANG_VIRTIO_NET_SEMANTICS_FAIL; then
+    return
+  fi
+
+  if cmdline_has bangbang.expect-pci-data=1; then
+    if ! pci_function_has_identity 0000:00:01.0 0x1042 \
+      || ! pci_function_has_identity 0000:00:02.0 0x1041; then
+      emit_line BANGBANG_PCI_NETWORK_IDENTITIES_FAIL
+      write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+      return
+    fi
+    emit_line BANGBANG_PCI_NETWORK_IDENTITIES_OK
+  fi
+
+  if ! ip link set dev "$mmds_iface" mtu 1500 2>/dev/null; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_MTU_1500
+    write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+    return
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_NO_PYTHON
+    write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+    return
+  fi
+  baseline_value=$(
+    python3 - <<'PY' 2>/dev/null || true
+import socket
+
+body_marker = b"BANGBANG_MMDS_GUEST_VALUE"
+request = (
+    b"GET /meta-data/bangbang-marker HTTP/1.1\r\n"
+    b"Host: 169.254.169.254\r\n"
+    b"Accept: */*\r\n"
+    b"X-Bangbang-Padding: " + (b"a" * 3000) + b"\r\n\r\n"
+)
+
+with socket.create_connection(("169.254.169.254", 80), timeout=10) as connection:
+    connection.settimeout(10)
+    connection.sendall(request)
+    response = bytearray()
+    header_end = -1
+    content_length = None
+    while True:
+        chunk = connection.recv(65536)
+        if not chunk:
+            break
+        response.extend(chunk)
+        if header_end < 0:
+            header_end = response.find(b"\r\n\r\n")
+            if header_end >= 0:
+                headers = bytes(response[:header_end]).split(b"\r\n")
+                for header in headers[1:]:
+                    name, separator, value = header.partition(b":")
+                    if separator and name.lower() == b"content-length":
+                        content_length = int(value.strip())
+                        break
+        if header_end >= 0 and content_length is not None:
+            body_start = header_end + 4
+            if len(response) >= body_start + content_length:
+                break
+
+if header_end < 0 or content_length is None:
+    raise RuntimeError("MMDS response was incomplete")
+body_start = header_end + 4
+body = bytes(response[body_start:body_start + content_length])
+if body != body_marker:
+    raise RuntimeError("MMDS response body did not match")
+print(body.decode("ascii"))
+PY
+  )
+  if [ "$baseline_value" != BANGBANG_MMDS_GUEST_VALUE ]; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_TSO
+    write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+    return
+  fi
+  emit_line BANGBANG_MMDS_FETCH_OK
+  emit_line BANGBANG_VIRTIO_NET_LARGE_TX_OK
+
+  if ! ip link set dev "$mmds_iface" mtu 50000 2>/dev/null; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_MTU_50000
+    write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+    return
+  fi
+
+  large_result=$(
+    python3 - <<'PY' 2>/dev/null || true
+import socket
+
+request = (
+    b"GET /meta-data/bangbang-large HTTP/1.1\r\n"
+    b"Host: 169.254.169.254\r\n"
+    b"Accept: */*\r\n\r\n"
+)
+
+with socket.create_connection(("169.254.169.254", 80), timeout=15) as connection:
+    connection.settimeout(15)
+    connection.sendall(request)
+    response = bytearray()
+    header_end = -1
+    content_length = None
+    while True:
+        chunk = connection.recv(65536)
+        if not chunk:
+            break
+        response.extend(chunk)
+        if header_end < 0:
+            header_end = response.find(b"\r\n\r\n")
+            if header_end >= 0:
+                headers = bytes(response[:header_end]).split(b"\r\n")
+                for header in headers[1:]:
+                    name, separator, value = header.partition(b":")
+                    if separator and name.lower() == b"content-length":
+                        content_length = int(value.strip())
+                        break
+        if header_end >= 0 and content_length is not None:
+            body_start = header_end + 4
+            if len(response) >= body_start + content_length:
+                break
+
+if header_end < 0 or content_length != 49152:
+    raise RuntimeError("MMDS large response headers did not match")
+body_start = header_end + 4
+body = bytes(response[body_start:body_start + content_length])
+if len(body) != 49152 or body[:1] != b"z" or body[-1:] != b"z" or body.count(b"z") != 49152:
+    raise RuntimeError("MMDS large response body did not match")
+print("BANGBANG_VIRTIO_NET_LARGE_RX_OK")
+PY
+  )
+  if [ "$large_result" != BANGBANG_VIRTIO_NET_LARGE_RX_OK ]; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_LARGE_CONTENT
+    write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+    return
+  fi
+
+  emit_line BANGBANG_VIRTIO_NET_LARGE_RX_OK
+  emit_line BANGBANG_VIRTIO_NET_SEMANTICS_OK
+  write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_OK
 }
 
 fetch_mmds_marker_for_interface() {
@@ -3863,6 +4004,8 @@ elif cmdline_has bangbang.mmds-process-b-fetch=1; then
   fetch_mmds_process_b_marker
 elif cmdline_has bangbang.mmds-v2-fetch=1; then
   fetch_mmds_v2_marker
+elif cmdline_has bangbang.virtio-net-semantics=1; then
+  prove_virtio_network_semantics
 elif cmdline_has bangbang.mmds-fetch=1; then
   fetch_mmds_marker
 elif cmdline_has bangbang.vsock-guest-connect=1; then
