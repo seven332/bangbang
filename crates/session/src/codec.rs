@@ -2,9 +2,9 @@ use std::fmt;
 
 use crate::BatchId;
 
-/// Maximum encoded v4 frame size, including its fixed header.
+/// Maximum encoded v5 frame size, including its fixed header.
 pub const MAX_FRAME_BYTES: usize = 4096;
-/// Encoded v4 header size.
+/// Encoded v5 header size.
 pub const HEADER_BYTES: usize = 56;
 const MAX_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - HEADER_BYTES;
 const MAX_BUFFER_BYTES: usize = MAX_FRAME_BYTES * 2;
@@ -371,7 +371,7 @@ impl fmt::Debug for WorkerPolicy {
     }
 }
 
-/// Closed v4 lifecycle message set.
+/// Closed v5 lifecycle message set.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Message {
     /// Proves that the resumed worker reached its no-authority bootstrap.
@@ -476,7 +476,7 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Encodes one bounded v4 frame.
+/// Encodes one bounded v5 frame.
 pub fn encode_frame(frame: Frame) -> Result<Vec<u8>, ProtocolError> {
     let (kind, payload) = encode_message(frame.message);
     let payload_len = u32::try_from(payload.len()).map_err(|_| ProtocolError::InvalidFrame)?;

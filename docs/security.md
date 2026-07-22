@@ -855,6 +855,14 @@ carried in lifecycle-v5 `Start`, retained immutably by `ContainedSession`, and
 cannot be supplied through ordinary worker argv, environment, files,
 descriptors, or a post-Ready message.
 
+The policy is published to the VMM only after `Proceed`, paired with the exact
+nonzero random lifecycle session identity. The process session and packet-I/O
+registry retain that pair across startup and restore. Every entry, realized
+backend profile, generation, callback/batch owner, and readiness bridge belongs
+to the same pair. Debug and error output redact both identity and policy, and
+the session identity is deliberately excluded from capture-ready state and
+snapshot artifacts.
+
 At final `InstanceStart`, after controller preflight but before grant
 consumption or starter/backend construction, the worker parses every configured
 mode/name. Complete MMDS coverage requires no authority and opens no vmnet.
@@ -865,12 +873,15 @@ PUT-time denial would make the same all-MMDS zero-resource configuration depend
 on API ordering. Denial is a fieldless error that reveals no interface ID,
 bridge name, count, limit, or session value.
 
-After startup, contained runtime insertion applies the same immutable authority
-on the owner thread. MMDS-only entries consume no vmnet authority. A vmnet entry
-must match the requested mode/bridge and fit the maximum after counting actual
-live vmnet entries rather than all configured MMDS-only interfaces. Denial
-occurs before backend start or live publication and leaves the configuration
-projection unchanged.
+After startup, contained runtime insertion applies the same immutable
+session-and-authority pair on the owner thread. A different session is denied
+before class selection even when it carries identical policy. MMDS-only entries
+consume no vmnet capacity, but still require the exact lifecycle owner. A vmnet
+entry must match the requested mode/bridge and fit the maximum after counting
+actual live vmnet entries rather than all configured MMDS-only interfaces.
+Paused capture checks the same owner before quiescing callbacks or traversing
+metrics/backend state. Denial occurs before backend start or live publication
+and leaves the configuration projection unchanged.
 
 Static authority is a separate gate. Static and suspended/live code validation
 classify only two closed shapes. `Networkless` is exactly Boolean App Sandbox
@@ -2386,10 +2397,11 @@ The current scaffold does not implement:
   that limit before selecting packet I/O, opens vmnet resources only for
   non-MMDS-only startup when configured interfaces use the supported names,
   keeps no-network startup on an empty hotplug-capable registry, and enforces
-  bounded lifecycle-v5 vmnet authority for contained startup and runtime
-  insertion. Public PCI PUT/DELETE coordinates that registry with exact PCI,
-  metrics, retry, and live-config ownership; MMDS-only runtime entries require
-  no vmnet authority, while actual live vmnet entries are charged to the bound.
+  bounded lifecycle-v5 session-and-vmnet-authority owner for contained startup,
+  restore, runtime insertion, and capture. Public PCI PUT/DELETE coordinates
+  that registry with exact PCI, metrics, retry, and live-config ownership;
+  MMDS-only runtime entries consume no vmnet capacity but still require the
+  exact session owner, while actual live vmnet entries are charged to the bound.
   The
   default networkless code-sign profile rejects every positive authority
   before worker spawn but supports the signed all-MMDS hotplug path. Explicit vmnet packaging can bind a caller-approved

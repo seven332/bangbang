@@ -130,7 +130,7 @@ use bangbang_runtime::{
 };
 #[cfg(target_os = "macos")]
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
-use bangbang_session::{GrantAccess, ResourceRole, VmnetAuthority};
+use bangbang_session::{GrantAccess, ResourceRole, SessionId, VmnetAuthority};
 
 #[cfg(target_os = "macos")]
 use crate::anchored_socket::{AnchoredSocketGuard, bind as bind_anchored_socket};
@@ -242,8 +242,10 @@ pub(crate) trait InstanceStartExecutor {
     fn start_with_startup_resources(
         &mut self,
         controller: &VmmController,
+        vmnet_authority: ProcessVmnetAuthority,
         startup_resources: VmStartupResources,
     ) -> Result<Self::Session, InstanceStartError> {
+        let _ = vmnet_authority;
         if !startup_resources.is_empty() {
             return Err(InstanceStartError::retryable(BackendError::Unsupported(
                 "startup executor cannot consume provided startup resources",
@@ -296,6 +298,7 @@ pub(crate) trait InstanceStartExecutor {
     fn preflight_snapshot_v1_network(
         &mut self,
         _session: &mut Self::Session,
+        _vmnet_authority: ProcessVmnetAuthority,
         _configs: Vec<NetworkInterfaceConfig>,
         _mmds_config: Option<MmdsConfig>,
         _mmds_state: MmdsStateHandle,
@@ -326,12 +329,14 @@ pub(crate) trait InstanceStartExecutor {
     fn load_snapshot_v1(
         &mut self,
         controller: &VmmController,
+        vmnet_authority: ProcessVmnetAuthority,
         input: &SnapshotLoadInput,
     ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError>;
 
     fn load_prepared_snapshot_v1(
         &mut self,
         _controller: &VmmController,
+        _vmnet_authority: ProcessVmnetAuthority,
         _input: &SnapshotLoadInput,
         prepared: PreparedHvfSnapshotV1Load,
     ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
@@ -1671,13 +1676,41 @@ const fn grant_access_for_read_only(read_only: bool) -> GrantAccess {
 }
 
 /// Process origin used to distinguish direct operator policy from contained authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ProcessVmnetAuthority {
     /// Direct execution retains the existing process vmnet behavior.
     #[default]
     Direct,
     /// Contained execution is bounded by authenticated launcher policy.
-    Contained(VmnetAuthority),
+    Contained {
+        session_id: SessionId,
+        authority: VmnetAuthority,
+    },
+}
+
+impl ProcessVmnetAuthority {
+    pub(crate) fn contained(session_id: SessionId, authority: VmnetAuthority) -> Option<Self> {
+        (!session_id.is_pre_session()).then_some(Self::Contained {
+            session_id,
+            authority,
+        })
+    }
+
+    const fn contained_authority(self) -> Option<VmnetAuthority> {
+        match self {
+            Self::Direct => None,
+            Self::Contained { authority, .. } => Some(authority),
+        }
+    }
+}
+
+impl fmt::Debug for ProcessVmnetAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct => formatter.write_str("Direct"),
+            Self::Contained { .. } => formatter.write_str("Contained(<redacted>)"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2346,11 +2379,16 @@ where
         }
         let controller = &mut self.controller;
         let starter = &mut self.starter;
+        let vmnet_authority = self.vmnet_authority;
         let mut started_session = None;
         let mut terminal_start_failure = false;
 
         let result = controller.start_instance_with(|controller| {
-            match starter.start_with_startup_resources(controller, startup_resources) {
+            match starter.start_with_startup_resources(
+                controller,
+                vmnet_authority,
+                startup_resources,
+            ) {
                 Ok(session) => {
                     started_session = Some(session);
                     Ok(())
@@ -3623,11 +3661,15 @@ where
 
         let prepared = self.prepare_contained_snapshot_v1_load(input)?;
         let result = match prepared {
-            Some(prepared) => {
-                self.starter
-                    .load_prepared_snapshot_v1(&self.controller, input, prepared)
-            }
-            None => self.starter.load_snapshot_v1(&self.controller, input),
+            Some(prepared) => self.starter.load_prepared_snapshot_v1(
+                &self.controller,
+                self.vmnet_authority,
+                input,
+                prepared,
+            ),
+            None => self
+                .starter
+                .load_snapshot_v1(&self.controller, self.vmnet_authority, input),
         };
         let restored = match result {
             Ok(restored) => restored,
@@ -3741,7 +3783,13 @@ where
         })?;
         let mmds_state = self.controller.mmds_state_handle();
         self.starter
-            .preflight_snapshot_v1_network(session, network_configs, mmds_config, mmds_state)
+            .preflight_snapshot_v1_network(
+                session,
+                self.vmnet_authority,
+                network_configs,
+                mmds_config,
+                mmds_state,
+            )
             .map_err(NativeV1SnapshotPublicationError::NetworkPreflight)?;
 
         self.controller
@@ -3988,12 +4036,17 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, InstanceStartError> {
-        self.start_with_startup_resources(controller, VmStartupResources::default())
+        self.start_with_startup_resources(
+            controller,
+            ProcessVmnetAuthority::Direct,
+            VmStartupResources::default(),
+        )
     }
 
     fn start_with_startup_resources(
         &mut self,
         controller: &VmmController,
+        vmnet_authority: ProcessVmnetAuthority,
         mut startup_resources: VmStartupResources,
     ) -> Result<Self::Session, InstanceStartError> {
         let provided_serial_output = startup_resources.take_serial_output();
@@ -4034,16 +4087,18 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             serial_output.clone(),
         );
         let (mut packet_io, mmds_metrics) =
-            ProcessNetworkPacketIoProvider::from_controller(controller).map_err(|err| {
-                let source = BackendError::Hypervisor(format!(
-                    "failed to build network packet I/O provider: {err}"
-                ));
-                if err.is_terminal() {
-                    InstanceStartError::terminal(source)
-                } else {
-                    InstanceStartError::retryable(source)
-                }
-            })?;
+            ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority).map_err(
+                |err| {
+                    let source = BackendError::Hypervisor(format!(
+                        "failed to build network packet I/O provider: {err}"
+                    ));
+                    if err.is_terminal() {
+                        InstanceStartError::terminal(source)
+                    } else {
+                        InstanceStartError::retryable(source)
+                    }
+                },
+            )?;
         startup_resources =
             startup_resources.with_network_device_profiles(packet_io.device_profiles());
         let session = match OwnedHvfArm64BootSession::new_with_startup_resources(
@@ -4065,7 +4120,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 ));
             }
         };
-        let session = ProcessHvfBootSession::new(session, packet_io, mmds_metrics);
+        let session = ProcessHvfBootSession::new_with_vmnet_authority(
+            session,
+            packet_io,
+            mmds_metrics,
+            vmnet_authority,
+        );
         let supervisor = match HvfBootRunLoopSupervisor::start_recoverable(
             session,
             default_hvf_boot_run_loop_step_limit(),
@@ -4134,12 +4194,13 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     fn preflight_snapshot_v1_network(
         &mut self,
         session: &mut Self::Session,
+        vmnet_authority: ProcessVmnetAuthority,
         configs: Vec<NetworkInterfaceConfig>,
         mmds_config: Option<MmdsConfig>,
         mmds_state: MmdsStateHandle,
     ) -> Result<(), ProcessCaptureReadyNetworkError> {
         session
-            .capture_ready_network_state(configs, mmds_config, mmds_state)
+            .capture_ready_network_state(vmnet_authority, configs, mmds_config, mmds_state)
             .map(|_| ())
     }
 
@@ -4172,6 +4233,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     fn load_snapshot_v1(
         &mut self,
         controller: &VmmController,
+        vmnet_authority: ProcessVmnetAuthority,
         input: &SnapshotLoadInput,
     ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
         let paths =
@@ -4180,12 +4242,13 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             load_snapshot_artifacts(&paths).map_err(NativeV1SnapshotLoadError::Artifact)?;
         let prepared = PreparedHvfSnapshotV1Load::from_loaded_artifacts(artifacts, Instant::now())
             .map_err(NativeV1SnapshotLoadError::Prepare)?;
-        self.load_prepared_snapshot_v1(controller, input, prepared)
+        self.load_prepared_snapshot_v1(controller, vmnet_authority, input, prepared)
     }
 
     fn load_prepared_snapshot_v1(
         &mut self,
         controller: &VmmController,
+        vmnet_authority: ProcessVmnetAuthority,
         input: &SnapshotLoadInput,
         prepared: PreparedHvfSnapshotV1Load,
     ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
@@ -4200,12 +4263,14 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             input.resume_vm(),
         )
         .map_err(NativeV1SnapshotLoadError::ControllerCommitAllocation)?;
-        let (packet_io, mmds_metrics) = ProcessNetworkPacketIoProvider::from_controller(controller)
-            .map_err(|source| {
-                NativeV1SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(format!(
-                    "failed to build network packet I/O provider: {source}"
-                )))
-            })?;
+        let (packet_io, mmds_metrics) =
+            ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority).map_err(
+                |source| {
+                    NativeV1SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(
+                        format!("failed to build network packet I/O provider: {source}"),
+                    ))
+                },
+            )?;
 
         let restored =
             OwnedHvfArm64BootSession::restore_snapshot_v1(prepared, input.track_dirty_pages())
@@ -4215,7 +4280,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             restored_drive == restored_drive_config,
             "restored drive configuration diverged from the preallocated controller commit"
         );
-        let process_session = ProcessHvfBootSession::new(session, packet_io, mmds_metrics);
+        let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
+            session,
+            packet_io,
+            mmds_metrics,
+            vmnet_authority,
+        );
         let supervisor = match HvfBootRunLoopSupervisor::start_paused(
             process_session,
             default_hvf_boot_run_loop_step_limit(),
@@ -4249,6 +4319,7 @@ pub(crate) struct ProcessHvfBootSession<S, P> {
     packet_io: P,
     session: S,
     mmds_metrics: Option<SharedMmdsMetrics>,
+    vmnet_authority: ProcessVmnetAuthority,
 }
 
 pub(crate) trait NativeV1SnapshotMemoryOutput: std::io::Write + Seek + Send {}
@@ -4473,11 +4544,27 @@ pub(crate) trait NativeV1SnapshotCaptureSession: BootRunLoopSession {
 }
 
 impl<S, P> ProcessHvfBootSession<S, P> {
+    #[cfg(test)]
     const fn new(session: S, packet_io: P, mmds_metrics: Option<SharedMmdsMetrics>) -> Self {
+        Self::new_with_vmnet_authority(
+            session,
+            packet_io,
+            mmds_metrics,
+            ProcessVmnetAuthority::Direct,
+        )
+    }
+
+    const fn new_with_vmnet_authority(
+        session: S,
+        packet_io: P,
+        mmds_metrics: Option<SharedMmdsMetrics>,
+        vmnet_authority: ProcessVmnetAuthority,
+    ) -> Self {
         Self {
             packet_io,
             session,
             mmds_metrics,
+            vmnet_authority,
         }
     }
 }
@@ -4492,6 +4579,9 @@ where
         config: &NetworkInterfaceConfig,
         authority: ProcessVmnetAuthority,
     ) -> Result<(), NetworkRuntimeMutationError> {
+        if authority != self.vmnet_authority {
+            return Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized);
+        }
         let (prepared, device_profile) = self.packet_io.prepare_runtime_entry(config, authority)?;
         let published = self.packet_io.publish_prepared_entry(prepared);
 
@@ -4684,14 +4774,21 @@ impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
 impl ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider> {
     fn capture_ready_network_state_at(
         &self,
+        vmnet_authority: ProcessVmnetAuthority,
         configs: &[NetworkInterfaceConfig],
         mmds_config: Option<&MmdsConfig>,
         mmds_state: &MmdsStateHandle,
         guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
         now: Instant,
     ) -> Result<ProcessCaptureReadyNetworkState, ProcessCaptureReadyNetworkError> {
-        let publication_guard = self.packet_io.quiesce_capture_publication()?;
-        let prepared = self.packet_io.prepare_capture(
+        if vmnet_authority != self.vmnet_authority {
+            return Err(ProcessCaptureReadyNetworkError::AuthorityMismatch);
+        }
+        let publication_guard = self
+            .packet_io
+            .quiesce_capture_publication_for_owner(vmnet_authority)?;
+        let prepared = self.packet_io.prepare_capture_for_owner(
+            vmnet_authority,
             configs,
             mmds_config,
             mmds_state,
@@ -4857,6 +4954,7 @@ where
             .field("session", &self.session)
             .field("packet_io", &self.packet_io)
             .field("mmds_metrics", &self.mmds_metrics)
+            .field("vmnet_authority", &self.vmnet_authority)
             .finish()
     }
 }
@@ -5147,6 +5245,7 @@ impl fmt::Debug for ProcessCaptureReadyNetworkState {
 #[derive(Debug)]
 pub(crate) enum ProcessCaptureReadyNetworkError {
     OwnerUnavailable,
+    AuthorityMismatch,
     Allocation,
     PublicationQuiescence,
     InventoryMismatch,
@@ -5173,6 +5272,9 @@ impl fmt::Display for ProcessCaptureReadyNetworkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OwnerUnavailable => formatter.write_str("network capture owner is unavailable"),
+            Self::AuthorityMismatch => {
+                formatter.write_str("network capture lifecycle owner is inconsistent")
+            }
             Self::Allocation => formatter.write_str("network capture allocation failed"),
             Self::PublicationQuiescence => {
                 formatter.write_str("network callback publication could not be quiesced")
@@ -5247,6 +5349,7 @@ struct ProcessNetworkPacketIoEntry<B>
 where
     B: ProcessVmnetBackend,
 {
+    owner: ProcessVmnetAuthority,
     generation: u64,
     iface_id: String,
     packet_io: ProcessNetworkPacketIo<B>,
@@ -5261,6 +5364,7 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProcessNetworkPacketIoEntry")
+            .field("owner", &self.owner)
             .field("generation", &self.generation)
             .field("iface_id", &"<redacted>")
             .field("packet_io", &self.packet_io)
@@ -5293,6 +5397,7 @@ where
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PublishedProcessNetworkPacketIoEntry {
+    owner: ProcessVmnetAuthority,
     generation: u64,
     iface_id: String,
 }
@@ -5301,6 +5406,7 @@ impl fmt::Debug for PublishedProcessNetworkPacketIoEntry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PublishedProcessNetworkPacketIoEntry")
+            .field("owner", &self.owner)
             .field("generation", &self.generation)
             .field("iface_id", &"<redacted>")
             .finish()
@@ -5326,6 +5432,7 @@ where
 }
 
 struct ProcessNetworkPacketReadinessBridge {
+    owner: ProcessVmnetAuthority,
     shutdown: Arc<AtomicBool>,
     signal: mpsc::SyncSender<()>,
     worker: Option<JoinHandle<()>>,
@@ -5335,6 +5442,7 @@ impl fmt::Debug for ProcessNetworkPacketReadinessBridge {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProcessNetworkPacketReadinessBridge")
+            .field("owner", &self.owner)
             .field("shutdown", &self.shutdown.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
@@ -5342,6 +5450,7 @@ impl fmt::Debug for ProcessNetworkPacketReadinessBridge {
 
 impl ProcessNetworkPacketReadinessBridge {
     fn start(
+        owner: ProcessVmnetAuthority,
         receiver: mpsc::Receiver<()>,
         signal: mpsc::SyncSender<()>,
         wake: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -5367,6 +5476,7 @@ impl ProcessNetworkPacketReadinessBridge {
                 BackendError::Hypervisor(format!("failed to start vmnet readiness bridge: {error}"))
             })?;
         Ok(Self {
+            owner,
             shutdown,
             signal,
             worker: Some(worker),
@@ -5395,6 +5505,7 @@ pub(crate) struct ProcessNetworkPacketIoRegistry<B>
 where
     B: ProcessVmnetBackend,
 {
+    owner: ProcessVmnetAuthority,
     entries: Vec<ProcessNetworkPacketIoEntry<B>>,
     reserved_macs: Vec<GuestMacAddress>,
     next_generation: u64,
@@ -5413,6 +5524,7 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProcessNetworkPacketIoRegistry")
+            .field("owner", &self.owner)
             .field("entry_count", &self.entries.len())
             .field("reserved_mac_count", &self.reserved_macs.len())
             .field("next_generation", &self.next_generation)
@@ -5430,7 +5542,14 @@ where
 impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
     fn from_controller(
         controller: &VmmController,
+        owner: ProcessVmnetAuthority,
     ) -> Result<(Self, Option<SharedMmdsMetrics>), ProcessNetworkPacketIoProviderBuildError> {
+        validate_process_vmnet_authority(controller, owner).map_err(|error| match error {
+            ProcessVmnetAuthorityValidationError::Provider(source) => source,
+            ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized => {
+                ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+            }
+        })?;
         let mmds_config = controller
             .mmds_config()
             .map_err(|source| ProcessNetworkPacketIoProviderBuildError::MmdsState { source })?;
@@ -5447,9 +5566,10 @@ impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
                     )
                 });
 
-        let provider = Self::from_network_configs_and_mmds_detour(
+        let provider = Self::from_network_configs_and_mmds_detour_with_owner(
             controller.network_interface_configs(),
             mmds_detour.as_ref(),
+            owner,
         )?;
         Ok((provider, mmds_metrics))
     }
@@ -5461,12 +5581,30 @@ impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
         Self::from_network_configs_and_mmds_detour(configs, None)
     }
 
+    #[cfg(test)]
     fn from_network_configs_and_mmds_detour(
         configs: &[NetworkInterfaceConfig],
         mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
     ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
+        Self::from_network_configs_and_mmds_detour_with_owner(
+            configs,
+            mmds_detour,
+            ProcessVmnetAuthority::Direct,
+        )
+    }
+
+    fn from_network_configs_and_mmds_detour_with_owner(
+        configs: &[NetworkInterfaceConfig],
+        mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
+        owner: ProcessVmnetAuthority,
+    ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
         let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-        Self::from_network_configs_and_mmds_detour_with_factory(configs, mmds_detour, &mut factory)
+        Self::from_network_configs_and_mmds_detour_with_factory_and_owner(
+            configs,
+            mmds_detour,
+            owner,
+            &mut factory,
+        )
     }
 
     fn prepare_runtime_entry(
@@ -5477,20 +5615,8 @@ impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
         PreparedProcessNetworkPacketIoEntry<SystemVmnetInterfaceBackend>,
         NetworkRuntimeMutationError,
     > {
-        let class = self.class_for_interface(config.iface_id());
-        let vmnet_config = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
-            .map(|vmnet| {
-                vmnet
-                    .with_guest_mac(config.guest_mac())
-                    .with_mtu(config.mtu())
-            })
-            .map_err(|_| NetworkRuntimeMutationError::PreparePacketIo {
-                message: "network host device configuration is unsupported".to_string(),
-            })?;
-        self.validate_runtime_authority(class, &vmnet_config, authority)?;
         let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-        self.prepare_entry_with_factory(config, class, false, &mut factory)
-            .map_err(runtime_network_packet_io_preparation_error)
+        self.prepare_runtime_entry_with_factory(config, authority, &mut factory)
     }
 }
 
@@ -5498,7 +5624,14 @@ fn runtime_network_packet_io_preparation_error(
     source: ProcessNetworkPacketIoProviderBuildError,
 ) -> NetworkRuntimeMutationError {
     let terminal = source.is_terminal();
+    let unauthorized = matches!(
+        source,
+        ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+    );
     let message = match source {
+        ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch => {
+            "network packet-I/O lifecycle owner is inconsistent"
+        }
         ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. } => {
             "network interface count is unsupported"
         }
@@ -5538,6 +5671,9 @@ fn runtime_network_packet_io_preparation_error(
             "MMDS packet-I/O initialization failed"
         }
     };
+    if unauthorized {
+        return NetworkRuntimeMutationError::HostNetworkNotAuthorized;
+    }
     if terminal {
         NetworkRuntimeMutationError::TerminalInsertion {
             message: message.to_string(),
@@ -5553,9 +5689,54 @@ impl<B> ProcessNetworkPacketIoRegistry<B>
 where
     B: ProcessVmnetBackend,
 {
+    fn prepare_runtime_entry_with_factory<F>(
+        &mut self,
+        config: &NetworkInterfaceConfig,
+        authority: ProcessVmnetAuthority,
+        factory: &mut F,
+    ) -> Result<PreparedProcessNetworkPacketIoEntry<B>, NetworkRuntimeMutationError>
+    where
+        F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    {
+        if authority != self.owner {
+            return Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized);
+        }
+        let class = self.class_for_interface(config.iface_id());
+        let vmnet_config = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
+            .map(|vmnet| {
+                vmnet
+                    .with_guest_mac(config.guest_mac())
+                    .with_mtu(config.mtu())
+            })
+            .map_err(|_| NetworkRuntimeMutationError::PreparePacketIo {
+                message: "network host device configuration is unsupported".to_string(),
+            })?;
+        self.validate_runtime_authority(class, &vmnet_config, authority)?;
+        self.prepare_entry_with_factory(config, class, false, factory)
+            .map_err(runtime_network_packet_io_preparation_error)
+    }
+
+    #[cfg(test)]
     fn from_network_configs_and_mmds_detour_with_factory<F>(
         configs: &[NetworkInterfaceConfig],
         mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
+        factory: &mut F,
+    ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError>
+    where
+        F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
+    {
+        Self::from_network_configs_and_mmds_detour_with_factory_and_owner(
+            configs,
+            mmds_detour,
+            ProcessVmnetAuthority::Direct,
+            factory,
+        )
+    }
+
+    fn from_network_configs_and_mmds_detour_with_factory_and_owner<F>(
+        configs: &[NetworkInterfaceConfig],
+        mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
+        owner: ProcessVmnetAuthority,
         factory: &mut F,
     ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError>
     where
@@ -5571,6 +5752,17 @@ where
         } else {
             ProcessNetworkPacketIoStartupPolicy::Vmnet
         };
+        validate_process_vmnet_authority_for_configs(
+            configs,
+            startup_policy == ProcessNetworkPacketIoStartupPolicy::MmdsPreferred,
+            owner,
+        )
+        .map_err(|error| match error {
+            ProcessVmnetAuthorityValidationError::Provider(source) => source,
+            ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized => {
+                ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+            }
+        })?;
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT)
@@ -5593,6 +5785,7 @@ where
         }
         let (readiness_signal, readiness_receiver) = mpsc::sync_channel(1);
         let mut provider = Self {
+            owner,
             entries,
             reserved_macs,
             next_generation: 0,
@@ -5640,28 +5833,24 @@ where
         vmnet: &VmnetInterfaceConfig,
         authority: ProcessVmnetAuthority,
     ) -> Result<(), NetworkRuntimeMutationError> {
+        if authority != self.owner {
+            return Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized);
+        }
         if class == ProcessNetworkPacketIoEntryClass::MmdsOnly
             || matches!(authority, ProcessVmnetAuthority::Direct)
         {
             return Ok(());
         }
-        let ProcessVmnetAuthority::Contained(authority) = authority else {
-            return Ok(());
-        };
+        let authority = authority
+            .contained_authority()
+            .ok_or(NetworkRuntimeMutationError::HostNetworkNotAuthorized)?;
         let max_interfaces = authority
             .max_interfaces()
             .ok_or(NetworkRuntimeMutationError::HostNetworkNotAuthorized)?;
         if self.vmnet_count() >= usize::from(max_interfaces) {
             return Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized);
         }
-        let allowed = match vmnet.mode() {
-            VmnetMode::Host => authority.allows_host(),
-            VmnetMode::Shared => authority.allows_shared(),
-            VmnetMode::Bridged => vmnet
-                .bridged_interface_name()
-                .is_some_and(|bridge| authority.allows_bridge(bridge)),
-        };
-        if !allowed {
+        if !vmnet_authority_allows(authority, vmnet) {
             return Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized);
         }
         Ok(())
@@ -5833,6 +6022,7 @@ where
         self.next_generation = next_generation;
         Ok(PreparedProcessNetworkPacketIoEntry {
             entry: ProcessNetworkPacketIoEntry {
+                owner: self.owner,
                 generation,
                 iface_id: iface_id.to_string(),
                 packet_io,
@@ -5847,6 +6037,10 @@ where
         &mut self,
         prepared: PreparedProcessNetworkPacketIoEntry<B>,
     ) -> PublishedProcessNetworkPacketIoEntry {
+        assert_eq!(
+            prepared.entry.owner, self.owner,
+            "prepared network packet-I/O owner must match its registry"
+        );
         assert!(
             !self
                 .entries
@@ -5874,6 +6068,7 @@ where
             self.reserved_macs.push(mac);
         }
         let published = PublishedProcessNetworkPacketIoEntry {
+            owner: prepared.entry.owner,
             generation: prepared.entry.generation,
             iface_id: prepared.entry.iface_id.clone(),
         };
@@ -5890,6 +6085,13 @@ where
             .iter()
             .position(|entry| entry.iface_id == iface_id)
             .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
+        let entry = self
+            .entries
+            .get(index)
+            .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
+        if entry.owner != self.owner {
+            return Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch);
+        }
         self.release_reserved_mac_for_entry(index)?;
         Ok(RemovedProcessNetworkPacketIoEntry {
             index,
@@ -5901,6 +6103,9 @@ where
         &mut self,
         published: &PublishedProcessNetworkPacketIoEntry,
     ) -> Result<RemovedProcessNetworkPacketIoEntry<B>, ProcessNetworkPacketIoRegistryError> {
+        if published.owner != self.owner {
+            return Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch);
+        }
         let index = self
             .entries
             .iter()
@@ -5908,6 +6113,13 @@ where
                 entry.generation == published.generation && entry.iface_id == published.iface_id
             })
             .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
+        let entry = self
+            .entries
+            .get(index)
+            .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
+        if entry.owner != self.owner {
+            return Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch);
+        }
         self.release_reserved_mac_for_entry(index)?;
         Ok(RemovedProcessNetworkPacketIoEntry {
             index,
@@ -5919,6 +6131,9 @@ where
         &mut self,
         removed: RemovedProcessNetworkPacketIoEntry<B>,
     ) -> Result<(), ProcessNetworkPacketIoRegistryError> {
+        if removed.entry.owner != self.owner {
+            return Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch);
+        }
         if self
             .entries
             .iter()
@@ -5964,10 +6179,28 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     fn quiesce_capture_publication(
         &self,
     ) -> Result<ProcessNetworkPacketIoPublicationQuiescenceGuard, ProcessCaptureReadyNetworkError>
     {
+        self.quiesce_capture_publication_for_owner(ProcessVmnetAuthority::Direct)
+    }
+
+    fn quiesce_capture_publication_for_owner(
+        &self,
+        owner: ProcessVmnetAuthority,
+    ) -> Result<ProcessNetworkPacketIoPublicationQuiescenceGuard, ProcessCaptureReadyNetworkError>
+    {
+        if owner != self.owner
+            || self.entries.iter().any(|entry| entry.owner != self.owner)
+            || self
+                .readiness_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.owner != self.owner)
+        {
+            return Err(ProcessCaptureReadyNetworkError::AuthorityMismatch);
+        }
         let mut guards = Vec::new();
         guards
             .try_reserve_exact(self.vmnet_count())
@@ -5988,6 +6221,7 @@ where
         Ok(ProcessNetworkPacketIoPublicationQuiescenceGuard { _guards: guards })
     }
 
+    #[cfg(test)]
     fn prepare_capture(
         &self,
         configs: &[NetworkInterfaceConfig],
@@ -5996,6 +6230,26 @@ where
         mmds_metrics: Option<&SharedMmdsMetrics>,
         now: Instant,
     ) -> Result<PreparedProcessNetworkCapture, ProcessCaptureReadyNetworkError> {
+        self.prepare_capture_for_owner(
+            ProcessVmnetAuthority::Direct,
+            configs,
+            mmds_config,
+            mmds_state,
+            mmds_metrics,
+            now,
+        )
+    }
+
+    fn prepare_capture_for_owner(
+        &self,
+        owner: ProcessVmnetAuthority,
+        configs: &[NetworkInterfaceConfig],
+        mmds_config: Option<&MmdsConfig>,
+        mmds_state: &MmdsStateHandle,
+        mmds_metrics: Option<&SharedMmdsMetrics>,
+        now: Instant,
+    ) -> Result<PreparedProcessNetworkCapture, ProcessCaptureReadyNetworkError> {
+        self.validate_capture_authority(configs, owner)?;
         if self.entries.len() != configs.len() {
             return Err(ProcessCaptureReadyNetworkError::InventoryMismatch);
         }
@@ -6164,6 +6418,53 @@ where
         })
     }
 
+    fn validate_capture_authority(
+        &self,
+        configs: &[NetworkInterfaceConfig],
+        owner: ProcessVmnetAuthority,
+    ) -> Result<(), ProcessCaptureReadyNetworkError> {
+        if owner != self.owner || self.entries.iter().any(|entry| entry.owner != self.owner) {
+            return Err(ProcessCaptureReadyNetworkError::AuthorityMismatch);
+        }
+        let Some(authority) = owner.contained_authority() else {
+            return Ok(());
+        };
+        let vmnet_count = self.vmnet_count();
+        if vmnet_count == 0 {
+            return Ok(());
+        }
+        if vmnet_count
+            > usize::from(
+                authority
+                    .max_interfaces()
+                    .ok_or(ProcessCaptureReadyNetworkError::AuthorityMismatch)?,
+            )
+        {
+            return Err(ProcessCaptureReadyNetworkError::AuthorityMismatch);
+        }
+        for config in configs {
+            let mut matches = self
+                .entries
+                .iter()
+                .filter(|entry| entry.iface_id == config.iface_id());
+            let entry = matches
+                .next()
+                .ok_or(ProcessCaptureReadyNetworkError::InventoryMismatch)?;
+            if matches.next().is_some() {
+                return Err(ProcessCaptureReadyNetworkError::InventoryMismatch);
+            }
+            if !entry.packet_io.is_vmnet() {
+                continue;
+            }
+            let vmnet = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
+                .map_err(|_| ProcessCaptureReadyNetworkError::AuthorityMismatch)?;
+            if !vmnet_authority_allows(authority, &vmnet) {
+                return Err(ProcessCaptureReadyNetworkError::AuthorityMismatch);
+            }
+        }
+        Ok(())
+    }
+
     fn device_profiles(&self) -> BTreeMap<String, NetworkDeviceProfile> {
         self.entries
             .iter()
@@ -6229,6 +6530,7 @@ where
                 "vmnet readiness wake target is unavailable",
             ))?;
         self.readiness_bridge = Some(ProcessNetworkPacketReadinessBridge::start(
+            self.owner,
             receiver,
             self.readiness_signal.clone(),
             wake,
@@ -6276,6 +6578,7 @@ enum ProcessNetworkPacketIoEntryClass {
 
 #[derive(Debug)]
 pub(crate) enum ProcessNetworkPacketIoRegistryError {
+    AuthorityMismatch,
     DuplicateInterface,
     DuplicateRealizedMac,
     MissingRealizedMac,
@@ -6286,6 +6589,9 @@ pub(crate) enum ProcessNetworkPacketIoRegistryError {
 impl fmt::Display for ProcessNetworkPacketIoRegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AuthorityMismatch => {
+                formatter.write_str("network packet-I/O lifecycle owner is inconsistent")
+            }
             Self::DuplicateInterface => {
                 formatter.write_str("network packet-I/O interface is already registered")
             }
@@ -6532,6 +6838,7 @@ where
 }
 
 enum ProcessNetworkPacketIoProviderBuildError {
+    AuthorityMismatch,
     NetworkInterfaceCount {
         source: NetworkInterfaceConfigError,
     },
@@ -6573,6 +6880,9 @@ enum ProcessNetworkPacketIoProviderBuildError {
 impl fmt::Debug for ProcessNetworkPacketIoProviderBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::AuthorityMismatch => {
+                "ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch"
+            }
             Self::NetworkInterfaceCount { .. } => {
                 "ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount"
             }
@@ -6619,7 +6929,7 @@ impl ProcessNetworkPacketIoProviderBuildError {
             Self::Start { source, .. } => {
                 source.disposition() == VmnetInterfaceStartDisposition::Terminal
             }
-            Self::CleanupUncertain | Self::ReadinessBridge { .. } => true,
+            Self::AuthorityMismatch | Self::CleanupUncertain | Self::ReadinessBridge { .. } => true,
             Self::NetworkInterfaceCount { .. }
             | Self::DuplicateInterface
             | Self::DuplicateRealizedMac
@@ -6640,6 +6950,9 @@ impl ProcessNetworkPacketIoProviderBuildError {
 impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AuthorityMismatch => {
+                f.write_str("network packet-I/O lifecycle owner is inconsistent")
+            }
             Self::NetworkInterfaceCount { source } => {
                 write!(f, "unsupported network interface count: {source}")
             }
@@ -6706,7 +7019,8 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
             Self::ReadinessBridge { source, .. } => Some(source),
             Self::PacketEvents { source, .. } => Some(source),
             Self::MmdsOnlyPacketIoBuild { source, .. } => Some(source),
-            Self::DuplicateInterface
+            Self::AuthorityMismatch
+            | Self::DuplicateInterface
             | Self::DuplicateRealizedMac
             | Self::RegistryCapacity
             | Self::GenerationExhausted
@@ -6743,15 +7057,10 @@ fn validate_process_vmnet_authority(
     controller: &VmmController,
     authority: ProcessVmnetAuthority,
 ) -> Result<(), ProcessVmnetAuthorityValidationError> {
-    let ProcessVmnetAuthority::Contained(authority) = authority else {
+    if matches!(authority, ProcessVmnetAuthority::Direct) {
         return Ok(());
-    };
+    }
     let configs = controller.network_interface_configs();
-    validate_network_interface_count(configs.len()).map_err(|source| {
-        ProcessVmnetAuthorityValidationError::Provider(
-            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source },
-        )
-    })?;
     let mmds_config = controller.mmds_config().map_err(|source| {
         ProcessVmnetAuthorityValidationError::Provider(
             ProcessNetworkPacketIoProviderBuildError::MmdsState { source },
@@ -6766,11 +7075,26 @@ fn validate_process_vmnet_authority(
             })
         });
 
-    let contained_authority = match (all_mmds, configs.is_empty()) {
+    validate_process_vmnet_authority_for_configs(configs, all_mmds, authority)
+}
+
+fn validate_process_vmnet_authority_for_configs(
+    configs: &[NetworkInterfaceConfig],
+    all_mmds: bool,
+    authority: ProcessVmnetAuthority,
+) -> Result<(), ProcessVmnetAuthorityValidationError> {
+    validate_network_interface_count(configs.len()).map_err(|source| {
+        ProcessVmnetAuthorityValidationError::Provider(
+            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source },
+        )
+    })?;
+    let contained_authority = authority.contained_authority();
+
+    let required_authority = match (all_mmds, configs.is_empty()) {
         (true, _) | (_, true) => None,
-        (false, false) => Some(authority),
+        (false, false) => contained_authority,
     };
-    if let Some(authority) = contained_authority
+    if let Some(authority) = required_authority
         && configs.len()
             > usize::from(
                 authority
@@ -6788,21 +7112,24 @@ fn validate_process_vmnet_authority(
                     ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source },
                 )
             })?;
-        let Some(authority) = contained_authority else {
+        let Some(authority) = required_authority else {
             continue;
         };
-        let allowed = match vmnet.mode() {
-            VmnetMode::Host => authority.allows_host(),
-            VmnetMode::Shared => authority.allows_shared(),
-            VmnetMode::Bridged => vmnet
-                .bridged_interface_name()
-                .is_some_and(|bridge| authority.allows_bridge(bridge)),
-        };
-        if !allowed {
+        if !vmnet_authority_allows(authority, &vmnet) {
             return Err(ProcessVmnetAuthorityValidationError::HostNetworkNotAuthorized);
         }
     }
     Ok(())
+}
+
+fn vmnet_authority_allows(authority: VmnetAuthority, vmnet: &VmnetInterfaceConfig) -> bool {
+    match vmnet.mode() {
+        VmnetMode::Host => authority.allows_host(),
+        VmnetMode::Shared => authority.allows_shared(),
+        VmnetMode::Bridged => vmnet
+            .bridged_interface_name()
+            .is_some_and(|bridge| authority.allows_bridge(bridge)),
+    }
 }
 
 trait ProcessVmnetPacketIoBackendFactory {
@@ -9755,6 +10082,7 @@ impl
 
     pub(crate) fn capture_ready_network_state(
         &self,
+        vmnet_authority: ProcessVmnetAuthority,
         configs: Vec<NetworkInterfaceConfig>,
         mmds_config: Option<MmdsConfig>,
         mmds_state: MmdsStateHandle,
@@ -9764,6 +10092,7 @@ impl
                 .quiesce_snapshot_auxiliary_work()
                 .map_err(|_| ProcessCaptureReadyNetworkError::OwnerUnavailable)?;
             let result = session.capture_ready_network_state_at(
+                vmnet_authority,
                 &configs,
                 mmds_config.as_ref(),
                 &mmds_state,
@@ -10570,7 +10899,6 @@ mod tests {
         BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
         VmmActionError, VmmController, VmmData,
     };
-    #[cfg(target_os = "macos")]
     use bangbang_session::SessionId;
     use bangbang_session::VmnetAuthority;
     #[cfg(target_os = "macos")]
@@ -10628,6 +10956,18 @@ mod tests {
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn contained_vmnet_authority(authority: VmnetAuthority) -> ProcessVmnetAuthority {
+        contained_vmnet_authority_for_session(0x5a, authority)
+    }
+
+    fn contained_vmnet_authority_for_session(
+        session_byte: u8,
+        authority: VmnetAuthority,
+    ) -> ProcessVmnetAuthority {
+        ProcessVmnetAuthority::contained(SessionId::from_bytes([session_byte; 32]), authority)
+            .expect("test session identity must not be the reserved pre-session value")
+    }
 
     #[derive(Debug)]
     struct TempFilePath {
@@ -11671,6 +12011,7 @@ mod tests {
         fn load_snapshot_v1(
             &mut self,
             _controller: &VmmController,
+            _vmnet_authority: ProcessVmnetAuthority,
             _input: &SnapshotLoadInput,
         ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
             Err(NativeV1SnapshotLoadError::ProcessTerminal)
@@ -11692,6 +12033,7 @@ mod tests {
     struct FakeStarter {
         result: FakeStartResult,
         calls: usize,
+        last_start_vmnet_authority: Option<ProcessVmnetAuthority>,
         provided_boot_file_calls: usize,
         provided_serial_output_calls: usize,
         snapshot_preflight_trace: Vec<&'static str>,
@@ -11711,6 +12053,7 @@ mod tests {
         last_snapshot_serial_config: Option<SerialConfig>,
         snapshot_serial_preflight_failure: bool,
         snapshot_network_preflight_calls: usize,
+        last_snapshot_vmnet_authority: Option<ProcessVmnetAuthority>,
         last_snapshot_network_configs: Option<Vec<NetworkInterfaceConfig>>,
         last_snapshot_mmds_config: Option<Option<MmdsConfig>>,
         last_snapshot_mmds_state: Option<MmdsStateHandle>,
@@ -11727,6 +12070,7 @@ mod tests {
             Self {
                 result: FakeStartResult::Success(Box::new(session)),
                 calls: 0,
+                last_start_vmnet_authority: None,
                 provided_boot_file_calls: 0,
                 provided_serial_output_calls: 0,
                 snapshot_preflight_trace: Vec::new(),
@@ -11746,6 +12090,7 @@ mod tests {
                 last_snapshot_serial_config: None,
                 snapshot_serial_preflight_failure: false,
                 snapshot_network_preflight_calls: 0,
+                last_snapshot_vmnet_authority: None,
                 last_snapshot_network_configs: None,
                 last_snapshot_mmds_config: None,
                 last_snapshot_mmds_state: None,
@@ -11796,6 +12141,7 @@ mod tests {
             Self {
                 result: FakeStartResult::Failure(source),
                 calls: 0,
+                last_start_vmnet_authority: None,
                 provided_boot_file_calls: 0,
                 provided_serial_output_calls: 0,
                 snapshot_preflight_trace: Vec::new(),
@@ -11815,6 +12161,7 @@ mod tests {
                 last_snapshot_serial_config: None,
                 snapshot_serial_preflight_failure: false,
                 snapshot_network_preflight_calls: 0,
+                last_snapshot_vmnet_authority: None,
                 last_snapshot_network_configs: None,
                 last_snapshot_mmds_config: None,
                 last_snapshot_mmds_state: None,
@@ -11827,6 +12174,7 @@ mod tests {
             Self {
                 result: FakeStartResult::TerminalFailure(source),
                 calls: 0,
+                last_start_vmnet_authority: None,
                 provided_boot_file_calls: 0,
                 provided_serial_output_calls: 0,
                 snapshot_preflight_trace: Vec::new(),
@@ -11846,6 +12194,7 @@ mod tests {
                 last_snapshot_serial_config: None,
                 snapshot_serial_preflight_failure: false,
                 snapshot_network_preflight_calls: 0,
+                last_snapshot_vmnet_authority: None,
                 last_snapshot_network_configs: None,
                 last_snapshot_mmds_config: None,
                 last_snapshot_mmds_state: None,
@@ -11875,8 +12224,10 @@ mod tests {
         fn start_with_startup_resources(
             &mut self,
             controller: &bangbang_runtime::VmmController,
+            vmnet_authority: ProcessVmnetAuthority,
             mut startup_resources: VmStartupResources,
         ) -> Result<Self::Session, InstanceStartError> {
+            self.last_start_vmnet_authority = Some(vmnet_authority);
             let serial_output = startup_resources.take_serial_output();
             if !startup_resources.is_empty() {
                 self.provided_boot_file_calls += 1;
@@ -11968,12 +12319,14 @@ mod tests {
         fn preflight_snapshot_v1_network(
             &mut self,
             _session: &mut Self::Session,
+            vmnet_authority: ProcessVmnetAuthority,
             configs: Vec<NetworkInterfaceConfig>,
             mmds_config: Option<MmdsConfig>,
             mmds_state: MmdsStateHandle,
         ) -> Result<(), ProcessCaptureReadyNetworkError> {
             self.snapshot_preflight_trace.push("network");
             self.snapshot_network_preflight_calls += 1;
+            self.last_snapshot_vmnet_authority = Some(vmnet_authority);
             self.last_snapshot_network_configs = Some(configs);
             self.last_snapshot_mmds_config = Some(mmds_config);
             self.last_snapshot_mmds_state = Some(mmds_state);
@@ -12003,6 +12356,7 @@ mod tests {
         fn load_snapshot_v1(
             &mut self,
             _controller: &VmmController,
+            _vmnet_authority: ProcessVmnetAuthority,
             _input: &SnapshotLoadInput,
         ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
             Err(NativeV1SnapshotLoadError::ProcessTerminal)
@@ -12020,6 +12374,7 @@ mod tests {
     struct FakeSnapshotLoadStarter {
         result: FakeSnapshotLoadResult,
         calls: Arc<AtomicU64>,
+        last_vmnet_authority: Option<ProcessVmnetAuthority>,
     }
 
     impl FakeSnapshotLoadStarter {
@@ -12027,6 +12382,7 @@ mod tests {
             Self {
                 result,
                 calls: Arc::default(),
+                last_vmnet_authority: None,
             }
         }
 
@@ -12062,9 +12418,11 @@ mod tests {
         fn load_snapshot_v1(
             &mut self,
             controller: &VmmController,
+            vmnet_authority: ProcessVmnetAuthority,
             input: &SnapshotLoadInput,
         ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_vmnet_authority = Some(vmnet_authority);
             assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
             if self.result == FakeSnapshotLoadResult::Terminal {
                 return Err(NativeV1SnapshotLoadError::ProcessTerminal);
@@ -14035,6 +14393,8 @@ mod tests {
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
         let calls = starter.calls();
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+        let owner = contained_vmnet_authority_for_session(0x62, VmnetAuthority::denied());
+        vmm.vmnet_authority = owner;
 
         assert!(
             vmm.restore_native_v1_snapshot(&snapshot_load_input(true))
@@ -14042,6 +14402,7 @@ mod tests {
         );
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(vmm.starter.last_vmnet_authority, Some(owner));
         assert_eq!(vmm.instance_info().state, InstanceState::Paused);
         assert!(vmm.has_started_session());
         assert_eq!(vmm.drive_configs().len(), 1);
@@ -14860,6 +15221,27 @@ mod tests {
     }
 
     #[test]
+    fn process_hvf_boot_session_rejects_same_policy_from_another_lifecycle_owner() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let inner = RuntimeNetworkTransactionSession::new(Arc::clone(&events));
+        let provider = RuntimeNetworkTransactionProvider::empty(Arc::clone(&events));
+        let authority =
+            VmnetAuthority::try_new(false, true, 1, &[]).expect("shared authority should validate");
+        let owner = contained_vmnet_authority_for_session(0x41, authority);
+        let other_owner = contained_vmnet_authority_for_session(0x42, authority);
+        let mut session =
+            ProcessHvfBootSession::new_with_vmnet_authority(inner, provider, None, owner);
+        let config = network_configs([("eth0", "vmnet:shared")]).remove(0);
+
+        assert_eq!(
+            session.insert_runtime_network_device(&config, other_owner),
+            Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized)
+        );
+        assert!(recorded_events(&events).is_empty());
+        assert!(session.packet_io.live_iface.is_none());
+    }
+
+    #[test]
     fn process_hvf_boot_session_cleans_hidden_provider_after_endpoint_publish_failure() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let inner = RuntimeNetworkTransactionSession::new(Arc::clone(&events)).with_insert_error(
@@ -15077,12 +15459,15 @@ mod tests {
     #[test]
     fn process_vmnet_readiness_bridge_delivers_prebind_signal_and_stops_cleanly() {
         let configs = network_configs([("eth0", "vmnet:shared")]);
+        let authority =
+            VmnetAuthority::try_new(false, true, 1, &[]).expect("shared authority should validate");
+        let owner = contained_vmnet_authority_for_session(0x43, authority);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
         let callbacks = factory.packet_callbacks();
-        let mut provider =
-            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+        let mut provider = ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory_and_owner(
                 &configs,
                 None,
+                owner,
                 &mut factory,
             )
             .expect("vmnet provider should build");
@@ -15096,6 +15481,13 @@ mod tests {
                 worker_wake_count.fetch_add(1, Ordering::SeqCst);
             }))
             .expect("readiness wake should bind");
+        assert_eq!(
+            provider
+                .readiness_bridge
+                .as_ref()
+                .map(|bridge| bridge.owner),
+            Some(owner)
+        );
 
         for _ in 0..100 {
             if wake_count.load(Ordering::SeqCst) != 0 {
@@ -15864,6 +16256,7 @@ mod tests {
             },
         };
         let published = super::PublishedProcessNetworkPacketIoEntry {
+            owner: ProcessVmnetAuthority::Direct,
             generation: 7,
             iface_id: private_iface.to_string(),
         };
@@ -16018,23 +16411,24 @@ mod tests {
     #[test]
     fn contained_runtime_vmnet_authority_counts_only_live_vmnet_entries() {
         let configs = network_configs([("eth0", "vmnet:shared")]);
+        let one_shared = VmnetAuthority::try_new(false, true, 1, &[])
+            .expect("bounded shared authority should validate");
+        let owner = contained_vmnet_authority(one_shared);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
-        let provider =
-            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+        let provider = ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory_and_owner(
                 &configs,
                 None,
+                owner,
                 &mut factory,
             )
             .expect("startup vmnet provider should build");
-        let one_shared = VmnetAuthority::try_new(false, true, 1, &[])
-            .expect("bounded shared authority should validate");
         let shared = VmnetInterfaceConfig::from_host_dev_name("vmnet:shared")
             .expect("shared mode should parse");
         assert_eq!(
             provider.validate_runtime_authority(
                 super::ProcessNetworkPacketIoEntryClass::Vmnet,
                 &shared,
-                ProcessVmnetAuthority::Contained(one_shared),
+                owner,
             ),
             Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized)
         );
@@ -16042,11 +16436,232 @@ mod tests {
             provider.validate_runtime_authority(
                 super::ProcessNetworkPacketIoEntryClass::MmdsOnly,
                 &shared,
-                ProcessVmnetAuthority::Contained(VmnetAuthority::denied()),
+                owner,
             ),
             Ok(()),
             "MMDS-only entries must not consume vmnet authority"
         );
+    }
+
+    #[test]
+    fn contained_vmnet_owner_rejects_pre_session_and_redacts_identity_and_policy() {
+        let authority = VmnetAuthority::try_new(false, false, 1, &["private-bridge"])
+            .expect("test bridge authority should validate");
+
+        assert!(
+            ProcessVmnetAuthority::contained(SessionId::pre_session(), authority).is_none(),
+            "the greeting identity must never become live network authority"
+        );
+        let owner = contained_vmnet_authority_for_session(0xa5, authority);
+        let diagnostics = format!("{owner:?}");
+        assert_eq!(diagnostics, "Contained(<redacted>)");
+        assert!(!diagnostics.contains("private-bridge"));
+        assert!(!diagnostics.contains("a5"));
+    }
+
+    #[test]
+    fn contained_provider_validates_complete_policy_before_backend_acquisition() {
+        let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "vmnet:host")]);
+        let authority = VmnetAuthority::try_new(false, true, 2, &[])
+            .expect("shared-only authority should validate");
+        let owner = contained_vmnet_authority_for_session(0x31, authority);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let events = factory.events();
+
+        let error = ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory_and_owner(
+            &configs,
+            None,
+            owner,
+            &mut factory,
+        )
+        .expect_err("one disallowed mode must reject the complete startup set");
+
+        assert!(matches!(
+            error,
+            ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+        ));
+        assert!(recorded_events(&events).is_empty());
+    }
+
+    #[test]
+    fn contained_provider_rejects_same_policy_from_another_session_before_runtime_backend() {
+        let authority =
+            VmnetAuthority::try_new(false, true, 1, &[]).expect("shared authority should validate");
+        let owner = contained_vmnet_authority_for_session(0x32, authority);
+        let other_owner = contained_vmnet_authority_for_session(0x33, authority);
+        let mut startup_factory = RecordingVmnetPacketIoBackendFactory::default();
+        let mut provider = ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory_and_owner(
+            &[],
+            None,
+            owner,
+            &mut startup_factory,
+        )
+        .expect("empty contained provider should build without host networking");
+        let config = network_configs([("eth0", "vmnet:shared")])
+            .pop()
+            .expect("runtime config should exist");
+        let mut runtime_factory = RecordingVmnetPacketIoBackendFactory::default();
+        let events = runtime_factory.events();
+
+        assert!(matches!(
+            provider
+                .prepare_runtime_entry_with_factory(&config, other_owner, &mut runtime_factory,),
+            Err(NetworkRuntimeMutationError::HostNetworkNotAuthorized)
+        ));
+        assert!(recorded_events(&events).is_empty());
+        assert!(provider.entries.is_empty());
+        assert_eq!(provider.next_generation, 0);
+
+        let prepared = provider
+            .prepare_runtime_entry_with_factory(&config, owner, &mut runtime_factory)
+            .expect("the exact lifecycle owner should prepare its admitted backend");
+        let published = provider.publish_prepared(prepared);
+        assert_eq!(provider.owner, owner);
+        assert_eq!(provider.entries[0].owner, owner);
+        assert_eq!(published.owner, owner);
+
+        let wrong_handle = super::PublishedProcessNetworkPacketIoEntry {
+            owner: other_owner,
+            generation: published.generation,
+            iface_id: published.iface_id.clone(),
+        };
+        assert!(matches!(
+            provider.take_published(&wrong_handle),
+            Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch)
+        ));
+        assert_eq!(provider.entries.len(), 1);
+    }
+
+    #[test]
+    fn contained_mmds_only_provider_requires_exact_owner_without_consuming_vmnet_limit() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mmds_state = MmdsStateHandle::default();
+        mmds_state
+            .with_mut(|state| {
+                state.put_config(MmdsConfigInput::new(vec!["eth0".to_string()]), &configs)
+            })
+            .expect("MMDS state should lock")
+            .expect("MMDS selection should install");
+        let mmds_config = mmds_state
+            .config()
+            .expect("MMDS state should lock")
+            .expect("MMDS config should exist");
+        let metrics = SharedMmdsMetrics::default();
+        let detour = ProcessMmdsPacketDetourConfig::from_mmds_config(
+            mmds_state.clone(),
+            &mmds_config,
+            metrics.clone(),
+        );
+        let authority = VmnetAuthority::denied();
+        let owner = contained_vmnet_authority_for_session(0x34, authority);
+        let other_owner = contained_vmnet_authority_for_session(0x35, authority);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let events = factory.events();
+        let mut provider = ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory_and_owner(
+            &configs,
+            Some(&detour),
+            owner,
+            &mut factory,
+        )
+        .expect("MMDS-only provider should not require host-network authority");
+
+        assert_eq!(provider.vmnet_count(), 0);
+        assert!(recorded_events(&events).is_empty());
+        assert!(matches!(
+            provider.quiesce_capture_publication_for_owner(other_owner),
+            Err(ProcessCaptureReadyNetworkError::AuthorityMismatch)
+        ));
+        assert!(matches!(
+            provider.prepare_capture_for_owner(
+                other_owner,
+                &configs,
+                Some(&mmds_config),
+                &mmds_state,
+                Some(&metrics),
+                Instant::now(),
+            ),
+            Err(ProcessCaptureReadyNetworkError::AuthorityMismatch)
+        ));
+        let captured = provider
+            .prepare_capture_for_owner(
+                owner,
+                &configs,
+                Some(&mmds_config),
+                &mmds_state,
+                Some(&metrics),
+                Instant::now(),
+            )
+            .expect("exact owner should capture MMDS-only state");
+        assert_eq!(captured.entries.len(), 1);
+        assert!(matches!(
+            captured.entries[0].backend,
+            super::ProcessCaptureReadyNetworkBackend::MmdsOnly
+        ));
+        let mut removed = provider
+            .take_interface("eth0")
+            .expect("MMDS-only owner should be removable");
+        removed.entry.owner = other_owner;
+        assert!(matches!(
+            provider.restore_removed(removed),
+            Err(ProcessNetworkPacketIoRegistryError::AuthorityMismatch)
+        ));
+        assert!(provider.entries.is_empty());
+    }
+
+    #[test]
+    fn contained_capture_rechecks_live_vmnet_modes_and_actual_count() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let authority = VmnetAuthority::try_new(false, true, 1, &[])
+            .expect("one-shared authority should validate");
+        let owner = contained_vmnet_authority_for_session(0x36, authority);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let mut provider = ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory_and_owner(
+            &configs,
+            None,
+            owner,
+            &mut factory,
+        )
+        .expect("one admitted vmnet entry should build");
+        let mmds_state = MmdsStateHandle::default();
+        let wrong_mode = network_configs([("eth0", "vmnet:host")]);
+
+        assert!(matches!(
+            provider.prepare_capture_for_owner(
+                owner,
+                &wrong_mode,
+                None,
+                &mmds_state,
+                None,
+                Instant::now(),
+            ),
+            Err(ProcessCaptureReadyNetworkError::AuthorityMismatch)
+        ));
+
+        let second = network_configs([("eth1", "vmnet:shared")])
+            .pop()
+            .expect("second config should exist");
+        let prepared = provider
+            .prepare_entry_with_factory(
+                &second,
+                super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                false,
+                &mut factory,
+            )
+            .expect("test-only drift should bypass runtime authority validation");
+        provider.publish_prepared(prepared);
+        let mut over_limit = configs;
+        over_limit.push(second);
+        assert!(matches!(
+            provider.prepare_capture_for_owner(
+                owner,
+                &over_limit,
+                None,
+                &mmds_state,
+                None,
+                Instant::now(),
+            ),
+            Err(ProcessCaptureReadyNetworkError::AuthorityMismatch)
+        ));
     }
 
     #[test]
@@ -16103,7 +16718,8 @@ mod tests {
 
         match error {
             ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. } => {}
-            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+            | ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
             | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
             | ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
             | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
@@ -16146,7 +16762,8 @@ mod tests {
                     }
                 );
             }
-            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. }
+            ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+            | ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. }
             | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
             | ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
             | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
@@ -16182,7 +16799,8 @@ mod tests {
 
         match error {
             ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. } => {}
-            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+            | ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
             | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
             | ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
             | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
@@ -16204,7 +16822,7 @@ mod tests {
     }
 
     #[test]
-    fn process_vmnet_packet_io_provider_cleans_started_entries_after_later_failure() {
+    fn process_vmnet_packet_io_provider_validates_complete_policy_before_any_backend() {
         let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "tap1")]);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
         let event_log = factory.events();
@@ -16218,7 +16836,8 @@ mod tests {
 
         match error {
             ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. } => {}
-            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+            | ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
             | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
             | ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
             | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
@@ -16236,15 +16855,7 @@ mod tests {
                 panic!("unsupported host_dev_name should be reported as config failure");
             }
         }
-        assert_eq!(
-            recorded_events(&event_log),
-            [
-                "backend:eth0".to_string(),
-                "descriptor:eth0:shared".to_string(),
-                "start:eth0".to_string(),
-                "stop:eth0".to_string(),
-            ]
-        );
+        assert!(recorded_events(&event_log).is_empty());
     }
 
     #[test]
@@ -16252,9 +16863,12 @@ mod tests {
         let configs = network_configs([
             ("eth0", "vmnet:shared"),
             ("eth1", "vmnet:host"),
-            ("eth2", "tap2"),
+            ("eth2", "vmnet:bridged:en0"),
         ]);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_start_status(None)
+            .with_next_start_status(None)
+            .with_next_start_status(Some(VmnetStatus::NotAuthorized))
             .with_next_stop_status(None)
             .with_next_stop_status(Some(VmnetStatus::Failure));
         let events = factory.events();
@@ -16280,6 +16894,9 @@ mod tests {
                 "backend:eth1".to_string(),
                 "descriptor:eth1:host".to_string(),
                 "start:eth1".to_string(),
+                "backend:eth2".to_string(),
+                "descriptor:eth2:bridged".to_string(),
+                "start:eth2".to_string(),
                 "stop:eth1".to_string(),
                 "stop:eth0".to_string(),
             ]
@@ -20053,7 +20670,7 @@ mod tests {
     #[test]
     fn contained_vmnet_denial_precedes_starter_and_grant_consumption() {
         let mut vmm = configured_vmm(FakeStarter::success(70))
-            .with_vmnet_authority(ProcessVmnetAuthority::Contained(VmnetAuthority::denied()));
+            .with_vmnet_authority(contained_vmnet_authority(VmnetAuthority::denied()));
         vmm.handle_action(VmmAction::PutNetworkInterface(
             NetworkInterfaceConfigInput::new("private_iface", "private_iface", "vmnet:shared"),
         ))
@@ -20087,8 +20704,8 @@ mod tests {
     fn contained_vmnet_authority_matches_every_exact_mode_and_active_limit() {
         let authority = VmnetAuthority::try_new(true, true, 3, &["en0"])
             .expect("test authority should validate");
-        let mut vmm = configured_vmm(FakeStarter::success(71))
-            .with_vmnet_authority(ProcessVmnetAuthority::Contained(authority));
+        let owner = contained_vmnet_authority(authority);
+        let mut vmm = configured_vmm(FakeStarter::success(71)).with_vmnet_authority(owner);
         for (iface_id, host_dev_name) in [
             ("eth0", "vmnet:host"),
             ("eth1", "vmnet:shared"),
@@ -20104,6 +20721,7 @@ mod tests {
             .expect("every exact admitted mode should start");
 
         assert_eq!(vmm.starter.calls, 1);
+        assert_eq!(vmm.starter.last_start_vmnet_authority, Some(owner));
         assert_eq!(vmm.instance_info().state, InstanceState::Running);
     }
 
@@ -20112,7 +20730,7 @@ mod tests {
         let bridge_authority = VmnetAuthority::try_new(false, false, 1, &["en0"])
             .expect("test authority should validate");
         let mut bridge_vmm = configured_vmm(FakeStarter::success(72))
-            .with_vmnet_authority(ProcessVmnetAuthority::Contained(bridge_authority));
+            .with_vmnet_authority(contained_vmnet_authority(bridge_authority));
         bridge_vmm
             .handle_action(VmmAction::PutNetworkInterface(
                 NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:bridged:en1"),
@@ -20129,7 +20747,7 @@ mod tests {
         let shared_authority =
             VmnetAuthority::try_new(false, true, 1, &[]).expect("test authority should validate");
         let mut count_vmm = configured_vmm(FakeStarter::success(73))
-            .with_vmnet_authority(ProcessVmnetAuthority::Contained(shared_authority));
+            .with_vmnet_authority(contained_vmnet_authority(shared_authority));
         for iface_id in ["eth0", "eth1"] {
             count_vmm
                 .handle_action(VmmAction::PutNetworkInterface(
@@ -20149,7 +20767,7 @@ mod tests {
     #[test]
     fn all_mmds_requires_no_vmnet_authority_but_still_validates_syntax() {
         let mut vmm = configured_vmm(FakeStarter::success(74))
-            .with_vmnet_authority(ProcessVmnetAuthority::Contained(VmnetAuthority::denied()));
+            .with_vmnet_authority(contained_vmnet_authority(VmnetAuthority::denied()));
         for iface_id in ["eth0", "eth1"] {
             vmm.handle_action(VmmAction::PutNetworkInterface(
                 NetworkInterfaceConfigInput::new(iface_id, iface_id, "vmnet:shared"),
@@ -20167,7 +20785,7 @@ mod tests {
         assert_eq!(vmm.starter.calls, 1);
 
         let mut malformed = configured_vmm(FakeStarter::success(75))
-            .with_vmnet_authority(ProcessVmnetAuthority::Contained(VmnetAuthority::denied()));
+            .with_vmnet_authority(contained_vmnet_authority(VmnetAuthority::denied()));
         malformed
             .handle_action(VmmAction::PutNetworkInterface(
                 NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"),
@@ -20190,7 +20808,7 @@ mod tests {
         let authority =
             VmnetAuthority::try_new(true, false, 2, &[]).expect("test authority should validate");
         let mut vmm = configured_vmm(FakeStarter::success(76))
-            .with_vmnet_authority(ProcessVmnetAuthority::Contained(authority));
+            .with_vmnet_authority(contained_vmnet_authority(authority));
         vmm.handle_action(VmmAction::PutNetworkInterface(
             NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:host"),
         ))
@@ -20485,6 +21103,8 @@ mod tests {
             .parent()
             .expect("missing broad snapshot path should have a parent");
         let mut vmm = configured_vmm(FakeStarter::success(160));
+        let owner = contained_vmnet_authority_for_session(0x61, VmnetAuthority::denied());
+        vmm.vmnet_authority = owner;
         vmm.handle_action(VmmAction::PutDrive(
             DriveConfigInput::new("root", "root", "/private/root", true)
                 .with_is_read_only(true)
@@ -20563,6 +21183,8 @@ mod tests {
             Some(vmm.controller.serial_config().clone())
         );
         assert_eq!(vmm.starter.snapshot_network_preflight_calls, 1);
+        assert_eq!(vmm.starter.last_start_vmnet_authority, Some(owner));
+        assert_eq!(vmm.starter.last_snapshot_vmnet_authority, Some(owner));
         assert_eq!(
             vmm.starter.last_snapshot_network_configs.as_deref(),
             Some(vmm.controller.network_interface_configs())
@@ -22873,7 +23495,7 @@ mod tests {
             .expect("contained shared authority should validate");
         let mut vmm = configured_vmm(FakeStarter::success(79));
         vmm.pci_enabled = true;
-        vmm.vmnet_authority = ProcessVmnetAuthority::Contained(authority);
+        vmm.vmnet_authority = contained_vmnet_authority(authority);
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
 
@@ -22888,7 +23510,7 @@ mod tests {
             .expect("started session should remain available");
         assert_eq!(
             session.last_network_authority,
-            Some(ProcessVmnetAuthority::Contained(authority))
+            Some(contained_vmnet_authority(authority))
         );
     }
 

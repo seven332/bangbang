@@ -551,6 +551,54 @@ fn launcher_exposes_exact_jailer_help_version_and_policy_validation() {
 }
 
 #[test]
+fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation() {
+    let bundle = production_bundle();
+    initialize_worker_container(&bundle);
+    // SAFETY: Credential getters have no pointer or ownership contract.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+
+    for (case, allowed_mode) in [
+        ("host", "host"),
+        ("shared", "shared"),
+        ("bridged", "bridged:bridge_7"),
+    ] {
+        let baseline_sessions = session_entries();
+        let mut command = Command::new(launcher(&bundle));
+        command
+            .arg(JAILER_OPTION)
+            .args(["--id", &format!("networkless-{case}")])
+            .arg("--exec-file")
+            .arg(worker_executable(&bundle))
+            .args([
+                "--uid",
+                &uid.to_string(),
+                "--gid",
+                &gid.to_string(),
+                "--vmnet-allow",
+                allowed_mode,
+                "--vmnet-max-interfaces",
+                "1",
+                "--",
+                "--version",
+            ]);
+
+        let output = run_with_timeout(
+            &mut command,
+            PROCESS_TIMEOUT,
+            "networkless positive vmnet policy rejection",
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "bangbang launcher: invalid production launch policy\n"
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("bridge_7"));
+        assert_eq!(session_entries(), baseline_sessions);
+    }
+}
+
+#[test]
 fn signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker() {
     let bundle = production_bundle();
     initialize_worker_container(&bundle);

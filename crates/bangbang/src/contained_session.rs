@@ -4,19 +4,24 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use bangbang_session::{GrantId, SnapshotOutputChild, SocketChild, VmnetAuthority, WorkerPolicy};
+use bangbang_session::{
+    GrantId, SessionId, SnapshotOutputChild, SocketChild, VmnetAuthority, WorkerPolicy,
+};
 #[cfg(not(target_os = "macos"))]
 use bangbang_session::{Readiness, TerminalCategory};
 
 const GRANT_REFERENCE_PREFIX: &str = "bangbang-grant:";
 
-fn started_vmnet_authority(
+fn started_vmnet_session_authority(
     policy: WorkerPolicy,
+    session: Option<SessionId>,
     started: bool,
-) -> Result<VmnetAuthority, ContainedSessionError> {
-    started
-        .then(|| policy.vmnet_authority())
-        .ok_or(ContainedSessionError)
+) -> Result<(SessionId, VmnetAuthority), ContainedSessionError> {
+    let session = session.filter(|session| !session.is_pre_session());
+    match (started, session) {
+        (true, Some(session)) => Ok((session, policy.vmnet_authority())),
+        (false, _) | (true, None) => Err(ContainedSessionError),
+    }
 }
 
 /// Stable private bootstrap failure that never includes identity or path data.
@@ -103,11 +108,11 @@ mod reference_tests {
     use std::path::{Path, PathBuf};
 
     use bangbang_session::{MAX_GRANT_ID_BYTES, MAX_SNAPSHOT_OUTPUT_CHILD_BYTES};
-    use bangbang_session::{VmnetAuthority, WorkerPolicy};
+    use bangbang_session::{SessionId, VmnetAuthority, WorkerPolicy};
 
     use super::{
         ContainedSessionError, GrantClaimError, grant_reference_id, snapshot_output_reference,
-        socket_directory_reference, started_vmnet_authority,
+        socket_directory_reference, started_vmnet_session_authority,
     };
 
     #[test]
@@ -234,7 +239,7 @@ mod reference_tests {
     }
 
     #[test]
-    fn vmnet_authority_is_published_only_for_each_started_session() {
+    fn vmnet_authority_is_published_only_with_each_started_session_identity() {
         let first =
             VmnetAuthority::try_new(true, false, 1, &[]).expect("first authority should validate");
         let second =
@@ -243,17 +248,40 @@ mod reference_tests {
             WorkerPolicy::new(501, 20, 2048, None, false).with_vmnet_authority(first);
         let second_policy =
             WorkerPolicy::new(501, 20, 2048, None, false).with_vmnet_authority(second);
+        let first_session = SessionId::from_bytes([1; 32]);
+        let second_session = SessionId::from_bytes([2; 32]);
 
         assert_eq!(
-            started_vmnet_authority(first_policy, false),
+            started_vmnet_session_authority(first_policy, Some(first_session), false),
             Err(ContainedSessionError),
             "cancelled pre-Proceed bootstrap must not publish policy"
         );
-        assert_eq!(started_vmnet_authority(first_policy, true), Ok(first));
-        assert_eq!(started_vmnet_authority(second_policy, true), Ok(second));
+        assert_eq!(
+            started_vmnet_session_authority(first_policy, None, true),
+            Err(ContainedSessionError),
+            "started bootstrap must retain its authenticated identity"
+        );
+        assert_eq!(
+            started_vmnet_session_authority(first_policy, Some(SessionId::pre_session()), true),
+            Err(ContainedSessionError),
+            "the reserved greeting identity is never a usable owner"
+        );
+        assert_eq!(
+            started_vmnet_session_authority(first_policy, Some(first_session), true),
+            Ok((first_session, first))
+        );
+        assert_eq!(
+            started_vmnet_session_authority(second_policy, Some(second_session), true),
+            Ok((second_session, second))
+        );
         assert_ne!(
-            started_vmnet_authority(first_policy, true),
-            started_vmnet_authority(second_policy, true),
+            started_vmnet_session_authority(first_policy, Some(first_session), true),
+            started_vmnet_session_authority(first_policy, Some(second_session), true),
+            "identical policies from independent sessions remain distinct"
+        );
+        assert_ne!(
+            started_vmnet_session_authority(first_policy, Some(first_session), true),
+            started_vmnet_session_authority(second_policy, Some(second_session), true),
             "concurrent sessions retain independent values"
         );
     }
@@ -2114,8 +2142,15 @@ mod platform {
             self.started.then(|| self.grants.clone())
         }
 
-        pub(crate) fn vmnet_authority(&self) -> Result<VmnetAuthority, ContainedSessionError> {
-            super::started_vmnet_authority(self.policy, self.started)
+        pub(crate) fn vmnet_session_authority(
+            &self,
+        ) -> Result<(SessionId, VmnetAuthority), ContainedSessionError> {
+            let session = self
+                .lifecycle
+                .lock()
+                .map_err(|_| ContainedSessionError)?
+                .session();
+            super::started_vmnet_session_authority(self.policy, session, self.started)
         }
 
         pub(crate) fn directory_grant_authority(&self) -> Option<DirectoryGrantAuthority> {
@@ -3913,9 +3948,15 @@ mod platform {
             None
         }
 
-        pub(crate) fn vmnet_authority(
+        pub(crate) fn vmnet_session_authority(
             &self,
-        ) -> Result<bangbang_session::VmnetAuthority, ContainedSessionError> {
+        ) -> Result<
+            (
+                bangbang_session::SessionId,
+                bangbang_session::VmnetAuthority,
+            ),
+            ContainedSessionError,
+        > {
             Err(ContainedSessionError)
         }
 
