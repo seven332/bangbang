@@ -981,8 +981,12 @@ with retained work and session-owned retry wakeups. They are not packet
 filters, a host firewall, or a NAT policy, and current signed limiter evidence
 uses MMDS-only packet I/O rather than direct vmnet. The boundary still lacks
 packet filtering, production network isolation, a repository-owned approved
-credential and real contained vmnet evidence, network snapshot state, and full
-Firecracker public packet-movement parity.
+credential and real contained vmnet evidence, network/MMDS snapshot encoding
+and restoration, and full Firecracker public packet-movement parity. The
+checked
+[network and MMDS closure contract](../compat/firecracker/v1.16.0/network-mmds-contract.md)
+separately pins the implemented deterministic capture-ready state and the
+#1378/#1490/#1491 handoffs without broadening this security claim.
 
 ## API Socket Handling
 

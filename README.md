@@ -1227,7 +1227,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 191 implemented-and-verified, 207 audit-required, three
+delivery overlay with 220 implemented-and-verified, 178 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1249,9 +1249,12 @@ PVTime behavior while retaining its one aggregate record for Wave 6
 clone/portability certification. The
 [aggregate remaining-device ledger](compat/firecracker/v1.16.0/remaining-device-contract.md)
 joins those five family ledgers into an exact 85-record,
-77-terminal/eight-Wave-6 closure without changing the repository-wide
-191/207/3/17 disposition
-counts; none of those 85 records is transferred to Wave 7 #1491.
+77-terminal/eight-Wave-6 closure. The
+[network and MMDS closure ledger](compat/firecracker/v1.16.0/network-mmds-contract.md)
+then maps an exact 35-record set to the composed direct, contained, capture,
+and non-success external gates: 31 are terminal and four remain audit-owned by
+#1378, #1490, or #1491. The repository-wide disposition counts are now
+220/178/3/17.
 
 ## Build And Test
 

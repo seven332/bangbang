@@ -234,11 +234,35 @@
     {
       "id": "api-operation:GET /mmds",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation GET /mmds.",
+      "summary": "Return the current bounded process-local MMDS JSON value through the strict Firecracker-shaped host API before or after startup, distinguishing an absent runtime store from a present uninitialized store and never exposing token or packet state.",
       "source_refs": [
         "api-operation:GET /mmds"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "GET /mmds request and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "MmdsState host data-store access"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "GET /mmds parser and response serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed API and no-API MMDS v1/v2 guest cases"
+        }
+      ]
     },
     {
       "id": "api-operation:GET /version",
@@ -532,20 +556,78 @@
     {
       "id": "api-operation:PATCH /mmds",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /mmds.",
+      "summary": "Apply RFC 7396 JSON Merge Patch to initialized process-local MMDS data before or during guest execution, enforce the effective serialized-size limit, and preserve the prior value on absent-store, uninitialized-store, malformed, or oversized results.",
       "source_refs": [
         "api-operation:PATCH /mmds"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PATCH /mmds request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "MmdsState merge_patch"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PATCH /mmds strict body tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "MMDS merge, size, runtime-state, and rollback tests"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /network-interfaces/{iface_id}",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PATCH /network-interfaces/{iface_id}.",
+      "summary": "Update one live network interface's RX and TX token buckets incrementally in Running or Paused state. Matching ID validation and owner-thread mutation precede stored-config commit; omitted buckets preserve exact live budget, enabled buckets start fresh, disabled buckets clear only their target, and failure is nonmutating.",
       "source_refs": [
         "api-operation:PATCH /network-interfaces/{iface_id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PartialNetworkInterface request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm::update_network_interface"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "incremental live network limiter update"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "network PATCH strict request tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "network limiter update, retry, rollback, and paused-state tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed MMIO and PCI limiter continuation evidence"
+        }
+      ]
     },
     {
       "id": "api-operation:PATCH /pmem/{id}",
@@ -1063,20 +1145,78 @@
     {
       "id": "api-operation:PUT /mmds",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /mmds.",
+      "summary": "Replace the process-local MMDS data store with a JSON object before or during guest execution, enforcing the effective serialized-size limit and committing only a complete valid value while preserving established guest sessions and configuration.",
       "source_refs": [
         "api-operation:PUT /mmds"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PUT /mmds request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "MmdsState put_data"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PUT /mmds strict object and size tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed API MMDS v1/v2 guest data cases"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /mmds/config",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /mmds/config.",
+      "summary": "Configure MMDS before startup with a nonempty validated interface set, V1 or V2, a default or valid link-local IPv4 address, and optional IMDS-compatible formatting. Startup creates one bounded stack per selected interface over shared VM data and immutable token authority.",
       "source_refs": [
         "api-operation:PUT /mmds/config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MmdsConfig request parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "MmdsConfigInput validation and committed state"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "per-interface MMDS stack construction"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete MMDS config parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed configured-IP, V1/V2, and multi-interface MMDS cases"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed MMIO and PCI V2 MMDS session evidence"
+        }
+      ]
     },
     {
       "id": "api-operation:PUT /network-interfaces/{iface_id}",
@@ -1726,29 +1866,111 @@
     {
       "id": "api-path:/mmds",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /mmds.",
+      "summary": "Provide the complete strict Firecracker-shaped /mmds host path: GET current data, PUT complete replacement, and RFC 7396 PATCH after initialization, with preboot/runtime store policy, bounded serialized content, stable errors, and no partial mutation.",
       "source_refs": [
         "api-path:/mmds"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "/mmds method routing and response model"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "bounded MMDS data-store operations"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "/mmds GET PUT PATCH and invalid-method tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "MMDS lifecycle and failure-atomicity tests"
+        }
+      ]
     },
     {
       "id": "api-path:/mmds/config",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /mmds/config.",
+      "summary": "Provide the strict preboot-only PUT /mmds/config path with interface existence and uniqueness checks, V1/V2 selection, valid link-local IPv4 policy, IMDS compatibility, committed full-config projection, and stable nonmutating runtime or malformed-request rejection.",
       "source_refs": [
         "api-path:/mmds/config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "/mmds/config route and body parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "MMDS config validation and projection"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "/mmds/config route and field matrix tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed configured MMDS interface and version cases"
+        }
+      ]
     },
     {
       "id": "api-path:/network-interfaces/{iface_id}",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /network-interfaces/{iface_id}.",
+      "summary": "Provide strict PUT configuration, runtime incremental PATCH, and bodyless PCI-only DELETE for one network interface. Matching identity, immutable requested/realized profiles, owner-first live mutation, rollback, redaction, and configuration-last commit cover startup, Running, Paused, teardown, and exact reuse.",
       "source_refs": [
         "api-path:/network-interfaces/{iface_id}"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "network interface PUT PATCH DELETE routing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "network startup update insertion and removal transactions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "network configuration and live device ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "network path strict routing and request tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed network configuration PATCH and PCI reuse evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_hotplugs_mmds_network_without_vmnet_authority"
+        }
+      ]
     },
     {
       "id": "api-path:/pmem/{id}",
@@ -4193,20 +4415,68 @@
     {
       "id": "api-property:FullVmConfiguration.mmds-config",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.mmds-config.",
+      "summary": "Return the committed nullable MMDS configuration through GET /vm/config with exact interface order, V1/V2 value, optional IPv4 address, and IMDS compatibility. Failed or unsupported updates preserve the previous projection.",
       "source_refs": [
         "api-property:FullVmConfiguration.mmds-config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "FullVmConfiguration mmds-config serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "VmmController committed MMDS config projection"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete VM config MMDS serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "MMDS config commit and rollback tests"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.network-interfaces",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.network-interfaces.",
+      "summary": "Return the ordered committed requested network configurations through GET /vm/config, including runtime insert, limiter update, and delete results while keeping realized backend-only properties separate and preserving the prior array on owner or cleanup failure.",
       "source_refs": [
         "api-property:FullVmConfiguration.network-interfaces"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "FullVmConfiguration network-interfaces serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live network configuration commit ordering"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "network projection rollback and runtime reuse tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed network full-config and hotplug evidence"
+        }
+      ]
     },
     {
       "id": "api-property:FullVmConfiguration.pmem",
@@ -5114,38 +5384,134 @@
     {
       "id": "api-property:MmdsConfig.imds_compat",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MmdsConfig.imds_compat.",
+      "summary": "Accept an optional boolean IMDS-compatibility policy, retain it in committed configuration, and force guest MMDS responses to IMDS formatting when true while preserving Accept-driven JSON or IMDS selection when false or omitted.",
       "source_refs": [
         "api-property:MmdsConfig.imds_compat"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MmdsConfig imds_compat parsing and response projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "MMDS IMDS and JSON response formatting"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MMDS imds_compat type and serialization tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "MMDS IMDS compatibility and Accept-header tests"
+        }
+      ]
     },
     {
       "id": "api-property:MmdsConfig.ipv4_address",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MmdsConfig.ipv4_address.",
+      "summary": "Accept an optional valid 169.254/16 MMDS IPv4 address excluding the network and broadcast boundary, default to 169.254.169.254 when omitted, expose the requested value, and bind every selected interface stack to the same effective target.",
       "source_refs": [
         "api-property:MmdsConfig.ipv4_address"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MmdsConfig IPv4 parsing and link-local validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "per-interface effective MMDS IPv4 ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MMDS IPv4 boundary tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed configured and default MMDS IPv4 guest cases"
+        }
+      ]
     },
     {
       "id": "api-property:MmdsConfig.network_interfaces",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MmdsConfig.network_interfaces.",
+      "summary": "Require a nonempty unique list of already configured interface IDs before startup, retain its order in public configuration, and create one isolated bounded MMDS stack for every selected device while sharing only VM data and token authority.",
       "source_refs": [
         "api-property:MmdsConfig.network_interfaces"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "MMDS interface selection validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "independent per-interface MMDS stack state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_serves_mmds_on_two_isolated_guest_interfaces"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "multi-interface isolation and shared-data tests"
+        }
+      ]
     },
     {
       "id": "api-property:MmdsConfig.version",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property MmdsConfig.version.",
+      "summary": "Accept only V1 or V2 before startup, default to V1 when omitted, retain the selected value in public configuration, and enforce exact guest token policy while preserving V1 compatibility and bounded V2 session TTL behavior.",
       "source_refs": [
         "api-property:MmdsConfig.version"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "MmdsVersion configuration and guest request policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_token.rs",
+          "anchor": "bounded V2 token authority"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed API and no-API MMDS V1/V2 guest cases"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "V1/V2 request header status and format tests"
+        }
+      ]
     },
     {
       "id": "api-property:MsrModifier.addr",
@@ -5168,56 +5534,205 @@
     {
       "id": "api-property:NetworkInterface.guest_mac",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.guest_mac.",
+      "summary": "Validate an optional six-octet guest MAC, enforce global uniqueness across explicit and vmnet-allocated realized values, advertise it through virtio config when present, observe source spoofing without filtering, and release exact ownership on rollback or delete.",
       "source_refs": [
         "api-property:NetworkInterface.guest_mac"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/vmnet.rs",
+          "anchor": "configured and allocated realized MAC validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "guest MAC config feature and spoof observation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "explicit allocated duplicate rollback and reuse tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed MMIO and PCI virtio-net config evidence"
+        }
+      ]
     },
     {
       "id": "api-property:NetworkInterface.host_dev_name",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.host_dev_name.",
+      "summary": "Require a nonempty requested backend name, map only vmnet host, shared, or nonempty bridged forms at startup, retain the requested API value separately from redacted realized backend state, and validate exact contained mode, bridge, session, and live-count authority before acquisition.",
       "source_refs": [
         "api-property:NetworkInterface.host_dev_name"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/vmnet.rs",
+          "anchor": "typed host shared and bridged vmnet descriptors"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "host_dev_name mapping and contained authority validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "requested network configuration ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "vmnet syntax policy redaction and authority tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "networkless positive-mode rejection and contained MMDS-only tests"
+        }
+      ]
     },
     {
       "id": "api-property:NetworkInterface.iface_id",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.iface_id.",
+      "summary": "Require a bounded valid identifier equal to the path ID and use it as the exact configuration, queue, provider, MMDS stack, metrics-generation, runtime PCI, callback, capture, teardown, and reuse key without exposing rejected values.",
       "source_refs": [
         "api-property:NetworkInterface.iface_id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "interface-keyed startup and runtime owner registry"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "network interface identity validation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "network path and body ID validation tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed multi-interface and exact same-ID runtime reuse"
+        }
+      ]
     },
     {
       "id": "api-property:NetworkInterface.mtu",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.mtu.",
+      "summary": "Accept optional MTU values in 68..=65535, advertise only a requested value, require host/shared vmnet equality or bridged fit against the returned effective MTU, retain returned packet bounds separately, and reject conflicts before guest publication.",
       "source_refs": [
         "api-property:NetworkInterface.mtu"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/vmnet.rs",
+          "anchor": "mode-specific requested and effective MTU validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "virtio-net MTU feature and config space"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_serves_mmds_with_configured_mtu_to_direct_rootfs_guest"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed MMIO and PCI negotiated MTU evidence"
+        }
+      ]
     },
     {
       "id": "api-property:NetworkInterface.rx_rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.rx_rate_limiter.",
+      "summary": "Apply optional RX bandwidth and operation buckets to each source packet transactionally, retain throttled source ownership, schedule the earliest retry without another guest notification, support incremental live replacement or disable, emit exact metrics, and capture host-time-free continuation state.",
       "source_refs": [
         "api-property:NetworkInterface.rx_rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "network RX limiter metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "RX token buckets retained source and retry capture"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_retries_rate_limited_mmds_rx_without_second_guest_notification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed merged RX limiter throttle and continuation evidence"
+        }
+      ]
     },
     {
       "id": "api-property:NetworkInterface.tx_rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property NetworkInterface.tx_rate_limiter.",
+      "summary": "Apply optional TX bandwidth and operation buckets once per guest descriptor before MMDS or normalized backend delivery, refund a successful MMDS detour, retain exact ordered work across throttling, support incremental live replacement or disable, emit metrics, and capture continuation state.",
       "source_refs": [
         "api-property:NetworkInterface.tx_rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "network TX limiter metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "TX token buckets MMDS refund retry and capture"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live TX limiter update and scheduler rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed normalized TX and limiter evidence"
+        }
+      ]
     },
     {
       "id": "api-property:NetworkOverride.host_dev_name",
@@ -5339,29 +5854,101 @@
     {
       "id": "api-property:PartialNetworkInterface.iface_id",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property PartialNetworkInterface.iface_id.",
+      "summary": "Require the runtime network PATCH body identifier to be valid and exactly equal to the path identifier before owner lookup or mutation, with missing, mismatched, malformed, and unknown IDs preserving live limiter, queue, retry, metrics, and public configuration state.",
       "source_refs": [
         "api-property:PartialNetworkInterface.iface_id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PartialNetworkInterface path and body identity parsing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "matching interface update identity"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "network PATCH missing malformed and mismatched ID tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "network update lookup and nonmutation tests"
+        }
+      ]
     },
     {
       "id": "api-property:PartialNetworkInterface.rx_rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property PartialNetworkInterface.rx_rate_limiter.",
+      "summary": "Interpret omitted, null, empty, and all-null RX limiter updates as preservation, replace only present enabled bandwidth or operation buckets with fresh budgets, and clear only explicit disabled buckets after successful live owner mutation.",
       "source_refs": [
         "api-property:PartialNetworkInterface.rx_rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "partial RX rate limiter request semantics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "incremental RX limiter preserve replace and clear"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live RX limiter PATCH commit and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "RX limiter update and pending-work tests"
+        }
+      ]
     },
     {
       "id": "api-property:PartialNetworkInterface.tx_rate_limiter",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property PartialNetworkInterface.tx_rate_limiter.",
+      "summary": "Interpret omitted, null, empty, and all-null TX limiter updates as preservation, replace only present enabled bandwidth or operation buckets with fresh budgets, and clear only explicit disabled buckets after successful live owner mutation.",
       "source_refs": [
         "api-property:PartialNetworkInterface.tx_rate_limiter"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "partial TX rate limiter request semantics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "incremental TX limiter preserve replace and clear"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live TX limiter PATCH commit and rollback tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "TX limiter update and pending-work tests"
+        }
+      ]
     },
     {
       "id": "api-property:PartialPmem.id",
@@ -6945,20 +7532,68 @@
     {
       "id": "api-schema:MmdsConfig",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema MmdsConfig.",
+      "summary": "Implement the complete strict MMDS configuration schema with required interface selection, optional link-local IPv4, V1/V2 defaulting, optional IMDS compatibility, unknown-field rejection, committed projection, and preboot-only lifecycle validation.",
       "source_refs": [
         "api-schema:MmdsConfig"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MmdsConfig request and response schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "validated MMDS configuration model"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete MmdsConfig field matrix tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed V1 V2 IPv4 and multi-interface config evidence"
+        }
+      ]
     },
     {
       "id": "api-schema:MmdsContentsObject",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema MmdsContentsObject.",
+      "summary": "Accept an arbitrary JSON object as bounded MMDS contents, preserve exact JSON types for host retrieval, replace or RFC 7396 merge it transactionally, and render guest JSON-pointer or IMDS responses without admitting non-object host payloads.",
       "source_refs": [
         "api-schema:MmdsContentsObject"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MmdsContentsObject request and response conversion"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "bounded JSON data merge and guest rendering"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "MMDS object non-object and payload-bound tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "JSON pointer merge and IMDS format tests"
+        }
+      ]
     },
     {
       "id": "api-schema:MsrModifier",
@@ -6972,11 +7607,45 @@
     {
       "id": "api-schema:NetworkInterface",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema NetworkInterface.",
+      "summary": "Implement the complete strict network interface schema with matching ID, required host backend name, optional guest MAC and MTU, independent RX/TX limiters, exact requested projection, immutable realized backend profile, selected MMIO/PCI startup, and transactional PCI runtime lifecycle.",
       "source_refs": [
         "api-schema:NetworkInterface"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "NetworkInterface request and response schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "network provider and selected transport lifecycle"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "complete network config device and capture model"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete NetworkInterface field matrix tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed MMIO and PCI complete virtio-network semantics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained network lifecycle and policy evidence"
+        }
+      ]
     },
     {
       "id": "api-schema:NetworkOverride",
@@ -7028,11 +7697,40 @@
     {
       "id": "api-schema:PartialNetworkInterface",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema PartialNetworkInterface.",
+      "summary": "Implement the strict post-boot network update schema with required matching interface ID and independently optional RX/TX limiter patches, including preserve, replace, disable, empty-no-op, unknown-field rejection, and owner-first failure-atomic commit semantics.",
       "source_refs": [
         "api-schema:PartialNetworkInterface"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PartialNetworkInterface request schema"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live partial network update transaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "partial network limiter model"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete PartialNetworkInterface parser tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "network update preserve clear rollback and retry tests"
+        }
+      ]
     },
     {
       "id": "api-schema:PartialPmem",
@@ -7804,16 +8502,50 @@
     {
       "id": "corpus:mmds-design",
       "family": "network-and-mmds",
-      "summary": "Audit all applicable capability claims owned by the pinned mmds-design source corpus.",
+      "summary": "Implement the applicable pinned MMDS design: bounded shared VM data, one isolated stack per selected interface, MMDS-before-backend classification, fixed server MAC, ARP and IPv4 ownership, independent-fragment handling, bounded TCP sessions and output scheduling, host API mutation, metrics, and the explicit operator-owned host-firewall boundary.",
       "source_refs": [
         "corpus:mmds-design"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds.rs",
+          "anchor": "shared bounded MMDS data and HTTP behavior"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "per-interface Ethernet ARP IPv4 TCP stack and scheduler"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_tcp/mod.rs",
+          "anchor": "source-attributed bounded MMDS TCP core"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed multi-interface concurrent-process and API MMDS evidence"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed MMIO and PCI segmented lossy MMDS sessions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "classification retention retransmission and metric tests"
+        }
+      ]
     },
     {
       "id": "corpus:mmds-user-guide",
       "family": "network-and-mmds",
-      "summary": "Audit all applicable capability claims owned by the pinned mmds-user-guide source corpus.",
+      "summary": "Live host GET/PUT/PATCH, preboot interface/IP/version/format configuration, guest V1/V2 token sessions, JSON-pointer and IMDS responses, isolation, limits, and capture-ready producer state are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns artifact encoding, persisted MMDS version/network-stack configuration, restore compatibility, data reseeding, and fresh clone session behavior.",
       "source_refs": [
         "corpus:mmds-user-guide"
       ],
@@ -7831,7 +8563,7 @@
     {
       "id": "corpus:network-setup",
       "family": "network-and-mmds",
-      "summary": "Audit all applicable capability claims owned by the pinned network-setup source corpus.",
+      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented. External gate https://github.com/seven332/bangbang/issues/1378 owns positive production vmnet connectivity and credentialed failure/cleanup evidence; Wave 6 https://github.com/seven332/bangbang/issues/1490 owns restored backend identity, portability, and concurrent clone network policy.",
       "source_refs": [
         "corpus:network-setup"
       ],
@@ -7883,11 +8615,45 @@
     {
       "id": "corpus:patch-network-interface",
       "family": "network-and-mmds",
-      "summary": "Audit all applicable capability claims owned by the pinned patch-network-interface source corpus.",
+      "summary": "Implement the pinned runtime network PATCH contract: merge only supplied RX/TX limiter fields into the existing interface, preserve omitted buckets and live budgets, replace enabled buckets, remove rate limiting through explicit zero-sized buckets, and commit stored state only after active owner success.",
       "source_refs": [
         "corpus:patch-network-interface"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "network PATCH parsing and zero-sized limiter semantics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "owner-first live network update"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "incremental limiter merge preserve replace and disable"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "network PATCH exact and disabled bucket tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "live limiter mutation rollback and retry tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed MMIO and PCI limiter continuation evidence"
+        }
+      ]
     },
     {
       "id": "corpus:pmem",
@@ -9488,7 +10254,7 @@
     {
       "id": "semantic.mmds:tcp-token-session-and-isolation",
       "family": "network-and-mmds",
-      "summary": "The current live subset implements Firecracker-shaped MMDS v1/v2 HTTP behavior, stateless AES-256-GCM v2 tokens bound to immutable instance identity, and independent bounded per-interface TCP sessions with exact target ownership, flow control, segmentation, retransmission, timeout, eviction, reset, delivery, scheduler, and signed lossy long-response behavior. Audit capture-ready state, contained aggregate evidence, final interface-policy reconciliation, and snapshot handoff.",
+      "summary": "Firecracker-shaped MMDS V1/V2 HTTP behavior, stateless AES-256-GCM tokens bound to immutable instance identity, independent bounded per-interface TCP sessions, flow control, segmentation, retransmission, timeout, eviction, reset, metrics, capture-ready state, and signed lossy isolation are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns artifact encoding, restore reconstruction, compatibility, data reseeding, and fresh clone token/session behavior.",
       "source_refs": [
         "corpus:mmds-design",
         "corpus:mmds-user-guide"
@@ -9498,7 +10264,7 @@
     {
       "id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
       "family": "network-and-mmds",
-      "summary": "The current live subset implements virtio-net queues and portable headers/offloads, typed vmnet results and lifecycle, generation-scoped callback readiness, bounded RX/TX batches with explicit partial counts, complete MMDS session ordering and timers, metrics, PCI ownership, and terminal cleanup. Audit external egress/connectivity and host resource policy, capture-ready state, contained aggregate evidence, and network snapshot handoff.",
+      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented. External gate https://github.com/seven332/bangbang/issues/1378 owns positive connectivity and credentialed service/crash evidence; Wave 6 https://github.com/seven332/bangbang/issues/1490 owns encoding, overrides, restore, portability, and clone identity; Wave 7 https://github.com/seven332/bangbang/issues/1491 owns final performance and observability closure.",
       "source_refs": [
         "corpus:network-performance",
         "corpus:network-setup",

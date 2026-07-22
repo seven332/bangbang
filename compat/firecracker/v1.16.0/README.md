@@ -82,6 +82,11 @@ claims mechanically visible.
   seven entropy, six serial, and one time/identity records; pins the 77 terminal
   and eight Wave 6 outcomes; and binds focused, signed MMIO/PCI, and production
   serial-isolation evidence without changing family semantics.
+- [`network-mmds-contract.md`](network-mmds-contract.md) is the #1496 checked
+  aggregate network/MMDS ledger. It pins an exact 35-record set, promotes 31
+  complete live/capture-ready outcomes, and retains four explicit #1378,
+  #1490, or #1491 handoffs for external vmnet, restore/clone, and performance
+  work.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -417,8 +422,8 @@ claiming a serialization format. The checked
 operation/path/property/schema leaves. Exactly `corpus:memory-hotplug` and
 `semantic.memory-device:virtio-mem-lifecycle-accounting-and-state` remain
 `audit-required`; Wave 6 owns encoding, artifact integration, restore,
-migration/clone behavior, portability, and signed restored-guest outcomes. The
-current overlay is therefore 181 `implemented-and-verified`, 217
+migration/clone behavior, portability, and signed restored-guest outcomes. At
+that checkpoint the overlay was 181 `implemented-and-verified`, 217
 `audit-required`, three `missing-platform-feasible`, and 17
 `proven-platform-impossible` records.
 
@@ -466,7 +471,7 @@ operation/path/property/schema leaves. Exactly
 `semantic.device:serial-stdin-stdout-rx-and-restore` remains
 `audit-required`; Wave 6 owns optional-device encoding, endpoint
 reconstruction, restore, migration/clone behavior, portability, and signed
-restored-guest outcomes. The current overlay is therefore 191
+restored-guest outcomes. At that checkpoint the overlay was therefore 191
 `implemented-and-verified`, 207 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` records.
 
@@ -497,8 +502,8 @@ default-stdio session isolation. The checked
 [`remaining-device-contract.md`](remaining-device-contract.md) selects exactly
 85 records: 77 are terminal and the same eight family aggregates remain
 `audit-required`, all under [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490).
-Wave 7 #1491 owns no selected row. No disposition changes, so the overlay
-remains 191/207/3/17.
+Wave 7 #1491 owns no selected row. No disposition changed in that slice, so at
+that checkpoint the overlay remained 191/207/3/17.
 
 #1502 closes the direct-vmnet callback/readiness and bounded-packet-batch slice
 under #1493 without promoting the broad network semantic record. Each live
@@ -527,8 +532,19 @@ generation-safe MMIO/PCI network scheduler. Signed MMIO and PCI guests renew a
 v2 token, receive a segmented 49,152-byte response, deliberately lose one ACK,
 and observe retransmission without vmnet authority. Capture-ready state,
 contained aggregate certification, positive #1378 connectivity, and the final
-35-record audit remain later #1493 slices; no disposition changes in this slice,
-so the overlay remains 191/207/3/17.
+35-record audit remained later #1493 slices; no disposition changed in that
+slice, so at that checkpoint the overlay remained 191/207/3/17.
+
+#1495, #1503, #1498, #1497, and #1501 subsequently close typed vmnet
+lifecycle/profile handling, portable virtio-net headers and offloads,
+instance-bound MMDS v2 tokens, deterministic capture-ready state, and the
+contained lifecycle-v5 ownership boundary. #1496 reconciles those slices with
+the existing API, runtime hotplug, process, MMIO/PCI, and signed production
+evidence. The checked [`network-mmds-contract.md`](network-mmds-contract.md)
+selects exactly 35 records: 31 are terminal and four remain `audit-required`
+only for #1378 external vmnet connectivity, #1490 encoding/restore/clone
+freshness, or #1491 performance/observability work. It promotes 29 previously
+audited records, so the current overlay is 220/178/3/17.
 
 ## Commands
 
