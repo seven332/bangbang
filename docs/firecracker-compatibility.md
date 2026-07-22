@@ -1373,7 +1373,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /network-interfaces/{iface_id}` | body `iface_id` | required | The API parser rejects requests where this does not match the path `iface_id`. |
 | `PUT /network-interfaces/{iface_id}` | `host_dev_name` | required | The API/VMM path records this value only after rejecting empty values and enforcing the current 16-interface bangbang limit; it does not open, stat, or otherwise touch host networking resources during configuration. `InstanceStart` later accepts only `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` for vmnet packet I/O startup. |
 | `PUT /network-interfaces/{iface_id}` | `guest_mac` | optional | The internal model accepts six colon-separated two-hex-digit octets, normalizes display to lowercase hex, and rejects duplicate configured MAC addresses across different interface IDs. |
-| `PUT /network-interfaces/{iface_id}` | `mtu` | optional | The internal model accepts Firecracker-compatible `68..=65535` values, stores them with the interface config, advertises `VIRTIO_NET_F_MTU`, and exposes the value through virtio-net config space. This guest-advertised value is not reconciled with Apple's separately returned vmnet MTU; host vmnet MTU changes remain out of scope. |
+| `PUT /network-interfaces/{iface_id}` | `mtu` | optional | The internal model accepts Firecracker-compatible `68..=65535` values, stores them with the interface config, advertises `VIRTIO_NET_F_MTU`, and exposes the requested value through virtio-net config space. For direct vmnet, host/shared startup requires Apple's returned effective MTU to match the request; bridged startup omits the forbidden descriptor MTU and requires the request to fit the returned effective bound. An omitted request remains unadvertised even though the returned MTU still bounds backend I/O. Host vmnet MTU mutation remains out of scope. |
 | `PUT /network-interfaces/{iface_id}` | `rx_rate_limiter`, `tx_rate_limiter` | optional; initial enabled buckets implemented | Missing, `null`, empty, and all-null limiter objects are unconfigured. Buckets with zero `size`, zero `refill_time`, or an overflowing millisecond conversion are explicit disabled controls and normalize away. Enabled bandwidth/ops values round-trip through `GET /vm/config` and create independent directional device budgets. Admission consumes one op plus complete guest-visible frame bytes atomically; one oversized frame can progress from a full byte bucket, and only successful MMDS TX detours refund the reservation. Runtime bucket updates and per-session HVF timed retry wakeups are implemented; pending work is retried on the boot-session owner thread after earliest-deadline replenishment without claiming Firecracker's Linux timerfd/eventfd identity. |
 | `PUT /network-interfaces/{iface_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /network-interfaces/{iface_id}` | path `iface_id` | required | The API parser captures this value before routing valid requests through the runtime lifecycle policy. |
@@ -2187,12 +2187,25 @@ packet-path and transaction evidence, not an external vmnet connectivity claim.
 Direct vmnet remains a separate conditional foundation. Apple's current
 [vmnet documentation](https://developer.apple.com/documentation/vmnet)
 describes returned guest MAC/MTU values and limits of 32 interfaces overall,
-four per guest operating system, and bounded read/write batches. The current
-bangbang start callback discards vmnet's MAC, MTU, and maximum-packet-size
-parameters; the FFI does not register the packet-available callback, so it has
-no asynchronous RX-readiness integration. It does retain synchronous
-single-packet adapters, injected start/stop/read/write tests, and stop-on-drop
-cleanup. No signed guest test uses Apple's restricted
+four per guest operating system, and bounded read/write batches. Bangbang copies
+and exactly types the successful start dictionary, validates the configured or
+allocated MAC, mode-specific effective MTU, maximum packet size, optional
+non-nil UUID, and optional nonzero batch maxima, then retains a redacted backend
+profile before guest or runtime publication. Requested API config stays
+unchanged; an allocated MAC is carried separately into MMIO or PCI virtio config
+space. All explicit startup MACs are reserved before the first allocation, and
+startup plus runtime entries share one realized-MAC reservation set.
+
+Start and stop waits use finite deadlines. Every failure after a non-null handle
+attempts one bounded stop; only a confirmed stop completion is retryable, while
+a stop scheduling failure, service failure, timeout, or callback-channel loss
+makes the owner terminal and uncertain without a second cleanup attempt.
+Diagnostics are value-redacted. The FFI still does not register the
+packet-available callback,
+so it has no asynchronous RX-readiness integration. Packet I/O remains
+raw-Ethernet and synchronous one-packet; returned batch maxima are retained only
+as dormant bounds, direct virtio headers remain disabled, and no offload feature
+is added. No signed guest test uses Apple's restricted
 [`com.apple.vm.networking`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.vm.networking)
 authorization or proves external packet movement, and the 16-interface config
 cap does not enforce Apple's per-guest resource policy.
@@ -2359,11 +2372,14 @@ contain no NUL bytes or ASCII control characters. Startup with configured
 network interfaces revalidates the 16-interface limit before selecting packet
 I/O, can use the MMDS-only adapter when every configured interface is selected
 by MMDS config, and otherwise opens vmnet resources through those supported
-forms and retains stop-on-drop cleanup. Startup without network interfaces
-starts with an empty registry that can accept later PCI entries. These helpers
-can advertise configured guest-visible MTU values and support the documented
-public PCI attach/remove transaction, but they do not change host vmnet MTU
-settings or prove direct vmnet host connectivity. Active HVF sessions schedule retained limiter work
+forms with bounded explicit cleanup. Startup without network interfaces starts
+with an empty registry that can accept later PCI entries. These helpers validate
+and retain Apple's returned backend profile, globally reserve explicit and
+allocated realized MACs, carry the realized guest identity into MMIO or PCI
+config space without rewriting requested API config, advertise only a requested
+guest-visible MTU, and support the documented public PCI attach/remove
+transaction. They do not change host vmnet MTU settings or prove direct vmnet
+host connectivity. Active HVF sessions schedule retained limiter work
 through the session-owned retry wakeup described above rather than through
 Linux timerfd/eventfd identities.
 
@@ -3641,10 +3657,12 @@ portable Firecracker-Linux promises.
 The following Firecracker features are outside the first compatibility tier.
 Their eventual support level should follow the endpoint matrix:
 
-- packet networking beyond the implemented supported virtio-MMIO/MMDS-only
-  subset, including direct-vmnet start-parameter reconciliation, asynchronous
-  RX readiness, entitled guest connectivity, host firewall/resource policy,
-  limiter-specific metrics, network snapshot state, and PCI attach/remove
+- packet networking beyond the implemented supported virtio-MMIO/MMDS-only and
+  conditional direct-vmnet typed-start subsets, including asynchronous RX
+  readiness, batch dispatch, direct virtio headers, offloads, entitled guest
+  connectivity, host firewall/resource policy, broader MMDS TCP behavior,
+  limiter-specific metrics, network snapshot state, and automatic PCI
+  notification
 - virtio-vsock behavior beyond the **implemented supported live
   virtio-MMIO/Unix-socket subset**. The live subset includes repeatable pre-boot
   PUT with stable post-start rejection, guest/host connection setup, dynamic

@@ -38,7 +38,8 @@ pub const DEFAULT_VMNET_VIRTIO_NETWORK_RX_BUFFER_LEN: usize = VIRTIO_NET_MAX_BUF
 #[derive(Debug)]
 pub enum VmnetVirtioNetworkPacketIoBuildError {
     EmptyRxBuffer,
-    RxBufferAllocation { len: usize, source: TryReserveError },
+    RxBufferTooSmall,
+    RxBufferAllocation { source: TryReserveError },
 }
 
 #[derive(Debug)]
@@ -71,11 +72,11 @@ impl fmt::Display for VmnetVirtioNetworkPacketIoBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyRxBuffer => f.write_str("vmnet virtio-net RX buffer must not be empty"),
-            Self::RxBufferAllocation { len, source } => {
-                write!(
-                    f,
-                    "failed to reserve vmnet virtio-net RX buffer of {len} bytes: {source}"
-                )
+            Self::RxBufferTooSmall => {
+                f.write_str("prepared vmnet virtio-net RX buffer is smaller than the host bound")
+            }
+            Self::RxBufferAllocation { source } => {
+                write!(f, "failed to reserve vmnet virtio-net RX buffer: {source}")
             }
         }
     }
@@ -84,19 +85,69 @@ impl fmt::Display for VmnetVirtioNetworkPacketIoBuildError {
 impl std::error::Error for VmnetVirtioNetworkPacketIoBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::RxBufferAllocation { source, .. } => Some(source),
-            Self::EmptyRxBuffer => None,
+            Self::RxBufferAllocation { source } => Some(source),
+            Self::EmptyRxBuffer | Self::RxBufferTooSmall => None,
         }
     }
 }
 
-#[derive(Debug)]
+pub struct PreparedVmnetVirtioNetworkRxBuffer {
+    buffer: Vec<u8>,
+}
+
+impl PreparedVmnetVirtioNetworkRxBuffer {
+    pub fn supported_maximum() -> Result<Self, VmnetVirtioNetworkPacketIoBuildError> {
+        Self::with_len(DEFAULT_VMNET_VIRTIO_NETWORK_RX_BUFFER_LEN)
+    }
+
+    fn with_len(rx_buffer_len: usize) -> Result<Self, VmnetVirtioNetworkPacketIoBuildError> {
+        if rx_buffer_len == 0 {
+            return Err(VmnetVirtioNetworkPacketIoBuildError::EmptyRxBuffer);
+        }
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(rx_buffer_len).map_err(|source| {
+            VmnetVirtioNetworkPacketIoBuildError::RxBufferAllocation { source }
+        })?;
+        buffer.resize(rx_buffer_len, 0);
+        Ok(Self { buffer })
+    }
+
+    pub(crate) fn into_buffer_with_len(
+        mut self,
+        rx_buffer_len: usize,
+    ) -> Result<Vec<u8>, VmnetVirtioNetworkPacketIoBuildError> {
+        if rx_buffer_len == 0 {
+            return Err(VmnetVirtioNetworkPacketIoBuildError::EmptyRxBuffer);
+        }
+        if rx_buffer_len > self.buffer.len() {
+            return Err(VmnetVirtioNetworkPacketIoBuildError::RxBufferTooSmall);
+        }
+        self.buffer.truncate(rx_buffer_len);
+        Ok(self.buffer)
+    }
+}
+
+impl fmt::Debug for PreparedVmnetVirtioNetworkRxBuffer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedVmnetVirtioNetworkRxBuffer(<owned>)")
+    }
+}
+
 pub struct VmnetVirtioNetworkPacketIo<B>
 where
     B: VmnetPacketIoBackend,
 {
     tx_sink: VmnetVirtioNetworkTxPacketSink<B>,
     rx_source: VmnetVirtioNetworkRxPacketSource<B>,
+}
+
+impl<B> fmt::Debug for VmnetVirtioNetworkPacketIo<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VmnetVirtioNetworkPacketIo(<owned>)")
+    }
 }
 
 impl<B> VmnetVirtioNetworkPacketIo<B>
@@ -119,42 +170,69 @@ where
         interface: B::Interface,
         rx_buffer_len: usize,
     ) -> Result<Self, VmnetVirtioNetworkPacketIoBuildError> {
-        Self::with_rx_buffer_len_and_mmds_detour(backend, interface, rx_buffer_len, None)
+        let prepared = PreparedVmnetVirtioNetworkRxBuffer::with_len(rx_buffer_len)?;
+        Self::with_prepared_rx_buffer_and_mmds_detour(
+            backend,
+            interface,
+            prepared,
+            rx_buffer_len,
+            None,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_mmds_detour(
         backend: B,
         interface: B::Interface,
         mmds_detour: MmdsPacketDetour,
     ) -> Result<Self, VmnetVirtioNetworkPacketIoBuildError> {
-        Self::with_rx_buffer_len_and_mmds_detour(
+        let prepared = PreparedVmnetVirtioNetworkRxBuffer::supported_maximum()?;
+        Self::with_prepared_rx_buffer_and_mmds_detour(
             backend,
             interface,
+            prepared,
             DEFAULT_VMNET_VIRTIO_NETWORK_RX_BUFFER_LEN,
             Some(mmds_detour),
         )
     }
 
-    fn with_rx_buffer_len_and_mmds_detour(
+    pub(crate) fn with_prepared_rx_buffer_and_mmds_detour(
         backend: B,
         interface: B::Interface,
+        prepared: PreparedVmnetVirtioNetworkRxBuffer,
         rx_buffer_len: usize,
         mmds_detour: Option<MmdsPacketDetour>,
     ) -> Result<Self, VmnetVirtioNetworkPacketIoBuildError> {
+        let read_buffer = prepared.into_buffer_with_len(rx_buffer_len)?;
+        Ok(Self::with_owned_rx_buffer_and_mmds_detour(
+            backend,
+            interface,
+            read_buffer,
+            mmds_detour,
+        ))
+    }
+
+    pub(crate) fn with_owned_rx_buffer_and_mmds_detour(
+        backend: B,
+        interface: B::Interface,
+        read_buffer: Vec<u8>,
+        mmds_detour: Option<MmdsPacketDetour>,
+    ) -> Self {
+        debug_assert!(!read_buffer.is_empty());
         let shared = Arc::new(Mutex::new(VmnetVirtioNetworkPacketIoState {
             backend,
             interface,
         }));
         let mmds_response_queue = mmds_detour.as_ref().map(MmdsPacketDetour::response_queue);
 
-        Ok(Self {
+        Self {
             tx_sink: VmnetVirtioNetworkTxPacketSink::new(Arc::clone(&shared), mmds_detour),
             rx_source: VmnetVirtioNetworkRxPacketSource::new(
                 shared,
-                rx_buffer_len,
+                read_buffer,
                 mmds_response_queue,
-            )?,
-        })
+            ),
+        }
     }
 
     pub fn tx_sink(&mut self) -> &mut VmnetVirtioNetworkTxPacketSink<B> {
@@ -189,13 +267,25 @@ where
     }
 }
 
-#[derive(Debug)]
 pub struct VmnetVirtioNetworkPacketIoProviderEntry<B>
 where
     B: VmnetPacketIoBackend,
 {
     iface_id: String,
     packet_io: VmnetVirtioNetworkPacketIo<B>,
+}
+
+impl<B> fmt::Debug for VmnetVirtioNetworkPacketIoProviderEntry<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetVirtioNetworkPacketIoProviderEntry")
+            .field("iface_id", &"<redacted>")
+            .field("packet_io", &"<owned>")
+            .finish()
+    }
 }
 
 impl<B> VmnetVirtioNetworkPacketIoProviderEntry<B>
@@ -231,12 +321,23 @@ impl fmt::Display for VmnetVirtioNetworkPacketIoProviderBuildError {
 
 impl std::error::Error for VmnetVirtioNetworkPacketIoProviderBuildError {}
 
-#[derive(Debug)]
 pub struct VmnetVirtioNetworkPacketIoProvider<B>
 where
     B: VmnetPacketIoBackend,
 {
     entries: Vec<VmnetVirtioNetworkPacketIoProviderEntry<B>>,
+}
+
+impl<B> fmt::Debug for VmnetVirtioNetworkPacketIoProvider<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetVirtioNetworkPacketIoProvider")
+            .field("entry_count", &self.entries.len())
+            .finish()
+    }
 }
 
 impl<B> VmnetVirtioNetworkPacketIoProvider<B>
@@ -288,7 +389,6 @@ where
     }
 }
 
-#[derive(Debug)]
 struct VmnetVirtioNetworkPacketIoState<B>
 where
     B: VmnetPacketIoBackend,
@@ -297,13 +397,37 @@ where
     interface: B::Interface,
 }
 
-#[derive(Debug)]
+impl<B> fmt::Debug for VmnetVirtioNetworkPacketIoState<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VmnetVirtioNetworkPacketIoState(<owned>)")
+    }
+}
+
 pub struct VmnetVirtioNetworkTxPacketSink<B>
 where
     B: VmnetPacketIoBackend,
 {
     shared: Arc<Mutex<VmnetVirtioNetworkPacketIoState<B>>>,
     mmds_detour: Option<MmdsPacketDetour>,
+}
+
+impl<B> fmt::Debug for VmnetVirtioNetworkTxPacketSink<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetVirtioNetworkTxPacketSink")
+            .field("shared", &"<owned>")
+            .field(
+                "mmds_detour",
+                &self.mmds_detour.as_ref().map(|_| "<configured>"),
+            )
+            .finish()
+    }
 }
 
 impl<B> VmnetVirtioNetworkTxPacketSink<B>
@@ -350,7 +474,6 @@ where
     }
 }
 
-#[derive(Debug)]
 pub struct VmnetVirtioNetworkRxPacketSource<B>
 where
     B: VmnetPacketIoBackend,
@@ -361,36 +484,39 @@ where
     mmds_response_queue: Option<MmdsResponseQueue>,
 }
 
+impl<B> fmt::Debug for VmnetVirtioNetworkRxPacketSource<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetVirtioNetworkRxPacketSource")
+            .field("shared", &"<owned>")
+            .field("read_buffer", &"<owned>")
+            .field("cached_packet", &self.cached_packet.map(|_| "<cached>"))
+            .field(
+                "mmds_response_queue",
+                &self.mmds_response_queue.as_ref().map(|_| "<configured>"),
+            )
+            .finish()
+    }
+}
+
 impl<B> VmnetVirtioNetworkRxPacketSource<B>
 where
     B: VmnetPacketIoBackend,
 {
     fn new(
         shared: Arc<Mutex<VmnetVirtioNetworkPacketIoState<B>>>,
-        rx_buffer_len: usize,
+        read_buffer: Vec<u8>,
         mmds_response_queue: Option<MmdsResponseQueue>,
-    ) -> Result<Self, VmnetVirtioNetworkPacketIoBuildError> {
-        if rx_buffer_len == 0 {
-            return Err(VmnetVirtioNetworkPacketIoBuildError::EmptyRxBuffer);
-        }
-
-        let mut read_buffer = Vec::new();
-        read_buffer
-            .try_reserve_exact(rx_buffer_len)
-            .map_err(
-                |source| VmnetVirtioNetworkPacketIoBuildError::RxBufferAllocation {
-                    len: rx_buffer_len,
-                    source,
-                },
-            )?;
-        read_buffer.resize(rx_buffer_len, 0);
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             shared,
             read_buffer,
             cached_packet: None,
             mmds_response_queue,
-        })
+        }
     }
 
     fn cached_packet(&self) -> Option<VirtioNetworkRxPacket<'_>> {
@@ -1358,6 +1484,75 @@ mod tests {
             error,
             VmnetVirtioNetworkPacketIoBuildError::EmptyRxBuffer
         ));
+    }
+
+    #[test]
+    fn prepared_rx_buffer_truncates_supported_storage_without_reallocation() {
+        let prepared = super::PreparedVmnetVirtioNetworkRxBuffer::supported_maximum()
+            .expect("supported maximum RX buffer should allocate");
+        let debug = format!("{prepared:?}");
+        assert_eq!(debug, "PreparedVmnetVirtioNetworkRxBuffer(<owned>)");
+        assert!(!debug.contains(&super::DEFAULT_VMNET_VIRTIO_NETWORK_RX_BUFFER_LEN.to_string()));
+
+        let buffer = prepared
+            .into_buffer_with_len(2048)
+            .expect("prepared RX buffer should accept smaller host bound");
+
+        assert_eq!(buffer.len(), 2048);
+        assert!(
+            buffer.capacity() >= super::DEFAULT_VMNET_VIRTIO_NETWORK_RX_BUFFER_LEN,
+            "truncation must retain the storage reserved before vmnet startup"
+        );
+        assert!(buffer.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn packet_io_owner_debug_omits_backend_buffers_and_interface_ids() {
+        let packet_io = packet_io(
+            FakeVmnetPacketIoBackend::default()
+                .with_read_result(Ok(Some(vec![0x5a, 0xa5, 0x5a, 0xa5]))),
+        );
+        assert_eq!(
+            format!("{packet_io:?}"),
+            "VmnetVirtioNetworkPacketIo(<owned>)"
+        );
+
+        let provider = VmnetVirtioNetworkPacketIoProvider::new(vec![
+            VmnetVirtioNetworkPacketIoProviderEntry::new("private-interface", packet_io),
+        ])
+        .expect("provider should build");
+        let debug = format!("{provider:?}");
+        assert!(debug.contains("entry_count: 1"));
+        assert!(!debug.contains("private-interface"));
+        assert!(!debug.contains("90"));
+        assert!(!debug.contains("165"));
+    }
+
+    #[test]
+    fn prepared_rx_buffer_rejects_empty_and_larger_host_bounds_without_values() {
+        let empty = super::PreparedVmnetVirtioNetworkRxBuffer::with_len(8)
+            .expect("prepared RX buffer should allocate")
+            .into_buffer_with_len(0)
+            .expect_err("empty realized RX bound should fail");
+        assert!(matches!(
+            empty,
+            VmnetVirtioNetworkPacketIoBuildError::EmptyRxBuffer
+        ));
+
+        let too_small = super::PreparedVmnetVirtioNetworkRxBuffer::with_len(8)
+            .expect("prepared RX buffer should allocate")
+            .into_buffer_with_len(9)
+            .expect_err("larger realized RX bound should fail");
+        assert!(matches!(
+            too_small,
+            VmnetVirtioNetworkPacketIoBuildError::RxBufferTooSmall
+        ));
+        assert_eq!(
+            too_small.to_string(),
+            "prepared vmnet virtio-net RX buffer is smaller than the host bound"
+        );
+        assert!(!too_small.to_string().contains('8'));
+        assert!(!too_small.to_string().contains('9'));
     }
 
     #[test]
@@ -3764,11 +3959,9 @@ mod tests {
             .transmit_frame(&memory, &frame)
             .expect_err("vmnet write failure should surface");
 
-        assert!(
-            error
-                .message()
-                .contains("vmnet TX packet write failed: vmnet_write returned packet count 0")
-        );
+        assert!(error.message().contains(
+            "vmnet TX packet write failed: vmnet_write returned an unexpected packet count"
+        ));
     }
 
     #[test]
@@ -3927,9 +4120,12 @@ mod tests {
     fn rx_source_rejects_oversized_mmds_response_without_dequeueing() {
         let response_queue = MmdsResponseQueue::with_capacity(1);
         push_mmds_response(&response_queue, &[0xaa, 0xbb, 0xcc]);
-        let mut packet_io = VmnetVirtioNetworkPacketIo::with_rx_buffer_len_and_mmds_detour(
+        let prepared = super::PreparedVmnetVirtioNetworkRxBuffer::with_len(2)
+            .expect("small prepared RX buffer should allocate");
+        let mut packet_io = VmnetVirtioNetworkPacketIo::with_prepared_rx_buffer_and_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
             fake_interface(),
+            prepared,
             2,
             Some(MmdsPacketDetour::new(
                 MmdsStateHandle::default(),
@@ -3995,11 +4191,9 @@ mod tests {
             .peek_packet()
             .expect_err("vmnet read failure should surface");
 
-        assert!(
-            error
-                .message()
-                .contains("vmnet RX packet read failed: vmnet_read returned packet count 0")
-        );
+        assert!(error.message().contains(
+            "vmnet RX packet read failed: vmnet_read returned an unexpected packet count"
+        ));
     }
 
     #[test]
@@ -4016,7 +4210,7 @@ mod tests {
 
         assert!(
             error.message().contains(
-                "vmnet RX packet read failed: vmnet_read returned packet size 2049, larger than read buffer 2048"
+                "vmnet RX packet read failed: vmnet_read returned a packet larger than the validated read buffer"
             )
         );
     }

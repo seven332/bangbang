@@ -2554,7 +2554,7 @@ mod tests {
 
     use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
-        ApiRequestMetricParseFailure, GetApiRequest, InstanceStartExecutor,
+        ApiRequestMetricParseFailure, GetApiRequest, InstanceStartError, InstanceStartExecutor,
         NativeV1SnapshotCaptureCancellation, NativeV1SnapshotLoadError,
         NativeV1SnapshotPublicationError, PatchApiRequest, ProcessSessionDiagnostics,
         ProcessSessionExitStatus, ProcessVmm, PutApiRequest, SnapshotV1LoadSuccess,
@@ -2577,7 +2577,7 @@ mod tests {
         fn start(
             &mut self,
             _controller: &bangbang_runtime::VmmController,
-        ) -> Result<Self::Session, BackendError> {
+        ) -> Result<Self::Session, InstanceStartError> {
             Ok(())
         }
 
@@ -2610,16 +2610,16 @@ mod tests {
         fn start(
             &mut self,
             controller: &bangbang_runtime::VmmController,
-        ) -> Result<Self::Session, BackendError> {
+        ) -> Result<Self::Session, InstanceStartError> {
             Arm64BootResources::assemble_from_controller(
                 controller,
                 minimal_arm64_boot_resource_config(),
             )
             .map(|_| ())
             .map_err(|source| {
-                BackendError::Hypervisor(format!(
+                InstanceStartError::retryable(BackendError::Hypervisor(format!(
                     "failed to assemble arm64 boot resources: {source}"
-                ))
+                )))
             })
         }
 
@@ -2715,7 +2715,7 @@ mod tests {
         fn start(
             &mut self,
             _controller: &bangbang_runtime::VmmController,
-        ) -> Result<Self::Session, BackendError> {
+        ) -> Result<Self::Session, InstanceStartError> {
             Ok(TestProcessExitSession {
                 signal: self.signal.clone(),
             })

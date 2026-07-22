@@ -1,11 +1,17 @@
 //! vmnet lifecycle boundary types for future macOS host networking.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
+use std::str::FromStr;
 use std::sync::mpsc;
+use std::time::Duration;
 
+use bangbang_runtime::network::{
+    GuestMacAddress, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU,
+    VIRTIO_NET_QUEUE_SIZE,
+};
 use block2::{Block, RcBlock};
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 
@@ -28,6 +34,12 @@ pub const VMNET_NOT_AUTHORIZED_VALUE: u32 = 1010;
 pub const VMNET_HOST_DEVICE_NAME_HOST: &str = "vmnet:host";
 pub const VMNET_HOST_DEVICE_NAME_SHARED: &str = "vmnet:shared";
 pub const VMNET_HOST_DEVICE_NAME_BRIDGED_PREFIX: &str = "vmnet:bridged:";
+
+pub const DEFAULT_VMNET_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const VMNET_MAX_PACKETS_PER_OPERATION: u64 = 200;
+const VMNET_MAX_BYTES_PER_OPERATION: u64 = 256 * 1024;
+const VMNET_MAC_ADDRESS_STRING_LEN: usize = 17;
+const VMNET_INTERFACE_ID_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmnetMode {
@@ -56,7 +68,7 @@ impl fmt::Display for VmnetMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum VmnetStatus {
     Success,
     Failure,
@@ -128,9 +140,15 @@ impl VmnetStatus {
 impl fmt::Display for VmnetStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.name() {
-            Some(name) => write!(f, "{name} (vmnet_return_t={})", self.raw_value()),
-            None => write!(f, "vmnet_return_t={}", self.raw_value()),
+            Some(name) => f.write_str(name),
+            None => f.write_str("unknown vmnet status"),
         }
+    }
+}
+
+impl fmt::Debug for VmnetStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
     }
 }
 
@@ -153,15 +171,45 @@ impl fmt::Display for VmnetOperation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmnetCompletionError {
+    TimedOut,
+    ChannelClosed,
+}
+
+impl fmt::Display for VmnetCompletionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TimedOut => "completion timed out",
+            Self::ChannelClosed => "completion channel closed",
+        })
+    }
+}
+
+impl std::error::Error for VmnetCompletionError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmnetError {
     operation: VmnetOperation,
     status: VmnetStatus,
+    completion: Option<VmnetCompletionError>,
 }
 
 impl VmnetError {
     pub const fn new(operation: VmnetOperation, status: VmnetStatus) -> Self {
-        Self { operation, status }
+        Self {
+            operation,
+            status,
+            completion: None,
+        }
+    }
+
+    const fn completion(operation: VmnetOperation, completion: VmnetCompletionError) -> Self {
+        Self {
+            operation,
+            status: VmnetStatus::Failure,
+            completion: Some(completion),
+        }
     }
 
     pub const fn operation(&self) -> VmnetOperation {
@@ -171,20 +219,29 @@ impl VmnetError {
     pub const fn status(&self) -> VmnetStatus {
         self.status
     }
+
+    pub const fn completion_error(&self) -> Option<VmnetCompletionError> {
+        self.completion
+    }
 }
 
 impl fmt::Display for VmnetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} failed with {}", self.operation, self.status)
+        match self.completion {
+            Some(completion) => write!(f, "{} {completion}", self.operation),
+            None => write!(f, "{} failed with {}", self.operation, self.status),
+        }
     }
 }
 
 impl std::error::Error for VmnetError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VmnetInterfaceConfig {
     mode: VmnetMode,
     bridged_interface_name: Option<String>,
+    guest_mac: Option<GuestMacAddress>,
+    mtu: Option<u16>,
 }
 
 impl VmnetInterfaceConfig {
@@ -192,6 +249,8 @@ impl VmnetInterfaceConfig {
         Self {
             mode: VmnetMode::Host,
             bridged_interface_name: None,
+            guest_mac: None,
+            mtu: None,
         }
     }
 
@@ -199,6 +258,8 @@ impl VmnetInterfaceConfig {
         Self {
             mode: VmnetMode::Shared,
             bridged_interface_name: None,
+            guest_mac: None,
+            mtu: None,
         }
     }
 
@@ -229,6 +290,8 @@ impl VmnetInterfaceConfig {
         Ok(Self {
             mode: VmnetMode::Bridged,
             bridged_interface_name: Some(interface_name),
+            guest_mac: None,
+            mtu: None,
         })
     }
 
@@ -238,6 +301,41 @@ impl VmnetInterfaceConfig {
 
     pub fn bridged_interface_name(&self) -> Option<&str> {
         self.bridged_interface_name.as_deref()
+    }
+
+    pub const fn guest_mac(&self) -> Option<GuestMacAddress> {
+        self.guest_mac
+    }
+
+    pub const fn mtu(&self) -> Option<u16> {
+        self.mtu
+    }
+
+    #[must_use]
+    pub const fn with_guest_mac(mut self, guest_mac: Option<GuestMacAddress>) -> Self {
+        self.guest_mac = guest_mac;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_mtu(mut self, mtu: Option<u16>) -> Self {
+        self.mtu = mtu;
+        self
+    }
+}
+
+impl fmt::Debug for VmnetInterfaceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetInterfaceConfig")
+            .field("mode", &self.mode)
+            .field(
+                "bridged_interface_name",
+                &self.bridged_interface_name.as_ref().map(|_| "<configured>"),
+            )
+            .field("guest_mac", &self.guest_mac.map(|_| "<configured>"))
+            .field("mtu", &self.mtu.map(|_| "<configured>"))
+            .finish()
     }
 }
 
@@ -298,6 +396,7 @@ impl std::error::Error for VmnetInterfaceConfigError {}
 pub enum VmnetInterfaceDescriptorError {
     CreateDictionaryFailed,
     InteriorNulInBridgedInterfaceName,
+    InteriorNulInMacAddress,
     MissingVmnetKey(&'static str),
 }
 
@@ -310,12 +409,195 @@ impl fmt::Display for VmnetInterfaceDescriptorError {
             Self::InteriorNulInBridgedInterfaceName => {
                 f.write_str("vmnet bridged interface name must not contain NUL bytes")
             }
+            Self::InteriorNulInMacAddress => {
+                f.write_str("vmnet MAC address must not contain NUL bytes")
+            }
             Self::MissingVmnetKey(key) => write!(f, "vmnet key symbol {key} is null"),
         }
     }
 }
 
 impl std::error::Error for VmnetInterfaceDescriptorError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmnetInterfaceParameterField {
+    ResultDictionary,
+    MacAddress,
+    EffectiveMtu,
+    MaximumPacketSize,
+    InterfaceId,
+    ReadMaximumPackets,
+    WriteMaximumPackets,
+    DirectVirtioHeader,
+}
+
+impl fmt::Display for VmnetInterfaceParameterField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ResultDictionary => "result dictionary",
+            Self::MacAddress => "MAC address",
+            Self::EffectiveMtu => "effective MTU",
+            Self::MaximumPacketSize => "maximum packet size",
+            Self::InterfaceId => "interface identifier",
+            Self::ReadMaximumPackets => "read batch maximum",
+            Self::WriteMaximumPackets => "write batch maximum",
+            Self::DirectVirtioHeader => "direct virtio-header mode",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmnetInterfaceParameterProblem {
+    Missing,
+    WrongType,
+    Malformed,
+    OutOfRange,
+    ConflictsWithRequest,
+}
+
+impl fmt::Display for VmnetInterfaceParameterProblem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "is missing",
+            Self::WrongType => "has the wrong XPC type",
+            Self::Malformed => "is malformed",
+            Self::OutOfRange => "is outside supported bounds",
+            Self::ConflictsWithRequest => "conflicts with requested configuration",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmnetInterfaceParameterError {
+    field: VmnetInterfaceParameterField,
+    problem: VmnetInterfaceParameterProblem,
+}
+
+impl VmnetInterfaceParameterError {
+    const fn new(
+        field: VmnetInterfaceParameterField,
+        problem: VmnetInterfaceParameterProblem,
+    ) -> Self {
+        Self { field, problem }
+    }
+
+    pub const fn field(&self) -> VmnetInterfaceParameterField {
+        self.field
+    }
+
+    pub const fn problem(&self) -> VmnetInterfaceParameterProblem {
+        self.problem
+    }
+}
+
+impl fmt::Display for VmnetInterfaceParameterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "vmnet {} {}", self.field, self.problem)
+    }
+}
+
+impl std::error::Error for VmnetInterfaceParameterError {}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VmnetInterfaceParameters {
+    realized_mac: GuestMacAddress,
+    effective_mtu: u16,
+    maximum_packet_size: usize,
+    interface_id: Option<[u8; VMNET_INTERFACE_ID_LEN]>,
+    read_max_packets: Option<u16>,
+    write_max_packets: Option<u16>,
+    direct_virtio_header_available: bool,
+    direct_virtio_header_enabled: bool,
+}
+
+impl VmnetInterfaceParameters {
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        realized_mac: GuestMacAddress,
+        effective_mtu: u16,
+        maximum_packet_size: usize,
+    ) -> Self {
+        Self {
+            realized_mac,
+            effective_mtu,
+            maximum_packet_size,
+            interface_id: None,
+            read_max_packets: None,
+            write_max_packets: None,
+            direct_virtio_header_available: false,
+            direct_virtio_header_enabled: false,
+        }
+    }
+
+    pub const fn realized_mac(&self) -> GuestMacAddress {
+        self.realized_mac
+    }
+
+    pub const fn effective_mtu(&self) -> u16 {
+        self.effective_mtu
+    }
+
+    pub const fn maximum_packet_size(&self) -> usize {
+        self.maximum_packet_size
+    }
+
+    pub const fn interface_id(&self) -> Option<[u8; VMNET_INTERFACE_ID_LEN]> {
+        self.interface_id
+    }
+
+    pub const fn read_max_packets(&self) -> Option<u16> {
+        self.read_max_packets
+    }
+
+    pub const fn write_max_packets(&self) -> Option<u16> {
+        self.write_max_packets
+    }
+
+    pub const fn direct_virtio_header_available(&self) -> bool {
+        self.direct_virtio_header_available
+    }
+
+    pub const fn direct_virtio_header_enabled(&self) -> bool {
+        self.direct_virtio_header_enabled
+    }
+}
+
+impl fmt::Debug for VmnetInterfaceParameters {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetInterfaceParameters")
+            .field("realized_mac", &"<redacted>")
+            .field("effective_mtu", &"<redacted>")
+            .field("maximum_packet_size", &"<redacted>")
+            .field(
+                "interface_id",
+                &self.interface_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "read_max_packets",
+                &self.read_max_packets.map(|_| "<redacted>"),
+            )
+            .field(
+                "write_max_packets",
+                &self.write_max_packets.map(|_| "<redacted>"),
+            )
+            .field(
+                "direct_virtio_header_available",
+                &self.direct_virtio_header_available,
+            )
+            .field(
+                "direct_virtio_header_enabled",
+                &self.direct_virtio_header_enabled,
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmnetInterfaceStartDisposition {
+    Retryable,
+    Terminal,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmnetInterfaceStartError {
@@ -324,7 +606,38 @@ pub enum VmnetInterfaceStartError {
     },
     Start {
         source: VmnetError,
+        disposition: VmnetInterfaceStartDisposition,
     },
+    Parameters {
+        source: VmnetInterfaceParameterError,
+        disposition: VmnetInterfaceStartDisposition,
+    },
+}
+
+impl VmnetInterfaceStartError {
+    const fn start(source: VmnetError, disposition: VmnetInterfaceStartDisposition) -> Self {
+        Self::Start {
+            source,
+            disposition,
+        }
+    }
+
+    const fn parameters(
+        source: VmnetInterfaceParameterError,
+        disposition: VmnetInterfaceStartDisposition,
+    ) -> Self {
+        Self::Parameters {
+            source,
+            disposition,
+        }
+    }
+
+    pub const fn disposition(&self) -> VmnetInterfaceStartDisposition {
+        match self {
+            Self::Descriptor { .. } => VmnetInterfaceStartDisposition::Retryable,
+            Self::Start { disposition, .. } | Self::Parameters { disposition, .. } => *disposition,
+        }
+    }
 }
 
 impl fmt::Display for VmnetInterfaceStartError {
@@ -333,7 +646,26 @@ impl fmt::Display for VmnetInterfaceStartError {
             Self::Descriptor { source } => {
                 write!(f, "failed to build vmnet interface descriptor: {source}")
             }
-            Self::Start { source } => write!(f, "{source}"),
+            Self::Start {
+                source,
+                disposition,
+            } => {
+                write!(f, "{source}")?;
+                if *disposition == VmnetInterfaceStartDisposition::Terminal {
+                    f.write_str("; vmnet cleanup could not be confirmed")?;
+                }
+                Ok(())
+            }
+            Self::Parameters {
+                source,
+                disposition,
+            } => {
+                write!(f, "failed to validate vmnet interface parameters: {source}")?;
+                if *disposition == VmnetInterfaceStartDisposition::Terminal {
+                    f.write_str("; vmnet cleanup could not be confirmed")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -342,7 +674,8 @@ impl std::error::Error for VmnetInterfaceStartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Descriptor { source } => Some(source),
-            Self::Start { source } => Some(source),
+            Self::Start { source, .. } => Some(source),
+            Self::Parameters { source, .. } => Some(source),
         }
     }
 }
@@ -379,7 +712,7 @@ impl fmt::Display for VmnetPacketCountExpectation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum VmnetPacketIoError {
     Vmnet {
         source: VmnetError,
@@ -411,20 +744,19 @@ impl fmt::Display for VmnetPacketIoError {
             Self::InterfaceStopped => f.write_str("vmnet interface is not started"),
             Self::UnexpectedPacketCount {
                 operation,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "{operation} returned packet count {actual}, expected {expected}"
-            ),
-            Self::ReadPacketSizeExceedsBuffer {
-                packet_size,
-                buffer_len,
-            } => write!(
-                f,
-                "vmnet_read returned packet size {packet_size}, larger than read buffer {buffer_len}"
-            ),
+                expected: _,
+                actual: _,
+            } => write!(f, "{operation} returned an unexpected packet count"),
+            Self::ReadPacketSizeExceedsBuffer { .. } => {
+                f.write_str("vmnet_read returned a packet larger than the validated read buffer")
+            }
         }
+    }
+}
+
+impl fmt::Debug for VmnetPacketIoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
     }
 }
 
@@ -439,9 +771,37 @@ impl std::error::Error for VmnetPacketIoError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy)]
+struct VmnetInterfaceResultPolicy {
+    mode: VmnetMode,
+    requested_mac: Option<GuestMacAddress>,
+    requested_mtu: Option<u16>,
+    direct_virtio_header_available: bool,
+    direct_virtio_header_enabled: bool,
+}
+
+impl fmt::Debug for VmnetInterfaceResultPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetInterfaceResultPolicy")
+            .field("mode", &self.mode)
+            .field("requested_mac", &self.requested_mac.map(|_| "<configured>"))
+            .field("requested_mtu", &self.requested_mtu.map(|_| "<configured>"))
+            .field(
+                "direct_virtio_header_available",
+                &self.direct_virtio_header_available,
+            )
+            .field(
+                "direct_virtio_header_enabled",
+                &self.direct_virtio_header_enabled,
+            )
+            .finish()
+    }
+}
+
 pub struct VmnetInterfaceDescriptor {
     dictionary: OwnedXpcObject,
+    result_policy: VmnetInterfaceResultPolicy,
 }
 
 impl VmnetInterfaceDescriptor {
@@ -478,7 +838,67 @@ impl VmnetInterfaceDescriptor {
             }
         }
 
-        Ok(Self { dictionary })
+        let allocate_mac_address_key = vmnet_allocate_mac_address_key()?;
+        let allocate_mac_address = config.guest_mac().is_none();
+        // SAFETY: `dictionary` owns a live XPC dictionary and the key is a
+        // non-null vmnet SDK key. Primitive Boolean insertion does not borrow
+        // data after this call.
+        unsafe {
+            xpc::xpc_dictionary_set_bool(
+                dictionary.as_ptr(),
+                allocate_mac_address_key,
+                allocate_mac_address,
+            );
+        }
+
+        if let Some(guest_mac) = config.guest_mac() {
+            let guest_mac = CString::new(guest_mac.to_string())
+                .map_err(|_| VmnetInterfaceDescriptorError::InteriorNulInMacAddress)?;
+            let mac_address_key = vmnet_mac_address_key()?;
+            // SAFETY: `dictionary` owns a live XPC dictionary, the key is
+            // non-null, and `guest_mac` is a valid C string for the call.
+            unsafe {
+                xpc::xpc_dictionary_set_string(
+                    dictionary.as_ptr(),
+                    mac_address_key,
+                    guest_mac.as_ptr(),
+                );
+            }
+        }
+
+        if config.mode() != VmnetMode::Bridged
+            && let Some(mtu) = config.mtu()
+        {
+            let mtu_key = vmnet_mtu_key()?;
+            // SAFETY: `dictionary` owns a live XPC dictionary and the key is a
+            // non-null vmnet SDK key. Primitive integer insertion does not
+            // borrow data after this call.
+            unsafe {
+                xpc::xpc_dictionary_set_uint64(dictionary.as_ptr(), mtu_key, u64::from(mtu));
+            }
+        }
+
+        let direct_virtio_header_key = optional_vmnet_enable_virtio_header_key();
+        if let Some(key) = direct_virtio_header_key {
+            // This foundational slice detects the capability but deliberately
+            // keeps raw-Ethernet packet I/O selected.
+            // SAFETY: `dictionary` owns a live XPC dictionary and `key` was
+            // resolved to a non-null vmnet data-symbol value.
+            unsafe {
+                xpc::xpc_dictionary_set_bool(dictionary.as_ptr(), key, false);
+            }
+        }
+
+        Ok(Self {
+            dictionary,
+            result_policy: VmnetInterfaceResultPolicy {
+                mode: config.mode(),
+                requested_mac: config.guest_mac(),
+                requested_mtu: config.mtu(),
+                direct_virtio_header_available: direct_virtio_header_key.is_some(),
+                direct_virtio_header_enabled: false,
+            },
+        })
     }
 
     pub fn as_raw_xpc_object(&self) -> *mut c_void {
@@ -486,8 +906,17 @@ impl VmnetInterfaceDescriptor {
     }
 }
 
+impl fmt::Debug for VmnetInterfaceDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetInterfaceDescriptor")
+            .field("dictionary", &"<owned>")
+            .field("result_policy", &self.result_policy)
+            .finish()
+    }
+}
+
 #[repr(C)]
-#[derive(Debug)]
 pub struct VmnetPacketDescriptor {
     vm_pkt_size: usize,
     vm_pkt_iov: *mut libc::iovec,
@@ -513,11 +942,22 @@ impl VmnetPacketDescriptor {
     }
 }
 
-#[derive(Debug)]
+impl fmt::Debug for VmnetPacketDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VmnetPacketDescriptor(<borrowed>)")
+    }
+}
+
 pub struct VmnetWritePacket<'a> {
     descriptor: VmnetPacketDescriptor,
     iov: Box<libc::iovec>,
     _packet: PhantomData<&'a [u8]>,
+}
+
+impl fmt::Debug for VmnetWritePacket<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VmnetWritePacket(<borrowed>)")
+    }
 }
 
 impl<'a> VmnetWritePacket<'a> {
@@ -557,11 +997,16 @@ impl<'a> VmnetWritePacket<'a> {
     }
 }
 
-#[derive(Debug)]
 pub struct VmnetReadPacket<'a> {
     descriptor: VmnetPacketDescriptor,
     iov: Box<libc::iovec>,
     _buffer: PhantomData<&'a mut [u8]>,
+}
+
+impl fmt::Debug for VmnetReadPacket<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VmnetReadPacket(<borrowed>)")
+    }
 }
 
 impl<'a> VmnetReadPacket<'a> {
@@ -601,7 +1046,6 @@ impl<'a> VmnetReadPacket<'a> {
     }
 }
 
-#[derive(Debug)]
 struct OwnedXpcObject {
     object: NonNull<c_void>,
 }
@@ -627,6 +1071,12 @@ impl Drop for OwnedXpcObject {
         unsafe {
             xpc::xpc_release(self.object.as_ptr());
         }
+    }
+}
+
+impl fmt::Debug for OwnedXpcObject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnedXpcObject(<owned>)")
     }
 }
 
@@ -656,6 +1106,95 @@ fn vmnet_shared_interface_name_key() -> Result<*const c_char, VmnetInterfaceDesc
     }
 }
 
+fn vmnet_mac_address_key() -> Result<*const c_char, VmnetInterfaceDescriptorError> {
+    // SAFETY: The symbol is provided by vmnet.framework on every supported
+    // deployment target. The null check prevents passing a null key to XPC.
+    let key = unsafe { xpc::VMNET_MAC_ADDRESS_KEY };
+    if key.is_null() {
+        Err(VmnetInterfaceDescriptorError::MissingVmnetKey(
+            "vmnet_mac_address_key",
+        ))
+    } else {
+        Ok(key)
+    }
+}
+
+fn vmnet_allocate_mac_address_key() -> Result<*const c_char, VmnetInterfaceDescriptorError> {
+    // SAFETY: The symbol is provided by vmnet.framework on every supported
+    // deployment target. The null check prevents passing a null key to XPC.
+    let key = unsafe { xpc::VMNET_ALLOCATE_MAC_ADDRESS_KEY };
+    if key.is_null() {
+        Err(VmnetInterfaceDescriptorError::MissingVmnetKey(
+            "vmnet_allocate_mac_address_key",
+        ))
+    } else {
+        Ok(key)
+    }
+}
+
+fn vmnet_mtu_key() -> Result<*const c_char, VmnetInterfaceDescriptorError> {
+    // SAFETY: The symbol is provided by vmnet.framework on every supported
+    // deployment target. The null check prevents passing a null key to XPC.
+    let key = unsafe { xpc::VMNET_MTU_KEY };
+    if key.is_null() {
+        Err(VmnetInterfaceDescriptorError::MissingVmnetKey(
+            "vmnet_mtu_key",
+        ))
+    } else {
+        Ok(key)
+    }
+}
+
+fn vmnet_max_packet_size_key() -> Result<*const c_char, VmnetInterfaceDescriptorError> {
+    // SAFETY: The symbol is provided by vmnet.framework on every supported
+    // deployment target. The null check prevents passing a null key to XPC.
+    let key = unsafe { xpc::VMNET_MAX_PACKET_SIZE_KEY };
+    if key.is_null() {
+        Err(VmnetInterfaceDescriptorError::MissingVmnetKey(
+            "vmnet_max_packet_size_key",
+        ))
+    } else {
+        Ok(key)
+    }
+}
+
+fn vmnet_interface_id_key() -> Result<*const c_char, VmnetInterfaceDescriptorError> {
+    // SAFETY: The symbol is provided by vmnet.framework on every supported
+    // deployment target. The null check prevents passing a null key to XPC.
+    let key = unsafe { xpc::VMNET_INTERFACE_ID_KEY };
+    if key.is_null() {
+        Err(VmnetInterfaceDescriptorError::MissingVmnetKey(
+            "vmnet_interface_id_key",
+        ))
+    } else {
+        Ok(key)
+    }
+}
+
+fn optional_vmnet_read_max_packets_key() -> Option<*const c_char> {
+    optional_vmnet_data_key(c"vmnet_read_max_packets_key")
+}
+
+fn optional_vmnet_write_max_packets_key() -> Option<*const c_char> {
+    optional_vmnet_data_key(c"vmnet_write_max_packets_key")
+}
+
+fn optional_vmnet_enable_virtio_header_key() -> Option<*const c_char> {
+    optional_vmnet_data_key(c"vmnet_enable_virtio_header_key")
+}
+
+fn optional_vmnet_data_key(symbol: &CStr) -> Option<*const c_char> {
+    // SAFETY: `symbol` is NUL-terminated. vmnet key exports are data symbols
+    // whose address points to one `const char *`; reading that pointer does not
+    // transfer ownership. A missing symbol or null key is treated as unavailable.
+    let symbol_address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
+    let symbol_address = NonNull::new(symbol_address)?;
+    // SAFETY: A successful lookup for a vmnet key data symbol points to storage
+    // containing one `const char *` value, as declared by the public SDK.
+    let key = unsafe { symbol_address.cast::<*const c_char>().as_ptr().read() };
+    (!key.is_null()).then_some(key)
+}
+
 mod xpc {
     use std::ffi::{c_char, c_void};
 
@@ -668,16 +1207,36 @@ mod xpc {
             count: usize,
         ) -> XpcObject;
         pub fn xpc_dictionary_set_uint64(xdict: XpcObject, key: *const c_char, value: u64);
+        pub fn xpc_dictionary_set_bool(xdict: XpcObject, key: *const c_char, value: bool);
         pub fn xpc_dictionary_set_string(
             xdict: XpcObject,
             key: *const c_char,
             string: *const c_char,
         );
         #[cfg(test)]
+        pub fn xpc_dictionary_set_uuid(xdict: XpcObject, key: *const c_char, uuid: *const u8);
+        #[cfg(test)]
+        pub fn xpc_dictionary_get_bool(xdict: XpcObject, key: *const c_char) -> bool;
+        #[cfg(test)]
         pub fn xpc_dictionary_get_uint64(xdict: XpcObject, key: *const c_char) -> u64;
         #[cfg(test)]
         pub fn xpc_dictionary_get_string(xdict: XpcObject, key: *const c_char) -> *const c_char;
+        pub fn xpc_dictionary_get_value(xdict: XpcObject, key: *const c_char) -> XpcObject;
+        pub fn xpc_get_type(object: XpcObject) -> *const c_void;
+        pub fn xpc_string_get_length(object: XpcObject) -> usize;
+        pub fn xpc_string_get_string_ptr(object: XpcObject) -> *const c_char;
+        pub fn xpc_uint64_get_value(object: XpcObject) -> u64;
+        pub fn xpc_uuid_get_bytes(object: XpcObject) -> *const u8;
         pub fn xpc_release(object: XpcObject);
+
+        #[link_name = "_xpc_type_dictionary"]
+        pub static XPC_TYPE_DICTIONARY: c_void;
+        #[link_name = "_xpc_type_string"]
+        pub static XPC_TYPE_STRING: c_void;
+        #[link_name = "_xpc_type_uint64"]
+        pub static XPC_TYPE_UINT64: c_void;
+        #[link_name = "_xpc_type_uuid"]
+        pub static XPC_TYPE_UUID: c_void;
     }
 
     #[link(name = "vmnet", kind = "framework")]
@@ -686,7 +1245,451 @@ mod xpc {
         pub static VMNET_OPERATION_MODE_KEY: *const c_char;
         #[link_name = "vmnet_shared_interface_name_key"]
         pub static VMNET_SHARED_INTERFACE_NAME_KEY: *const c_char;
+        #[link_name = "vmnet_mac_address_key"]
+        pub static VMNET_MAC_ADDRESS_KEY: *const c_char;
+        #[link_name = "vmnet_allocate_mac_address_key"]
+        pub static VMNET_ALLOCATE_MAC_ADDRESS_KEY: *const c_char;
+        #[link_name = "vmnet_mtu_key"]
+        pub static VMNET_MTU_KEY: *const c_char;
+        #[link_name = "vmnet_max_packet_size_key"]
+        pub static VMNET_MAX_PACKET_SIZE_KEY: *const c_char;
+        #[link_name = "vmnet_interface_id_key"]
+        pub static VMNET_INTERFACE_ID_KEY: *const c_char;
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RawVmnetInterfaceParameters {
+    returned_mac: Option<GuestMacAddress>,
+    effective_mtu: u64,
+    maximum_packet_size: u64,
+    interface_id: Option<[u8; VMNET_INTERFACE_ID_LEN]>,
+    read_max_packets: Option<u64>,
+    write_max_packets: Option<u64>,
+}
+
+impl fmt::Debug for RawVmnetInterfaceParameters {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawVmnetInterfaceParameters")
+            .field("returned_mac", &self.returned_mac.map(|_| "<redacted>"))
+            .field("effective_mtu", &"<redacted>")
+            .field("maximum_packet_size", &"<redacted>")
+            .field(
+                "interface_id",
+                &self.interface_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "read_max_packets",
+                &self.read_max_packets.map(|_| "<redacted>"),
+            )
+            .field(
+                "write_max_packets",
+                &self.write_max_packets.map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl RawVmnetInterfaceParameters {
+    fn validate(
+        self,
+        policy: VmnetInterfaceResultPolicy,
+    ) -> Result<VmnetInterfaceParameters, VmnetInterfaceParameterError> {
+        let realized_mac = match (policy.requested_mac, self.returned_mac) {
+            (Some(requested), Some(returned)) if requested != returned => {
+                return Err(VmnetInterfaceParameterError::new(
+                    VmnetInterfaceParameterField::MacAddress,
+                    VmnetInterfaceParameterProblem::ConflictsWithRequest,
+                ));
+            }
+            (Some(requested), Some(_) | None) => requested,
+            (None, Some(returned)) if allocated_mac_is_valid(returned) => returned,
+            (None, Some(_)) => {
+                return Err(VmnetInterfaceParameterError::new(
+                    VmnetInterfaceParameterField::MacAddress,
+                    VmnetInterfaceParameterProblem::OutOfRange,
+                ));
+            }
+            (None, None) => {
+                return Err(VmnetInterfaceParameterError::new(
+                    VmnetInterfaceParameterField::MacAddress,
+                    VmnetInterfaceParameterProblem::Missing,
+                ));
+            }
+        };
+
+        let effective_mtu = u16::try_from(self.effective_mtu).map_err(|_| {
+            VmnetInterfaceParameterError::new(
+                VmnetInterfaceParameterField::EffectiveMtu,
+                VmnetInterfaceParameterProblem::OutOfRange,
+            )
+        })?;
+        if !(VIRTIO_NET_MIN_MTU..=VIRTIO_NET_MAX_MTU).contains(&effective_mtu) {
+            return Err(VmnetInterfaceParameterError::new(
+                VmnetInterfaceParameterField::EffectiveMtu,
+                VmnetInterfaceParameterProblem::OutOfRange,
+            ));
+        }
+        match (policy.mode, policy.requested_mtu) {
+            (VmnetMode::Host | VmnetMode::Shared, Some(requested))
+                if requested != effective_mtu =>
+            {
+                return Err(VmnetInterfaceParameterError::new(
+                    VmnetInterfaceParameterField::EffectiveMtu,
+                    VmnetInterfaceParameterProblem::ConflictsWithRequest,
+                ));
+            }
+            (VmnetMode::Bridged, Some(requested)) if requested > effective_mtu => {
+                return Err(VmnetInterfaceParameterError::new(
+                    VmnetInterfaceParameterField::EffectiveMtu,
+                    VmnetInterfaceParameterProblem::ConflictsWithRequest,
+                ));
+            }
+            _ => {}
+        }
+
+        if policy.direct_virtio_header_enabled && !policy.direct_virtio_header_available {
+            return Err(VmnetInterfaceParameterError::new(
+                VmnetInterfaceParameterField::DirectVirtioHeader,
+                VmnetInterfaceParameterProblem::ConflictsWithRequest,
+            ));
+        }
+        if self.maximum_packet_size == 0
+            || self.maximum_packet_size < u64::from(effective_mtu)
+            || self.maximum_packet_size > c_int::MAX as u64
+        {
+            return Err(VmnetInterfaceParameterError::new(
+                VmnetInterfaceParameterField::MaximumPacketSize,
+                VmnetInterfaceParameterProblem::OutOfRange,
+            ));
+        }
+        let virtio_header_size = u64::from(bangbang_runtime::network::VIRTIO_NET_TX_HEADER_SIZE);
+        let packet_buffer_size = self
+            .maximum_packet_size
+            .checked_add(if policy.direct_virtio_header_enabled {
+                virtio_header_size
+            } else {
+                0
+            })
+            .ok_or_else(|| {
+                VmnetInterfaceParameterError::new(
+                    VmnetInterfaceParameterField::DirectVirtioHeader,
+                    VmnetInterfaceParameterProblem::OutOfRange,
+                )
+            })?;
+        let guest_buffer_size = self
+            .maximum_packet_size
+            .checked_add(virtio_header_size)
+            .ok_or_else(|| {
+                VmnetInterfaceParameterError::new(
+                    if policy.direct_virtio_header_enabled {
+                        VmnetInterfaceParameterField::DirectVirtioHeader
+                    } else {
+                        VmnetInterfaceParameterField::MaximumPacketSize
+                    },
+                    VmnetInterfaceParameterProblem::OutOfRange,
+                )
+            })?;
+        if guest_buffer_size > VIRTIO_NET_MAX_BUFFER_SIZE {
+            return Err(VmnetInterfaceParameterError::new(
+                if policy.direct_virtio_header_enabled {
+                    VmnetInterfaceParameterField::DirectVirtioHeader
+                } else {
+                    VmnetInterfaceParameterField::MaximumPacketSize
+                },
+                VmnetInterfaceParameterProblem::OutOfRange,
+            ));
+        }
+        let maximum_packet_size = usize::try_from(self.maximum_packet_size).map_err(|_| {
+            VmnetInterfaceParameterError::new(
+                VmnetInterfaceParameterField::MaximumPacketSize,
+                VmnetInterfaceParameterProblem::OutOfRange,
+            )
+        })?;
+        let read_max_packets = validate_batch_limit(
+            self.read_max_packets,
+            VmnetInterfaceParameterField::ReadMaximumPackets,
+            packet_buffer_size,
+        )?;
+        let write_max_packets = validate_batch_limit(
+            self.write_max_packets,
+            VmnetInterfaceParameterField::WriteMaximumPackets,
+            packet_buffer_size,
+        )?;
+
+        Ok(VmnetInterfaceParameters {
+            realized_mac,
+            effective_mtu,
+            maximum_packet_size,
+            interface_id: self.interface_id,
+            read_max_packets,
+            write_max_packets,
+            direct_virtio_header_available: policy.direct_virtio_header_available,
+            direct_virtio_header_enabled: policy.direct_virtio_header_enabled,
+        })
+    }
+}
+
+fn allocated_mac_is_valid(mac: GuestMacAddress) -> bool {
+    let octets = mac.octets();
+    octets != [0; 6] && octets[0] & 1 == 0
+}
+
+fn validate_batch_limit(
+    returned: Option<u64>,
+    field: VmnetInterfaceParameterField,
+    packet_buffer_size: u64,
+) -> Result<Option<u16>, VmnetInterfaceParameterError> {
+    let Some(returned) = returned else {
+        return Ok(None);
+    };
+    if returned == 0 || returned > c_int::MAX as u64 {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::OutOfRange,
+        ));
+    }
+    let memory_limit = VMNET_MAX_BYTES_PER_OPERATION / packet_buffer_size;
+    let capped = returned
+        .min(VMNET_MAX_PACKETS_PER_OPERATION)
+        .min(u64::from(VIRTIO_NET_QUEUE_SIZE))
+        .min(memory_limit);
+    let capped = u16::try_from(capped).map_err(|_| {
+        VmnetInterfaceParameterError::new(field, VmnetInterfaceParameterProblem::OutOfRange)
+    })?;
+    if capped == 0 {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::OutOfRange,
+        ));
+    }
+    Ok(Some(capped))
+}
+
+fn decode_vmnet_interface_parameters(
+    dictionary: xpc::XpcObject,
+) -> Result<RawVmnetInterfaceParameters, VmnetInterfaceParameterError> {
+    if dictionary.is_null() || !xpc_object_has_type(dictionary, xpc_dictionary_type()) {
+        return Err(VmnetInterfaceParameterError::new(
+            VmnetInterfaceParameterField::ResultDictionary,
+            if dictionary.is_null() {
+                VmnetInterfaceParameterProblem::Missing
+            } else {
+                VmnetInterfaceParameterProblem::WrongType
+            },
+        ));
+    }
+
+    let returned_mac = optional_xpc_mac(
+        dictionary,
+        required_result_key(
+            vmnet_mac_address_key(),
+            VmnetInterfaceParameterField::MacAddress,
+        )?,
+    )?;
+    let effective_mtu = required_xpc_uint64(
+        dictionary,
+        required_result_key(vmnet_mtu_key(), VmnetInterfaceParameterField::EffectiveMtu)?,
+        VmnetInterfaceParameterField::EffectiveMtu,
+    )?;
+    let maximum_packet_size = required_xpc_uint64(
+        dictionary,
+        required_result_key(
+            vmnet_max_packet_size_key(),
+            VmnetInterfaceParameterField::MaximumPacketSize,
+        )?,
+        VmnetInterfaceParameterField::MaximumPacketSize,
+    )?;
+    let interface_id = optional_xpc_uuid(
+        dictionary,
+        required_result_key(
+            vmnet_interface_id_key(),
+            VmnetInterfaceParameterField::InterfaceId,
+        )?,
+        VmnetInterfaceParameterField::InterfaceId,
+    )?;
+    let read_max_packets = optional_vmnet_read_max_packets_key()
+        .map(|key| {
+            optional_xpc_uint64(
+                dictionary,
+                key,
+                VmnetInterfaceParameterField::ReadMaximumPackets,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let write_max_packets = optional_vmnet_write_max_packets_key()
+        .map(|key| {
+            optional_xpc_uint64(
+                dictionary,
+                key,
+                VmnetInterfaceParameterField::WriteMaximumPackets,
+            )
+        })
+        .transpose()?
+        .flatten();
+
+    Ok(RawVmnetInterfaceParameters {
+        returned_mac,
+        effective_mtu,
+        maximum_packet_size,
+        interface_id,
+        read_max_packets,
+        write_max_packets,
+    })
+}
+
+fn required_result_key(
+    key: Result<*const c_char, VmnetInterfaceDescriptorError>,
+    field: VmnetInterfaceParameterField,
+) -> Result<*const c_char, VmnetInterfaceParameterError> {
+    key.map_err(|_| {
+        VmnetInterfaceParameterError::new(field, VmnetInterfaceParameterProblem::Missing)
+    })
+}
+
+fn optional_xpc_mac(
+    dictionary: xpc::XpcObject,
+    key: *const c_char,
+) -> Result<Option<GuestMacAddress>, VmnetInterfaceParameterError> {
+    let field = VmnetInterfaceParameterField::MacAddress;
+    let Some(object) = dictionary_value(dictionary, key) else {
+        return Ok(None);
+    };
+    if !xpc_object_has_type(object, xpc_string_type()) {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::WrongType,
+        ));
+    }
+    // SAFETY: Exact XPC string type was established above and the object stays
+    // borrowed from the live callback dictionary throughout these calls.
+    let len = unsafe { xpc::xpc_string_get_length(object) };
+    if len != VMNET_MAC_ADDRESS_STRING_LEN {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::Malformed,
+        ));
+    }
+    // SAFETY: Exact XPC string type was established above. XPC returns a
+    // NUL-terminated pointer valid while the borrowed object is alive.
+    let value = unsafe { xpc::xpc_string_get_string_ptr(object) };
+    if value.is_null() {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::Malformed,
+        ));
+    }
+    // SAFETY: `value` is a non-null NUL-terminated XPC string pointer and is
+    // consumed only during this callback-bound decode.
+    let value = unsafe { CStr::from_ptr(value) };
+    if value.to_bytes().len() != len {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::Malformed,
+        ));
+    }
+    let value = value.to_str().map_err(|_| {
+        VmnetInterfaceParameterError::new(field, VmnetInterfaceParameterProblem::Malformed)
+    })?;
+    GuestMacAddress::from_str(value).map(Some).map_err(|_| {
+        VmnetInterfaceParameterError::new(field, VmnetInterfaceParameterProblem::Malformed)
+    })
+}
+
+fn required_xpc_uint64(
+    dictionary: xpc::XpcObject,
+    key: *const c_char,
+    field: VmnetInterfaceParameterField,
+) -> Result<u64, VmnetInterfaceParameterError> {
+    optional_xpc_uint64(dictionary, key, field)?.ok_or_else(|| {
+        VmnetInterfaceParameterError::new(field, VmnetInterfaceParameterProblem::Missing)
+    })
+}
+
+fn optional_xpc_uint64(
+    dictionary: xpc::XpcObject,
+    key: *const c_char,
+    field: VmnetInterfaceParameterField,
+) -> Result<Option<u64>, VmnetInterfaceParameterError> {
+    let Some(object) = dictionary_value(dictionary, key) else {
+        return Ok(None);
+    };
+    if !xpc_object_has_type(object, xpc_uint64_type()) {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::WrongType,
+        ));
+    }
+    // SAFETY: Exact XPC uint64 type was established and the object remains
+    // borrowed from the live callback dictionary for this synchronous call.
+    Ok(Some(unsafe { xpc::xpc_uint64_get_value(object) }))
+}
+
+fn optional_xpc_uuid(
+    dictionary: xpc::XpcObject,
+    key: *const c_char,
+    field: VmnetInterfaceParameterField,
+) -> Result<Option<[u8; VMNET_INTERFACE_ID_LEN]>, VmnetInterfaceParameterError> {
+    let Some(object) = dictionary_value(dictionary, key) else {
+        return Ok(None);
+    };
+    if !xpc_object_has_type(object, xpc_uuid_type()) {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::WrongType,
+        ));
+    }
+    // SAFETY: Exact XPC UUID type was established. The returned 16-byte pointer
+    // remains valid while the callback dictionary owns the object.
+    let bytes = unsafe { xpc::xpc_uuid_get_bytes(object) };
+    if bytes.is_null() {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::Malformed,
+        ));
+    }
+    let mut copied = [0_u8; VMNET_INTERFACE_ID_LEN];
+    // SAFETY: `bytes` points to the public XPC UUID object's fixed 16-byte
+    // payload and `copied` has exactly that length without overlap.
+    unsafe {
+        ptr::copy_nonoverlapping(bytes, copied.as_mut_ptr(), copied.len());
+    }
+    if copied == [0; VMNET_INTERFACE_ID_LEN] {
+        return Err(VmnetInterfaceParameterError::new(
+            field,
+            VmnetInterfaceParameterProblem::OutOfRange,
+        ));
+    }
+    Ok(Some(copied))
+}
+
+fn dictionary_value(dictionary: xpc::XpcObject, key: *const c_char) -> Option<xpc::XpcObject> {
+    // SAFETY: `dictionary` was verified as an XPC dictionary and `key` is a
+    // non-null vmnet SDK key. The returned object remains borrowed.
+    NonNull::new(unsafe { xpc::xpc_dictionary_get_value(dictionary, key) }).map(NonNull::as_ptr)
+}
+
+fn xpc_object_has_type(object: xpc::XpcObject, expected: *const c_void) -> bool {
+    // SAFETY: `object` is non-null and borrowed from a live XPC dictionary.
+    unsafe { xpc::xpc_get_type(object) == expected }
+}
+
+fn xpc_dictionary_type() -> *const c_void {
+    ptr::addr_of!(xpc::XPC_TYPE_DICTIONARY).cast()
+}
+
+fn xpc_string_type() -> *const c_void {
+    ptr::addr_of!(xpc::XPC_TYPE_STRING).cast()
+}
+
+fn xpc_uint64_type() -> *const c_void {
+    ptr::addr_of!(xpc::XPC_TYPE_UINT64).cast()
+}
+
+fn xpc_uuid_type() -> *const c_void {
+    ptr::addr_of!(xpc::XPC_TYPE_UUID).cast()
 }
 
 mod vmnet_sys {
@@ -722,6 +1725,38 @@ mod vmnet_sys {
     }
 }
 
+pub struct VmnetStartedInterface<I> {
+    interface: I,
+    parameters: VmnetInterfaceParameters,
+}
+
+impl<I> VmnetStartedInterface<I> {
+    pub const fn new(interface: I, parameters: VmnetInterfaceParameters) -> Self {
+        Self {
+            interface,
+            parameters,
+        }
+    }
+
+    pub const fn parameters(&self) -> &VmnetInterfaceParameters {
+        &self.parameters
+    }
+
+    pub fn into_parts(self) -> (I, VmnetInterfaceParameters) {
+        (self.interface, self.parameters)
+    }
+}
+
+impl<I> fmt::Debug for VmnetStartedInterface<I> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetStartedInterface")
+            .field("interface", &"<owned>")
+            .field("parameters", &self.parameters)
+            .finish()
+    }
+}
+
 pub trait VmnetInterfaceBackend: fmt::Debug + Send + 'static {
     type Interface: fmt::Debug + Send + 'static;
 
@@ -735,7 +1770,7 @@ pub trait VmnetInterfaceBackend: fmt::Debug + Send + 'static {
     fn start_interface(
         &mut self,
         descriptor: &VmnetInterfaceDescriptor,
-    ) -> Result<Self::Interface, VmnetError>;
+    ) -> Result<VmnetStartedInterface<Self::Interface>, VmnetInterfaceStartError>;
 
     fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError>;
 }
@@ -866,9 +1901,14 @@ impl VmnetSystemApi for SystemVmnetApi {
     }
 }
 
-#[derive(Debug)]
 pub struct SystemVmnetInterface {
     interface: NonNull<c_void>,
+}
+
+impl fmt::Debug for SystemVmnetInterface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SystemVmnetInterface(<owned>)")
+    }
 }
 
 // SAFETY: `interface` is an opaque vmnet.framework handle. Moving the owner
@@ -886,9 +1926,14 @@ impl SystemVmnetInterface {
     }
 }
 
-#[derive(Debug)]
 pub struct SystemVmnetInterfaceBackend {
     inner: SystemVmnetInterfaceBackendWithApi<SystemVmnetApi>,
+}
+
+impl fmt::Debug for SystemVmnetInterfaceBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SystemVmnetInterfaceBackend(<owned>)")
+    }
 }
 
 impl Default for SystemVmnetInterfaceBackend {
@@ -911,7 +1956,7 @@ impl VmnetInterfaceBackend for SystemVmnetInterfaceBackend {
     fn start_interface(
         &mut self,
         descriptor: &VmnetInterfaceDescriptor,
-    ) -> Result<Self::Interface, VmnetError> {
+    ) -> Result<VmnetStartedInterface<Self::Interface>, VmnetInterfaceStartError> {
         self.inner.start_interface(descriptor)
     }
 
@@ -940,10 +1985,12 @@ impl VmnetPacketIoBackend for SystemVmnetInterfaceBackend {
     }
 }
 
-#[derive(Debug)]
 struct SystemVmnetInterfaceBackendWithApi<A> {
     api: A,
     queue: DispatchRetained<DispatchQueue>,
+    completion_timeout: Duration,
+    #[cfg(test)]
+    hold_completion_channel_open: bool,
 }
 
 impl<A> SystemVmnetInterfaceBackendWithApi<A> {
@@ -954,7 +2001,82 @@ impl<A> SystemVmnetInterfaceBackendWithApi<A> {
                 "com.github.seven332.bangbang.vmnet",
                 DispatchQueueAttr::SERIAL,
             ),
+            completion_timeout: DEFAULT_VMNET_COMPLETION_TIMEOUT,
+            #[cfg(test)]
+            hold_completion_channel_open: false,
         }
+    }
+
+    #[cfg(test)]
+    fn with_api_and_timeout(api: A, completion_timeout: Duration) -> Self {
+        Self::with_api_timeout_and_channel_liveness(api, completion_timeout, true)
+    }
+
+    #[cfg(test)]
+    fn with_api_timeout_and_channel_liveness(
+        api: A,
+        completion_timeout: Duration,
+        hold_completion_channel_open: bool,
+    ) -> Self {
+        Self {
+            api,
+            queue: DispatchQueue::new(
+                "com.github.seven332.bangbang.vmnet",
+                DispatchQueueAttr::SERIAL,
+            ),
+            completion_timeout,
+            hold_completion_channel_open,
+        }
+    }
+}
+
+impl<A> fmt::Debug for SystemVmnetInterfaceBackendWithApi<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SystemVmnetInterfaceBackendWithApi(<owned>)")
+    }
+}
+
+struct VmnetStartCompletion {
+    status: VmnetStatus,
+    parameters: Result<RawVmnetInterfaceParameters, VmnetInterfaceParameterError>,
+}
+
+impl fmt::Debug for VmnetStartCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetStartCompletion")
+            .field("status", &self.status)
+            .field("parameters", &self.parameters.as_ref().map(|_| "<decoded>"))
+            .finish()
+    }
+}
+
+impl<A> SystemVmnetInterfaceBackendWithApi<A>
+where
+    A: VmnetSystemApi,
+{
+    fn start_error_after_cleanup(
+        &mut self,
+        interface: &mut SystemVmnetInterface,
+        source: VmnetError,
+    ) -> VmnetInterfaceStartError {
+        let disposition = match self.stop_interface(interface) {
+            Ok(()) => VmnetInterfaceStartDisposition::Retryable,
+            Err(_) => VmnetInterfaceStartDisposition::Terminal,
+        };
+        VmnetInterfaceStartError::start(source, disposition)
+    }
+
+    fn parameter_error_after_cleanup(
+        &mut self,
+        interface: &mut SystemVmnetInterface,
+        source: VmnetInterfaceParameterError,
+    ) -> VmnetInterfaceStartError {
+        let disposition = match self.stop_interface(interface) {
+            Ok(()) => VmnetInterfaceStartDisposition::Retryable,
+            Err(_) => VmnetInterfaceStartDisposition::Terminal,
+        };
+        VmnetInterfaceStartError::parameters(source, disposition)
     }
 }
 
@@ -967,44 +2089,89 @@ where
     fn start_interface(
         &mut self,
         descriptor: &VmnetInterfaceDescriptor,
-    ) -> Result<Self::Interface, VmnetError> {
+    ) -> Result<VmnetStartedInterface<Self::Interface>, VmnetInterfaceStartError> {
         let (sender, receiver) = mpsc::channel();
-        let completion = RcBlock::new(move |status: u32, _interface_param: *mut c_void| {
-            let _ = sender.send(VmnetStatus::from_raw(status));
+        #[cfg(test)]
+        let completion_channel_guard = self.hold_completion_channel_open.then(|| sender.clone());
+        let completion = RcBlock::new(move |status: u32, interface_param: *mut c_void| {
+            let status = VmnetStatus::from_raw(status);
+            let parameters = if status == VmnetStatus::Success {
+                decode_vmnet_interface_parameters(interface_param)
+            } else {
+                Err(VmnetInterfaceParameterError::new(
+                    VmnetInterfaceParameterField::ResultDictionary,
+                    VmnetInterfaceParameterProblem::Missing,
+                ))
+            };
+            let _ = sender.send(VmnetStartCompletion { status, parameters });
         });
-        let Some(interface) = self
+        let interface = self
             .api
-            .start_interface(descriptor, &self.queue, &completion)
-        else {
-            let status = receiver.try_recv().unwrap_or(VmnetStatus::Failure);
+            .start_interface(descriptor, &self.queue, &completion);
+        // The public vmnet API copies an asynchronous completion block before
+        // returning. Releasing our local block is what makes a missing external
+        // callback owner observable as channel loss instead of a false timeout.
+        drop(completion);
+        let Some(interface) = interface else {
+            let status = receiver
+                .try_recv()
+                .map(|completion| completion.status)
+                .unwrap_or(VmnetStatus::Failure);
             let status = if status == VmnetStatus::Success {
                 VmnetStatus::Failure
             } else {
                 status
             };
 
-            return Err(VmnetError::new(VmnetOperation::StartInterface, status));
+            return Err(VmnetInterfaceStartError::start(
+                VmnetError::new(VmnetOperation::StartInterface, status),
+                VmnetInterfaceStartDisposition::Retryable,
+            ));
         };
-        let status = wait_for_vmnet_completion(receiver, VmnetOperation::StartInterface)?;
-        if status == VmnetStatus::Success {
-            return Ok(SystemVmnetInterface::new(interface));
-        }
-
         let mut interface = SystemVmnetInterface::new(interface);
-        match self.stop_interface(&mut interface) {
-            Ok(()) | Err(_) => {}
+        let completion = match wait_for_vmnet_completion(
+            receiver,
+            VmnetOperation::StartInterface,
+            self.completion_timeout,
+        ) {
+            Ok(completion) => completion,
+            Err(source) => return Err(self.start_error_after_cleanup(&mut interface, source)),
+        };
+        #[cfg(test)]
+        drop(completion_channel_guard);
+        if completion.status != VmnetStatus::Success {
+            let source = VmnetError::new(VmnetOperation::StartInterface, completion.status);
+            return Err(self.start_error_after_cleanup(&mut interface, source));
         }
-        Err(VmnetError::new(VmnetOperation::StartInterface, status))
+        let raw_parameters = match completion.parameters {
+            Ok(parameters) => parameters,
+            Err(source) => {
+                return Err(self.parameter_error_after_cleanup(&mut interface, source));
+            }
+        };
+        let parameters = match raw_parameters.validate(descriptor.result_policy) {
+            Ok(parameters) => parameters,
+            Err(source) => {
+                return Err(self.parameter_error_after_cleanup(&mut interface, source));
+            }
+        };
+
+        Ok(VmnetStartedInterface::new(interface, parameters))
     }
 
     fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
         let (sender, receiver) = mpsc::channel();
+        #[cfg(test)]
+        let completion_channel_guard = self.hold_completion_channel_open.then(|| sender.clone());
         let completion = RcBlock::new(move |status: u32| {
             let _ = sender.send(VmnetStatus::from_raw(status));
         });
         let schedule_status =
             self.api
                 .stop_interface(interface.as_raw_interface(), &self.queue, &completion);
+        // Match start ownership: only the framework's copied block may keep the
+        // completion channel alive after the scheduling call returns.
+        drop(completion);
         if schedule_status != VmnetStatus::Success {
             return Err(VmnetError::new(
                 VmnetOperation::StopInterface,
@@ -1012,7 +2179,14 @@ where
             ));
         }
 
-        let status = wait_for_vmnet_completion(receiver, VmnetOperation::StopInterface)?;
+        let status = wait_for_vmnet_completion(
+            receiver,
+            VmnetOperation::StopInterface,
+            self.completion_timeout,
+        );
+        #[cfg(test)]
+        drop(completion_channel_guard);
+        let status = status?;
         if status == VmnetStatus::Success {
             Ok(())
         } else {
@@ -1099,22 +2273,30 @@ where
     }
 }
 
-fn wait_for_vmnet_completion(
-    receiver: mpsc::Receiver<VmnetStatus>,
+fn wait_for_vmnet_completion<T>(
+    receiver: mpsc::Receiver<T>,
     operation: VmnetOperation,
-) -> Result<VmnetStatus, VmnetError> {
-    receiver
-        .recv()
-        .map_err(|_| VmnetError::new(operation, VmnetStatus::Failure))
+    timeout: Duration,
+) -> Result<T, VmnetError> {
+    receiver.recv_timeout(timeout).map_err(|error| {
+        VmnetError::completion(
+            operation,
+            match error {
+                mpsc::RecvTimeoutError::Timeout => VmnetCompletionError::TimedOut,
+                mpsc::RecvTimeoutError::Disconnected => VmnetCompletionError::ChannelClosed,
+            },
+        )
+    })
 }
 
-#[derive(Debug)]
 pub struct StartedVmnetInterface<B>
 where
     B: VmnetInterfaceBackend,
 {
     backend: B,
     interface: Option<B::Interface>,
+    parameters: VmnetInterfaceParameters,
+    uncertain: bool,
 }
 
 impl<B> StartedVmnetInterface<B>
@@ -1128,27 +2310,62 @@ where
         let descriptor = backend
             .build_interface_descriptor(config)
             .map_err(|source| VmnetInterfaceStartError::Descriptor { source })?;
-        let interface = backend
-            .start_interface(&descriptor)
-            .map_err(|source| VmnetInterfaceStartError::Start { source })?;
+        let started = backend.start_interface(&descriptor)?;
+        let (interface, parameters) = started.into_parts();
 
         Ok(Self {
             backend,
             interface: Some(interface),
+            parameters,
+            uncertain: false,
         })
     }
 
     pub const fn is_started(&self) -> bool {
-        self.interface.is_some()
+        self.interface.is_some() && !self.uncertain
+    }
+
+    pub const fn is_uncertain(&self) -> bool {
+        self.uncertain
+    }
+
+    pub const fn parameters(&self) -> &VmnetInterfaceParameters {
+        &self.parameters
     }
 
     pub fn stop(&mut self) -> Result<(), VmnetError> {
+        if self.uncertain {
+            return Err(VmnetError::new(
+                VmnetOperation::StopInterface,
+                VmnetStatus::Failure,
+            ));
+        }
         if let Some(interface) = self.interface.as_mut() {
-            self.backend.stop_interface(interface)?;
-            self.interface = None;
+            match self.backend.stop_interface(interface) {
+                Ok(()) => self.interface = None,
+                Err(source) => {
+                    self.uncertain = true;
+                    return Err(source);
+                }
+            }
         }
 
         Ok(())
+    }
+}
+
+impl<B> fmt::Debug for StartedVmnetInterface<B>
+where
+    B: VmnetInterfaceBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StartedVmnetInterface")
+            .field("backend", &"<owned>")
+            .field("interface", &self.interface.as_ref().map(|_| "<owned>"))
+            .field("parameters", &self.parameters)
+            .field("uncertain", &self.uncertain)
+            .finish()
     }
 }
 
@@ -1157,8 +2374,10 @@ where
     B: VmnetInterfaceBackend,
 {
     fn drop(&mut self) {
-        match self.stop() {
-            Ok(()) | Err(_) => {}
+        if !self.uncertain {
+            match self.stop() {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
 }
@@ -1196,6 +2415,10 @@ where
         self.started.is_started()
     }
 
+    pub const fn parameters(&self) -> &VmnetInterfaceParameters {
+        self.started.parameters()
+    }
+
     pub fn stop(&mut self) -> Result<(), VmnetError> {
         self.started.stop()
     }
@@ -1213,6 +2436,9 @@ where
         _interface: &mut Self::Interface,
         packet: &mut VmnetReadPacket<'_>,
     ) -> Result<Option<usize>, VmnetPacketIoError> {
+        if !self.started.is_started() {
+            return Err(VmnetPacketIoError::InterfaceStopped);
+        }
         let Some(interface) = self.started.interface.as_mut() else {
             return Err(VmnetPacketIoError::InterfaceStopped);
         };
@@ -1225,6 +2451,9 @@ where
         _interface: &mut Self::Interface,
         packet: &mut VmnetWritePacket<'_>,
     ) -> Result<(), VmnetPacketIoError> {
+        if !self.started.is_started() {
+            return Err(VmnetPacketIoError::InterfaceStopped);
+        }
         let Some(interface) = self.started.interface.as_mut() else {
             return Err(VmnetPacketIoError::InterfaceStopped);
         };
@@ -1244,13 +2473,13 @@ pub trait VmnetInterfaceLifecycle: fmt::Debug + Send + 'static {
     fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError>;
 }
 
-#[derive(Debug)]
 pub struct OwnedVmnetInterface<L>
 where
     L: VmnetInterfaceLifecycle,
 {
     lifecycle: L,
     interface: Option<L::Interface>,
+    uncertain: bool,
 }
 
 impl<L> OwnedVmnetInterface<L>
@@ -1263,20 +2492,50 @@ where
         Ok(Self {
             lifecycle,
             interface: Some(interface),
+            uncertain: false,
         })
     }
 
     pub const fn is_started(&self) -> bool {
-        self.interface.is_some()
+        self.interface.is_some() && !self.uncertain
+    }
+
+    pub const fn is_uncertain(&self) -> bool {
+        self.uncertain
     }
 
     pub fn stop(&mut self) -> Result<(), VmnetError> {
+        if self.uncertain {
+            return Err(VmnetError::new(
+                VmnetOperation::StopInterface,
+                VmnetStatus::Failure,
+            ));
+        }
         if let Some(interface) = self.interface.as_mut() {
-            self.lifecycle.stop_interface(interface)?;
-            self.interface = None;
+            match self.lifecycle.stop_interface(interface) {
+                Ok(()) => self.interface = None,
+                Err(source) => {
+                    self.uncertain = true;
+                    return Err(source);
+                }
+            }
         }
 
         Ok(())
+    }
+}
+
+impl<L> fmt::Debug for OwnedVmnetInterface<L>
+where
+    L: VmnetInterfaceLifecycle,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedVmnetInterface")
+            .field("lifecycle", &"<owned>")
+            .field("interface", &self.interface.as_ref().map(|_| "<owned>"))
+            .field("uncertain", &self.uncertain)
+            .finish()
     }
 }
 
@@ -1285,8 +2544,10 @@ where
     L: VmnetInterfaceLifecycle,
 {
     fn drop(&mut self) {
-        match self.stop() {
-            Ok(()) | Err(_) => {}
+        if !self.uncertain {
+            match self.stop() {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
 }
@@ -1299,8 +2560,12 @@ mod tests {
     use std::mem::{align_of, offset_of, size_of};
     use std::ptr::{self, NonNull};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use bangbang_runtime::network::VirtioNetworkRxPacketSource;
+    use bangbang_runtime::network::{
+        GuestMacAddress, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU,
+        VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_TX_HEADER_SIZE, VirtioNetworkRxPacketSource,
+    };
     use block2::Block;
     use dispatch2::DispatchQueue;
 
@@ -1311,9 +2576,11 @@ mod tests {
         VMNET_BRIDGED_MODE_VALUE, VMNET_HOST_MODE_VALUE, VMNET_SHARED_MODE_VALUE, VmnetError,
         VmnetHostDeviceNameConfigError, VmnetInterfaceBackend, VmnetInterfaceConfig,
         VmnetInterfaceConfigError, VmnetInterfaceDescriptor, VmnetInterfaceDescriptorError,
-        VmnetInterfaceLifecycle, VmnetInterfaceStartError, VmnetMode, VmnetOperation,
-        VmnetPacketCountExpectation, VmnetPacketDescriptor, VmnetPacketDescriptorError,
-        VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket, VmnetStatus, VmnetSystemApi,
+        VmnetInterfaceLifecycle, VmnetInterfaceParameterError, VmnetInterfaceParameterField,
+        VmnetInterfaceParameterProblem, VmnetInterfaceParameters, VmnetInterfaceStartDisposition,
+        VmnetInterfaceStartError, VmnetMode, VmnetOperation, VmnetPacketCountExpectation,
+        VmnetPacketDescriptor, VmnetPacketDescriptorError, VmnetPacketIoBackend,
+        VmnetPacketIoError, VmnetReadPacket, VmnetStartedInterface, VmnetStatus, VmnetSystemApi,
         VmnetWritePacket,
     };
 
@@ -1448,16 +2715,26 @@ mod tests {
         fn start_interface(
             &mut self,
             descriptor: &VmnetInterfaceDescriptor,
-        ) -> Result<Self::Interface, VmnetError> {
+        ) -> Result<VmnetStartedInterface<Self::Interface>, VmnetInterfaceStartError> {
             push_event(
                 &self.events,
                 format!("start:{}", descriptor_mode(descriptor)),
             );
             if let Some(status) = self.start_status {
-                return Err(VmnetError::new(VmnetOperation::StartInterface, status));
+                return Err(VmnetInterfaceStartError::Start {
+                    source: VmnetError::new(VmnetOperation::StartInterface, status),
+                    disposition: VmnetInterfaceStartDisposition::Retryable,
+                });
             }
 
-            Ok(RecordedVmnetInterface { id: 9 })
+            Ok(VmnetStartedInterface::new(
+                RecordedVmnetInterface { id: 9 },
+                VmnetInterfaceParameters::for_test(
+                    GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 9]),
+                    1500,
+                    2048,
+                ),
+            ))
         }
 
         fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
@@ -1504,8 +2781,11 @@ mod tests {
         events: Arc<Mutex<Vec<String>>>,
         start_handle: Option<usize>,
         start_completion: VmnetStatus,
+        deliver_start_completion: bool,
+        omit_start_mtu: bool,
         stop_schedule_statuses: VecDeque<VmnetStatus>,
         stop_completion_statuses: VecDeque<VmnetStatus>,
+        deliver_stop_completion: bool,
         read_status: VmnetStatus,
         read_packet_count: c_int,
         read_packet_size: usize,
@@ -1519,8 +2799,11 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
                 start_handle: Some(0x10),
                 start_completion: VmnetStatus::Success,
+                deliver_start_completion: true,
+                omit_start_mtu: false,
                 stop_schedule_statuses: VecDeque::new(),
                 stop_completion_statuses: VecDeque::new(),
+                deliver_stop_completion: true,
                 read_status: VmnetStatus::Success,
                 read_packet_count: 1,
                 read_packet_size: 64,
@@ -1539,6 +2822,16 @@ mod tests {
             self
         }
 
+        fn without_start_completion(mut self) -> Self {
+            self.deliver_start_completion = false;
+            self
+        }
+
+        fn with_missing_start_mtu(mut self) -> Self {
+            self.omit_start_mtu = true;
+            self
+        }
+
         fn with_stop_schedule_status(mut self, status: VmnetStatus) -> Self {
             self.stop_schedule_statuses.push_back(status);
             self
@@ -1546,6 +2839,11 @@ mod tests {
 
         fn with_stop_completion_status(mut self, status: VmnetStatus) -> Self {
             self.stop_completion_statuses.push_back(status);
+            self
+        }
+
+        fn without_stop_completion(mut self) -> Self {
+            self.deliver_stop_completion = false;
             self
         }
 
@@ -1583,7 +2881,16 @@ mod tests {
                 &self.events,
                 format!("system-start:{}", descriptor_mode(descriptor)),
             );
-            completion.call((self.start_completion.raw_value(), ptr::null_mut()));
+            if self.deliver_start_completion {
+                let parameters = (self.start_completion == VmnetStatus::Success)
+                    .then(|| successful_result_dictionary(descriptor, !self.omit_start_mtu));
+                completion.call((
+                    self.start_completion.raw_value(),
+                    parameters
+                        .as_ref()
+                        .map_or(ptr::null_mut(), super::OwnedXpcObject::as_ptr),
+                ));
+            }
 
             self.start_handle.map(fake_interface)
         }
@@ -1602,7 +2909,7 @@ mod tests {
                 .stop_schedule_statuses
                 .pop_front()
                 .unwrap_or(VmnetStatus::Success);
-            if schedule_status == VmnetStatus::Success {
+            if schedule_status == VmnetStatus::Success && self.deliver_stop_completion {
                 let completion_status = self
                     .stop_completion_statuses
                     .pop_front()
@@ -1660,6 +2967,127 @@ mod tests {
         }
     }
 
+    fn successful_result_dictionary(
+        descriptor: &VmnetInterfaceDescriptor,
+        include_mtu: bool,
+    ) -> super::OwnedXpcObject {
+        let mac = descriptor
+            .result_policy
+            .requested_mac
+            .unwrap_or_else(|| GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x10]));
+        let effective_mtu = u64::from(descriptor.result_policy.requested_mtu.unwrap_or(1500));
+        let maximum_packet_size = effective_mtu.max(2048);
+        let mac = mac.to_string();
+        test_result_dictionary(
+            Some(&mac),
+            include_mtu.then_some(effective_mtu),
+            Some(maximum_packet_size),
+        )
+    }
+
+    fn test_result_dictionary(
+        mac: Option<&str>,
+        effective_mtu: Option<u64>,
+        maximum_packet_size: Option<u64>,
+    ) -> super::OwnedXpcObject {
+        let dictionary = super::OwnedXpcObject::dictionary()
+            .expect("test vmnet result dictionary should allocate");
+        if let Some(mac) = mac {
+            set_dictionary_string(
+                &dictionary,
+                super::vmnet_mac_address_key().expect("test MAC key should exist"),
+                mac,
+            );
+        }
+        if let Some(effective_mtu) = effective_mtu {
+            set_dictionary_uint64(
+                &dictionary,
+                super::vmnet_mtu_key().expect("test MTU key should exist"),
+                effective_mtu,
+            );
+        }
+        if let Some(maximum_packet_size) = maximum_packet_size {
+            set_dictionary_uint64(
+                &dictionary,
+                super::vmnet_max_packet_size_key().expect("test maximum-packet key should exist"),
+                maximum_packet_size,
+            );
+        }
+        dictionary
+    }
+
+    fn set_dictionary_string(
+        dictionary: &super::OwnedXpcObject,
+        key: *const std::ffi::c_char,
+        value: &str,
+    ) {
+        let value = std::ffi::CString::new(value).expect("test XPC string should contain no NUL");
+        // SAFETY: The dictionary and key are live, and `value` is a valid C
+        // string for the duration of this insertion.
+        unsafe {
+            super::xpc::xpc_dictionary_set_string(dictionary.as_ptr(), key, value.as_ptr());
+        }
+    }
+
+    fn set_dictionary_uint64(
+        dictionary: &super::OwnedXpcObject,
+        key: *const std::ffi::c_char,
+        value: u64,
+    ) {
+        // SAFETY: The dictionary and key are live and primitive insertion does
+        // not retain borrowed Rust data.
+        unsafe {
+            super::xpc::xpc_dictionary_set_uint64(dictionary.as_ptr(), key, value);
+        }
+    }
+
+    fn set_dictionary_uuid(
+        dictionary: &super::OwnedXpcObject,
+        key: *const std::ffi::c_char,
+        value: [u8; super::VMNET_INTERFACE_ID_LEN],
+    ) {
+        // SAFETY: The dictionary and key are live. XPC copies the fixed-size
+        // UUID bytes before this call returns.
+        unsafe {
+            super::xpc::xpc_dictionary_set_uuid(dictionary.as_ptr(), key, value.as_ptr());
+        }
+    }
+
+    fn decode_test_parameters(
+        dictionary: &super::OwnedXpcObject,
+        config: &VmnetInterfaceConfig,
+    ) -> Result<VmnetInterfaceParameters, VmnetInterfaceParameterError> {
+        let descriptor =
+            VmnetInterfaceDescriptor::new(config).expect("test vmnet descriptor should be created");
+        super::decode_vmnet_interface_parameters(dictionary.as_ptr())?
+            .validate(descriptor.result_policy)
+    }
+
+    fn raw_test_parameters(
+        returned_mac: Option<GuestMacAddress>,
+        effective_mtu: u64,
+        maximum_packet_size: u64,
+    ) -> super::RawVmnetInterfaceParameters {
+        super::RawVmnetInterfaceParameters {
+            returned_mac,
+            effective_mtu,
+            maximum_packet_size,
+            interface_id: None,
+            read_max_packets: None,
+            write_max_packets: None,
+        }
+    }
+
+    fn assert_parameter_error<T: std::fmt::Debug>(
+        result: Result<T, VmnetInterfaceParameterError>,
+        field: VmnetInterfaceParameterField,
+        problem: VmnetInterfaceParameterProblem,
+    ) {
+        let error = result.expect_err("vmnet parameter fixture should fail");
+        assert_eq!(error.field(), field);
+        assert_eq!(error.problem(), problem);
+    }
+
     fn push_event(events: &Arc<Mutex<Vec<String>>>, event: String) {
         match events.lock() {
             Ok(mut guard) => guard.push(event),
@@ -1686,27 +3114,60 @@ mod tests {
         unsafe { super::xpc::xpc_dictionary_get_uint64(descriptor.dictionary.as_ptr(), key) }
     }
 
-    fn descriptor_bridged_interface_name(descriptor: &VmnetInterfaceDescriptor) -> Option<String> {
-        let key = super::vmnet_shared_interface_name_key()
-            .expect("vmnet shared interface name key should be available");
+    fn descriptor_has_value(
+        descriptor: &VmnetInterfaceDescriptor,
+        key: *const std::ffi::c_char,
+    ) -> bool {
+        // SAFETY: The descriptor owns a live dictionary and the caller passes
+        // a live vmnet key.
+        !unsafe { super::xpc::xpc_dictionary_get_value(descriptor.dictionary.as_ptr(), key) }
+            .is_null()
+    }
 
-        // SAFETY: The descriptor owns a live XPC dictionary, and the key comes
-        // from the vmnet SDK symbol wrapper. XPC owns the returned C string.
+    fn descriptor_bool(
+        descriptor: &VmnetInterfaceDescriptor,
+        key: *const std::ffi::c_char,
+    ) -> bool {
+        // SAFETY: The descriptor owns a live dictionary and the test only uses
+        // keys populated with an XPC Boolean.
+        unsafe { super::xpc::xpc_dictionary_get_bool(descriptor.dictionary.as_ptr(), key) }
+    }
+
+    fn descriptor_uint64(
+        descriptor: &VmnetInterfaceDescriptor,
+        key: *const std::ffi::c_char,
+    ) -> u64 {
+        // SAFETY: The descriptor owns a live dictionary and the test only uses
+        // keys populated with an XPC uint64.
+        unsafe { super::xpc::xpc_dictionary_get_uint64(descriptor.dictionary.as_ptr(), key) }
+    }
+
+    fn descriptor_string(
+        descriptor: &VmnetInterfaceDescriptor,
+        key: *const std::ffi::c_char,
+    ) -> Option<String> {
+        // SAFETY: The descriptor owns a live dictionary and the key comes from
+        // vmnet. XPC owns the returned C string.
         let value =
             unsafe { super::xpc::xpc_dictionary_get_string(descriptor.dictionary.as_ptr(), key) };
-
         if value.is_null() {
             None
         } else {
-            // SAFETY: XPC returns either null or a valid null-terminated C string
-            // for the lifetime of the dictionary.
+            // SAFETY: XPC returned a non-null, NUL-terminated string borrowed
+            // from the live descriptor dictionary.
             Some(
                 unsafe { CStr::from_ptr(value) }
                     .to_str()
-                    .expect("bridged interface name should be valid UTF-8")
-                    .to_string(),
+                    .expect("descriptor test string should be UTF-8")
+                    .to_owned(),
             )
         }
+    }
+
+    fn descriptor_bridged_interface_name(descriptor: &VmnetInterfaceDescriptor) -> Option<String> {
+        let key = super::vmnet_shared_interface_name_key()
+            .expect("vmnet shared interface name key should be available");
+        descriptor_string(descriptor, key)
     }
 
     fn descriptor_iov(descriptor: &VmnetPacketDescriptor) -> &libc::iovec {
@@ -1734,12 +3195,13 @@ mod tests {
         assert_eq!(VmnetStatus::from_raw(9000), VmnetStatus::Unknown(9000));
         assert_eq!(
             VmnetStatus::NotAuthorized.to_string(),
-            "VMNET_NOT_AUTHORIZED (vmnet_return_t=1010)"
+            "VMNET_NOT_AUTHORIZED"
         );
         assert_eq!(
             VmnetStatus::Unknown(9000).to_string(),
-            "vmnet_return_t=9000"
+            "unknown vmnet status"
         );
+        assert!(!format!("{:?}", VmnetStatus::Unknown(9000)).contains("9000"));
     }
 
     #[test]
@@ -1761,6 +3223,27 @@ mod tests {
         assert_eq!(
             size_of::<VmnetPacketDescriptor>(),
             size_of::<usize>() + size_of::<*mut libc::iovec>() + (2 * size_of::<u32>())
+        );
+    }
+
+    #[test]
+    fn packet_descriptor_debug_omits_buffers_sizes_and_pointers() {
+        let packet = [0x12, 0x34, 0x56];
+        let write = VmnetWritePacket::new(&packet)
+            .expect("non-empty write packet descriptor should be created");
+        let mut buffer = [0x78_u8; 2048];
+        let read = VmnetReadPacket::new(&mut buffer)
+            .expect("non-empty read packet descriptor should be created");
+
+        assert_eq!(format!("{write:?}"), "VmnetWritePacket(<borrowed>)");
+        assert_eq!(format!("{read:?}"), "VmnetReadPacket(<borrowed>)");
+        assert_eq!(
+            format!("{:?}", write.as_raw_descriptor()),
+            "VmnetPacketDescriptor(<borrowed>)"
+        );
+        assert_eq!(
+            format!("{:?}", read.as_raw_descriptor()),
+            "VmnetPacketDescriptor(<borrowed>)"
         );
     }
 
@@ -1921,12 +3404,15 @@ mod tests {
             .expect_err("start failure should prevent interface ownership");
 
         match error {
-            VmnetInterfaceStartError::Start { source } => {
+            VmnetInterfaceStartError::Start { source, .. } => {
                 assert_eq!(source.operation(), VmnetOperation::StartInterface);
                 assert_eq!(source.status(), VmnetStatus::InvalidArgument);
             }
             VmnetInterfaceStartError::Descriptor { .. } => {
                 panic!("start failure should not return a descriptor error");
+            }
+            VmnetInterfaceStartError::Parameters { .. } => {
+                panic!("fake start failure should not return a parameter error");
             }
         }
         assert_eq!(
@@ -1939,7 +3425,7 @@ mod tests {
     }
 
     #[test]
-    fn started_interface_failed_stop_keeps_interface_for_retry() {
+    fn started_interface_failed_stop_marks_owner_uncertain_without_retry() {
         let backend = RecordingVmnetBackend::new().with_stop_status(VmnetStatus::SetupIncomplete);
         let event_log = backend.events();
         let config = VmnetInterfaceConfig::host();
@@ -1951,18 +3437,18 @@ mod tests {
 
         assert_eq!(error.operation(), VmnetOperation::StopInterface);
         assert_eq!(error.status(), VmnetStatus::SetupIncomplete);
-        assert!(interface.is_started());
+        assert!(!interface.is_started());
+        assert!(interface.is_uncertain());
 
         interface
             .stop()
-            .expect("second stop should retry and succeed");
+            .expect_err("uncertain interface must not retry stop");
         assert!(!interface.is_started());
         assert_eq!(
             recorded_events(&event_log),
             [
                 "descriptor:host".to_string(),
                 format!("start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
-                "stop:9".to_string(),
                 "stop:9".to_string(),
             ]
         );
@@ -1990,7 +3476,7 @@ mod tests {
     }
 
     #[test]
-    fn started_interface_drop_retries_after_failed_explicit_stop() {
+    fn started_interface_drop_does_not_retry_after_failed_explicit_stop() {
         let backend = RecordingVmnetBackend::new().with_stop_status(VmnetStatus::SetupIncomplete);
         let event_log = backend.events();
         let config = VmnetInterfaceConfig::shared();
@@ -2010,7 +3496,6 @@ mod tests {
             [
                 "descriptor:shared".to_string(),
                 format!("start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
-                "stop:9".to_string(),
                 "stop:9".to_string(),
             ]
         );
@@ -2161,12 +3646,15 @@ mod tests {
             .expect_err("start failure should prevent packet I/O ownership");
 
         match error {
-            VmnetInterfaceStartError::Start { source } => {
+            VmnetInterfaceStartError::Start { source, .. } => {
                 assert_eq!(source.operation(), VmnetOperation::StartInterface);
                 assert_eq!(source.status(), VmnetStatus::NotAuthorized);
             }
             VmnetInterfaceStartError::Descriptor { .. } => {
                 panic!("start failure should not return a descriptor error");
+            }
+            VmnetInterfaceStartError::Parameters { .. } => {
+                panic!("fake start failure should not return a parameter error");
             }
         }
         assert_eq!(
@@ -2215,18 +3703,84 @@ mod tests {
             .expect_err("system start completion failure should prevent ownership");
 
         match error {
-            VmnetInterfaceStartError::Start { source } => {
+            VmnetInterfaceStartError::Start { source, .. } => {
                 assert_eq!(source.operation(), VmnetOperation::StartInterface);
                 assert_eq!(source.status(), VmnetStatus::InvalidAccess);
             }
             VmnetInterfaceStartError::Descriptor { .. } => {
                 panic!("system start failure should not be reported as a descriptor error");
             }
+            VmnetInterfaceStartError::Parameters { .. } => {
+                panic!("system service failure should not be reported as a parameter error");
+            }
         }
         assert_eq!(
             recorded_events(&event_log),
             [
                 format!("system-start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+                "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_cleans_up_after_parameter_validation_failure() {
+        let api = RecordingVmnetSystemApi::new().with_missing_start_mtu();
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::host();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let error = StartedVmnetInterface::start(backend, &config)
+            .expect_err("missing successful-start MTU should prevent ownership");
+
+        match error {
+            VmnetInterfaceStartError::Parameters {
+                source,
+                disposition,
+            } => {
+                assert_eq!(source.field(), VmnetInterfaceParameterField::EffectiveMtu);
+                assert_eq!(source.problem(), VmnetInterfaceParameterProblem::Missing);
+                assert_eq!(disposition, VmnetInterfaceStartDisposition::Retryable);
+            }
+            VmnetInterfaceStartError::Descriptor { .. }
+            | VmnetInterfaceStartError::Start { .. } => {
+                panic!("missing successful-start MTU should be a parameter error");
+            }
+        }
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+                "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_parameter_failure_is_terminal_when_cleanup_is_uncertain() {
+        let api = RecordingVmnetSystemApi::new()
+            .with_missing_start_mtu()
+            .with_stop_schedule_status(VmnetStatus::SetupIncomplete);
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::shared();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let error = StartedVmnetInterface::start(backend, &config)
+            .expect_err("unclean parameter failure should prevent ownership");
+
+        assert_eq!(
+            error.disposition(),
+            VmnetInterfaceStartDisposition::Terminal
+        );
+        assert!(matches!(
+            error,
+            VmnetInterfaceStartError::Parameters {
+                source,
+                disposition: VmnetInterfaceStartDisposition::Terminal,
+            } if source.field() == VmnetInterfaceParameterField::EffectiveMtu
+        ));
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
                 "system-stop:10".to_string(),
             ]
         );
@@ -2244,12 +3798,15 @@ mod tests {
             .expect_err("null vmnet start handle should prevent ownership");
 
         match error {
-            VmnetInterfaceStartError::Start { source } => {
+            VmnetInterfaceStartError::Start { source, .. } => {
                 assert_eq!(source.operation(), VmnetOperation::StartInterface);
                 assert_eq!(source.status(), VmnetStatus::NotAuthorized);
             }
             VmnetInterfaceStartError::Descriptor { .. } => {
                 panic!("null start handle should not be reported as a descriptor error");
+            }
+            VmnetInterfaceStartError::Parameters { .. } => {
+                panic!("null start handle should not be reported as a parameter error");
             }
         }
         assert_eq!(
@@ -2268,12 +3825,15 @@ mod tests {
             .expect_err("null vmnet start handle should fail even with success completion");
 
         match error {
-            VmnetInterfaceStartError::Start { source } => {
+            VmnetInterfaceStartError::Start { source, .. } => {
                 assert_eq!(source.operation(), VmnetOperation::StartInterface);
                 assert_eq!(source.status(), VmnetStatus::Failure);
             }
             VmnetInterfaceStartError::Descriptor { .. } => {
                 panic!("null start handle should not be reported as a descriptor error");
+            }
+            VmnetInterfaceStartError::Parameters { .. } => {
+                panic!("null start handle should not be reported as a parameter error");
             }
         }
         assert_eq!(
@@ -2286,7 +3846,7 @@ mod tests {
     }
 
     #[test]
-    fn system_vmnet_backend_failed_stop_schedule_keeps_interface_for_retry() {
+    fn system_vmnet_backend_failed_stop_schedule_marks_interface_uncertain() {
         let api =
             RecordingVmnetSystemApi::new().with_stop_schedule_status(VmnetStatus::SetupIncomplete);
         let event_log = api.events();
@@ -2300,24 +3860,25 @@ mod tests {
 
         assert_eq!(error.operation(), VmnetOperation::StopInterface);
         assert_eq!(error.status(), VmnetStatus::SetupIncomplete);
-        assert!(interface.is_started());
+        assert!(!interface.is_started());
+        assert!(interface.is_uncertain());
 
-        interface
+        let second = interface
             .stop()
-            .expect("second system stop should retry and succeed");
+            .expect_err("uncertain system stop must not be retried");
+        assert_eq!(second.status(), VmnetStatus::Failure);
         assert!(!interface.is_started());
         assert_eq!(
             recorded_events(&event_log),
             [
                 format!("system-start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
                 "system-stop:10".to_string(),
-                "system-stop:10".to_string(),
             ]
         );
     }
 
     #[test]
-    fn system_vmnet_backend_failed_stop_completion_keeps_interface_for_retry() {
+    fn system_vmnet_backend_failed_stop_completion_marks_interface_uncertain() {
         let api = RecordingVmnetSystemApi::new()
             .with_stop_completion_status(VmnetStatus::SharingServiceBusy);
         let event_log = api.events();
@@ -2331,17 +3892,177 @@ mod tests {
 
         assert_eq!(error.operation(), VmnetOperation::StopInterface);
         assert_eq!(error.status(), VmnetStatus::SharingServiceBusy);
-        assert!(interface.is_started());
+        assert!(!interface.is_started());
+        assert!(interface.is_uncertain());
 
-        interface
+        let second = interface
             .stop()
-            .expect("second system stop should retry and succeed");
+            .expect_err("uncertain system stop must not be retried");
+        assert_eq!(second.status(), VmnetStatus::Failure);
         assert!(!interface.is_started());
         assert_eq!(
             recorded_events(&event_log),
             [
                 format!("system-start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
                 "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_start_timeout_cleans_up_with_finite_deadline() {
+        let api = RecordingVmnetSystemApi::new().without_start_completion();
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::host();
+        let backend =
+            super::SystemVmnetInterfaceBackendWithApi::with_api_and_timeout(api, Duration::ZERO);
+        let error = StartedVmnetInterface::start(backend, &config)
+            .expect_err("start timeout should prevent ownership");
+
+        match error {
+            VmnetInterfaceStartError::Start {
+                source,
+                disposition,
+            } => {
+                assert_eq!(
+                    source.completion_error(),
+                    Some(super::VmnetCompletionError::TimedOut)
+                );
+                assert_eq!(disposition, VmnetInterfaceStartDisposition::Retryable);
+            }
+            VmnetInterfaceStartError::Descriptor { .. }
+            | VmnetInterfaceStartError::Parameters { .. } => {
+                panic!("start timeout should remain a lifecycle error");
+            }
+        }
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+                "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_start_timeout_is_terminal_when_cleanup_times_out() {
+        let api = RecordingVmnetSystemApi::new()
+            .without_start_completion()
+            .without_stop_completion();
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::host();
+        let backend =
+            super::SystemVmnetInterfaceBackendWithApi::with_api_and_timeout(api, Duration::ZERO);
+        let error = StartedVmnetInterface::start(backend, &config)
+            .expect_err("start and cleanup timeout should prevent ownership");
+
+        assert_eq!(
+            error.disposition(),
+            VmnetInterfaceStartDisposition::Terminal
+        );
+        assert!(matches!(
+            error,
+            VmnetInterfaceStartError::Start {
+                source,
+                disposition: VmnetInterfaceStartDisposition::Terminal,
+            } if source.completion_error() == Some(super::VmnetCompletionError::TimedOut)
+        ));
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+                "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_distinguishes_lost_start_callback_owner() {
+        let api = RecordingVmnetSystemApi::new().without_start_completion();
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::host();
+        let backend =
+            super::SystemVmnetInterfaceBackendWithApi::with_api_timeout_and_channel_liveness(
+                api,
+                Duration::ZERO,
+                false,
+            );
+
+        let error = StartedVmnetInterface::start(backend, &config)
+            .expect_err("lost start callback owner should prevent ownership");
+
+        assert!(matches!(
+            error,
+            VmnetInterfaceStartError::Start {
+                source,
+                disposition: VmnetInterfaceStartDisposition::Retryable,
+            } if source.completion_error() == Some(super::VmnetCompletionError::ChannelClosed)
+        ));
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+                "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_completion_distinguishes_channel_loss_and_rejects_late_send() {
+        let (sender, receiver) = std::sync::mpsc::channel::<u8>();
+        drop(sender);
+        let channel_error = super::wait_for_vmnet_completion(
+            receiver,
+            VmnetOperation::StartInterface,
+            Duration::ZERO,
+        )
+        .expect_err("closed completion channel should fail");
+        assert_eq!(
+            channel_error.completion_error(),
+            Some(super::VmnetCompletionError::ChannelClosed)
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel::<u8>();
+        let timeout_error = super::wait_for_vmnet_completion(
+            receiver,
+            VmnetOperation::StartInterface,
+            Duration::ZERO,
+        )
+        .expect_err("undelivered completion should time out");
+        assert_eq!(
+            timeout_error.completion_error(),
+            Some(super::VmnetCompletionError::TimedOut)
+        );
+        assert!(
+            sender.send(1).is_err(),
+            "a late completion must not regain an owner after timeout"
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_stop_timeout_is_not_retried() {
+        let api = RecordingVmnetSystemApi::new().without_stop_completion();
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::shared();
+        let backend =
+            super::SystemVmnetInterfaceBackendWithApi::with_api_and_timeout(api, Duration::ZERO);
+        let mut interface = StartedVmnetInterface::start(backend, &config)
+            .expect("system vmnet interface should start");
+
+        let error = interface.stop().expect_err("stop timeout should fail");
+        assert_eq!(
+            error.completion_error(),
+            Some(super::VmnetCompletionError::TimedOut)
+        );
+        assert!(interface.is_uncertain());
+        interface
+            .stop()
+            .expect_err("uncertain system stop must not be retried");
+        drop(interface);
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
                 "system-stop:10".to_string(),
             ]
         );
@@ -2459,7 +4180,7 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "vmnet_read returned packet count -1, expected 0 or 1"
+            "vmnet_read returned an unexpected packet count"
         );
     }
 
@@ -2484,8 +4205,11 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "vmnet_read returned packet size 2049, larger than read buffer 2048"
+            "vmnet_read returned a packet larger than the validated read buffer"
         );
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("2049"));
+        assert!(!debug.contains("2048"));
     }
 
     #[test]
@@ -2558,7 +4282,7 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "vmnet_write returned packet count 2, expected 1"
+            "vmnet_write returned an unexpected packet count"
         );
     }
 
@@ -2570,7 +4294,7 @@ mod tests {
         assert_eq!(error.status(), VmnetStatus::BufferExhausted);
         assert_eq!(
             error.to_string(),
-            "vmnet_read failed with VMNET_BUFFER_EXHAUSTED (vmnet_return_t=1007)"
+            "vmnet_read failed with VMNET_BUFFER_EXHAUSTED"
         );
     }
 
@@ -2777,6 +4501,398 @@ mod tests {
     }
 
     #[test]
+    fn vmnet_interface_descriptor_encodes_requested_identity_and_redacts_private_values() {
+        let configured_mac = GuestMacAddress::from_bytes([0x01, 0x23, 0x45, 0x67, 0x89, 0xab]);
+        let configured = VmnetInterfaceConfig::shared()
+            .with_guest_mac(Some(configured_mac))
+            .with_mtu(Some(1400));
+        let configured_descriptor = VmnetInterfaceDescriptor::new(&configured)
+            .expect("configured descriptor should be created");
+        let allocate_key =
+            super::vmnet_allocate_mac_address_key().expect("allocate-MAC key should be available");
+        let mac_key = super::vmnet_mac_address_key().expect("MAC key should be available");
+        let mtu_key = super::vmnet_mtu_key().expect("MTU key should be available");
+
+        assert!(!descriptor_bool(&configured_descriptor, allocate_key));
+        assert_eq!(
+            descriptor_string(&configured_descriptor, mac_key),
+            Some(configured_mac.to_string())
+        );
+        assert_eq!(descriptor_uint64(&configured_descriptor, mtu_key), 1400);
+
+        let allocated_descriptor = VmnetInterfaceDescriptor::new(&VmnetInterfaceConfig::host())
+            .expect("allocated descriptor should be created");
+        assert!(descriptor_bool(&allocated_descriptor, allocate_key));
+        assert!(!descriptor_has_value(&allocated_descriptor, mac_key));
+
+        let bridged = VmnetInterfaceConfig::bridged("private-en7")
+            .expect("bridged config should validate")
+            .with_mtu(Some(1300));
+        let bridged_descriptor =
+            VmnetInterfaceDescriptor::new(&bridged).expect("bridged descriptor should be created");
+        assert!(!descriptor_has_value(&bridged_descriptor, mtu_key));
+        assert_eq!(bridged_descriptor.result_policy.requested_mtu, Some(1300));
+
+        if let Some(direct_header_key) = super::optional_vmnet_enable_virtio_header_key() {
+            assert!(descriptor_has_value(
+                &configured_descriptor,
+                direct_header_key
+            ));
+            assert!(!descriptor_bool(&configured_descriptor, direct_header_key));
+        }
+
+        let debug = format!("{configured:?} {configured_descriptor:?} {bridged_descriptor:?}");
+        assert!(debug.contains("<configured>"));
+        assert!(!debug.contains(&configured_mac.to_string()));
+        assert!(!debug.contains("private-en7"));
+        assert!(!debug.contains("1400"));
+        assert!(!debug.contains("1300"));
+    }
+
+    #[test]
+    fn vmnet_result_decoder_requires_dictionary_and_core_integer_fields() {
+        assert_parameter_error(
+            super::decode_vmnet_interface_parameters(ptr::null_mut()),
+            VmnetInterfaceParameterField::ResultDictionary,
+            VmnetInterfaceParameterProblem::Missing,
+        );
+
+        let wrong_container =
+            test_result_dictionary(Some("02:00:00:00:00:10"), Some(1500), Some(2048));
+        let mac_key = super::vmnet_mac_address_key().expect("MAC key should exist");
+        // SAFETY: The dictionary and key are live; the returned value remains
+        // borrowed for this synchronous decode attempt.
+        let string_object =
+            unsafe { super::xpc::xpc_dictionary_get_value(wrong_container.as_ptr(), mac_key) };
+        assert_parameter_error(
+            super::decode_vmnet_interface_parameters(string_object),
+            VmnetInterfaceParameterField::ResultDictionary,
+            VmnetInterfaceParameterProblem::WrongType,
+        );
+
+        let missing_mtu = test_result_dictionary(Some("02:00:00:00:00:10"), None, Some(2048));
+        assert_parameter_error(
+            super::decode_vmnet_interface_parameters(missing_mtu.as_ptr()),
+            VmnetInterfaceParameterField::EffectiveMtu,
+            VmnetInterfaceParameterProblem::Missing,
+        );
+        let wrong_mtu = test_result_dictionary(Some("02:00:00:00:00:10"), Some(1500), Some(2048));
+        set_dictionary_string(
+            &wrong_mtu,
+            super::vmnet_mtu_key().expect("MTU key should exist"),
+            "1500",
+        );
+        assert_parameter_error(
+            super::decode_vmnet_interface_parameters(wrong_mtu.as_ptr()),
+            VmnetInterfaceParameterField::EffectiveMtu,
+            VmnetInterfaceParameterProblem::WrongType,
+        );
+
+        let missing_maximum = test_result_dictionary(Some("02:00:00:00:00:10"), Some(1500), None);
+        assert_parameter_error(
+            super::decode_vmnet_interface_parameters(missing_maximum.as_ptr()),
+            VmnetInterfaceParameterField::MaximumPacketSize,
+            VmnetInterfaceParameterProblem::Missing,
+        );
+        let wrong_maximum =
+            test_result_dictionary(Some("02:00:00:00:00:10"), Some(1500), Some(2048));
+        set_dictionary_string(
+            &wrong_maximum,
+            super::vmnet_max_packet_size_key().expect("maximum-packet key should exist"),
+            "2048",
+        );
+        assert_parameter_error(
+            super::decode_vmnet_interface_parameters(wrong_maximum.as_ptr()),
+            VmnetInterfaceParameterField::MaximumPacketSize,
+            VmnetInterfaceParameterProblem::WrongType,
+        );
+    }
+
+    #[test]
+    fn vmnet_result_decoder_rejects_wrong_and_malformed_mac_values() {
+        let wrong_type = test_result_dictionary(Some("02:00:00:00:00:10"), Some(1500), Some(2048));
+        set_dictionary_uint64(
+            &wrong_type,
+            super::vmnet_mac_address_key().expect("MAC key should exist"),
+            1,
+        );
+        assert_parameter_error(
+            super::decode_vmnet_interface_parameters(wrong_type.as_ptr()),
+            VmnetInterfaceParameterField::MacAddress,
+            VmnetInterfaceParameterProblem::WrongType,
+        );
+
+        for malformed in ["02:00:00:00:00:1", "zz:00:00:00:00:10"] {
+            let dictionary = test_result_dictionary(Some(malformed), Some(1500), Some(2048));
+            assert_parameter_error(
+                super::decode_vmnet_interface_parameters(dictionary.as_ptr()),
+                VmnetInterfaceParameterField::MacAddress,
+                VmnetInterfaceParameterProblem::Malformed,
+            );
+        }
+    }
+
+    #[test]
+    fn vmnet_result_decoder_copies_uuid_and_optional_batch_values() {
+        let dictionary = test_result_dictionary(Some("02:00:00:00:00:10"), Some(1500), Some(2048));
+        let interface_id = [0x5a; super::VMNET_INTERFACE_ID_LEN];
+        set_dictionary_uuid(
+            &dictionary,
+            super::vmnet_interface_id_key().expect("interface-ID key should exist"),
+            interface_id,
+        );
+        if let Some(key) = super::optional_vmnet_read_max_packets_key() {
+            set_dictionary_uint64(&dictionary, key, 500);
+        }
+        if let Some(key) = super::optional_vmnet_write_max_packets_key() {
+            set_dictionary_uint64(&dictionary, key, 7);
+        }
+
+        let parameters = decode_test_parameters(&dictionary, &VmnetInterfaceConfig::shared())
+            .expect("valid allocated result should decode");
+        assert_eq!(
+            parameters.realized_mac(),
+            GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x10])
+        );
+        assert_eq!(parameters.effective_mtu(), 1500);
+        assert_eq!(parameters.maximum_packet_size(), 2048);
+        assert_eq!(parameters.interface_id(), Some(interface_id));
+        if super::optional_vmnet_read_max_packets_key().is_some() {
+            assert_eq!(parameters.read_max_packets(), Some(128));
+        } else {
+            assert_eq!(parameters.read_max_packets(), None);
+        }
+        if super::optional_vmnet_write_max_packets_key().is_some() {
+            assert_eq!(parameters.write_max_packets(), Some(7));
+        } else {
+            assert_eq!(parameters.write_max_packets(), None);
+        }
+        assert!(!parameters.direct_virtio_header_enabled());
+
+        let debug = format!("{parameters:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("02:00:00:00:00:10"));
+        assert!(!debug.contains("2048"));
+        assert!(!debug.contains("128"));
+    }
+
+    #[test]
+    fn vmnet_result_decoder_rejects_wrong_type_and_nil_uuid() {
+        let wrong_type = test_result_dictionary(Some("02:00:00:00:00:10"), Some(1500), Some(2048));
+        set_dictionary_uint64(
+            &wrong_type,
+            super::vmnet_interface_id_key().expect("interface-ID key should exist"),
+            1,
+        );
+        assert_parameter_error(
+            super::decode_vmnet_interface_parameters(wrong_type.as_ptr()),
+            VmnetInterfaceParameterField::InterfaceId,
+            VmnetInterfaceParameterProblem::WrongType,
+        );
+
+        let nil_uuid = test_result_dictionary(Some("02:00:00:00:00:10"), Some(1500), Some(2048));
+        set_dictionary_uuid(
+            &nil_uuid,
+            super::vmnet_interface_id_key().expect("interface-ID key should exist"),
+            [0; super::VMNET_INTERFACE_ID_LEN],
+        );
+        assert_parameter_error(
+            super::decode_vmnet_interface_parameters(nil_uuid.as_ptr()),
+            VmnetInterfaceParameterField::InterfaceId,
+            VmnetInterfaceParameterProblem::OutOfRange,
+        );
+    }
+
+    #[test]
+    fn vmnet_result_validation_preserves_configured_mac_and_checks_allocated_mac() {
+        let configured_mac = GuestMacAddress::from_bytes([0x01, 0, 0, 0, 0, 0x41]);
+        let configured = VmnetInterfaceConfig::shared().with_guest_mac(Some(configured_mac));
+        let configured_policy = VmnetInterfaceDescriptor::new(&configured)
+            .expect("configured descriptor should build")
+            .result_policy;
+        let parameters = raw_test_parameters(None, 1500, 2048)
+            .validate(configured_policy)
+            .expect("configured multicast MAC should retain syntax-only API behavior");
+        assert_eq!(parameters.realized_mac(), configured_mac);
+
+        let mismatched = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x42]);
+        assert_parameter_error(
+            raw_test_parameters(Some(mismatched), 1500, 2048).validate(configured_policy),
+            VmnetInterfaceParameterField::MacAddress,
+            VmnetInterfaceParameterProblem::ConflictsWithRequest,
+        );
+
+        let allocated_policy = VmnetInterfaceDescriptor::new(&VmnetInterfaceConfig::host())
+            .expect("allocated descriptor should build")
+            .result_policy;
+        assert_parameter_error(
+            raw_test_parameters(None, 1500, 2048).validate(allocated_policy),
+            VmnetInterfaceParameterField::MacAddress,
+            VmnetInterfaceParameterProblem::Missing,
+        );
+        for invalid in [
+            GuestMacAddress::from_bytes([0; 6]),
+            GuestMacAddress::from_bytes([0x01, 0, 0, 0, 0, 1]),
+        ] {
+            assert_parameter_error(
+                raw_test_parameters(Some(invalid), 1500, 2048).validate(allocated_policy),
+                VmnetInterfaceParameterField::MacAddress,
+                VmnetInterfaceParameterProblem::OutOfRange,
+            );
+        }
+    }
+
+    #[test]
+    fn vmnet_result_validation_enforces_mode_specific_mtu_contract() {
+        let mac = Some(GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x51]));
+        for mode in [VmnetInterfaceConfig::host(), VmnetInterfaceConfig::shared()] {
+            let policy = VmnetInterfaceDescriptor::new(&mode.with_mtu(Some(1400)))
+                .expect("requested-MTU descriptor should build")
+                .result_policy;
+            assert_parameter_error(
+                raw_test_parameters(mac, 1500, 2048).validate(policy),
+                VmnetInterfaceParameterField::EffectiveMtu,
+                VmnetInterfaceParameterProblem::ConflictsWithRequest,
+            );
+        }
+
+        let bridged = VmnetInterfaceConfig::bridged("en0")
+            .expect("bridged config should build")
+            .with_mtu(Some(1500));
+        let bridged_policy = VmnetInterfaceDescriptor::new(&bridged)
+            .expect("bridged descriptor should build")
+            .result_policy;
+        assert_parameter_error(
+            raw_test_parameters(mac, 1400, 2048).validate(bridged_policy),
+            VmnetInterfaceParameterField::EffectiveMtu,
+            VmnetInterfaceParameterProblem::ConflictsWithRequest,
+        );
+        assert!(
+            raw_test_parameters(mac, 1600, 2048)
+                .validate(bridged_policy)
+                .is_ok()
+        );
+
+        let unrequested_policy = VmnetInterfaceDescriptor::new(&VmnetInterfaceConfig::host())
+            .expect("host descriptor should build")
+            .result_policy;
+        for invalid in [
+            u64::from(VIRTIO_NET_MIN_MTU) - 1,
+            u64::from(VIRTIO_NET_MAX_MTU) + 1,
+            u64::MAX,
+        ] {
+            assert_parameter_error(
+                raw_test_parameters(mac, invalid, 2048).validate(unrequested_policy),
+                VmnetInterfaceParameterField::EffectiveMtu,
+                VmnetInterfaceParameterProblem::OutOfRange,
+            );
+        }
+    }
+
+    #[test]
+    fn vmnet_result_validation_bounds_packet_and_direct_header_sizes() {
+        let mac = Some(GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x61]));
+        let base_policy = VmnetInterfaceDescriptor::new(&VmnetInterfaceConfig::host())
+            .expect("host descriptor should build")
+            .result_policy;
+        for invalid in [
+            0,
+            u64::from(VIRTIO_NET_MIN_MTU) - 1,
+            VIRTIO_NET_MAX_BUFFER_SIZE,
+            VIRTIO_NET_MAX_BUFFER_SIZE + 1,
+            u64::MAX,
+        ] {
+            assert_parameter_error(
+                raw_test_parameters(mac, u64::from(VIRTIO_NET_MIN_MTU), invalid)
+                    .validate(base_policy),
+                VmnetInterfaceParameterField::MaximumPacketSize,
+                VmnetInterfaceParameterProblem::OutOfRange,
+            );
+        }
+        assert!(
+            raw_test_parameters(
+                mac,
+                1500,
+                VIRTIO_NET_MAX_BUFFER_SIZE - u64::from(VIRTIO_NET_TX_HEADER_SIZE),
+            )
+            .validate(base_policy)
+            .is_ok()
+        );
+
+        let unavailable_direct = super::VmnetInterfaceResultPolicy {
+            direct_virtio_header_available: false,
+            direct_virtio_header_enabled: true,
+            ..base_policy
+        };
+        assert_parameter_error(
+            raw_test_parameters(mac, 1500, 2048).validate(unavailable_direct),
+            VmnetInterfaceParameterField::DirectVirtioHeader,
+            VmnetInterfaceParameterProblem::ConflictsWithRequest,
+        );
+
+        let enabled_direct = super::VmnetInterfaceResultPolicy {
+            direct_virtio_header_available: true,
+            direct_virtio_header_enabled: true,
+            ..base_policy
+        };
+        assert_parameter_error(
+            raw_test_parameters(mac, 1500, VIRTIO_NET_MAX_BUFFER_SIZE).validate(enabled_direct),
+            VmnetInterfaceParameterField::DirectVirtioHeader,
+            VmnetInterfaceParameterProblem::OutOfRange,
+        );
+        assert!(
+            raw_test_parameters(
+                mac,
+                1500,
+                VIRTIO_NET_MAX_BUFFER_SIZE - u64::from(VIRTIO_NET_TX_HEADER_SIZE),
+            )
+            .validate(enabled_direct)
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn vmnet_result_validation_rejects_zero_and_overflowing_batches_and_caps_valid_values() {
+        let mac = Some(GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x71]));
+        let policy = VmnetInterfaceDescriptor::new(&VmnetInterfaceConfig::host())
+            .expect("host descriptor should build")
+            .result_policy;
+        for (field, read, write) in [
+            (
+                VmnetInterfaceParameterField::ReadMaximumPackets,
+                Some(0),
+                None,
+            ),
+            (
+                VmnetInterfaceParameterField::WriteMaximumPackets,
+                None,
+                Some(c_int::MAX as u64 + 1),
+            ),
+        ] {
+            let mut raw = raw_test_parameters(mac, 1500, 2048);
+            raw.read_max_packets = read;
+            raw.write_max_packets = write;
+            assert_parameter_error(
+                raw.validate(policy),
+                field,
+                VmnetInterfaceParameterProblem::OutOfRange,
+            );
+        }
+
+        let mut raw = raw_test_parameters(mac, 1500, 2048);
+        raw.read_max_packets = Some(500);
+        raw.write_max_packets = Some(500);
+        let parameters = raw
+            .validate(policy)
+            .expect("valid batches should be capped");
+        let expected = (super::VMNET_MAX_BYTES_PER_OPERATION / 2048)
+            .min(super::VMNET_MAX_PACKETS_PER_OPERATION)
+            .min(u64::from(VIRTIO_NET_QUEUE_SIZE)) as u16;
+        assert_eq!(parameters.read_max_packets(), Some(expected));
+        assert_eq!(parameters.write_max_packets(), Some(expected));
+    }
+
+    #[test]
     fn owned_interface_starts_and_stops_once() {
         let lifecycle = RecordingVmnetLifecycle::new();
         let event_log = lifecycle.events();
@@ -2821,7 +4937,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_stop_keeps_interface_started_for_retry() {
+    fn owned_interface_failed_stop_marks_owner_uncertain_without_retry() {
         let lifecycle =
             RecordingVmnetLifecycle::new().with_stop_status(VmnetStatus::SetupIncomplete);
         let event_log = lifecycle.events();
@@ -2834,12 +4950,16 @@ mod tests {
 
         assert_eq!(error.operation(), VmnetOperation::StopInterface);
         assert_eq!(error.status(), VmnetStatus::SetupIncomplete);
-        assert!(interface.is_started());
+        assert!(!interface.is_started());
+        assert!(interface.is_uncertain());
+        interface
+            .stop()
+            .expect_err("uncertain owner must not retry stop");
         assert_eq!(recorded_events(&event_log), ["start:host", "stop:7"]);
     }
 
     #[test]
-    fn drop_retries_cleanup_after_failed_explicit_stop() {
+    fn owned_interface_drop_does_not_retry_after_failed_explicit_stop() {
         let lifecycle =
             RecordingVmnetLifecycle::new().with_stop_status(VmnetStatus::SetupIncomplete);
         let event_log = lifecycle.events();
@@ -2852,10 +4972,7 @@ mod tests {
             let _ = interface.stop();
         }
 
-        assert_eq!(
-            recorded_events(&event_log),
-            ["start:host", "stop:7", "stop:7"]
-        );
+        assert_eq!(recorded_events(&event_log), ["start:host", "stop:7"]);
     }
 
     #[test]
@@ -2864,7 +4981,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "vmnet_write failed with VMNET_PACKET_TOO_BIG (vmnet_return_t=1006)"
+            "vmnet_write failed with VMNET_PACKET_TOO_BIG"
         );
     }
 }

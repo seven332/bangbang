@@ -67,10 +67,10 @@ use bangbang_runtime::mmds::{
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::{
-    NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkInterfaceConfigInput,
-    NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
-    NetworkMmioLayout, NetworkRuntimeMutationError, PreparedNetworkDevice,
-    validate_network_interface_count,
+    GuestMacAddress, NetworkDeviceProfile, NetworkInterfaceConfig, NetworkInterfaceConfigError,
+    NetworkInterfaceConfigInput, NetworkInterfaceUpdate, NetworkInterfaceUpdateError,
+    NetworkInterfaceUpdateInput, NetworkMmioLayout, NetworkRuntimeMutationError,
+    PreparedNetworkDevice, validate_network_interface_count,
 };
 #[cfg(test)]
 use bangbang_runtime::network::{
@@ -140,18 +140,13 @@ use crate::contained_session::{
 use crate::direct_vhost_user;
 use crate::host_network::virtio_vmnet::{
     MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour,
-    MmdsResponseQueue, VmnetVirtioNetworkPacketIo, VmnetVirtioNetworkPacketIoBuildError,
-    VmnetVirtioNetworkPacketIoStopError,
-};
-#[cfg(test)]
-use crate::host_network::virtio_vmnet::{
-    VmnetVirtioNetworkPacketIoProvider, VmnetVirtioNetworkPacketIoProviderBuildError,
-    VmnetVirtioNetworkPacketIoProviderEntry,
+    MmdsResponseQueue, PreparedVmnetVirtioNetworkRxBuffer, VmnetVirtioNetworkPacketIo,
+    VmnetVirtioNetworkPacketIoBuildError, VmnetVirtioNetworkPacketIoStopError,
 };
 use crate::host_network::vmnet::{
     StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VmnetHostDeviceNameConfigError,
-    VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceStartError, VmnetMode,
-    VmnetPacketIoBackend,
+    VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceParameters,
+    VmnetInterfaceStartDisposition, VmnetInterfaceStartError, VmnetMode, VmnetPacketIoBackend,
 };
 
 #[cfg(test)]
@@ -186,20 +181,63 @@ const BOOT_RUN_LOOP_COMMAND_QUEUE_CAPACITY: usize = 32;
 const HVF_BOOT_RUN_LOOP_THREAD_NAME: &str = "bangbang-hvf-boot-loop";
 const DIRECT_VHOST_USER_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstanceStartDisposition {
+    Retryable,
+    Terminal,
+}
+
+#[derive(Debug)]
+pub(crate) struct InstanceStartError {
+    source: BackendError,
+    disposition: InstanceStartDisposition,
+}
+
+impl InstanceStartError {
+    pub(crate) const fn new(source: BackendError, disposition: InstanceStartDisposition) -> Self {
+        Self {
+            source,
+            disposition,
+        }
+    }
+
+    pub(crate) const fn retryable(source: BackendError) -> Self {
+        Self::new(source, InstanceStartDisposition::Retryable)
+    }
+
+    pub(crate) const fn terminal(source: BackendError) -> Self {
+        Self::new(source, InstanceStartDisposition::Terminal)
+    }
+
+    pub(crate) const fn disposition(&self) -> InstanceStartDisposition {
+        self.disposition
+    }
+
+    pub(crate) fn into_source(self) -> BackendError {
+        self.source
+    }
+}
+
+impl From<BackendError> for InstanceStartError {
+    fn from(source: BackendError) -> Self {
+        Self::retryable(source)
+    }
+}
+
 pub(crate) trait InstanceStartExecutor {
     type Session: ProcessSessionDiagnostics;
 
-    fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError>;
+    fn start(&mut self, controller: &VmmController) -> Result<Self::Session, InstanceStartError>;
 
     fn start_with_startup_resources(
         &mut self,
         controller: &VmmController,
         startup_resources: VmStartupResources,
-    ) -> Result<Self::Session, BackendError> {
+    ) -> Result<Self::Session, InstanceStartError> {
         if !startup_resources.is_empty() {
-            return Err(BackendError::Unsupported(
+            return Err(InstanceStartError::retryable(BackendError::Unsupported(
                 "startup executor cannot consume provided startup resources",
-            ));
+            )));
         }
         self.start(controller)
     }
@@ -1632,6 +1670,7 @@ where
     process_signal_metrics: Option<SharedSignalMetrics>,
     snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation,
     terminal_snapshot_load_failure: bool,
+    terminal_instance_start_failure: bool,
     pci_enabled: bool,
     vmnet_authority: ProcessVmnetAuthority,
     grant_authority: Option<GrantAuthority>,
@@ -1735,6 +1774,7 @@ where
             process_signal_metrics: None,
             snapshot_capture_cancellation: NativeV1SnapshotCaptureCancellation::default(),
             terminal_snapshot_load_failure: false,
+            terminal_instance_start_failure: false,
             pci_enabled: false,
             vmnet_authority: ProcessVmnetAuthority::Direct,
             grant_authority: None,
@@ -2282,12 +2322,25 @@ where
         let controller = &mut self.controller;
         let starter = &mut self.starter;
         let mut started_session = None;
+        let mut terminal_start_failure = false;
 
         let result = controller.start_instance_with(|controller| {
-            started_session =
-                Some(starter.start_with_startup_resources(controller, startup_resources)?);
-            Ok(())
+            match starter.start_with_startup_resources(controller, startup_resources) {
+                Ok(session) => {
+                    started_session = Some(session);
+                    Ok(())
+                }
+                Err(source) => {
+                    terminal_start_failure =
+                        source.disposition() == InstanceStartDisposition::Terminal;
+                    Err(source.into_source())
+                }
+            }
         });
+
+        if terminal_start_failure {
+            self.terminal_instance_start_failure = true;
+        }
 
         match result {
             Ok(data) => match started_session {
@@ -3398,7 +3451,7 @@ where
     }
 
     pub(crate) fn process_exit_status(&self) -> ProcessSessionExitStatus {
-        if self.terminal_snapshot_load_failure {
+        if self.terminal_snapshot_load_failure || self.terminal_instance_start_failure {
             return ProcessSessionExitStatus::Terminal;
         }
         self.started_session
@@ -3899,7 +3952,7 @@ fn snapshot_destination_machine_config(
 impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
-    fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
+    fn start(&mut self, controller: &VmmController) -> Result<Self::Session, InstanceStartError> {
         self.start_with_startup_resources(controller, VmStartupResources::default())
     }
 
@@ -3907,7 +3960,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         &mut self,
         controller: &VmmController,
         mut startup_resources: VmStartupResources,
-    ) -> Result<Self::Session, BackendError> {
+    ) -> Result<Self::Session, InstanceStartError> {
         let provided_serial_output = startup_resources.take_serial_output();
         let (serial_output, serial_input) = if self.process_serial_stdio
             && controller.serial_config().serial_out_path().is_none()
@@ -3945,21 +3998,56 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             controller,
             serial_output.clone(),
         );
-        let (packet_io, mmds_metrics) = ProcessNetworkPacketIoProvider::from_controller(controller)
-            .map_err(|err| {
-                BackendError::Hypervisor(format!(
+        let (mut packet_io, mmds_metrics) =
+            ProcessNetworkPacketIoProvider::from_controller(controller).map_err(|err| {
+                let source = BackendError::Hypervisor(format!(
                     "failed to build network packet I/O provider: {err}"
-                ))
+                ));
+                if err.is_terminal() {
+                    InstanceStartError::terminal(source)
+                } else {
+                    InstanceStartError::retryable(source)
+                }
             })?;
-        let session = OwnedHvfArm64BootSession::new_with_startup_resources(
+        startup_resources =
+            startup_resources.with_network_device_profiles(packet_io.device_profiles());
+        let session = match OwnedHvfArm64BootSession::new_with_startup_resources(
             controller,
             boot_session_config,
             startup_resources,
         )
-        .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
+        .map_err(|err| BackendError::Hypervisor(err.to_string()))
+        {
+            Ok(session) => session,
+            Err(source) => {
+                return Err(InstanceStartError::new(
+                    source,
+                    if packet_io.stop_all() {
+                        InstanceStartDisposition::Terminal
+                    } else {
+                        InstanceStartDisposition::Retryable
+                    },
+                ));
+            }
+        };
         let session = ProcessHvfBootSession::new(session, packet_io, mmds_metrics);
-        let supervisor =
-            HvfBootRunLoopSupervisor::start(session, default_hvf_boot_run_loop_step_limit())?;
+        let supervisor = match HvfBootRunLoopSupervisor::start_recoverable(
+            session,
+            default_hvf_boot_run_loop_step_limit(),
+        ) {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                let (source, mut session) = error.into_parts();
+                return Err(InstanceStartError::new(
+                    source,
+                    if session.packet_io.stop_all() {
+                        InstanceStartDisposition::Terminal
+                    } else {
+                        InstanceStartDisposition::Retryable
+                    },
+                ));
+            }
+        };
         self.active_serial_output = Some(serial_output);
 
         Ok(supervisor)
@@ -4357,10 +4445,10 @@ where
         config: &NetworkInterfaceConfig,
         authority: ProcessVmnetAuthority,
     ) -> Result<(), NetworkRuntimeMutationError> {
-        let prepared = self.packet_io.prepare_runtime_entry(config, authority)?;
+        let (prepared, device_profile) = self.packet_io.prepare_runtime_entry(config, authority)?;
         let published = self.packet_io.publish_prepared_entry(prepared);
 
-        let endpoint = PreparedNetworkDevice::from_config(config);
+        let endpoint = PreparedNetworkDevice::from_config_with_profile(config, device_profile);
         if let Err(primary) = self.session.insert_runtime_network_device(endpoint) {
             let mut removed = match self.packet_io.take_published_entry(&published) {
                 Ok(removed) => removed,
@@ -4638,13 +4726,24 @@ enum ProcessNetworkPacketIoStartupPolicy {
     Vmnet,
 }
 
-#[derive(Debug)]
 enum ProcessNetworkPacketIo<B>
 where
     B: ProcessVmnetBackend,
 {
     MmdsOnly(MmdsOnlyVirtioNetworkPacketIo),
     Vmnet(VmnetVirtioNetworkPacketIo<StartedVmnetPacketIoBackend<B>>),
+}
+
+impl<B> fmt::Debug for ProcessNetworkPacketIo<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MmdsOnly(_) => "ProcessNetworkPacketIo::MmdsOnly(<owned>)",
+            Self::Vmnet(_) => "ProcessNetworkPacketIo::Vmnet(<owned>)",
+        })
+    }
 }
 
 impl<B> ProcessNetworkPacketIo<B>
@@ -4675,7 +4774,6 @@ where
     }
 }
 
-#[derive(Debug)]
 struct ProcessNetworkPacketIoEntry<B>
 where
     B: ProcessVmnetBackend,
@@ -4683,6 +4781,27 @@ where
     generation: u64,
     iface_id: String,
     packet_io: ProcessNetworkPacketIo<B>,
+    device_profile: NetworkDeviceProfile,
+    backend_parameters: Option<VmnetInterfaceParameters>,
+}
+
+impl<B> fmt::Debug for ProcessNetworkPacketIoEntry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessNetworkPacketIoEntry")
+            .field("generation", &self.generation)
+            .field("iface_id", &"<redacted>")
+            .field("packet_io", &self.packet_io)
+            .field("device_profile", &self.device_profile)
+            .field(
+                "backend_parameters",
+                &self.backend_parameters.as_ref().map(|_| "<validated>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -4691,12 +4810,32 @@ where
     B: ProcessVmnetBackend,
 {
     entry: ProcessNetworkPacketIoEntry<B>,
+    reserve_realized_mac: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl<B> PreparedProcessNetworkPacketIoEntry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    const fn device_profile(&self) -> NetworkDeviceProfile {
+        self.entry.device_profile
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PublishedProcessNetworkPacketIoEntry {
     generation: u64,
     iface_id: String,
+}
+
+impl fmt::Debug for PublishedProcessNetworkPacketIoEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedProcessNetworkPacketIoEntry")
+            .field("generation", &self.generation)
+            .field("iface_id", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -4717,15 +4856,34 @@ where
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct ProcessNetworkPacketIoRegistry<B>
 where
     B: ProcessVmnetBackend,
 {
     entries: Vec<ProcessNetworkPacketIoEntry<B>>,
+    reserved_macs: Vec<GuestMacAddress>,
     next_generation: u64,
     startup_policy: ProcessNetworkPacketIoStartupPolicy,
     mmds_detour: Option<ProcessMmdsPacketDetourConfig>,
+}
+
+impl<B> fmt::Debug for ProcessNetworkPacketIoRegistry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessNetworkPacketIoRegistry")
+            .field("entry_count", &self.entries.len())
+            .field("reserved_mac_count", &self.reserved_macs.len())
+            .field("next_generation", &self.next_generation)
+            .field("startup_policy", &self.startup_policy)
+            .field(
+                "mmds_detour",
+                &self.mmds_detour.as_ref().map(|_| "<configured>"),
+            )
+            .finish()
+    }
 }
 
 impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
@@ -4780,12 +4938,17 @@ impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
     > {
         let class = self.class_for_interface(config.iface_id());
         let vmnet_config = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
+            .map(|vmnet| {
+                vmnet
+                    .with_guest_mac(config.guest_mac())
+                    .with_mtu(config.mtu())
+            })
             .map_err(|_| NetworkRuntimeMutationError::PreparePacketIo {
                 message: "network host device configuration is unsupported".to_string(),
             })?;
         self.validate_runtime_authority(class, &vmnet_config, authority)?;
         let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-        self.prepare_entry_with_factory(config, class, &mut factory)
+        self.prepare_entry_with_factory(config, class, false, &mut factory)
             .map_err(runtime_network_packet_io_preparation_error)
     }
 }
@@ -4793,12 +4956,16 @@ impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
 fn runtime_network_packet_io_preparation_error(
     source: ProcessNetworkPacketIoProviderBuildError,
 ) -> NetworkRuntimeMutationError {
+    let terminal = source.is_terminal();
     let message = match source {
         ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. } => {
             "network interface count is unsupported"
         }
         ProcessNetworkPacketIoProviderBuildError::DuplicateInterface => {
             "network packet-I/O identity is already registered"
+        }
+        ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac => {
+            "network guest identity is already in use"
         }
         ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
         | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity => {
@@ -4815,17 +4982,22 @@ fn runtime_network_packet_io_preparation_error(
         ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. } => {
             "vmnet packet-I/O initialization failed"
         }
+        ProcessNetworkPacketIoProviderBuildError::CleanupUncertain => {
+            "vmnet cleanup could not be confirmed"
+        }
         ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
-        | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. } => {
+        | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
             "MMDS packet-I/O initialization failed"
         }
-        #[cfg(test)]
-        ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
-            "vmnet packet-I/O registry initialization failed"
-        }
     };
-    NetworkRuntimeMutationError::PreparePacketIo {
-        message: message.to_string(),
+    if terminal {
+        NetworkRuntimeMutationError::TerminalInsertion {
+            message: message.to_string(),
+        }
+    } else {
+        NetworkRuntimeMutationError::PreparePacketIo {
+            message: message.to_string(),
+        }
     }
 }
 
@@ -4857,15 +5029,40 @@ where
             .map_err(
                 |source| ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { source },
             )?;
+        let mut reserved_macs = Vec::new();
+        reserved_macs
+            .try_reserve_exact(bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT)
+            .map_err(
+                |source| ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { source },
+            )?;
+        for config in configs {
+            if let Some(mac) = config.guest_mac() {
+                if reserved_macs.contains(&mac) {
+                    return Err(ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac);
+                }
+                reserved_macs.push(mac);
+            }
+        }
         let mut provider = Self {
             entries,
+            reserved_macs,
             next_generation: 0,
             startup_policy,
             mmds_detour: mmds_detour.cloned(),
         };
         for config in configs {
             let class = provider.class_for_interface(config.iface_id());
-            let prepared = provider.prepare_entry_with_factory(config, class, factory)?;
+            let prepared = match provider.prepare_entry_with_factory(
+                config,
+                class,
+                config.guest_mac().is_some(),
+                factory,
+            ) {
+                Ok(prepared) => prepared,
+                Err(source) => {
+                    return Err(provider.cleanup_after_build_error(source));
+                }
+            };
             provider.publish_prepared(prepared);
         }
         Ok(provider)
@@ -4921,6 +5118,7 @@ where
         &mut self,
         config: &NetworkInterfaceConfig,
         class: ProcessNetworkPacketIoEntryClass,
+        explicit_mac_pre_reserved: bool,
         factory: &mut F,
     ) -> Result<PreparedProcessNetworkPacketIoEntry<B>, ProcessNetworkPacketIoProviderBuildError>
     where
@@ -4933,74 +5131,106 @@ where
         {
             return Err(ProcessNetworkPacketIoProviderBuildError::DuplicateInterface);
         }
-        if self.entries.len() == self.entries.capacity() {
+        if self.entries.len() == bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT {
             return Err(ProcessNetworkPacketIoProviderBuildError::RegistryCapacity);
+        }
+        if !explicit_mac_pre_reserved
+            && config
+                .guest_mac()
+                .is_some_and(|mac| self.reserved_macs.contains(&mac))
+        {
+            return Err(ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac);
         }
         let next_generation = self
             .next_generation
             .checked_add(1)
             .ok_or(ProcessNetworkPacketIoProviderBuildError::GenerationExhausted)?;
         let iface_id = config.iface_id();
-        let packet_io = match class {
+        let (packet_io, device_profile, backend_parameters, reserve_realized_mac) = match class {
             ProcessNetworkPacketIoEntryClass::MmdsOnly => {
                 VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(
-                    |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
-                        iface_id: iface_id.to_string(),
-                        source,
-                    },
+                    |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source },
                 )?;
                 let Some(detour) = self
                     .mmds_detour
                     .as_ref()
                     .and_then(|detour| detour.detour_for_interface(iface_id))
                 else {
-                    return Err(
-                        ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour {
-                            iface_id: iface_id.to_string(),
-                        },
-                    );
+                    return Err(ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour);
                 };
                 let packet_io = MmdsOnlyVirtioNetworkPacketIo::new(detour).map_err(|source| {
-                    ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild {
-                        iface_id: iface_id.to_string(),
-                        source,
-                    }
+                    ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { source }
                 })?;
-                ProcessNetworkPacketIo::MmdsOnly(packet_io)
+                let device_profile = NetworkDeviceProfile::from_config(config);
+                (
+                    ProcessNetworkPacketIo::MmdsOnly(packet_io),
+                    device_profile,
+                    None,
+                    !explicit_mac_pre_reserved && device_profile.guest_mac().is_some(),
+                )
             }
             ProcessNetworkPacketIoEntryClass::Vmnet => {
-                let vmnet_config = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
-                    .map_err(
-                        |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
-                            iface_id: iface_id.to_string(),
-                            source,
-                        },
-                    )?;
+                let vmnet_config =
+                    VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
+                        .map(|vmnet| {
+                            vmnet
+                                .with_guest_mac(config.guest_mac())
+                                .with_mtu(config.mtu())
+                        })
+                        .map_err(|source| {
+                            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source }
+                        })?;
+                let prepared_rx =
+                    PreparedVmnetVirtioNetworkRxBuffer::supported_maximum().map_err(|source| {
+                        ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { source }
+                    })?;
                 let backend = factory.new_backend(iface_id);
-                let (backend, interface) =
+                let (mut backend, interface) =
                     StartedVmnetPacketIoBackend::start(backend, &vmnet_config).map_err(
-                        |source| ProcessNetworkPacketIoProviderBuildError::Start {
-                            iface_id: iface_id.to_string(),
-                            source,
-                        },
+                        |source| ProcessNetworkPacketIoProviderBuildError::Start { source },
                     )?;
+                let parameters = backend.parameters().clone();
+                let realized_mac = parameters.realized_mac();
+                if !explicit_mac_pre_reserved && self.reserved_macs.contains(&realized_mac) {
+                    return match backend.stop() {
+                        Ok(()) => {
+                            Err(ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac)
+                        }
+                        Err(_) => Err(ProcessNetworkPacketIoProviderBuildError::CleanupUncertain),
+                    };
+                }
                 let detour = self
                     .mmds_detour
                     .as_ref()
                     .and_then(|detour| detour.detour_for_interface(iface_id));
-                let packet_io = match detour {
-                    Some(detour) => {
-                        VmnetVirtioNetworkPacketIo::with_mmds_detour(backend, interface, detour)
+                let rx_buffer_len = backend.parameters().maximum_packet_size();
+                let read_buffer = match prepared_rx.into_buffer_with_len(rx_buffer_len) {
+                    Ok(read_buffer) => read_buffer,
+                    Err(source) => {
+                        return match backend.stop() {
+                            Ok(()) => {
+                                Err(ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
+                                    source,
+                                })
+                            }
+                            Err(_) => {
+                                Err(ProcessNetworkPacketIoProviderBuildError::CleanupUncertain)
+                            }
+                        };
                     }
-                    None => VmnetVirtioNetworkPacketIo::new(backend, interface),
-                }
-                .map_err(|source| {
-                    ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
-                        iface_id: iface_id.to_string(),
-                        source,
-                    }
-                })?;
-                ProcessNetworkPacketIo::Vmnet(packet_io)
+                };
+                let packet_io = VmnetVirtioNetworkPacketIo::with_owned_rx_buffer_and_mmds_detour(
+                    backend,
+                    interface,
+                    read_buffer,
+                    detour,
+                );
+                (
+                    ProcessNetworkPacketIo::Vmnet(packet_io),
+                    NetworkDeviceProfile::new(Some(realized_mac), config.mtu()),
+                    Some(parameters),
+                    !explicit_mac_pre_reserved,
+                )
             }
         };
         let generation = self.next_generation;
@@ -5010,7 +5240,10 @@ where
                 generation,
                 iface_id: iface_id.to_string(),
                 packet_io,
+                device_profile,
+                backend_parameters,
             },
+            reserve_realized_mac,
         })
     }
 
@@ -5026,9 +5259,24 @@ where
             "prepared network packet-I/O publication must remain unique"
         );
         assert!(
-            self.entries.len() < self.entries.capacity(),
+            self.entries.len() < bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT
+                && self.entries.len() < self.entries.capacity(),
             "prepared network packet-I/O publication must retain reserved capacity"
         );
+        if prepared.reserve_realized_mac
+            && let Some(mac) = prepared.entry.device_profile.guest_mac()
+        {
+            assert!(
+                !self.reserved_macs.contains(&mac),
+                "prepared network MAC publication must remain unique"
+            );
+            assert!(
+                self.reserved_macs.len() < bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT
+                    && self.reserved_macs.len() < self.reserved_macs.capacity(),
+                "prepared network MAC publication must retain reserved capacity"
+            );
+            self.reserved_macs.push(mac);
+        }
         let published = PublishedProcessNetworkPacketIoEntry {
             generation: prepared.entry.generation,
             iface_id: prepared.entry.iface_id.clone(),
@@ -5046,6 +5294,7 @@ where
             .iter()
             .position(|entry| entry.iface_id == iface_id)
             .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
+        self.release_reserved_mac_for_entry(index)?;
         Ok(RemovedProcessNetworkPacketIoEntry {
             index,
             entry: self.entries.remove(index),
@@ -5063,6 +5312,7 @@ where
                 entry.generation == published.generation && entry.iface_id == published.iface_id
             })
             .ok_or(ProcessNetworkPacketIoRegistryError::UnknownInterface)?;
+        self.release_reserved_mac_for_entry(index)?;
         Ok(RemovedProcessNetworkPacketIoEntry {
             index,
             entry: self.entries.remove(index),
@@ -5080,11 +5330,70 @@ where
         {
             return Err(ProcessNetworkPacketIoRegistryError::DuplicateInterface);
         }
-        if self.entries.len() == self.entries.capacity() || removed.index > self.entries.len() {
+        if self.entries.len() == bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT
+            || removed.index > self.entries.len()
+        {
             return Err(ProcessNetworkPacketIoRegistryError::Capacity);
+        }
+        if let Some(mac) = removed.entry.device_profile.guest_mac() {
+            if self.reserved_macs.contains(&mac) {
+                return Err(ProcessNetworkPacketIoRegistryError::DuplicateRealizedMac);
+            }
+            if self.reserved_macs.len() == bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT {
+                return Err(ProcessNetworkPacketIoRegistryError::Capacity);
+            }
+            self.reserved_macs.push(mac);
         }
         self.entries.insert(removed.index, removed.entry);
         Ok(())
+    }
+
+    fn release_reserved_mac_for_entry(
+        &mut self,
+        entry_index: usize,
+    ) -> Result<(), ProcessNetworkPacketIoRegistryError> {
+        let Some(mac) = self
+            .entries
+            .get(entry_index)
+            .and_then(|entry| entry.device_profile.guest_mac())
+        else {
+            return Ok(());
+        };
+        let reservation_index = self
+            .reserved_macs
+            .iter()
+            .position(|reserved| *reserved == mac)
+            .ok_or(ProcessNetworkPacketIoRegistryError::MissingRealizedMac)?;
+        self.reserved_macs.remove(reservation_index);
+        Ok(())
+    }
+
+    fn device_profiles(&self) -> BTreeMap<String, NetworkDeviceProfile> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.iface_id.clone(), entry.device_profile))
+            .collect()
+    }
+
+    fn cleanup_after_build_error(
+        &mut self,
+        source: ProcessNetworkPacketIoProviderBuildError,
+    ) -> ProcessNetworkPacketIoProviderBuildError {
+        if self.stop_all() {
+            ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
+        } else {
+            source
+        }
+    }
+
+    fn stop_all(&mut self) -> bool {
+        let mut uncertain = false;
+        for entry in self.entries.iter_mut().rev() {
+            if entry.packet_io.stop().is_err() {
+                uncertain = true;
+            }
+        }
+        uncertain
     }
 
     fn vmnet_count(&self) -> usize {
@@ -5104,6 +5413,8 @@ enum ProcessNetworkPacketIoEntryClass {
 #[derive(Debug)]
 pub(crate) enum ProcessNetworkPacketIoRegistryError {
     DuplicateInterface,
+    DuplicateRealizedMac,
+    MissingRealizedMac,
     UnknownInterface,
     Capacity,
 }
@@ -5113,6 +5424,12 @@ impl fmt::Display for ProcessNetworkPacketIoRegistryError {
         match self {
             Self::DuplicateInterface => {
                 formatter.write_str("network packet-I/O interface is already registered")
+            }
+            Self::DuplicateRealizedMac => {
+                formatter.write_str("network packet-I/O guest identity is already reserved")
+            }
+            Self::MissingRealizedMac => {
+                formatter.write_str("network packet-I/O guest identity reservation is missing")
             }
             Self::UnknownInterface => {
                 formatter.write_str("network packet-I/O interface is not registered")
@@ -5158,7 +5475,7 @@ pub(crate) trait ProcessRuntimeNetworkPacketIoProvider:
         &mut self,
         config: &NetworkInterfaceConfig,
         authority: ProcessVmnetAuthority,
-    ) -> Result<Self::PreparedEntry, NetworkRuntimeMutationError>;
+    ) -> Result<(Self::PreparedEntry, NetworkDeviceProfile), NetworkRuntimeMutationError>;
 
     fn publish_prepared_entry(&mut self, prepared: Self::PreparedEntry) -> Self::PublishedEntry;
 
@@ -5191,8 +5508,11 @@ impl ProcessRuntimeNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
         &mut self,
         config: &NetworkInterfaceConfig,
         authority: ProcessVmnetAuthority,
-    ) -> Result<Self::PreparedEntry, NetworkRuntimeMutationError> {
-        ProcessNetworkPacketIoRegistry::prepare_runtime_entry(self, config, authority)
+    ) -> Result<(Self::PreparedEntry, NetworkDeviceProfile), NetworkRuntimeMutationError> {
+        let prepared =
+            ProcessNetworkPacketIoRegistry::prepare_runtime_entry(self, config, authority)?;
+        let profile = prepared.device_profile();
+        Ok((prepared, profile))
     }
 
     fn publish_prepared_entry(&mut self, prepared: Self::PreparedEntry) -> Self::PublishedEntry {
@@ -5300,12 +5620,12 @@ where
     }
 }
 
-#[derive(Debug)]
 enum ProcessNetworkPacketIoProviderBuildError {
     NetworkInterfaceCount {
         source: NetworkInterfaceConfigError,
     },
     DuplicateInterface,
+    DuplicateRealizedMac,
     ProviderCapacity {
         source: TryReserveError,
     },
@@ -5315,28 +5635,77 @@ enum ProcessNetworkPacketIoProviderBuildError {
         source: MmdsStateLockError,
     },
     HostDeviceName {
-        iface_id: String,
         source: VmnetHostDeviceNameConfigError,
     },
     Start {
-        iface_id: String,
         source: VmnetInterfaceStartError,
     },
     PacketIoBuild {
-        iface_id: String,
         source: VmnetVirtioNetworkPacketIoBuildError,
     },
+    CleanupUncertain,
     MmdsOnlyPacketIoBuild {
-        iface_id: String,
         source: MmdsOnlyVirtioNetworkPacketIoBuildError,
     },
-    MissingMmdsDetour {
-        iface_id: String,
-    },
-    #[cfg(test)]
-    ProviderBuild {
-        source: VmnetVirtioNetworkPacketIoProviderBuildError,
-    },
+    MissingMmdsDetour,
+}
+
+impl fmt::Debug for ProcessNetworkPacketIoProviderBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NetworkInterfaceCount { .. } => {
+                "ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount"
+            }
+            Self::DuplicateInterface => {
+                "ProcessNetworkPacketIoProviderBuildError::DuplicateInterface"
+            }
+            Self::DuplicateRealizedMac => {
+                "ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac"
+            }
+            Self::ProviderCapacity { .. } => {
+                "ProcessNetworkPacketIoProviderBuildError::ProviderCapacity"
+            }
+            Self::RegistryCapacity => "ProcessNetworkPacketIoProviderBuildError::RegistryCapacity",
+            Self::GenerationExhausted => {
+                "ProcessNetworkPacketIoProviderBuildError::GenerationExhausted"
+            }
+            Self::MmdsState { .. } => "ProcessNetworkPacketIoProviderBuildError::MmdsState",
+            Self::HostDeviceName { .. } => {
+                "ProcessNetworkPacketIoProviderBuildError::HostDeviceName"
+            }
+            Self::Start { .. } => "ProcessNetworkPacketIoProviderBuildError::Start",
+            Self::PacketIoBuild { .. } => "ProcessNetworkPacketIoProviderBuildError::PacketIoBuild",
+            Self::CleanupUncertain => "ProcessNetworkPacketIoProviderBuildError::CleanupUncertain",
+            Self::MmdsOnlyPacketIoBuild { .. } => {
+                "ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild"
+            }
+            Self::MissingMmdsDetour => {
+                "ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour"
+            }
+        })
+    }
+}
+
+impl ProcessNetworkPacketIoProviderBuildError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Start { source, .. } => {
+                source.disposition() == VmnetInterfaceStartDisposition::Terminal
+            }
+            Self::CleanupUncertain => true,
+            Self::NetworkInterfaceCount { .. }
+            | Self::DuplicateInterface
+            | Self::DuplicateRealizedMac
+            | Self::ProviderCapacity { .. }
+            | Self::RegistryCapacity
+            | Self::GenerationExhausted
+            | Self::MmdsState { .. }
+            | Self::HostDeviceName { .. }
+            | Self::PacketIoBuild { .. }
+            | Self::MmdsOnlyPacketIoBuild { .. }
+            | Self::MissingMmdsDetour => false,
+        }
+    }
 }
 
 impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
@@ -5348,6 +5717,9 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
             Self::DuplicateInterface => {
                 f.write_str("network packet I/O interface is already configured")
             }
+            Self::DuplicateRealizedMac => {
+                f.write_str("network packet I/O guest identity is already reserved")
+            }
             Self::ProviderCapacity { source } => {
                 write!(f, "failed to reserve network packet I/O registry: {source}")
             }
@@ -5358,36 +5730,26 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
             Self::MmdsState { source } => {
                 write!(f, "failed to access MMDS state: {source}")
             }
-            Self::HostDeviceName { iface_id, source } => {
+            Self::HostDeviceName { source } => {
                 write!(
                     f,
-                    "network interface {iface_id} has unsupported vmnet host device config: {source}"
+                    "network interface has unsupported vmnet host device config: {source}"
                 )
             }
-            Self::Start { iface_id, source } => {
-                write!(
-                    f,
-                    "failed to start vmnet packet I/O for interface {iface_id}: {source}"
-                )
+            Self::Start { source } => {
+                write!(f, "failed to start vmnet packet I/O: {source}")
             }
-            Self::PacketIoBuild { iface_id, source } => {
-                write!(
-                    f,
-                    "failed to build vmnet packet I/O for interface {iface_id}: {source}"
-                )
+            Self::PacketIoBuild { source } => {
+                write!(f, "failed to build vmnet packet I/O: {source}")
             }
-            Self::MmdsOnlyPacketIoBuild { iface_id, source } => {
-                write!(
-                    f,
-                    "failed to build MMDS-only packet I/O for interface {iface_id}: {source}"
-                )
+            Self::CleanupUncertain => {
+                f.write_str("vmnet packet I/O cleanup could not be confirmed")
             }
-            Self::MissingMmdsDetour { iface_id } => {
-                write!(f, "missing MMDS packet detour for interface {iface_id}")
+            Self::MmdsOnlyPacketIoBuild { source } => {
+                write!(f, "failed to build MMDS-only packet I/O: {source}")
             }
-            #[cfg(test)]
-            Self::ProviderBuild { source } => {
-                write!(f, "failed to build vmnet packet I/O provider: {source}")
+            Self::MissingMmdsDetour => {
+                f.write_str("missing MMDS packet detour for network interface")
             }
         }
     }
@@ -5404,11 +5766,11 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
             Self::PacketIoBuild { source, .. } => Some(source),
             Self::MmdsOnlyPacketIoBuild { source, .. } => Some(source),
             Self::DuplicateInterface
+            | Self::DuplicateRealizedMac
             | Self::RegistryCapacity
             | Self::GenerationExhausted
-            | Self::MissingMmdsDetour { .. } => None,
-            #[cfg(test)]
-            Self::ProviderBuild { source } => Some(source),
+            | Self::CleanupUncertain
+            | Self::MissingMmdsDetour => None,
         }
     }
 }
@@ -5482,10 +5844,7 @@ fn validate_process_vmnet_authority(
         let vmnet =
             VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(|source| {
                 ProcessVmnetAuthorityValidationError::Provider(
-                    ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
-                        iface_id: config.iface_id().to_string(),
-                        source,
-                    },
+                    ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source },
                 )
             })?;
         let Some(authority) = contained_authority else {
@@ -5520,78 +5879,6 @@ impl ProcessVmnetPacketIoBackendFactory for SystemProcessVmnetPacketIoBackendFac
     fn new_backend(&mut self, _iface_id: &str) -> Self::Backend {
         SystemVmnetInterfaceBackend::new()
     }
-}
-
-#[cfg(test)]
-fn process_vmnet_packet_io_provider_from_configs<F>(
-    configs: &[NetworkInterfaceConfig],
-    factory: &mut F,
-) -> Result<
-    VmnetVirtioNetworkPacketIoProvider<StartedVmnetPacketIoBackend<F::Backend>>,
-    ProcessNetworkPacketIoProviderBuildError,
->
-where
-    F: ProcessVmnetPacketIoBackendFactory,
-    F::Backend: VmnetPacketIoBackend<Interface = <F::Backend as VmnetInterfaceBackend>::Interface>,
-{
-    process_vmnet_packet_io_provider_from_configs_with_mmds_detour(configs, factory, None)
-}
-
-#[cfg(test)]
-fn process_vmnet_packet_io_provider_from_configs_with_mmds_detour<F>(
-    configs: &[NetworkInterfaceConfig],
-    factory: &mut F,
-    mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
-) -> Result<
-    VmnetVirtioNetworkPacketIoProvider<StartedVmnetPacketIoBackend<F::Backend>>,
-    ProcessNetworkPacketIoProviderBuildError,
->
-where
-    F: ProcessVmnetPacketIoBackendFactory,
-    F::Backend: VmnetPacketIoBackend<Interface = <F::Backend as VmnetInterfaceBackend>::Interface>,
-{
-    validate_network_interface_count(configs.len()).map_err(|source| {
-        ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source }
-    })?;
-
-    let mut entries = Vec::new();
-
-    for config in configs {
-        let iface_id = config.iface_id();
-        let vmnet_config = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
-            .map_err(
-                |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
-                    iface_id: iface_id.to_string(),
-                    source,
-                },
-            )?;
-        let backend = factory.new_backend(iface_id);
-        let (backend, interface) = StartedVmnetPacketIoBackend::start(backend, &vmnet_config)
-            .map_err(|source| ProcessNetworkPacketIoProviderBuildError::Start {
-                iface_id: iface_id.to_string(),
-                source,
-            })?;
-        let detour = mmds_detour.and_then(|detour| detour.detour_for_interface(iface_id));
-        let packet_io = match detour {
-            Some(detour) => {
-                VmnetVirtioNetworkPacketIo::with_mmds_detour(backend, interface, detour)
-            }
-            None => VmnetVirtioNetworkPacketIo::new(backend, interface),
-        }
-        .map_err(
-            |source| ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
-                iface_id: iface_id.to_string(),
-                source,
-            },
-        )?;
-
-        entries.push(VmnetVirtioNetworkPacketIoProviderEntry::new(
-            iface_id, packet_io,
-        ));
-    }
-
-    VmnetVirtioNetworkPacketIoProvider::new(entries)
-        .map_err(|source| ProcessNetworkPacketIoProviderBuildError::ProviderBuild { source })
 }
 
 #[derive(Debug, Default)]
@@ -7752,14 +8039,24 @@ impl<S> BootRunLoopSupervisor<S>
 where
     S: BootRunLoopSession,
 {
+    #[cfg(test)]
     fn start(session: S, max_steps: NonZeroUsize) -> Result<Self, BackendError> {
-        Self::start_with_command_queue_capacity(
+        Self::start_recoverable(session, max_steps).map_err(BootRunLoopStartError::into_source)
+    }
+
+    fn start_recoverable(
+        session: S,
+        max_steps: NonZeroUsize,
+    ) -> Result<Self, BootRunLoopStartError<S>> {
+        Self::start_with_initial_state(
             session,
             max_steps,
             BOOT_RUN_LOOP_COMMAND_QUEUE_CAPACITY,
+            false,
         )
     }
 
+    #[cfg(test)]
     fn start_with_command_queue_capacity(
         session: S,
         max_steps: NonZeroUsize,
@@ -9185,11 +9482,11 @@ mod tests {
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
-        MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig, NetworkInterfaceConfigError,
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkInterfaceUpdate,
-        NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput, NetworkMmioLayout,
-        NetworkRateLimiterConfig, NetworkRuntimeMutationError, NetworkTokenBucketConfig,
-        PreparedNetworkDevice, PreparedNetworkDevices,
+        GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkDeviceProfile, NetworkInterfaceConfig,
+        NetworkInterfaceConfigError, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
+        NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
+        NetworkMmioLayout, NetworkRateLimiterConfig, NetworkRuntimeMutationError,
+        NetworkTokenBucketConfig, PreparedNetworkDevice, PreparedNetworkDevices,
     };
     use bangbang_runtime::pmem::{
         PmemConfig, PmemConfigInput, PmemConfigs, PmemFileBacking, PmemMmioLayout,
@@ -9245,8 +9542,9 @@ mod tests {
     use crate::host_network::virtio_vmnet::VmnetVirtioNetworkPacketIoStopError;
     use crate::host_network::vmnet::{
         VmnetError, VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceDescriptor,
-        VmnetInterfaceDescriptorError, VmnetOperation, VmnetPacketIoBackend, VmnetPacketIoError,
-        VmnetReadPacket, VmnetStatus, VmnetWritePacket,
+        VmnetInterfaceDescriptorError, VmnetInterfaceParameters, VmnetInterfaceStartDisposition,
+        VmnetInterfaceStartError, VmnetOperation, VmnetPacketIoBackend, VmnetPacketIoError,
+        VmnetReadPacket, VmnetStartedInterface, VmnetStatus, VmnetWritePacket,
     };
     #[cfg(target_os = "macos")]
     use crate::vhost_user_block::{VhostUserBlockBackend, VhostUserBlockBackendOptions};
@@ -9267,19 +9565,20 @@ mod tests {
         HvfArm64BootBalloonCaptureError, HvfArm64BootEntropyCaptureError,
         HvfArm64BootMemoryHotplugCaptureError, HvfArm64BootSerialCaptureError,
         HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootStorageCaptureError,
-        HvfInstanceStartExecutor, InstanceStartExecutor, NativeV1SnapshotCaptureCancellation,
-        NativeV1SnapshotCaptureError, NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
-        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
-        NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
-        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
-        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
-        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
-        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
-        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
-        ProcessVmm, ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
-        SnapshotCreateSession, SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
-        require_native_v1_composite_record, snapshot_destination_machine_config,
+        HvfInstanceStartExecutor, InstanceStartError, InstanceStartExecutor,
+        NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
+        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
+        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
+        NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
+        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
+        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
+        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
+        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
+        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
+        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, require_native_v1_composite_record,
+        snapshot_destination_machine_config,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -10304,7 +10603,7 @@ mod tests {
         fn start(
             &mut self,
             _controller: &bangbang_runtime::VmmController,
-        ) -> Result<Self::Session, BackendError> {
+        ) -> Result<Self::Session, InstanceStartError> {
             self.calls += 1;
             Ok(DiagnosticSession {
                 status: self.status,
@@ -10340,6 +10639,7 @@ mod tests {
     enum FakeStartResult {
         Success(Box<FakeSession>),
         Failure(BackendError),
+        TerminalFailure(BackendError),
     }
 
     #[derive(Debug, Clone)]
@@ -10456,6 +10756,32 @@ mod tests {
                 snapshot_publication_failure: false,
             }
         }
+
+        const fn terminal_failure(source: BackendError) -> Self {
+            Self {
+                result: FakeStartResult::TerminalFailure(source),
+                calls: 0,
+                provided_boot_file_calls: 0,
+                provided_serial_output_calls: 0,
+                snapshot_preflight_trace: Vec::new(),
+                snapshot_storage_preflight_calls: 0,
+                last_snapshot_storage_configs: None,
+                snapshot_storage_preflight_failure: None,
+                snapshot_balloon_preflight_calls: 0,
+                last_snapshot_balloon_config: None,
+                snapshot_balloon_preflight_failure: false,
+                snapshot_memory_hotplug_preflight_calls: 0,
+                last_snapshot_memory_hotplug_config: None,
+                snapshot_memory_hotplug_preflight_failure: false,
+                snapshot_entropy_preflight_calls: 0,
+                last_snapshot_entropy_config: None,
+                snapshot_entropy_preflight_failure: false,
+                snapshot_serial_preflight_calls: 0,
+                last_snapshot_serial_config: None,
+                snapshot_serial_preflight_failure: false,
+                snapshot_publication_failure: false,
+            }
+        }
     }
 
     impl InstanceStartExecutor for FakeStarter {
@@ -10464,11 +10790,14 @@ mod tests {
         fn start(
             &mut self,
             _controller: &bangbang_runtime::VmmController,
-        ) -> Result<Self::Session, BackendError> {
+        ) -> Result<Self::Session, InstanceStartError> {
             self.calls += 1;
             match &self.result {
                 FakeStartResult::Success(session) => Ok((**session).clone()),
-                FakeStartResult::Failure(source) => Err(source.clone()),
+                FakeStartResult::Failure(source) => Err(source.clone().into()),
+                FakeStartResult::TerminalFailure(source) => {
+                    Err(InstanceStartError::terminal(source.clone()))
+                }
             }
         }
 
@@ -10476,7 +10805,7 @@ mod tests {
             &mut self,
             controller: &bangbang_runtime::VmmController,
             mut startup_resources: VmStartupResources,
-        ) -> Result<Self::Session, BackendError> {
+        ) -> Result<Self::Session, InstanceStartError> {
             let serial_output = startup_resources.take_serial_output();
             if !startup_resources.is_empty() {
                 self.provided_boot_file_calls += 1;
@@ -10619,10 +10948,14 @@ mod tests {
     impl InstanceStartExecutor for FakeSnapshotLoadStarter {
         type Session = FakeSession;
 
-        fn start(&mut self, _controller: &VmmController) -> Result<Self::Session, BackendError> {
-            Err(BackendError::InvalidState(
-                "fake snapshot loader does not support ordinary start",
-            ))
+        fn start(
+            &mut self,
+            _controller: &VmmController,
+        ) -> Result<Self::Session, InstanceStartError> {
+            Err(
+                BackendError::InvalidState("fake snapshot loader does not support ordinary start")
+                    .into(),
+            )
         }
 
         fn publish_snapshot_v1(
@@ -11771,7 +12104,8 @@ mod tests {
             &mut self,
             _config: &NetworkInterfaceConfig,
             _authority: ProcessVmnetAuthority,
-        ) -> Result<Self::PreparedEntry, NetworkRuntimeMutationError> {
+        ) -> Result<(Self::PreparedEntry, NetworkDeviceProfile), NetworkRuntimeMutationError>
+        {
             Err(NetworkRuntimeMutationError::ActiveSessionUnavailable)
         }
 
@@ -11995,7 +12329,8 @@ mod tests {
             &mut self,
             config: &NetworkInterfaceConfig,
             _authority: ProcessVmnetAuthority,
-        ) -> Result<Self::PreparedEntry, NetworkRuntimeMutationError> {
+        ) -> Result<(Self::PreparedEntry, NetworkDeviceProfile), NetworkRuntimeMutationError>
+        {
             push_recorded_event(
                 &self.events,
                 format!("provider-prepare:{}", config.iface_id()),
@@ -12003,11 +12338,14 @@ mod tests {
             if let Some(error) = self.prepare_error.clone() {
                 return Err(error);
             }
-            Ok(RuntimeNetworkTransactionEntry {
-                iface_id: config.iface_id().to_string(),
-                events: Arc::clone(&self.events),
-                stop_fails: self.stop_fails,
-            })
+            Ok((
+                RuntimeNetworkTransactionEntry {
+                    iface_id: config.iface_id().to_string(),
+                    events: Arc::clone(&self.events),
+                    stop_fails: self.stop_fails,
+                },
+                NetworkDeviceProfile::from_config(config),
+            ))
         }
 
         fn publish_prepared_entry(
@@ -12099,6 +12437,7 @@ mod tests {
         events: Arc<Mutex<Vec<String>>>,
         start_status: Option<VmnetStatus>,
         stop_status: Option<VmnetStatus>,
+        realized_mac: GuestMacAddress,
     }
 
     impl VmnetInterfaceBackend for RecordingVmnetPacketIoBackend {
@@ -12118,15 +12457,21 @@ mod tests {
         fn start_interface(
             &mut self,
             _descriptor: &VmnetInterfaceDescriptor,
-        ) -> Result<Self::Interface, VmnetError> {
+        ) -> Result<VmnetStartedInterface<Self::Interface>, VmnetInterfaceStartError> {
             push_recorded_event(&self.events, format!("start:{}", self.iface_id));
             if let Some(status) = self.start_status {
-                return Err(VmnetError::new(VmnetOperation::StartInterface, status));
+                return Err(VmnetInterfaceStartError::Start {
+                    source: VmnetError::new(VmnetOperation::StartInterface, status),
+                    disposition: VmnetInterfaceStartDisposition::Retryable,
+                });
             }
 
-            Ok(RecordingVmnetInterface {
-                iface_id: self.iface_id.clone(),
-            })
+            Ok(VmnetStartedInterface::new(
+                RecordingVmnetInterface {
+                    iface_id: self.iface_id.clone(),
+                },
+                VmnetInterfaceParameters::for_test(self.realized_mac, 1500, 2048),
+            ))
         }
 
         fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
@@ -12165,6 +12510,8 @@ mod tests {
         events: Arc<Mutex<Vec<String>>>,
         start_statuses: VecDeque<Option<VmnetStatus>>,
         stop_statuses: VecDeque<Option<VmnetStatus>>,
+        realized_macs: VecDeque<GuestMacAddress>,
+        next_realized_mac: u8,
     }
 
     impl RecordingVmnetPacketIoBackendFactory {
@@ -12181,6 +12528,11 @@ mod tests {
             self.stop_statuses.push_back(status);
             self
         }
+
+        fn with_next_realized_mac(mut self, mac: GuestMacAddress) -> Self {
+            self.realized_macs.push_back(mac);
+            self
+        }
     }
 
     impl ProcessVmnetPacketIoBackendFactory for RecordingVmnetPacketIoBackendFactory {
@@ -12188,11 +12540,15 @@ mod tests {
 
         fn new_backend(&mut self, iface_id: &str) -> Self::Backend {
             push_recorded_event(&self.events, format!("backend:{iface_id}"));
+            self.next_realized_mac = self.next_realized_mac.saturating_add(1);
             RecordingVmnetPacketIoBackend {
                 iface_id: iface_id.to_string(),
                 events: Arc::clone(&self.events),
                 start_status: self.start_statuses.pop_front().unwrap_or(None),
                 stop_status: self.stop_statuses.pop_front().unwrap_or(None),
+                realized_mac: self.realized_macs.pop_front().unwrap_or_else(|| {
+                    GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, self.next_realized_mac])
+                }),
             }
         }
     }
@@ -13492,8 +13848,12 @@ mod tests {
 
         {
             let mut provider =
-                process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
-                    .expect("supported vmnet configs should build provider");
+                ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                    &configs,
+                    None,
+                    &mut factory,
+                )
+                .expect("supported vmnet configs should build provider");
             provider
                 .packet_io(test_boot_network_device().interface())
                 .expect("provider should select packet I/O by iface id");
@@ -13519,7 +13879,12 @@ mod tests {
         ]);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
         let event_log = factory.events();
-        let provider = process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
+        let provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
             .expect("all supported vmnet host device names should build provider");
 
         let events = recorded_events(&event_log);
@@ -13571,7 +13936,17 @@ mod tests {
 
     #[test]
     fn process_network_packet_io_provider_uses_mmds_only_for_all_mmds_interfaces() {
-        let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "vmnet:shared")]);
+        let explicit_mac = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x31]);
+        let configs = vec![
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+                .with_guest_mac(explicit_mac.to_string())
+                .with_mtu(1400)
+                .validate()
+                .expect("first MMDS-only network config should validate"),
+            NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:shared")
+                .validate()
+                .expect("second MMDS-only network config should validate"),
+        ];
         let mmds_config = MmdsConfigInput::new(vec!["eth0".to_string(), "eth1".to_string()])
             .validate(&configs)
             .expect("MMDS config should validate");
@@ -13580,12 +13955,16 @@ mod tests {
             &mmds_config,
             SharedMmdsMetrics::default(),
         );
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let events = factory.events();
 
-        let mut provider = ProcessNetworkPacketIoProvider::from_network_configs_and_mmds_detour(
-            &configs,
-            Some(&detour_config),
-        )
-        .expect("all-MMDS network configs should build an MMDS-only provider");
+        let mut provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                Some(&detour_config),
+                &mut factory,
+            )
+            .expect("all-MMDS network configs should build an MMDS-only provider");
 
         assert_eq!(provider.entries.len(), configs.len());
         assert!(
@@ -13595,6 +13974,13 @@ mod tests {
                 .all(|entry| !entry.packet_io.is_vmnet()),
             "all-MMDS network configs should not open vmnet resources"
         );
+        let profiles = provider.device_profiles();
+        assert_eq!(profiles["eth0"].guest_mac(), Some(explicit_mac));
+        assert_eq!(profiles["eth0"].mtu(), Some(1400));
+        assert_eq!(profiles["eth1"].guest_mac(), None);
+        assert_eq!(profiles["eth1"].mtu(), None);
+        assert_eq!(provider.reserved_macs, [explicit_mac]);
+        assert!(recorded_events(&events).is_empty());
         provider
             .packet_io(test_boot_network_device().interface())
             .expect("MMDS-only provider should return packet I/O for configured device");
@@ -13633,7 +14019,7 @@ mod tests {
         let class = provider.class_for_interface("eth0");
         assert_eq!(class, super::ProcessNetworkPacketIoEntryClass::MmdsOnly);
         let prepared = provider
-            .prepare_entry_with_factory(&configs[0], class, &mut factory)
+            .prepare_entry_with_factory(&configs[0], class, false, &mut factory)
             .expect("predeclared MMDS identity should prepare without vmnet");
         provider.publish_prepared(prepared);
         assert_eq!(provider.entries.len(), 1);
@@ -13651,6 +14037,7 @@ mod tests {
             .prepare_entry_with_factory(
                 &new_config,
                 super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                false,
                 &mut factory,
             )
             .expect("non-MMDS runtime identity should prepare vmnet");
@@ -13705,6 +14092,367 @@ mod tests {
         let events = recorded_events(&events);
         assert!(events.iter().any(|event| event == "stop:eth0"));
         assert!(events.iter().any(|event| event == "stop:eth1"));
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_rolls_back_duplicate_allocated_mac() {
+        let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "vmnet:shared")]);
+        let duplicate = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x44]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(duplicate)
+            .with_next_realized_mac(duplicate);
+        let events = factory.events();
+
+        let error =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect_err("duplicate allocated MAC should roll the startup batch back");
+
+        assert!(matches!(
+            error,
+            ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "backend:eth1".to_string(),
+                "descriptor:eth1:shared".to_string(),
+                "start:eth1".to_string(),
+                "stop:eth1".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_rejects_duplicate_explicit_macs_before_start() {
+        let duplicate = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x45]);
+        let configs = ["eth0", "eth1"]
+            .into_iter()
+            .map(|iface_id| {
+                NetworkInterfaceConfigInput::new(iface_id, iface_id, "vmnet:shared")
+                    .with_guest_mac(duplicate.to_string())
+                    .validate()
+                    .expect("explicit network config should validate")
+            })
+            .collect::<Vec<_>>();
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let events = factory.events();
+
+        let error =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect_err("duplicate explicit MAC should fail before vmnet start");
+
+        assert!(matches!(
+            error,
+            ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
+        ));
+        assert!(recorded_events(&events).is_empty());
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_rolls_back_allocated_mac_matching_earlier_explicit() {
+        let duplicate = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x46]);
+        let configs = vec![
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+                .with_guest_mac(duplicate.to_string())
+                .validate()
+                .expect("explicit network config should validate"),
+            NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:shared")
+                .validate()
+                .expect("allocated network config should validate"),
+        ];
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(duplicate)
+            .with_next_realized_mac(duplicate);
+        let events = factory.events();
+
+        let error =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect_err("allocated MAC matching explicit identity should roll back");
+
+        assert!(matches!(
+            error,
+            ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "backend:eth1".to_string(),
+                "descriptor:eth1:shared".to_string(),
+                "start:eth1".to_string(),
+                "stop:eth1".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_reserves_later_explicit_mac_before_allocated_start() {
+        let duplicate = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x47]);
+        let configs = vec![
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+                .validate()
+                .expect("allocated network config should validate"),
+            NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:shared")
+                .with_guest_mac(duplicate.to_string())
+                .validate()
+                .expect("explicit network config should validate"),
+        ];
+        let mut factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(duplicate);
+        let events = factory.events();
+
+        let error =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect_err("allocated MAC matching later explicit identity should fail immediately");
+
+        assert!(matches!(
+            error,
+            ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_retains_realized_profiles_without_rewriting_requests() {
+        let allocated = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x48]);
+        let configured = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x49]);
+        let configs = vec![
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+                .validate()
+                .expect("allocated network config should validate"),
+            NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:host")
+                .with_guest_mac(configured.to_string())
+                .with_mtu(1400)
+                .validate()
+                .expect("configured network config should validate"),
+        ];
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_realized_mac(allocated)
+            .with_next_realized_mac(configured);
+
+        let provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect("unique realized profiles should build");
+        let profiles = provider.device_profiles();
+
+        assert_eq!(configs[0].guest_mac(), None);
+        assert_eq!(profiles["eth0"].guest_mac(), Some(allocated));
+        assert_eq!(profiles["eth0"].mtu(), None);
+        assert_eq!(configs[1].guest_mac(), Some(configured));
+        assert_eq!(profiles["eth1"].guest_mac(), Some(configured));
+        assert_eq!(profiles["eth1"].mtu(), Some(1400));
+        assert!(provider.entries.iter().all(|entry| {
+            entry
+                .backend_parameters
+                .as_ref()
+                .is_some_and(|parameters| parameters.maximum_packet_size() == 2048)
+        }));
+        let debug = format!("{provider:?} {:?}", provider.entries);
+        assert!(!debug.contains(&allocated.to_string()));
+        assert!(!debug.contains(&configured.to_string()));
+        assert!(!debug.contains("2048"));
+    }
+
+    #[test]
+    fn process_network_packet_io_diagnostics_redact_interface_and_framework_values() {
+        let private_iface = "private_iface";
+        let config_error = ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
+            source: crate::host_network::vmnet::VmnetHostDeviceNameConfigError::UnsupportedHostDeviceName,
+        };
+        let start_error = ProcessNetworkPacketIoProviderBuildError::Start {
+            source: VmnetInterfaceStartError::Start {
+                source: VmnetError::new(
+                    VmnetOperation::StartInterface,
+                    VmnetStatus::Unknown(4_294_967_000),
+                ),
+                disposition: VmnetInterfaceStartDisposition::Retryable,
+            },
+        };
+        let published = super::PublishedProcessNetworkPacketIoEntry {
+            generation: 7,
+            iface_id: private_iface.to_string(),
+        };
+
+        let diagnostics =
+            format!("{config_error:?} {config_error} {start_error:?} {start_error} {published:?}");
+        assert!(!diagnostics.contains(private_iface));
+        assert!(!diagnostics.contains("4294967000"));
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_runtime_collision_is_nonmutating_and_delete_releases_mac()
+    {
+        let realized = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x4a]);
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mut startup_factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(realized);
+        let mut provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut startup_factory,
+            )
+            .expect("startup provider should build");
+        let generation = provider.next_generation;
+
+        let explicit_collision = NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:shared")
+            .with_guest_mac(realized.to_string())
+            .validate()
+            .expect("explicit runtime config should validate");
+        let mut explicit_factory = RecordingVmnetPacketIoBackendFactory::default();
+        let explicit_events = explicit_factory.events();
+        let explicit_error = provider
+            .prepare_entry_with_factory(
+                &explicit_collision,
+                super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                false,
+                &mut explicit_factory,
+            )
+            .expect_err("explicit runtime collision should fail before start");
+        assert!(matches!(
+            explicit_error,
+            ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
+        ));
+        assert!(recorded_events(&explicit_events).is_empty());
+
+        let allocated_collision = NetworkInterfaceConfigInput::new("eth2", "eth2", "vmnet:shared")
+            .validate()
+            .expect("allocated runtime config should validate");
+        let mut allocated_factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(realized);
+        let allocated_events = allocated_factory.events();
+        let allocated_error = provider
+            .prepare_entry_with_factory(
+                &allocated_collision,
+                super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                false,
+                &mut allocated_factory,
+            )
+            .expect_err("allocated runtime collision should stop provisional owner");
+        assert!(matches!(
+            allocated_error,
+            ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
+        ));
+        assert_eq!(
+            recorded_events(&allocated_events),
+            [
+                "backend:eth2".to_string(),
+                "descriptor:eth2:shared".to_string(),
+                "start:eth2".to_string(),
+                "stop:eth2".to_string(),
+            ]
+        );
+        assert_eq!(provider.entries.len(), 1);
+        assert_eq!(provider.reserved_macs, [realized]);
+        assert_eq!(provider.next_generation, generation);
+
+        let mut removed = provider
+            .take_interface("eth0")
+            .expect("existing owner should be taken");
+        removed.stop().expect("existing owner should stop cleanly");
+        drop(removed);
+        assert!(provider.reserved_macs.is_empty());
+
+        let mut retry_factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(realized);
+        let prepared = provider
+            .prepare_entry_with_factory(
+                &allocated_collision,
+                super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                false,
+                &mut retry_factory,
+            )
+            .expect("released realized identity should be reusable");
+        provider.publish_prepared(prepared);
+        assert_eq!(provider.entries.len(), 1);
+        assert_eq!(provider.reserved_macs, [realized]);
+    }
+
+    #[test]
+    fn process_network_packet_io_registry_runtime_collision_is_terminal_when_cleanup_uncertain() {
+        let realized = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x4b]);
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mut startup_factory =
+            RecordingVmnetPacketIoBackendFactory::default().with_next_realized_mac(realized);
+        let mut provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut startup_factory,
+            )
+            .expect("startup provider should build");
+        let config = NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:shared")
+            .validate()
+            .expect("runtime network config should validate");
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_stop_status(Some(VmnetStatus::Failure))
+            .with_next_realized_mac(realized);
+        let events = factory.events();
+
+        let error = provider
+            .prepare_entry_with_factory(
+                &config,
+                super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                false,
+                &mut factory,
+            )
+            .expect_err("uncertain duplicate cleanup should be terminal");
+
+        assert!(matches!(
+            &error,
+            ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
+        ));
+        assert!(error.is_terminal());
+        assert!(matches!(
+            super::runtime_network_packet_io_preparation_error(error),
+            NetworkRuntimeMutationError::TerminalInsertion { .. }
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth1".to_string(),
+                "descriptor:eth1:shared".to_string(),
+                "start:eth1".to_string(),
+                "stop:eth1".to_string(),
+            ]
+        );
+        assert_eq!(provider.entries.len(), 1);
+        assert_eq!(provider.reserved_macs, [realized]);
     }
 
     #[test]
@@ -13770,8 +14518,8 @@ mod tests {
                 .iter()
                 .filter(|event| event.as_str() == "stop:eth0")
                 .count(),
-            2,
-            "explicit failure and best-effort owner drop should both attempt cleanup"
+            1,
+            "uncertain stop ownership must not trigger an unproven second cleanup attempt"
         );
     }
 
@@ -13794,20 +14542,19 @@ mod tests {
         .expect_err("MMDS-only provider should still validate host_dev_name syntax");
 
         match error {
-            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { iface_id, .. } => {
-                assert_eq!(iface_id, "eth0");
-            }
+            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. } => {}
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
             | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
+            | ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
             | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
             | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
             | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
-            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
-            | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
+            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
                 panic!("unsupported host_dev_name should be reported as config failure");
             }
         }
@@ -13818,7 +14565,12 @@ mod tests {
         let configs = validated_network_configs(MAX_NETWORK_INTERFACE_COUNT + 1);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
         let event_log = factory.events();
-        let error = process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
+        let error =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
             .expect_err("over-limit network configs should fail provider construction");
 
         match error {
@@ -13833,15 +14585,16 @@ mod tests {
             }
             ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. }
             | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
+            | ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
             | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
             | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
             | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
-            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
-            | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
+            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
                 panic!("over-limit configs should fail before vmnet backend start");
             }
         }
@@ -13853,24 +14606,28 @@ mod tests {
         let configs = network_configs([("eth0", "tap0")]);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
         let event_log = factory.events();
-        let error = process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
+        let error =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
             .expect_err("unsupported host_dev_name should fail provider construction");
 
         match error {
-            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { iface_id, .. } => {
-                assert_eq!(iface_id, "eth0");
-            }
+            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. } => {}
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
             | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
+            | ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
             | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
             | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
             | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
-            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
-            | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
+            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
                 panic!("unsupported host_dev_name should fail before vmnet backend start");
             }
         }
@@ -13882,24 +14639,28 @@ mod tests {
         let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "tap1")]);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
         let event_log = factory.events();
-        let error = process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
+        let error =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
             .expect_err("later unsupported config should fail provider construction");
 
         match error {
-            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { iface_id, .. } => {
-                assert_eq!(iface_id, "eth1");
-            }
+            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. } => {}
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
             | ProcessNetworkPacketIoProviderBuildError::DuplicateInterface
+            | ProcessNetworkPacketIoProviderBuildError::DuplicateRealizedMac
             | ProcessNetworkPacketIoProviderBuildError::ProviderCapacity { .. }
             | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
             | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
-            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
-            | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
+            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
                 panic!("unsupported host_dev_name should be reported as config failure");
             }
         }
@@ -13909,6 +14670,45 @@ mod tests {
                 "backend:eth0".to_string(),
                 "descriptor:eth0:shared".to_string(),
                 "start:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_vmnet_packet_io_provider_attempts_reverse_cleanup_and_reports_uncertainty() {
+        let configs = network_configs([
+            ("eth0", "vmnet:shared"),
+            ("eth1", "vmnet:host"),
+            ("eth2", "tap2"),
+        ]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_stop_status(None)
+            .with_next_stop_status(Some(VmnetStatus::Failure));
+        let events = factory.events();
+
+        let error =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect_err("uncertain reverse cleanup should fail provider construction");
+
+        assert!(matches!(
+            error,
+            ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
+        ));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "backend:eth1".to_string(),
+                "descriptor:eth1:host".to_string(),
+                "start:eth1".to_string(),
+                "stop:eth1".to_string(),
                 "stop:eth0".to_string(),
             ]
         );
@@ -13932,8 +14732,9 @@ mod tests {
         let event_log = factory.events();
         let error = controller
             .start_instance_with(|controller| {
-                process_vmnet_packet_io_provider_from_configs(
+                ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
                     controller.network_interface_configs(),
+                    None,
                     &mut factory,
                 )
                 .map(|_provider| ())
@@ -13947,7 +14748,8 @@ mod tests {
 
         match error {
             VmmActionError::InstanceStart(BackendError::Hypervisor(message)) => {
-                assert!(message.contains("failed to start vmnet packet I/O for interface eth0"));
+                assert!(message.contains("failed to start vmnet packet I/O"));
+                assert!(!message.contains("eth0"));
             }
             VmmActionError::InstanceStart(
                 BackendError::Unsupported(_) | BackendError::InvalidState(_),
@@ -21717,6 +22519,27 @@ mod tests {
         assert_eq!(vmm.starter.calls, 1);
         assert!(!vmm.has_started_session());
         assert_eq!(vmm.metrics_session_epoch(), None);
+        assert_eq!(vmm.process_exit_status(), ProcessSessionExitStatus::Running);
+    }
+
+    #[test]
+    fn terminal_instance_start_failure_latches_process_failure_without_session() {
+        let source = BackendError::InvalidState("test terminal startup failed");
+        let mut vmm = configured_vmm(FakeStarter::terminal_failure(source.clone()));
+
+        let err = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("terminal startup failure should propagate");
+
+        assert_eq!(err, VmmActionError::InstanceStart(source));
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(vmm.starter.calls, 1);
+        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.metrics_session_epoch(), None);
+        assert_eq!(
+            vmm.process_exit_status(),
+            ProcessSessionExitStatus::Terminal
+        );
     }
 
     #[test]

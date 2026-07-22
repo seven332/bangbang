@@ -65,11 +65,11 @@ use crate::mmio::{
     MmioRegionId, MmioRegistrationError, MmioRegistrationLease, MmioRegistrationOwner,
 };
 use crate::network::{
-    NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioDeviceRegistration,
-    NetworkMmioLayout, NetworkMmioRegistrationError, PreparedNetworkDevice,
-    PreparedNetworkDeviceError, PreparedNetworkDevices, VirtioNetworkDeviceNotificationDispatch,
-    VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource,
-    VirtioNetworkTxPacketSink,
+    NetworkDeviceProfile, NetworkInterfaceUpdate, NetworkInterfaceUpdateError,
+    NetworkMmioDeviceRegistration, NetworkMmioLayout, NetworkMmioRegistrationError,
+    PreparedNetworkDevice, PreparedNetworkDeviceError, PreparedNetworkDevices,
+    VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError,
+    VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource, VirtioNetworkTxPacketSink,
 };
 use crate::pci::{
     Arm64PciAddressPlan, PciBarAddressSpace, PciBarAllocator, PciClassCode, PciFunctionLease,
@@ -126,6 +126,7 @@ pub struct VmStartupResources {
     serial_input: Option<SerialStdioInput>,
     supplied_vsock_listener: Option<SuppliedVsockListener>,
     guest_memory_backing: GuestMemoryBacking,
+    network_device_profiles: Option<BTreeMap<String, NetworkDeviceProfile>>,
 }
 
 struct VmStartupResourceParts {
@@ -135,6 +136,7 @@ struct VmStartupResourceParts {
     pmem_backings: BTreeMap<String, PmemFileBacking>,
     supplied_vsock_listener: Option<SuppliedVsockListener>,
     guest_memory_backing: GuestMemoryBacking,
+    network_device_profiles: Option<BTreeMap<String, NetworkDeviceProfile>>,
 }
 
 impl fmt::Debug for VmStartupResources {
@@ -167,6 +169,10 @@ impl fmt::Debug for VmStartupResources {
                 &self.supplied_vsock_listener.as_ref().map(|_| "<owned>"),
             )
             .field("guest_memory_backing", &self.guest_memory_backing)
+            .field(
+                "network_device_profiles",
+                &self.network_device_profiles.as_ref().map(BTreeMap::len),
+            )
             .finish()
     }
 }
@@ -187,6 +193,7 @@ impl VmStartupResources {
             serial_input: None,
             supplied_vsock_listener: None,
             guest_memory_backing: GuestMemoryBacking::Anonymous,
+            network_device_profiles: None,
         }
     }
 
@@ -247,6 +254,16 @@ impl VmStartupResources {
         self
     }
 
+    /// Adds exact guest-visible realized profiles for configured network interfaces.
+    #[must_use]
+    pub fn with_network_device_profiles(
+        mut self,
+        profiles: BTreeMap<String, NetworkDeviceProfile>,
+    ) -> Self {
+        self.network_device_profiles = Some(profiles);
+        self
+    }
+
     /// Returns whether every startup resource should use its configured path.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -258,6 +275,7 @@ impl VmStartupResources {
             && self.serial_input.is_none()
             && self.supplied_vsock_listener.is_none()
             && self.guest_memory_backing == GuestMemoryBacking::Anonymous
+            && self.network_device_profiles.is_none()
     }
 
     fn into_parts(self) -> VmStartupResourceParts {
@@ -270,6 +288,7 @@ impl VmStartupResources {
             pmem_backings: self.pmem_backings,
             supplied_vsock_listener: self.supplied_vsock_listener,
             guest_memory_backing: self.guest_memory_backing,
+            network_device_profiles: self.network_device_profiles,
         }
     }
 }
@@ -4662,6 +4681,7 @@ impl Arm64BootResources {
             pmem_backings,
             supplied_vsock_listener,
             guest_memory_backing,
+            network_device_profiles,
         } = startup_resources.into_parts();
         let Arm64BootResourceConfig {
             vcpu_mpidrs,
@@ -4824,9 +4844,16 @@ impl Arm64BootResources {
         prepared_blocks
             .bind_async_runtime(&block_async_runtime)
             .map_err(|source| Arm64BootResourceError::PrepareBlockAsyncRuntime { source })?;
-        let prepared_networks =
-            PreparedNetworkDevices::from_config_slice(controller.network_interface_configs())
-                .map_err(|source| Arm64BootResourceError::PrepareNetworkDevices { source })?;
+        let prepared_networks = match network_device_profiles {
+            Some(profiles) => PreparedNetworkDevices::from_config_slice_with_profiles(
+                controller.network_interface_configs(),
+                profiles,
+            ),
+            None => {
+                PreparedNetworkDevices::from_config_slice(controller.network_interface_configs())
+            }
+        }
+        .map_err(|source| Arm64BootResourceError::PrepareNetworkDevices { source })?;
         let (
             mut mmio_dispatcher,
             block_devices,
@@ -5838,7 +5865,7 @@ fn register_serial_mmio(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -5913,9 +5940,10 @@ mod tests {
         MmioHandler, MmioHandlerError, MmioOperation, MmioRegionId,
     };
     use crate::network::{
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkInterfaceUpdateError,
-        NetworkInterfaceUpdateInput, NetworkMmioDeviceRegistration, NetworkMmioLayout,
-        NetworkRateLimiterConfig, NetworkTokenBucketConfig, PreparedNetworkDevices,
+        GuestMacAddress, NetworkDeviceProfile, NetworkInterfaceConfigInput,
+        NetworkInterfaceConfigs, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
+        NetworkMmioDeviceRegistration, NetworkMmioLayout, NetworkRateLimiterConfig,
+        NetworkTokenBucketConfig, PreparedNetworkDeviceError, PreparedNetworkDevices,
         VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
         VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkMmioHandler, VirtioNetworkRxPacket,
         VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
@@ -5940,7 +5968,7 @@ mod tests {
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
-        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioRegister,
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioRegister,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -6092,6 +6120,30 @@ mod tests {
             resources.into_parts().guest_memory_backing,
             GuestMemoryBacking::Shared
         );
+    }
+
+    #[test]
+    fn startup_resources_retain_exact_network_profiles_and_redact_values() {
+        let mac = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0xa1]);
+        let profiles = BTreeMap::from([(
+            "private-eth0".to_owned(),
+            NetworkDeviceProfile::new(Some(mac), Some(1400)),
+        )]);
+        let resources = VmStartupResources::default().with_network_device_profiles(profiles);
+
+        assert!(!resources.is_empty());
+        let debug = format!("{resources:?}");
+        assert!(debug.contains("network_device_profiles: Some(1)"));
+        assert!(!debug.contains("private-eth0"));
+        assert!(!debug.contains(&mac.to_string()));
+        assert!(!debug.contains("1400"));
+        let retained = resources
+            .into_parts()
+            .network_device_profiles
+            .expect("network profile map should be retained");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained["private-eth0"].guest_mac(), Some(mac));
+        assert_eq!(retained["private-eth0"].mtu(), Some(1400));
     }
 
     #[test]
@@ -10121,6 +10173,136 @@ mod tests {
             .find("/virtio_mmio@40004000")
             .expect("network virtio-mmio node should be in assembled FDT");
         assert_eq!(network_node.prop_str("compatible").unwrap(), "virtio,mmio");
+    }
+
+    #[test]
+    fn startup_network_profiles_must_match_configured_interface_ids_exactly() {
+        let kernel = temp_file("kernel-network-profile-exact", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "vmnet:shared");
+        let network_lines = [line(33)];
+
+        let missing = Arm64BootResources::assemble_from_controller_with_startup_resources(
+            &controller,
+            Arm64BootResourceConfig {
+                network_interrupt_lines: &network_lines,
+                ..valid_config(&[])
+            },
+            VmStartupResources::default().with_network_device_profiles(BTreeMap::new()),
+        )
+        .expect_err("missing network profile should fail startup");
+        assert!(matches!(
+            missing,
+            Arm64BootResourceError::PrepareNetworkDevices {
+                source: PreparedNetworkDeviceError::MissingProfile,
+            }
+        ));
+
+        let profiles = BTreeMap::from([
+            ("eth0".to_owned(), NetworkDeviceProfile::new(None, None)),
+            (
+                "unexpected".to_owned(),
+                NetworkDeviceProfile::new(None, None),
+            ),
+        ]);
+        let unexpected = Arm64BootResources::assemble_from_controller_with_startup_resources(
+            &controller,
+            Arm64BootResourceConfig {
+                network_interrupt_lines: &network_lines,
+                ..valid_config(&[])
+            },
+            VmStartupResources::default().with_network_device_profiles(profiles),
+        )
+        .expect_err("unexpected network profile should fail startup");
+        assert!(matches!(
+            unexpected,
+            Arm64BootResourceError::PrepareNetworkDevices {
+                source: PreparedNetworkDeviceError::UnexpectedProfile,
+            }
+        ));
+    }
+
+    #[test]
+    fn startup_network_profile_reaches_mmio_and_pci_guest_config_spaces() {
+        let kernel = temp_file("kernel-network-profile-config", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared").with_mtu(1400),
+            ))
+            .expect("network config should be stored");
+        let realized_mac = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0xb1]);
+        let profile = NetworkDeviceProfile::new(Some(realized_mac), Some(1400));
+        let network_lines = [line(33)];
+        let profiles = BTreeMap::from([("eth0".to_owned(), profile)]);
+
+        let mut mmio_resources =
+            Arm64BootResources::assemble_from_controller_with_startup_resources(
+                &controller,
+                Arm64BootResourceConfig {
+                    network_interrupt_lines: &network_lines,
+                    ..valid_config(&[])
+                },
+                VmStartupResources::default().with_network_device_profiles(profiles),
+            )
+            .expect("MMIO network profile should assemble");
+        let config_address = mmio_resources.network_devices[0]
+            .registration
+            .address()
+            .checked_add(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET)
+            .expect("network config address should not overflow");
+        let mut actual = [0_u8; 12];
+        for (offset, len) in [(0_u64, 4_u64), (4, 2), (10, 2)] {
+            let address = config_address
+                .checked_add(offset)
+                .expect("network config chunk address should not overflow");
+            let access = mmio_resources
+                .mmio_dispatcher
+                .lookup(address, len)
+                .expect("network config access should resolve");
+            let outcome = mmio_resources
+                .mmio_dispatcher
+                .dispatch(MmioOperation::read(access).expect("network config read should build"))
+                .expect("network config read should dispatch");
+            let MmioDispatchOutcome::Read { data } = outcome else {
+                panic!("network config read should not produce a write outcome");
+            };
+            let start = offset as usize;
+            actual[start..start + len as usize].copy_from_slice(data.as_slice());
+        }
+        let mut expected = [0_u8; 12];
+        expected[..6].copy_from_slice(&realized_mac.octets());
+        expected[10..].copy_from_slice(&1400_u16.to_le_bytes());
+        assert_eq!(actual, expected);
+        assert_eq!(
+            controller.network_interface_configs()[0].guest_mac(),
+            None,
+            "realized identity must not rewrite requested API configuration"
+        );
+
+        let profiles = BTreeMap::from([("eth0".to_owned(), profile)]);
+        let mut pci_config = valid_config(&[]);
+        pci_config.gic = valid_gic_with_msi();
+        let pci_resources =
+            Arm64BootResources::assemble_from_controller_with_startup_resources_and_pci_validation(
+                &controller,
+                pci_config,
+                VmStartupResources::default().with_network_device_profiles(profiles),
+                Some(Arm64BootPciValidationConfig::data_devices()),
+            )
+            .expect("PCI network profile should assemble");
+        assert!(pci_resources.network_devices.is_empty());
+        assert_eq!(pci_resources.pci_network_devices.len(), 1);
+        assert_eq!(
+            pci_resources.pci_network_devices[0]
+                .config_space()
+                .guest_mac(),
+            Some(realized_mac)
+        );
+        assert_eq!(
+            pci_resources.pci_network_devices[0].config_space().mtu(),
+            Some(1400)
+        );
     }
 
     #[test]

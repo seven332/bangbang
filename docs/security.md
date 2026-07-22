@@ -829,8 +829,10 @@ Unsupported names fail before the VM reaches `Running`. When every configured
 network interface is selected by MMDS config, startup still validates the same
 vmnet-shaped names but can use process-local MMDS-only packet I/O without
 opening vmnet resources. Otherwise, startup opens vmnet resources for the
-configured interfaces and retains stop-on-drop cleanup ownership inside the
-process.
+configured interfaces, validates their returned profiles, and retains one
+bounded lifecycle owner per handle inside the process. Drop stops an active
+owner at most once; a failed or unconfirmed stop marks it uncertain and cannot
+trigger another attempt or reuse.
 
 Public PCI sessions retain those owners in a bounded per-interface registry.
 Runtime PUT prepares a complete independent MMDS-only or vmnet entry, publishes
@@ -916,16 +918,26 @@ for separate VMs unless sharing is intentional and externally coordinated.
 Apple's current [vmnet contract](https://developer.apple.com/documentation/vmnet)
 returns the MAC address and MTU that the guest should use and documents limits
 of 32 interfaces overall, four per guest operating system, and read/write calls
-of at most 200 packets and 256 KB. The current bangbang system backend discards
-vmnet's start-completion MAC, MTU, and maximum-packet-size values and does not
-register the packet-available event callback. It retains synchronous
-single-packet read/write adapters, injected backend tests, and stop-on-drop
-cleanup, but its generic 16-interface configuration cap is not enforcement of
-Apple's per-guest resource policy. Repository tests carry no restricted
-credential fixture. They prove the positive packaging transaction with
-synthetic tools, the real blocked preflight contract without credentials, and
-signed negative runtime shapes, but do not prove direct-vmnet guest
-connectivity.
+of at most 200 packets and 256 KB. The bangbang system backend copies, validates,
+and retains the start-completion MAC, effective MTU, maximum packet size,
+optional UUID, and optional batch limits before guest or runtime publication.
+Configured and allocated realized MACs share one process-local reservation set;
+requested API configuration remains distinct from the redacted realized
+profile. Start and stop completions have finite deadlines. A returned handle is
+either retained by one active owner, confirmed stopped once, or marked terminal
+and uncertain; failed stop is never retried or reused. Diagnostics omit MAC,
+UUID, bridge/interface names, returned bounds, XPC contents, raw handles, and
+unknown framework values.
+
+The backend does not register the packet-available event callback and retains
+raw-Ethernet synchronous single-packet reads and writes. Returned batch limits
+are dormant bounds, direct virtio headers stay disabled, and no offload feature
+is advertised. The generic 16-interface configuration cap is not enforcement
+of Apple's per-guest resource policy. Repository tests carry no restricted
+credential fixture. They prove typed reconciliation and bounded lifecycle with
+injected backends, the positive packaging transaction with synthetic tools, the
+real blocked preflight contract without credentials, and signed negative
+runtime shapes, but do not prove direct-vmnet guest connectivity.
 
 Configured RX/TX token buckets are implemented as device-local queue admission
 with retained work and session-owned retry wakeups. They are not packet

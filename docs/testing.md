@@ -1960,9 +1960,12 @@ add Running/Paused PUT, rescan, real MMDS exchange, sysfs removal, DELETE,
 live-config projection, exact BDF/capacity reuse, and clean shutdown; the
 contained case proves this needs no vmnet entitlement and that unauthorized
 non-MMDS insertion rolls back. The tests do not execute direct-vmnet external
-connectivity, returned MAC/MTU/maximum-packet reconciliation, packet-available
-callbacks, broader MMDS TCP behavior, limiter-specific metrics, automatic PCI
-notification, or network snapshot state.
+connectivity. Unsigned injected-system tests cover returned
+MAC/MTU/maximum-packet/UUID/batch reconciliation, allocated-MAC uniqueness,
+finite start/stop deadlines, late callbacks, and terminal cleanup uncertainty.
+Packet-available callbacks, batch dispatch, direct virtio headers, offloads,
+broader MMDS TCP behavior, limiter-specific metrics, automatic PCI notification,
+and network snapshot state remain outside the signed evidence.
 
 For block specifically, this evidence validates the supported public
 file-backed subset over MMIO by default or PCI with `--enable-pci`, including

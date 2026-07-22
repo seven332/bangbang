@@ -1,6 +1,6 @@
 //! Backend-neutral network-interface configuration model.
 
-use std::collections::TryReserveError;
+use std::collections::{BTreeMap, TryReserveError};
 use std::fmt;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -3325,7 +3325,41 @@ impl VirtioMmioDeviceActivationHandler for VirtioNetworkDevice {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct NetworkDeviceProfile {
+    guest_mac: Option<GuestMacAddress>,
+    mtu: Option<u16>,
+}
+
+impl NetworkDeviceProfile {
+    pub const fn new(guest_mac: Option<GuestMacAddress>, mtu: Option<u16>) -> Self {
+        Self { guest_mac, mtu }
+    }
+
+    pub const fn from_config(config: &NetworkInterfaceConfig) -> Self {
+        Self::new(config.guest_mac(), config.mtu())
+    }
+
+    pub const fn guest_mac(&self) -> Option<GuestMacAddress> {
+        self.guest_mac
+    }
+
+    pub const fn mtu(&self) -> Option<u16> {
+        self.mtu
+    }
+}
+
+impl fmt::Debug for NetworkDeviceProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NetworkDeviceProfile")
+            .field("guest_mac", &self.guest_mac.map(|_| "<configured>"))
+            .field("mtu", &self.mtu.map(|_| "<configured>"))
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedNetworkDevice {
     iface_id: String,
     host_dev_name: String,
@@ -3335,10 +3369,17 @@ pub struct PreparedNetworkDevice {
 
 impl PreparedNetworkDevice {
     pub fn from_config(config: &NetworkInterfaceConfig) -> Self {
+        Self::from_config_with_profile(config, NetworkDeviceProfile::from_config(config))
+    }
+
+    pub fn from_config_with_profile(
+        config: &NetworkInterfaceConfig,
+        profile: NetworkDeviceProfile,
+    ) -> Self {
         Self {
             iface_id: config.iface_id().to_string(),
             host_dev_name: config.host_dev_name().to_string(),
-            config_space: VirtioNetworkConfigSpace::new(config.guest_mac(), config.mtu()),
+            config_space: VirtioNetworkConfigSpace::new(profile.guest_mac(), profile.mtu()),
             device: VirtioNetworkDevice::with_rate_limiters(
                 config.rx_rate_limiter(),
                 config.tx_rate_limiter(),
@@ -3379,6 +3420,18 @@ impl PreparedNetworkDevice {
     }
 }
 
+impl fmt::Debug for PreparedNetworkDevice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedNetworkDevice")
+            .field("iface_id", &"<redacted>")
+            .field("host_dev_name", &"<redacted>")
+            .field("config_space", &"<redacted>")
+            .field("device", &"<owned>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PreparedNetworkDevices {
     devices: Vec<PreparedNetworkDevice>,
@@ -3401,6 +3454,30 @@ impl PreparedNetworkDevices {
 
         for config in configs {
             devices.push(PreparedNetworkDevice::from_config(config));
+        }
+
+        Ok(Self { devices })
+    }
+
+    pub fn from_config_slice_with_profiles(
+        configs: &[NetworkInterfaceConfig],
+        mut profiles: BTreeMap<String, NetworkDeviceProfile>,
+    ) -> Result<Self, PreparedNetworkDeviceError> {
+        let mut devices = Vec::new();
+        devices
+            .try_reserve_exact(configs.len())
+            .map_err(|source| PreparedNetworkDeviceError::AllocateDevices { source })?;
+
+        for config in configs {
+            let profile = profiles
+                .remove(config.iface_id())
+                .ok_or(PreparedNetworkDeviceError::MissingProfile)?;
+            devices.push(PreparedNetworkDevice::from_config_with_profile(
+                config, profile,
+            ));
+        }
+        if !profiles.is_empty() {
+            return Err(PreparedNetworkDeviceError::UnexpectedProfile);
         }
 
         Ok(Self { devices })
@@ -3884,6 +3961,8 @@ impl std::error::Error for NetworkMmioRegistrationError {
 #[derive(Debug)]
 pub enum PreparedNetworkDeviceError {
     AllocateDevices { source: TryReserveError },
+    MissingProfile,
+    UnexpectedProfile,
 }
 
 impl fmt::Display for PreparedNetworkDeviceError {
@@ -3891,6 +3970,12 @@ impl fmt::Display for PreparedNetworkDeviceError {
         match self {
             Self::AllocateDevices { source } => {
                 write!(f, "failed to allocate prepared network devices: {source}")
+            }
+            Self::MissingProfile => {
+                f.write_str("a configured network interface has no realized device profile")
+            }
+            Self::UnexpectedProfile => {
+                f.write_str("a realized network device profile has no configured interface")
             }
         }
     }
@@ -3900,6 +3985,7 @@ impl std::error::Error for PreparedNetworkDeviceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::AllocateDevices { source } => Some(source),
+            Self::MissingProfile | Self::UnexpectedProfile => None,
         }
     }
 }
@@ -4879,6 +4965,7 @@ fn validate_interface_update_id(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::str::FromStr;
     use std::time::{Duration, Instant};
 
@@ -4905,24 +4992,25 @@ mod tests {
     };
 
     use super::{
-        GuestMacAddress, InterfaceIdSource, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig,
-        NetworkInterfaceConfigError, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
-        NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput, NetworkMmioDevices,
-        NetworkMmioLayout, NetworkMmioRegistrationError, NetworkRateLimiterConfig,
-        NetworkRuntimeMutationError, NetworkTokenBucketConfig, PreparedNetworkDevices,
-        VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_CONFIG_MTU_OFFSET,
-        VIRTIO_NET_CONFIG_MTU_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU,
-        VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT,
-        VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE,
-        VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace,
-        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
-        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRateLimiter,
-        VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket,
-        VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
-        VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
-        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
-        VirtioNetworkTxPacketSinkError, VirtioNetworkTxQueueDispatchError,
+        GuestMacAddress, InterfaceIdSource, MAX_NETWORK_INTERFACE_COUNT, NetworkDeviceProfile,
+        NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkInterfaceConfigInput,
+        NetworkInterfaceConfigs, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
+        NetworkMmioDevices, NetworkMmioLayout, NetworkMmioRegistrationError,
+        NetworkRateLimiterConfig, NetworkRuntimeMutationError, NetworkTokenBucketConfig,
+        PreparedNetworkDeviceError, PreparedNetworkDevices, VIRTIO_FEATURE_VERSION_1,
+        VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_CONFIG_MTU_OFFSET, VIRTIO_NET_CONFIG_MTU_SIZE,
+        VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU, VIRTIO_NET_MAX_BUFFER_SIZE,
+        VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE,
+        VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX,
+        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace, VirtioNetworkDevice,
+        VirtioNetworkDeviceActivationError, VirtioNetworkDeviceNotificationError,
+        VirtioNetworkMmioHandler, VirtioNetworkRateLimiter, VirtioNetworkRxBuffer,
+        VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
+        VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
+        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketDisposition,
+        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+        VirtioNetworkTxQueueDispatchError,
     };
 
     const TEST_MMIO_BASE: GuestAddress = GuestAddress::new(0x1000);
@@ -7192,6 +7280,104 @@ mod tests {
                 | virtio_feature_bit(VIRTIO_NET_F_MTU)
         );
         assert!(!device.device().is_activated());
+    }
+
+    #[test]
+    fn prepared_network_device_profile_keeps_requested_config_immutable() {
+        let requested_mac = test_guest_mac();
+        let realized_mac = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 0x88]);
+        let config = NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+            .with_guest_mac(requested_mac.to_string())
+            .with_mtu(1500)
+            .validate()
+            .expect("requested network config should validate");
+        let profile = NetworkDeviceProfile::new(Some(realized_mac), Some(1500));
+
+        let device = super::PreparedNetworkDevice::from_config_with_profile(&config, profile);
+
+        assert_eq!(config.guest_mac(), Some(requested_mac));
+        assert_eq!(config.mtu(), Some(1500));
+        assert_eq!(device.config_space().guest_mac(), Some(realized_mac));
+        assert_eq!(device.config_space().mtu(), Some(1500));
+        assert_eq!(profile.guest_mac(), Some(realized_mac));
+        assert_eq!(profile.mtu(), Some(1500));
+        let debug = format!("{profile:?} {device:?}");
+        assert!(debug.contains("<configured>"));
+        assert!(!debug.contains(&requested_mac.to_string()));
+        assert!(!debug.contains(&realized_mac.to_string()));
+        assert!(!debug.contains("vmnet:shared"));
+    }
+
+    #[test]
+    fn prepared_network_devices_consume_exact_profiles_in_configuration_order() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new(
+                "eth0",
+                "eth0",
+                "vmnet:shared",
+            ))
+            .expect("first network config should validate");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "vmnet:host").with_mtu(1400))
+            .expect("second network config should validate");
+        let first_mac = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 1]);
+        let second_mac = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 2]);
+        let profiles = BTreeMap::from([
+            (
+                "eth1".to_owned(),
+                NetworkDeviceProfile::new(Some(second_mac), Some(1400)),
+            ),
+            (
+                "eth0".to_owned(),
+                NetworkDeviceProfile::new(Some(first_mac), None),
+            ),
+        ]);
+
+        let devices =
+            PreparedNetworkDevices::from_config_slice_with_profiles(configs.as_slice(), profiles)
+                .expect("exact profile map should prepare");
+
+        assert_eq!(devices.as_slice()[0].iface_id(), "eth0");
+        assert_eq!(
+            devices.as_slice()[0].config_space().guest_mac(),
+            Some(first_mac)
+        );
+        assert_eq!(devices.as_slice()[0].config_space().mtu(), None);
+        assert_eq!(devices.as_slice()[1].iface_id(), "eth1");
+        assert_eq!(
+            devices.as_slice()[1].config_space().guest_mac(),
+            Some(second_mac)
+        );
+        assert_eq!(devices.as_slice()[1].config_space().mtu(), Some(1400));
+    }
+
+    #[test]
+    fn prepared_network_devices_reject_missing_and_unexpected_profiles() {
+        let config = NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+            .validate()
+            .expect("network config should validate");
+        let configs = [config];
+
+        let missing =
+            PreparedNetworkDevices::from_config_slice_with_profiles(&configs, BTreeMap::new())
+                .expect_err("missing realized profile should fail");
+        assert!(matches!(
+            missing,
+            PreparedNetworkDeviceError::MissingProfile
+        ));
+
+        let profiles = BTreeMap::from([
+            ("eth0".to_owned(), NetworkDeviceProfile::new(None, None)),
+            ("eth1".to_owned(), NetworkDeviceProfile::new(None, None)),
+        ]);
+        let unexpected =
+            PreparedNetworkDevices::from_config_slice_with_profiles(&configs, profiles)
+                .expect_err("unexpected realized profile should fail");
+        assert!(matches!(
+            unexpected,
+            PreparedNetworkDeviceError::UnexpectedProfile
+        ));
     }
 
     #[test]

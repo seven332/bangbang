@@ -97,7 +97,7 @@ use crate::periodic_metrics::{
 use crate::vmm::{
     ApiRequestMetricParseFailure, ApiRequestMetricPatchParseFailure,
     ApiRequestMetricPutParseFailure, GetApiRequest, PatchApiRequest, ProcessSessionExitDecision,
-    PutApiRequest, VmmRequestHandler,
+    ProcessSessionExitStatus, PutApiRequest, VmmRequestHandler,
 };
 
 const READ_CHUNK_SIZE: usize = 4096;
@@ -252,6 +252,9 @@ impl ApiServer {
             .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
         loop {
+            if process_session_should_exit(vmm.process_exit_status())? {
+                return Ok(());
+            }
             let now = Instant::now();
             let metrics_timeout =
                 metrics_scheduler.poll_timeout_ms(now, vmm.metrics_session_epoch());
@@ -271,12 +274,8 @@ impl ApiServer {
             }
             vmm.drain_process_exit_wakeup()
                 .map_err(ApiServerError::Connection)?;
-            match vmm.process_exit_status().decision() {
-                ProcessSessionExitDecision::Continue => {}
-                ProcessSessionExitDecision::ExitSuccessfully => return Ok(()),
-                ProcessSessionExitDecision::ExitWithFailure => {
-                    return Err(ApiServerError::ProcessSessionTerminal);
-                }
+            if process_session_should_exit(vmm.process_exit_status())? {
+                return Ok(());
             }
 
             if handle_due_periodic_schedulers(vmm, &mut metrics_scheduler, &mut balloon_scheduler)?
@@ -288,6 +287,9 @@ impl ApiServer {
                 Ok(()) => {}
                 Err(ApiServerError::Accept(kind)) if is_transient_accept_error(kind) => {}
                 Err(err) => return Err(err),
+            }
+            if process_session_should_exit(vmm.process_exit_status())? {
+                return Ok(());
             }
         }
     }
@@ -304,6 +306,14 @@ impl ApiServer {
         let _ = handle_connection(&mut stream, vmm, self.http_api_max_payload_size);
 
         Ok(())
+    }
+}
+
+fn process_session_should_exit(status: ProcessSessionExitStatus) -> Result<bool, ApiServerError> {
+    match status.decision() {
+        ProcessSessionExitDecision::Continue => Ok(false),
+        ProcessSessionExitDecision::ExitSuccessfully => Ok(true),
+        ProcessSessionExitDecision::ExitWithFailure => Err(ApiServerError::ProcessSessionTerminal),
     }
 }
 
@@ -2302,10 +2312,11 @@ mod tests {
 
     use crate::test_support::minimal_arm64_boot_resource_config;
     use crate::vmm::{
-        BlockBackingUpdate, InstanceStartExecutor, NativeV1SnapshotCaptureCancellation,
-        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
-        NativeV1SnapshotPublicationProducerError, ProcessSessionDiagnostics,
-        ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority, SnapshotV1LoadSuccess,
+        BlockBackingUpdate, InstanceStartError, InstanceStartExecutor,
+        NativeV1SnapshotCaptureCancellation, NativeV1SnapshotLoadError,
+        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
+        SnapshotV1LoadSuccess,
     };
 
     use super::*;
@@ -2380,6 +2391,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestInstanceStarter {
         result: Result<TestSession, BackendError>,
+        terminal_start_failure: bool,
         assemble_boot_resources: bool,
         snapshot_operations_succeed: bool,
         snapshot_gate: Option<SnapshotCallGate>,
@@ -2655,6 +2667,7 @@ mod tests {
         const fn success() -> Self {
             Self {
                 result: Ok(TestSession::without_boot_run_loop_status()),
+                terminal_start_failure: false,
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
                 snapshot_gate: None,
@@ -2664,6 +2677,7 @@ mod tests {
         const fn success_with_boot_run_loop_status(status: BootRunLoopMetricStatus) -> Self {
             Self {
                 result: Ok(TestSession::with_boot_run_loop_status(status)),
+                terminal_start_failure: false,
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
                 snapshot_gate: None,
@@ -2673,6 +2687,7 @@ mod tests {
         fn success_with_process_exit_signal(signal: TestProcessExitSignal) -> Self {
             Self {
                 result: Ok(TestSession::with_process_exit_signal(signal)),
+                terminal_start_failure: false,
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
                 snapshot_gate: None,
@@ -2686,6 +2701,7 @@ mod tests {
                 result: Ok(TestSession::with_memory_hotplug_status_plugged_size_mib(
                     plugged_size_mib,
                 )),
+                terminal_start_failure: false,
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
                 snapshot_gate: None,
@@ -2695,6 +2711,7 @@ mod tests {
         const fn failure() -> Self {
             Self {
                 result: Err(BackendError::InvalidState("test startup failed")),
+                terminal_start_failure: false,
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
                 snapshot_gate: None,
@@ -2704,6 +2721,17 @@ mod tests {
         fn failure_with(source: BackendError) -> Self {
             Self {
                 result: Err(source),
+                terminal_start_failure: false,
+                assemble_boot_resources: false,
+                snapshot_operations_succeed: false,
+                snapshot_gate: None,
+            }
+        }
+
+        const fn terminal_failure() -> Self {
+            Self {
+                result: Err(BackendError::InvalidState("test terminal startup failed")),
+                terminal_start_failure: true,
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: false,
                 snapshot_gate: None,
@@ -2713,6 +2741,7 @@ mod tests {
         const fn boot_resource_assembler() -> Self {
             Self {
                 result: Ok(TestSession::without_boot_run_loop_status()),
+                terminal_start_failure: false,
                 assemble_boot_resources: true,
                 snapshot_operations_succeed: false,
                 snapshot_gate: None,
@@ -2722,6 +2751,7 @@ mod tests {
         const fn snapshot_success() -> Self {
             Self {
                 result: Ok(TestSession::without_boot_run_loop_status()),
+                terminal_start_failure: false,
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: true,
                 snapshot_gate: None,
@@ -2731,6 +2761,7 @@ mod tests {
         fn snapshot_success_with_gate(snapshot_gate: SnapshotCallGate) -> Self {
             Self {
                 result: Ok(TestSession::without_boot_run_loop_status()),
+                terminal_start_failure: false,
                 assemble_boot_resources: false,
                 snapshot_operations_succeed: true,
                 snapshot_gate: Some(snapshot_gate),
@@ -2744,7 +2775,7 @@ mod tests {
         fn start(
             &mut self,
             controller: &bangbang_runtime::VmmController,
-        ) -> Result<Self::Session, BackendError> {
+        ) -> Result<Self::Session, InstanceStartError> {
             if self.assemble_boot_resources {
                 return Arm64BootResources::assemble_from_controller(
                     controller,
@@ -2752,13 +2783,19 @@ mod tests {
                 )
                 .map(|_| TestSession::without_boot_run_loop_status())
                 .map_err(|source| {
-                    BackendError::Hypervisor(format!(
+                    InstanceStartError::retryable(BackendError::Hypervisor(format!(
                         "failed to assemble arm64 boot resources: {source}"
-                    ))
+                    )))
                 });
             }
 
-            self.result.clone()
+            self.result.clone().map_err(|source| {
+                if self.terminal_start_failure {
+                    InstanceStartError::terminal(source)
+                } else {
+                    InstanceStartError::retryable(source)
+                }
+            })
         }
 
         fn publish_snapshot_v1(
@@ -11275,6 +11312,53 @@ mod tests {
         assert_eq!(
             server.run_until(&mut vmm, &mut shutdown_reader),
             Err(ApiServerError::ProcessSessionTerminal)
+        );
+        drop(server);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_until_returns_terminal_start_response_before_exiting_without_wakeup_fd() {
+        let path = unique_socket_path("terminal-start");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let (mut shutdown_reader, _shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::terminal_failure());
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        let request = request_with_body("PUT", "/actions", r#"{"action_type":"InstanceStart"}"#);
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let client_handle = thread::spawn(move || {
+            client
+                .write_all(request.as_bytes())
+                .expect("client should write terminal start request");
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("client should read terminal start response");
+            response
+        });
+
+        assert_eq!(
+            server.run_until(&mut vmm, &mut shutdown_reader),
+            Err(ApiServerError::ProcessSessionTerminal)
+        );
+        let response = client_handle
+            .join()
+            .expect("terminal start client should not panic");
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "unexpected terminal start response: {response}"
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+        assert_eq!(
+            vmm.process_exit_status(),
+            ProcessSessionExitStatus::Terminal
         );
         drop(server);
         assert!(!path.exists());
