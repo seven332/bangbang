@@ -2243,15 +2243,30 @@ arbitrary version tokens. It can synthesize deterministic
 Ethernet/ARP replies, Ethernet/IPv4/TCP SYN-ACK frames, and Ethernet/IPv4/TCP
 response frames carrying those bytes, expose queued response frames through the
 matching virtio-net RX source, and schedule one bounded post-TX RX retry when
-that source reports a queued response. It also has a process-local
-opaque token authority with a default `1024`-entry active-token store and can
-model process-local guest `PUT /latest/api/token` exchanges that return
-generated tokens. When MMDS v2 is configured, process-local guest GET handling
-requires a valid generated token before returning metadata. The signed
-executable e2e coverage includes a direct-rootfs v2 token flow that requests a
-guest token and uses it for metadata access, while the guest init script emits
-only static success or failure markers and must not log generated tokens or
-metadata values. The runtime can
+that source reports a queued response. It also has a stateless process-local
+MMDS v2 token authority matching Firecracker v1.16.0's AES-256-GCM envelope:
+a 12-byte random nonce, encrypted 8-byte little-endian monotonic expiry, and
+16-byte authentication tag encoded as exactly 48 standard-Base64 characters.
+The immutable `microvmid=<instance-id>` additional-authentication data binds
+each token to the controller instance that created it. Keys and AAD are
+zeroizing and debug-redacted. Instance/startup configuration and internal HTTP,
+request-buffer, response-queue, normalized-packet, staged-frame, and RX-packet
+debug views redact identities and packet contents while retaining only safe
+shape, count, and length diagnostics. The authority rotates before encrypting
+beyond `u32::MAX` tokens under one key, and failed first-use or rotation
+attempts do not replace the current key or advance its counter. Validation
+applies the 70-byte input gate before decoding, accepts only the current key,
+does not mutate authority state, and exposes all malformed, modified,
+foreign-instance, stale-key, and expired values through the same invalid-token
+result. When MMDS
+v2 is configured, process-local guest GET handling requires a valid generated
+token before returning metadata. Signed executable e2e coverage requests and
+uses a guest token without logging it. Its concurrent two-process case also
+moves each opaque token through fixed scratch sectors while both VMs are
+paused, requires `401 Unauthorized` when each guest presents its peer's token,
+then proves each guest's own token remains valid. The host and guest emit only
+static coordination markers, and dynamic token bytes are checked absent from
+stdout, stderr, and failure diagnostics. The runtime can
 classify ARP requests for the configured MMDS IPv4 address and raw
 Ethernet/IPv4/TCP guest packet bytes as MMDS candidates only when they target
 the configured MMDS IPv4 address and TCP port `80`; malformed, truncated,

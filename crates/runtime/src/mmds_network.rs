@@ -80,13 +80,25 @@ impl fmt::Display for MmdsOnlyVirtioNetworkPacketIoProviderBuildError {
 
 impl std::error::Error for MmdsOnlyVirtioNetworkPacketIoProviderBuildError {}
 
-#[derive(Debug)]
 pub struct MmdsPacketDetour {
     mmds_state: MmdsStateHandle,
     mmds_ipv4_address: Ipv4Addr,
     response_queue: MmdsResponseQueue,
     request_buffers: MmdsRequestBuffers,
     metrics: SharedMmdsMetrics,
+}
+
+impl fmt::Debug for MmdsPacketDetour {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsPacketDetour")
+            .field("mmds_state", &"<configured>")
+            .field("mmds_ipv4_address", &self.mmds_ipv4_address)
+            .field("response_queue", &self.response_queue)
+            .field("request_buffers", &self.request_buffers)
+            .field("metrics", &"<configured>")
+            .finish()
+    }
 }
 
 impl MmdsPacketDetour {
@@ -328,11 +340,21 @@ fn record_mmds_guest_http_request_metrics(
     }
 }
 
-#[derive(Debug)]
 struct MmdsRequestBuffers {
     capacity: usize,
     request_len_limit: usize,
     entries: Vec<MmdsRequestBufferEntry>,
+}
+
+impl fmt::Debug for MmdsRequestBuffers {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsRequestBuffers")
+            .field("capacity", &self.capacity)
+            .field("request_len_limit", &self.request_len_limit)
+            .field("entry_count", &self.entries.len())
+            .finish()
+    }
 }
 
 impl Default for MmdsRequestBuffers {
@@ -420,12 +442,24 @@ enum MmdsRequestBufferAppend {
     Complete(MmdsBufferedRequest),
 }
 
-#[derive(Debug)]
 struct MmdsRequestBufferEntry {
     key: MmdsRequestBufferKey,
     response_context: MmdsGuestTcpResponseContext,
     next_sequence_number: u32,
     payload: Vec<u8>,
+}
+
+impl fmt::Debug for MmdsRequestBufferEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsRequestBufferEntry")
+            .field("key", &self.key)
+            .field("response_context", &self.response_context)
+            .field("next_sequence_number", &self.next_sequence_number)
+            .field("payload", &"[REDACTED]")
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 impl MmdsRequestBufferEntry {
@@ -476,10 +510,20 @@ impl MmdsRequestBufferEntry {
     }
 }
 
-#[derive(Debug)]
 struct MmdsBufferedRequest {
     response_context: MmdsGuestTcpResponseContext,
     payload: Vec<u8>,
+}
+
+impl fmt::Debug for MmdsBufferedRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsBufferedRequest")
+            .field("response_context", &self.response_context)
+            .field("payload", &"[REDACTED]")
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 fn mmds_request_next_sequence_number(
@@ -572,10 +616,20 @@ fn mmds_http_request_is_complete(payload: &[u8]) -> bool {
         .any(|window| window == MMDS_HTTP_HEADER_TERMINATOR)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MmdsResponseQueue {
     state: Arc<Mutex<MmdsResponseQueueState>>,
     metrics: SharedMmdsMetrics,
+}
+
+impl fmt::Debug for MmdsResponseQueue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsResponseQueue")
+            .field("state", &"<configured>")
+            .field("metrics", &"<configured>")
+            .finish()
+    }
 }
 
 impl Default for MmdsResponseQueue {
@@ -796,16 +850,36 @@ impl MmdsResponseQueue {
     }
 }
 
-#[derive(Debug)]
 struct MmdsResponseQueueState {
     capacity: usize,
     responses: VecDeque<MmdsQueuedResponse>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for MmdsResponseQueueState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsResponseQueueState")
+            .field("capacity", &self.capacity)
+            .field("response_count", &self.responses.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct MmdsQueuedResponse {
     priority: MmdsResponseQueuePriority,
     frame: Vec<u8>,
+}
+
+impl fmt::Debug for MmdsQueuedResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsQueuedResponse")
+            .field("priority", &self.priority)
+            .field("frame", &"[REDACTED]")
+            .field("frame_len", &self.frame.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -994,10 +1068,19 @@ impl fmt::Debug for MmdsOnlyVirtioNetworkTxPacketSink {
     }
 }
 
-#[derive(Debug)]
 struct StagedMmdsOnlyTxFrame {
     packet: VirtioNetworkPacketPlan,
     disposition: VirtioNetworkTxPacketDisposition,
+}
+
+impl fmt::Debug for StagedMmdsOnlyTxFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StagedMmdsOnlyTxFrame")
+            .field("packet", &"[REDACTED]")
+            .field("disposition", &self.disposition)
+            .finish()
+    }
 }
 
 impl MmdsOnlyVirtioNetworkTxPacketSink {
@@ -1184,11 +1267,22 @@ impl VirtioNetworkTxPacketSink for MmdsOnlyVirtioNetworkTxPacketSink {
     }
 }
 
-#[derive(Debug)]
 pub struct MmdsOnlyVirtioNetworkRxPacketSource {
     response_queue: MmdsResponseQueue,
     read_buffer: Vec<u8>,
     cached_len: Option<usize>,
+}
+
+impl fmt::Debug for MmdsOnlyVirtioNetworkRxPacketSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsOnlyVirtioNetworkRxPacketSource")
+            .field("response_queue", &self.response_queue)
+            .field("read_buffer", &"[REDACTED]")
+            .field("read_buffer_len", &self.read_buffer.len())
+            .field("cached_len", &self.cached_len)
+            .finish()
+    }
 }
 
 impl MmdsOnlyVirtioNetworkRxPacketSource {
@@ -1270,8 +1364,176 @@ fn rx_mmds_response_queue_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mmds::DEFAULT_MMDS_IPV4_ADDRESS;
+    use crate::mmds::{DEFAULT_MMDS_IPV4_ADDRESS, MMDS_GUEST_TCP_PORT};
     use crate::network::VirtioNetworkTxHeader;
+
+    fn test_mmds_tcp_packet(payload: &[u8]) -> Vec<u8> {
+        const ETHERNET_HEADER_LEN: usize = 14;
+        const IPV4_HEADER_LEN: usize = 20;
+        const TCP_HEADER_LEN: usize = 20;
+
+        let ipv4_total_len = u16::try_from(IPV4_HEADER_LEN + TCP_HEADER_LEN + payload.len())
+            .expect("test IPv4 packet length should fit u16");
+        let mut packet = Vec::with_capacity(ETHERNET_HEADER_LEN + usize::from(ipv4_total_len));
+        packet.extend_from_slice(&[0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        packet.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        packet.extend_from_slice(&0x0800_u16.to_be_bytes());
+
+        packet.push(0x45);
+        packet.push(0);
+        packet.extend_from_slice(&ipv4_total_len.to_be_bytes());
+        packet.extend_from_slice(&0x1234_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.push(64);
+        packet.push(6);
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(&[10, 0, 0, 2]);
+        packet.extend_from_slice(&DEFAULT_MMDS_IPV4_ADDRESS.octets());
+
+        packet.extend_from_slice(&49152_u16.to_be_bytes());
+        packet.extend_from_slice(&MMDS_GUEST_TCP_PORT.to_be_bytes());
+        packet.extend_from_slice(&7_u32.to_be_bytes());
+        packet.extend_from_slice(&1_u32.to_be_bytes());
+        packet.push(0x50);
+        packet.push(0x18);
+        packet.extend_from_slice(&4096_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    fn assert_debug_redacts(debug_output: &str, protected_value: &str) {
+        let byte_sequence = protected_value
+            .as_bytes()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(!debug_output.contains(protected_value));
+        assert!(!debug_output.contains(&byte_sequence));
+    }
+
+    #[test]
+    fn mmds_request_buffer_debug_surfaces_redact_token_payloads() {
+        let token_value = "private-buffered-token-value-that-must-not-appear";
+        let request = format!("GET /meta-data HTTP/1.1\r\nX-metadata-token: {token_value}");
+        let packet = test_mmds_tcp_packet(request.as_bytes());
+        let classified = classify_mmds_guest_tcp_packet(&packet, DEFAULT_MMDS_IPV4_ADDRESS)
+            .expect("test MMDS packet should classify");
+
+        let mut request_buffers = MmdsRequestBuffers::default();
+        request_buffers
+            .start_request(
+                MmdsRequestBufferKey::from_packet(classified),
+                classified.response_context(),
+                classified.sequence_number(),
+                classified.payload(),
+            )
+            .expect("incomplete request should buffer");
+        let buffers_debug = format!("{request_buffers:?}");
+        let entry_debug = format!(
+            "{:?}",
+            request_buffers
+                .entries
+                .first()
+                .expect("buffered request entry should exist")
+        );
+        let buffered_request_debug = format!(
+            "{:?}",
+            request_buffers
+                .entries
+                .pop()
+                .expect("buffered request entry should exist")
+                .into_buffered_request()
+        );
+
+        let mut detour = MmdsPacketDetour::new(
+            MmdsStateHandle::default(),
+            DEFAULT_MMDS_IPV4_ADDRESS,
+            MmdsResponseQueue::default(),
+            SharedMmdsMetrics::default(),
+        );
+        assert!(
+            detour
+                .detour_packet(&packet)
+                .expect("incomplete MMDS request should detour")
+        );
+        let detour_debug = format!("{detour:?}");
+
+        for debug_output in [
+            &buffers_debug,
+            &entry_debug,
+            &buffered_request_debug,
+            &detour_debug,
+        ] {
+            assert_debug_redacts(debug_output, token_value);
+        }
+        assert!(buffers_debug.contains("entry_count: 1"));
+        assert!(entry_debug.contains("[REDACTED]"));
+        assert!(buffered_request_debug.contains("[REDACTED]"));
+        assert!(detour_debug.contains("entry_count: 1"));
+    }
+
+    #[test]
+    fn mmds_response_debug_surfaces_redact_queued_and_cached_frames() {
+        let token_value = "private-response-token-value-that-must-not-appear";
+        let queue = MmdsResponseQueue::with_capacity(2);
+        queue
+            .push_with(|| Ok(token_value.as_bytes().to_vec()))
+            .expect("test response should queue");
+
+        let queue_debug = format!("{queue:?}");
+        let state = queue.state.lock().expect("test response queue should lock");
+        let state_debug = format!("{state:?}");
+        let queued_response_debug = format!(
+            "{:?}",
+            state
+                .responses
+                .front()
+                .expect("queued response should exist")
+        );
+        drop(state);
+
+        let mut rx_source = MmdsOnlyVirtioNetworkRxPacketSource::new(queue, 256)
+            .expect("test MMDS RX source should build");
+        assert!(
+            rx_source
+                .peek_packet()
+                .expect("queued response should be readable")
+                .is_some()
+        );
+        let rx_source_debug = format!("{rx_source:?}");
+
+        for debug_output in [
+            &queue_debug,
+            &state_debug,
+            &queued_response_debug,
+            &rx_source_debug,
+        ] {
+            assert_debug_redacts(debug_output, token_value);
+        }
+        assert!(state_debug.contains("response_count: 1"));
+        assert!(queued_response_debug.contains("[REDACTED]"));
+        assert!(rx_source_debug.contains("[REDACTED]"));
+        assert!(rx_source_debug.contains(&format!("cached_len: Some({})", token_value.len())));
+    }
+
+    #[test]
+    fn staged_mmds_tx_frame_debug_redacts_packet_bytes() {
+        let token_value = "private-staged-token-value-that-must-not-appear";
+        let mut packet = vec![0; 14];
+        packet.extend_from_slice(token_value.as_bytes());
+        let staged = StagedMmdsOnlyTxFrame {
+            packet: VirtioNetworkPacketPlan::prepare(VirtioNetworkTxHeader::new(), 0, packet)
+                .expect("test Ethernet packet should validate"),
+            disposition: VirtioNetworkTxPacketDisposition::Forwarded,
+        };
+        let debug_output = format!("{staged:?}");
+
+        assert_debug_redacts(&debug_output, token_value);
+        assert!(debug_output.contains("[REDACTED]"));
+    }
 
     #[test]
     fn mmds_only_tx_observes_configured_source_mac_without_filtering() {

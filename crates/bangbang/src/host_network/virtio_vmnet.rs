@@ -1783,8 +1783,8 @@ mod tests {
     };
     use bangbang_runtime::metrics::{MmdsMetrics, SharedMmdsMetrics};
     use bangbang_runtime::mmds::{
-        DEFAULT_MMDS_IPV4_ADDRESS, DEFAULT_MMDS_MAC_ADDRESS, MMDS_GUEST_TCP_PORT, MmdsConfigInput,
-        MmdsStateHandle, MmdsVersion,
+        DEFAULT_MMDS_IPV4_ADDRESS, DEFAULT_MMDS_MAC_ADDRESS, MMDS_GUEST_TCP_PORT, MmdsConfig,
+        MmdsConfigInput, MmdsState, MmdsStateHandle, MmdsVersion,
     };
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::{
@@ -2334,6 +2334,17 @@ mod tests {
             .expect("MMDS state should lock")
             .expect("MMDS config should initialize");
         handle
+    }
+
+    fn mmds_state_projection(
+        state: &MmdsState,
+    ) -> (Option<MmdsConfig>, bool, serde_json::Value, usize) {
+        (
+            state.config().cloned(),
+            state.data_store_present(),
+            state.get_data_or_null(),
+            state.data_store_limit_bytes(),
+        )
     }
 
     fn mmds_response_frame_tcp_payload(response_frame: &[u8]) -> &[u8] {
@@ -3766,7 +3777,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(0);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -3786,7 +3797,7 @@ mod tests {
         );
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -4205,7 +4216,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(2);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -4228,7 +4239,7 @@ mod tests {
         drop(state);
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -4250,7 +4261,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(2);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -4273,7 +4284,7 @@ mod tests {
         drop(state);
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -4294,7 +4305,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(2);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -4317,7 +4328,7 @@ mod tests {
         drop(state);
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -4338,7 +4349,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(2);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -4361,7 +4372,7 @@ mod tests {
         drop(state);
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -4521,7 +4532,7 @@ mod tests {
             let response_queue = MmdsResponseQueue::with_capacity(2);
             let mmds_state = v2_mmds_state_handle();
             let state_before = mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock");
             let mut packet_io = packet_io_with_mmds_detour(
                 FakeVmnetPacketIoBackend::default(),
@@ -4544,7 +4555,7 @@ mod tests {
             drop(state);
             assert_eq!(
                 mmds_state
-                    .with(Clone::clone)
+                    .with(mmds_state_projection)
                     .expect("MMDS state should lock"),
                 state_before
             );
@@ -4574,7 +4585,7 @@ mod tests {
             let response_queue = MmdsResponseQueue::with_capacity(2);
             let mmds_state = v2_mmds_state_handle();
             let state_before = mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock");
             let mut packet_io = packet_io_with_mmds_detour(
                 FakeVmnetPacketIoBackend::default(),
@@ -4597,7 +4608,7 @@ mod tests {
             drop(state);
             assert_eq!(
                 mmds_state
-                    .with(Clone::clone)
+                    .with(mmds_state_projection)
                     .expect("MMDS state should lock"),
                 state_before
             );
@@ -4802,7 +4813,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(0);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -4817,7 +4828,7 @@ mod tests {
 
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -4854,7 +4865,7 @@ mod tests {
             .expect("MMDS response queue should read");
         let token =
             std::str::from_utf8(mmds_response_body(&responses[0])).expect("token should be UTF-8");
-        assert_eq!(token.len(), 64);
+        assert_eq!(token.len(), 48);
         assert!(
             mmds_state
                 .with(|state| state.is_guest_token_valid(token))
@@ -4999,7 +5010,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(2);
         let mmds_state = MmdsStateHandle::default();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -5022,7 +5033,7 @@ mod tests {
         drop(state);
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -5058,7 +5069,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(2);
         let mmds_state = MmdsStateHandle::default();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -5089,7 +5100,7 @@ mod tests {
         drop(state);
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -5208,7 +5219,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(2);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -5224,7 +5235,7 @@ mod tests {
 
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -5247,7 +5258,7 @@ mod tests {
         assert_eq!(responses.len(), 1);
         let token =
             std::str::from_utf8(mmds_response_body(&responses[0])).expect("token should be UTF-8");
-        assert_eq!(token.len(), 64);
+        assert_eq!(token.len(), 48);
         assert!(
             mmds_state
                 .with(|state| state.is_guest_token_valid(token))
@@ -5274,7 +5285,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(2);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -5304,7 +5315,7 @@ mod tests {
         );
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -5529,7 +5540,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(2);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -5553,7 +5564,7 @@ mod tests {
         assert!(error.message().contains("exceeds limit"));
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );
@@ -5656,7 +5667,7 @@ mod tests {
         let response_queue = MmdsResponseQueue::with_capacity(0);
         let mmds_state = v2_mmds_state_handle();
         let state_before = mmds_state
-            .with(Clone::clone)
+            .with(mmds_state_projection)
             .expect("MMDS state should lock");
         let mut packet_io = packet_io_with_mmds_detour(
             FakeVmnetPacketIoBackend::default(),
@@ -5677,7 +5688,7 @@ mod tests {
 
         assert_eq!(
             mmds_state
-                .with(Clone::clone)
+                .with(mmds_state_projection)
                 .expect("MMDS state should lock"),
             state_before
         );

@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod mmds;
 #[doc(hidden)]
 pub mod mmds_network;
+mod mmds_token;
 pub mod mmio;
 pub mod network;
 pub mod network_packet;
@@ -73,12 +74,24 @@ pub enum VmStateTransition {
     AlreadyInTargetState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InstanceInfo {
     pub id: String,
     pub state: InstanceState,
     pub vmm_version: String,
     pub app_name: String,
+}
+
+impl fmt::Debug for InstanceInfo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstanceInfo")
+            .field("id", &"[REDACTED]")
+            .field("state", &self.state)
+            .field("vmm_version", &self.vmm_version)
+            .field("app_name", &self.app_name)
+            .finish()
+    }
 }
 
 impl InstanceInfo {
@@ -588,10 +601,11 @@ impl VmmController {
         app_name: impl Into<String>,
         mmds_data_store_limit_bytes: usize,
     ) -> Self {
+        let instance_id = instance_id.into();
         let shared_logger_metrics = logger::SharedLoggerMetrics::default();
         Self {
             instance_info: InstanceInfo::new(
-                instance_id,
+                instance_id.clone(),
                 InstanceState::NotStarted,
                 vmm_version,
                 app_name,
@@ -610,8 +624,9 @@ impl VmmController {
             serial_config: serial::SerialConfig::default(),
             logger_state: logger::LoggerState::with_shared_metrics(shared_logger_metrics.clone()),
             metrics_state: metrics::MetricsState::with_shared_logger_metrics(shared_logger_metrics),
-            mmds_state: mmds::MmdsStateHandle::new(mmds::MmdsState::new(
+            mmds_state: mmds::MmdsStateHandle::new(mmds::MmdsState::with_instance_id(
                 mmds_data_store_limit_bytes,
+                instance_id,
             )),
             snapshot_load_history_fresh: true,
         }
@@ -2375,6 +2390,20 @@ mod tests {
         assert!(controller.network_interface_configs().is_empty());
         assert_eq!(controller.vsock_config(), None);
         assert_eq!(controller.serial_config().serial_out_path(), None);
+    }
+
+    #[test]
+    fn instance_debug_surfaces_redact_instance_identity() {
+        let instance_id = "private-instance-identity-that-must-not-appear";
+        let controller = VmmController::new(instance_id, "0.1.0", "bangbang");
+
+        for debug_output in [
+            format!("{:?}", controller.instance_info()),
+            format!("{controller:?}"),
+        ] {
+            assert!(!debug_output.contains(instance_id));
+            assert!(debug_output.contains("[REDACTED]"));
+        }
     }
 
     #[test]
@@ -5190,6 +5219,25 @@ mod tests {
             controller.handle_action(VmmAction::GetMmds),
             Ok(VmmData::MmdsValue(value))
         );
+    }
+
+    #[test]
+    fn controller_binds_mmds_token_authority_to_immutable_instance_id() {
+        let controller = VmmController::new("bound-instance", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller
+                .mmds_state
+                .with(|state| state.token_authority_is_bound_to_instance_id("bound-instance")),
+            Ok(true)
+        );
+        assert_eq!(
+            controller
+                .mmds_state
+                .with(|state| state.token_authority_is_bound_to_instance_id("peer-instance")),
+            Ok(false)
+        );
+        assert!(controller.instance_info().id == "bound-instance");
     }
 
     #[test]

@@ -1,21 +1,19 @@
 //! Backend-neutral MMDS control-plane input and metadata query model.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::str;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use serde_json::{Map, Value};
 
+pub use crate::mmds_token::{
+    MMDS_TOKEN_MAX_TTL_SECONDS, MMDS_TOKEN_MIN_TTL_SECONDS, MmdsTokenAuthority, MmdsTokenError,
+};
 use crate::network::NetworkInterfaceConfig;
 
 pub const MMDS_DATA_STORE_LIMIT_BYTES: usize = 51_200;
 pub const MMDS_GUEST_TCP_PORT: u16 = 80;
-pub const MMDS_TOKEN_MIN_TTL_SECONDS: u32 = 1;
-pub const MMDS_TOKEN_MAX_TTL_SECONDS: u32 = 21_600;
-pub const MMDS_TOKEN_MAX_ACTIVE_TOKENS: usize = 1_024;
 pub const DEFAULT_MMDS_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 pub const DEFAULT_MMDS_MAC_ADDRESS: EthernetMacAddress =
     EthernetMacAddress::from_octets([0x06, 0x01, 0x23, 0x45, 0x67, 0x01]);
@@ -69,7 +67,6 @@ const ARP_PROTOCOL_TYPE_OFFSET: usize = 2;
 const ARP_SENDER_HARDWARE_ADDRESS_OFFSET: usize = 8;
 const ARP_SENDER_PROTOCOL_ADDRESS_OFFSET: usize = 14;
 const ARP_TARGET_PROTOCOL_ADDRESS_OFFSET: usize = 24;
-const MMDS_TOKEN_BYTES: usize = 32;
 const MMDS_GUEST_TCP_SYN_ACK_SEQUENCE_NUMBER: u32 = 0;
 const MMDS_GUEST_ALLOW_METHODS: &str = "GET, PUT";
 const MMDS_GUEST_INVALID_TOKEN: &str = "MMDS token not valid.";
@@ -81,8 +78,6 @@ const MMDS_GUEST_X_AWS_EC2_METADATA_TOKEN_TTL_SECONDS: &str =
 const MMDS_GUEST_X_FORWARDED_FOR: &str = "X-Forwarded-For";
 const MMDS_GUEST_X_METADATA_TOKEN: &str = "X-metadata-token";
 const MMDS_GUEST_X_METADATA_TOKEN_TTL_SECONDS: &str = "X-metadata-token-ttl-seconds";
-const MMDS_MILLISECONDS_PER_SECOND: u64 = 1_000;
-const MMDS_TOKEN_GENERATION_ATTEMPTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EthernetMacAddress {
@@ -99,7 +94,7 @@ impl EthernetMacAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MmdsGuestTcpPacket<'a> {
     source_ethernet_address: EthernetMacAddress,
     destination_ethernet_address: EthernetMacAddress,
@@ -111,6 +106,27 @@ pub struct MmdsGuestTcpPacket<'a> {
     acknowledgement_number: u32,
     tcp_flags: u8,
     payload: &'a [u8],
+}
+
+impl fmt::Debug for MmdsGuestTcpPacket<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MmdsGuestTcpPacket")
+            .field("source_ethernet_address", &self.source_ethernet_address)
+            .field(
+                "destination_ethernet_address",
+                &self.destination_ethernet_address,
+            )
+            .field("source_ipv4_address", &self.source_ipv4_address)
+            .field("destination_ipv4_address", &self.destination_ipv4_address)
+            .field("source_port", &self.source_port)
+            .field("destination_port", &self.destination_port)
+            .field("sequence_number", &self.sequence_number)
+            .field("acknowledgement_number", &self.acknowledgement_number)
+            .field("tcp_flags", &self.tcp_flags)
+            .field("payload", &"[REDACTED]")
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1168,7 +1184,7 @@ pub enum MmdsGuestTokenTtl {
     Duplicate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum MmdsGuestToken {
     Missing,
     Header {
@@ -1176,6 +1192,20 @@ pub enum MmdsGuestToken {
         token_value: String,
     },
     Duplicate,
+}
+
+impl fmt::Debug for MmdsGuestToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => f.write_str("Missing"),
+            Self::Header { token_header, .. } => f
+                .debug_struct("Header")
+                .field("token_header", token_header)
+                .field("token_value", &"[REDACTED]")
+                .finish(),
+            Self::Duplicate => f.write_str("Duplicate"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1355,7 +1385,7 @@ impl MmdsGuestContentType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MmdsGuestResponse {
     http_version: MmdsGuestHttpVersion,
     status: MmdsGuestStatus,
@@ -1363,6 +1393,20 @@ pub struct MmdsGuestResponse {
     allow: Option<&'static str>,
     custom_headers: Vec<(&'static str, String)>,
     body: String,
+}
+
+impl fmt::Debug for MmdsGuestResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MmdsGuestResponse")
+            .field("http_version", &self.http_version)
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .field("allow", &self.allow)
+            .field("custom_headers", &"[REDACTED]")
+            .field("body", &"[REDACTED]")
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl MmdsGuestResponse {
@@ -1432,156 +1476,6 @@ impl MmdsGuestResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MmdsTokenError {
-    InvalidTtl { ttl_seconds: u32 },
-    ActiveTokenLimitExceeded { limit: usize },
-    RandomnessUnavailable,
-    TokenCollision,
-}
-
-impl fmt::Display for MmdsTokenError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidTtl { ttl_seconds } => write!(
-                f,
-                "Invalid MMDS token TTL: {ttl_seconds}. Please provide a value between {MMDS_TOKEN_MIN_TTL_SECONDS} and {MMDS_TOKEN_MAX_TTL_SECONDS}."
-            ),
-            Self::ActiveTokenLimitExceeded { limit } => {
-                write!(f, "The MMDS active token limit was exceeded: {limit}.")
-            }
-            Self::RandomnessUnavailable => f.write_str("MMDS token randomness is unavailable."),
-            Self::TokenCollision => f.write_str("MMDS token generation collided repeatedly."),
-        }
-    }
-}
-
-impl std::error::Error for MmdsTokenError {}
-
-#[derive(Debug, Clone, Copy)]
-enum MmdsTokenClock {
-    System {
-        origin: Instant,
-    },
-    #[cfg(test)]
-    Manual {
-        now_millis: u64,
-    },
-}
-
-impl Default for MmdsTokenClock {
-    fn default() -> Self {
-        Self::System {
-            origin: Instant::now(),
-        }
-    }
-}
-
-impl MmdsTokenClock {
-    fn now_millis(&self) -> u64 {
-        match self {
-            Self::System { origin } => {
-                u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
-            }
-            #[cfg(test)]
-            Self::Manual { now_millis } => *now_millis,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct MmdsTokenAuthority {
-    tokens: HashMap<String, u64>,
-    max_active_tokens: usize,
-    clock: MmdsTokenClock,
-}
-
-impl PartialEq for MmdsTokenAuthority {
-    fn eq(&self, other: &Self) -> bool {
-        self.tokens == other.tokens && self.max_active_tokens == other.max_active_tokens
-    }
-}
-
-impl Eq for MmdsTokenAuthority {}
-
-impl Default for MmdsTokenAuthority {
-    fn default() -> Self {
-        Self::new(MMDS_TOKEN_MAX_ACTIVE_TOKENS)
-    }
-}
-
-impl MmdsTokenAuthority {
-    pub fn new(max_active_tokens: usize) -> Self {
-        Self {
-            tokens: HashMap::new(),
-            max_active_tokens,
-            clock: MmdsTokenClock::default(),
-        }
-    }
-
-    pub fn generate_token(&mut self, ttl_seconds: u32) -> Result<String, MmdsTokenError> {
-        self.validate_ttl(ttl_seconds)?;
-
-        let now_millis = self.clock.now_millis();
-        self.remove_expired_tokens(now_millis);
-        if self.tokens.len() >= self.max_active_tokens {
-            return Err(MmdsTokenError::ActiveTokenLimitExceeded {
-                limit: self.max_active_tokens,
-            });
-        }
-
-        let expiry_millis = token_expiry_millis(now_millis, ttl_seconds);
-        for _ in 0..MMDS_TOKEN_GENERATION_ATTEMPTS {
-            let token = generate_opaque_token()?;
-            if self.tokens.contains_key(&token) {
-                continue;
-            }
-
-            self.tokens.insert(token.clone(), expiry_millis);
-            return Ok(token);
-        }
-
-        Err(MmdsTokenError::TokenCollision)
-    }
-
-    pub fn is_valid(&self, token: &str) -> bool {
-        if token.is_empty() {
-            return false;
-        }
-
-        self.tokens
-            .get(token)
-            .is_some_and(|expiry_millis| *expiry_millis > self.clock.now_millis())
-    }
-
-    fn validate_ttl(&self, ttl_seconds: u32) -> Result<(), MmdsTokenError> {
-        if (MMDS_TOKEN_MIN_TTL_SECONDS..=MMDS_TOKEN_MAX_TTL_SECONDS).contains(&ttl_seconds) {
-            return Ok(());
-        }
-
-        Err(MmdsTokenError::InvalidTtl { ttl_seconds })
-    }
-
-    fn remove_expired_tokens(&mut self, now_millis: u64) {
-        self.tokens
-            .retain(|_, expiry_millis| *expiry_millis > now_millis);
-    }
-
-    #[cfg(test)]
-    fn with_manual_clock(max_active_tokens: usize, now_millis: u64) -> Self {
-        Self {
-            tokens: HashMap::new(),
-            max_active_tokens,
-            clock: MmdsTokenClock::Manual { now_millis },
-        }
-    }
-
-    #[cfg(test)]
-    fn set_now_millis(&mut self, now_millis: u64) {
-        self.clock = MmdsTokenClock::Manual { now_millis };
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmdsDataStoreError {
     InvalidObject,
     NotFound,
@@ -1619,13 +1513,24 @@ impl fmt::Display for MmdsDataStoreError {
 
 impl std::error::Error for MmdsDataStoreError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmdsState {
     config: Option<MmdsConfig>,
     data_store_present: bool,
     value: Option<Value>,
     data_store_limit_bytes: usize,
     token_authority: MmdsTokenAuthority,
+}
+
+impl fmt::Debug for MmdsState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MmdsState")
+            .field("config", &self.config)
+            .field("data_store_present", &self.data_store_present)
+            .field("value", &"[REDACTED]")
+            .field("data_store_limit_bytes", &self.data_store_limit_bytes)
+            .field("token_authority", &self.token_authority)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1683,12 +1588,16 @@ impl Default for MmdsState {
 
 impl MmdsState {
     pub fn new(data_store_limit_bytes: usize) -> Self {
+        Self::with_instance_id(data_store_limit_bytes, "anonymous")
+    }
+
+    pub fn with_instance_id(data_store_limit_bytes: usize, instance_id: impl AsRef<str>) -> Self {
         Self {
             config: None,
             data_store_present: false,
             value: None,
             data_store_limit_bytes,
-            token_authority: MmdsTokenAuthority::default(),
+            token_authority: MmdsTokenAuthority::new(instance_id),
         }
     }
 
@@ -1700,8 +1609,13 @@ impl MmdsState {
         self.config.as_ref()
     }
 
-    pub(crate) const fn data_store_present(&self) -> bool {
+    pub const fn data_store_present(&self) -> bool {
         self.data_store_present
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_authority_is_bound_to_instance_id(&self, instance_id: &str) -> bool {
+        self.token_authority.is_bound_to_instance_id(instance_id)
     }
 
     pub(crate) fn ensure_data_store_present(&mut self) {
@@ -1980,35 +1894,6 @@ impl MmdsState {
     }
 }
 
-fn token_expiry_millis(now_millis: u64, ttl_seconds: u32) -> u64 {
-    now_millis.saturating_add(u64::from(ttl_seconds) * MMDS_MILLISECONDS_PER_SECOND)
-}
-
-fn generate_opaque_token() -> Result<String, MmdsTokenError> {
-    let mut bytes = [0_u8; MMDS_TOKEN_BYTES];
-    getrandom::fill(&mut bytes).map_err(|_| MmdsTokenError::RandomnessUnavailable)?;
-
-    Ok(hex_encode(&bytes))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(hex_digit(byte >> 4));
-        output.push(hex_digit(byte & 0x0f));
-    }
-
-    output
-}
-
-fn hex_digit(nibble: u8) -> char {
-    match nibble {
-        0..=9 => char::from(b'0' + nibble),
-        10..=15 => char::from(b'a' + (nibble - 10)),
-        _ => '?',
-    }
-}
-
 fn mmds_pointer_path(path: &str) -> &str {
     path.strip_suffix('/').unwrap_or(path)
 }
@@ -2263,6 +2148,8 @@ fn is_valid_link_local_ipv4(ipv4_address: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+
     use crate::network::NetworkInterfaceConfigInput;
 
     const ARP_TARGET_HARDWARE_ADDRESS_OFFSET: usize = 18;
@@ -3768,7 +3655,8 @@ mod tests {
 
         for packet in [wrong_destination, truncated] {
             let mut state = initialized_query_state();
-            state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+            state.token_authority =
+                MmdsTokenAuthority::with_manual_clock("ignored-packet-instance", 1_000);
             let original = state.get_data().expect("data store should be initialized");
 
             assert_eq!(
@@ -3778,7 +3666,7 @@ mod tests {
             assert_eq!(state.get_data(), Ok(original));
             let token = state
                 .generate_guest_token(1)
-                .expect("ignored packet should not consume token capacity");
+                .expect("ignored packet should not initialize token state");
             assert!(state.is_guest_token_valid(&token));
         }
     }
@@ -3787,7 +3675,8 @@ mod tests {
     fn mmds_guest_tcp_packet_response_bytes_ignore_empty_payload_without_mutating() {
         let packet = test_mmds_tcp_packet(b"");
         let mut state = initialized_query_state();
-        state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+        state.token_authority =
+            MmdsTokenAuthority::with_manual_clock("empty-payload-instance", 1_000);
         let original = state.get_data().expect("data store should be initialized");
 
         assert_eq!(
@@ -3797,7 +3686,7 @@ mod tests {
         assert_eq!(state.get_data(), Ok(original));
         let token = state
             .generate_guest_token(1)
-            .expect("empty TCP payload should not consume token capacity");
+            .expect("empty TCP payload should not initialize token state");
         assert!(state.is_guest_token_valid(&token));
     }
 
@@ -3821,7 +3710,8 @@ mod tests {
     fn mmds_guest_tcp_packet_response_bytes_preserve_token_flow() {
         let mut state = initialized_query_state();
         enable_mmds_v2(&mut state);
-        state.token_authority = MmdsTokenAuthority::with_manual_clock(2, 1_000);
+        state.token_authority =
+            MmdsTokenAuthority::with_manual_clock("packet-flow-instance", 1_000);
         let put_packet = test_mmds_tcp_packet(
             b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 60\r\n\r\n",
         );
@@ -3938,123 +3828,20 @@ mod tests {
     }
 
     fn assert_mmds_token_shape(token: &str) {
-        assert_eq!(token.len(), MMDS_TOKEN_BYTES * 2);
-        assert!(
-            token
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        );
-    }
-
-    #[test]
-    fn mmds_token_authority_accepts_ttl_boundaries() {
-        let mut authority = MmdsTokenAuthority::with_manual_clock(2, 1_000);
-
-        let min_token = authority
-            .generate_token(MMDS_TOKEN_MIN_TTL_SECONDS)
-            .expect("minimum token TTL should be accepted");
-        let max_token = authority
-            .generate_token(MMDS_TOKEN_MAX_TTL_SECONDS)
-            .expect("maximum token TTL should be accepted");
-
-        assert_mmds_token_shape(&min_token);
-        assert_mmds_token_shape(&max_token);
-        assert!(authority.is_valid(&min_token));
-        assert!(authority.is_valid(&max_token));
-    }
-
-    #[test]
-    fn mmds_token_authority_rejects_invalid_ttl_values() {
-        let mut authority = MmdsTokenAuthority::with_manual_clock(2, 1_000);
-
+        assert_eq!(token.len(), 48);
         assert_eq!(
-            authority.generate_token(0),
-            Err(MmdsTokenError::InvalidTtl { ttl_seconds: 0 })
+            base64::engine::general_purpose::STANDARD
+                .decode(token)
+                .expect("test MMDS token should use standard Base64")
+                .len(),
+            36
         );
-        assert_eq!(
-            authority.generate_token(MMDS_TOKEN_MAX_TTL_SECONDS + 1),
-            Err(MmdsTokenError::InvalidTtl {
-                ttl_seconds: MMDS_TOKEN_MAX_TTL_SECONDS + 1,
-            })
-        );
-        assert!(authority.tokens.is_empty());
-    }
-
-    #[test]
-    fn mmds_token_errors_display_deterministic_messages() {
-        assert_eq!(
-            MmdsTokenError::InvalidTtl { ttl_seconds: 0 }.to_string(),
-            "Invalid MMDS token TTL: 0. Please provide a value between 1 and 21600."
-        );
-        assert_eq!(
-            MmdsTokenError::ActiveTokenLimitExceeded { limit: 1 }.to_string(),
-            "The MMDS active token limit was exceeded: 1."
-        );
-        assert_eq!(
-            MmdsTokenError::RandomnessUnavailable.to_string(),
-            "MMDS token randomness is unavailable."
-        );
-        assert_eq!(
-            MmdsTokenError::TokenCollision.to_string(),
-            "MMDS token generation collided repeatedly."
-        );
-    }
-
-    #[test]
-    fn mmds_token_authority_rejects_unknown_empty_and_expired_tokens() {
-        let mut authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
-        let token = authority
-            .generate_token(1)
-            .expect("token generation should succeed");
-
-        assert!(authority.is_valid(&token));
-        assert!(!authority.is_valid(""));
-        assert!(!authority.is_valid("not-a-generated-token"));
-
-        authority.set_now_millis(1_999);
-        assert!(authority.is_valid(&token));
-
-        authority.set_now_millis(2_000);
-        assert!(!authority.is_valid(&token));
-    }
-
-    #[test]
-    fn mmds_token_authority_cleans_expired_tokens_before_capacity_check() {
-        let mut authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
-        let first = authority
-            .generate_token(1)
-            .expect("first token generation should succeed");
-        assert_eq!(authority.tokens.len(), 1);
-
-        authority.set_now_millis(2_000);
-        assert!(!authority.is_valid(&first));
-
-        let second = authority
-            .generate_token(1)
-            .expect("expired token should be cleaned before capacity check");
-
-        assert!(authority.is_valid(&second));
-        assert_eq!(authority.tokens.len(), 1);
-    }
-
-    #[test]
-    fn mmds_token_authority_reports_capacity_exhaustion() {
-        let mut authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
-        authority
-            .generate_token(1)
-            .expect("first token generation should succeed");
-
-        assert_eq!(
-            authority.generate_token(1),
-            Err(MmdsTokenError::ActiveTokenLimitExceeded { limit: 1 })
-        );
-        assert_eq!(authority.tokens.len(), 1);
     }
 
     #[test]
     fn mmds_state_guest_token_delegates_to_token_authority() {
         let mut state = MmdsState {
-            token_authority: MmdsTokenAuthority::with_manual_clock(1, 1_000),
+            token_authority: MmdsTokenAuthority::with_manual_clock("state-instance", 1_000),
             ..MmdsState::default()
         };
         let token = state
@@ -4070,24 +3857,81 @@ mod tests {
     #[test]
     fn mmds_state_guest_tokens_are_isolated_between_states() {
         let mut first = MmdsState {
-            token_authority: MmdsTokenAuthority::with_manual_clock(1, 1_000),
+            token_authority: MmdsTokenAuthority::with_manual_clock("first-instance", 1_000),
             ..MmdsState::default()
         };
-        let second = MmdsState {
-            token_authority: MmdsTokenAuthority::with_manual_clock(1, 1_000),
+        let mut second = MmdsState {
+            token_authority: MmdsTokenAuthority::with_manual_clock("second-instance", 1_000),
             ..MmdsState::default()
         };
-        let token = first
+        let first_token = first
             .generate_guest_token(60)
             .expect("first state should generate a guest token");
+        let second_token = second
+            .generate_guest_token(60)
+            .expect("second state should generate a guest token");
 
-        assert!(first.is_guest_token_valid(&token));
-        assert!(!second.is_guest_token_valid(&token));
+        assert!(first.is_guest_token_valid(&first_token));
+        assert!(second.is_guest_token_valid(&second_token));
+        assert!(!first.is_guest_token_valid(&second_token));
+        assert!(!second.is_guest_token_valid(&first_token));
     }
 
     #[test]
-    fn mmds_state_equality_ignores_token_clock_origin() {
-        assert_eq!(MmdsState::default(), MmdsState::default());
+    fn mmds_state_debug_redacts_instance_metadata_and_token_state() {
+        let instance_id = "private-mmds-instance";
+        let metadata_secret = "private-metadata-value";
+        let mut state = MmdsState::with_instance_id(MMDS_DATA_STORE_LIMIT_BYTES, instance_id);
+        state
+            .put_data(MmdsContentInput::new(serde_json::json!({
+                "secret": metadata_secret,
+            })))
+            .expect("test metadata should store");
+        let token = state
+            .generate_guest_token(60)
+            .expect("test token should generate");
+        let debug = format!("{state:?}");
+
+        assert!(!debug.contains(instance_id));
+        assert!(!debug.contains(metadata_secret));
+        assert!(!debug.contains(&token));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn mmds_guest_debug_surfaces_redact_token_values_and_packet_payloads() {
+        let token_value = "private-token-value-that-must-never-appear";
+        let token = MmdsGuestToken::Header {
+            token_header: MmdsGuestTokenHeader::Metadata,
+            token_value: token_value.to_string(),
+        };
+        let request = MmdsGuestRequest::Get(MmdsGuestGetRequest {
+            http_version: MmdsGuestHttpVersion::Http11,
+            uri: "/meta-data/hostname".to_string(),
+            output_format: MmdsOutputFormat::Imds,
+            token: token.clone(),
+        });
+        let request_bytes =
+            format!("GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: {token_value}\r\n\r\n");
+        let packet_bytes = test_mmds_tcp_packet(request_bytes.as_bytes());
+        let packet = classify_mmds_guest_tcp_packet(&packet_bytes, test_mmds_ipv4_address())
+            .expect("test MMDS packet should classify");
+        let response = MmdsGuestResponse::new(
+            MmdsGuestStatus::Ok,
+            MmdsGuestContentType::PlainText,
+            token_value.to_string(),
+        )
+        .with_custom_header("X-test-private", token_value);
+
+        for debug in [
+            format!("{token:?}"),
+            format!("{request:?}"),
+            format!("{packet:?}"),
+            format!("{response:?}"),
+        ] {
+            assert!(!debug.contains(token_value));
+            assert!(debug.contains("[REDACTED]"));
+        }
     }
 
     #[test]
@@ -4106,6 +3950,48 @@ mod tests {
                 .with(MmdsState::get_data)
                 .expect("cloned MMDS handle should lock"),
             Ok(value)
+        );
+    }
+
+    #[test]
+    fn mmds_state_handle_serializes_concurrent_token_generation() {
+        const THREADS: usize = 8;
+        const TOKENS_PER_THREAD: usize = 16;
+
+        let state = MmdsState {
+            token_authority: MmdsTokenAuthority::with_manual_clock("concurrent-instance", 1_000),
+            ..MmdsState::default()
+        };
+        let handle = MmdsStateHandle::new(state);
+        let tokens = std::thread::scope(|scope| {
+            let workers = (0..THREADS)
+                .map(|_| {
+                    let handle = handle.clone();
+                    scope.spawn(move || {
+                        (0..TOKENS_PER_THREAD)
+                            .map(|_| {
+                                handle
+                                    .with_mut(|state| state.generate_guest_token(60))
+                                    .expect("MMDS state should lock")
+                                    .expect("token should generate")
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("token worker should not panic"))
+                .collect::<Vec<_>>()
+        });
+        let unique_tokens = tokens.iter().collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(tokens.len(), THREADS * TOKENS_PER_THREAD);
+        assert_eq!(unique_tokens.len(), tokens.len());
+        assert_eq!(
+            handle.with(|state| tokens.iter().all(|token| state.is_guest_token_valid(token))),
+            Ok(true)
         );
     }
 
@@ -4799,7 +4685,7 @@ mod tests {
 
         assert_eq!(
             head,
-            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\nContent-Length: 64"
+            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\nContent-Length: 48"
         );
         assert_mmds_token_shape(token);
         assert!(state.is_guest_token_valid(token));
@@ -4818,7 +4704,7 @@ mod tests {
 
         assert_eq!(
             head,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\nContent-Length: 64"
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\nContent-Length: 48"
         );
         assert_mmds_token_shape(token);
         assert!(state.is_guest_token_valid(token));
@@ -4959,7 +4845,8 @@ mod tests {
             b"PUT /wrong HTTP/1.1\r\nX-metadata-token-ttl-seconds: 1\r\n\r\n",
         ] {
             let mut state = initialized_query_state();
-            state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+            state.token_authority =
+                MmdsTokenAuthority::with_manual_clock("failed-put-instance", 1_000);
 
             assert_ne!(
                 state.guest_http_response(request).status(),
@@ -4967,7 +4854,7 @@ mod tests {
             );
             let token = state
                 .generate_guest_token(1)
-                .expect("failed token PUT should not consume token capacity");
+                .expect("failed token PUT should not initialize token state");
             assert!(state.is_guest_token_valid(&token));
         }
     }
@@ -5040,7 +4927,8 @@ mod tests {
     fn mmds_guest_http_response_v2_rejects_expired_token() {
         let mut state = initialized_query_state();
         enable_mmds_v2(&mut state);
-        state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+        state.token_authority =
+            MmdsTokenAuthority::with_manual_clock("expired-token-instance", 1_000);
         let token = state
             .generate_guest_token(1)
             .expect("test token generation should succeed");
@@ -5060,7 +4948,8 @@ mod tests {
     fn mmds_guest_http_response_v2_accepts_valid_tokens() {
         let mut state = initialized_query_state();
         enable_mmds_v2(&mut state);
-        state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+        state.token_authority =
+            MmdsTokenAuthority::with_manual_clock("valid-token-instance", 1_000);
         let token = state
             .generate_guest_token(1)
             .expect("test token generation should succeed");
@@ -5087,7 +4976,8 @@ mod tests {
         for request in requests {
             let mut state = initialized_query_state();
             enable_mmds_v2(&mut state);
-            state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+            state.token_authority =
+                MmdsTokenAuthority::with_manual_clock("token-error-instance", 1_000);
             let token = state
                 .generate_guest_token(1)
                 .expect("test token generation should succeed");

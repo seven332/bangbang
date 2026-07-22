@@ -206,10 +206,20 @@ mod macos_arm64 {
         r#"{"meta-data":{"bangbang-release":"BANGBANG_MMDS_PROCESS_B_RELEASE"}}"#;
     const CONCURRENT_MMDS_PROCESS_A_SUCCESS: &[u8] = b"BANGBANG_MMDS_PROCESS_A_FETCH_OK";
     const CONCURRENT_MMDS_PROCESS_A_FAILURE: &[u8] = b"BANGBANG_MMDS_PROCESS_A_FETCH_FAIL";
+    const CONCURRENT_MMDS_PROCESS_A_TOKEN_READY: &[u8] = b"BANGBANG_MMDS_PROCESS_A_TOKEN_READY";
     const CONCURRENT_MMDS_PROCESS_B_READY: &[u8] = b"BANGBANG_MMDS_PROCESS_B_READY";
     const CONCURRENT_MMDS_PROCESS_B_READY_FAILURE: &[u8] = b"BANGBANG_MMDS_PROCESS_B_READY_FAIL";
+    const CONCURRENT_MMDS_PROCESS_B_TOKEN_READY: &[u8] = b"BANGBANG_MMDS_PROCESS_B_TOKEN_READY";
     const CONCURRENT_MMDS_PROCESS_B_SUCCESS: &[u8] = b"BANGBANG_MMDS_PROCESS_B_FETCH_OK";
     const CONCURRENT_MMDS_PROCESS_B_FAILURE: &[u8] = b"BANGBANG_MMDS_PROCESS_B_FETCH_FAIL";
+    const CONCURRENT_MMDS_PEER_TOKEN_READY: &[u8] = b"BANGBANG_MMDS_PEER_TOKEN_READY";
+    const CONCURRENT_MMDS_TOKEN_BYTES: usize = 48;
+    const CONCURRENT_MMDS_SCRATCH_SECTORS: u64 = 5;
+    const CONCURRENT_MMDS_TOKEN_OFFSET: u64 = bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE * 2;
+    const CONCURRENT_MMDS_PEER_TOKEN_OFFSET: u64 =
+        bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE * 3;
+    const CONCURRENT_MMDS_PEER_TOKEN_READY_OFFSET: u64 =
+        bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE * 4;
     const CONCURRENT_MMDS_PROCESS_B_TERMINAL_OFFSET: u64 =
         bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
     const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
@@ -8271,7 +8281,7 @@ mod macos_arm64 {
         let instance_prefix = test_dir.instance_id();
         let instance_a = format!("{instance_prefix}-mmds-a");
         let instance_b = format!("{instance_prefix}-mmds-b");
-        let private_fragments = concurrent_mmds_private_fragments(
+        let mut private_fragments = concurrent_mmds_private_fragments(
             test_dir.path(),
             &kernel_path,
             &rootfs_path,
@@ -8279,8 +8289,8 @@ mod macos_arm64 {
             &instance_b,
         );
 
-        create_zeroed_block_backing(&scratch_a);
-        create_zeroed_block_backing_with_sectors(&scratch_b, 2);
+        create_zeroed_block_backing_with_sectors(&scratch_a, CONCURRENT_MMDS_SCRATCH_SECTORS);
+        create_zeroed_block_backing_with_sectors(&scratch_b, CONCURRENT_MMDS_SCRATCH_SECTORS);
         let mut process_a = BangbangProcess::start(&socket_a, &instance_a);
         let mut process_b = BangbangProcess::start(&socket_b, &instance_b);
 
@@ -8333,6 +8343,125 @@ mod macos_arm64 {
         }
 
         if wait_for_concurrent_mmds_marker(
+            &scratch_a,
+            0,
+            CONCURRENT_MMDS_PROCESS_A_TOKEN_READY,
+            CONCURRENT_MMDS_PROCESS_A_FAILURE,
+        )
+        .is_err()
+            || wait_for_concurrent_mmds_marker(
+                &scratch_b,
+                0,
+                CONCURRENT_MMDS_PROCESS_B_TOKEN_READY,
+                CONCURRENT_MMDS_PROCESS_B_READY_FAILURE,
+            )
+            .is_err()
+            || concurrent_mmds_state_is(&socket_a, "Running").is_err()
+            || concurrent_mmds_state_is(&socket_b, "Running").is_err()
+        {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "guest token publication",
+            );
+        }
+
+        let pause_a = concurrent_mmds_http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        let pause_b = concurrent_mmds_http_json(&socket_b, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        if !matches!(pause_a, Ok(ref response) if concurrent_mmds_response_is_no_content(response))
+            || !matches!(pause_b, Ok(ref response) if concurrent_mmds_response_is_no_content(response))
+            || concurrent_mmds_state_is(&socket_a, "Paused").is_err()
+            || concurrent_mmds_state_is(&socket_b, "Paused").is_err()
+        {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "guest token exchange pause",
+            );
+        }
+
+        let token_a = match concurrent_mmds_token_at(&scratch_a) {
+            Ok(token) => token,
+            Err(()) => fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process A opaque token read",
+            ),
+        };
+        let token_b = match concurrent_mmds_token_at(&scratch_b) {
+            Ok(token) => token,
+            Err(()) => fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process B opaque token read",
+            ),
+        };
+        let Some(token_a_text) = std::str::from_utf8(&token_a).ok() else {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process A opaque token encoding",
+            );
+        };
+        let Some(token_b_text) = std::str::from_utf8(&token_b).ok() else {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "process B opaque token encoding",
+            );
+        };
+        private_fragments.push(token_a_text.to_owned());
+        private_fragments.push(token_b_text.to_owned());
+        if token_a == token_b
+            || concurrent_mmds_write_at(&scratch_a, CONCURRENT_MMDS_PEER_TOKEN_OFFSET, &token_b)
+                .is_err()
+            || concurrent_mmds_write_at(&scratch_b, CONCURRENT_MMDS_PEER_TOKEN_OFFSET, &token_a)
+                .is_err()
+            || concurrent_mmds_write_at(
+                &scratch_a,
+                CONCURRENT_MMDS_PEER_TOKEN_READY_OFFSET,
+                CONCURRENT_MMDS_PEER_TOKEN_READY,
+            )
+            .is_err()
+            || concurrent_mmds_write_at(
+                &scratch_b,
+                CONCURRENT_MMDS_PEER_TOKEN_READY_OFFSET,
+                CONCURRENT_MMDS_PEER_TOKEN_READY,
+            )
+            .is_err()
+        {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "opaque peer token exchange",
+            );
+        }
+
+        let resume_a =
+            concurrent_mmds_http_json(&socket_a, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        let resume_b =
+            concurrent_mmds_http_json(&socket_b, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        if !matches!(resume_a, Ok(ref response) if concurrent_mmds_response_is_no_content(response))
+            || !matches!(resume_b, Ok(ref response) if concurrent_mmds_response_is_no_content(response))
+            || concurrent_mmds_state_is(&socket_a, "Running").is_err()
+            || concurrent_mmds_state_is(&socket_b, "Running").is_err()
+        {
+            fail_concurrent_mmds_pair(
+                &mut process_a,
+                &mut process_b,
+                &private_fragments,
+                "guest token exchange resume",
+            );
+        }
+
+        if wait_for_concurrent_mmds_marker(
             &scratch_b,
             0,
             CONCURRENT_MMDS_PROCESS_B_READY,
@@ -8346,7 +8475,7 @@ mod macos_arm64 {
                 &mut process_a,
                 &mut process_b,
                 &private_fragments,
-                "process B guest readiness",
+                "cross-instance token rejection",
             );
         }
 
@@ -9947,6 +10076,29 @@ mod macos_arm64 {
         file_marker_state_at(path, offset, success, failure).map_err(|_| ())
     }
 
+    fn concurrent_mmds_token_at(path: &Path) -> Result<Vec<u8>, ()> {
+        let mut token = vec![0_u8; CONCURRENT_MMDS_TOKEN_BYTES];
+        let mut file = fs::File::open(path).map_err(|_| ())?;
+        file.seek(SeekFrom::Start(CONCURRENT_MMDS_TOKEN_OFFSET))
+            .map_err(|_| ())?;
+        file.read_exact(&mut token).map_err(|_| ())?;
+        if concurrent_mmds_token_shape(&token) {
+            Ok(token)
+        } else {
+            Err(())
+        }
+    }
+
+    fn concurrent_mmds_write_at(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), ()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|_| ())?;
+        file.seek(SeekFrom::Start(offset)).map_err(|_| ())?;
+        file.write_all(bytes).map_err(|_| ())?;
+        file.sync_all().map_err(|_| ())
+    }
+
     fn concurrent_mmds_metrics_are_isolated(
         path: &Path,
         own_iface_id: &str,
@@ -10014,10 +10166,13 @@ mod macos_arm64 {
             [
                 CONCURRENT_MMDS_PROCESS_A_SUCCESS,
                 CONCURRENT_MMDS_PROCESS_A_FAILURE,
+                CONCURRENT_MMDS_PROCESS_A_TOKEN_READY,
                 CONCURRENT_MMDS_PROCESS_B_READY,
                 CONCURRENT_MMDS_PROCESS_B_READY_FAILURE,
+                CONCURRENT_MMDS_PROCESS_B_TOKEN_READY,
                 CONCURRENT_MMDS_PROCESS_B_SUCCESS,
                 CONCURRENT_MMDS_PROCESS_B_FAILURE,
+                CONCURRENT_MMDS_PEER_TOKEN_READY,
             ]
             .into_iter()
             .map(|marker| String::from_utf8_lossy(marker).into_owned()),
@@ -10029,9 +10184,34 @@ mod macos_arm64 {
         output: &CompletedProcess,
         private_fragments: &[String],
     ) -> bool {
-        private_fragments
-            .iter()
-            .all(|fragment| !output.stderr.contains(fragment.as_str()))
+        private_fragments.iter().all(|fragment| {
+            !output.stderr.contains(fragment.as_str())
+                && (concurrent_mmds_fragment_is_public_marker(fragment)
+                    || !output.stdout.contains(fragment.as_str()))
+        })
+    }
+
+    fn concurrent_mmds_fragment_is_public_marker(fragment: &str) -> bool {
+        [
+            CONCURRENT_MMDS_PROCESS_A_SUCCESS,
+            CONCURRENT_MMDS_PROCESS_A_FAILURE,
+            CONCURRENT_MMDS_PROCESS_A_TOKEN_READY,
+            CONCURRENT_MMDS_PROCESS_B_READY,
+            CONCURRENT_MMDS_PROCESS_B_READY_FAILURE,
+            CONCURRENT_MMDS_PROCESS_B_TOKEN_READY,
+            CONCURRENT_MMDS_PROCESS_B_SUCCESS,
+            CONCURRENT_MMDS_PROCESS_B_FAILURE,
+            CONCURRENT_MMDS_PEER_TOKEN_READY,
+        ]
+        .into_iter()
+        .any(|marker| fragment.as_bytes() == marker)
+    }
+
+    fn concurrent_mmds_token_shape(token: &[u8]) -> bool {
+        token.len() == CONCURRENT_MMDS_TOKEN_BYTES
+            && token
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/'))
     }
 
     fn concurrent_mmds_serial_outputs_are_isolated(
@@ -10049,19 +10229,31 @@ mod macos_arm64 {
             .all(|value| !process_a.stdout.contains(value) && !process_b.stdout.contains(value))
             && process_a
                 .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_A_TOKEN_READY).as_ref())
+            && process_a
+                .stdout
                 .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_A_SUCCESS).as_ref())
             && !process_a
                 .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_TOKEN_READY).as_ref())
+            && !process_a
+                .stdout
                 .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_READY).as_ref())
             && !process_a
                 .stdout
                 .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_SUCCESS).as_ref())
             && process_b
                 .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_TOKEN_READY).as_ref())
+            && process_b
+                .stdout
                 .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_READY).as_ref())
             && process_b
                 .stdout
                 .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_B_SUCCESS).as_ref())
+            && !process_b
+                .stdout
+                .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_A_TOKEN_READY).as_ref())
             && !process_b
                 .stdout
                 .contains(String::from_utf8_lossy(CONCURRENT_MMDS_PROCESS_A_SUCCESS).as_ref())

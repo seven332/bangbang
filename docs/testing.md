@@ -1760,7 +1760,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v77.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v78.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -1794,17 +1794,27 @@ deadline and checks that both API interface metric objects report RX and TX
 activity. This MMDS-only scenario does not open direct vmnet resources or need
 the restricted networking entitlement. The process-specific MMDS boot modes
 extend that protocol to two concurrently running signed executables with
-unique API sockets, interface IDs, metadata, metrics, and scratch drives. The
-second guest obtains a v2 token, verifies its own value plus an initial
-process-local release state, and writes a static ready marker before the host
-pauses it. After the first guest succeeds and its process exits, the host
+unique instance IDs, API sockets, interface IDs, metadata, metrics, and scratch
+drives. Each guest obtains a 48-character standard-Base64 v2 token, verifies
+its own metadata, stores the opaque token in a reserved scratch sector, and
+publishes only a static token-ready marker. The host pauses both VMs, reads
+exactly 48 bytes from each token sector without including them in diagnostics,
+writes each token into the peer's reserved sector, publishes a static
+continuation marker, and resumes both VMs. Each guest must receive
+`401 Unauthorized` for the peer token and then re-fetch its own value
+successfully with its original token. The second guest next verifies its initial
+process-local release state and writes the existing ready marker before the
+host pauses it. After the first guest succeeds and its process exits, the host
 patches only the surviving process's release field and resumes it; that guest
-must re-fetch its original value with the same token before writing a distinct
-terminal marker. Bounded kqueue-backed marker waits replace fixed sleeps, and
+must again fetch its original value with the same token before writing a
+distinct terminal marker. Bounded kqueue-backed marker waits replace fixed
+sleeps, and
 the test verifies that each metrics file contains only its own interface key,
 that peer flush/teardown cannot rewrite it, and that API socket cleanup cannot
-remove or stop the survivor. Tokens, metadata values, scratch bytes, private
-paths, and raw worker output are excluded from failure diagnostics. Both
+remove or stop the survivor. Dynamic tokens are added to the redaction set as
+soon as the host reads them and must be absent from both process stdout and
+stderr. Tokens, metadata values, scratch bytes, private paths, and raw worker
+output are excluded from failure diagnostics. Both
 interfaces are completely covered by their process-local MMDS configuration,
 so this concurrent scenario also stays on MMDS-only packet I/O without the
 restricted networking entitlement. When the boot args include
