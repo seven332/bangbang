@@ -91,11 +91,23 @@ impl VirtioNetworkPacketEnvelope {
 }
 
 /// Contiguous packets emitted from one guest frame, plus exact packet ranges.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VirtioNetworkEmittedPackets {
     bytes: Vec<u8>,
     ranges: Vec<Range<usize>>,
     source_mac: Option<[u8; ETHERNET_ADDRESS_LEN]>,
+}
+
+impl fmt::Debug for VirtioNetworkEmittedPackets {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkEmittedPackets")
+            .field("bytes", &"[REDACTED]")
+            .field("bytes_len", &self.bytes.len())
+            .field("ranges", &self.ranges)
+            .field("source_mac", &self.source_mac)
+            .finish()
+    }
 }
 
 impl VirtioNetworkEmittedPackets {
@@ -126,11 +138,23 @@ impl VirtioNetworkEmittedPackets {
 }
 
 /// A validated and bounded normalization plan for one guest-owned frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VirtioNetworkPacketPlan {
     packet: Vec<u8>,
     kind: VirtioNetworkPacketPlanKind,
     source_mac: Option<[u8; ETHERNET_ADDRESS_LEN]>,
+}
+
+impl fmt::Debug for VirtioNetworkPacketPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkPacketPlan")
+            .field("packet", &"[REDACTED]")
+            .field("packet_len", &self.packet.len())
+            .field("kind", &self.kind)
+            .field("source_mac", &self.source_mac)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1548,6 +1572,18 @@ mod tests {
             .fold(0, |bits, feature| bits | (1_u64 << feature))
     }
 
+    fn assert_debug_redacts(debug_output: &str, protected_value: &str) {
+        let byte_sequence = protected_value
+            .as_bytes()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(!debug_output.contains(protected_value));
+        assert!(!debug_output.contains(&byte_sequence));
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
     fn ethernet_prefix(ethertype: u16) -> Vec<u8> {
         let mut packet = Vec::from([0x02, 0, 0, 0, 0, 1]);
         packet.extend_from_slice(&SOURCE_MAC);
@@ -1657,6 +1693,20 @@ mod tests {
             .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         packet.extend_from_slice(&transport);
         packet
+    }
+
+    #[test]
+    fn packet_plan_and_emitted_packet_debug_redact_network_bytes() {
+        let protected_value = "private-network-token-value-that-must-not-appear";
+        let packet = ipv4_packet(IP_PROTOCOL_TCP, tcp_segment(protected_value.as_bytes()));
+        let plan = VirtioNetworkPacketPlan::prepare(VirtioNetworkTxHeader::new(), 0, packet)
+            .expect("test network packet should prepare");
+        let emitted = plan
+            .emit(VirtioNetworkPacketEnvelope::RawEthernet)
+            .expect("test network packet should emit");
+
+        assert_debug_redacts(&format!("{plan:?}"), protected_value);
+        assert_debug_redacts(&format!("{emitted:?}"), protected_value);
     }
 
     fn offload_header(

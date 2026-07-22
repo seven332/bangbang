@@ -1757,7 +1757,7 @@ impl fmt::Debug for SnapshotInspectionPath {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct StartupConfig {
     api_sock: String,
     boot_timer: bool,
@@ -1771,6 +1771,35 @@ struct StartupConfig {
     metrics_config: Option<MetricsConfigInput>,
     no_api: bool,
     startup_time: StartupTimeConfig,
+}
+
+impl fmt::Debug for StartupConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StartupConfig")
+            .field("api_sock", &"[REDACTED]")
+            .field("boot_timer", &self.boot_timer)
+            .field(
+                "config_file",
+                &self.config_file.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("enable_pci", &self.enable_pci)
+            .field("http_api_max_payload_size", &self.http_api_max_payload_size)
+            .field("id", &"[REDACTED]")
+            .field(
+                "logger_config",
+                &self.logger_config.as_ref().map(|_| "<configured>"),
+            )
+            .field("mmds_size_limit", &self.mmds_size_limit)
+            .field("metadata", &self.metadata.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "metrics_config",
+                &self.metrics_config.as_ref().map(|_| "<configured>"),
+            )
+            .field("no_api", &self.no_api)
+            .field("startup_time", &self.startup_time)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -3842,6 +3871,19 @@ mod tests {
         assert_eq!(config.id, "demo-1");
         assert_eq!(config.logger_config, None);
         assert_eq!(config.metrics_config, None);
+    }
+
+    #[test]
+    fn startup_config_debug_redacts_instance_identity_and_metadata_path() {
+        let instance_id = "private-startup-instance";
+        let metadata_path = "/private/startup/metadata.json";
+        let config = parse_run(&["--id", instance_id, "--metadata", metadata_path])
+            .expect("private startup args should parse");
+        let debug_output = format!("{config:?}");
+
+        assert!(!debug_output.contains(instance_id));
+        assert!(!debug_output.contains(metadata_path));
+        assert!(debug_output.contains("[REDACTED]"));
     }
 
     #[test]

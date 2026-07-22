@@ -1795,9 +1795,19 @@ impl VirtioNetworkRateLimiter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct VirtioNetworkRxPacket<'a> {
     bytes: &'a [u8],
+}
+
+impl fmt::Debug for VirtioNetworkRxPacket<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkRxPacket")
+            .field("bytes", &"[REDACTED]")
+            .field("len", &self.bytes.len())
+            .finish()
+    }
 }
 
 impl<'a> VirtioNetworkRxPacket<'a> {
@@ -6999,6 +7009,24 @@ mod tests {
 
     fn virtio_feature_bit(feature: u32) -> u64 {
         1_u64 << feature
+    }
+
+    #[test]
+    fn virtio_network_rx_packet_debug_redacts_packet_bytes() {
+        let protected_value = "private-rx-token-value-that-must-not-appear";
+        let byte_sequence = protected_value
+            .as_bytes()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let packet = VirtioNetworkRxPacket::new(protected_value.as_bytes());
+        let debug_output = format!("{packet:?}");
+
+        assert!(!debug_output.contains(protected_value));
+        assert!(!debug_output.contains(&byte_sequence));
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(debug_output.contains(&format!("len: {}", protected_value.len())));
     }
 
     #[test]
