@@ -2839,6 +2839,7 @@ mod tests {
         fn load_snapshot_v1(
             &mut self,
             _controller: &VmmController,
+            _vmnet_authority: crate::vmm::ProcessVmnetAuthority,
             input: &SnapshotLoadInput,
         ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
             if !self.snapshot_operations_succeed {

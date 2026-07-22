@@ -39,6 +39,14 @@ two may remain at final certification, with their required evidence.
 
 ## Matrix
 
+Network lifecycle certification #1501 binds the authenticated lifecycle-v5
+session identity and vmnet authority as one live-only owner across startup,
+restore, runtime MMDS-only/vmnet selection, provider entries and readiness, and
+capture traversal. Same-policy cross-session use is rejected before backend or
+callback work; the identity is redacted and absent from detached state. Signed
+networkless coverage rejects positive host, shared, and bridged policies before
+session creation. Positive external vmnet start/connectivity remains #1378.
+
 | Area | Current status | Primary validation | Related issue | Notes |
 | --- | --- | --- | --- | --- |
 | Direct pmem mapping and root boot | implemented for startup MMIO/PCI and non-root runtime PCI; complete capture-ready live state and aggregate live certification implemented; optional serialization/restore deferred | unit, process e2e, signed HVF capture equality, signed executable aggregate, signed production bundle aggregate, docs, pinned-source compare | #1439, #1444, #1448, #1471 | One reference-counted file/private-tail mapping is registered directly with HVF; there is no anonymous data copy or writeback path. Writable files use a shared host mapping. Read-only descriptors use a private write-capable host mapping required by HVF while guest permissions stay read-only, so accidental host writes are COW and signed guest writes fault without changing the backing. Flush synchronizes exactly the nonzero file prefix with `MS_SYNC`; the aligned tail is volatile. Exactly one ordinary block or pmem root is accepted before startup, pmem order selects `/dev/pmem<i>` plus `ro`/`rw`, and runtime root mutation remains rejected. Signed evidence covers pre-flush writable coherence, read-only protection, MMIO `ro` root, PCI `rw` root, exact teardown/reuse, and a normal contained root using the launcher-opened descriptor after pathname replacement with unchanged entitlements. #1471 certifies pmem together with Sync, Async, vhost-user, and virtio-mem through direct and contained product-PCI guests. Pmem remains outside ordinary RAM dirty epochs; exactly `corpus:pmem` and `semantic.storage:pmem-root-mapping-flush-and-state` stay with Wave 6 for optional-device serialization/restore. |

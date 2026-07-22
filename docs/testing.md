@@ -281,8 +281,12 @@ generation-safe metrics reuse, independent provider classes, actual-live-vmnet
 authority counting, explicit vmnet stop/drop, packet-I/O and endpoint
 take/restore, publication/removal injection, terminal cleanup, snapshot and
 shutdown admission, paused FIFO ordering, default-MMIO rejection, redaction,
-and exact PCI lease reuse. Apple-approved vmnet credentials and real external
-connectivity remain separate #1351/#1378 gates.
+exact lifecycle-session propagation through start/restore/capture, rejection of
+same-policy authority from a different session before both vmnet and MMDS-only
+paths, and exact PCI lease reuse. The signed networkless matrix must try host,
+shared, and bridged positive policies and prove the fixed rejection occurs with
+no worker-session directory creation. Apple-approved vmnet credentials and real
+external connectivity remain separate #1351/#1378 gates.
 
 Aggregate runtime PCI hotplug changes additionally require
 `runtime_mixed_device_mutations_preserve_type_scoped_identity_and_live_configuration`
@@ -1998,7 +2002,9 @@ add Running/Paused PUT, rescan, real MMDS exchange, sysfs removal, DELETE,
 live-config projection, exact BDF/capacity reuse, and clean shutdown; the
 contained case proves this needs no vmnet entitlement and that unauthorized
 non-MMDS insertion rolls back. The tests do not execute direct-vmnet external
-connectivity. Unsigned injected-system, runtime, transport, HVF-loop, and
+connectivity. The networkless production test additionally rejects positive
+host, shared, and bridged launch policies before any session is created.
+Unsigned injected-system, runtime, transport, HVF-loop, and
 process-registry tests cover returned MAC/MTU/maximum-packet/UUID/batch
 reconciliation, allocated-MAC uniqueness, finite start/stop deadlines,
 packet-event enable/disable/drain ordering, callback storms and closed/full wake

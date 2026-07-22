@@ -164,11 +164,13 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
                 })?;
             }
             let vmnet_authority = match contained.as_ref() {
-                Some(session) => ProcessVmnetAuthority::Contained(
-                    session
-                        .vmnet_authority()
-                        .map_err(|_| ProcessError::ContainedSession)?,
-                ),
+                Some(session) => {
+                    let (session_id, authority) = session
+                        .vmnet_session_authority()
+                        .map_err(|_| ProcessError::ContainedSession)?;
+                    ProcessVmnetAuthority::contained(session_id, authority)
+                        .ok_or(ProcessError::ContainedSession)?
+                }
                 None => ProcessVmnetAuthority::Direct,
             };
             let grant_authority = contained
@@ -2624,6 +2626,7 @@ mod tests {
         fn load_snapshot_v1(
             &mut self,
             _controller: &bangbang_runtime::VmmController,
+            _vmnet_authority: crate::vmm::ProcessVmnetAuthority,
             _input: &SnapshotLoadInput,
         ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
             Err(NativeV1SnapshotLoadError::ProcessTerminal)
@@ -2666,6 +2669,7 @@ mod tests {
         fn load_snapshot_v1(
             &mut self,
             _controller: &bangbang_runtime::VmmController,
+            _vmnet_authority: crate::vmm::ProcessVmnetAuthority,
             _input: &SnapshotLoadInput,
         ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
             Err(NativeV1SnapshotLoadError::ProcessTerminal)
@@ -2764,6 +2768,7 @@ mod tests {
         fn load_snapshot_v1(
             &mut self,
             _controller: &bangbang_runtime::VmmController,
+            _vmnet_authority: crate::vmm::ProcessVmnetAuthority,
             _input: &SnapshotLoadInput,
         ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
             Err(NativeV1SnapshotLoadError::ProcessTerminal)

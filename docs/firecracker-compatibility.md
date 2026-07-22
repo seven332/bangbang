@@ -2176,8 +2176,10 @@ use vmnet for all additions, while an initially empty or all-MMDS session can
 use MMDS-only packet I/O for an ID listed in immutable pre-boot MMDS config and
 uses vmnet otherwise. Contained MMDS-only entries need no vmnet authority;
 contained vmnet entries must match the exact mode/bridge and fit the count of
-actual live vmnet owners. Packet I/O publishes immediately before the PCI
-endpoint and live config commits last.
+actual live vmnet owners. Both kinds are also bound to the exact authenticated
+lifecycle session; same-policy authority from another session fails before the
+MMDS-only fast path or vmnet backend. Packet I/O publishes immediately before
+the PCI endpoint and live config commits last.
 
 Bodyless network DELETE requires the operator to remove the PCI function in the
 guest first. The owner transaction prepares reversible endpoint teardown,
@@ -3973,7 +3975,11 @@ revocation remain incomplete. Lifecycle v5 carries a canonical
 bounded host/shared/exact-bridge allowlist plus a separate 1-through-4 active
 limit, retains it immutably in contained workers, and applies it to the complete
 non-MMDS-only interface set before any startup resource or vmnet backend is
-acquired. Direct mode is unchanged and all-MMDS requires no vmnet authority.
+acquired. After `Proceed`, the exact random lifecycle identity travels with that
+authority through start, restore, runtime mutation, provider entries/readiness,
+and capture; another session is rejected before backend or callback work even
+for MMDS-only paths. The identity is redacted and excluded from detached state.
+Direct mode is unchanged and all-MMDS consumes no vmnet capacity.
 The default App Sandbox plus Hypervisor worker is an exact profile-absent
 networkless profile and rejects every positive authority before spawn/resume.
 An explicit caller-approved vmnet package profile requires a named identity,

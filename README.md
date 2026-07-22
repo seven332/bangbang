@@ -577,6 +577,19 @@ that the current host accepted that restricted signature/profile combination;
 real `vmnet_start_interface`, packet connectivity, teardown, crash, and
 concurrency evidence remain separate and are not claimed here.
 
+After `Proceed`, the worker exposes vmnet policy only as the live pair of that
+random session identity and its immutable authority. `ProcessVmm` passes the
+pair unchanged through ordinary start, native-v1 restore, runtime insertion,
+and paused network capture. The packet-I/O registry binds the same pair to its
+backend profiles, realized MAC/MTU state, entries, generations, callbacks,
+batch buffers, readiness bridge, scheduler state, and metrics traversal.
+Runtime and capture reject a different session even when its policy bytes are
+identical, before MMDS-only selection, backend acquisition, callback
+publication, or capture traversal. The identity is live-only: debug output is
+redacted and neither the capture-ready handoff nor a snapshot artifact records
+it. The outer launcher still receives no guest frames, backend handles, or
+packet state.
+
 Before public argument or VM processing, the worker creates and locks a unique
 mode-0700 empty namespace in its App Sandbox container and enters it through the
 retained directory descriptor. The launcher derives that path independently and
@@ -801,7 +814,7 @@ the worker still has exactly App Sandbox and Hypervisor entitlements and steady
 state remains one launcher plus one worker.
 
 General dynamic post-Ready brokerage, hard revocation, cross-filesystem socket
-publication, real contained vmnet connectivity and lifecycle evidence, broader
+publication, positive contained vmnet start/connectivity/teardown evidence, broader
 snapshot profiles, automatic restart policy, repository-owned Developer ID or
 profile possession, launch-constraint policy, and
 notarization workflow remain. The session namespace must be empty at the
@@ -1030,11 +1043,14 @@ routing/NAT, resource, and distribution policy. See the
 [compatibility scope](docs/firecracker-compatibility.md#internal-network-interface-configuration),
 [vmnet security boundary](docs/security.md#vmnet-host-policy-boundary), and
 [testing guide](docs/testing.md) for the exact supported subset and exclusions.
-Contained startup and runtime insertion additionally enforce the authenticated
-lifecycle-v5 mode, bridge name, and actual live-vmnet count before backend
-construction. The current networkless production profile rejects every positive
-vmnet authority before worker spawn, but supports all-MMDS startup and hotplug
-without that authority. This is not a production-connectivity claim.
+Contained startup, runtime insertion, and capture additionally require the
+exact authenticated lifecycle-v5 session-and-authority pair. Mode, bridge name,
+and actual live-vmnet count are checked before backend construction; even an
+MMDS-only fast path rejects a different session while consuming zero vmnet
+capacity. The current networkless production profile rejects positive host,
+shared, and bridged authority before session creation, but supports all-MMDS
+startup and hotplug without positive authority. This is not a
+production-connectivity claim.
 
 Record a pre-boot vsock configuration:
 
