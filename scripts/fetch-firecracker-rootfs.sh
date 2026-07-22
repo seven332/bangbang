@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v69"
+direct_boot_variant="direct-boot-v72"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -3610,6 +3610,177 @@ check_pvtime_marker() {
   emit_line BANGBANG_PVTIME_IDLE_OK
 }
 
+remaining_device_fail() {
+  reason=$1
+  marker="BANGBANG_REMAINING_DEVICE_FAIL_$reason"
+  emit_line "$marker"
+  write_vdb_sector_marker "$marker" 7 2>/dev/null || true
+}
+
+remaining_device_pci_identity_count() {
+  expected_device=$1
+  count=0
+  for function_path in /sys/bus/pci/devices/*; do
+    [ -d "$function_path" ] || continue
+    function=${function_path##*/}
+    if pci_function_has_identity "$function" "$expected_device"; then
+      count=$((count + 1))
+    fi
+  done
+  printf '%s\n' "$count"
+}
+
+check_remaining_device_transport() {
+  if cmdline_has bangbang.expect-remaining-device-transport=mmio; then
+    if ! cmdline_has pci=off; then
+      remaining_device_fail MMIO_PCI_ENABLED
+      return 1
+    fi
+    mmio_count=$(find /sys/firmware/devicetree/base -maxdepth 1 -name 'virtio_mmio@*' 2>/dev/null \
+      | wc -l 2>/dev/null || true)
+    mmio_count=${mmio_count##* }
+    case "$mmio_count" in
+      '' | *[!0-9]*)
+        remaining_device_fail MMIO_COUNT
+        return 1
+        ;;
+    esac
+    if [ "$mmio_count" -lt 5 ]; then
+      remaining_device_fail MMIO_IDENTITIES
+      return 1
+    fi
+    transport=MMIO
+  elif cmdline_has bangbang.expect-remaining-device-transport=pci; then
+    if cmdline_has pci=off; then
+      remaining_device_fail PCI_DISABLED
+      return 1
+    fi
+    if find /sys/firmware/devicetree/base -maxdepth 1 -name 'virtio_mmio@*' 2>/dev/null \
+      | grep -q .; then
+      remaining_device_fail PCI_LEGACY_MMIO
+      return 1
+    fi
+    if [ "$(remaining_device_pci_identity_count 0x1045)" != 1 ] \
+      || [ "$(remaining_device_pci_identity_count 0x1042)" != 2 ] \
+      || [ "$(remaining_device_pci_identity_count 0x1044)" != 1 ] \
+      || [ "$(remaining_device_pci_identity_count 0x1058)" != 1 ]; then
+      remaining_device_fail PCI_IDENTITIES
+      return 1
+    fi
+    transport=PCI
+  else
+    remaining_device_fail TRANSPORT_ARGUMENT
+    return 1
+  fi
+
+  marker="BANGBANG_REMAINING_DEVICE_TRANSPORT_${transport}_OK"
+  emit_line "$marker"
+  write_vdb_sector_marker "$marker" 2 || {
+    remaining_device_fail TRANSPORT_MARKER
+    return 1
+  }
+}
+
+check_remaining_device_pvtime() {
+  discovery=$(dmesg 2>/dev/null | grep -m 1 'stolen time PV' || true)
+  if [ -z "$discovery" ]; then
+    remaining_device_fail PVTIME_DISCOVERY
+    return 1
+  fi
+  steal_ticks=$(pvtime_steal_ticks || true)
+  case "$steal_ticks" in
+    '' | *[!0-9]*)
+      remaining_device_fail PVTIME_STEAL
+      return 1
+      ;;
+  esac
+  emit_line "$discovery"
+  emit_line "BANGBANG_REMAINING_DEVICE_PVTIME_STEAL=$steal_ticks"
+  emit_line BANGBANG_REMAINING_DEVICE_PVTIME_OK
+}
+
+check_remaining_device_certification() {
+  if ! check_remaining_device_transport; then
+    return
+  fi
+
+  emit_line BANGBANG_REMAINING_DEVICE_MEMORY_BEGIN
+  check_memory_hotplug_marker
+  if ! vdb_starts_with_marker BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK; then
+    remaining_device_fail MEMORY_HOTPLUG
+    return
+  fi
+  emit_line BANGBANG_REMAINING_DEVICE_MEMORY_OK
+
+  check_rtc_marker
+  if ! vdb_starts_with_marker BANGBANG_RTC_GUEST_CHECK_OK; then
+    remaining_device_fail RTC
+    return
+  fi
+  check_vmgenid_marker
+  if ! vdb_starts_with_marker BANGBANG_VMGENID_GUEST_CHECK_OK; then
+    remaining_device_fail VMGENID
+    return
+  fi
+  check_vmclock_marker
+  if ! vdb_starts_with_marker BANGBANG_VMCLOCK_GUEST_CHECK_OK; then
+    remaining_device_fail VMCLOCK
+    return
+  fi
+  if ! check_remaining_device_pvtime; then
+    return
+  fi
+  if ! write_vdb_sector_marker BANGBANG_REMAINING_DEVICE_TIME_IDENTITY_OK 3; then
+    remaining_device_fail TIME_IDENTITY_MARKER
+    return
+  fi
+  emit_line BANGBANG_REMAINING_DEVICE_TIME_IDENTITY_OK
+
+  read_entropy_lifecycle_marker
+  if ! vdb_starts_with_marker BANGBANG_ENTROPY_LIFECYCLE_OK; then
+    remaining_device_fail ENTROPY
+    return
+  fi
+  emit_line BANGBANG_REMAINING_DEVICE_ENTROPY_OK
+
+  check_balloon_marker
+  if ! vdb_starts_with_marker BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK; then
+    remaining_device_fail BALLOON
+    return
+  fi
+  emit_line BANGBANG_REMAINING_DEVICE_BALLOON_OK
+
+  expected_serial_input=BANGBANG_REMAINING_DEVICE_SERIAL_ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz_0123456789_END
+  if ! stty -F /dev/ttyS0 raw -echo 2>/dev/null; then
+    remaining_device_fail SERIAL_MODE
+    return
+  fi
+  emit_line BANGBANG_REMAINING_DEVICE_SERIAL_READY
+  if ! write_vdb_sector_marker BANGBANG_REMAINING_DEVICE_SERIAL_READY 4; then
+    remaining_device_fail SERIAL_READY_MARKER
+    return
+  fi
+  serial_input=$(timeout 90 dd if=/dev/ttyS0 bs=1 count="${#expected_serial_input}" 2>/dev/null || true)
+  if [ -z "$serial_input" ]; then
+    remaining_device_fail SERIAL_EOF
+    return
+  fi
+  if [ "$serial_input" != "$expected_serial_input" ]; then
+    remaining_device_fail SERIAL_INPUT
+    return
+  fi
+  emit_line BANGBANG_REMAINING_DEVICE_SERIAL_OK
+  if ! write_vdb_sector_marker BANGBANG_REMAINING_DEVICE_SERIAL_OK 4; then
+    remaining_device_fail SERIAL_SUCCESS_MARKER
+    return
+  fi
+
+  emit_line BANGBANG_REMAINING_DEVICE_CERTIFICATION_OK
+  if ! write_vdb_sector_marker BANGBANG_REMAINING_DEVICE_CERTIFICATION_OK 5; then
+    remaining_device_fail FINAL_MARKER
+  fi
+}
+
 cmdline=
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_BEGIN
 if [ -r /etc/os-release ]; then
@@ -3636,7 +3807,9 @@ if cmdline_has bangbang.block-serial=vda; then
 elif cmdline_has bangbang.block-serial=vdb; then
   report_block_serial vdb
 fi
-if cmdline_has bangbang.pvtime-check=1; then
+if cmdline_has bangbang.remaining-device-certification=1; then
+  check_remaining_device_certification
+elif cmdline_has bangbang.pvtime-check=1; then
   check_pvtime_marker
 elif cmdline_has bangbang.storage-certification=1; then
   check_storage_certification

@@ -26402,6 +26402,184 @@ mod tests {
     }
 
     #[test]
+    fn remaining_device_owner_budget_covers_mmio_and_pci_and_reuses_resources() {
+        let kernel = temp_file("remaining-device-kernel", &arm64_image());
+        let root = temp_sized_file("remaining-device-root", VIRTIO_BLOCK_SECTOR_SIZE);
+        let control = temp_sized_file("remaining-device-control", VIRTIO_BLOCK_SECTOR_SIZE);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "root", root.path(), true);
+        add_drive(&mut controller, "control", control.path(), false);
+        controller
+            .handle_action(VmmAction::PutBalloon(
+                BalloonConfigInput::new(1, true)
+                    .with_stats_polling_interval_s(1)
+                    .with_free_page_hinting(true)
+                    .with_free_page_reporting(true),
+            ))
+            .expect("remaining-device balloon should configure");
+        add_memory_hotplug(&mut controller);
+        controller
+            .handle_action(VmmAction::PutEntropy(
+                bangbang_runtime::entropy::EntropyConfigInput::new(),
+            ))
+            .expect("remaining-device entropy should configure");
+
+        let assemble_mmio = || {
+            Arm64BootResources::assemble_from_controller(
+                &controller,
+                Arm64BootResourceConfig {
+                    rtc_device: Some(bangbang_runtime::startup::Arm64BootRtcDeviceConfig::new(
+                        RtcMmioLayout::new(GuestAddress::new(0x4000_b000), MmioRegionId::new(3000)),
+                    )),
+                    serial_device: Some(RuntimeArm64BootSerialDeviceConfig::new(
+                        MmioRegionId::new(150),
+                        GuestAddress::new(0x4000_9000),
+                        line(37),
+                        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                    )),
+                    balloon_interrupt_line: Some(line(34)),
+                    memory_hotplug_device: Some(Arm64BootMemoryHotplugDeviceConfig::new(
+                        VirtioMemMmioLayout::new(
+                            TEST_MEMORY_HOTPLUG_MMIO_BASE,
+                            MmioRegionId::new(120),
+                        ),
+                        line(36),
+                    )),
+                    entropy_device: Some(Arm64BootEntropyDeviceConfig::new(
+                        EntropyMmioLayout::new(TEST_ENTROPY_MMIO_BASE, MmioRegionId::new(100)),
+                        line(35),
+                    )),
+                    ..valid_boot_resource_config(&[line(32), line(33)])
+                },
+            )
+            .expect("combined remaining-device MMIO resources should assemble")
+        };
+
+        for attempt in 0..2 {
+            let parts = assemble_mmio().into_parts();
+            assert_eq!(parts.runtime.block_devices.len(), 2);
+            assert!(parts.runtime.balloon_device.is_some());
+            assert!(parts.runtime.memory_hotplug_device.is_some());
+            assert!(parts.runtime.entropy_device.is_some());
+            assert!(parts.runtime.serial_device.is_some());
+            assert!(parts.runtime.rtc_device.is_some());
+            assert_eq!(
+                parts
+                    .runtime
+                    .pvtime_state
+                    .layout()
+                    .expect("remaining-device PVTime layout should exist")
+                    .len(),
+                1
+            );
+            let region_ids = parts
+                .mmio_dispatcher
+                .regions()
+                .iter()
+                .map(|region| region.id())
+                .collect::<Vec<_>>();
+            assert_eq!(region_ids.len(), 7, "MMIO owner count on attempt {attempt}");
+            for expected in [
+                MmioRegionId::new(1),
+                MmioRegionId::new(2),
+                MmioRegionId::new(100),
+                MmioRegionId::new(110),
+                MmioRegionId::new(120),
+                MmioRegionId::new(150),
+                MmioRegionId::new(3000),
+            ] {
+                assert!(
+                    region_ids.contains(&expected),
+                    "MMIO owner {expected} should be present on attempt {attempt}"
+                );
+            }
+            drop(parts);
+        }
+
+        let balloon_queue_count = controller
+            .balloon_config()
+            .map(|config| super::VirtioBalloonQueueLayout::from_config(config).queue_count());
+        let pci_demand = pci_all_virtio_resource_demand(
+            controller.drive_configs().len(),
+            0,
+            0,
+            balloon_queue_count,
+            false,
+            true,
+            true,
+        )
+        .expect("remaining-device PCI owner demand should fit");
+        assert_eq!(pci_demand.endpoints, 5);
+        assert_eq!(
+            pci_demand.routes,
+            2 * (super::VIRTIO_BLOCK_QUEUE_SIZES.len() + 1)
+                + balloon_queue_count.expect("balloon queue count should exist")
+                + 1
+                + super::VIRTIO_RNG_QUEUE_SIZES.len()
+                + 1
+                + super::VIRTIO_MEM_QUEUE_SIZES.len()
+                + 1
+        );
+
+        let platform_lines = allocate_interrupt_lines(
+            &gic_with_spi_range(32, 3),
+            HvfArm64BootInterruptRequest {
+                serial_configured: true,
+                ..HvfArm64BootInterruptRequest::default()
+            },
+        )
+        .expect("PCI transport should reserve SPIs only for remaining platform devices");
+        assert!(platform_lines.block.is_empty());
+        assert_eq!(platform_lines.balloon, None);
+        assert_eq!(platform_lines.entropy, None);
+        assert_eq!(platform_lines.memory_hotplug, None);
+        assert_eq!(
+            platform_lines.serial.map(GuestInterruptLine::raw_value),
+            Some(32)
+        );
+        assert_eq!(platform_lines.vmgenid.raw_value(), 33);
+        assert_eq!(platform_lines.vmclock.raw_value(), 34);
+
+        let bar_range = GuestMemoryRange::new(
+            GuestAddress::new(0x40_0000_0000),
+            u64::try_from(pci_demand.endpoints).expect("endpoint count should fit u64")
+                * super::VIRTIO_PCI_CAPABILITY_BAR_SIZE,
+        )
+        .expect("remaining-device PCI BAR range should fit");
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, bar_range);
+        let first_plan = pci_data_bar_plan(&allocator, pci_demand.endpoints)
+            .expect("remaining-device PCI BAR plan should fit");
+        let mut leases = Vec::new();
+        for _ in 0..pci_demand.endpoints {
+            leases.push(
+                allocator
+                    .allocate(super::VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+                    .expect("remaining-device PCI BAR should allocate"),
+            );
+        }
+        assert_eq!(
+            pci_data_available_bar_count(&allocator)
+                .expect("exhausted remaining-device BAR count should be readable"),
+            0
+        );
+        for lease in leases.into_iter().rev() {
+            allocator
+                .release(&lease)
+                .expect("remaining-device PCI BAR should release");
+        }
+        assert_eq!(
+            pci_data_available_bar_count(&allocator)
+                .expect("released remaining-device BAR count should be readable"),
+            pci_demand.endpoints
+        );
+        assert_eq!(
+            pci_data_bar_plan(&allocator, pci_demand.endpoints)
+                .expect("released remaining-device PCI BAR plan should be reusable"),
+            first_plan
+        );
+    }
+
+    #[test]
     fn product_pci_msi_configuration_reserves_bounded_dynamic_slot_headroom() {
         let controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
         let config = HvfArm64BootSessionConfig::new(

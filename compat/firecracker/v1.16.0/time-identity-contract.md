@@ -5,9 +5,11 @@ slice of #1440 under #1348. It covers the delivered aarch64 PL031 RTC, VMGenID,
 VMClock, and public live/capture-ready PVTime portions of exactly one
 aggregate identity:
 `semantic.device:rtc-vmclock-vmgenid-and-pvtime`. That identity remains
-`audit-required` because aggregate clone/portability policy and final combined
-certification remain under #1481. #1480 therefore changes no inventory
-disposition or global count.
+`audit-required` because PVTime artifact/restore, aggregate clone, and
+portability policy remain under
+[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). #1480 and the
+aggregate #1481 certification therefore change no inventory disposition or
+global count.
 
 ## Evidence keys
 
@@ -73,7 +75,7 @@ disposition or global count.
 
 | Identity | Current disposition | Exact contract and remaining handoff |
 | --- | --- | --- |
-| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, same-host repeated-load behavior, failure classification, redaction, signed guest observation, and public per-vCPU PVTime measurement/accounting/publication/discovery plus capture-ready continuity are implemented and verified. **#1481** owns final aggregate clone/portability reconciliation and terminal disposition. |
+| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, same-host repeated-load behavior, failure classification, redaction, signed guest observation, and public per-vCPU PVTime measurement/accounting/publication/discovery plus capture-ready continuity are implemented and verified. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** owns PVTime artifact encoding/restore, repeated-clone behavior, cross-host time-source portability, signed restored-guest outcomes, and terminal disposition. |
 
 ## VMClock state and version contract
 
@@ -129,6 +131,7 @@ it is not a claim of alarm delivery or source-wall-clock freezing.
 
 This ledger does not claim KVM's ARM steal-time device attribute, PVTime
 artifact serialization/restore orchestration, repeated clone behavior, or
-cross-host time-source portability. #1481 must reconcile those applicable
-clone and portability outcomes across the complete remaining-device family
-before the aggregate inventory record can become terminal.
+cross-host time-source portability. The aggregate #1481 certification proves
+the live/capture-ready coexistence boundary; Wave 6 #1490 must implement those
+artifact, clone, restored-guest, and portability outcomes before the aggregate
+inventory record can become terminal.

@@ -160,6 +160,65 @@ fn delivery_closure_policy_is_stable() {
         "corpus:pmem",
         "semantic.storage:pmem-root-mapping-flush-and-state",
     ];
+    const WAVE_6_ISSUE_URL: &str = "https://github.com/seven332/bangbang/issues/1490";
+    const BALLOON_TERMINAL: [&str; 50] = [
+        "api-operation:GET /balloon",
+        "api-operation:GET /balloon/hinting/status",
+        "api-operation:GET /balloon/statistics",
+        "api-operation:PATCH /balloon",
+        "api-operation:PATCH /balloon/hinting/start",
+        "api-operation:PATCH /balloon/hinting/stop",
+        "api-operation:PATCH /balloon/statistics",
+        "api-operation:PUT /balloon",
+        "api-path:/balloon",
+        "api-path:/balloon/hinting/start",
+        "api-path:/balloon/hinting/status",
+        "api-path:/balloon/hinting/stop",
+        "api-path:/balloon/statistics",
+        "api-property:Balloon.amount_mib",
+        "api-property:Balloon.deflate_on_oom",
+        "api-property:Balloon.free_page_hinting",
+        "api-property:Balloon.free_page_reporting",
+        "api-property:Balloon.stats_polling_interval_s",
+        "api-property:BalloonHintingStatus.guest_cmd",
+        "api-property:BalloonHintingStatus.host_cmd",
+        "api-property:BalloonStartCmd.acknowledge_on_stop",
+        "api-property:BalloonStats.actual_mib",
+        "api-property:BalloonStats.actual_pages",
+        "api-property:BalloonStats.alloc_stall",
+        "api-property:BalloonStats.async_reclaim",
+        "api-property:BalloonStats.async_scan",
+        "api-property:BalloonStats.available_memory",
+        "api-property:BalloonStats.direct_reclaim",
+        "api-property:BalloonStats.direct_scan",
+        "api-property:BalloonStats.disk_caches",
+        "api-property:BalloonStats.free_memory",
+        "api-property:BalloonStats.hugetlb_allocations",
+        "api-property:BalloonStats.hugetlb_failures",
+        "api-property:BalloonStats.major_faults",
+        "api-property:BalloonStats.minor_faults",
+        "api-property:BalloonStats.oom_kill",
+        "api-property:BalloonStats.swap_in",
+        "api-property:BalloonStats.swap_out",
+        "api-property:BalloonStats.target_mib",
+        "api-property:BalloonStats.target_pages",
+        "api-property:BalloonStats.total_memory",
+        "api-property:BalloonStatsUpdate.stats_polling_interval_s",
+        "api-property:BalloonUpdate.amount_mib",
+        "api-property:FullVmConfiguration.balloon",
+        "api-schema:Balloon",
+        "api-schema:BalloonHintingStatus",
+        "api-schema:BalloonStartCmd",
+        "api-schema:BalloonStats",
+        "api-schema:BalloonStatsUpdate",
+        "api-schema:BalloonUpdate",
+    ];
+    const BALLOON_WAVE_6: [&str; 2] = [
+        "corpus:ballooning",
+        "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
+    ];
+    const TIME_IDENTITY_WAVE_6: [&str; 1] = ["semantic.device:rtc-vmclock-vmgenid-and-pvtime"];
+
     const MEMORY_HOTPLUG_TERMINAL: [&str; 17] = [
         "api-operation:GET /hotplug/memory",
         "api-operation:PATCH /hotplug/memory",
@@ -578,6 +637,258 @@ fn delivery_closure_policy_is_stable() {
             serial_contract.matches(&format!("| `{id}` |")).count(),
             1,
             "checked serial contract row must be unique: {id}"
+        );
+    }
+
+    let balloon_ids = BALLOON_TERMINAL
+        .into_iter()
+        .chain(BALLOON_WAVE_6)
+        .collect::<BTreeSet<_>>();
+    let memory_hotplug_ids = MEMORY_HOTPLUG_TERMINAL
+        .into_iter()
+        .chain(MEMORY_HOTPLUG_WAVE_6)
+        .collect::<BTreeSet<_>>();
+    let entropy_ids = ENTROPY_TERMINAL
+        .into_iter()
+        .chain(ENTROPY_WAVE_6)
+        .collect::<BTreeSet<_>>();
+    let serial_ids = SERIAL_TERMINAL
+        .into_iter()
+        .chain(SERIAL_WAVE_6)
+        .collect::<BTreeSet<_>>();
+    let time_identity_ids = TIME_IDENTITY_WAVE_6.into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(balloon_ids.len(), 52);
+    assert_eq!(memory_hotplug_ids.len(), 19);
+    assert_eq!(entropy_ids.len(), 7);
+    assert_eq!(serial_ids.len(), 6);
+    assert_eq!(time_identity_ids.len(), 1);
+
+    let family_sets = [
+        &balloon_ids,
+        &memory_hotplug_ids,
+        &entropy_ids,
+        &serial_ids,
+        &time_identity_ids,
+    ];
+    for (index, left) in family_sets.iter().enumerate() {
+        for right in family_sets.iter().skip(index + 1) {
+            assert!(
+                left.is_disjoint(right),
+                "remaining-device family ledgers must be disjoint"
+            );
+        }
+    }
+    let remaining_ids = family_sets
+        .iter()
+        .flat_map(|ids| ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(remaining_ids.len(), 85);
+
+    let selected_inventory_ids = inventory
+        .capabilities
+        .iter()
+        .filter(|capability| {
+            let id = capability.id.as_str();
+            let lower = id.to_ascii_lowercase();
+            lower.contains("balloon")
+                || lower.contains("entropy")
+                || lower.contains("serial")
+                || lower.contains("hotplug/memory")
+                || lower.contains("memory-hotplug")
+                || lower.contains("virtio-mem")
+                || id.contains("MemoryHotplug")
+                || id == "semantic.device:rtc-vmclock-vmgenid-and-pvtime"
+        })
+        .map(|capability| capability.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        selected_inventory_ids, remaining_ids,
+        "the reproducible remaining-device selector must resolve to exactly the five ledgers"
+    );
+
+    let remaining_terminal_ids = BALLOON_TERMINAL
+        .into_iter()
+        .chain(MEMORY_HOTPLUG_TERMINAL)
+        .chain(ENTROPY_TERMINAL)
+        .chain(SERIAL_TERMINAL)
+        .collect::<BTreeSet<_>>();
+    let remaining_wave_6_ids = BALLOON_WAVE_6
+        .into_iter()
+        .chain(MEMORY_HOTPLUG_WAVE_6)
+        .chain(ENTROPY_WAVE_6)
+        .chain(SERIAL_WAVE_6)
+        .chain(TIME_IDENTITY_WAVE_6)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(remaining_terminal_ids.len(), 77);
+    assert_eq!(remaining_wave_6_ids.len(), 8);
+    assert!(remaining_terminal_ids.is_disjoint(&remaining_wave_6_ids));
+    assert_eq!(
+        remaining_terminal_ids
+            .union(&remaining_wave_6_ids)
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        remaining_ids
+    );
+
+    for id in &remaining_terminal_ids {
+        let capability = by_id
+            .get(id)
+            .expect("terminal remaining-device record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "remaining-device terminal disposition drifted: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "remaining-device terminal evidence must remain concrete: {id}"
+        );
+        assert!(
+            !capability.summary.contains("#1440")
+                && !capability.summary.contains("#1481")
+                && !capability.summary.contains("future remaining-device"),
+            "remaining-device terminal summary still names future aggregate work: {id}"
+        );
+    }
+    for id in &remaining_wave_6_ids {
+        let capability = by_id
+            .get(id)
+            .expect("Wave 6 remaining-device record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "remaining-device Wave 6 disposition drifted: {id}"
+        );
+        assert!(
+            capability.summary.contains(WAVE_6_ISSUE_URL),
+            "remaining-device Wave 6 summary must name its exact issue URL: {id}"
+        );
+        for outcome in ["restore", "portability", "signed restored-guest"] {
+            assert!(
+                capability.summary.contains(outcome),
+                "remaining-device Wave 6 summary must name missing {outcome}: {id}"
+            );
+        }
+        assert!(
+            capability.summary.contains("artifact")
+                || capability.summary.contains("native artifacts"),
+            "remaining-device Wave 6 summary must name missing artifact integration: {id}"
+        );
+        assert!(
+            capability.summary.contains("migration/clone")
+                || capability.summary.contains("repeated-clone"),
+            "remaining-device Wave 6 summary must name missing clone or migration outcomes: {id}"
+        );
+    }
+
+    let ledger_contracts = [
+        (
+            "balloon-contract.md",
+            &balloon_ids,
+            "checked balloon contract",
+        ),
+        (
+            "memory-hotplug-contract.md",
+            &memory_hotplug_ids,
+            "checked memory-hotplug contract",
+        ),
+        (
+            "entropy-contract.md",
+            &entropy_ids,
+            "checked entropy contract",
+        ),
+        ("serial-contract.md", &serial_ids, "checked serial contract"),
+        (
+            "time-identity-contract.md",
+            &time_identity_ids,
+            "checked time/identity contract",
+        ),
+    ];
+    for (filename, expected_ids, context) in ledger_contracts {
+        let contract = std::fs::read_to_string(
+            repository_root
+                .join("compat/firecracker/v1.16.0")
+                .join(filename),
+        )
+        .unwrap_or_else(|error| panic!("{context} must be readable: {error}"));
+        let rows = contract
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .collect::<Vec<_>>();
+        let ids = rows
+            .iter()
+            .filter_map(|line| {
+                line.strip_prefix("| `")
+                    .and_then(|line| line.split_once("` |"))
+                    .map(|(id, _)| id)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            rows.len(),
+            expected_ids.len(),
+            "{context} row count drifted"
+        );
+        assert_eq!(&ids, expected_ids, "{context} identity set drifted");
+    }
+
+    let aggregate_contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/remaining-device-contract.md"),
+    )
+    .expect("checked aggregate remaining-device contract must be readable");
+    let aggregate_rows = aggregate_contract
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect::<Vec<_>>();
+    let aggregate_ids = aggregate_rows
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix("| `")
+                .and_then(|line| line.split_once("` |"))
+                .map(|(id, _)| id)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(aggregate_rows.len(), 85);
+    assert_eq!(aggregate_ids, remaining_ids);
+    for id in &remaining_ids {
+        let row_prefix = format!("| `{id}` |");
+        let row = aggregate_rows
+            .iter()
+            .copied()
+            .find(|row| row.starts_with(&row_prefix))
+            .unwrap_or_else(|| panic!("aggregate contract row must exist: {id}"));
+        assert_eq!(
+            aggregate_contract.matches(&row_prefix).count(),
+            1,
+            "aggregate contract row must be unique: {id}"
+        );
+        assert!(
+            !row.contains("| `` |"),
+            "aggregate evidence key is empty: {id}"
+        );
+        assert!(
+            !row.contains("`W7`"),
+            "selected row must not hand off to Wave 7: {id}"
+        );
+        if remaining_terminal_ids.contains(id) {
+            assert!(row.contains("`implemented-and-verified`"));
+            assert!(row.ends_with("| `terminal` |"));
+        } else {
+            assert!(row.contains("`audit-required`"));
+            assert!(row.contains("`W6-"));
+        }
+    }
+    for required in [
+        "https://github.com/seven332/bangbang/issues/1490",
+        "https://github.com/seven332/bangbang/issues/1491",
+        "signed_executable_certifies_remaining_devices_over_mmio",
+        "signed_executable_certifies_remaining_devices_over_product_pci",
+        "aggregate_remaining_device_snapshot_preflight_failures_preserve_order_and_reuse",
+        "remaining_device_owner_budget_covers_mmio_and_pci_and_reuses_resources",
+        "normal_bundle_isolates_concurrent_default_serial_stdio_sessions",
+    ] {
+        assert!(
+            aggregate_contract.contains(required),
+            "aggregate contract must pin {required}"
         );
     }
 

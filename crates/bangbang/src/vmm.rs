@@ -10348,6 +10348,7 @@ mod tests {
         calls: usize,
         provided_boot_file_calls: usize,
         provided_serial_output_calls: usize,
+        snapshot_preflight_trace: Vec<&'static str>,
         snapshot_storage_preflight_calls: usize,
         last_snapshot_storage_configs: Option<CaptureReadyStorageConfigs>,
         snapshot_storage_preflight_failure: Option<HvfArm64BootStorageCaptureError>,
@@ -10377,6 +10378,7 @@ mod tests {
                 calls: 0,
                 provided_boot_file_calls: 0,
                 provided_serial_output_calls: 0,
+                snapshot_preflight_trace: Vec::new(),
                 snapshot_storage_preflight_calls: 0,
                 last_snapshot_storage_configs: None,
                 snapshot_storage_preflight_failure: None,
@@ -10435,6 +10437,7 @@ mod tests {
                 calls: 0,
                 provided_boot_file_calls: 0,
                 provided_serial_output_calls: 0,
+                snapshot_preflight_trace: Vec::new(),
                 snapshot_storage_preflight_calls: 0,
                 last_snapshot_storage_configs: None,
                 snapshot_storage_preflight_failure: None,
@@ -10493,6 +10496,7 @@ mod tests {
             configs: CaptureReadyStorageConfigs,
             _cancellation: NativeV1SnapshotCaptureCancellation,
         ) -> Result<(), HvfArm64BootStorageCaptureError> {
+            self.snapshot_preflight_trace.push("storage");
             self.snapshot_storage_preflight_calls += 1;
             self.last_snapshot_storage_configs = Some(configs);
             match self.snapshot_storage_preflight_failure {
@@ -10506,6 +10510,7 @@ mod tests {
             _session: &mut Self::Session,
             config: Option<BalloonConfig>,
         ) -> Result<(), HvfArm64BootBalloonCaptureError> {
+            self.snapshot_preflight_trace.push("balloon");
             self.snapshot_balloon_preflight_calls += 1;
             self.last_snapshot_balloon_config = Some(config);
             if self.snapshot_balloon_preflight_failure {
@@ -10520,6 +10525,7 @@ mod tests {
             _session: &mut Self::Session,
             config: Option<MemoryHotplugConfig>,
         ) -> Result<(), HvfArm64BootMemoryHotplugCaptureError> {
+            self.snapshot_preflight_trace.push("memory-hotplug");
             self.snapshot_memory_hotplug_preflight_calls += 1;
             self.last_snapshot_memory_hotplug_config = Some(config);
             if self.snapshot_memory_hotplug_preflight_failure {
@@ -10534,6 +10540,7 @@ mod tests {
             _session: &mut Self::Session,
             config: Option<EntropyConfig>,
         ) -> Result<(), HvfArm64BootEntropyCaptureError> {
+            self.snapshot_preflight_trace.push("entropy");
             self.snapshot_entropy_preflight_calls += 1;
             self.last_snapshot_entropy_config = Some(config);
             if self.snapshot_entropy_preflight_failure {
@@ -10548,6 +10555,7 @@ mod tests {
             _session: &mut Self::Session,
             config: SerialConfig,
         ) -> Result<(), HvfArm64BootSerialCaptureError> {
+            self.snapshot_preflight_trace.push("serial");
             self.snapshot_serial_preflight_calls += 1;
             self.last_snapshot_serial_config = Some(config);
             if self.snapshot_serial_preflight_failure {
@@ -18079,6 +18087,147 @@ mod tests {
         assert!(!state_path.exists());
         assert!(!memory_path.exists());
         assert!(!parent.exists());
+    }
+
+    #[test]
+    fn aggregate_remaining_device_snapshot_preflight_failures_preserve_order_and_reuse() {
+        #[derive(Clone, Copy)]
+        enum FailureStage {
+            Storage,
+            Balloon,
+            MemoryHotplug,
+            Entropy,
+            Serial,
+        }
+
+        const COMPLETE_TRACE: &[&str] =
+            &["storage", "balloon", "memory-hotplug", "entropy", "serial"];
+        let cases = [
+            (
+                FailureStage::Storage,
+                "storage",
+                FakeStarter::success(170).with_snapshot_storage_preflight_failure(
+                    HvfArm64BootStorageCaptureError::owner_unavailable(),
+                ),
+                &COMPLETE_TRACE[..1],
+            ),
+            (
+                FailureStage::Balloon,
+                "balloon",
+                FakeStarter::success(171).with_snapshot_balloon_preflight_failure(),
+                &COMPLETE_TRACE[..2],
+            ),
+            (
+                FailureStage::MemoryHotplug,
+                "memory-hotplug",
+                FakeStarter::success(172).with_snapshot_memory_hotplug_preflight_failure(),
+                &COMPLETE_TRACE[..3],
+            ),
+            (
+                FailureStage::Entropy,
+                "entropy",
+                FakeStarter::success(173).with_snapshot_entropy_preflight_failure(),
+                &COMPLETE_TRACE[..4],
+            ),
+            (
+                FailureStage::Serial,
+                "serial",
+                FakeStarter::success(174).with_snapshot_serial_preflight_failure(),
+                COMPLETE_TRACE,
+            ),
+        ];
+
+        for (stage, name, starter, expected_failed_trace) in cases {
+            let state_path = missing_temp_child_path(&format!("aggregate-{name}.state"));
+            let memory_path = state_path.with_file_name(format!("aggregate-{name}.memory"));
+            let parent = state_path
+                .parent()
+                .expect("aggregate snapshot path should have a parent");
+            let mut vmm = configured_vmm(starter);
+            vmm.handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new("root", "root", "/private/root", true)
+                    .with_is_read_only(true)
+                    .with_io_engine(DriveIoEngine::Sync),
+            ))
+            .expect("aggregate snapshot root should configure");
+            vmm.handle_action(VmmAction::PutBalloon(
+                BalloonConfigInput::new(8, true)
+                    .with_stats_polling_interval_s(1)
+                    .with_free_page_hinting(true)
+                    .with_free_page_reporting(true),
+            ))
+            .expect("aggregate snapshot balloon should configure");
+            vmm.handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+                .expect("aggregate snapshot memory hotplug should configure");
+            vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                .expect("aggregate snapshot entropy should configure");
+            vmm.handle_action(VmmAction::PutSerial(
+                SerialConfigInput::new().with_rate_limiter(
+                    bangbang_runtime::serial::SerialRateLimiterConfig::new(8, Some(16), 100),
+                ),
+            ))
+            .expect("aggregate snapshot serial should configure");
+            vmm.handle_action(VmmAction::InstanceStart)
+                .expect("aggregate snapshot fake session should start");
+            vmm.handle_action(VmmAction::Pause)
+                .expect("aggregate snapshot fake session should pause");
+
+            let drive_configs = vmm.controller.drive_configs().to_vec();
+            let balloon_config = vmm.controller.balloon_config();
+            let memory_hotplug_config = vmm.controller.memory_hotplug_config();
+            let entropy_config = vmm.controller.entropy_config();
+            let serial_config = vmm.controller.serial_config().clone();
+            let input = SnapshotCreateInput::new(SnapshotType::Full, &state_path, &memory_path);
+            let error = vmm
+                .handle_action(VmmAction::CreateSnapshot(input.clone()))
+                .expect_err("injected aggregate preflight failure should be reported");
+
+            assert!(
+                matches!(error, VmmActionError::SnapshotCreate(_)),
+                "{name} should retain its typed snapshot-create classification: {error:?}"
+            );
+            assert_eq!(vmm.starter.snapshot_preflight_trace, expected_failed_trace);
+            assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+            assert_eq!(vmm.controller.drive_configs(), drive_configs);
+            assert_eq!(vmm.controller.balloon_config(), balloon_config);
+            assert_eq!(
+                vmm.controller.memory_hotplug_config(),
+                memory_hotplug_config
+            );
+            assert_eq!(vmm.controller.entropy_config(), entropy_config);
+            assert_eq!(vmm.controller.serial_config(), &serial_config);
+            assert!(!state_path.exists());
+            assert!(!memory_path.exists());
+            assert!(!parent.exists());
+
+            match stage {
+                FailureStage::Storage => vmm.starter.snapshot_storage_preflight_failure = None,
+                FailureStage::Balloon => vmm.starter.snapshot_balloon_preflight_failure = false,
+                FailureStage::MemoryHotplug => {
+                    vmm.starter.snapshot_memory_hotplug_preflight_failure = false;
+                }
+                FailureStage::Entropy => vmm.starter.snapshot_entropy_preflight_failure = false,
+                FailureStage::Serial => vmm.starter.snapshot_serial_preflight_failure = false,
+            }
+
+            let retry_error = vmm
+                .handle_action(VmmAction::CreateSnapshot(input))
+                .expect_err("aggregate retry should traverse every owner before profile rejection");
+            assert_eq!(retry_error, VmmActionError::SnapshotUnsupported);
+            let mut expected_retry_trace = expected_failed_trace.to_vec();
+            expected_retry_trace.extend_from_slice(COMPLETE_TRACE);
+            assert_eq!(vmm.starter.snapshot_preflight_trace, expected_retry_trace);
+            assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+            let session = vmm
+                .started_session
+                .as_ref()
+                .expect("aggregate retry should retain its paused session");
+            assert_eq!(session.native_snapshot_publication_count, 0);
+            assert_eq!(session.native_snapshot_producer_count, 0);
+            assert!(!state_path.exists());
+            assert!(!memory_path.exists());
+            assert!(!parent.exists());
+        }
     }
 
     #[test]
