@@ -1901,6 +1901,17 @@ impl fmt::Debug for Arm64BootNetworkPacketIo<'_> {
 }
 
 pub trait Arm64BootNetworkPacketIoProvider {
+    /// Takes one coalesced callback-driven owner-pass request.
+    fn take_scheduled_packet_readiness(&mut self) -> bool {
+        false
+    }
+
+    /// Returns persistent readiness for one exact interface. This does not
+    /// consume the condition and is also used during guest/MMIO/limiter work.
+    fn has_packet_readiness(&self, _interface: Arm64BootNetworkInterface<'_>) -> bool {
+        false
+    }
+
     fn packet_io(
         &mut self,
         interface: Arm64BootNetworkInterface<'_>,
@@ -3383,7 +3394,12 @@ impl Arm64BootRuntimeResources {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioNetworkMmioHandler>(region_id) {
                 Ok(handler) => {
-                    if !handler.has_pending_network_queue_work() {
+                    let interface = Arm64BootNetworkInterface::new(
+                        device.registration.iface_id(),
+                        device.registration.host_dev_name(),
+                    );
+                    let has_packet_readiness = packet_io.has_packet_readiness(interface);
+                    if !handler.has_pending_network_queue_work() && !has_packet_readiness {
                         match handler.dispatch_network_queue_notifications(memory) {
                             Ok(dispatch) => {
                                 Arm64BootNetworkNotificationOutcome::Dispatched(Box::new(dispatch))
@@ -3393,10 +3409,7 @@ impl Arm64BootRuntimeResources {
                             }
                         }
                     } else {
-                        match packet_io.packet_io(Arm64BootNetworkInterface::new(
-                            device.registration.iface_id(),
-                            device.registration.host_dev_name(),
-                        )) {
+                        match packet_io.packet_io(interface) {
                             Ok(packet_io) => {
                                 let Arm64BootNetworkPacketIo { tx_sink, rx_source } = packet_io;
                                 match handler.dispatch_network_queue_notifications_with_packet_io(
@@ -8162,6 +8175,10 @@ mod tests {
     }
 
     impl VirtioNetworkRxPacketSource for RecordingRxPacketSource {
+        fn host_readiness_hint(&self) -> bool {
+            !self.packets.is_empty()
+        }
+
         fn peek_packet(
             &mut self,
         ) -> Result<Option<VirtioNetworkRxPacket<'_>>, VirtioNetworkRxPacketSourceError> {
@@ -8199,6 +8216,7 @@ mod tests {
     struct RecordingNetworkPacketIoProvider {
         endpoints: Vec<RecordingNetworkPacketEndpoint>,
         requested_ifaces: Vec<String>,
+        ready_ifaces: Vec<String>,
         fail_iface: Option<String>,
     }
 
@@ -8214,6 +8232,11 @@ mod tests {
             self
         }
 
+        fn ready_for(mut self, iface_id: &str) -> Self {
+            self.ready_ifaces.push(iface_id.to_string());
+            self
+        }
+
         fn endpoint(&self, iface_id: &str) -> &RecordingNetworkPacketEndpoint {
             self.endpoints
                 .iter()
@@ -8223,6 +8246,12 @@ mod tests {
     }
 
     impl Arm64BootNetworkPacketIoProvider for RecordingNetworkPacketIoProvider {
+        fn has_packet_readiness(&self, interface: super::Arm64BootNetworkInterface<'_>) -> bool {
+            self.ready_ifaces
+                .iter()
+                .any(|iface_id| iface_id == interface.iface_id())
+        }
+
         fn packet_io(
             &mut self,
             interface: super::Arm64BootNetworkInterface<'_>,
@@ -13171,6 +13200,102 @@ mod tests {
             .expect("no pending notification should dispatch as no-op");
         assert!(dispatch.drained_notifications().is_empty());
         assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_network_packet_readiness_routes_only_the_exact_interface() {
+        let kernel = temp_file("kernel-network-packet-readiness", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        add_network(&mut controller, "eth1", "tap1");
+        let config = Arm64BootResourceConfig {
+            network_interrupt_lines: &[line(33), line(34)],
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        let layout = network_queue_layout(1);
+        configure_boot_network_queues_with_layout(&mut runtime, &mut mmio_dispatcher, 1, layout);
+        write_rx_buffer(&mut memory, layout);
+        let mut provider = RecordingNetworkPacketIoProvider::default()
+            .with_endpoint("eth0", vec![vec![0x10]])
+            .with_endpoint("eth1", vec![vec![0x20, 0x21]])
+            .ready_for("eth1");
+
+        let dispatches = runtime
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("readiness dispatch should allocate");
+
+        assert_eq!(provider.requested_ifaces, ["eth1".to_string()]);
+        assert_eq!(dispatches.len(), 2);
+        let first = dispatches.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("unready interface should no-op");
+        assert!(first.rx_queue_dispatch().is_none());
+        let second = dispatches.as_slice()[1]
+            .outcome()
+            .dispatched()
+            .expect("ready interface should dispatch");
+        let rx = second
+            .rx_queue_dispatch()
+            .expect("ready interface should enter its RX queue");
+        assert_eq!(rx.delivered_packets(), 1);
+        assert_eq!(provider.endpoint("eth0").rx_source.consume_calls, 0);
+        assert_eq!(provider.endpoint("eth1").rx_source.consume_calls, 1);
+        let mut expected_rx_frame = vec![0; VIRTIO_NET_TX_HEADER_SIZE as usize];
+        expected_rx_frame.extend([0x20, 0x21]);
+        assert_eq!(
+            read_guest_bytes(&memory, layout.rx_buffer, expected_rx_frame.len()),
+            expected_rx_frame
+        );
+    }
+
+    #[test]
+    fn boot_runtime_network_readiness_on_inactive_device_parks_without_error() {
+        let kernel = temp_file("kernel-inactive-network-packet-readiness", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        let config = Arm64BootResourceConfig {
+            network_interrupt_lines: &[line(33)],
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        let mut provider = RecordingNetworkPacketIoProvider::default()
+            .with_endpoint("eth0", vec![vec![0x30]])
+            .ready_for("eth0");
+
+        let dispatches = runtime
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("inactive readiness should park, not fail");
+
+        assert_eq!(provider.requested_ifaces, ["eth0".to_string()]);
+        let dispatch = dispatches.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("inactive readiness should produce a parked dispatch");
+        assert!(dispatch.drained_notifications().is_empty());
+        assert!(dispatch.rx_queue_dispatch().is_none());
+        assert!(dispatch.tx_queue_dispatch().is_none());
+        assert_eq!(provider.endpoint("eth0").rx_source.consume_calls, 0);
+        assert_eq!(provider.endpoint("eth0").rx_source.packets.len(), 1);
     }
 
     #[test]

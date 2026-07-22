@@ -205,6 +205,32 @@ impl MmdsPacketDetour {
         Ok(true)
     }
 
+    /// Classifies whether `detour_packet` can perform an MMDS effect without
+    /// mutating request buffers, response queues, state, or metrics.
+    ///
+    /// Batch sinks use this only to preserve effect order by flushing earlier
+    /// external frames before the matching packet is committed.
+    pub fn would_detour_packet(&self, packet: &[u8]) -> bool {
+        if classify_mmds_guest_arp_request(packet, self.mmds_ipv4_address).is_some() {
+            return true;
+        }
+        let Some(classified) = classify_mmds_guest_tcp_packet(packet, self.mmds_ipv4_address)
+        else {
+            return false;
+        };
+        if classified.is_initial_synchronization_request()
+            || classified.acknowledges_initial_synchronization_response()
+            || classified.is_empty_fin_close_request()
+            || classified.is_reset_control()
+            || classified.is_unsupported_empty_control_reset_request()
+        {
+            return true;
+        }
+        !classified.payload().is_empty()
+            && !classified.has_unsupported_payload_control_flags()
+            && classified.has_initial_synchronization_acknowledgement()
+    }
+
     fn queue_response(
         &self,
         response_context: MmdsGuestTcpResponseContext,

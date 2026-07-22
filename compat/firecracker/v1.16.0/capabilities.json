@@ -9498,7 +9498,7 @@
     {
       "id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
       "family": "network-and-mmds",
-      "summary": "Audit virtio-net queues, vmnet properties/callbacks/batching, egress policy, limiting, metrics, connectivity, cleanup, PCI, and snapshot state.",
+      "summary": "The current live subset implements virtio-net queues, typed vmnet results and lifecycle, generation-scoped callback readiness, bounded RX/TX batches with explicit partial counts, MMDS/limiter/result ordering, metrics, PCI ownership, and terminal cleanup. Audit direct virtio headers and offloads, external egress/connectivity and host resource policy, broader MMDS TCP behavior, and network snapshot state.",
       "source_refs": [
         "corpus:network-performance",
         "corpus:network-setup",

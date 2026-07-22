@@ -1988,12 +1988,13 @@ impl HvfArm64BootPciDataDevices {
                     continue;
                 }
             };
-            let result = if has_pending {
+            let interface = Arm64BootNetworkInterface::new(&device.iface_id, &device.host_dev_name);
+            let has_packet_readiness = packet_io
+                .as_deref()
+                .is_some_and(|provider| provider.has_packet_readiness(interface));
+            let result = if has_pending || has_packet_readiness {
                 match packet_io.as_deref_mut() {
-                    Some(provider) => match provider.packet_io(Arm64BootNetworkInterface::new(
-                        &device.iface_id,
-                        &device.host_dev_name,
-                    )) {
+                    Some(provider) => match provider.packet_io(interface) {
                         Ok(packet_io) => {
                             let (tx_sink, rx_source) = packet_io.into_parts();
                             endpoint.dispatch_network_queue_notifications_with_packet_io(
@@ -10743,6 +10744,10 @@ where
         self.session.cancel_run_loop_network_retry_wakeup();
     }
 
+    fn take_run_loop_network_packet_readiness(&mut self) -> bool {
+        self.packet_io.take_scheduled_packet_readiness()
+    }
+
     fn take_run_loop_entropy_retry_wakeup_request(&mut self) -> bool {
         self.session.take_run_loop_entropy_retry_wakeup_request()
     }
@@ -12345,6 +12350,10 @@ trait BootSessionRunLoopSession {
 
     fn cancel_run_loop_network_retry_wakeup(&mut self);
 
+    fn take_run_loop_network_packet_readiness(&mut self) -> bool {
+        false
+    }
+
     fn take_run_loop_entropy_retry_wakeup_request(&mut self) -> bool {
         false
     }
@@ -12779,6 +12788,12 @@ fn run_boot_session_loop_with_observer_inner(
         let _ = dispatch_run_loop_network_retry_notifications_for_step(session, steps)?;
         if stop_token.is_stop_requested() {
             return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+        }
+        if session.take_run_loop_network_packet_readiness() {
+            dispatch_run_loop_network_notifications_for_step(session, steps)?;
+            if stop_token.is_stop_requested() {
+                return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+            }
         }
 
         let monitor = session.start_run_loop_wakeup_monitor().map_err(|source| {
@@ -18823,6 +18838,7 @@ mod tests {
         block_retry_wakeup_requested: bool,
         pmem_retry_wakeup_requested: bool,
         network_retry_wakeup_requested: bool,
+        network_packet_readiness_requested: bool,
         entropy_retry_wakeup_requested: bool,
         scheduled_block_retry_wakeups: Vec<Option<Duration>>,
         scheduled_pmem_retry_wakeups: Vec<Option<Duration>>,
@@ -18862,6 +18878,7 @@ mod tests {
                 block_retry_wakeup_requested: false,
                 pmem_retry_wakeup_requested: false,
                 network_retry_wakeup_requested: false,
+                network_packet_readiness_requested: false,
                 entropy_retry_wakeup_requested: false,
                 scheduled_block_retry_wakeups: Vec::new(),
                 scheduled_pmem_retry_wakeups: Vec::new(),
@@ -18901,6 +18918,7 @@ mod tests {
                 block_retry_wakeup_requested: false,
                 pmem_retry_wakeup_requested: false,
                 network_retry_wakeup_requested: false,
+                network_packet_readiness_requested: false,
                 entropy_retry_wakeup_requested: false,
                 scheduled_block_retry_wakeups: Vec::new(),
                 scheduled_pmem_retry_wakeups: Vec::new(),
@@ -19017,6 +19035,10 @@ mod tests {
 
         fn request_stop_on_network_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
             self.request_stop_on_network_dispatch = Some(stop_token);
+        }
+
+        fn request_network_packet_readiness(&mut self) {
+            self.network_packet_readiness_requested = true;
         }
 
         fn request_stop_on_vsock_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
@@ -19156,6 +19178,12 @@ mod tests {
         fn cancel_run_loop_network_retry_wakeup(&mut self) {
             self.network_retry_wakeup_requested = false;
             self.network_retry_cancel_count += 1;
+        }
+
+        fn take_run_loop_network_packet_readiness(&mut self) -> bool {
+            let requested = self.network_packet_readiness_requested;
+            self.network_packet_readiness_requested = false;
+            requested
         }
 
         fn take_run_loop_entropy_retry_wakeup_request(&mut self) -> bool {
@@ -25473,6 +25501,40 @@ mod tests {
         );
         assert_eq!(session.scheduled_network_retry_wakeups, [None]);
         assert_eq!(session.network_retry_cancel_count, 0);
+    }
+
+    #[test]
+    fn boot_session_run_loop_dispatches_packet_readiness_before_first_vcpu_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
+        session.request_network_packet_readiness();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("packet readiness dispatch should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(
+            session.events,
+            ["network-dispatch", "run", "vsock-dispatch"]
+        );
+        assert!(!session.network_packet_readiness_requested);
+    }
+
+    #[test]
+    fn boot_session_run_loop_stop_after_packet_readiness_prevents_first_vcpu_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
+        session.request_network_packet_readiness();
+        session.request_stop_on_network_dispatch(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after packet readiness should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 0 });
+        assert_eq!(session.events, ["network-dispatch"]);
     }
 
     #[test]

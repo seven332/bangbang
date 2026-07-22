@@ -980,9 +980,16 @@ the guest device. A vmnet-allocated MAC becomes guest-visible without rewriting
 the requested `GET /vm/config` projection, and explicit plus allocated MACs are
 reserved globally across startup and runtime insertion. Start and stop waits
 have finite deadlines; cleanup that cannot confirm stop makes the process
-terminal instead of allowing reuse. Packet I/O remains raw Ethernet and one
-packet per call, without packet-available callbacks, batch dispatch, direct
-virtio headers, or offloads.
+terminal instead of allowing reuse. Packet I/O remains raw Ethernet. Direct
+vmnet registers packet-available callbacks into generation-scoped readiness
+leases; the callbacks only coalesce an optional bounded packet-count hint and
+signal a capacity-one owner-loop bridge. The owner loop performs at most one
+realized host batch per pass, bounded by Apple's returned limits, 200 packets,
+256 KiB, packet size, and virtqueue capacity. RX retains packets until guest
+used-ring publication succeeds, while TX preserves descriptor and MMDS effect
+order and maps successful short writes to an exact forwarded prefix without
+retrying the suffix. Callback generations are retired, disabled, and drained
+before vmnet stop and reuse. Direct virtio headers and offloads remain disabled.
 
 Current signed Network/MMDS scenarios select every configured interface in MMDS
 config, so startup uses process-local MMDS-only packet I/O without opening

@@ -883,6 +883,58 @@ pub trait VirtioNetworkTxPacketSink {
         memory: &GuestMemory,
         frame: &VirtioNetworkTxFrame,
     ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>;
+
+    /// Returns whether this sink implements the two-phase bounded batch seam.
+    fn supports_staged_batch(&self) -> bool {
+        false
+    }
+
+    /// Copies all guest-owned bytes needed by one frame into sink-owned
+    /// staging before the used descriptor is published.
+    fn stage_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+    ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+        Err(VirtioNetworkTxPacketSinkError::new(
+            "virtio-net sink does not support staged batches",
+        ))
+    }
+
+    /// Commits the one currently staged frame after used-ring publication.
+    fn commit_staged_frame(&mut self) -> VirtioNetworkTxPacketCommit {
+        VirtioNetworkTxPacketCommit::Immediate(Err(VirtioNetworkTxPacketSinkError::new(
+            "virtio-net sink does not support staged batches",
+        )))
+    }
+
+    /// Discards the one uncommitted staged frame after a publication failure.
+    fn discard_staged_frame(&mut self) {}
+
+    /// Flushes committed frames and appends exactly one ordered result per
+    /// committed frame to `results`.
+    fn flush_staged_frames(
+        &mut self,
+        _results: &mut Vec<
+            Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>,
+        >,
+    ) {
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioNetworkTxPacketStage {
+    /// The frame is staged. A detour or other immediate side effect requires
+    /// all earlier committed external frames to flush first.
+    Staged { flush_before_commit: bool },
+    /// The current committed batch must flush before this frame can fit.
+    FlushRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtioNetworkTxPacketCommit {
+    Deferred,
+    Immediate(Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1046,6 +1098,15 @@ impl<'a> VirtioNetworkRxPacket<'a> {
 }
 
 pub trait VirtioNetworkRxPacketSource {
+    /// Starts one bounded owner-side RX dispatch pass.
+    fn begin_rx_dispatch(&mut self) {}
+
+    /// Returns whether this source owns persistent host-readiness or a retained
+    /// host packet that may be consumed during an already-entered owner pass.
+    fn host_readiness_hint(&self) -> bool {
+        false
+    }
+
     /// Returns whether an RX retry is known to be useful after TX dispatch.
     ///
     /// Implementations must keep this cheap, non-consuming, and nonblocking.
@@ -1659,7 +1720,20 @@ impl VirtioNetworkDevice {
         rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
         now: Instant,
     ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
-        if drained_notifications.is_empty() && !self.has_pending_rate_limited_queue_work() {
+        let host_readiness = rx_source.host_readiness_hint();
+        if drained_notifications.is_empty()
+            && !self.has_pending_rate_limited_queue_work()
+            && !host_readiness
+        {
+            return Ok(VirtioNetworkDeviceNotificationDispatch::new(
+                drained_notifications,
+                None,
+                None,
+                None,
+            ));
+        }
+
+        if !self.is_activated() && drained_notifications.is_empty() && host_readiness {
             return Ok(VirtioNetworkDeviceNotificationDispatch::new(
                 drained_notifications,
                 None,
@@ -1687,7 +1761,8 @@ impl VirtioNetworkDevice {
             .iter()
             .copied()
             .any(|queue_index| queue_index == VIRTIO_NET_RX_QUEUE_INDEX)
-            || self.pending_rate_limited_rx_queue;
+            || self.pending_rate_limited_rx_queue
+            || host_readiness;
         let dispatch_tx = drained_notifications
             .iter()
             .copied()
@@ -1888,6 +1963,7 @@ impl VirtioNetworkRxQueue {
         let mut dispatch =
             VirtioNetworkRxQueueDispatch::with_capacity(self.available.queue_size())?;
         let mut rate_limiter = rate_limiter;
+        rx_source.begin_rx_dispatch();
 
         loop {
             if require_ready_hint && !rx_source.retry_after_tx_hint() {
@@ -2730,6 +2806,19 @@ impl VirtioNetworkTxQueue {
         rate_limiter: Option<&mut VirtioNetworkRateLimiter>,
         now: Instant,
     ) -> Result<VirtioNetworkTxQueueDispatch, VirtioNetworkTxQueueDispatchError> {
+        if tx_sink.supports_staged_batch() {
+            return self.dispatch_with_staged_sink_at(memory, tx_sink, rate_limiter, now);
+        }
+        self.dispatch_with_single_sink_at(memory, tx_sink, rate_limiter, now)
+    }
+
+    fn dispatch_with_single_sink_at(
+        &mut self,
+        memory: &mut GuestMemory,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
+        rate_limiter: Option<&mut VirtioNetworkRateLimiter>,
+        now: Instant,
+    ) -> Result<VirtioNetworkTxQueueDispatch, VirtioNetworkTxQueueDispatchError> {
         let mut dispatch =
             VirtioNetworkTxQueueDispatch::with_capacity(self.available.queue_size())?;
         let mut rate_limiter = rate_limiter;
@@ -2819,6 +2908,258 @@ impl VirtioNetworkTxQueue {
         Ok(dispatch)
     }
 
+    fn dispatch_with_staged_sink_at(
+        &mut self,
+        memory: &mut GuestMemory,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
+        rate_limiter: Option<&mut VirtioNetworkRateLimiter>,
+        now: Instant,
+    ) -> Result<VirtioNetworkTxQueueDispatch, VirtioNetworkTxQueueDispatchError> {
+        let queue_size = self.available.queue_size();
+        let mut dispatch = VirtioNetworkTxQueueDispatch::with_capacity(queue_size)?;
+        let mut pending_frames = Vec::new();
+        pending_frames
+            .try_reserve_exact(usize::from(queue_size))
+            .map_err(
+                |source| VirtioNetworkTxQueueDispatchError::FrameMetadataAllocation { source },
+            )?;
+        let mut flush_results = Vec::new();
+        flush_results
+            .try_reserve_exact(usize::from(queue_size))
+            .map_err(
+                |source| VirtioNetworkTxQueueDispatchError::FrameMetadataAllocation { source },
+            )?;
+        let mut rate_limiter = rate_limiter;
+
+        loop {
+            let chain = match self.available.pop_descriptor_chain(memory) {
+                Ok(Some(chain)) => chain,
+                Ok(None) => break,
+                Err(source) => {
+                    flush_staged_tx_frames(
+                        tx_sink,
+                        &mut dispatch,
+                        &mut pending_frames,
+                        &mut flush_results,
+                    );
+                    return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(dispatch),
+                        source,
+                    });
+                }
+            };
+            let Some(descriptor_head) = descriptor_chain_head(&chain) else {
+                flush_staged_tx_frames(
+                    tx_sink,
+                    &mut dispatch,
+                    &mut pending_frames,
+                    &mut flush_results,
+                );
+                return Err(VirtioNetworkTxQueueDispatchError::EmptyDescriptorChain {
+                    completed_dispatch: Box::new(dispatch),
+                });
+            };
+            let frame = match VirtioNetworkTxFrame::parse(memory, &chain) {
+                Ok(frame) => frame,
+                Err(source) => {
+                    flush_staged_tx_frames(
+                        tx_sink,
+                        &mut dispatch,
+                        &mut pending_frames,
+                        &mut flush_results,
+                    );
+                    let notification_suppression = match self.notification_suppression(memory) {
+                        Ok(notification_suppression) => notification_suppression,
+                        Err(source) => {
+                            return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                                completed_dispatch: Box::new(dispatch),
+                                source,
+                            });
+                        }
+                    };
+                    let publication = match self.used.publish_used_element_with_notification(
+                        memory,
+                        descriptor_head,
+                        0,
+                        notification_suppression,
+                    ) {
+                        Ok(publication) => publication,
+                        Err(publication_source) => {
+                            return Err(VirtioNetworkTxQueueDispatchError::UsedRing {
+                                completed_dispatch: Box::new(dispatch),
+                                descriptor_head,
+                                bytes_written_to_guest: 0,
+                                source: publication_source,
+                            });
+                        }
+                    };
+                    dispatch.record(
+                        VirtioNetworkTxQueueDispatchOutcome::ParseError(source),
+                        publication,
+                    );
+                    continue;
+                }
+            };
+            let reservation = if let Some(limiter) = rate_limiter.as_deref_mut() {
+                match limiter.reduce_at(frame.frame_len(), now) {
+                    VirtioNetworkRateLimiterReduction::Allowed(reservation) => Some(reservation),
+                    VirtioNetworkRateLimiterReduction::Throttled { retry_after } => {
+                        flush_staged_tx_frames(
+                            tx_sink,
+                            &mut dispatch,
+                            &mut pending_frames,
+                            &mut flush_results,
+                        );
+                        if let Err(source) = self.available.undo_pop_descriptor_chain() {
+                            return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                                completed_dispatch: Box::new(dispatch),
+                                source,
+                            });
+                        }
+                        dispatch.record_rate_limited_frame(retry_after);
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mut staged = false;
+            let mut stage_error = None;
+            let mut retried_after_flush = false;
+            loop {
+                match tx_sink.stage_frame(memory, &frame) {
+                    Ok(VirtioNetworkTxPacketStage::Staged {
+                        flush_before_commit,
+                    }) => {
+                        staged = true;
+                        if flush_before_commit {
+                            flush_staged_tx_frames(
+                                tx_sink,
+                                &mut dispatch,
+                                &mut pending_frames,
+                                &mut flush_results,
+                            );
+                        }
+                        break;
+                    }
+                    Ok(VirtioNetworkTxPacketStage::FlushRequired)
+                        if !pending_frames.is_empty() && !retried_after_flush =>
+                    {
+                        flush_staged_tx_frames(
+                            tx_sink,
+                            &mut dispatch,
+                            &mut pending_frames,
+                            &mut flush_results,
+                        );
+                        retried_after_flush = true;
+                    }
+                    Ok(VirtioNetworkTxPacketStage::FlushRequired) => {
+                        stage_error = Some(VirtioNetworkTxPacketSinkError::new(
+                            "virtio-net staged frame exceeds an empty batch bound",
+                        ));
+                        break;
+                    }
+                    Err(source) => {
+                        flush_staged_tx_frames(
+                            tx_sink,
+                            &mut dispatch,
+                            &mut pending_frames,
+                            &mut flush_results,
+                        );
+                        stage_error = Some(source);
+                        break;
+                    }
+                }
+            }
+
+            let notification_suppression = match self.notification_suppression(memory) {
+                Ok(notification_suppression) => notification_suppression,
+                Err(source) => {
+                    if staged {
+                        tx_sink.discard_staged_frame();
+                    }
+                    flush_staged_tx_frames(
+                        tx_sink,
+                        &mut dispatch,
+                        &mut pending_frames,
+                        &mut flush_results,
+                    );
+                    return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(dispatch),
+                        source,
+                    });
+                }
+            };
+            let publication = match self.used.publish_used_element_with_notification(
+                memory,
+                descriptor_head,
+                0,
+                notification_suppression,
+            ) {
+                Ok(publication) => publication,
+                Err(source) => {
+                    if staged {
+                        tx_sink.discard_staged_frame();
+                    }
+                    flush_staged_tx_frames(
+                        tx_sink,
+                        &mut dispatch,
+                        &mut pending_frames,
+                        &mut flush_results,
+                    );
+                    return Err(VirtioNetworkTxQueueDispatchError::UsedRing {
+                        completed_dispatch: Box::new(dispatch),
+                        descriptor_head,
+                        bytes_written_to_guest: 0,
+                        source,
+                    });
+                }
+            };
+
+            if let Some(source) = stage_error {
+                dispatch.record(
+                    VirtioNetworkTxQueueDispatchOutcome::Ok {
+                        frame,
+                        sink_error: Some(source),
+                    },
+                    publication,
+                );
+                continue;
+            }
+
+            match tx_sink.commit_staged_frame() {
+                VirtioNetworkTxPacketCommit::Deferred => {
+                    let frame_index = dispatch.record_deferred(frame, publication);
+                    pending_frames.push(frame_index);
+                }
+                VirtioNetworkTxPacketCommit::Immediate(result) => {
+                    if matches!(result, Ok(VirtioNetworkTxPacketDisposition::Detoured))
+                        && let (Some(limiter), Some(reservation)) =
+                            (rate_limiter.as_deref_mut(), reservation)
+                    {
+                        limiter.restore(reservation);
+                    }
+                    dispatch.record(
+                        VirtioNetworkTxQueueDispatchOutcome::Ok {
+                            frame,
+                            sink_error: result.err(),
+                        },
+                        publication,
+                    );
+                }
+            }
+        }
+
+        flush_staged_tx_frames(
+            tx_sink,
+            &mut dispatch,
+            &mut pending_frames,
+            &mut flush_results,
+        );
+        Ok(dispatch)
+    }
+
     fn notification_suppression(
         &self,
         memory: &GuestMemory,
@@ -2832,6 +3173,28 @@ impl VirtioNetworkTxQueue {
             Ok(VirtqueueNotificationSuppression::Disabled)
         }
     }
+}
+
+fn flush_staged_tx_frames(
+    tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
+    dispatch: &mut VirtioNetworkTxQueueDispatch,
+    pending_frames: &mut Vec<usize>,
+    results: &mut Vec<Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>>,
+) {
+    if pending_frames.is_empty() {
+        return;
+    }
+    results.clear();
+    tx_sink.flush_staged_frames(results);
+    for (result_index, frame_index) in pending_frames.drain(..).enumerate() {
+        let result = results.get(result_index).cloned().unwrap_or_else(|| {
+            Err(VirtioNetworkTxPacketSinkError::new(
+                "virtio-net staged sink omitted a committed frame result",
+            ))
+        });
+        dispatch.record_deferred_sink_result(frame_index, result);
+    }
+    results.clear();
 }
 
 #[derive(Debug)]
@@ -2983,6 +3346,41 @@ impl VirtioNetworkTxQueueDispatch {
                 self.parse_failures += 1;
                 if self.first_parse_failure.is_none() {
                     self.first_parse_failure = Some(source);
+                }
+            }
+        }
+    }
+
+    fn record_deferred(
+        &mut self,
+        frame: VirtioNetworkTxFrame,
+        publication: VirtqueueUsedRingPublication,
+    ) -> usize {
+        self.processed_frames += 1;
+        self.successful_frames += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
+        let frame_index = self.frames.len();
+        self.frames.push(frame);
+        frame_index
+    }
+
+    fn record_deferred_sink_result(
+        &mut self,
+        frame_index: usize,
+        result: Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>,
+    ) {
+        match result {
+            Ok(_) => {
+                self.sink_successful_frames += 1;
+                if let Some(frame) = self.frames.get(frame_index) {
+                    self.sink_successful_bytes =
+                        self.sink_successful_bytes.saturating_add(frame.frame_len());
+                }
+            }
+            Err(source) => {
+                self.sink_failures += 1;
+                if self.first_sink_failure.is_none() {
+                    self.first_sink_failure = Some(source);
                 }
             }
         }
@@ -4983,7 +5381,8 @@ mod tests {
         VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_MAGIC_VALUE, VirtioMmioDeviceActivation,
         VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
         VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError, VirtioMmioQueueRegisters,
-        VirtioMmioRegister, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+        VirtioMmioQueueState, VirtioMmioRegister, VirtioMmioRegisterHandler,
+        VirtioMmioRegisterHandlerError,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_INDIRECT, VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE,
@@ -5008,8 +5407,9 @@ mod tests {
         VirtioNetworkMmioHandler, VirtioNetworkRateLimiter, VirtioNetworkRxBuffer,
         VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
         VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
-        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketDisposition,
-        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketCommit,
+        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+        VirtioNetworkTxPacketSinkError, VirtioNetworkTxPacketStage, VirtioNetworkTxQueue,
         VirtioNetworkTxQueueDispatchError,
     };
 
@@ -5519,6 +5919,147 @@ mod tests {
                 Ok(VirtioNetworkTxPacketDisposition::Detoured)
             } else {
                 Ok(VirtioNetworkTxPacketDisposition::Forwarded)
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct StagedRecordingTxFrame {
+        descriptor_head: u16,
+        packet: Vec<u8>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingStagedTxPacketSink {
+        staged: Option<StagedRecordingTxFrame>,
+        committed: Vec<StagedRecordingTxFrame>,
+        flush_before_heads: Vec<u16>,
+        immediate_detour_heads: Vec<u16>,
+        flush_failure_heads: Vec<u16>,
+        flushed_packets: Vec<Vec<u8>>,
+        events: Vec<String>,
+        flush_calls: usize,
+        discard_calls: usize,
+    }
+
+    impl RecordingStagedTxPacketSink {
+        fn failing_flush_for(descriptor_head: u16) -> Self {
+            Self {
+                flush_failure_heads: vec![descriptor_head],
+                ..Self::default()
+            }
+        }
+
+        fn detouring_after_flush(descriptor_head: u16) -> Self {
+            Self {
+                flush_before_heads: vec![descriptor_head],
+                immediate_detour_heads: vec![descriptor_head],
+                ..Self::default()
+            }
+        }
+    }
+
+    impl VirtioNetworkTxPacketSink for RecordingStagedTxPacketSink {
+        fn transmit_frame(
+            &mut self,
+            _memory: &GuestMemory,
+            _frame: &VirtioNetworkTxFrame,
+        ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+            Err(VirtioNetworkTxPacketSinkError::new(
+                "test staged sink used the single-frame path",
+            ))
+        }
+
+        fn supports_staged_batch(&self) -> bool {
+            true
+        }
+
+        fn stage_frame(
+            &mut self,
+            memory: &GuestMemory,
+            frame: &VirtioNetworkTxFrame,
+        ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+            assert!(self.staged.is_none(), "only one frame may be staged");
+            let mut packet = Vec::new();
+            packet
+                .try_reserve_exact(
+                    usize::try_from(frame.payload_len())
+                        .expect("test payload length should fit usize"),
+                )
+                .expect("test staged packet allocation should succeed");
+            for segment in frame.payload_segments() {
+                let mut bytes = vec![
+                    0;
+                    usize::try_from(segment.len())
+                        .expect("test payload segment length should fit usize")
+                ];
+                memory
+                    .read_slice(&mut bytes, segment.address())
+                    .expect("test staged payload segment should read");
+                packet.extend_from_slice(&bytes);
+            }
+            let descriptor_head = frame.descriptor_head();
+            self.events.push(format!("stage:{descriptor_head}"));
+            self.staged = Some(StagedRecordingTxFrame {
+                descriptor_head,
+                packet,
+            });
+            Ok(VirtioNetworkTxPacketStage::Staged {
+                flush_before_commit: self.flush_before_heads.contains(&descriptor_head),
+            })
+        }
+
+        fn commit_staged_frame(&mut self) -> VirtioNetworkTxPacketCommit {
+            let staged = self.staged.take().expect("a test frame should be staged");
+            self.events
+                .push(format!("commit:{}", staged.descriptor_head));
+            if self
+                .immediate_detour_heads
+                .contains(&staged.descriptor_head)
+            {
+                VirtioNetworkTxPacketCommit::Immediate(Ok(
+                    VirtioNetworkTxPacketDisposition::Detoured,
+                ))
+            } else {
+                self.committed.push(staged);
+                VirtioNetworkTxPacketCommit::Deferred
+            }
+        }
+
+        fn discard_staged_frame(&mut self) {
+            let staged = self
+                .staged
+                .take()
+                .expect("a test frame should exist before discard");
+            self.events
+                .push(format!("discard:{}", staged.descriptor_head));
+            self.discard_calls += 1;
+        }
+
+        fn flush_staged_frames(
+            &mut self,
+            results: &mut Vec<
+                Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError>,
+            >,
+        ) {
+            self.flush_calls += 1;
+            let heads = self
+                .committed
+                .iter()
+                .map(|frame| frame.descriptor_head.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            self.events.push(format!("flush:{heads}"));
+            for frame in self.committed.drain(..) {
+                self.flushed_packets.push(frame.packet);
+                if self.flush_failure_heads.contains(&frame.descriptor_head) {
+                    results.push(Err(VirtioNetworkTxPacketSinkError::new(format!(
+                        "test staged flush failure for head {}",
+                        frame.descriptor_head
+                    ))));
+                } else {
+                    results.push(Ok(VirtioNetworkTxPacketDisposition::Forwarded));
+                }
             }
         }
     }
@@ -11087,6 +11628,221 @@ mod tests {
         assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
         assert_eq!(read_tx_used_element(&memory, 1), (1, 0));
         assert_eq!(read_tx_used_element(&memory, 2), (2, 0));
+    }
+
+    #[test]
+    fn virtio_network_staged_tx_maps_ordered_short_batch_results() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingStagedTxPacketSink::failing_flush_for(2);
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_two_tx_frames(&mut memory);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect("staged TX queue should record a short-batch suffix failure");
+
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("staged TX dispatch should be present");
+        assert_eq!(dispatch.processed_frames(), 2);
+        assert_eq!(dispatch.successful_frames(), 2);
+        assert_eq!(dispatch.sink_successful_frames(), 1);
+        assert_eq!(dispatch.sink_failures(), 1);
+        assert_eq!(dispatch.sink_successful_bytes(), 16);
+        assert_eq!(
+            dispatch
+                .first_sink_failure()
+                .expect("staged suffix failure should be recorded")
+                .message(),
+            "test staged flush failure for head 2"
+        );
+        assert_eq!(sink.flush_calls, 1);
+        assert_eq!(
+            sink.flushed_packets,
+            [vec![0x10, 0x11, 0x12, 0x13], vec![0x20, 0x21, 0x22, 0x23]]
+        );
+        assert_eq!(
+            sink.events,
+            ["stage:0", "commit:0", "stage:2", "commit:2", "flush:0,2"]
+        );
+        assert_eq!(read_tx_used_index(&memory), 2);
+        assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(read_tx_used_element(&memory, 1), (2, 0));
+    }
+
+    #[test]
+    fn virtio_network_staged_tx_flushes_external_frames_before_immediate_detour() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingStagedTxPacketSink::detouring_after_flush(2);
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_two_tx_frames(&mut memory);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect("external TX should flush before an immediate detour");
+
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("staged TX dispatch should be present");
+        assert_eq!(dispatch.processed_frames(), 2);
+        assert_eq!(dispatch.sink_successful_frames(), 2);
+        assert_eq!(dispatch.sink_failures(), 0);
+        assert_eq!(dispatch.sink_successful_bytes(), 32);
+        assert_eq!(sink.flush_calls, 1);
+        assert_eq!(sink.flushed_packets, [vec![0x10, 0x11, 0x12, 0x13]]);
+        assert_eq!(
+            sink.events,
+            ["stage:0", "commit:0", "stage:2", "flush:0", "commit:2"]
+        );
+        assert_eq!(read_tx_used_index(&memory), 2);
+    }
+
+    #[test]
+    fn virtio_network_staged_tx_flushes_committed_prefix_before_queue_error() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingStagedTxPacketSink::default();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_two_tx_frames(&mut memory);
+        write_tx_available_heads(&mut memory, &[0, TEST_QUEUE_SIZE]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let error = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect_err("invalid descriptor head should preserve the staged prefix");
+
+        assert!(matches!(
+            error,
+            VirtioNetworkDeviceNotificationError::TxQueueDispatch {
+                source: VirtioNetworkTxQueueDispatchError::AvailableRing { .. },
+                ..
+            }
+        ));
+        let completed = error
+            .completed_tx_dispatch()
+            .expect("staged prefix metadata should be retained");
+        assert_eq!(completed.processed_frames(), 1);
+        assert_eq!(completed.sink_successful_frames(), 1);
+        assert_eq!(completed.sink_failures(), 0);
+        assert_eq!(sink.flush_calls, 1);
+        assert_eq!(sink.flushed_packets, [vec![0x10, 0x11, 0x12, 0x13]]);
+        assert_eq!(sink.events, ["stage:0", "commit:0", "flush:0"]);
+        assert_eq!(read_tx_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn virtio_network_staged_tx_discards_frame_when_used_publication_fails() {
+        let mut memory = tx_frame_memory();
+        write_two_tx_frames(&mut memory);
+        write_tx_available_heads(&mut memory, &[0]);
+        let queue_state = VirtioMmioQueueState::from_parts(
+            TEST_QUEUE_SIZE,
+            TEST_QUEUE_SIZE,
+            true,
+            TEST_TX_DESCRIPTOR_TABLE,
+            TEST_TX_AVAILABLE_RING,
+            GuestAddress::new(TEST_TX_MEMORY_SIZE),
+        );
+        let mut queue = VirtioNetworkTxQueue::from_mmio_queue_state(queue_state)
+            .expect("unmapped used ring should remain a dispatch-time failure");
+        let mut sink = RecordingStagedTxPacketSink::default();
+
+        let error = queue
+            .dispatch_with_sink(&mut memory, &mut sink)
+            .expect_err("used-ring publication should fail after staging");
+
+        assert!(matches!(
+            error,
+            VirtioNetworkTxQueueDispatchError::UsedRing {
+                descriptor_head: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            error
+                .completed_dispatch()
+                .expect("failed publication should retain empty dispatch metadata")
+                .processed_frames(),
+            0
+        );
+        assert_eq!(sink.discard_calls, 1);
+        assert_eq!(sink.flush_calls, 0);
+        assert!(sink.flushed_packets.is_empty());
+        assert_eq!(sink.events, ["stage:0", "discard:0"]);
+    }
+
+    #[test]
+    fn virtio_network_staged_tx_refunds_only_immediate_detours() {
+        let now = Instant::now();
+        let rate_limiter = NetworkRateLimiterConfig::new(
+            Some(NetworkTokenBucketConfig::new(16, None, 100)),
+            Some(NetworkTokenBucketConfig::new(1, None, 100)),
+        );
+        let mut memory = tx_frame_memory();
+        let mut handler =
+            network_activation_handler_with_rate_limiters_at(None, Some(rate_limiter), now);
+        let mut sink = RecordingStagedTxPacketSink::detouring_after_flush(0);
+        let mut source = RecordingRxPacketSource::default();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_two_tx_frames(&mut memory);
+
+        let notification = handler
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications_with_packet_io_at(
+                &mut memory,
+                vec![VIRTIO_NET_TX_QUEUE_INDEX],
+                &mut sink,
+                &mut source,
+                now,
+            )
+            .expect("refunded detour should leave capacity for the forwarded frame");
+
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("staged TX dispatch should be present");
+        assert_eq!(dispatch.processed_frames(), 2);
+        assert_eq!(dispatch.sink_successful_frames(), 2);
+        assert_eq!(dispatch.rate_limiter_throttled_frames(), 0);
+        assert_eq!(sink.flush_calls, 1);
+        assert_eq!(sink.flushed_packets, [vec![0x20, 0x21, 0x22, 0x23]]);
+        assert_eq!(
+            sink.events,
+            ["stage:0", "commit:0", "stage:2", "commit:2", "flush:2"]
+        );
+        assert_eq!(read_tx_used_index(&memory), 2);
     }
 
     #[test]

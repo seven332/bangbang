@@ -1960,12 +1960,21 @@ add Running/Paused PUT, rescan, real MMDS exchange, sysfs removal, DELETE,
 live-config projection, exact BDF/capacity reuse, and clean shutdown; the
 contained case proves this needs no vmnet entitlement and that unauthorized
 non-MMDS insertion rolls back. The tests do not execute direct-vmnet external
-connectivity. Unsigned injected-system tests cover returned
-MAC/MTU/maximum-packet/UUID/batch reconciliation, allocated-MAC uniqueness,
-finite start/stop deadlines, late callbacks, and terminal cleanup uncertainty.
-Packet-available callbacks, batch dispatch, direct virtio headers, offloads,
-broader MMDS TCP behavior, limiter-specific metrics, automatic PCI notification,
-and network snapshot state remain outside the signed evidence.
+connectivity. Unsigned injected-system, runtime, transport, HVF-loop, and
+process-registry tests cover returned MAC/MTU/maximum-packet/UUID/batch
+reconciliation, allocated-MAC uniqueness, finite start/stop deadlines,
+packet-event enable/disable/drain ordering, callback storms and closed/full wake
+channels, pre-bind wakeups, stale-generation reuse, exact-interface readiness
+before the first vCPU step, zero/full/partial/malformed batch counts,
+one-batch-per-pass RX caching, publication-safe staged TX, MMDS effect order,
+partial results, and terminal cleanup uncertainty. MMDS-only entries open no
+vmnet backend and register no packet callback or bridge work. Packet-available
+callbacks and bounded batch dispatch are therefore implemented but remain
+outside positive signed vmnet evidence because the signed cases intentionally
+open no vmnet interface. Direct virtio headers, offloads, broader MMDS TCP
+behavior, limiter-specific metrics, automatic PCI notification, external
+connectivity, and network snapshot state remain outside the supported or signed
+boundary as described by their owning issues.
 
 For block specifically, this evidence validates the supported public
 file-backed subset over MMIO by default or PCI with `--enable-pci`, including

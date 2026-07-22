@@ -140,7 +140,8 @@ use crate::contained_session::{
 use crate::direct_vhost_user;
 use crate::host_network::virtio_vmnet::{
     MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour,
-    MmdsResponseQueue, PreparedVmnetVirtioNetworkRxBuffer, VmnetVirtioNetworkPacketIo,
+    MmdsResponseQueue, PreparedVmnetVirtioNetworkRxBuffer, VmnetPacketReadinessLease,
+    VmnetVirtioNetworkBatchLimits, VmnetVirtioNetworkPacketIo,
     VmnetVirtioNetworkPacketIoBuildError, VmnetVirtioNetworkPacketIoStopError,
 };
 use crate::host_network::vmnet::{
@@ -4199,8 +4200,8 @@ pub(crate) type HvfBootRunLoopSupervisor = BootRunLoopSupervisor<
 >;
 
 pub(crate) struct ProcessHvfBootSession<S, P> {
-    session: S,
     packet_io: P,
+    session: S,
     mmds_metrics: Option<SharedMmdsMetrics>,
 }
 
@@ -4428,8 +4429,8 @@ pub(crate) trait NativeV1SnapshotCaptureSession: BootRunLoopSession {
 impl<S, P> ProcessHvfBootSession<S, P> {
     const fn new(session: S, packet_io: P, mmds_metrics: Option<SharedMmdsMetrics>) -> Self {
         Self {
-            session,
             packet_io,
+            session,
             mmds_metrics,
         }
     }
@@ -4772,6 +4773,20 @@ where
     const fn is_vmnet(&self) -> bool {
         matches!(self, Self::Vmnet(_))
     }
+
+    fn take_scheduled_readiness(&self) -> bool {
+        match self {
+            Self::MmdsOnly(_) => false,
+            Self::Vmnet(packet_io) => packet_io.take_scheduled_readiness(),
+        }
+    }
+
+    fn has_persistent_readiness(&self) -> bool {
+        match self {
+            Self::MmdsOnly(_) => false,
+            Self::Vmnet(packet_io) => packet_io.has_persistent_readiness(),
+        }
+    }
 }
 
 struct ProcessNetworkPacketIoEntry<B>
@@ -4856,6 +4871,72 @@ where
     }
 }
 
+struct ProcessNetworkPacketReadinessBridge {
+    shutdown: Arc<AtomicBool>,
+    signal: mpsc::SyncSender<()>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl fmt::Debug for ProcessNetworkPacketReadinessBridge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessNetworkPacketReadinessBridge")
+            .field("shutdown", &self.shutdown.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProcessNetworkPacketReadinessBridge {
+    fn start(
+        receiver: mpsc::Receiver<()>,
+        signal: mpsc::SyncSender<()>,
+        wake: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Result<Self, BackendError> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::Builder::new()
+            .name("bangbang-vmnet-readiness".to_string())
+            .spawn(move || {
+                while !worker_shutdown.load(Ordering::Acquire) {
+                    match receiver.recv_timeout(Duration::from_millis(100)) {
+                        Ok(()) => {
+                            if !worker_shutdown.load(Ordering::Acquire) {
+                                wake();
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .map_err(|error| {
+                BackendError::Hypervisor(format!("failed to start vmnet readiness bridge: {error}"))
+            })?;
+        Ok(Self {
+            shutdown,
+            signal,
+            worker: Some(worker),
+        })
+    }
+
+    fn stop(&mut self) -> Result<(), BackendError> {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.signal.try_send(());
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| BackendError::InvalidState("vmnet readiness bridge worker panicked"))
+    }
+}
+
+impl Drop for ProcessNetworkPacketReadinessBridge {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 pub(crate) struct ProcessNetworkPacketIoRegistry<B>
 where
     B: ProcessVmnetBackend,
@@ -4865,6 +4946,10 @@ where
     next_generation: u64,
     startup_policy: ProcessNetworkPacketIoStartupPolicy,
     mmds_detour: Option<ProcessMmdsPacketDetourConfig>,
+    readiness_signal: mpsc::SyncSender<()>,
+    readiness_receiver: Option<mpsc::Receiver<()>>,
+    readiness_wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    readiness_bridge: Option<ProcessNetworkPacketReadinessBridge>,
 }
 
 impl<B> fmt::Debug for ProcessNetworkPacketIoRegistry<B>
@@ -4882,6 +4967,8 @@ where
                 "mmds_detour",
                 &self.mmds_detour.as_ref().map(|_| "<configured>"),
             )
+            .field("readiness_bound", &self.readiness_wake.is_some())
+            .field("readiness_bridge", &self.readiness_bridge.is_some())
             .finish()
     }
 }
@@ -4982,6 +5069,12 @@ fn runtime_network_packet_io_preparation_error(
         ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. } => {
             "vmnet packet-I/O initialization failed"
         }
+        ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. } => {
+            "vmnet packet readiness initialization failed"
+        }
+        ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. } => {
+            "vmnet packet event initialization failed"
+        }
         ProcessNetworkPacketIoProviderBuildError::CleanupUncertain => {
             "vmnet cleanup could not be confirmed"
         }
@@ -5043,12 +5136,17 @@ where
                 reserved_macs.push(mac);
             }
         }
+        let (readiness_signal, readiness_receiver) = mpsc::sync_channel(1);
         let mut provider = Self {
             entries,
             reserved_macs,
             next_generation: 0,
             startup_policy,
             mmds_detour: mmds_detour.cloned(),
+            readiness_signal,
+            readiness_receiver: Some(readiness_receiver),
+            readiness_wake: None,
+            readiness_bridge: None,
         };
         for config in configs {
             let class = provider.class_for_interface(config.iface_id());
@@ -5145,6 +5243,7 @@ where
             .next_generation
             .checked_add(1)
             .ok_or(ProcessNetworkPacketIoProviderBuildError::GenerationExhausted)?;
+        let generation = self.next_generation;
         let iface_id = config.iface_id();
         let (packet_io, device_profile, backend_parameters, reserve_realized_mac) = match class {
             ProcessNetworkPacketIoEntryClass::MmdsOnly => {
@@ -5170,6 +5269,8 @@ where
                 )
             }
             ProcessNetworkPacketIoEntryClass::Vmnet => {
+                let (readiness_lease, packet_callback) =
+                    VmnetPacketReadinessLease::new(generation, self.readiness_signal.clone());
                 let vmnet_config =
                     VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
                         .map(|vmnet| {
@@ -5204,27 +5305,40 @@ where
                     .as_ref()
                     .and_then(|detour| detour.detour_for_interface(iface_id));
                 let rx_buffer_len = backend.parameters().maximum_packet_size();
-                let read_buffer = match prepared_rx.into_buffer_with_len(rx_buffer_len) {
-                    Ok(read_buffer) => read_buffer,
-                    Err(source) => {
-                        return match backend.stop() {
-                            Ok(()) => {
-                                Err(ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
-                                    source,
-                                })
-                            }
-                            Err(_) => {
-                                Err(ProcessNetworkPacketIoProviderBuildError::CleanupUncertain)
-                            }
-                        };
-                    }
-                };
-                let packet_io = VmnetVirtioNetworkPacketIo::with_owned_rx_buffer_and_mmds_detour(
-                    backend,
-                    interface,
-                    read_buffer,
-                    detour,
-                );
+                let read_batch_size = usize::from(parameters.read_max_packets().unwrap_or(1));
+                let write_batch_size = usize::from(parameters.write_max_packets().unwrap_or(1));
+                let mut packet_io =
+                    VmnetVirtioNetworkPacketIo::with_prepared_batch_and_mmds_detour(
+                        backend,
+                        interface,
+                        prepared_rx,
+                        VmnetVirtioNetworkBatchLimits::new(
+                            rx_buffer_len,
+                            read_batch_size,
+                            write_batch_size,
+                        ),
+                        detour,
+                        Some(readiness_lease),
+                    )
+                    .map_err(|source| {
+                        ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { source }
+                    })?;
+                if let Err(source) = self.start_readiness_bridge_if_needed(true) {
+                    return match packet_io.stop() {
+                        Ok(()) => Err(ProcessNetworkPacketIoProviderBuildError::ReadinessBridge {
+                            source,
+                        }),
+                        Err(_) => Err(ProcessNetworkPacketIoProviderBuildError::CleanupUncertain),
+                    };
+                }
+                if let Err(source) = packet_io.enable_packet_available_callback(packet_callback) {
+                    return match packet_io.stop() {
+                        Ok(()) => {
+                            Err(ProcessNetworkPacketIoProviderBuildError::PacketEvents { source })
+                        }
+                        Err(_) => Err(ProcessNetworkPacketIoProviderBuildError::CleanupUncertain),
+                    };
+                }
                 (
                     ProcessNetworkPacketIo::Vmnet(packet_io),
                     NetworkDeviceProfile::new(Some(realized_mac), config.mtu()),
@@ -5233,7 +5347,6 @@ where
                 )
             }
         };
-        let generation = self.next_generation;
         self.next_generation = next_generation;
         Ok(PreparedProcessNetworkPacketIoEntry {
             entry: ProcessNetworkPacketIoEntry {
@@ -5396,11 +5509,79 @@ where
         uncertain
     }
 
+    fn bind_readiness_wake(
+        &mut self,
+        wake: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Result<(), BackendError> {
+        if self.readiness_wake.is_some() {
+            return Err(BackendError::InvalidState(
+                "vmnet readiness wake target is already bound",
+            ));
+        }
+        self.readiness_wake = Some(wake);
+        self.start_readiness_bridge_if_needed(false)
+    }
+
+    fn start_readiness_bridge_if_needed(
+        &mut self,
+        preparing_vmnet: bool,
+    ) -> Result<(), BackendError> {
+        if self.readiness_bridge.is_some()
+            || self.readiness_wake.is_none()
+            || (!preparing_vmnet && self.vmnet_count() == 0)
+        {
+            return Ok(());
+        }
+        let receiver = self
+            .readiness_receiver
+            .take()
+            .ok_or(BackendError::InvalidState(
+                "vmnet readiness receiver is unavailable",
+            ))?;
+        let wake = self
+            .readiness_wake
+            .as_ref()
+            .cloned()
+            .ok_or(BackendError::InvalidState(
+                "vmnet readiness wake target is unavailable",
+            ))?;
+        self.readiness_bridge = Some(ProcessNetworkPacketReadinessBridge::start(
+            receiver,
+            self.readiness_signal.clone(),
+            wake,
+        )?);
+        Ok(())
+    }
+
+    fn shutdown_packet_io(&mut self) -> Result<(), BackendError> {
+        let packet_io_uncertain = self.stop_all();
+        let bridge_result = match self.readiness_bridge.take() {
+            Some(mut bridge) => bridge.stop(),
+            None => Ok(()),
+        };
+        self.readiness_wake = None;
+        if packet_io_uncertain {
+            return Err(BackendError::InvalidState(
+                "vmnet packet-I/O cleanup could not be confirmed",
+            ));
+        }
+        bridge_result
+    }
+
     fn vmnet_count(&self) -> usize {
         self.entries
             .iter()
             .filter(|entry| entry.packet_io.is_vmnet())
             .count()
+    }
+}
+
+impl<B> Drop for ProcessNetworkPacketIoRegistry<B>
+where
+    B: ProcessVmnetBackend,
+{
+    fn drop(&mut self) {
+        let _ = self.shutdown_packet_io();
     }
 }
 
@@ -5471,6 +5652,17 @@ pub(crate) trait ProcessRuntimeNetworkPacketIoProvider:
     type PublishedEntry;
     type RemovedEntry;
 
+    fn bind_readiness_wake(
+        &mut self,
+        _wake: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn shutdown_packet_io(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn prepare_runtime_entry(
         &mut self,
         config: &NetworkInterfaceConfig,
@@ -5503,6 +5695,17 @@ impl ProcessRuntimeNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
     type PreparedEntry = PreparedProcessNetworkPacketIoEntry<SystemVmnetInterfaceBackend>;
     type PublishedEntry = PublishedProcessNetworkPacketIoEntry;
     type RemovedEntry = RemovedProcessNetworkPacketIoEntry<SystemVmnetInterfaceBackend>;
+
+    fn bind_readiness_wake(
+        &mut self,
+        wake: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Result<(), BackendError> {
+        ProcessNetworkPacketIoRegistry::bind_readiness_wake(self, wake)
+    }
+
+    fn shutdown_packet_io(&mut self) -> Result<(), BackendError> {
+        ProcessNetworkPacketIoRegistry::shutdown_packet_io(self)
+    }
 
     fn prepare_runtime_entry(
         &mut self,
@@ -5603,6 +5806,21 @@ impl<B> Arm64BootNetworkPacketIoProvider for ProcessNetworkPacketIoRegistry<B>
 where
     B: ProcessVmnetBackend,
 {
+    fn take_scheduled_packet_readiness(&mut self) -> bool {
+        let mut scheduled = false;
+        for entry in &self.entries {
+            scheduled |= entry.packet_io.take_scheduled_readiness();
+        }
+        scheduled
+    }
+
+    fn has_packet_readiness(&self, interface: Arm64BootNetworkInterface<'_>) -> bool {
+        self.entries
+            .iter()
+            .find(|entry| entry.iface_id == interface.iface_id())
+            .is_some_and(|entry| entry.packet_io.has_persistent_readiness())
+    }
+
     fn packet_io(
         &mut self,
         interface: Arm64BootNetworkInterface<'_>,
@@ -5643,6 +5861,12 @@ enum ProcessNetworkPacketIoProviderBuildError {
     PacketIoBuild {
         source: VmnetVirtioNetworkPacketIoBuildError,
     },
+    ReadinessBridge {
+        source: BackendError,
+    },
+    PacketEvents {
+        source: VmnetVirtioNetworkPacketIoStopError,
+    },
     CleanupUncertain,
     MmdsOnlyPacketIoBuild {
         source: MmdsOnlyVirtioNetworkPacketIoBuildError,
@@ -5675,6 +5899,10 @@ impl fmt::Debug for ProcessNetworkPacketIoProviderBuildError {
             }
             Self::Start { .. } => "ProcessNetworkPacketIoProviderBuildError::Start",
             Self::PacketIoBuild { .. } => "ProcessNetworkPacketIoProviderBuildError::PacketIoBuild",
+            Self::ReadinessBridge { .. } => {
+                "ProcessNetworkPacketIoProviderBuildError::ReadinessBridge"
+            }
+            Self::PacketEvents { .. } => "ProcessNetworkPacketIoProviderBuildError::PacketEvents",
             Self::CleanupUncertain => "ProcessNetworkPacketIoProviderBuildError::CleanupUncertain",
             Self::MmdsOnlyPacketIoBuild { .. } => {
                 "ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild"
@@ -5692,7 +5920,7 @@ impl ProcessNetworkPacketIoProviderBuildError {
             Self::Start { source, .. } => {
                 source.disposition() == VmnetInterfaceStartDisposition::Terminal
             }
-            Self::CleanupUncertain => true,
+            Self::CleanupUncertain | Self::ReadinessBridge { .. } => true,
             Self::NetworkInterfaceCount { .. }
             | Self::DuplicateInterface
             | Self::DuplicateRealizedMac
@@ -5702,6 +5930,7 @@ impl ProcessNetworkPacketIoProviderBuildError {
             | Self::MmdsState { .. }
             | Self::HostDeviceName { .. }
             | Self::PacketIoBuild { .. }
+            | Self::PacketEvents { .. }
             | Self::MmdsOnlyPacketIoBuild { .. }
             | Self::MissingMmdsDetour => false,
         }
@@ -5742,6 +5971,12 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
             Self::PacketIoBuild { source } => {
                 write!(f, "failed to build vmnet packet I/O: {source}")
             }
+            Self::ReadinessBridge { source } => {
+                write!(f, "failed to bind vmnet packet readiness: {source}")
+            }
+            Self::PacketEvents { source } => {
+                write!(f, "failed to enable vmnet packet events: {source}")
+            }
             Self::CleanupUncertain => {
                 f.write_str("vmnet packet I/O cleanup could not be confirmed")
             }
@@ -5764,6 +5999,8 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
             Self::HostDeviceName { source, .. } => Some(source),
             Self::Start { source, .. } => Some(source),
             Self::PacketIoBuild { source, .. } => Some(source),
+            Self::ReadinessBridge { source, .. } => Some(source),
+            Self::PacketEvents { source, .. } => Some(source),
             Self::MmdsOnlyPacketIoBuild { source, .. } => Some(source),
             Self::DuplicateInterface
             | Self::DuplicateRealizedMac
@@ -6409,6 +6646,17 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
 
     fn run_loop_control(&self) -> Self::Control;
 
+    fn bind_run_loop_auxiliary_wakeup(
+        &mut self,
+        _control: Self::Control,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn shutdown_run_loop_auxiliary_work(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn quiesce_snapshot_auxiliary_work(
         &self,
     ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError>;
@@ -6809,6 +7057,19 @@ where
 
     fn run_loop_control(&self) -> Self::Control {
         self.session.run_loop_control()
+    }
+
+    fn bind_run_loop_auxiliary_wakeup(
+        &mut self,
+        control: Self::Control,
+    ) -> Result<(), BackendError> {
+        self.packet_io.bind_readiness_wake(Arc::new(move || {
+            let _ = control.request_wakeup();
+        }))
+    }
+
+    fn shutdown_run_loop_auxiliary_work(&mut self) -> Result<(), BackendError> {
+        self.packet_io.shutdown_packet_io()
     }
 
     fn quiesce_snapshot_auxiliary_work(
@@ -8080,7 +8341,7 @@ where
     }
 
     fn start_with_initial_state(
-        session: S,
+        mut session: S,
         max_steps: NonZeroUsize,
         command_queue_capacity: usize,
         initially_paused: bool,
@@ -8166,37 +8427,60 @@ where
                                     );
                                 }
                                 BootRunLoopPauseWait::Shutdown => {
-                                    if matches!(
-                                        worker_status.snapshot(),
-                                        BootRunLoopWorkerStatus::Failed(_)
-                                    ) {
-                                        let _ = terminal_wakeup_writer.write_all(&[1]);
-                                    }
-                                    break 'worker;
+                                    break 'worker None;
                                 }
                             }
                         }
                         match session.run_loop(&stop_token, max_steps) {
                             Ok(outcome) if S::should_continue_after_outcome(&outcome) => continue,
                             Ok(outcome) => {
-                                worker_status
-                                    .record(BootRunLoopWorkerStatus::Exited(outcome.clone()));
-                                let _ = terminal_wakeup_writer.write_all(&[1]);
-                                break;
+                                break 'worker Some(BootRunLoopWorkerStatus::Exited(
+                                    outcome.clone(),
+                                ));
                             }
                             Err(err) => {
-                                worker_status
-                                    .record(BootRunLoopWorkerStatus::Failed(err.to_string()));
-                                let _ = terminal_wakeup_writer.write_all(&[1]);
-                                break;
+                                break 'worker Some(BootRunLoopWorkerStatus::Failed(
+                                    err.to_string(),
+                                ));
                             }
                         }
                     }
                 }));
-                if worker_result.is_err() {
-                    worker_status.record(BootRunLoopWorkerStatus::Failed(
+                let intended_status = match worker_result {
+                    Ok(status) => status,
+                    Err(_) => Some(BootRunLoopWorkerStatus::Failed(
                         "boot run loop worker panicked".to_owned(),
-                    ));
+                    )),
+                };
+                let cleanup_error = session.shutdown_run_loop_auxiliary_work().err();
+                let final_status = match cleanup_error {
+                    Some(source) => {
+                        let prior = match intended_status.as_ref() {
+                            Some(BootRunLoopWorkerStatus::Failed(message)) => {
+                                format!("{message}; ")
+                            }
+                            Some(BootRunLoopWorkerStatus::Exited(_)) => {
+                                "boot run loop exited; ".to_string()
+                            }
+                            Some(BootRunLoopWorkerStatus::Running)
+                            | Some(BootRunLoopWorkerStatus::Paused)
+                            | None => match worker_status.snapshot() {
+                                BootRunLoopWorkerStatus::Failed(message) => {
+                                    format!("{message}; ")
+                                }
+                                _ => String::new(),
+                            },
+                        };
+                        Some(BootRunLoopWorkerStatus::Failed(format!(
+                            "{prior}terminal network cleanup failed: {source}"
+                        )))
+                    }
+                    None => intended_status,
+                };
+                if let Some(final_status) = final_status {
+                    worker_status.record(final_status);
+                    let _ = terminal_wakeup_writer.write_all(&[1]);
+                } else if matches!(worker_status.snapshot(), BootRunLoopWorkerStatus::Failed(_)) {
                     let _ = terminal_wakeup_writer.write_all(&[1]);
                 }
                 drop(command_receiver);
@@ -8210,6 +8494,11 @@ where
                 ));
             }
         };
+        if let Err(source) = session.bind_run_loop_auxiliary_wakeup(control.clone()) {
+            drop(session_sender);
+            let _ = worker.join();
+            return Err(BootRunLoopStartError::new(source, session));
+        }
         if let Err(err) = session_sender.send(session) {
             let _ = worker.join();
             return Err(BootRunLoopStartError::new(
@@ -9543,8 +9832,9 @@ mod tests {
     use crate::host_network::vmnet::{
         VmnetError, VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceDescriptor,
         VmnetInterfaceDescriptorError, VmnetInterfaceParameters, VmnetInterfaceStartDisposition,
-        VmnetInterfaceStartError, VmnetOperation, VmnetPacketIoBackend, VmnetPacketIoError,
-        VmnetReadPacket, VmnetStartedInterface, VmnetStatus, VmnetWritePacket,
+        VmnetInterfaceStartError, VmnetOperation, VmnetPacketAvailableCallback,
+        VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket, VmnetStartedInterface,
+        VmnetStatus, VmnetWritePacket,
     };
     #[cfg(target_os = "macos")]
     use crate::vhost_user_block::{VhostUserBlockBackend, VhostUserBlockBackendOptions};
@@ -11327,6 +11617,9 @@ mod tests {
         wait_for_stop: bool,
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
+        run_loop_auxiliary_events: Arc<Mutex<Vec<&'static str>>>,
+        run_loop_auxiliary_bind_error: Option<BackendError>,
+        run_loop_auxiliary_shutdown_error: Option<BackendError>,
         snapshot_auxiliary_quiescence: Arc<FakeSnapshotAuxiliaryQuiescenceState>,
         native_snapshot_memory: Option<GuestMemory>,
         native_snapshot_events: Arc<Mutex<Vec<&'static str>>>,
@@ -11379,6 +11672,9 @@ mod tests {
                 wait_for_stop: true,
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
+                run_loop_auxiliary_events: Arc::default(),
+                run_loop_auxiliary_bind_error: None,
+                run_loop_auxiliary_shutdown_error: None,
                 snapshot_auxiliary_quiescence: Arc::default(),
                 native_snapshot_memory: None,
                 native_snapshot_events: Arc::default(),
@@ -11406,6 +11702,10 @@ mod tests {
 
         fn snapshot_auxiliary_quiescence(&self) -> Arc<FakeSnapshotAuxiliaryQuiescenceState> {
             Arc::clone(&self.snapshot_auxiliary_quiescence)
+        }
+
+        fn run_loop_auxiliary_events(&self) -> Arc<Mutex<Vec<&'static str>>> {
+            Arc::clone(&self.run_loop_auxiliary_events)
         }
 
         fn native_snapshot_events(&self) -> Arc<Mutex<Vec<&'static str>>> {
@@ -11470,6 +11770,16 @@ mod tests {
                 .acquire_error
                 .lock()
                 .expect("fake auxiliary quiescence error should lock") = Some(source);
+            self
+        }
+
+        fn with_run_loop_auxiliary_bind_error(mut self, source: BackendError) -> Self {
+            self.run_loop_auxiliary_bind_error = Some(source);
+            self
+        }
+
+        fn with_run_loop_auxiliary_shutdown_error(mut self, source: BackendError) -> Self {
+            self.run_loop_auxiliary_shutdown_error = Some(source);
             self
         }
 
@@ -11648,6 +11958,31 @@ mod tests {
 
         fn run_loop_control(&self) -> Self::Control {
             self.control.clone()
+        }
+
+        fn bind_run_loop_auxiliary_wakeup(
+            &mut self,
+            _control: Self::Control,
+        ) -> Result<(), BackendError> {
+            self.run_loop_auxiliary_events
+                .lock()
+                .expect("fake run-loop auxiliary events should lock")
+                .push("bind");
+            match self.run_loop_auxiliary_bind_error.clone() {
+                Some(source) => Err(source),
+                None => Ok(()),
+            }
+        }
+
+        fn shutdown_run_loop_auxiliary_work(&mut self) -> Result<(), BackendError> {
+            self.run_loop_auxiliary_events
+                .lock()
+                .expect("fake run-loop auxiliary events should lock")
+                .push("shutdown");
+            match self.run_loop_auxiliary_shutdown_error.clone() {
+                Some(source) => Err(source),
+                None => Ok(()),
+            }
         }
 
         fn quiesce_snapshot_auxiliary_work(
@@ -12435,6 +12770,8 @@ mod tests {
     struct RecordingVmnetPacketIoBackend {
         iface_id: String,
         events: Arc<Mutex<Vec<String>>>,
+        packet_callbacks: Arc<Mutex<Vec<(String, VmnetPacketAvailableCallback)>>>,
+        record_packet_event_lifecycle: bool,
         start_status: Option<VmnetStatus>,
         stop_status: Option<VmnetStatus>,
         realized_mac: GuestMacAddress,
@@ -12481,6 +12818,41 @@ mod tests {
             }
             Ok(())
         }
+
+        fn enable_packet_available_callback(
+            &mut self,
+            interface: &mut Self::Interface,
+            callback: VmnetPacketAvailableCallback,
+        ) -> Result<(), VmnetError> {
+            if self.record_packet_event_lifecycle {
+                push_recorded_event(
+                    &self.events,
+                    format!("packet-events-enable:{}", interface.iface_id),
+                );
+            }
+            self.packet_callbacks
+                .lock()
+                .expect("recorded callback list should lock")
+                .push((interface.iface_id.clone(), callback));
+            Ok(())
+        }
+
+        fn disable_and_drain_packet_available_callback(
+            &mut self,
+            interface: &mut Self::Interface,
+        ) -> Result<(), VmnetError> {
+            if self.record_packet_event_lifecycle {
+                push_recorded_event(
+                    &self.events,
+                    format!("packet-events-disable-drain:{}", interface.iface_id),
+                );
+            }
+            self.packet_callbacks
+                .lock()
+                .expect("recorded callback list should lock")
+                .retain(|(iface_id, _)| iface_id != &interface.iface_id);
+            Ok(())
+        }
     }
 
     impl VmnetPacketIoBackend for RecordingVmnetPacketIoBackend {
@@ -12508,6 +12880,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingVmnetPacketIoBackendFactory {
         events: Arc<Mutex<Vec<String>>>,
+        packet_callbacks: Arc<Mutex<Vec<(String, VmnetPacketAvailableCallback)>>>,
+        record_packet_event_lifecycle: bool,
         start_statuses: VecDeque<Option<VmnetStatus>>,
         stop_statuses: VecDeque<Option<VmnetStatus>>,
         realized_macs: VecDeque<GuestMacAddress>,
@@ -12517,6 +12891,15 @@ mod tests {
     impl RecordingVmnetPacketIoBackendFactory {
         fn events(&self) -> Arc<Mutex<Vec<String>>> {
             Arc::clone(&self.events)
+        }
+
+        fn packet_callbacks(&self) -> Arc<Mutex<Vec<(String, VmnetPacketAvailableCallback)>>> {
+            Arc::clone(&self.packet_callbacks)
+        }
+
+        fn recording_packet_event_lifecycle(mut self) -> Self {
+            self.record_packet_event_lifecycle = true;
+            self
         }
 
         fn with_next_start_status(mut self, status: Option<VmnetStatus>) -> Self {
@@ -12544,6 +12927,8 @@ mod tests {
             RecordingVmnetPacketIoBackend {
                 iface_id: iface_id.to_string(),
                 events: Arc::clone(&self.events),
+                packet_callbacks: Arc::clone(&self.packet_callbacks),
+                record_packet_event_lifecycle: self.record_packet_event_lifecycle,
                 start_status: self.start_statuses.pop_front().unwrap_or(None),
                 stop_status: self.stop_statuses.pop_front().unwrap_or(None),
                 realized_mac: self.realized_macs.pop_front().unwrap_or_else(|| {
@@ -12565,6 +12950,19 @@ mod tests {
             .lock()
             .expect("recorded event log should lock")
             .clone()
+    }
+
+    fn recorded_packet_callback(
+        callbacks: &Arc<Mutex<Vec<(String, VmnetPacketAvailableCallback)>>>,
+        iface_id: &str,
+    ) -> VmnetPacketAvailableCallback {
+        callbacks
+            .lock()
+            .expect("recorded callback list should lock")
+            .iter()
+            .find(|(candidate, _)| candidate == iface_id)
+            .map(|(_, callback)| callback.clone())
+            .expect("recorded packet callback should exist")
     }
 
     fn network_configs(
@@ -13871,6 +14269,136 @@ mod tests {
     }
 
     #[test]
+    fn process_vmnet_readiness_bridge_delivers_prebind_signal_and_stops_cleanly() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let callbacks = factory.packet_callbacks();
+        let mut provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect("vmnet provider should build");
+        let callback = recorded_packet_callback(&callbacks, "eth0");
+        callback.publish_for_test(Some(3));
+        let wake_count = Arc::new(AtomicU64::new(0));
+        let worker_wake_count = Arc::clone(&wake_count);
+
+        provider
+            .bind_readiness_wake(Arc::new(move || {
+                worker_wake_count.fetch_add(1, Ordering::SeqCst);
+            }))
+            .expect("readiness wake should bind");
+
+        for _ in 0..100 {
+            if wake_count.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        assert!(provider.take_scheduled_packet_readiness());
+        assert!(provider.has_packet_readiness(test_boot_network_device().interface()));
+        provider
+            .shutdown_packet_io()
+            .expect("readiness bridge and packet I/O should stop");
+        assert!(provider.readiness_bridge.is_none());
+        assert!(provider.readiness_wake.is_none());
+        assert!(
+            callbacks
+                .lock()
+                .expect("recorded callback list should lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn process_vmnet_readiness_rejects_retired_generation_after_replacement() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let callbacks = factory.packet_callbacks();
+        let mut provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect("vmnet provider should build");
+        let stale_callback = recorded_packet_callback(&callbacks, "eth0");
+        let mut removed = provider
+            .take_interface("eth0")
+            .expect("first generation should be removable");
+        removed
+            .stop()
+            .expect("first generation should stop exactly");
+        drop(removed);
+
+        let prepared = provider
+            .prepare_entry_with_factory(
+                &configs[0],
+                super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                false,
+                &mut factory,
+            )
+            .expect("replacement generation should prepare");
+        provider.publish_prepared(prepared);
+        let replacement_callback = recorded_packet_callback(&callbacks, "eth0");
+
+        stale_callback.publish_for_test(Some(1));
+        assert!(!provider.take_scheduled_packet_readiness());
+        assert!(!provider.has_packet_readiness(test_boot_network_device().interface()));
+
+        replacement_callback.publish_for_test(Some(1));
+        assert!(provider.take_scheduled_packet_readiness());
+        assert!(provider.has_packet_readiness(test_boot_network_device().interface()));
+    }
+
+    #[test]
+    fn process_vmnet_shutdown_disables_and_drains_callbacks_before_reverse_stop() {
+        let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "vmnet:shared")]);
+        let mut factory =
+            RecordingVmnetPacketIoBackendFactory::default().recording_packet_event_lifecycle();
+        let events = factory.events();
+        let callbacks = factory.packet_callbacks();
+        let mut provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect("vmnet provider should build");
+
+        provider
+            .shutdown_packet_io()
+            .expect("reverse packet-I/O cleanup should succeed");
+
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "packet-events-enable:eth0".to_string(),
+                "backend:eth1".to_string(),
+                "descriptor:eth1:shared".to_string(),
+                "start:eth1".to_string(),
+                "packet-events-enable:eth1".to_string(),
+                "packet-events-disable-drain:eth1".to_string(),
+                "stop:eth1".to_string(),
+                "packet-events-disable-drain:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+        assert!(
+            callbacks
+                .lock()
+                .expect("recorded callback list should lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn process_vmnet_packet_io_provider_maps_all_supported_host_dev_name_forms() {
         let configs = network_configs([
             ("eth0", "vmnet:host"),
@@ -14089,9 +14617,19 @@ mod tests {
             ]
         );
         drop(provider);
-        let events = recorded_events(&events);
-        assert!(events.iter().any(|event| event == "stop:eth0"));
-        assert!(events.iter().any(|event| event == "stop:eth1"));
+        assert_eq!(
+            recorded_events(&events),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "backend:eth1".to_string(),
+                "descriptor:eth1:shared".to_string(),
+                "start:eth1".to_string(),
+                "stop:eth1".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -14552,6 +15090,8 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
+            | ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. }
             | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
@@ -14592,6 +15132,8 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
+            | ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. }
             | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
@@ -14625,6 +15167,8 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
+            | ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. }
             | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
@@ -14658,6 +15202,8 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
+            | ProcessNetworkPacketIoProviderBuildError::PacketEvents { .. }
             | ProcessNetworkPacketIoProviderBuildError::CleanupUncertain
             | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
@@ -14844,6 +15390,108 @@ mod tests {
         drop(supervisor);
 
         assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_runs_auxiliary_shutdown_before_terminal_status() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_wait_for_stop(false);
+        let auxiliary_events = session.run_loop_auxiliary_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(8).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            8
+        );
+
+        assert_eq!(
+            supervisor.wait_for_terminal_status(),
+            BootRunLoopWorkerStatus::Exited(FakeRunLoopOutcome::Terminal)
+        );
+        assert_eq!(
+            *auxiliary_events
+                .lock()
+                .expect("fake run-loop auxiliary events should lock"),
+            ["bind", "shutdown"]
+        );
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_returns_session_when_auxiliary_bind_fails() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, _max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_run_loop_auxiliary_bind_error(BackendError::InvalidState(
+                "injected readiness bridge bind failure",
+            ));
+        let auxiliary_events = session.run_loop_auxiliary_events();
+
+        let error = BootRunLoopSupervisor::start_recoverable(
+            session,
+            NonZeroUsize::new(10).expect("non-zero limit"),
+        )
+        .expect_err("auxiliary bind failure should preserve the session");
+        let (source, recovered_session) = error.into_parts();
+
+        assert_eq!(
+            source,
+            BackendError::InvalidState("injected readiness bridge bind failure")
+        );
+        assert_eq!(
+            *auxiliary_events
+                .lock()
+                .expect("fake run-loop auxiliary events should lock"),
+            ["bind"]
+        );
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+        drop(recovered_session);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_turns_auxiliary_shutdown_failure_terminal() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_wait_for_stop(false)
+            .with_run_loop_auxiliary_shutdown_error(BackendError::InvalidState(
+                "injected readiness bridge shutdown failure",
+            ));
+        let auxiliary_events = session.run_loop_auxiliary_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(9).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            9
+        );
+
+        assert!(matches!(
+            supervisor.wait_for_terminal_status(),
+            BootRunLoopWorkerStatus::Failed(message)
+                if message.contains("terminal network cleanup failed")
+                    && message.contains("injected readiness bridge shutdown failure")
+        ));
+        assert_eq!(
+            *auxiliary_events
+                .lock()
+                .expect("fake run-loop auxiliary events should lock"),
+            ["bind", "shutdown"]
+        );
+        drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 

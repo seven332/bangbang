@@ -3,9 +3,10 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::ptr::{self, NonNull};
 use std::str::FromStr;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use bangbang_runtime::network::{
@@ -36,8 +37,9 @@ pub const VMNET_HOST_DEVICE_NAME_SHARED: &str = "vmnet:shared";
 pub const VMNET_HOST_DEVICE_NAME_BRIDGED_PREFIX: &str = "vmnet:bridged:";
 
 pub const DEFAULT_VMNET_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
-const VMNET_MAX_PACKETS_PER_OPERATION: u64 = 200;
-const VMNET_MAX_BYTES_PER_OPERATION: u64 = 256 * 1024;
+pub(crate) const VMNET_MAX_PACKETS_PER_OPERATION: usize = 200;
+pub(crate) const VMNET_MAX_BYTES_PER_OPERATION: usize = 256 * 1024;
+pub const VMNET_INTERFACE_PACKETS_AVAILABLE_VALUE: u32 = 1 << 0;
 const VMNET_MAC_ADDRESS_STRING_LEN: usize = 17;
 const VMNET_INTERFACE_ID_LEN: usize = 16;
 
@@ -155,6 +157,9 @@ impl fmt::Debug for VmnetStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmnetOperation {
     StartInterface,
+    EnablePacketEvents,
+    DisablePacketEvents,
+    DrainPacketEvents,
     StopInterface,
     ReadPackets,
     WritePackets,
@@ -164,6 +169,9 @@ impl fmt::Display for VmnetOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::StartInterface => "vmnet_start_interface",
+            Self::EnablePacketEvents => "vmnet_interface_set_event_callback(enable)",
+            Self::DisablePacketEvents => "vmnet_interface_set_event_callback(disable)",
+            Self::DrainPacketEvents => "vmnet packet-event callback drain",
             Self::StopInterface => "vmnet_stop_interface",
             Self::ReadPackets => "vmnet_read",
             Self::WritePackets => "vmnet_write",
@@ -701,14 +709,16 @@ impl std::error::Error for VmnetPacketDescriptorError {}
 pub enum VmnetPacketCountExpectation {
     ZeroOrOne,
     One,
+    AtMost(usize),
 }
 
 impl fmt::Display for VmnetPacketCountExpectation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::ZeroOrOne => "0 or 1",
-            Self::One => "1",
-        })
+        match self {
+            Self::ZeroOrOne => f.write_str("0 or 1"),
+            Self::One => f.write_str("1"),
+            Self::AtMost(maximum) => write!(f, "0 through {maximum}"),
+        }
     }
 }
 
@@ -726,6 +736,9 @@ pub enum VmnetPacketIoError {
     ReadPacketSizeExceedsBuffer {
         packet_size: usize,
         buffer_len: usize,
+    },
+    InvalidBatch {
+        message: &'static str,
     },
 }
 
@@ -750,6 +763,7 @@ impl fmt::Display for VmnetPacketIoError {
             Self::ReadPacketSizeExceedsBuffer { .. } => {
                 f.write_str("vmnet_read returned a packet larger than the validated read buffer")
             }
+            Self::InvalidBatch { message } => write!(f, "invalid vmnet packet batch: {message}"),
         }
     }
 }
@@ -766,8 +780,42 @@ impl std::error::Error for VmnetPacketIoError {
             Self::Vmnet { source } => Some(source),
             Self::InterfaceStopped
             | Self::UnexpectedPacketCount { .. }
-            | Self::ReadPacketSizeExceedsBuffer { .. } => None,
+            | Self::ReadPacketSizeExceedsBuffer { .. }
+            | Self::InvalidBatch { .. } => None,
         }
+    }
+}
+
+/// Restricted publisher installed in Apple's packet-available callback.
+///
+/// The callback receives no interface handle or guest/runtime state. Its only
+/// capability is publishing a best-effort packet-count hint to the generation
+/// owner supplied by the caller.
+#[derive(Clone)]
+pub struct VmnetPacketAvailableCallback {
+    publish: Arc<dyn Fn(Option<u64>) + Send + Sync + 'static>,
+}
+
+impl VmnetPacketAvailableCallback {
+    pub fn new(publish: impl Fn(Option<u64>) + Send + Sync + 'static) -> Self {
+        Self {
+            publish: Arc::new(publish),
+        }
+    }
+
+    fn publish(&self, estimated_packets: Option<u64>) {
+        (self.publish)(estimated_packets);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, estimated_packets: Option<u64>) {
+        self.publish(estimated_packets);
+    }
+}
+
+impl fmt::Debug for VmnetPacketAvailableCallback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VmnetPacketAvailableCallback(<restricted>)")
     }
 }
 
@@ -1171,6 +1219,14 @@ fn vmnet_interface_id_key() -> Result<*const c_char, VmnetInterfaceDescriptorErr
     }
 }
 
+fn vmnet_estimated_packets_available_key() -> Option<*const c_char> {
+    // SAFETY: The symbol is provided by vmnet.framework on every deployment
+    // target that exposes packet events. A null defensive check keeps malformed
+    // framework state from reaching XPC dictionary access.
+    let key = unsafe { xpc::VMNET_ESTIMATED_PACKETS_AVAILABLE_KEY };
+    (!key.is_null()).then_some(key)
+}
+
 fn optional_vmnet_read_max_packets_key() -> Option<*const c_char> {
     optional_vmnet_data_key(c"vmnet_read_max_packets_key")
 }
@@ -1255,6 +1311,8 @@ mod xpc {
         pub static VMNET_MAX_PACKET_SIZE_KEY: *const c_char;
         #[link_name = "vmnet_interface_id_key"]
         pub static VMNET_INTERFACE_ID_KEY: *const c_char;
+        #[link_name = "vmnet_estimated_packets_available_key"]
+        pub static VMNET_ESTIMATED_PACKETS_AVAILABLE_KEY: *const c_char;
     }
 }
 
@@ -1450,9 +1508,9 @@ fn validate_batch_limit(
             VmnetInterfaceParameterProblem::OutOfRange,
         ));
     }
-    let memory_limit = VMNET_MAX_BYTES_PER_OPERATION / packet_buffer_size;
+    let memory_limit = VMNET_MAX_BYTES_PER_OPERATION as u64 / packet_buffer_size;
     let capped = returned
-        .min(VMNET_MAX_PACKETS_PER_OPERATION)
+        .min(VMNET_MAX_PACKETS_PER_OPERATION as u64)
         .min(u64::from(VIRTIO_NET_QUEUE_SIZE))
         .min(memory_limit);
     let capped = u16::try_from(capped).map_err(|_| {
@@ -1671,6 +1729,20 @@ fn dictionary_value(dictionary: xpc::XpcObject, key: *const c_char) -> Option<xp
     NonNull::new(unsafe { xpc::xpc_dictionary_get_value(dictionary, key) }).map(NonNull::as_ptr)
 }
 
+fn decode_vmnet_packet_estimate(event: xpc::XpcObject) -> Option<u64> {
+    if event.is_null() || !xpc_object_has_type(event, xpc_dictionary_type()) {
+        return None;
+    }
+    let value = dictionary_value(event, vmnet_estimated_packets_available_key()?)?;
+    if !xpc_object_has_type(value, xpc_uint64_type()) {
+        return None;
+    }
+
+    // SAFETY: Exact XPC uint64 type was established above and `value` remains
+    // borrowed from the live event dictionary for this callback invocation.
+    Some(unsafe { xpc::xpc_uint64_get_value(value) })
+}
+
 fn xpc_object_has_type(object: xpc::XpcObject, expected: *const c_void) -> bool {
     // SAFETY: `object` is non-null and borrowed from a live XPC dictionary.
     unsafe { xpc::xpc_get_type(object) == expected }
@@ -1721,6 +1793,12 @@ mod vmnet_sys {
             interface: *mut c_void,
             packets: *mut VmnetPacketDescriptor,
             packet_count: *mut c_int,
+        ) -> u32;
+        pub fn vmnet_interface_set_event_callback(
+            interface: *mut c_void,
+            event_mask: u32,
+            queue: Option<&DispatchQueue>,
+            callback: Option<&Block<dyn Fn(u32, *mut c_void)>>,
         ) -> u32;
     }
 }
@@ -1773,6 +1851,17 @@ pub trait VmnetInterfaceBackend: fmt::Debug + Send + 'static {
     ) -> Result<VmnetStartedInterface<Self::Interface>, VmnetInterfaceStartError>;
 
     fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError>;
+
+    fn enable_packet_available_callback(
+        &mut self,
+        interface: &mut Self::Interface,
+        callback: VmnetPacketAvailableCallback,
+    ) -> Result<(), VmnetError>;
+
+    fn disable_and_drain_packet_available_callback(
+        &mut self,
+        interface: &mut Self::Interface,
+    ) -> Result<(), VmnetError>;
 }
 
 pub trait VmnetPacketIoBackend: fmt::Debug + Send + 'static {
@@ -1789,6 +1878,149 @@ pub trait VmnetPacketIoBackend: fmt::Debug + Send + 'static {
         interface: &mut Self::Interface,
         packet: &mut VmnetWritePacket<'_>,
     ) -> Result<(), VmnetPacketIoError>;
+
+    /// Reads at most `requested_packets` fixed-capacity packets into one
+    /// contiguous owned buffer and returns the initialized prefix length.
+    ///
+    /// Backends overriding this method must fill `packet_lengths[..count]`
+    /// only and must never expose a count greater than the request.
+    fn read_packet_batch(
+        &mut self,
+        interface: &mut Self::Interface,
+        buffer: &mut [u8],
+        packet_capacity: usize,
+        requested_packets: usize,
+        packet_lengths: &mut [usize],
+    ) -> Result<usize, VmnetPacketIoError> {
+        validate_read_batch_layout(
+            buffer.len(),
+            packet_capacity,
+            requested_packets,
+            packet_lengths.len(),
+        )?;
+        let mut completed = 0;
+        for (packet_index, packet_len_slot) in packet_lengths
+            .iter_mut()
+            .take(requested_packets)
+            .enumerate()
+        {
+            let start = packet_index.checked_mul(packet_capacity).ok_or(
+                VmnetPacketIoError::InvalidBatch {
+                    message: "read packet offset overflowed",
+                },
+            )?;
+            let end =
+                start
+                    .checked_add(packet_capacity)
+                    .ok_or(VmnetPacketIoError::InvalidBatch {
+                        message: "read packet range overflowed",
+                    })?;
+            let packet_buffer =
+                buffer
+                    .get_mut(start..end)
+                    .ok_or(VmnetPacketIoError::InvalidBatch {
+                        message: "read packet range exceeds the aggregate buffer",
+                    })?;
+            let mut packet = VmnetReadPacket::new(packet_buffer).map_err(|_| {
+                VmnetPacketIoError::InvalidBatch {
+                    message: "read packet buffer must not be empty",
+                }
+            })?;
+            let Some(packet_len) = self.read_packet(interface, &mut packet)? else {
+                break;
+            };
+            *packet_len_slot = packet_len;
+            completed += 1;
+        }
+        Ok(completed)
+    }
+
+    /// Writes a bounded list of packet ranges from one sink-owned staging
+    /// buffer and returns the successfully written prefix length.
+    fn write_packet_batch(
+        &mut self,
+        interface: &mut Self::Interface,
+        buffer: &[u8],
+        packet_ranges: &[Range<usize>],
+    ) -> Result<usize, VmnetPacketIoError> {
+        validate_write_batch_layout(buffer, packet_ranges)?;
+        let mut completed = 0;
+        for range in packet_ranges {
+            let bytes = buffer
+                .get(range.clone())
+                .ok_or(VmnetPacketIoError::InvalidBatch {
+                    message: "write packet range exceeds the aggregate buffer",
+                })?;
+            let mut packet =
+                VmnetWritePacket::new(bytes).map_err(|_| VmnetPacketIoError::InvalidBatch {
+                    message: "write packet buffer must not be empty",
+                })?;
+            self.write_packet(interface, &mut packet)?;
+            completed += 1;
+        }
+        Ok(completed)
+    }
+}
+
+fn validate_read_batch_layout(
+    buffer_len: usize,
+    packet_capacity: usize,
+    requested_packets: usize,
+    packet_lengths_len: usize,
+) -> Result<(), VmnetPacketIoError> {
+    if packet_capacity == 0 {
+        return Err(VmnetPacketIoError::InvalidBatch {
+            message: "read packet capacity must not be zero",
+        });
+    }
+    if requested_packets == 0 || requested_packets > VMNET_MAX_PACKETS_PER_OPERATION {
+        return Err(VmnetPacketIoError::InvalidBatch {
+            message: "read packet count is outside the vmnet operation bound",
+        });
+    }
+    if packet_lengths_len < requested_packets {
+        return Err(VmnetPacketIoError::InvalidBatch {
+            message: "read packet length storage is smaller than the request",
+        });
+    }
+    let required =
+        packet_capacity
+            .checked_mul(requested_packets)
+            .ok_or(VmnetPacketIoError::InvalidBatch {
+                message: "read aggregate byte count overflowed",
+            })?;
+    if required > buffer_len || required > VMNET_MAX_BYTES_PER_OPERATION {
+        return Err(VmnetPacketIoError::InvalidBatch {
+            message: "read aggregate buffer exceeds its validated byte bound",
+        });
+    }
+    Ok(())
+}
+
+fn validate_write_batch_layout(
+    buffer: &[u8],
+    packet_ranges: &[Range<usize>],
+) -> Result<(), VmnetPacketIoError> {
+    if packet_ranges.is_empty() || packet_ranges.len() > VMNET_MAX_PACKETS_PER_OPERATION {
+        return Err(VmnetPacketIoError::InvalidBatch {
+            message: "write packet count is outside the vmnet operation bound",
+        });
+    }
+    if buffer.len() > VMNET_MAX_BYTES_PER_OPERATION {
+        return Err(VmnetPacketIoError::InvalidBatch {
+            message: "write aggregate buffer exceeds the vmnet byte bound",
+        });
+    }
+    let mut previous_end = 0;
+    for range in packet_ranges {
+        if range.is_empty() || range.start < previous_end || range.end > buffer.len() {
+            return Err(VmnetPacketIoError::InvalidBatch {
+                message: "write packet ranges are empty, overlapping, or out of bounds",
+            });
+        }
+        previous_end = range.end;
+    }
+    Ok(())
 }
 
 trait VmnetSystemApi: fmt::Debug + Send + 'static {
@@ -1804,6 +2036,14 @@ trait VmnetSystemApi: fmt::Debug + Send + 'static {
         interface: NonNull<c_void>,
         queue: &DispatchQueue,
         completion: &Block<dyn Fn(u32)>,
+    ) -> VmnetStatus;
+
+    fn set_event_callback(
+        &mut self,
+        interface: NonNull<c_void>,
+        event_mask: u32,
+        queue: Option<&DispatchQueue>,
+        callback: Option<&Block<dyn Fn(u32, *mut c_void)>>,
     ) -> VmnetStatus;
 
     fn read_packets(
@@ -1858,6 +2098,27 @@ impl VmnetSystemApi for SystemVmnetApi {
         VmnetStatus::from_raw(status)
     }
 
+    fn set_event_callback(
+        &mut self,
+        interface: NonNull<c_void>,
+        event_mask: u32,
+        queue: Option<&DispatchQueue>,
+        callback: Option<&Block<dyn Fn(u32, *mut c_void)>>,
+    ) -> VmnetStatus {
+        // SAFETY: `interface` is a live vmnet handle. A non-null queue and
+        // callback are paired for enable; both are null for disable. vmnet
+        // copies the callback before returning from a successful enable.
+        let status = unsafe {
+            vmnet_sys::vmnet_interface_set_event_callback(
+                interface.as_ptr(),
+                event_mask,
+                queue,
+                callback,
+            )
+        };
+        VmnetStatus::from_raw(status)
+    }
+
     fn read_packets(
         &mut self,
         interface: NonNull<c_void>,
@@ -1865,9 +2126,10 @@ impl VmnetSystemApi for SystemVmnetApi {
         packet_count: &mut c_int,
     ) -> VmnetStatus {
         // SAFETY: `interface` is an opaque handle returned by
-        // `vmnet_start_interface`, `packets` points to a live packet descriptor
-        // for one element, and `packet_count` is a valid mutable pointer for
-        // vmnet.framework to read and update during the synchronous call.
+        // `vmnet_start_interface`, `packets` points to a live descriptor array
+        // whose initialized length is the input `packet_count`, and
+        // `packet_count` is a valid mutable pointer for vmnet.framework to read
+        // and update during the synchronous call.
         let status = unsafe {
             vmnet_sys::vmnet_read(
                 interface.as_ptr(),
@@ -1886,9 +2148,10 @@ impl VmnetSystemApi for SystemVmnetApi {
         packet_count: &mut c_int,
     ) -> VmnetStatus {
         // SAFETY: `interface` is an opaque handle returned by
-        // `vmnet_start_interface`, `packets` points to a live packet descriptor
-        // for one element, and `packet_count` is a valid mutable pointer for
-        // vmnet.framework to read and update during the synchronous call.
+        // `vmnet_start_interface`, `packets` points to a live descriptor array
+        // whose initialized length is the input `packet_count`, and
+        // `packet_count` is a valid mutable pointer for vmnet.framework to read
+        // and update during the synchronous call.
         let status = unsafe {
             vmnet_sys::vmnet_write(
                 interface.as_ptr(),
@@ -1903,6 +2166,7 @@ impl VmnetSystemApi for SystemVmnetApi {
 
 pub struct SystemVmnetInterface {
     interface: NonNull<c_void>,
+    packet_event_callback: Option<RcBlock<dyn Fn(u32, *mut c_void)>>,
 }
 
 impl fmt::Debug for SystemVmnetInterface {
@@ -1911,14 +2175,20 @@ impl fmt::Debug for SystemVmnetInterface {
     }
 }
 
-// SAFETY: `interface` is an opaque vmnet.framework handle. Moving the owner
-// between threads does not dereference it, and lifecycle operations still go
-// through vmnet.framework with an explicit dispatch queue.
+// SAFETY: `interface` is an opaque vmnet.framework handle. The optional
+// `RcBlock` is a copied Objective-C heap block whose capture is `Send + Sync`;
+// it is invoked only by the retained serial dispatch queue and may be released
+// from any thread. Moving this owner does not invoke or dereference either
+// value, and lifecycle operations still go through vmnet.framework with that
+// explicit queue.
 unsafe impl Send for SystemVmnetInterface {}
 
 impl SystemVmnetInterface {
     const fn new(interface: NonNull<c_void>) -> Self {
-        Self { interface }
+        Self {
+            interface,
+            packet_event_callback: None,
+        }
     }
 
     pub const fn as_raw_interface(&self) -> NonNull<c_void> {
@@ -1963,6 +2233,23 @@ impl VmnetInterfaceBackend for SystemVmnetInterfaceBackend {
     fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
         self.inner.stop_interface(interface)
     }
+
+    fn enable_packet_available_callback(
+        &mut self,
+        interface: &mut Self::Interface,
+        callback: VmnetPacketAvailableCallback,
+    ) -> Result<(), VmnetError> {
+        self.inner
+            .enable_packet_available_callback(interface, callback)
+    }
+
+    fn disable_and_drain_packet_available_callback(
+        &mut self,
+        interface: &mut Self::Interface,
+    ) -> Result<(), VmnetError> {
+        self.inner
+            .disable_and_drain_packet_available_callback(interface)
+    }
 }
 
 impl VmnetPacketIoBackend for SystemVmnetInterfaceBackend {
@@ -1982,6 +2269,33 @@ impl VmnetPacketIoBackend for SystemVmnetInterfaceBackend {
         packet: &mut VmnetWritePacket<'_>,
     ) -> Result<(), VmnetPacketIoError> {
         self.inner.write_packet(interface, packet)
+    }
+
+    fn read_packet_batch(
+        &mut self,
+        interface: &mut Self::Interface,
+        buffer: &mut [u8],
+        packet_capacity: usize,
+        requested_packets: usize,
+        packet_lengths: &mut [usize],
+    ) -> Result<usize, VmnetPacketIoError> {
+        self.inner.read_packet_batch(
+            interface,
+            buffer,
+            packet_capacity,
+            requested_packets,
+            packet_lengths,
+        )
+    }
+
+    fn write_packet_batch(
+        &mut self,
+        interface: &mut Self::Interface,
+        buffer: &[u8],
+        packet_ranges: &[Range<usize>],
+    ) -> Result<usize, VmnetPacketIoError> {
+        self.inner
+            .write_packet_batch(interface, buffer, packet_ranges)
     }
 }
 
@@ -2160,6 +2474,9 @@ where
     }
 
     fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
+        if interface.packet_event_callback.is_some() {
+            self.disable_and_drain_packet_available_callback(interface)?;
+        }
         let (sender, receiver) = mpsc::channel();
         #[cfg(test)]
         let completion_channel_guard = self.hold_completion_channel_open.then(|| sender.clone());
@@ -2192,6 +2509,65 @@ where
         } else {
             Err(VmnetError::new(VmnetOperation::StopInterface, status))
         }
+    }
+
+    fn enable_packet_available_callback(
+        &mut self,
+        interface: &mut Self::Interface,
+        callback: VmnetPacketAvailableCallback,
+    ) -> Result<(), VmnetError> {
+        if interface.packet_event_callback.is_some() {
+            return Err(VmnetError::new(
+                VmnetOperation::EnablePacketEvents,
+                VmnetStatus::InvalidArgument,
+            ));
+        }
+        let event_callback = RcBlock::new(move |event_mask: u32, event: *mut c_void| {
+            if event_mask & VMNET_INTERFACE_PACKETS_AVAILABLE_VALUE != 0 {
+                callback.publish(decode_vmnet_packet_estimate(event));
+            }
+        });
+        let status = self.api.set_event_callback(
+            interface.as_raw_interface(),
+            VMNET_INTERFACE_PACKETS_AVAILABLE_VALUE,
+            Some(&self.queue),
+            Some(&event_callback),
+        );
+        if status != VmnetStatus::Success {
+            return Err(VmnetError::new(VmnetOperation::EnablePacketEvents, status));
+        }
+        interface.packet_event_callback = Some(event_callback);
+        Ok(())
+    }
+
+    fn disable_and_drain_packet_available_callback(
+        &mut self,
+        interface: &mut Self::Interface,
+    ) -> Result<(), VmnetError> {
+        if interface.packet_event_callback.is_none() {
+            return Ok(());
+        }
+        let status = self.api.set_event_callback(
+            interface.as_raw_interface(),
+            VMNET_INTERFACE_PACKETS_AVAILABLE_VALUE,
+            None,
+            None,
+        );
+        if status != VmnetStatus::Success {
+            return Err(VmnetError::new(VmnetOperation::DisablePacketEvents, status));
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        self.queue.exec_async(move || {
+            let _ = sender.send(());
+        });
+        wait_for_vmnet_completion(
+            receiver,
+            VmnetOperation::DrainPacketEvents,
+            self.completion_timeout,
+        )?;
+        interface.packet_event_callback = None;
+        Ok(())
     }
 }
 
@@ -2270,6 +2646,177 @@ where
                 actual: packet_count,
             })
         }
+    }
+
+    fn read_packet_batch(
+        &mut self,
+        interface: &mut Self::Interface,
+        buffer: &mut [u8],
+        packet_capacity: usize,
+        requested_packets: usize,
+        packet_lengths: &mut [usize],
+    ) -> Result<usize, VmnetPacketIoError> {
+        validate_read_batch_layout(
+            buffer.len(),
+            packet_capacity,
+            requested_packets,
+            packet_lengths.len(),
+        )?;
+
+        let mut iovs: [libc::iovec; VMNET_MAX_PACKETS_PER_OPERATION] =
+            std::array::from_fn(|_| libc::iovec {
+                iov_base: ptr::null_mut(),
+                iov_len: 0,
+            });
+        let mut descriptors: [VmnetPacketDescriptor; VMNET_MAX_PACKETS_PER_OPERATION] =
+            std::array::from_fn(|_| VmnetPacketDescriptor {
+                vm_pkt_size: 0,
+                vm_pkt_iov: ptr::null_mut(),
+                vm_pkt_iovcnt: 0,
+                vm_flags: 0,
+            });
+        for (packet_index, (iov, descriptor)) in iovs
+            .iter_mut()
+            .zip(descriptors.iter_mut())
+            .take(requested_packets)
+            .enumerate()
+        {
+            let start = packet_index * packet_capacity;
+            let packet_buffer = buffer.get_mut(start..start + packet_capacity).ok_or(
+                VmnetPacketIoError::InvalidBatch {
+                    message: "read packet range exceeds the aggregate buffer",
+                },
+            )?;
+            *iov = libc::iovec {
+                iov_base: packet_buffer.as_mut_ptr().cast::<c_void>(),
+                iov_len: packet_buffer.len(),
+            };
+            *descriptor = VmnetPacketDescriptor {
+                vm_pkt_size: packet_buffer.len(),
+                vm_pkt_iov: ptr::from_mut(iov),
+                vm_pkt_iovcnt: 1,
+                vm_flags: 0,
+            };
+        }
+
+        let mut packet_count =
+            c_int::try_from(requested_packets).map_err(|_| VmnetPacketIoError::InvalidBatch {
+                message: "read packet count does not fit the vmnet ABI",
+            })?;
+        let descriptor_head = descriptors
+            .first_mut()
+            .ok_or(VmnetPacketIoError::InvalidBatch {
+                message: "read packet descriptor batch is unexpectedly empty",
+            })?;
+        let status = self.api.read_packets(
+            interface.as_raw_interface(),
+            NonNull::from(descriptor_head),
+            &mut packet_count,
+        );
+        if status != VmnetStatus::Success {
+            return Err(VmnetPacketIoError::vmnet(
+                VmnetOperation::ReadPackets,
+                status,
+            ));
+        }
+        let completed = usize::try_from(packet_count)
+            .ok()
+            .filter(|completed| *completed <= requested_packets);
+        let Some(completed) = completed else {
+            return Err(VmnetPacketIoError::UnexpectedPacketCount {
+                operation: VmnetOperation::ReadPackets,
+                expected: VmnetPacketCountExpectation::AtMost(requested_packets),
+                actual: packet_count,
+            });
+        };
+        for (descriptor, packet_len_slot) in descriptors
+            .iter()
+            .zip(packet_lengths.iter_mut())
+            .take(completed)
+        {
+            let packet_size = descriptor.packet_size();
+            if packet_size > packet_capacity {
+                return Err(VmnetPacketIoError::ReadPacketSizeExceedsBuffer {
+                    packet_size,
+                    buffer_len: packet_capacity,
+                });
+            }
+            *packet_len_slot = packet_size;
+        }
+        Ok(completed)
+    }
+
+    fn write_packet_batch(
+        &mut self,
+        interface: &mut Self::Interface,
+        buffer: &[u8],
+        packet_ranges: &[Range<usize>],
+    ) -> Result<usize, VmnetPacketIoError> {
+        validate_write_batch_layout(buffer, packet_ranges)?;
+
+        let mut iovs: [libc::iovec; VMNET_MAX_PACKETS_PER_OPERATION] =
+            std::array::from_fn(|_| libc::iovec {
+                iov_base: ptr::null_mut(),
+                iov_len: 0,
+            });
+        let mut descriptors: [VmnetPacketDescriptor; VMNET_MAX_PACKETS_PER_OPERATION] =
+            std::array::from_fn(|_| VmnetPacketDescriptor {
+                vm_pkt_size: 0,
+                vm_pkt_iov: ptr::null_mut(),
+                vm_pkt_iovcnt: 0,
+                vm_flags: 0,
+            });
+        for ((iov, descriptor), range) in iovs
+            .iter_mut()
+            .zip(descriptors.iter_mut())
+            .zip(packet_ranges)
+        {
+            let packet = buffer
+                .get(range.clone())
+                .ok_or(VmnetPacketIoError::InvalidBatch {
+                    message: "write packet range exceeds the aggregate buffer",
+                })?;
+            *iov = libc::iovec {
+                iov_base: packet.as_ptr().cast::<c_void>().cast_mut(),
+                iov_len: packet.len(),
+            };
+            *descriptor = VmnetPacketDescriptor {
+                vm_pkt_size: packet.len(),
+                vm_pkt_iov: ptr::from_mut(iov),
+                vm_pkt_iovcnt: 1,
+                vm_flags: 0,
+            };
+        }
+
+        let requested_packets = packet_ranges.len();
+        let mut packet_count =
+            c_int::try_from(requested_packets).map_err(|_| VmnetPacketIoError::InvalidBatch {
+                message: "write packet count does not fit the vmnet ABI",
+            })?;
+        let descriptor_head = descriptors
+            .first_mut()
+            .ok_or(VmnetPacketIoError::InvalidBatch {
+                message: "write packet descriptor batch is unexpectedly empty",
+            })?;
+        let status = self.api.write_packets(
+            interface.as_raw_interface(),
+            NonNull::from(descriptor_head),
+            &mut packet_count,
+        );
+        if status != VmnetStatus::Success {
+            return Err(VmnetPacketIoError::vmnet(
+                VmnetOperation::WritePackets,
+                status,
+            ));
+        }
+        usize::try_from(packet_count)
+            .ok()
+            .filter(|completed| *completed <= requested_packets)
+            .ok_or(VmnetPacketIoError::UnexpectedPacketCount {
+                operation: VmnetOperation::WritePackets,
+                expected: VmnetPacketCountExpectation::AtMost(requested_packets),
+                actual: packet_count,
+            })
     }
 }
 
@@ -2392,6 +2939,7 @@ where
         + VmnetPacketIoBackend<Interface = <B as VmnetInterfaceBackend>::Interface>,
 {
     started: StartedVmnetInterface<B>,
+    packet_events_enabled: bool,
 }
 
 impl<B> StartedVmnetPacketIoBackend<B>
@@ -2406,6 +2954,7 @@ where
         Ok((
             Self {
                 started: StartedVmnetInterface::start(backend, config)?,
+                packet_events_enabled: false,
             },
             StartedVmnetPacketIoInterface,
         ))
@@ -2419,8 +2968,69 @@ where
         self.started.parameters()
     }
 
+    pub fn enable_packet_available_callback(
+        &mut self,
+        callback: VmnetPacketAvailableCallback,
+    ) -> Result<(), VmnetError> {
+        if self.packet_events_enabled || !self.started.is_started() {
+            return Err(VmnetError::new(
+                VmnetOperation::EnablePacketEvents,
+                VmnetStatus::InvalidArgument,
+            ));
+        }
+        let Some(interface) = self.started.interface.as_mut() else {
+            return Err(VmnetError::new(
+                VmnetOperation::EnablePacketEvents,
+                VmnetStatus::Failure,
+            ));
+        };
+        self.started
+            .backend
+            .enable_packet_available_callback(interface, callback)?;
+        self.packet_events_enabled = true;
+        Ok(())
+    }
+
     pub fn stop(&mut self) -> Result<(), VmnetError> {
+        if self.started.is_uncertain() {
+            return Err(VmnetError::new(
+                if self.packet_events_enabled {
+                    VmnetOperation::DisablePacketEvents
+                } else {
+                    VmnetOperation::StopInterface
+                },
+                VmnetStatus::Failure,
+            ));
+        }
+        if self.packet_events_enabled {
+            let Some(interface) = self.started.interface.as_mut() else {
+                self.started.uncertain = true;
+                return Err(VmnetError::new(
+                    VmnetOperation::DisablePacketEvents,
+                    VmnetStatus::Failure,
+                ));
+            };
+            if let Err(source) = self
+                .started
+                .backend
+                .disable_and_drain_packet_available_callback(interface)
+            {
+                self.started.uncertain = true;
+                return Err(source);
+            }
+            self.packet_events_enabled = false;
+        }
         self.started.stop()
+    }
+}
+
+impl<B> Drop for StartedVmnetPacketIoBackend<B>
+where
+    B: VmnetInterfaceBackend
+        + VmnetPacketIoBackend<Interface = <B as VmnetInterfaceBackend>::Interface>,
+{
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -2459,6 +3069,46 @@ where
         };
 
         self.started.backend.write_packet(interface, packet)
+    }
+
+    fn read_packet_batch(
+        &mut self,
+        _interface: &mut Self::Interface,
+        buffer: &mut [u8],
+        packet_capacity: usize,
+        requested_packets: usize,
+        packet_lengths: &mut [usize],
+    ) -> Result<usize, VmnetPacketIoError> {
+        if !self.started.is_started() {
+            return Err(VmnetPacketIoError::InterfaceStopped);
+        }
+        let Some(interface) = self.started.interface.as_mut() else {
+            return Err(VmnetPacketIoError::InterfaceStopped);
+        };
+        self.started.backend.read_packet_batch(
+            interface,
+            buffer,
+            packet_capacity,
+            requested_packets,
+            packet_lengths,
+        )
+    }
+
+    fn write_packet_batch(
+        &mut self,
+        _interface: &mut Self::Interface,
+        buffer: &[u8],
+        packet_ranges: &[Range<usize>],
+    ) -> Result<usize, VmnetPacketIoError> {
+        if !self.started.is_started() {
+            return Err(VmnetPacketIoError::InterfaceStopped);
+        }
+        let Some(interface) = self.started.interface.as_mut() else {
+            return Err(VmnetPacketIoError::InterfaceStopped);
+        };
+        self.started
+            .backend
+            .write_packet_batch(interface, buffer, packet_ranges)
     }
 }
 
@@ -2578,10 +3228,10 @@ mod tests {
         VmnetInterfaceConfigError, VmnetInterfaceDescriptor, VmnetInterfaceDescriptorError,
         VmnetInterfaceLifecycle, VmnetInterfaceParameterError, VmnetInterfaceParameterField,
         VmnetInterfaceParameterProblem, VmnetInterfaceParameters, VmnetInterfaceStartDisposition,
-        VmnetInterfaceStartError, VmnetMode, VmnetOperation, VmnetPacketCountExpectation,
-        VmnetPacketDescriptor, VmnetPacketDescriptorError, VmnetPacketIoBackend,
-        VmnetPacketIoError, VmnetReadPacket, VmnetStartedInterface, VmnetStatus, VmnetSystemApi,
-        VmnetWritePacket,
+        VmnetInterfaceStartError, VmnetMode, VmnetOperation, VmnetPacketAvailableCallback,
+        VmnetPacketCountExpectation, VmnetPacketDescriptor, VmnetPacketDescriptorError,
+        VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket, VmnetStartedInterface,
+        VmnetStatus, VmnetSystemApi, VmnetWritePacket,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2745,6 +3395,21 @@ mod tests {
 
             Ok(())
         }
+
+        fn enable_packet_available_callback(
+            &mut self,
+            _interface: &mut Self::Interface,
+            _callback: VmnetPacketAvailableCallback,
+        ) -> Result<(), VmnetError> {
+            Ok(())
+        }
+
+        fn disable_and_drain_packet_available_callback(
+            &mut self,
+            _interface: &mut Self::Interface,
+        ) -> Result<(), VmnetError> {
+            Ok(())
+        }
     }
 
     impl VmnetPacketIoBackend for RecordingVmnetBackend {
@@ -2791,6 +3456,8 @@ mod tests {
         read_packet_size: usize,
         write_status: VmnetStatus,
         write_packet_count: c_int,
+        event_callback_statuses: VecDeque<VmnetStatus>,
+        packet_event_estimate: Option<Option<u64>>,
     }
 
     impl RecordingVmnetSystemApi {
@@ -2809,6 +3476,8 @@ mod tests {
                 read_packet_size: 64,
                 write_status: VmnetStatus::Success,
                 write_packet_count: 1,
+                event_callback_statuses: VecDeque::new(),
+                packet_event_estimate: None,
             }
         }
 
@@ -2862,6 +3531,16 @@ mod tests {
         fn with_write_result(mut self, status: VmnetStatus, packet_count: c_int) -> Self {
             self.write_status = status;
             self.write_packet_count = packet_count;
+            self
+        }
+
+        fn with_event_callback_status(mut self, status: VmnetStatus) -> Self {
+            self.event_callback_statuses.push_back(status);
+            self
+        }
+
+        fn with_packet_event(mut self, estimate: Option<u64>) -> Self {
+            self.packet_event_estimate = Some(estimate);
             self
         }
 
@@ -2920,12 +3599,59 @@ mod tests {
             schedule_status
         }
 
+        fn set_event_callback(
+            &mut self,
+            interface: NonNull<c_void>,
+            event_mask: u32,
+            queue: Option<&DispatchQueue>,
+            callback: Option<&Block<dyn Fn(u32, *mut c_void)>>,
+        ) -> VmnetStatus {
+            let enabling = queue.is_some() && callback.is_some();
+            push_event(
+                &self.events,
+                format!(
+                    "system-events:{:x}:{}:{event_mask}",
+                    interface.as_ptr() as usize,
+                    if enabling { "enable" } else { "disable" }
+                ),
+            );
+            let status = self
+                .event_callback_statuses
+                .pop_front()
+                .unwrap_or(VmnetStatus::Success);
+            if status == VmnetStatus::Success
+                && let (Some(callback), Some(estimate)) =
+                    (callback, self.packet_event_estimate.take())
+            {
+                let event = super::OwnedXpcObject::dictionary()
+                    .expect("test vmnet event dictionary should allocate");
+                if let Some(estimate) = estimate {
+                    // SAFETY: The test dictionary and framework key are live,
+                    // and primitive insertion retains no Rust borrow.
+                    unsafe {
+                        super::xpc::xpc_dictionary_set_uint64(
+                            event.as_ptr(),
+                            super::vmnet_estimated_packets_available_key()
+                                .expect("test estimate key should exist"),
+                            estimate,
+                        );
+                    }
+                }
+                callback.call((
+                    super::VMNET_INTERFACE_PACKETS_AVAILABLE_VALUE,
+                    event.as_ptr(),
+                ));
+            }
+            status
+        }
+
         fn read_packets(
             &mut self,
             interface: NonNull<c_void>,
             packets: NonNull<VmnetPacketDescriptor>,
             packet_count: &mut c_int,
         ) -> VmnetStatus {
+            let requested_packet_count = *packet_count;
             push_event(
                 &self.events,
                 format!(
@@ -2935,12 +3661,16 @@ mod tests {
                 ),
             );
             *packet_count = self.read_packet_count;
-            if self.read_status == VmnetStatus::Success && self.read_packet_count == 1 {
-                // SAFETY: The fake backend is called with a descriptor borrowed
-                // from the packet wrapper for the duration of this synchronous
-                // method call, matching the production adapter contract.
-                unsafe {
-                    (*packets.as_ptr()).vm_pkt_size = self.read_packet_size;
+            if self.read_status == VmnetStatus::Success
+                && self.read_packet_count > 0
+                && self.read_packet_count <= requested_packet_count
+            {
+                for packet_index in 0..self.read_packet_count as usize {
+                    // SAFETY: The fake backend is called with a contiguous
+                    // descriptor prefix of `requested_packet_count` elements.
+                    unsafe {
+                        (*packets.as_ptr().add(packet_index)).vm_pkt_size = self.read_packet_size;
+                    }
                 }
             }
 
@@ -3694,6 +4424,112 @@ mod tests {
     }
 
     #[test]
+    fn system_vmnet_backend_publishes_packet_event_hint_and_drains_before_stop() {
+        let api = RecordingVmnetSystemApi::new().with_packet_event(Some(7));
+        let event_log = api.events();
+        let mut backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let mut interface = super::SystemVmnetInterface::new(fake_interface(0x20));
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let callback_published = Arc::clone(&published);
+        let callback = VmnetPacketAvailableCallback::new(move |estimate| {
+            callback_published
+                .lock()
+                .expect("packet event result should lock")
+                .push(estimate);
+        });
+
+        backend
+            .enable_packet_available_callback(&mut interface, callback)
+            .expect("packet callback enable should succeed");
+        backend
+            .stop_interface(&mut interface)
+            .expect("stop should disable, drain, then stop");
+
+        assert_eq!(
+            *published.lock().expect("packet event result should lock"),
+            [Some(7)]
+        );
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "system-events:20:enable:1",
+                "system-events:20:disable:1",
+                "system-stop:20",
+            ]
+        );
+        assert!(interface.packet_event_callback.is_none());
+    }
+
+    #[test]
+    fn system_vmnet_backend_disable_failure_prevents_stop_and_retains_callback_owner() {
+        let api = RecordingVmnetSystemApi::new()
+            .with_event_callback_status(VmnetStatus::Success)
+            .with_event_callback_status(VmnetStatus::Failure);
+        let event_log = api.events();
+        let mut backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let mut interface = super::SystemVmnetInterface::new(fake_interface(0x20));
+        backend
+            .enable_packet_available_callback(
+                &mut interface,
+                VmnetPacketAvailableCallback::new(|_| {}),
+            )
+            .expect("packet callback enable should succeed");
+
+        let error = backend
+            .stop_interface(&mut interface)
+            .expect_err("failed callback disable must prevent vmnet stop");
+
+        assert_eq!(error.operation(), VmnetOperation::DisablePacketEvents);
+        assert!(interface.packet_event_callback.is_some());
+        assert_eq!(
+            recorded_events(&event_log),
+            ["system-events:20:enable:1", "system-events:20:disable:1"]
+        );
+    }
+
+    #[test]
+    fn started_packet_io_backend_never_retries_uncertain_event_disable() {
+        let api = RecordingVmnetSystemApi::new()
+            .with_event_callback_status(VmnetStatus::Success)
+            .with_event_callback_status(VmnetStatus::Failure);
+        let event_log = api.events();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let config = VmnetInterfaceConfig::host();
+        let (mut backend, _interface) = StartedVmnetPacketIoBackend::start(backend, &config)
+            .expect("system packet-I/O backend should start");
+        backend
+            .enable_packet_available_callback(VmnetPacketAvailableCallback::new(|_| {}))
+            .expect("packet callback enable should succeed");
+
+        let first_error = backend
+            .stop()
+            .expect_err("failed callback disable must make cleanup uncertain");
+        assert_eq!(first_error.operation(), VmnetOperation::DisablePacketEvents);
+        let second_error = backend
+            .stop()
+            .expect_err("uncertain cleanup must not be retried explicitly");
+        assert_eq!(
+            second_error.operation(),
+            VmnetOperation::DisablePacketEvents
+        );
+        drop(backend);
+
+        let events = recorded_events(&event_log);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.as_str() == "system-events:10:disable:1")
+                .count(),
+            1,
+            "explicit retry and drop must not issue another disable"
+        );
+        assert!(
+            !events.iter().any(|event| event == "system-stop:10"),
+            "an uncertain callback retirement must prevent vmnet stop"
+        );
+    }
+
+    #[test]
     fn system_vmnet_backend_cleans_up_after_start_completion_failure() {
         let api = RecordingVmnetSystemApi::new().with_start_completion(VmnetStatus::InvalidAccess);
         let event_log = api.events();
@@ -4109,6 +4945,50 @@ mod tests {
     }
 
     #[test]
+    fn system_vmnet_backend_reads_one_bounded_descriptor_array() {
+        let api = RecordingVmnetSystemApi::new().with_read_result(VmnetStatus::Success, 2, 96);
+        let event_log = api.events();
+        let mut backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let mut interface = super::SystemVmnetInterface::new(fake_interface(0x20));
+        let mut buffer = [0_u8; 384];
+        let mut packet_lengths = [0_usize; 3];
+
+        let completed = backend
+            .read_packet_batch(&mut interface, &mut buffer, 128, 3, &mut packet_lengths)
+            .expect("bounded vmnet read batch should succeed");
+
+        assert_eq!(completed, 2);
+        assert_eq!(packet_lengths, [96, 96, 0]);
+        assert_eq!(recorded_events(&event_log), ["system-read:20:3"]);
+    }
+
+    #[test]
+    fn system_vmnet_backend_rejects_untrusted_batch_read_count() {
+        for returned in [-1, 4] {
+            let api =
+                RecordingVmnetSystemApi::new().with_read_result(VmnetStatus::Success, returned, 64);
+            let mut backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+            let mut interface = super::SystemVmnetInterface::new(fake_interface(0x20));
+            let mut buffer = [0_u8; 384];
+            let mut packet_lengths = [0_usize; 3];
+
+            let error = backend
+                .read_packet_batch(&mut interface, &mut buffer, 128, 3, &mut packet_lengths)
+                .expect_err("out-of-range vmnet read count must fail closed");
+
+            assert!(matches!(
+                error,
+                VmnetPacketIoError::UnexpectedPacketCount {
+                    operation: VmnetOperation::ReadPackets,
+                    expected: VmnetPacketCountExpectation::AtMost(3),
+                    actual,
+                } if actual == returned
+            ));
+            assert_eq!(packet_lengths, [0, 0, 0]);
+        }
+    }
+
+    #[test]
     fn system_vmnet_backend_returns_none_when_no_packet_is_available() {
         let api = RecordingVmnetSystemApi::new().with_read_result(VmnetStatus::Success, 0, 64);
         let event_log = api.events();
@@ -4153,6 +5033,9 @@ mod tests {
             }
             VmnetPacketIoError::ReadPacketSizeExceedsBuffer { .. } => {
                 panic!("vmnet read status failure should not become a packet size error");
+            }
+            VmnetPacketIoError::InvalidBatch { .. } => {
+                panic!("vmnet read status failure should not become a batch error");
             }
         }
         assert_eq!(recorded_events(&event_log), ["system-read:20:1"]);
@@ -4230,6 +5113,23 @@ mod tests {
     }
 
     #[test]
+    fn system_vmnet_backend_reports_successful_short_batch_write_prefix() {
+        let api = RecordingVmnetSystemApi::new().with_write_result(VmnetStatus::Success, 2);
+        let event_log = api.events();
+        let mut backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let mut interface = super::SystemVmnetInterface::new(fake_interface(0x20));
+        let bytes = [1_u8, 2, 3, 4, 5, 6];
+        let ranges = [0..2, 2..4, 4..6];
+
+        let completed = backend
+            .write_packet_batch(&mut interface, &bytes, &ranges)
+            .expect("short vmnet write is an explicit completed prefix");
+
+        assert_eq!(completed, 2);
+        assert_eq!(recorded_events(&event_log), ["system-write:20:3"]);
+    }
+
+    #[test]
     fn system_vmnet_backend_preserves_write_failure_status() {
         let api = RecordingVmnetSystemApi::new().with_write_result(VmnetStatus::PacketTooBig, 0);
         let event_log = api.events();
@@ -4255,6 +5155,9 @@ mod tests {
             }
             VmnetPacketIoError::ReadPacketSizeExceedsBuffer { .. } => {
                 panic!("vmnet write status failure should not become a packet size error");
+            }
+            VmnetPacketIoError::InvalidBatch { .. } => {
+                panic!("vmnet write status failure should not become a batch error");
             }
         }
         assert_eq!(recorded_events(&event_log), ["system-write:20:1"]);
@@ -4887,7 +5790,7 @@ mod tests {
             .expect("valid batches should be capped");
         let expected = (super::VMNET_MAX_BYTES_PER_OPERATION / 2048)
             .min(super::VMNET_MAX_PACKETS_PER_OPERATION)
-            .min(u64::from(VIRTIO_NET_QUEUE_SIZE)) as u16;
+            .min(usize::from(VIRTIO_NET_QUEUE_SIZE)) as u16;
         assert_eq!(parameters.read_max_packets(), Some(expected));
         assert_eq!(parameters.write_max_packets(), Some(expected));
     }

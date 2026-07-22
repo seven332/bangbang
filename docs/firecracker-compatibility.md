@@ -2200,12 +2200,29 @@ Start and stop waits use finite deadlines. Every failure after a non-null handle
 attempts one bounded stop; only a confirmed stop completion is retryable, while
 a stop scheduling failure, service failure, timeout, or callback-channel loss
 makes the owner terminal and uncertain without a second cleanup attempt.
-Diagnostics are value-redacted. The FFI still does not register the
-packet-available callback,
-so it has no asynchronous RX-readiness integration. Packet I/O remains
-raw-Ethernet and synchronous one-packet; returned batch maxima are retained only
-as dormant bounds, direct virtio headers remain disabled, and no offload feature
-is added. No signed guest test uses Apple's restricted
+Diagnostics are value-redacted.
+
+Direct vmnet registers Apple's packet-available event against one non-clone,
+generation-scoped lease. The callback only records persistent readiness plus a
+bounded optional estimate and tries a capacity-one signal; it cannot access
+guest memory, queues, packet bytes, limiters, configuration, or public metrics.
+A provider bridge wakes the owner loop outside the serial callback queue, and
+MMIO or PCI dispatch routes the readiness to the exact current interface before
+vCPU entry. Stale generations cannot select a same-ID replacement. A retained
+packet parks during RX-buffer or limiter pressure, and the existing guest or
+retry event resumes it without callback-driven spinning.
+
+Packet I/O remains raw Ethernet but uses preallocated bounded batches. Each
+owner pass performs at most one host read batch, and each operation is capped by
+the realized profile, 200 packets, 256 KiB, per-packet size, and virtqueue
+capacity. Untrusted read/write counts expose only a validated initialized
+prefix. TX copies guest bytes before used publication, retains descriptor and
+per-frame MMDS effect order, and maps a successful short write to the exact
+forwarded prefix without retrying the suffix. Teardown retires the generation,
+disables and drains the callback queue, stops vmnet, and only then releases the
+lease and wake ownership; uncertainty is terminal. Direct virtio headers remain
+disabled, and no offload feature is added. No signed guest test uses Apple's
+restricted
 [`com.apple.vm.networking`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.vm.networking)
 authorization or proves external packet movement, and the 16-interface config
 cap does not enforce Apple's per-guest resource policy.
@@ -3658,10 +3675,10 @@ The following Firecracker features are outside the first compatibility tier.
 Their eventual support level should follow the endpoint matrix:
 
 - packet networking beyond the implemented supported virtio-MMIO/MMDS-only and
-  conditional direct-vmnet typed-start subsets, including asynchronous RX
-  readiness, batch dispatch, direct virtio headers, offloads, entitled guest
-  connectivity, host firewall/resource policy, broader MMDS TCP behavior,
-  limiter-specific metrics, network snapshot state, and automatic PCI
+  conditional direct-vmnet typed-start, generation-scoped RX readiness, and
+  bounded packet-batch subsets, including direct virtio headers, offloads,
+  entitled guest connectivity, host firewall/resource policy, broader MMDS TCP
+  behavior, limiter-specific metrics, network snapshot state, and automatic PCI
   notification
 - virtio-vsock behavior beyond the **implemented supported live
   virtio-MMIO/Unix-socket subset**. The live subset includes repeatable pre-boot
