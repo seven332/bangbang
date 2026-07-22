@@ -973,11 +973,21 @@ for a selected ID. Removal releases the exact queues, retry deadline, metrics
 generation, packet-I/O owner, and PCI resources before the ID/MAC/slot can be
 reused. Default MMIO rejects runtime PUT/DELETE without mutation.
 
-The configured `mtu` is advertised to the guest virtio-net device. Current
-signed Network/MMDS scenarios select every configured interface in MMDS config,
-so startup uses process-local MMDS-only packet I/O without opening vmnet; they
-do not prove direct vmnet or external packet movement. Non-MMDS-only startup
-conditionally uses the internal direct-vmnet foundation, which requires
+The configured `mtu` is advertised to the guest virtio-net device. For direct
+vmnet, startup now validates and retains Apple's returned MAC, effective MTU,
+maximum packet size, optional UUID, and optional batch limits before publishing
+the guest device. A vmnet-allocated MAC becomes guest-visible without rewriting
+the requested `GET /vm/config` projection, and explicit plus allocated MACs are
+reserved globally across startup and runtime insertion. Start and stop waits
+have finite deadlines; cleanup that cannot confirm stop makes the process
+terminal instead of allowing reuse. Packet I/O remains raw Ethernet and one
+packet per call, without packet-available callbacks, batch dispatch, direct
+virtio headers, or offloads.
+
+Current signed Network/MMDS scenarios select every configured interface in MMDS
+config, so startup uses process-local MMDS-only packet I/O without opening
+vmnet; they do not prove direct vmnet or external packet movement. Non-MMDS-only
+startup conditionally uses the internal direct-vmnet foundation, which requires
 Apple's restricted networking authorization plus operator-owned firewall,
 routing/NAT, resource, and distribution policy. See the
 [compatibility scope](docs/firecracker-compatibility.md#internal-network-interface-configuration),
