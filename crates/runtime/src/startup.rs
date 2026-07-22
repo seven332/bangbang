@@ -8155,6 +8155,20 @@ mod tests {
 
             Ok(VirtioNetworkTxPacketDisposition::Forwarded)
         }
+
+        fn transmit_prepared_frame(
+            &mut self,
+            _memory: &crate::memory::GuestMemory,
+            _frame: &VirtioNetworkTxFrame,
+            packet: &crate::network_packet::VirtioNetworkPacketPlan,
+        ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+            self.calls += 1;
+            let emitted = packet
+                .emit(crate::network_packet::VirtioNetworkPacketEnvelope::RawEthernet)
+                .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+            self.packets.push(emitted.bytes().to_vec());
+            Ok(VirtioNetworkTxPacketDisposition::Forwarded)
+        }
     }
 
     #[derive(Debug, Default)]
@@ -13252,6 +13266,9 @@ mod tests {
         assert_eq!(provider.endpoint("eth0").rx_source.consume_calls, 0);
         assert_eq!(provider.endpoint("eth1").rx_source.consume_calls, 1);
         let mut expected_rx_frame = vec![0; VIRTIO_NET_TX_HEADER_SIZE as usize];
+        *expected_rx_frame
+            .get_mut(10)
+            .expect("RX num_buffers field should exist") = 1;
         expected_rx_frame.extend([0x20, 0x21]);
         assert_eq!(
             read_guest_bytes(&memory, layout.rx_buffer, expected_rx_frame.len()),
@@ -13548,6 +13565,9 @@ mod tests {
         assert_eq!(endpoint.rx_source.consume_calls, 1);
         assert!(endpoint.rx_source.packets.is_empty());
         let mut expected_rx_frame = vec![0; VIRTIO_NET_TX_HEADER_SIZE as usize];
+        *expected_rx_frame
+            .get_mut(10)
+            .expect("RX num_buffers field should exist") = 1;
         expected_rx_frame.extend([0xaa, 0xbb]);
         assert_eq!(
             read_guest_bytes(&memory, layout.rx_buffer, expected_rx_frame.len()),

@@ -3,9 +3,10 @@
 use std::collections::{TryReserveError, VecDeque};
 use std::fmt;
 use std::net::Ipv4Addr;
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, TryLockError};
 
-use crate::memory::{GuestMemory, GuestMemoryAccessError};
+use crate::memory::GuestMemory;
 use crate::metrics::SharedMmdsMetrics;
 use crate::mmds::{
     MmdsGuestArpResponseFrameError, MmdsGuestRequest, MmdsGuestTcpPacket,
@@ -14,10 +15,12 @@ use crate::mmds::{
     classify_mmds_guest_tcp_packet,
 };
 use crate::network::{
-    VIRTIO_NET_MAX_BUFFER_SIZE, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition,
-    VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+    GuestMacAddress, VIRTIO_NET_MAX_BUFFER_SIZE, VirtioNetworkBackendMetrics,
+    VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
+    VirtioNetworkTxFrame, VirtioNetworkTxPacketCommit, VirtioNetworkTxPacketDisposition,
+    VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, VirtioNetworkTxPacketStage,
 };
+use crate::network_packet::{VirtioNetworkPacketEnvelope, VirtioNetworkPacketPlan};
 use crate::startup::{
     Arm64BootNetworkInterface, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
     Arm64BootNetworkPacketIoProvider,
@@ -950,9 +953,21 @@ impl MmdsOnlyVirtioNetworkPacketIo {
     pub fn new(
         mmds_detour: MmdsPacketDetour,
     ) -> Result<Self, MmdsOnlyVirtioNetworkPacketIoBuildError> {
+        Self::with_guest_mac(mmds_detour, None)
+    }
+
+    pub fn with_guest_mac(
+        mmds_detour: MmdsPacketDetour,
+        guest_mac: Option<GuestMacAddress>,
+    ) -> Result<Self, MmdsOnlyVirtioNetworkPacketIoBuildError> {
         let response_queue = mmds_detour.response_queue();
         Ok(Self {
-            tx_sink: MmdsOnlyVirtioNetworkTxPacketSink { mmds_detour },
+            tx_sink: MmdsOnlyVirtioNetworkTxPacketSink {
+                mmds_detour,
+                staged_frame: None,
+                guest_mac,
+                backend_metrics: VirtioNetworkBackendMetrics::default(),
+            },
             rx_source: MmdsOnlyVirtioNetworkRxPacketSource::new(
                 response_queue,
                 DEFAULT_MMDS_VIRTIO_NETWORK_RX_BUFFER_LEN,
@@ -961,9 +976,133 @@ impl MmdsOnlyVirtioNetworkPacketIo {
     }
 }
 
-#[derive(Debug)]
 pub struct MmdsOnlyVirtioNetworkTxPacketSink {
     mmds_detour: MmdsPacketDetour,
+    staged_frame: Option<StagedMmdsOnlyTxFrame>,
+    guest_mac: Option<GuestMacAddress>,
+    backend_metrics: VirtioNetworkBackendMetrics,
+}
+
+impl fmt::Debug for MmdsOnlyVirtioNetworkTxPacketSink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsOnlyVirtioNetworkTxPacketSink")
+            .field("mmds_detour", &"<configured>")
+            .field("staged_frame", &self.staged_frame.is_some())
+            .field("guest_mac", &self.guest_mac.map(|_| "<configured>"))
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+struct StagedMmdsOnlyTxFrame {
+    packet: VirtioNetworkPacketPlan,
+    disposition: VirtioNetworkTxPacketDisposition,
+}
+
+impl MmdsOnlyVirtioNetworkTxPacketSink {
+    fn prepare_frame(
+        &mut self,
+        memory: &GuestMemory,
+        frame: &VirtioNetworkTxFrame,
+    ) -> Result<StagedMmdsOnlyTxFrame, VirtioNetworkTxPacketSinkError> {
+        let plan = frame
+            .prepare_packet(memory)
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        self.prepare_owned_packet_plan(plan)
+    }
+
+    fn classify_packet_plan(
+        &self,
+        plan: &VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        let mut disposition = None;
+        let visit = plan
+            .visit_packets(VirtioNetworkPacketEnvelope::RawEthernet, |packet| {
+                let current = if self.mmds_detour.would_detour_packet(packet) {
+                    VirtioNetworkTxPacketDisposition::Detoured
+                } else {
+                    VirtioNetworkTxPacketDisposition::Forwarded
+                };
+                if disposition.is_some_and(|previous| previous != current) {
+                    return ControlFlow::Break(VirtioNetworkTxPacketSinkError::new(
+                        "MMDS classification changed within one normalized TX frame",
+                    ));
+                }
+                disposition = Some(current);
+                ControlFlow::Continue(())
+            })
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        if let ControlFlow::Break(source) = visit {
+            return Err(source);
+        }
+        disposition.ok_or_else(|| {
+            VirtioNetworkTxPacketSinkError::new("MMDS-only normalization emitted no TX packet")
+        })
+    }
+
+    fn prepare_owned_packet_plan(
+        &mut self,
+        packet: VirtioNetworkPacketPlan,
+    ) -> Result<StagedMmdsOnlyTxFrame, VirtioNetworkTxPacketSinkError> {
+        let disposition = self.classify_packet_plan(&packet)?;
+        self.observe_source_mac(&packet);
+        Ok(StagedMmdsOnlyTxFrame {
+            packet,
+            disposition,
+        })
+    }
+
+    fn prepare_borrowed_packet_plan(
+        &mut self,
+        packet: &VirtioNetworkPacketPlan,
+    ) -> Result<StagedMmdsOnlyTxFrame, VirtioNetworkTxPacketSinkError> {
+        let disposition = self.classify_packet_plan(packet)?;
+        let packet = packet
+            .try_clone_owned()
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        self.observe_source_mac(&packet);
+        Ok(StagedMmdsOnlyTxFrame {
+            packet,
+            disposition,
+        })
+    }
+
+    fn observe_source_mac(&mut self, packet: &VirtioNetworkPacketPlan) {
+        if let (Some(expected), Some(observed)) = (self.guest_mac, packet.source_mac())
+            && expected.octets() != observed
+        {
+            self.backend_metrics.record_spoofed_mac();
+        }
+    }
+
+    fn commit_frame(
+        &mut self,
+        staged: StagedMmdsOnlyTxFrame,
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        let expected_detour = staged.disposition == VirtioNetworkTxPacketDisposition::Detoured;
+        let visit = staged
+            .packet
+            .visit_packets(
+                VirtioNetworkPacketEnvelope::RawEthernet,
+                |packet| match self
+                    .mmds_detour
+                    .detour_packet(packet)
+                    .map_err(tx_mmds_detour_error)
+                {
+                    Ok(detoured) if detoured == expected_detour => ControlFlow::Continue(()),
+                    Ok(_) => ControlFlow::Break(VirtioNetworkTxPacketSinkError::new(
+                        "MMDS side-effect classification changed at commit",
+                    )),
+                    Err(source) => ControlFlow::Break(source),
+                },
+            )
+            .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+        if let ControlFlow::Break(source) = visit {
+            return Err(source);
+        }
+        Ok(staged.disposition)
+    }
 }
 
 impl VirtioNetworkTxPacketSink for MmdsOnlyVirtioNetworkTxPacketSink {
@@ -972,17 +1111,76 @@ impl VirtioNetworkTxPacketSink for MmdsOnlyVirtioNetworkTxPacketSink {
         memory: &GuestMemory,
         frame: &VirtioNetworkTxFrame,
     ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
-        let packet = copy_tx_frame_payload(memory, frame).map_err(tx_error)?;
-        self.mmds_detour
-            .detour_packet(&packet)
-            .map(|detoured| {
-                if detoured {
-                    VirtioNetworkTxPacketDisposition::Detoured
-                } else {
-                    VirtioNetworkTxPacketDisposition::Forwarded
-                }
+        let staged = self.prepare_frame(memory, frame)?;
+        self.commit_frame(staged)
+    }
+
+    fn transmit_prepared_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+        packet: &VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+        let staged = self.prepare_borrowed_packet_plan(packet)?;
+        self.commit_frame(staged)
+    }
+
+    fn supports_staged_batch(&self) -> bool {
+        true
+    }
+
+    fn stage_frame(
+        &mut self,
+        memory: &GuestMemory,
+        frame: &VirtioNetworkTxFrame,
+    ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+        if self.staged_frame.is_some() {
+            return Err(VirtioNetworkTxPacketSinkError::new(
+                "MMDS-only TX staging already owns an uncommitted frame",
+            ));
+        }
+        let staged = self.prepare_frame(memory, frame)?;
+        self.staged_frame = Some(staged);
+        Ok(VirtioNetworkTxPacketStage::Staged {
+            flush_before_commit: true,
+        })
+    }
+
+    fn stage_prepared_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+        packet: &VirtioNetworkPacketPlan,
+    ) -> Result<VirtioNetworkTxPacketStage, VirtioNetworkTxPacketSinkError> {
+        if self.staged_frame.is_some() {
+            return Err(VirtioNetworkTxPacketSinkError::new(
+                "MMDS-only TX staging already owns an uncommitted frame",
+            ));
+        }
+        let staged = self.prepare_borrowed_packet_plan(packet)?;
+        self.staged_frame = Some(staged);
+        Ok(VirtioNetworkTxPacketStage::Staged {
+            flush_before_commit: true,
+        })
+    }
+
+    fn commit_staged_frame(&mut self) -> VirtioNetworkTxPacketCommit {
+        let result = self
+            .staged_frame
+            .take()
+            .ok_or_else(|| {
+                VirtioNetworkTxPacketSinkError::new("MMDS-only TX commit has no staged frame")
             })
-            .map_err(tx_mmds_detour_error)
+            .and_then(|staged| self.commit_frame(staged));
+        VirtioNetworkTxPacketCommit::Immediate(result)
+    }
+
+    fn discard_staged_frame(&mut self) {
+        self.staged_frame = None;
+    }
+
+    fn take_backend_metrics(&mut self) -> VirtioNetworkBackendMetrics {
+        std::mem::take(&mut self.backend_metrics)
     }
 }
 
@@ -1059,118 +1257,6 @@ impl VirtioNetworkRxPacketSource for MmdsOnlyVirtioNetworkRxPacketSource {
     }
 }
 
-#[derive(Debug)]
-enum MmdsVirtioNetworkTxCopyError {
-    PayloadLengthTooLarge {
-        len: u64,
-    },
-    PacketAllocation {
-        len: usize,
-        source: TryReserveError,
-    },
-    SegmentLengthTooLarge {
-        descriptor_index: u16,
-        len: u32,
-    },
-    SegmentRead {
-        descriptor_index: u16,
-        source: GuestMemoryAccessError,
-    },
-}
-
-impl fmt::Display for MmdsVirtioNetworkTxCopyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PayloadLengthTooLarge { len } => {
-                write!(
-                    f,
-                    "virtio-net TX payload length {len} does not fit host usize"
-                )
-            }
-            Self::PacketAllocation { len, source } => {
-                write!(
-                    f,
-                    "failed to reserve MMDS-only TX packet buffer of {len} bytes: {source}"
-                )
-            }
-            Self::SegmentLengthTooLarge {
-                descriptor_index,
-                len,
-            } => write!(
-                f,
-                "virtio-net TX payload descriptor {descriptor_index} length {len} does not fit host usize"
-            ),
-            Self::SegmentRead {
-                descriptor_index,
-                source,
-            } => write!(
-                f,
-                "failed to read virtio-net TX payload descriptor {descriptor_index}: {source}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MmdsVirtioNetworkTxCopyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PacketAllocation { source, .. } => Some(source),
-            Self::SegmentRead { source, .. } => Some(source),
-            Self::PayloadLengthTooLarge { .. } | Self::SegmentLengthTooLarge { .. } => None,
-        }
-    }
-}
-
-fn copy_tx_frame_payload(
-    memory: &GuestMemory,
-    frame: &VirtioNetworkTxFrame,
-) -> Result<Vec<u8>, MmdsVirtioNetworkTxCopyError> {
-    let packet_len = usize::try_from(frame.payload_len()).map_err(|_| {
-        MmdsVirtioNetworkTxCopyError::PayloadLengthTooLarge {
-            len: frame.payload_len(),
-        }
-    })?;
-    let mut packet = Vec::new();
-    packet.try_reserve_exact(packet_len).map_err(|source| {
-        MmdsVirtioNetworkTxCopyError::PacketAllocation {
-            len: packet_len,
-            source,
-        }
-    })?;
-
-    for segment in frame.payload_segments() {
-        let segment_len = usize::try_from(segment.len()).map_err(|_| {
-            MmdsVirtioNetworkTxCopyError::SegmentLengthTooLarge {
-                descriptor_index: segment.descriptor_index(),
-                len: segment.len(),
-            }
-        })?;
-        let start = packet.len();
-        let end = start.checked_add(segment_len).ok_or(
-            MmdsVirtioNetworkTxCopyError::PayloadLengthTooLarge {
-                len: frame.payload_len(),
-            },
-        )?;
-        packet.resize(end, 0);
-        let segment_buffer = packet.get_mut(start..end).ok_or(
-            MmdsVirtioNetworkTxCopyError::PayloadLengthTooLarge {
-                len: frame.payload_len(),
-            },
-        )?;
-        memory
-            .read_slice(segment_buffer, segment.address())
-            .map_err(|source| MmdsVirtioNetworkTxCopyError::SegmentRead {
-                descriptor_index: segment.descriptor_index(),
-                source,
-            })?;
-    }
-
-    Ok(packet)
-}
-fn tx_error(source: MmdsVirtioNetworkTxCopyError) -> VirtioNetworkTxPacketSinkError {
-    VirtioNetworkTxPacketSinkError::new(source.to_string())
-}
-
 fn tx_mmds_detour_error(source: MmdsPacketDetourError) -> VirtioNetworkTxPacketSinkError {
     VirtioNetworkTxPacketSinkError::new(format!("MMDS packet detour failed: {source}"))
 }
@@ -1179,4 +1265,49 @@ fn rx_mmds_response_queue_error(
     source: MmdsResponseQueueError,
 ) -> VirtioNetworkRxPacketSourceError {
     VirtioNetworkRxPacketSourceError::new(format!("MMDS response queue read failed: {source}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mmds::DEFAULT_MMDS_IPV4_ADDRESS;
+    use crate::network::VirtioNetworkTxHeader;
+
+    #[test]
+    fn mmds_only_tx_observes_configured_source_mac_without_filtering() {
+        let expected = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 1]);
+        let detour = MmdsPacketDetour::new(
+            MmdsStateHandle::default(),
+            DEFAULT_MMDS_IPV4_ADDRESS,
+            MmdsResponseQueue::default(),
+            SharedMmdsMetrics::default(),
+        );
+        let mut packet_io = MmdsOnlyVirtioNetworkPacketIo::with_guest_mac(detour, Some(expected))
+            .expect("MMDS-only packet I/O should build");
+        let mut packet = vec![0; 14];
+        packet[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 2]);
+        let plan = VirtioNetworkPacketPlan::prepare(VirtioNetworkTxHeader::new(), 0, packet)
+            .expect("plain Ethernet packet should validate");
+
+        let staged = packet_io
+            .tx_sink
+            .prepare_borrowed_packet_plan(&plan)
+            .expect("spoof observation must not filter the packet");
+
+        assert_eq!(
+            staged.disposition,
+            VirtioNetworkTxPacketDisposition::Forwarded
+        );
+        assert_eq!(
+            packet_io
+                .tx_sink
+                .take_backend_metrics()
+                .tx_spoofed_mac_count(),
+            1
+        );
+        assert_eq!(
+            packet_io.tx_sink.take_backend_metrics(),
+            VirtioNetworkBackendMetrics::default()
+        );
+    }
 }

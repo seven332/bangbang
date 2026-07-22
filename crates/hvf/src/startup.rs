@@ -62,7 +62,7 @@ use bangbang_runtime::network::{
     NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioLayout,
     NetworkRuntimeMutationError, PreparedNetworkDevice, VIRTIO_NET_DEVICE_ID,
     VIRTIO_NET_QUEUE_SIZES, VirtioNetworkConfigSpace, VirtioNetworkDevice,
-    VirtioNetworkDeviceNotificationError,
+    VirtioNetworkDeviceNotificationError, attach_network_metrics_to_mmio_handler,
 };
 use bangbang_runtime::pci::{
     PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE, PciBarAddressSpace, PciBarAllocator,
@@ -1285,7 +1285,7 @@ impl HvfArm64BootPciDataDevices {
 
     fn insert_runtime_network(
         &mut self,
-        prepared: PreparedNetworkDevice,
+        mut prepared: PreparedNetworkDevice,
         metrics: &SharedNetworkInterfaceMetricsRegistry,
     ) -> Result<(), NetworkRuntimeMutationError> {
         if !self.runtime_hotplug {
@@ -1317,6 +1317,7 @@ impl HvfArm64BootPciDataDevices {
             .map_err(|source| NetworkRuntimeMutationError::PrepareDevice {
                 message: source.to_string(),
             })?;
+        prepared.attach_metrics_with_aggregate(prepared_metrics.metrics(), metrics.aggregate());
         let interrupts = self.shared_msi_registry().map_err(|source| {
             NetworkRuntimeMutationError::TerminalInsertion {
                 message: source.to_string(),
@@ -14774,6 +14775,9 @@ pub enum HvfArm64BootSessionError {
     PciData {
         source: HvfArm64BootPciDataError,
     },
+    NetworkMetricsBinding {
+        message: String,
+    },
     MapGuestMemory {
         source: HvfGuestMemoryMappingError,
     },
@@ -14902,6 +14906,9 @@ impl fmt::Display for HvfArm64BootSessionError {
             Self::PciData { source } => {
                 write!(f, "failed to prepare PCI data devices: {source}")
             }
+            Self::NetworkMetricsBinding { message } => {
+                write!(f, "failed to bind network transport metrics: {message}")
+            }
             Self::MapGuestMemory { source } => {
                 write!(
                     f,
@@ -14969,6 +14976,7 @@ impl std::error::Error for HvfArm64BootSessionError {
             Self::BackendAlreadyInitialized
             | Self::SerialInputWithoutDevice
             | Self::UnsupportedVcpuCount { .. }
+            | Self::NetworkMetricsBinding { .. }
             | Self::PvTimeAddressOverflow { .. }
             | Self::PowerTopology
             | Self::MissingPciValidationMsiSignaler
@@ -15741,6 +15749,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     } else {
         SharedNetworkInterfaceMetricsRegistry::from_interface_ids(network_interface_ids)
     };
+    bind_mmio_network_transport_metrics(&runtime, &mmio_dispatcher, &network_interface_metrics)?;
     let has_block_devices =
         !runtime.block_devices.is_empty() || !runtime.pci_block_devices.is_empty();
     let has_network_devices =
@@ -16151,6 +16160,37 @@ fn preflight_pci_data_dispatcher(
     Ok(())
 }
 
+fn bind_mmio_network_transport_metrics(
+    runtime: &Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    metrics: &SharedNetworkInterfaceMetricsRegistry,
+) -> Result<(), HvfArm64BootSessionError> {
+    let mut dispatcher =
+        dispatcher
+            .lock()
+            .map_err(|_| HvfArm64BootSessionError::NetworkMetricsBinding {
+                message: "MMIO dispatcher is unavailable".to_string(),
+            })?;
+    for device in &runtime.network_devices {
+        let iface_id = device.registration.iface_id();
+        let interface_metrics = metrics.per_interface(iface_id).ok_or_else(|| {
+            HvfArm64BootSessionError::NetworkMetricsBinding {
+                message: format!("missing metrics generation for MMIO interface {iface_id}"),
+            }
+        })?;
+        attach_network_metrics_to_mmio_handler(
+            &mut dispatcher,
+            device.registration.region_id(),
+            interface_metrics,
+            metrics.aggregate(),
+        )
+        .map_err(|source| HvfArm64BootSessionError::NetworkMetricsBinding {
+            message: format!("failed to resolve MMIO interface {iface_id}: {source}"),
+        })?;
+    }
+    Ok(())
+}
+
 fn prepare_pci_data_devices(
     backend: &HvfBackend,
     runtime: &mut Arm64BootRuntimeResources,
@@ -16451,7 +16491,19 @@ fn prepare_pci_data_devices(
             endpoint_index += 1;
         }
 
-        for prepared in networks {
+        for mut prepared in networks {
+            let iface_id = prepared.iface_id().to_string();
+            let interface_metrics = network_interface_metrics
+                .per_interface(&iface_id)
+                .ok_or_else(|| {
+                    HvfArm64BootPciDataError::new(format!(
+                        "missing PCI network metrics generation for {iface_id}"
+                    ))
+                })?;
+            prepared.attach_metrics_with_aggregate(
+                interface_metrics,
+                network_interface_metrics.aggregate(),
+            );
             let (iface_id, host_dev_name, config_space, device) = prepared.into_parts();
             let metrics_lease = if all_virtio {
                 Some(
@@ -16921,7 +16973,8 @@ mod tests {
     use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
-        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VirtioMmioRegister,
     };
     use bangbang_runtime::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -18541,6 +18594,19 @@ mod tests {
             }
             self.packets.push(packet);
 
+            Ok(VirtioNetworkTxPacketDisposition::Forwarded)
+        }
+
+        fn transmit_prepared_frame(
+            &mut self,
+            _memory: &GuestMemory,
+            _frame: &VirtioNetworkTxFrame,
+            packet: &bangbang_runtime::network_packet::VirtioNetworkPacketPlan,
+        ) -> Result<VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSinkError> {
+            let emitted = packet
+                .emit(bangbang_runtime::network_packet::VirtioNetworkPacketEnvelope::RawEthernet)
+                .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
+            self.packets.push(emitted.bytes().to_vec());
             Ok(VirtioNetworkTxPacketDisposition::Forwarded)
         }
     }
@@ -21762,24 +21828,8 @@ mod tests {
     }
 
     fn write_network_tx_header_at(memory: &mut GuestMemory, address: GuestAddress) {
-        let mut bytes = [0; VIRTIO_NET_TX_HEADER_SIZE as usize];
-        let (flags, tail) = bytes.split_at_mut(1);
-        let (gso_type, tail) = tail.split_at_mut(1);
-        let (header_len, tail) = tail.split_at_mut(2);
-        let (gso_size, tail) = tail.split_at_mut(2);
-        let (checksum_start, tail) = tail.split_at_mut(2);
-        let (checksum_offset, num_buffers) = tail.split_at_mut(2);
-
-        flags.copy_from_slice(&[0x1]);
-        gso_type.copy_from_slice(&[0x2]);
-        header_len.copy_from_slice(&0x0304_u16.to_le_bytes());
-        gso_size.copy_from_slice(&0x0506_u16.to_le_bytes());
-        checksum_start.copy_from_slice(&0x0708_u16.to_le_bytes());
-        checksum_offset.copy_from_slice(&0x090a_u16.to_le_bytes());
-        num_buffers.copy_from_slice(&0x0b0c_u16.to_le_bytes());
-
         memory
-            .write_slice(&bytes, address)
+            .write_slice(&[0; VIRTIO_NET_TX_HEADER_SIZE as usize], address)
             .expect("virtio-net TX header should write");
     }
 
@@ -23069,6 +23119,41 @@ mod tests {
     }
 
     #[test]
+    fn mmio_network_transport_metrics_bind_aggregate_and_interface_at_source() {
+        let (_memory, runtime, dispatcher) = boot_runtime_with_networks(&[("eth0", "tap0")]);
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0"]);
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        super::bind_mmio_network_transport_metrics(&runtime, &dispatcher, &metrics)
+            .expect("MMIO network metrics should bind");
+
+        let address = runtime.network_devices[0]
+            .registration
+            .address()
+            .checked_add(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET)
+            .expect("network config address should not overflow");
+        let mut dispatcher = dispatcher
+            .lock()
+            .expect("MMIO network dispatcher should remain available");
+        let access = dispatcher
+            .lookup(address, 1)
+            .expect("network config access should resolve");
+        assert!(
+            dispatcher
+                .dispatch(MmioOperation::read(access).expect("config read should build"))
+                .is_err(),
+            "an interface without MAC or MTU config should reject config reads"
+        );
+        drop(dispatcher);
+
+        let expected = NetworkInterfaceMetrics::default().with_cfg_fails(1);
+        assert_eq!(metrics.aggregate_snapshot(), expected);
+        assert_eq!(
+            metrics.per_interface_snapshot(),
+            NetworkInterfaceMetricsByInterface::new().with_interface_metrics("eth0", expected)
+        );
+    }
+
+    #[test]
     fn network_notification_packet_io_dispatch_accepts_empty_devices() {
         let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_without_drives();
         let mut provider = RecordingNetworkPacketIoProvider::for_iface("eth0");
@@ -23493,6 +23578,7 @@ mod tests {
                 .with_tx_bytes_count(16)
                 .with_tx_packets_count(1)
                 .with_tx_count(1)
+                .with_tx_remaining_reqs_count(1)
         );
         assert_eq!(read_network_tx_used_index(&memory), 1);
         assert_eq!(read_network_tx_used_element(&memory, 0), (0, 0));

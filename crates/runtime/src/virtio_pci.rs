@@ -122,6 +122,7 @@ pub struct VirtioPciDiagnostics {
     pub phase: VirtioPciEndpointPhase,
     pub device_activated: bool,
     pub driver_ready: bool,
+    pub driver_features: u64,
     pub msix_enabled: bool,
     pub msix_function_masked: bool,
     pub programmed_msix_entries: usize,
@@ -501,6 +502,7 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             phase: state.phase,
             device_activated: state.core.device_activated,
             driver_ready: state.core.device.status() == VIRTIO_DRIVER_READY_STATUS,
+            driver_features: state.core.device.driver_features(),
             msix_enabled: state.msix.enabled,
             msix_function_masked: state.msix.function_masked,
             programmed_msix_entries: state

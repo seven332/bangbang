@@ -568,6 +568,15 @@ impl VmnetInterfaceParameters {
     pub const fn direct_virtio_header_enabled(&self) -> bool {
         self.direct_virtio_header_enabled
     }
+
+    pub fn packet_buffer_size(&self) -> Option<usize> {
+        self.maximum_packet_size
+            .checked_add(if self.direct_virtio_header_enabled {
+                bangbang_runtime::network::VIRTIO_NET_TX_HEADER_SIZE as usize
+            } else {
+                0
+            })
+    }
 }
 
 impl fmt::Debug for VmnetInterfaceParameters {
@@ -928,12 +937,10 @@ impl VmnetInterfaceDescriptor {
 
         let direct_virtio_header_key = optional_vmnet_enable_virtio_header_key();
         if let Some(key) = direct_virtio_header_key {
-            // This foundational slice detects the capability but deliberately
-            // keeps raw-Ethernet packet I/O selected.
             // SAFETY: `dictionary` owns a live XPC dictionary and `key` was
             // resolved to a non-null vmnet data-symbol value.
             unsafe {
-                xpc::xpc_dictionary_set_bool(dictionary.as_ptr(), key, false);
+                xpc::xpc_dictionary_set_bool(dictionary.as_ptr(), key, true);
             }
         }
 
@@ -944,7 +951,7 @@ impl VmnetInterfaceDescriptor {
                 requested_mac: config.guest_mac(),
                 requested_mtu: config.mtu(),
                 direct_virtio_header_available: direct_virtio_header_key.is_some(),
-                direct_virtio_header_enabled: false,
+                direct_virtio_header_enabled: direct_virtio_header_key.is_some(),
             },
         })
     }
@@ -5441,7 +5448,7 @@ mod tests {
                 &configured_descriptor,
                 direct_header_key
             ));
-            assert!(!descriptor_bool(&configured_descriptor, direct_header_key));
+            assert!(descriptor_bool(&configured_descriptor, direct_header_key));
         }
 
         let debug = format!("{configured:?} {configured_descriptor:?} {bridged_descriptor:?}");
@@ -5561,7 +5568,16 @@ mod tests {
         assert_eq!(parameters.maximum_packet_size(), 2048);
         assert_eq!(parameters.interface_id(), Some(interface_id));
         if super::optional_vmnet_read_max_packets_key().is_some() {
-            assert_eq!(parameters.read_max_packets(), Some(128));
+            let packet_buffer_size = if parameters.direct_virtio_header_enabled() {
+                2048 + usize::try_from(VIRTIO_NET_TX_HEADER_SIZE)
+                    .expect("virtio header size should fit usize")
+            } else {
+                2048
+            };
+            let expected = (super::VMNET_MAX_BYTES_PER_OPERATION / packet_buffer_size)
+                .min(super::VMNET_MAX_PACKETS_PER_OPERATION)
+                .min(usize::from(VIRTIO_NET_QUEUE_SIZE)) as u16;
+            assert_eq!(parameters.read_max_packets(), Some(expected));
         } else {
             assert_eq!(parameters.read_max_packets(), None);
         }
@@ -5570,7 +5586,14 @@ mod tests {
         } else {
             assert_eq!(parameters.write_max_packets(), None);
         }
-        assert!(!parameters.direct_virtio_header_enabled());
+        assert_eq!(
+            parameters.direct_virtio_header_available(),
+            super::optional_vmnet_enable_virtio_header_key().is_some()
+        );
+        assert_eq!(
+            parameters.direct_virtio_header_enabled(),
+            super::optional_vmnet_enable_virtio_header_key().is_some()
+        );
 
         let debug = format!("{parameters:?}");
         assert!(debug.contains("<redacted>"));
@@ -5698,6 +5721,10 @@ mod tests {
         let base_policy = VmnetInterfaceDescriptor::new(&VmnetInterfaceConfig::host())
             .expect("host descriptor should build")
             .result_policy;
+        let raw_policy = super::VmnetInterfaceResultPolicy {
+            direct_virtio_header_enabled: false,
+            ..base_policy
+        };
         for invalid in [
             0,
             u64::from(VIRTIO_NET_MIN_MTU) - 1,
@@ -5707,7 +5734,7 @@ mod tests {
         ] {
             assert_parameter_error(
                 raw_test_parameters(mac, u64::from(VIRTIO_NET_MIN_MTU), invalid)
-                    .validate(base_policy),
+                    .validate(raw_policy),
                 VmnetInterfaceParameterField::MaximumPacketSize,
                 VmnetInterfaceParameterProblem::OutOfRange,
             );
@@ -5718,7 +5745,7 @@ mod tests {
                 1500,
                 VIRTIO_NET_MAX_BUFFER_SIZE - u64::from(VIRTIO_NET_TX_HEADER_SIZE),
             )
-            .validate(base_policy)
+            .validate(raw_policy)
             .is_ok()
         );
 
@@ -5788,7 +5815,13 @@ mod tests {
         let parameters = raw
             .validate(policy)
             .expect("valid batches should be capped");
-        let expected = (super::VMNET_MAX_BYTES_PER_OPERATION / 2048)
+        let packet_buffer_size = if policy.direct_virtio_header_enabled {
+            2048 + usize::try_from(VIRTIO_NET_TX_HEADER_SIZE)
+                .expect("virtio header size should fit usize")
+        } else {
+            2048
+        };
+        let expected = (super::VMNET_MAX_BYTES_PER_OPERATION / packet_buffer_size)
             .min(super::VMNET_MAX_PACKETS_PER_OPERATION)
             .min(usize::from(VIRTIO_NET_QUEUE_SIZE)) as u16;
         assert_eq!(parameters.read_max_packets(), Some(expected));

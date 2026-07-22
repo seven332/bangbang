@@ -20,6 +20,7 @@ pub mod mmds;
 pub mod mmds_network;
 pub mod mmio;
 pub mod network;
+pub mod network_packet;
 pub(crate) mod output_file;
 pub mod pci;
 pub mod pmem;

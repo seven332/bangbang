@@ -945,8 +945,12 @@ virtqueue capacity. Read counts and packet lengths are treated as untrusted;
 only a validated initialized prefix becomes visible. TX copies frames before
 used-ring publication, commits them in descriptor order, preserves per-frame
 MMDS effects, and maps a successful short write to an exact forwarded prefix;
-the suffix fails without an ambiguous retry. Direct virtio headers stay
-disabled and no offload feature is advertised.
+the suffix fails without an ambiguous retry. An immutable backend profile
+selects raw Ethernet or Apple's direct virtio-header envelope without using
+that transport choice to authorize guest features. The portable packet layer
+validates negotiated checksum/segmentation operations and normalizes every TX
+frame before MMDS or vmnet sees it; direct RX accepts only the canonical
+zero-offload header.
 
 Teardown marks the exact generation retiring, disables its event, waits for a
 bounded marker on the same serial callback queue, stops vmnet with its finite
@@ -966,9 +970,8 @@ with retained work and session-owned retry wakeups. They are not packet
 filters, a host firewall, or a NAT policy, and current signed limiter evidence
 uses MMDS-only packet I/O rather than direct vmnet. The boundary still lacks
 packet filtering, production network isolation, a repository-owned approved
-credential and real contained vmnet evidence, limiter-specific metrics,
-network snapshot state, and full Firecracker public
-packet-movement parity.
+credential and real contained vmnet evidence, network snapshot state, and full
+Firecracker public packet-movement parity.
 
 ## API Socket Handling
 
