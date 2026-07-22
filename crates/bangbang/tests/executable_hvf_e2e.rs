@@ -67,6 +67,14 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_ENTROPY_HOST_CONTINUE_MARKER: &[u8] = b"BANGBANG_ENTROPY_HOST_CONTINUE";
     const DIRECT_ROOTFS_ENTROPY_LIFECYCLE_SUCCESS_MARKER: &[u8] = b"BANGBANG_ENTROPY_LIFECYCLE_OK";
     const ENTROPY_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(60);
+    const DIRECT_ROOTFS_REMAINING_DEVICE_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 memhp_default_state=online_movable init=/bangbang-direct-rootfs-init bangbang.remaining-device-certification=1";
+    const REMAINING_DEVICE_SERIAL_INPUT: &str = "BANGBANG_REMAINING_DEVICE_SERIAL_ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz_0123456789_END";
+    const REMAINING_DEVICE_SERIAL_READY_MARKER: &str = "BANGBANG_REMAINING_DEVICE_SERIAL_READY";
+    const REMAINING_DEVICE_SERIAL_SUCCESS_MARKER: &str = "BANGBANG_REMAINING_DEVICE_SERIAL_OK";
+    const REMAINING_DEVICE_SUCCESS_MARKER: &str = "BANGBANG_REMAINING_DEVICE_CERTIFICATION_OK";
+    const REMAINING_DEVICE_FAILURE_MARKER: &str = "BANGBANG_REMAINING_DEVICE_FAIL_";
+    const REMAINING_DEVICE_FINAL_MARKER_OFFSET: u64 =
+        5 * bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE;
     const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
     const DIRECT_ROOTFS_PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
     const DIRECT_ROOTFS_PMEM_ROOT_RO_MARKER: &[u8] = b"BANGBANG_PMEM_ROOT_RO_OK";
@@ -4816,6 +4824,577 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             &format!("bangbang entropy lifecycle {transport}"),
+        );
+    }
+
+    #[test]
+    fn signed_executable_certifies_remaining_devices_over_mmio() {
+        run_signed_remaining_device_certification(false);
+    }
+
+    #[test]
+    fn signed_executable_certifies_remaining_devices_over_product_pci() {
+        run_signed_remaining_device_certification(true);
+    }
+
+    fn run_signed_remaining_device_certification(enable_pci: bool) {
+        const MIB: u64 = 1024 * 1024;
+
+        let transport = if enable_pci { "product PCI" } else { "MMIO" };
+        let transport_arg = if enable_pci { "pci" } else { "mmio" };
+        let transport_marker = format!(
+            "BANGBANG_REMAINING_DEVICE_TRANSPORT_{}_OK",
+            transport_arg.to_ascii_uppercase()
+        );
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let control_path = test_dir.path().join("remaining-device-control.img");
+        let metrics_path = test_dir.path().join("remaining-device-metrics.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing_with_sectors(&control_path, 8);
+
+        let configure = |context: &str| {
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/machine-config",
+                    r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+                ),
+                &format!("PUT /machine-config remaining-device {context}"),
+            );
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/balloon",
+                    r#"{"amount_mib":8,"deflate_on_oom":true,"stats_polling_interval_s":1,"free_page_hinting":true,"free_page_reporting":true}"#,
+                ),
+                &format!("PUT /balloon remaining-device {context}"),
+            );
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/hotplug/memory",
+                    r#"{"total_size_mib":128,"block_size_mib":2,"slot_size_mib":128}"#,
+                ),
+                &format!("PUT /hotplug/memory remaining-device {context}"),
+            );
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/entropy",
+                    r#"{"rate_limiter":{"bandwidth":{"size":64,"one_time_burst":256,"refill_time":2000},"ops":{"size":1,"one_time_burst":4,"refill_time":2000}}}"#,
+                ),
+                &format!("PUT /entropy remaining-device {context}"),
+            );
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/metrics",
+                    &format!(
+                        r#"{{"metrics_path":{}}}"#,
+                        json_string(path_text(&metrics_path))
+                    ),
+                ),
+                &format!("PUT /metrics remaining-device {context}"),
+            );
+            let boot_args = format!(
+                "{DIRECT_ROOTFS_REMAINING_DEVICE_BOOT_ARGS} bangbang.expect-remaining-device-transport={transport_arg}"
+            );
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/boot-source",
+                    &format!(
+                        r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+                        json_string(path_text(&kernel_path)),
+                        json_string(&boot_args)
+                    ),
+                ),
+                &format!("PUT /boot-source remaining-device {context}"),
+            );
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/drives/rootfs",
+                    &format!(
+                        r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+                        json_string(path_text(&rootfs_path))
+                    ),
+                ),
+                &format!("PUT /drives/rootfs remaining-device {context}"),
+            );
+            assert_no_content_response(
+                &http_put_json(
+                    &socket_path,
+                    "/drives/control",
+                    &format!(
+                        r#"{{"drive_id":"control","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback"}}"#,
+                        json_string(path_text(&control_path))
+                    ),
+                ),
+                &format!("PUT /drives/control remaining-device {context}"),
+            );
+
+            let vm_config = http_get(&socket_path, "/vm/config");
+            assert_ok_response(
+                &vm_config,
+                &format!("GET /vm/config remaining-device {context}"),
+            );
+            for expected in [
+                r#""vcpu_count":1"#,
+                r#""amount_mib":8"#,
+                r#""deflate_on_oom":true"#,
+                r#""free_page_hinting":true"#,
+                r#""free_page_reporting":true"#,
+                r#""total_size_mib":128"#,
+                r#""bandwidth":{"one_time_burst":256,"refill_time":2000,"size":64}"#,
+                r#""ops":{"one_time_burst":4,"refill_time":2000,"size":1}"#,
+            ] {
+                assert_response_contains(
+                    &vm_config,
+                    expected,
+                    &format!("GET /vm/config remaining-device {context}"),
+                );
+            }
+        };
+
+        let mut bangbang = if enable_pci {
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"])
+        } else {
+            BangbangProcess::start(&socket_path, &instance_id)
+        };
+        configure(transport);
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            &format!("start remaining-device {transport}"),
+        );
+        bangbang
+            .wait_for_stdout_marker(&transport_marker, PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("{transport} remaining-device transport should validate: {error}")
+            });
+
+        wait_for_file_prefix_marker(
+            &control_path,
+            DIRECT_ROOTFS_MEMORY_HOTPLUG_READY_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .unwrap_or_else(|error| {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} remaining-device virtio-mem should become ready: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            )
+        });
+
+        let rejected_memory = http_json(
+            &socket_path,
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":127}"#,
+        );
+        assert_bad_request_response(
+            &rejected_memory,
+            &format!("reject unaligned remaining-device memory size {transport}"),
+        );
+        let unchanged_memory = std::panic::catch_unwind(|| http_get(&socket_path, "/hotplug/memory"))
+            .unwrap_or_else(|_| {
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "{transport} remaining-device process exited after rejected memory update; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                )
+            });
+        assert_ok_response(
+            &unchanged_memory,
+            &format!("GET unchanged remaining-device memory {transport}"),
+        );
+        for expected in [r#""requested_size_mib":0"#, r#""plugged_size_mib":0"#] {
+            assert_response_contains(
+                &unchanged_memory,
+                expected,
+                &format!("GET unchanged remaining-device memory {transport}"),
+            );
+        }
+
+        let (memory_grow, statistics_update) = std::thread::scope(|scope| {
+            let memory_grow = scope.spawn(|| {
+                http_json_with_io_timeout(
+                    &socket_path,
+                    "PATCH",
+                    "/hotplug/memory",
+                    r#"{"requested_size_mib":128}"#,
+                    PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+                )
+            });
+            let statistics_update = scope.spawn(|| {
+                http_json(
+                    &socket_path,
+                    "PATCH",
+                    "/balloon/statistics",
+                    r#"{"stats_polling_interval_s":2}"#,
+                )
+            });
+            (
+                memory_grow
+                    .join()
+                    .expect("remaining-device memory grow request should join"),
+                statistics_update
+                    .join()
+                    .expect("remaining-device balloon statistics request should join"),
+            )
+        });
+        assert_no_content_response(
+            &memory_grow,
+            &format!("concurrent memory grow remaining-device {transport}"),
+        );
+        assert_no_content_response(
+            &statistics_update,
+            &format!("concurrent balloon statistics update remaining-device {transport}"),
+        );
+
+        wait_for_file_prefix_marker(
+            &control_path,
+            DIRECT_ROOTFS_MEMORY_HOTPLUG_GROWN_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .unwrap_or_else(|error| {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} remaining-device virtio-mem should grow: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            )
+        });
+        std::panic::catch_unwind(|| {
+            wait_for_http_response_fragment(
+                &socket_path,
+                "/hotplug/memory",
+                r#""plugged_size_mib":128"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            )
+        })
+        .unwrap_or_else(|_| {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} remaining-device process exited after memory grow; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            )
+        })
+        .expect("remaining-device public memory state should report completed grow");
+        let grow_metrics = flush_memory_hotplug_metrics(
+            &socket_path,
+            &metrics_path,
+            &format!("FlushMetrics after remaining-device grow {transport}"),
+        );
+        assert_eq!(grow_metrics["plug_bytes"].as_u64(), Some(128 * MIB));
+        assert_eq!(grow_metrics["plug_fails"].as_u64(), Some(0));
+
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &socket_path,
+                "PATCH",
+                "/hotplug/memory",
+                r#"{"requested_size_mib":0}"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            ),
+            &format!("shrink remaining-device memory {transport}"),
+        );
+        wait_for_file_prefix_marker(
+            &control_path,
+            DIRECT_ROOTFS_MEMORY_HOTPLUG_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("remaining-device guest should observe the completed memory shrink");
+        std::panic::catch_unwind(|| {
+            wait_for_http_response_fragment(
+                &socket_path,
+                "/hotplug/memory",
+                r#""plugged_size_mib":0"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            )
+        })
+        .unwrap_or_else(|_| {
+            let metrics = file_tail_lossy(&metrics_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} remaining-device process exited after memory shrink; status: {:?}\nmetrics:\n{metrics}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr,
+            )
+        })
+        .expect("remaining-device public memory state should report completed shrink");
+        let shrink_metrics = flush_memory_hotplug_metrics(
+            &socket_path,
+            &metrics_path,
+            &format!("FlushMetrics after remaining-device shrink {transport}"),
+        );
+        assert_eq!(shrink_metrics["unplug_bytes"].as_u64(), Some(128 * MIB));
+        assert_eq!(shrink_metrics["unplug_fails"].as_u64(), Some(0));
+
+        bangbang
+            .wait_for_stdout_marker(
+                "BANGBANG_REMAINING_DEVICE_TIME_IDENTITY_OK",
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            )
+            .expect("remaining-device guest should validate time and identity devices");
+        bangbang
+            .wait_for_stdout_marker(
+                "BANGBANG_ENTROPY_LIFECYCLE_READY",
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            )
+            .expect("remaining-device entropy lifecycle should become ready");
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"FlushMetrics"}"#,
+            ),
+            &format!("baseline remaining-device entropy metrics {transport}"),
+        );
+        let entropy_metric_line = metrics_line_count(&metrics_path);
+        write_block_marker_at(
+            &control_path,
+            bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE,
+            DIRECT_ROOTFS_ENTROPY_HOST_CONTINUE_MARKER,
+        );
+        assert!(
+            wait_for_entropy_metric_since(
+                &socket_path,
+                &metrics_path,
+                entropy_metric_line,
+                "entropy_rate_limiter_throttled",
+                1,
+                ENTROPY_LIFECYCLE_TIMEOUT,
+            )
+            .expect("remaining-device entropy reads should reach dual-bucket pressure")
+                >= 1
+        );
+        bangbang
+            .wait_for_stdout_marker(
+                "BANGBANG_REMAINING_DEVICE_ENTROPY_OK",
+                ENTROPY_LIFECYCLE_TIMEOUT,
+            )
+            .expect("remaining-device entropy reads should complete after retry");
+        assert!(
+            wait_for_entropy_metric_since(
+                &socket_path,
+                &metrics_path,
+                entropy_metric_line,
+                "rate_limiter_event_count",
+                1,
+                ENTROPY_LIFECYCLE_TIMEOUT,
+            )
+            .expect("remaining-device entropy retry event should publish")
+                >= 1
+        );
+
+        if let Err(error) =
+            wait_for_nonzero_balloon_actual_pages(&socket_path, PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+        {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} remaining-device balloon should inflate: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        if enable_pci {
+            let core_statistics = http_get(&socket_path, "/balloon/statistics");
+            assert_ok_response(
+                &core_statistics,
+                "GET core remaining-device balloon statistics over product PCI",
+            );
+            for expected in [r#""actual_pages":2048"#, r#""target_pages":2048"#] {
+                assert_response_contains(
+                    &core_statistics,
+                    expected,
+                    "GET core remaining-device balloon statistics over product PCI",
+                );
+            }
+        } else {
+            wait_for_balloon_optional_statistics(&socket_path, PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+                .expect("MMIO remaining-device balloon should publish optional statistics");
+        }
+        let hinting_start = http_json(
+            &socket_path,
+            "PATCH",
+            "/balloon/hinting/start",
+            r#"{"acknowledge_on_stop":true}"#,
+        );
+        if !hinting_start.starts_with("HTTP/1.1 204 No Content\r\n") {
+            let metrics = file_tail_lossy(&metrics_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "start remaining-device balloon hinting {transport} failed: {hinting_start}\nstatus: {:?}\nmetrics:\n{metrics}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr,
+            );
+        }
+        wait_for_balloon_hinting_status(&socket_path, 1, Some(0), PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("remaining-device balloon hinting should be acknowledged");
+        assert_no_content_response(
+            &http_no_body(&socket_path, "PATCH", "/balloon/hinting/stop"),
+            &format!("stop remaining-device balloon hinting {transport}"),
+        );
+        wait_for_nonzero_balloon_free_page_report_count(
+            &socket_path,
+            &metrics_path,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("remaining-device balloon reporting should execute");
+
+        bangbang
+            .wait_for_stdout_marker(
+                REMAINING_DEVICE_SERIAL_READY_MARKER,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            )
+            .expect("remaining-device serial input should become ready");
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            &format!("pause remaining-device guest {transport}"),
+        );
+        let mut serial_input = REMAINING_DEVICE_SERIAL_INPUT.as_bytes().to_vec();
+        serial_input.push(b'\n');
+        assert!(
+            serial_input.len() > bangbang_runtime::serial::SERIAL_RECEIVE_FIFO_CAPACITY,
+            "remaining-device input must cross the bounded UART FIFO"
+        );
+        bangbang.write_stdin(&serial_input);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !bangbang
+                .stdout_snapshot()
+                .contains(REMAINING_DEVICE_SERIAL_SUCCESS_MARKER),
+            "paused {transport} remaining-device guest must not consume queued serial input"
+        );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            &format!("paused aggregate remaining-device capture-ready preflight {transport}"),
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            &format!("resume remaining-device guest {transport}"),
+        );
+        if let Err(error) = bangbang
+            .wait_for_stdout_marker(REMAINING_DEVICE_SUCCESS_MARKER, GUEST_EXECUTION_TIMEOUT)
+        {
+            let _ = http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"FlushMetrics"}"#,
+            );
+            let metrics = file_tail_lossy(&metrics_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} remaining-device guest should finish its aggregate contract: {error}; status: {:?}\nmetrics:\n{metrics}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr,
+            );
+        }
+        let aggregate_stdout = bangbang.stdout_snapshot();
+        assert!(aggregate_stdout.contains(REMAINING_DEVICE_SERIAL_SUCCESS_MARKER));
+        assert!(aggregate_stdout.contains("BANGBANG_REMAINING_DEVICE_PVTIME_STEAL="));
+        assert!(!aggregate_stdout.contains(REMAINING_DEVICE_FAILURE_MARKER));
+        assert_eq!(
+            file_bytes_at(
+                &control_path,
+                REMAINING_DEVICE_FINAL_MARKER_OFFSET,
+                REMAINING_DEVICE_SUCCESS_MARKER.len(),
+            ),
+            REMAINING_DEVICE_SUCCESS_MARKER.as_bytes(),
+        );
+
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &socket_path,
+                "PATCH",
+                "/balloon",
+                r#"{"amount_mib":0}"#,
+                PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+            ),
+            &format!("deflate remaining-device balloon {transport}"),
+        );
+        wait_for_balloon_page_counts(&socket_path, 0, 0, PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("remaining-device balloon should deflate to zero");
+        bangbang.close_stdin();
+        std::thread::sleep(Duration::from_millis(100));
+        let after_eof = http_get(&socket_path, "/");
+        assert_ok_response(
+            &after_eof,
+            &format!("GET / after remaining-device serial EOF {transport}"),
+        );
+        assert_response_contains(
+            &after_eof,
+            r#""state":"Running""#,
+            &format!("GET / after remaining-device serial EOF {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"FlushMetrics"}"#,
+            ),
+            &format!("final remaining-device metrics flush {transport}"),
+        );
+        let metrics_output = fs::read_to_string(&metrics_path)
+            .expect("remaining-device metrics output should be readable");
+        let final_metrics: serde_json::Value = serde_json::from_str(
+            metrics_output
+                .lines()
+                .next_back()
+                .expect("remaining-device metrics should contain a final generation"),
+        )
+        .expect("remaining-device final metrics generation should be JSON");
+        assert_eq!(
+            final_metrics.pointer("/uart/input_count"),
+            Some(&serde_json::json!(serial_input.len())),
+        );
+        assert_eq!(
+            final_metrics.pointer("/uart/error_count"),
+            Some(&serde_json::json!(0)),
+        );
+        assert_eq!(
+            final_metrics.pointer("/uart/overrun_count"),
+            Some(&serde_json::json!(0)),
+        );
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            &format!("bangbang remaining-device {transport}"),
+        );
+
+        reset_zeroed_block_backing(&control_path, 8);
+        let reused = if enable_pci {
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"])
+        } else {
+            BangbangProcess::start(&socket_path, &instance_id)
+        };
+        configure(&format!("reused {transport}"));
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            &format!("start reused remaining-device {transport}"),
+        );
+        reused
+            .wait_for_stdout_marker(&transport_marker, PCI_ALL_VIRTIO_GUEST_TIMEOUT)
+            .expect("reused remaining-device transport should publish");
+        wait_for_file_prefix_marker(
+            &control_path,
+            DIRECT_ROOTFS_MEMORY_HOTPLUG_READY_MARKER,
+            PCI_ALL_VIRTIO_GUEST_TIMEOUT,
+        )
+        .expect("reused remaining-device owner set should reach guest readiness");
+        assert_clean_shutdown(
+            reused.terminate(),
+            &socket_path,
+            &format!("reused bangbang remaining-device {transport}"),
         );
     }
 
@@ -10648,6 +11227,22 @@ mod macos_arm64 {
             .expect("guest block backing should create");
         file.set_len(len)
             .expect("guest block backing should have requested sectors");
+    }
+
+    fn reset_zeroed_block_backing(path: &Path, sectors: u64) {
+        let len = bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE
+            .checked_mul(sectors)
+            .expect("reused guest block backing sector count should not overflow");
+        assert!(len > 0, "reused guest block backing should not be empty");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("guest block backing should reopen for deterministic reuse");
+        file.set_len(len)
+            .expect("reused guest block backing should have requested sectors");
+        file.sync_all()
+            .expect("reused guest block backing should persist its reset");
     }
 
     fn create_block_backing_with_prefix(path: &Path, sectors: u64, marker: &[u8]) {

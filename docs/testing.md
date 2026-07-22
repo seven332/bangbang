@@ -1029,6 +1029,17 @@ validator, and the ordinary workspace gates. The
 five terminal API leaves and exactly one Wave 6 optional-device
 encoding/endpoint-reconstruction handoff. Serial changes additionally require
 the signed default-stdio executable cases and production-bundle boundary case.
+The checked
+[aggregate remaining-device ledger](../compat/firecracker/v1.16.0/remaining-device-contract.md)
+then fixes the union at 85 unique records with a 77-terminal/eight-Wave-6
+split. Its audit test rejects family drift, overlap, stale #1440/#1481 handoffs,
+wrong #1490 URLs, any selected #1491 row, and missing focused or signed evidence.
+Run its two focused gates with:
+
+```sh
+cargo test -p bangbang aggregate_remaining_device_snapshot_preflight_failures_preserve_order_and_reuse --all-features --locked
+cargo test -p bangbang-hvf --lib remaining_device_owner_budget_covers_mmio_and_pci_and_reuses_resources --all-features --locked
+```
 
 Run the offline compiler's focused surface with:
 
@@ -1486,6 +1497,19 @@ After resume, the guest completes eight additional nonempty reads and publishes
 a terminal marker; the host requires a retry-event metric and clean shutdown.
 The marker gate and two-second refill window make the pending retry observation
 causal rather than sleep-based.
+The #1481 aggregate cases
+`signed_executable_certifies_remaining_devices_over_mmio` and
+`signed_executable_certifies_remaining_devices_over_product_pci` use one shared
+guest protocol to compose balloon, virtio-mem, entropy, default serial stdio,
+PL031, VMGenID, VMClock, and PVTime. They assert exact transport identity,
+reject an unaligned memory update without projection mutation, overlap a valid
+virtio-mem grow with a balloon-statistics update, exercise entropy throttling,
+send more than the UART FIFO capacity, pause with input queued, require ordered
+capture-ready optional-profile rejection with no artifacts, resume, shrink and
+deflate, detach stdin at EOF while the API remains live, and repeat a short
+session with the same socket/control-resource names. This proves live and
+capture-ready coexistence only; it does not prove optional-device encoding,
+restore, or PVTime clone portability.
 It also includes a direct-rootfs balloon scenario that configures `/balloon`,
 enables free-page reporting, checks that the guest bound a virtio-balloon driver
 and negotiated reporting feature bit 5, observes periodic optional statistics,
@@ -1724,7 +1748,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v69.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v72.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -1804,6 +1828,15 @@ follows `dmesg` for the 128-MiB requested-size transition, writes
 zero. The host-side e2e advances on those markers, sends the grow and shrink
 `PATCH /hotplug/memory` requests, and requires public requested and plugged
 sizes to complete `0 -> 128 MiB -> 0`.
+When the boot args include `bangbang.remaining-device-certification=1`, the
+wrapper instead runs the aggregate protocol before the single-device profiles.
+It requires an exact `bangbang.expect-remaining-device-transport=mmio|pci`
+selector, checks either `pci=off` plus at least five virtio-mmio nodes or the
+exact five PCI virtio identities, and emits phase/failure markers for memory
+hotplug, time/identity discovery, entropy, balloon, and greater-than-FIFO serial
+input. Host tests use control-drive sectors and public API state as the source
+of progress; no entropy bytes, serial bytes, raw PVTime values, or paths appear
+in failure diagnostics.
 When the boot args include `bangbang.rtc-check=1`, the same init script checks
 that Linux exposes `/dev/rtc0` as a character device and finds PL031 RTC
 evidence in sysfs, procfs, or dmesg before writing

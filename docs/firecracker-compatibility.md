@@ -416,6 +416,23 @@ signed Linux contention/idle/pause certification. Firecracker allocates and regi
 while bangbang prepares and publishes an equivalent standard structure per vCPU
 without claiming KVM's registration mechanism.
 
+#1481 closes the aggregate live/capture-ready device gate without broadening
+artifact support. The checked
+[aggregate remaining-device contract](../compat/firecracker/v1.16.0/remaining-device-contract.md)
+selects exactly 85 records across balloon, memory hotplug, entropy, serial, and
+time/identity: 77 are terminal and the same eight serialization/restore
+aggregates remain `audit-required`. One public signed process profile composes
+the full device set over default MMIO and product PCI, including concurrent
+virtio-mem and balloon control, entropy retry pressure, greater-than-FIFO
+default serial input across pause, ordered snapshot preflight rejection, and
+same-name process/control-resource reuse. Focused tests pin the five-device
+preflight order and bounded MMIO/PCI owner release/reuse; a production-bundle
+test proves independent default-stdio sessions across two
+launcher/sandboxed-worker pairs. All eight retained records belong to
+[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490); none belongs
+to Wave 7 #1491. These capture-ready values remain private validated live state,
+not a Firecracker-compatible artifact or restored optional-device contract.
+
 Balloon inflate, accepted hinting, and free-page reporting use whole-range
 validation, per-owner segmentation, inward host-page alignment, and Darwin
 zero-before-free advice. Pinned Apple XNU maps
@@ -761,8 +778,12 @@ remain 191/207/3/17. Exactly
 `semantic.device:rtc-vmclock-vmgenid-and-pvtime` remains `audit-required`.
 #1478 adds its aligned per-vCPU PVTime ABI and owner-thread HVF timing primitive;
 #1480 adds public accounting, capture-ready continuity, and focused Linux guest
-certification without changing those counts. #1481 owns final aggregate
-clone/portability reconciliation.
+certification without changing those counts. #1481 adds the checked aggregate
+MMIO/PCI, failure-ordering, reuse, and production-stdio certification. Its exact
+85-record selector has 77 terminal outcomes and retains eight `audit-required`
+outcomes, all assigned to Wave 6 #1490 for serialization, restore,
+clone/portability policy, and signed restored-guest proof. No selected row is a
+Wave 7 #1491 handoff, and the global counts remain 191/207/3/17.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
@@ -2588,7 +2609,9 @@ barrier returns topology-ordered cumulative values without source clock
 baselines. Signed Linux requires `stolen time PV`, nonzero monotonic `/proc/stat`
 steal under controlled contention, unchanged idle accounting, and unchanged
 paused captures. This is not a claim of KVM's device attribute or PVTime
-artifact restore; the aggregate remains nonterminal until #1481 completes.
+artifact restore; #1481 certifies the live/capture-ready aggregate, while the
+one time/identity record remains nonterminal under Wave 6 #1490 for artifact
+restore and clone/portability behavior.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are
 not part of the minimal RTC device. The backend-neutral arm64 FDT builder emits

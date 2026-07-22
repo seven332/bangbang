@@ -7354,7 +7354,7 @@
     {
       "id": "corpus:ballooning",
       "family": "memory-devices",
-      "summary": "Live Firecracker v1.16 balloon configuration, MMIO/PCI queue execution, DEFLATE_ON_OOM negotiation, compact paired PFN accounting, statistics polling and optional-field handling, hinting/reporting, Darwin discard, metrics, failure diagnostics, cleanup, and bounded capture-ready ownership are implemented and verified. Wave 6 retains this broad corpus because its complete upstream claim also requires optional-device state encoding, artifact integration, MMIO/PCI restore construction, migration/clone behavior, portability policy, and signed restored-guest outcomes.",
+      "summary": "Live Firecracker v1.16 balloon configuration, MMIO/PCI queue execution, DEFLATE_ON_OOM negotiation, compact paired PFN accounting, statistics polling and optional-field handling, hinting/reporting, Darwin discard, metrics, failure diagnostics, cleanup, and bounded capture-ready ownership are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains this broad corpus because its complete upstream claim also requires optional-device state encoding, artifact integration, MMIO/PCI restore construction, migration/clone behavior, portability policy, and signed restored-guest outcomes.",
       "source_refs": [
         "corpus:ballooning"
       ],
@@ -7639,7 +7639,7 @@
     {
       "id": "corpus:entropy",
       "family": "remaining-devices",
-      "summary": "Strict entropy API/configuration, live MMIO/PCI ownership, bounded host-random queue processing, dual-bucket limiting, retained retry wakeups, metrics, failure ordering, cleanup, and detached capture-ready state are implemented and verified. Wave 6 retains this aggregate until entropy state is encoded, integrated into artifacts, restored into exact transport/queue/limiter/retry owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
+      "summary": "Strict entropy API/configuration, live MMIO/PCI ownership, bounded host-random queue processing, dual-bucket limiting, retained retry wakeups, metrics, failure ordering, cleanup, and detached capture-ready state are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains this aggregate until entropy state is encoded, integrated into artifacts, restored into exact transport/queue/limiter/retry owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
       "source_refs": [
         "corpus:entropy"
       ],
@@ -7786,7 +7786,7 @@
     {
       "id": "corpus:memory-hotplug",
       "family": "memory-devices",
-      "summary": "Validated API sizing and status, block-granular STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe guest/HVF/dirty ownership, exact rollback, best-effort discard, Firecracker-shaped metrics, MMIO/PCI capture-ready state, sparse vhost aperture coexistence, failures, and cleanup are implemented and verified. Wave 6 retains the aggregate until virtio-mem state is encoded, integrated into artifacts, restored into live owners and shared mappings, and certified for migration/clone, portability, and signed restored-guest behavior.",
+      "summary": "Validated API sizing and status, block-granular STATE/PLUG/UNPLUG/UNPLUG_ALL, publication-safe guest/HVF/dirty ownership, exact rollback, best-effort discard, Firecracker-shaped metrics, MMIO/PCI capture-ready state, sparse vhost aperture coexistence, failures, and cleanup are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains the aggregate until virtio-mem state is encoded, integrated into artifacts, restored into live owners and shared mappings, and certified for migration/clone, portability, and signed restored-guest behavior.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],
@@ -9160,7 +9160,7 @@
     {
       "id": "semantic.device:entropy-queues-limits-metrics-and-state",
       "family": "remaining-devices",
-      "summary": "Live entropy configuration, one-queue processing, the 64-KiB cap, host randomness failures, dual-bucket limiting, scheduler retry, metrics, MMIO/PCI placement, failure-atomic accounting, detached capture, and cleanup are implemented and verified. Wave 6 retains this semantic aggregate solely for optional-device state encoding, artifact integration, live restore construction, migration/clone and portability outcomes, and signed restored-guest certification; those missing outcomes must not be inferred from capture-ready state.",
+      "summary": "Live entropy configuration, one-queue processing, the 64-KiB cap, host randomness failures, dual-bucket limiting, scheduler retry, metrics, MMIO/PCI placement, failure-atomic accounting, detached capture, and cleanup are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains this semantic aggregate solely for optional-device state encoding, artifact integration, live restore construction, migration/clone and portability outcomes, and signed restored-guest certification; those missing outcomes must not be inferred from capture-ready state.",
       "source_refs": [
         "corpus:entropy"
       ],
@@ -9169,7 +9169,7 @@
     {
       "id": "semantic.device:rtc-vmclock-vmgenid-and-pvtime",
       "family": "serial-and-time",
-      "summary": "The aarch64 PL031 no-alarm device, RTC metrics and destination-wall-clock reconstruction, VMGenID startup plus fresh post-restore replacement/notification, complete typed VMClock startup/capture/backward-compatible native-v1 restore, and public aligned per-vCPU PVTime measurement, bounded accounting, atomic publication, SMCCC discovery, capture-ready continuity, and signed Linux contention/idle/pause certification are implemented and verified. #1481 owns final aggregate clone and portability reconciliation.",
+      "summary": "The aarch64 PL031 no-alarm device, RTC metrics and destination-wall-clock reconstruction, VMGenID startup plus fresh post-restore replacement/notification, complete typed VMClock startup/capture/backward-compatible native-v1 restore, and public aligned per-vCPU PVTime measurement, bounded accounting, atomic publication, SMCCC discovery, capture-ready continuity, and signed Linux contention/idle/pause certification are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 owns PVTime artifact encoding and restore, repeated-clone behavior, cross-host time-source portability, and signed restored-guest outcomes.",
       "source_refs": [
         "corpus:device-api",
         "corpus:snapshot-random-clones"
@@ -9179,7 +9179,7 @@
     {
       "id": "semantic.device:serial-stdin-stdout-rx-and-restore",
       "family": "serial-and-time",
-      "summary": "Live serial default stdout, configured output, terminal/FIFO stdin, bounded RX dispatch, TX limiting, metrics, Running/Paused behavior, MMIO ownership, capture-ready state, endpoint restoration, and cleanup are implemented and verified. Wave 6 retains this semantic aggregate solely for optional-device state encoding, artifact integration, live endpoint and UART restore construction, migration/clone and portability outcomes, and signed restored-guest certification; those missing outcomes must not be inferred from capture-ready state.",
+      "summary": "Live serial default stdout, configured output, terminal/FIFO stdin, bounded RX dispatch, TX limiting, metrics, Running/Paused behavior, MMIO ownership, capture-ready state, endpoint restoration, and cleanup are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains this semantic aggregate solely for optional-device state encoding, artifact integration, fresh endpoint and UART restore construction, migration/clone and terminal/FIFO portability outcomes, and signed restored-guest certification; those missing outcomes must not be inferred from capture-ready state.",
       "source_refs": [
         "corpus:device-api",
         "corpus:snapshot-support"
@@ -9411,7 +9411,7 @@
     {
       "id": "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
       "family": "memory-devices",
-      "summary": "Live inflate/deflate, DEFLATE_ON_OOM, publication-safe paired PFN accounting, polling and optional statistics, hinting/reporting, best-effort host reclaim, metrics, exact MMIO/PCI owner traversal, detached state validation, failures, and cleanup are implemented and verified. Wave 6 retains the aggregate until balloon state is encoded, integrated into artifacts, restored into live owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
+      "summary": "Live inflate/deflate, DEFLATE_ON_OOM, publication-safe paired PFN accounting, polling and optional statistics, hinting/reporting, best-effort host reclaim, metrics, exact MMIO/PCI owner traversal, detached state validation, failures, and cleanup are implemented and verified. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains the aggregate until balloon state is encoded, integrated into artifacts, restored into live owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
       "source_refs": [
         "corpus:ballooning"
       ],
@@ -9420,7 +9420,7 @@
     {
       "id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
       "family": "memory-devices",
-      "summary": "Live virtio-mem sizing and status, block lifecycle, publication-safe guest/HVF mapping, dirty metadata, exact reverse rollback, best-effort discard, singleton metrics, opaque shared-aperture identity, MMIO/PCI capture-ready state, failures, and cleanup are implemented and verified, including stable vhost coexistence. Wave 6 retains the aggregate until detached state is encoded, integrated into native artifacts, restored into exact transport and mapping owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
+      "summary": "Live virtio-mem sizing and status, block lifecycle, publication-safe guest/HVF mapping, dirty metadata, exact reverse rollback, best-effort discard, singleton metrics, opaque shared-aperture identity, MMIO/PCI capture-ready state, failures, and cleanup are implemented and verified, including stable vhost coexistence. Wave 6 issue https://github.com/seven332/bangbang/issues/1490 retains the aggregate until detached state is encoded, integrated into native artifacts, restored into exact transport and mapping owners, and certified for migration/clone, portability, and signed restored-guest behavior.",
       "source_refs": [
         "corpus:memory-hotplug"
       ],

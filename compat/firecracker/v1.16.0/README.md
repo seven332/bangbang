@@ -75,8 +75,13 @@ claims mechanically visible.
   typed VMClock capture, backward-compatible native-v1 state, ordered
   destination notifications, postcommit terminality, fresh destination PL031
   time, public per-vCPU PVTime measurement/accounting/publication/discovery,
-  capture-ready cumulative values, and signed Linux proof while leaving the one
-  aggregate record open for final clone/portability certification.
+  capture-ready cumulative values, and signed Linux proof while handing the one
+  aggregate record to Wave 6 #1490 for clone/portability certification.
+- [`remaining-device-contract.md`](remaining-device-contract.md) is the #1481
+  checked aggregate ledger. It joins the exact 52 balloon, 19 memory-hotplug,
+  seven entropy, six serial, and one time/identity records; pins the 77 terminal
+  and eight Wave 6 outcomes; and binds focused, signed MMIO/PCI, and production
+  serial-isolation evidence without changing family semantics.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -485,9 +490,15 @@ initialization and rollback, owner-thread `hv_vcpu_get_exec_time` measurement
 with Mach conversion, and policy-gated 64-bit SMCCC dispatch. #1480 adds bounded
 runnable wall/execution accounting, dirty-aware atomic little-endian
 publication, fail-closed public discovery, topology-ordered paused capture, and
-signed Linux contention/idle/pause certification. #1481 still owns final
-aggregate clone/portability reconciliation. No disposition changes, so the
-overlay remains 191/207/3/17.
+signed Linux contention/idle/pause certification. #1481 completes the aggregate
+live/capture-ready reconciliation with one shared MMIO/PCI signed profile,
+ordered failure/retry proof, bounded owner-budget reuse, and production
+default-stdio session isolation. The checked
+[`remaining-device-contract.md`](remaining-device-contract.md) selects exactly
+85 records: 77 are terminal and the same eight family aggregates remain
+`audit-required`, all under [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490).
+Wave 7 #1491 owns no selected row. No disposition changes, so the overlay
+remains 191/207/3/17.
 
 ## Commands
 

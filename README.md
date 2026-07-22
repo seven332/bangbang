@@ -36,6 +36,19 @@ reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
 for exact upstream sources and classifications.
 
+The checked
+[aggregate remaining-device contract](compat/firecracker/v1.16.0/remaining-device-contract.md)
+closes #1481's live and capture-ready certification boundary across balloon,
+virtio-mem, entropy, default serial stdio, and time/identity devices. Its exact
+85-record selector has 77 terminal records and eight `audit-required` records,
+all assigned to [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)
+for optional-device encoding, restore, clone/portability policy, and signed
+restored-guest outcomes. The aggregate signed profile composes those devices
+over both default MMIO and product PCI, while the production-bundle gate proves
+two launcher/App-Sandbox-worker default-stdio sessions remain isolated. This
+does not make the private capture-ready values a snapshot format or a restored
+device claim.
+
 On macOS arm64 hosts with the required macOS 15+ HVF GIC/MSI symbols,
 `--enable-pci` selects Firecracker's exclusive all-virtio startup transport.
 Balloon, block, network, pmem, vsock, entropy, and virtio-mem functions are
@@ -1167,8 +1180,13 @@ records its exact five-terminal/two-Wave-6 split, and the
 its exact five-terminal/one-Wave-6 split. The
 [time and identity restore ledger](compat/firecracker/v1.16.0/time-identity-contract.md)
 records the completed PL031, VMGenID, VMClock, and live/capture-ready public
-PVTime behavior while retaining its one aggregate record for final
-clone/portability certification.
+PVTime behavior while retaining its one aggregate record for Wave 6
+clone/portability certification. The
+[aggregate remaining-device ledger](compat/firecracker/v1.16.0/remaining-device-contract.md)
+joins those five family ledgers into an exact 85-record,
+77-terminal/eight-Wave-6 closure without changing the repository-wide
+191/207/3/17 disposition
+counts; none of those 85 records is transferred to Wave 7 #1491.
 
 ## Build And Test
 

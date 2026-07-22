@@ -292,6 +292,15 @@ claim is permitted. Active SVE/SME or breakpoint/watchpoint state is rejected
 rather than silently omitted, and optional devices remain outside the accepted
 profile.
 
+The #1481 aggregate preflight traverses balloon, memory-hotplug, entropy,
+serial, and time/identity state in one fixed order before the existing
+optional-profile rejection. Injected failures stop at the named stage, preserve the
+paused configuration, publish no artifact, and permit same-session retry after
+complete cleanup. The captured values remain private validation objects: they
+do not authorize host endpoints, encode optional devices, or establish restore,
+clone, migration, or cross-host portability. Those responsibilities remain
+with Wave 6 #1490.
+
 The internal native-v1 device profile is untrusted input even when its outer
 state file passed length and CRC checks; CRC detects accidental corruption and
 is not authentication. The standalone `BANGDEV\0` decoder caps the complete
@@ -2128,6 +2137,12 @@ the legacy six mutable register bytes; restore constructs fresh default output
 with empty metrics. It does not preserve a public output path, limiter budget,
 RX bytes/intents, or any host endpoint. This prevents silent inheritance of
 source-process authority and is not a Firecracker artifact-compatibility claim.
+The aggregate production gate additionally holds two
+launcher/App-Sandbox-worker sessions at once and proves that pausing, feeding, closing, or terminating
+one default-stdio session cannot advance or tear down the other. Each launcher
+retains exactly one worker, and both socket/session roots disappear only with
+their owning session; no steady helper or cross-session descriptor authority is
+introduced.
 
 Block devices can expose host file contents to the guest and can write to the
 backing file when configured read-write. Operators should use dedicated disk

@@ -3268,6 +3268,161 @@ fn normal_bundle_streams_default_serial_stdio_across_launcher_worker_boundary() 
 }
 
 #[test]
+fn normal_bundle_isolates_concurrent_default_serial_stdio_sessions() {
+    let bundle = production_bundle();
+    let mut first = spawn_ready_serial_api_launcher(&bundle, "concurrent-serial-a");
+    let mut second = spawn_ready_serial_api_launcher(&bundle, "concurrent-serial-b");
+    assert_eq!(session_entries().len(), 2);
+
+    let configure_and_start = |running: &RunningSerialApiLauncher, name: &str| {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            204,
+            &format!("PUT {name} serial machine config"),
+        );
+        let resources = worker_bundle(&bundle).join("Contents/Resources");
+        let boot_source = serde_json::json!({
+            "kernel_image_path": path_text(&resources.join("guest-kernel")),
+            "initrd_path": path_text(&resources.join("guest-initrd")),
+            "boot_args": GUEST_SERIAL_RX_BOOT_ARGS,
+        });
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                "/boot-source",
+                &serde_json::to_string(&boot_source)
+                    .expect("concurrent serial boot source should serialize"),
+            ),
+            204,
+            &format!("PUT {name} serial boot source"),
+        );
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            204,
+            &format!("start {name} serial guest"),
+        );
+        running
+            .wait_for_stdout_marker(GUEST_SERIAL_RX_READY_MARKER, PROCESS_TIMEOUT)
+            .unwrap_or_else(|error| panic!("{name} serial receiver should become ready: {error}"));
+    };
+    configure_and_start(&first, "first concurrent");
+    configure_and_start(&second, "second concurrent");
+
+    let first_worker = only_worker_pid(&first.child);
+    let second_worker = only_worker_pid(&second.child);
+    assert_ne!(first_worker, second_worker);
+    assert!(
+        child_pids(first_worker).is_empty(),
+        "first serial worker must not retain a binder or broker helper"
+    );
+    assert!(
+        child_pids(second_worker).is_empty(),
+        "second serial worker must not retain a binder or broker helper"
+    );
+
+    assert_http_status(
+        &http_request(&first.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause first concurrent production serial guest",
+    );
+    let mut serial_input = b"BANGBANG_SERIAL_RX_".to_vec();
+    serial_input.extend(std::iter::repeat_n(b'A', 80));
+    serial_input.extend_from_slice(b"_END\n");
+
+    second.write_stdin(&serial_input);
+    second
+        .wait_for_stdout_marker(GUEST_SERIAL_RX_SUCCESS_MARKER, PROCESS_TIMEOUT)
+        .expect("second concurrent production serial guest should receive its input");
+    assert!(
+        !first
+            .stdout_snapshot()
+            .contains(GUEST_SERIAL_RX_SUCCESS_MARKER),
+        "the paused first serial session must not observe second-session progress"
+    );
+
+    first.write_stdin(&serial_input);
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !first
+            .stdout_snapshot()
+            .contains(GUEST_SERIAL_RX_SUCCESS_MARKER),
+        "the paused first serial session must not consume its queued input"
+    );
+    assert_http_status(
+        &http_request(&first.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume first concurrent production serial guest",
+    );
+    first
+        .wait_for_stdout_marker(GUEST_SERIAL_RX_SUCCESS_MARKER, PROCESS_TIMEOUT)
+        .expect("first concurrent production serial guest should consume its own input");
+
+    for (running, name) in [(&first, "first"), (&second, "second")] {
+        let stdout = running.stdout_snapshot();
+        assert_eq!(
+            stdout.matches(GUEST_SERIAL_RX_SUCCESS_MARKER).count(),
+            1,
+            "{name} serial session should publish exactly one success marker"
+        );
+        assert!(!stdout.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
+    }
+    second.close_stdin();
+    thread::sleep(Duration::from_millis(100));
+    assert_http_status(
+        &http_get(&second.socket, "/"),
+        200,
+        "second concurrent serial API after stdin EOF",
+    );
+    first.close_stdin();
+    thread::sleep(Duration::from_millis(100));
+    assert_http_status(
+        &http_get(&first.socket, "/"),
+        200,
+        "first concurrent serial API after stdin EOF",
+    );
+
+    let second_pid = i32::try_from(second.child.id()).expect("second launcher PID should fit");
+    // SAFETY: This targets the live unreaped launcher owned by the test.
+    assert_eq!(unsafe { libc::kill(second_pid, libc::SIGTERM) }, 0);
+    let (second_status, second_stdout, second_stderr) =
+        second.wait("second concurrent production serial stop");
+    assert!(
+        second_status.success(),
+        "second concurrent serial launcher should stop cleanly: {second_status:?}\nstdout:\n{second_stdout}\nstderr:\n{second_stderr}"
+    );
+    assert!(!second.socket.exists());
+    assert!(first.socket.exists());
+    assert_eq!(session_entries().len(), 1);
+    assert_http_status(
+        &http_get(&first.socket, "/"),
+        200,
+        "first concurrent serial API after peer termination",
+    );
+    assert_eq!(only_worker_pid(&first.child), first_worker);
+    assert!(child_pids(first_worker).is_empty());
+
+    let first_pid = i32::try_from(first.child.id()).expect("first launcher PID should fit");
+    // SAFETY: This targets the live unreaped launcher owned by the test.
+    assert_eq!(unsafe { libc::kill(first_pid, libc::SIGTERM) }, 0);
+    let (first_status, first_stdout, first_stderr) =
+        first.wait("first concurrent production serial stop");
+    assert!(
+        first_status.success(),
+        "first concurrent serial launcher should stop cleanly: {first_status:?}\nstdout:\n{first_stdout}\nstderr:\n{first_stderr}"
+    );
+    assert!(!first.socket.exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
 fn normal_bundle_adopts_output_grants_from_config_file_and_startup_cli() {
     let bundle = production_bundle();
     for (case, mode) in [
