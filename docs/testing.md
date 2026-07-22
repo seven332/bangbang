@@ -123,6 +123,16 @@ the small request in the same run preserves the older MMDS baseline. This is
 deterministic internal packet-path evidence, not positive external vmnet
 connectivity.
 
+Aggregate network/MMDS reconciliation additionally requires
+`network_mmds_closure_policy_is_stable`. The checked
+[network and MMDS ledger](../compat/firecracker/v1.16.0/network-mmds-contract.md)
+pins exactly 35 identities, 31 terminal outcomes, four named downstream
+handoffs, the direct MMIO/PCI transport cases above, signed process isolation
+and hotplug, signed capture-ready traversal, contained production ownership,
+and the credential-free vmnet preflight block. These layers compose the
+aggregate claim; the repository still does not treat a blocked credential gate
+as positive #1378 connectivity evidence.
+
 Public `--enable-pci` changes additionally require
 `macos_arm64::signed_executable_runs_all_startup_virtio_devices_over_product_pci`
 through
@@ -1033,7 +1043,7 @@ records the corresponding evidence and later-wave boundaries. Generic source,
 reference, and disposition invariants remain owned by the validator itself.
 
 After the checked storage, balloon, memory-hotplug, entropy, and serial delivery
-closures, the same 418-record overlay contains 191
+closures, that checkpoint of the 418-record overlay contains 191
 `implemented-and-verified`, 207 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. The
 [entropy closure ledger](../compat/firecracker/v1.16.0/entropy-contract.md)
@@ -1050,6 +1060,13 @@ The checked
 then fixes the union at 85 unique records with a 77-terminal/eight-Wave-6
 split. Its audit test rejects family drift, overlap, stale #1440/#1481 handoffs,
 wrong #1490 URLs, any selected #1491 row, and missing focused or signed evidence.
+
+After the checked network/MMDS closure, the current overlay contains 220
+`implemented-and-verified`, 178 `audit-required`, three
+`missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. Its
+35-record selector promotes 29 formerly audited rows and retains exactly four
+for #1378, #1490, or #1491 outcomes.
+
 Run its two focused gates with:
 
 ```sh
@@ -2019,8 +2036,9 @@ open no vmnet interface. Portable checksum/segmentation semantics, merged RX,
 ring behavior, limiter/backend metrics, bounded MMDS TCP sessions, and merged
 protocol/limiter scheduling have focused unsigned coverage plus signed MMIO and
 PCI MMDS-only packet-path evidence. Positive direct-header vmnet I/O, automatic
-PCI notification, external connectivity, and network snapshot state remain
-outside the signed boundary as described by their owning issues.
+PCI notification, external connectivity, and network/MMDS snapshot encoding
+and restore remain outside the signed boundary as described by their owning
+issues; deterministic capture-ready state is covered separately.
 
 For block specifically, this evidence validates the supported public
 file-backed subset over MMIO by default or PCI with `--enable-pci`, including

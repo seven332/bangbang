@@ -46,6 +46,231 @@ fn checked_source_manifest_is_canonical_and_deterministic() {
 }
 
 #[test]
+fn network_mmds_closure_policy_is_stable() {
+    const TERMINAL: [&str; 31] = [
+        "api-operation:GET /mmds",
+        "api-operation:PATCH /mmds",
+        "api-operation:PATCH /network-interfaces/{iface_id}",
+        "api-operation:PUT /mmds",
+        "api-operation:PUT /mmds/config",
+        "api-operation:PUT /network-interfaces/{iface_id}",
+        "api-path:/mmds",
+        "api-path:/mmds/config",
+        "api-path:/network-interfaces/{iface_id}",
+        "api-property:FullVmConfiguration.mmds-config",
+        "api-property:FullVmConfiguration.network-interfaces",
+        "api-property:MmdsConfig.imds_compat",
+        "api-property:MmdsConfig.ipv4_address",
+        "api-property:MmdsConfig.network_interfaces",
+        "api-property:MmdsConfig.version",
+        "api-property:NetworkInterface.guest_mac",
+        "api-property:NetworkInterface.host_dev_name",
+        "api-property:NetworkInterface.iface_id",
+        "api-property:NetworkInterface.mtu",
+        "api-property:NetworkInterface.rx_rate_limiter",
+        "api-property:NetworkInterface.tx_rate_limiter",
+        "api-property:PartialNetworkInterface.iface_id",
+        "api-property:PartialNetworkInterface.rx_rate_limiter",
+        "api-property:PartialNetworkInterface.tx_rate_limiter",
+        "api-schema:MmdsConfig",
+        "api-schema:MmdsContentsObject",
+        "api-schema:NetworkInterface",
+        "api-schema:PartialNetworkInterface",
+        "corpus:mmds-design",
+        "corpus:patch-network-interface",
+        "non-swagger-route:DELETE /network-interfaces/{iface_id}",
+    ];
+    const RETAINED: [(&str, &[&str], &str); 4] = [
+        (
+            "corpus:mmds-user-guide",
+            &["https://github.com/seven332/bangbang/issues/1490"],
+            "`W6`",
+        ),
+        (
+            "corpus:network-setup",
+            &[
+                "https://github.com/seven332/bangbang/issues/1378",
+                "https://github.com/seven332/bangbang/issues/1490",
+            ],
+            "`EXTERNAL-GATE + W6`",
+        ),
+        (
+            "semantic.mmds:tcp-token-session-and-isolation",
+            &["https://github.com/seven332/bangbang/issues/1490"],
+            "`W6`",
+        ),
+        (
+            "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+            &[
+                "https://github.com/seven332/bangbang/issues/1378",
+                "https://github.com/seven332/bangbang/issues/1490",
+                "https://github.com/seven332/bangbang/issues/1491",
+            ],
+            "`EXTERNAL-GATE + W6 + W7`",
+        ),
+    ];
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+    let contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/network-mmds-contract.md"),
+    )
+    .expect("checked network/MMDS contract must be readable");
+
+    let expected_ids = TERMINAL
+        .into_iter()
+        .chain(RETAINED.iter().map(|(id, _, _)| *id))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected_ids.len(),
+        35,
+        "network/MMDS ledger must stay exact"
+    );
+
+    for id in TERMINAL {
+        let capability = by_id
+            .get(id)
+            .expect("terminal network/MMDS record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "terminal network/MMDS disposition drifted: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "terminal network/MMDS evidence is incomplete: {id}"
+        );
+        assert!(
+            !capability.summary.contains("Audit ")
+                && !capability.summary.contains("Continue auditing")
+                && !capability.summary.contains("current live subset"),
+            "terminal network/MMDS summary still names future audit work: {id}"
+        );
+    }
+
+    for (id, owner_urls, downstream) in RETAINED {
+        let capability = by_id
+            .get(id)
+            .expect("retained network/MMDS record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "retained network/MMDS disposition drifted: {id}"
+        );
+        for owner_url in owner_urls {
+            assert!(
+                capability.summary.contains(owner_url),
+                "retained network/MMDS summary must name {owner_url}: {id}"
+            );
+        }
+        for outcome in ["restore", "clone"] {
+            assert!(
+                capability.summary.contains(outcome),
+                "retained network/MMDS summary must name missing {outcome}: {id}"
+            );
+        }
+        if id.contains("network") {
+            assert!(
+                capability.summary.contains("connectivity"),
+                "retained network summary must name missing connectivity: {id}"
+            );
+        }
+        if id.starts_with("semantic.network") {
+            assert!(
+                capability.summary.contains("performance")
+                    && capability.summary.contains("observability"),
+                "retained network semantic must name Wave 7 outcomes"
+            );
+        }
+
+        let row_prefix = format!("| `{id}` |");
+        let row = contract
+            .lines()
+            .find(|line| line.starts_with(&row_prefix))
+            .unwrap_or_else(|| panic!("network/MMDS contract row must exist: {id}"));
+        assert!(
+            row.contains("`audit-required`") && row.ends_with(&format!("| {downstream} |")),
+            "retained network/MMDS ledger row has the wrong handoff: {id}"
+        );
+    }
+
+    let rows = contract
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect::<Vec<_>>();
+    let contract_ids = rows
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix("| `")
+                .and_then(|line| line.split_once("` |"))
+                .map(|(id, _)| id)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(rows.len(), 35, "network/MMDS contract row count drifted");
+    assert_eq!(
+        contract_ids, expected_ids,
+        "network/MMDS identity set drifted"
+    );
+    for id in TERMINAL {
+        let row_prefix = format!("| `{id}` |");
+        let row = rows
+            .iter()
+            .copied()
+            .find(|row| row.starts_with(&row_prefix))
+            .unwrap_or_else(|| panic!("terminal network/MMDS row must exist: {id}"));
+        assert_eq!(
+            contract.matches(&row_prefix).count(),
+            1,
+            "network/MMDS contract row must be unique: {id}"
+        );
+        assert!(row.contains("`implemented-and-verified`"));
+        assert!(row.ends_with("| `terminal` |"));
+    }
+
+    for required in [
+        "https://github.com/seven332/bangbang/issues/1378",
+        "https://github.com/seven332/bangbang/issues/1490",
+        "https://github.com/seven332/bangbang/issues/1491",
+        "boots_signed_mmio_guest_with_complete_virtio_network_semantics",
+        "boots_signed_pci_guest_with_complete_virtio_network_semantics",
+        "capture_ready_network_traverses_signed_mmio_and_pci_owners",
+        "signed_executable_serves_mmds_on_two_isolated_guest_interfaces",
+        "signed_executable_keeps_concurrent_mmds_processes_isolated",
+        "signed_executable_hotplugs_mmds_network_and_reuses_product_pci_slot",
+        "normal_bundle_hotplugs_mmds_network_without_vmnet_authority",
+        "networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation",
+        "bangbang vmnet preflight: blocked",
+    ] {
+        assert!(
+            contract.contains(required),
+            "network/MMDS contract must pin {required}"
+        );
+    }
+
+    let count = |disposition| {
+        inventory
+            .capabilities
+            .iter()
+            .filter(|capability| capability.disposition == disposition)
+            .count()
+    };
+    assert_eq!(count(Disposition::ImplementedAndVerified), 220);
+    assert_eq!(count(Disposition::AuditRequired), 178);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
+}
+
+#[test]
 fn delivery_closure_policy_is_stable() {
     const IMPLEMENTED_ORIGINAL: [&str; 5] = [
         "corpus:cpu-boot-protocol",
@@ -309,8 +534,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 191);
-    assert_eq!(count(Disposition::AuditRequired), 207);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 220);
+    assert_eq!(count(Disposition::AuditRequired), 178);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
