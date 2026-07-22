@@ -308,11 +308,18 @@ five-component `BANGHVF\0` payload and nested `BANGDEV\0` device profile.
 
 Create reserves one FIFO boot-worker transaction, then failure-atomically
 quiesces the block, PMEM, network, and entropy retry publishers. The same lease
-traverses capture-ready storage, balloon, memory-hotplug, and entropy MMIO/PCI
-owners before applying the narrow public optional-device profile rejection.
+traverses capture-ready storage, balloon, memory-hotplug, entropy, serial, and
+network owners across their applicable MMIO/PCI transports before applying the
+narrow public optional-device profile rejection.
 Entropy traversal validates exact queue, feature, limiter, pending-descriptor,
 and scheduler state without persisting host entropy bytes or a wall-clock
-value. The same lease
+value. Network traversal joins configuration order to generation-bound packet
+I/O, metrics, MMDS identity, transport, queue, feature, limiter, and retry
+state. It retains one exact reconstructible TX retry while validating and
+normalizing source-only cached RX, active MMDS protocol state, callbacks, host
+handles, peer packets, and absolute deadlines out of the handoff. These
+detached, redacted values are input for Wave 6 #1490, not a network encoding or
+restore claim. The same lease
 preflights both final namespaces, streams the paused aggregate capture into an
 owner-only staging inode, verifies and synchronizes it, publishes memory first
 and state last as the commit marker without replacing existing entries, and

@@ -20,6 +20,8 @@ use bangbang_hvf::{
     HvfArm64BootEntropyCaptureState, HvfArm64BootEntropyDeviceConfig,
     HvfArm64BootLimiterRetryWakeupQuiescenceGuard, HvfArm64BootMemoryHotplugCaptureError,
     HvfArm64BootMemoryHotplugCaptureState, HvfArm64BootMemoryHotplugDeviceConfig,
+    HvfArm64BootNetworkCaptureConfig, HvfArm64BootNetworkCaptureError,
+    HvfArm64BootNetworkCaptureState, HvfArm64BootNetworkInterfaceCaptureState,
     HvfArm64BootPciBalloonDeviceUpdater, HvfArm64BootPciBlockDeviceUpdater,
     HvfArm64BootPciNetworkDeviceUpdater, HvfArm64BootPciPmemDeviceUpdater,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
@@ -57,13 +59,18 @@ use bangbang_runtime::memory_hotplug::{
     MemoryHotplugUpdateError, VirtioMemMmioLayout,
 };
 use bangbang_runtime::metrics::{
-    BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
+    BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, MmdsMetrics,
+    NetworkInterfaceMetrics, NetworkInterfaceMetricsCaptureError,
+    NetworkInterfaceMetricsCaptureState, SharedBalloonDeviceMetrics,
     SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
     SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
     SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
+};
+use bangbang_runtime::mmds_network::{
+    MmdsNetworkStackCaptureDescriptor, MmdsNetworkStackCaptureError,
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::{
@@ -141,7 +148,8 @@ use crate::direct_vhost_user;
 use crate::host_network::virtio_vmnet::{
     MmdsNetworkStackBuildError, MmdsOnlyVirtioNetworkPacketIo,
     MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour, PreparedVmnetVirtioNetworkRxBuffer,
-    VmnetPacketReadinessLease, VmnetVirtioNetworkBatchLimits, VmnetVirtioNetworkPacketIo,
+    VmnetPacketReadinessLease, VmnetPacketReadinessQuiescenceError,
+    VmnetPacketReadinessQuiescenceGuard, VmnetVirtioNetworkBatchLimits, VmnetVirtioNetworkPacketIo,
     VmnetVirtioNetworkPacketIoBuildError, VmnetVirtioNetworkPacketIoStopError,
     VmnetVirtioNetworkPacketProfile,
 };
@@ -285,6 +293,16 @@ pub(crate) trait InstanceStartExecutor {
         Ok(())
     }
 
+    fn preflight_snapshot_v1_network(
+        &mut self,
+        _session: &mut Self::Session,
+        _configs: Vec<NetworkInterfaceConfig>,
+        _mmds_config: Option<MmdsConfig>,
+        _mmds_state: MmdsStateHandle,
+    ) -> Result<(), ProcessCaptureReadyNetworkError> {
+        Ok(())
+    }
+
     fn publish_snapshot_v1(
         &mut self,
         session: &mut Self::Session,
@@ -398,6 +416,7 @@ pub(crate) enum NativeV1SnapshotPublicationError {
     MemoryHotplugPreflight(HvfArm64BootMemoryHotplugCaptureError),
     EntropyPreflight(HvfArm64BootEntropyCaptureError),
     SerialPreflight(HvfArm64BootSerialCaptureError),
+    NetworkPreflight(ProcessCaptureReadyNetworkError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -425,6 +444,9 @@ impl fmt::Display for NativeV1SnapshotPublicationError {
             Self::SerialPreflight(source) => {
                 write!(f, "native-v1 serial preflight failed: {source}")
             }
+            Self::NetworkPreflight(source) => {
+                write!(f, "native-v1 network preflight failed: {source}")
+            }
             Self::Resource(source) => {
                 write!(
                     f,
@@ -449,6 +471,7 @@ impl std::error::Error for NativeV1SnapshotPublicationError {
             Self::MemoryHotplugPreflight(source) => Some(source),
             Self::EntropyPreflight(source) => Some(source),
             Self::SerialPreflight(source) => Some(source),
+            Self::NetworkPreflight(source) => Some(source),
             Self::Resource(source) => Some(source),
             Self::Transaction(source) => Some(source),
             Self::SessionUnavailable | Self::ConfigurationUnavailable => None,
@@ -3710,6 +3733,16 @@ where
         self.starter
             .preflight_snapshot_v1_serial(session, serial_config.clone())
             .map_err(NativeV1SnapshotPublicationError::SerialPreflight)?;
+        let network_configs = self.controller.network_interface_configs().to_vec();
+        let mmds_config = self.controller.mmds_config().map_err(|source| {
+            NativeV1SnapshotPublicationError::NetworkPreflight(
+                ProcessCaptureReadyNetworkError::MmdsState { source },
+            )
+        })?;
+        let mmds_state = self.controller.mmds_state_handle();
+        self.starter
+            .preflight_snapshot_v1_network(session, network_configs, mmds_config, mmds_state)
+            .map_err(NativeV1SnapshotPublicationError::NetworkPreflight)?;
 
         self.controller
             .preflight_create_snapshot_profile()
@@ -4096,6 +4129,18 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         config: SerialConfig,
     ) -> Result<(), HvfArm64BootSerialCaptureError> {
         session.capture_ready_serial_state(config).map(|_| ())
+    }
+
+    fn preflight_snapshot_v1_network(
+        &mut self,
+        session: &mut Self::Session,
+        configs: Vec<NetworkInterfaceConfig>,
+        mmds_config: Option<MmdsConfig>,
+        mmds_state: MmdsStateHandle,
+    ) -> Result<(), ProcessCaptureReadyNetworkError> {
+        session
+            .capture_ready_network_state(configs, mmds_config, mmds_state)
+            .map(|_| ())
     }
 
     fn publish_snapshot_v1(
@@ -4636,6 +4681,114 @@ impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
     }
 }
 
+impl ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider> {
+    fn capture_ready_network_state_at(
+        &self,
+        configs: &[NetworkInterfaceConfig],
+        mmds_config: Option<&MmdsConfig>,
+        mmds_state: &MmdsStateHandle,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<ProcessCaptureReadyNetworkState, ProcessCaptureReadyNetworkError> {
+        let publication_guard = self.packet_io.quiesce_capture_publication()?;
+        let prepared = self.packet_io.prepare_capture(
+            configs,
+            mmds_config,
+            mmds_state,
+            self.mmds_metrics.as_ref(),
+            now,
+        )?;
+        let metrics = self
+            .session
+            .shared_network_interface_metrics()
+            .capture_state()
+            .map_err(|source| ProcessCaptureReadyNetworkError::Metrics { source })?;
+        let hvf = self
+            .session
+            .capture_ready_network_state_at(&prepared.hvf_configs, guard, now)
+            .map_err(|source| ProcessCaptureReadyNetworkError::Hvf { source })?;
+        let captured =
+            compose_process_capture_ready_network_state(configs, prepared, metrics, hvf)?;
+        drop(publication_guard);
+        Ok(captured)
+    }
+}
+
+fn compose_process_capture_ready_network_state(
+    configs: &[NetworkInterfaceConfig],
+    prepared: PreparedProcessNetworkCapture,
+    metrics: NetworkInterfaceMetricsCaptureState,
+    hvf: HvfArm64BootNetworkCaptureState,
+) -> Result<ProcessCaptureReadyNetworkState, ProcessCaptureReadyNetworkError> {
+    if prepared.entries.len() != configs.len()
+        || prepared.hvf_configs.len() != configs.len()
+        || metrics.entries().len() != configs.len()
+        || hvf.interfaces().len() != configs.len()
+    {
+        return Err(ProcessCaptureReadyNetworkError::InventoryMismatch);
+    }
+    let mut interfaces = Vec::new();
+    interfaces
+        .try_reserve_exact(configs.len())
+        .map_err(|_| ProcessCaptureReadyNetworkError::Allocation)?;
+    let mut metrics_generations = Vec::new();
+    metrics_generations
+        .try_reserve_exact(configs.len())
+        .map_err(|_| ProcessCaptureReadyNetworkError::Allocation)?;
+
+    for (index, config) in configs.iter().enumerate() {
+        let provider = prepared
+            .entries
+            .get(index)
+            .ok_or(ProcessCaptureReadyNetworkError::InventoryMismatch)?;
+        let hvf_config = prepared
+            .hvf_configs
+            .get(index)
+            .ok_or(ProcessCaptureReadyNetworkError::InventoryMismatch)?;
+        let hvf_entry = hvf
+            .interfaces()
+            .get(index)
+            .ok_or(ProcessCaptureReadyNetworkError::InventoryMismatch)?;
+        if hvf_config.config() != config
+            || hvf_entry.config() != config
+            || hvf_entry.profile() != hvf_config.profile()
+        {
+            return Err(ProcessCaptureReadyNetworkError::InventoryMismatch);
+        }
+        let mut metric_matches = metrics
+            .entries()
+            .iter()
+            .filter(|entry| entry.iface_id() == config.iface_id());
+        let metric = metric_matches
+            .next()
+            .ok_or(ProcessCaptureReadyNetworkError::InventoryMismatch)?;
+        if metric_matches.next().is_some()
+            || metrics_generations.contains(&metric.generation())
+            || metric.generation() >= metrics.next_generation()
+        {
+            return Err(ProcessCaptureReadyNetworkError::GenerationMismatch);
+        }
+        metrics_generations.push(metric.generation());
+        interfaces.push(ProcessCaptureReadyNetworkInterfaceState {
+            provider_generation: provider.generation,
+            metrics_generation: metric.generation(),
+            metrics: metric.metrics(),
+            backend: provider.backend.clone(),
+            mmds_stack: provider.mmds_stack,
+            hvf: hvf_entry.clone(),
+        });
+    }
+
+    Ok(ProcessCaptureReadyNetworkState {
+        interfaces,
+        provider_next_generation: prepared.provider_next_generation,
+        metrics_next_generation: metrics.next_generation(),
+        aggregate_metrics: metrics.aggregate(),
+        mmds: prepared.mmds,
+        source_work_normalized: hvf.source_work_normalized(),
+    })
+}
+
 impl<P> NativeV1SnapshotCaptureSession for ProcessHvfBootSession<OwnedHvfArm64BootSession, P>
 where
     P: ProcessRuntimeNetworkPacketIoProvider + Send + 'static,
@@ -4795,6 +4948,299 @@ where
             Self::Vmnet(packet_io) => packet_io.mmds_retry_after(),
         }
     }
+
+    fn capture_cached_rx_len(&self) -> Option<usize> {
+        match self {
+            Self::MmdsOnly(packet_io) => packet_io.capture_cached_rx_len(),
+            Self::Vmnet(packet_io) => packet_io.capture_cached_rx_len(),
+        }
+    }
+
+    fn packet_retry_after_at(&self, now: Instant) -> Option<Duration> {
+        match self {
+            Self::MmdsOnly(packet_io) => packet_io.mmds_retry_after_at(now),
+            Self::Vmnet(packet_io) => packet_io.mmds_retry_after_at(now),
+        }
+    }
+
+    fn capture_mmds_ready_at(&self, now: Instant) -> bool {
+        match self {
+            Self::MmdsOnly(packet_io) => packet_io.capture_mmds_ready_at(now),
+            Self::Vmnet(packet_io) => packet_io.capture_mmds_ready_at(now),
+        }
+    }
+
+    fn capture_tx_transaction_active(&self) -> bool {
+        match self {
+            Self::MmdsOnly(packet_io) => packet_io.capture_tx_transaction_active(),
+            Self::Vmnet(packet_io) => packet_io.capture_tx_transaction_active(),
+        }
+    }
+
+    fn capture_mmds_stack(&self) -> Option<bangbang_runtime::mmds_network::MmdsNetworkStackHandle> {
+        match self {
+            Self::MmdsOnly(packet_io) => Some(packet_io.capture_mmds_stack()),
+            Self::Vmnet(packet_io) => packet_io.capture_mmds_stack(),
+        }
+    }
+
+    fn quiesce_readiness_publication(
+        &self,
+    ) -> Result<Option<VmnetPacketReadinessQuiescenceGuard>, VmnetPacketReadinessQuiescenceError>
+    {
+        match self {
+            Self::MmdsOnly(_) => Ok(None),
+            Self::Vmnet(packet_io) => packet_io.quiesce_readiness_publication().map(Some),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum ProcessCaptureReadyNetworkBackend {
+    MmdsOnly,
+    Vmnet(VmnetInterfaceParameters),
+}
+
+impl fmt::Debug for ProcessCaptureReadyNetworkBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MmdsOnly => "ProcessCaptureReadyNetworkBackend::MmdsOnly",
+            Self::Vmnet(_) => "ProcessCaptureReadyNetworkBackend::Vmnet(<redacted>)",
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProcessCaptureReadyNetworkInterfaceState {
+    provider_generation: u64,
+    metrics_generation: u64,
+    metrics: NetworkInterfaceMetrics,
+    backend: ProcessCaptureReadyNetworkBackend,
+    mmds_stack: Option<MmdsNetworkStackCaptureDescriptor>,
+    hvf: HvfArm64BootNetworkInterfaceCaptureState,
+}
+
+#[expect(
+    dead_code,
+    reason = "encoding-independent network handoff accessors are consumed by #1490"
+)]
+impl ProcessCaptureReadyNetworkInterfaceState {
+    pub(crate) const fn provider_generation(&self) -> u64 {
+        self.provider_generation
+    }
+
+    pub(crate) const fn metrics_generation(&self) -> u64 {
+        self.metrics_generation
+    }
+
+    pub(crate) const fn metrics(&self) -> NetworkInterfaceMetrics {
+        self.metrics
+    }
+
+    pub(crate) const fn backend(&self) -> &ProcessCaptureReadyNetworkBackend {
+        &self.backend
+    }
+
+    pub(crate) const fn mmds_stack(&self) -> Option<MmdsNetworkStackCaptureDescriptor> {
+        self.mmds_stack
+    }
+
+    pub(crate) const fn hvf(&self) -> &HvfArm64BootNetworkInterfaceCaptureState {
+        &self.hvf
+    }
+}
+
+impl fmt::Debug for ProcessCaptureReadyNetworkInterfaceState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessCaptureReadyNetworkInterfaceState")
+            .field("provider_generation", &self.provider_generation)
+            .field("metrics_generation", &self.metrics_generation)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProcessCaptureReadyMmdsState {
+    config: MmdsConfig,
+    metrics: MmdsMetrics,
+}
+
+#[expect(
+    dead_code,
+    reason = "encoding-independent MMDS handoff accessors are consumed by #1490"
+)]
+impl ProcessCaptureReadyMmdsState {
+    pub(crate) const fn config(&self) -> &MmdsConfig {
+        &self.config
+    }
+
+    pub(crate) const fn metrics(&self) -> MmdsMetrics {
+        self.metrics
+    }
+}
+
+impl fmt::Debug for ProcessCaptureReadyMmdsState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessCaptureReadyMmdsState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The encoding-independent process handoff consumed by #1490.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProcessCaptureReadyNetworkState {
+    interfaces: Vec<ProcessCaptureReadyNetworkInterfaceState>,
+    provider_next_generation: u64,
+    metrics_next_generation: u64,
+    aggregate_metrics: NetworkInterfaceMetrics,
+    mmds: Option<ProcessCaptureReadyMmdsState>,
+    source_work_normalized: bool,
+}
+
+#[expect(
+    dead_code,
+    reason = "encoding-independent network handoff accessors are consumed by #1490"
+)]
+impl ProcessCaptureReadyNetworkState {
+    pub(crate) fn interfaces(&self) -> &[ProcessCaptureReadyNetworkInterfaceState] {
+        &self.interfaces
+    }
+
+    pub(crate) const fn provider_next_generation(&self) -> u64 {
+        self.provider_next_generation
+    }
+
+    pub(crate) const fn metrics_next_generation(&self) -> u64 {
+        self.metrics_next_generation
+    }
+
+    pub(crate) const fn aggregate_metrics(&self) -> NetworkInterfaceMetrics {
+        self.aggregate_metrics
+    }
+
+    pub(crate) const fn mmds(&self) -> Option<&ProcessCaptureReadyMmdsState> {
+        self.mmds.as_ref()
+    }
+
+    pub(crate) const fn source_work_normalized(&self) -> bool {
+        self.source_work_normalized
+    }
+}
+
+impl fmt::Debug for ProcessCaptureReadyNetworkState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessCaptureReadyNetworkState")
+            .field("interface_count", &self.interfaces.len())
+            .field("provider_next_generation", &self.provider_next_generation)
+            .field("metrics_next_generation", &self.metrics_next_generation)
+            .field("mmds", &self.mmds.as_ref().map(|_| "<configured>"))
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ProcessCaptureReadyNetworkError {
+    OwnerUnavailable,
+    Allocation,
+    PublicationQuiescence,
+    InventoryMismatch,
+    GenerationMismatch,
+    ReservedMacMismatch,
+    BackendMismatch,
+    PacketTransactionInFlight,
+    MmdsMismatch,
+    MmdsState {
+        source: MmdsStateLockError,
+    },
+    MmdsStack {
+        source: MmdsNetworkStackCaptureError,
+    },
+    Metrics {
+        source: NetworkInterfaceMetricsCaptureError,
+    },
+    Hvf {
+        source: HvfArm64BootNetworkCaptureError,
+    },
+}
+
+impl fmt::Display for ProcessCaptureReadyNetworkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OwnerUnavailable => formatter.write_str("network capture owner is unavailable"),
+            Self::Allocation => formatter.write_str("network capture allocation failed"),
+            Self::PublicationQuiescence => {
+                formatter.write_str("network callback publication could not be quiesced")
+            }
+            Self::InventoryMismatch => {
+                formatter.write_str("network capture inventory is inconsistent")
+            }
+            Self::GenerationMismatch => {
+                formatter.write_str("network capture generation ownership is inconsistent")
+            }
+            Self::ReservedMacMismatch => formatter
+                .write_str("network capture realized identity reservations are inconsistent"),
+            Self::BackendMismatch => {
+                formatter.write_str("network capture backend profile is inconsistent")
+            }
+            Self::PacketTransactionInFlight => {
+                formatter.write_str("network packet transaction remains in flight")
+            }
+            Self::MmdsMismatch => formatter.write_str("network MMDS ownership is inconsistent"),
+            Self::MmdsState { source } => write!(formatter, "MMDS state is unavailable: {source}"),
+            Self::MmdsStack { source } => write!(formatter, "MMDS stack capture failed: {source}"),
+            Self::Metrics { source } => {
+                write!(formatter, "network metrics capture failed: {source}")
+            }
+            Self::Hvf { source } => write!(formatter, "HVF network capture failed: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessCaptureReadyNetworkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MmdsState { source } => Some(source),
+            Self::MmdsStack { source } => Some(source),
+            Self::Metrics { source } => Some(source),
+            Self::Hvf { source } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProcessNetworkPacketIoPublicationQuiescenceGuard {
+    _guards: Vec<VmnetPacketReadinessQuiescenceGuard>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProcessNetworkPacketIoCaptureEntry {
+    generation: u64,
+    backend: ProcessCaptureReadyNetworkBackend,
+    mmds_stack: Option<MmdsNetworkStackCaptureDescriptor>,
+}
+
+impl fmt::Debug for ProcessNetworkPacketIoCaptureEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessNetworkPacketIoCaptureEntry")
+            .field("generation", &self.generation)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+struct PreparedProcessNetworkCapture {
+    entries: Vec<ProcessNetworkPacketIoCaptureEntry>,
+    hvf_configs: Vec<HvfArm64BootNetworkCaptureConfig>,
+    provider_next_generation: u64,
+    mmds: Option<ProcessCaptureReadyMmdsState>,
 }
 
 struct ProcessNetworkPacketIoEntry<B>
@@ -5516,6 +5962,206 @@ where
             .ok_or(ProcessNetworkPacketIoRegistryError::MissingRealizedMac)?;
         self.reserved_macs.remove(reservation_index);
         Ok(())
+    }
+
+    fn quiesce_capture_publication(
+        &self,
+    ) -> Result<ProcessNetworkPacketIoPublicationQuiescenceGuard, ProcessCaptureReadyNetworkError>
+    {
+        let mut guards = Vec::new();
+        guards
+            .try_reserve_exact(self.vmnet_count())
+            .map_err(|_| ProcessCaptureReadyNetworkError::Allocation)?;
+        for entry in &self.entries {
+            let Some(guard) = entry
+                .packet_io
+                .quiesce_readiness_publication()
+                .map_err(|_| ProcessCaptureReadyNetworkError::PublicationQuiescence)?
+            else {
+                continue;
+            };
+            if guard.generation() != entry.generation {
+                return Err(ProcessCaptureReadyNetworkError::GenerationMismatch);
+            }
+            guards.push(guard);
+        }
+        Ok(ProcessNetworkPacketIoPublicationQuiescenceGuard { _guards: guards })
+    }
+
+    fn prepare_capture(
+        &self,
+        configs: &[NetworkInterfaceConfig],
+        mmds_config: Option<&MmdsConfig>,
+        mmds_state: &MmdsStateHandle,
+        mmds_metrics: Option<&SharedMmdsMetrics>,
+        now: Instant,
+    ) -> Result<PreparedProcessNetworkCapture, ProcessCaptureReadyNetworkError> {
+        if self.entries.len() != configs.len() {
+            return Err(ProcessCaptureReadyNetworkError::InventoryMismatch);
+        }
+        let live_mmds_config = mmds_state
+            .config()
+            .map_err(|source| ProcessCaptureReadyNetworkError::MmdsState { source })?;
+        let mmds = match (mmds_config, self.mmds_detour.as_ref(), mmds_metrics) {
+            (None, None, None) if live_mmds_config.is_none() => None,
+            (Some(config), Some(detour), Some(metrics)) => {
+                if !detour.mmds_state.shares_state_with(mmds_state)
+                    || !detour.metrics.shares_state_with(metrics)
+                    || detour.mmds_ipv4_address != config.effective_ipv4_address()
+                    || detour.network_interfaces != config.network_interfaces()
+                    || live_mmds_config.as_ref() != Some(config)
+                {
+                    return Err(ProcessCaptureReadyNetworkError::MmdsMismatch);
+                }
+                Some(ProcessCaptureReadyMmdsState {
+                    config: config.clone(),
+                    metrics: metrics.snapshot(),
+                })
+            }
+            _ => return Err(ProcessCaptureReadyNetworkError::MmdsMismatch),
+        };
+        if mmds_config.is_some_and(|mmds| {
+            mmds.network_interfaces().iter().any(|selected| {
+                configs
+                    .iter()
+                    .filter(|config| config.iface_id() == selected)
+                    .count()
+                    != 1
+            })
+        }) {
+            return Err(ProcessCaptureReadyNetworkError::MmdsMismatch);
+        }
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(configs.len())
+            .map_err(|_| ProcessCaptureReadyNetworkError::Allocation)?;
+        let mut hvf_configs = Vec::new();
+        hvf_configs
+            .try_reserve_exact(configs.len())
+            .map_err(|_| ProcessCaptureReadyNetworkError::Allocation)?;
+        let mut generations = Vec::new();
+        generations
+            .try_reserve_exact(configs.len())
+            .map_err(|_| ProcessCaptureReadyNetworkError::Allocation)?;
+        let mut expected_macs = Vec::new();
+        expected_macs
+            .try_reserve_exact(configs.len())
+            .map_err(|_| ProcessCaptureReadyNetworkError::Allocation)?;
+
+        for config in configs {
+            let mut matches = self
+                .entries
+                .iter()
+                .filter(|entry| entry.iface_id == config.iface_id());
+            let entry = matches
+                .next()
+                .ok_or(ProcessCaptureReadyNetworkError::InventoryMismatch)?;
+            if matches.next().is_some() || entry.generation >= self.next_generation {
+                return Err(ProcessCaptureReadyNetworkError::GenerationMismatch);
+            }
+            if generations.contains(&entry.generation) {
+                return Err(ProcessCaptureReadyNetworkError::GenerationMismatch);
+            }
+            generations.push(entry.generation);
+            if entry.packet_io.capture_tx_transaction_active() {
+                return Err(ProcessCaptureReadyNetworkError::PacketTransactionInFlight);
+            }
+
+            if let Some(mac) = entry.device_profile.guest_mac() {
+                if expected_macs.contains(&mac) {
+                    return Err(ProcessCaptureReadyNetworkError::ReservedMacMismatch);
+                }
+                expected_macs.push(mac);
+            }
+
+            let backend = match (&entry.packet_io, entry.backend_parameters.as_ref()) {
+                (ProcessNetworkPacketIo::MmdsOnly(_), None)
+                    if entry.device_profile == NetworkDeviceProfile::from_config(config) =>
+                {
+                    ProcessCaptureReadyNetworkBackend::MmdsOnly
+                }
+                (ProcessNetworkPacketIo::Vmnet(_), Some(parameters)) => {
+                    let expected_envelope = if parameters.direct_virtio_header_enabled() {
+                        VirtioNetworkPacketEnvelope::DirectVirtioHeader
+                    } else {
+                        VirtioNetworkPacketEnvelope::RawEthernet
+                    };
+                    if entry.device_profile.guest_mac() != Some(parameters.realized_mac())
+                        || entry.device_profile.mtu() != config.mtu()
+                        || entry.device_profile.packet_envelope() != expected_envelope
+                        || entry.device_profile.feature_capabilities()
+                            != bangbang_runtime::network::VirtioNetworkFeatureCapabilities::complete_software()
+                        || config
+                            .guest_mac()
+                            .is_some_and(|mac| mac != parameters.realized_mac())
+                        || config
+                            .mtu()
+                            .is_some_and(|mtu| mtu != parameters.effective_mtu())
+                        || parameters.maximum_packet_size() == 0
+                        || parameters.packet_buffer_size().is_none()
+                        || (parameters.direct_virtio_header_enabled()
+                            && !parameters.direct_virtio_header_available())
+                    {
+                        return Err(ProcessCaptureReadyNetworkError::BackendMismatch);
+                    }
+                    ProcessCaptureReadyNetworkBackend::Vmnet(parameters.clone())
+                }
+                _ => return Err(ProcessCaptureReadyNetworkError::BackendMismatch),
+            };
+
+            let selected_for_mmds = mmds_config.is_some_and(|mmds| {
+                mmds.network_interfaces()
+                    .iter()
+                    .any(|iface_id| iface_id == config.iface_id())
+            });
+            let stack = entry.packet_io.capture_mmds_stack();
+            if stack.is_some() != selected_for_mmds
+                || matches!(backend, ProcessCaptureReadyNetworkBackend::MmdsOnly)
+                    && !selected_for_mmds
+            {
+                return Err(ProcessCaptureReadyNetworkError::MmdsMismatch);
+            }
+            let mmds_stack = match (stack, mmds_metrics) {
+                (Some(stack), Some(metrics)) => Some(
+                    stack
+                        .capture_descriptor(mmds_state, metrics)
+                        .map_err(|source| ProcessCaptureReadyNetworkError::MmdsStack { source })?,
+                ),
+                (None, _) => None,
+                (Some(_), None) => return Err(ProcessCaptureReadyNetworkError::MmdsMismatch),
+            };
+            let provider_cached_rx_len = entry.packet_io.capture_cached_rx_len();
+            let provider_retry_after = entry.packet_io.packet_retry_after_at(now);
+            let provider_mmds_ready = entry.packet_io.capture_mmds_ready_at(now);
+            hvf_configs.push(HvfArm64BootNetworkCaptureConfig::new(
+                config.clone(),
+                entry.device_profile,
+                provider_cached_rx_len,
+                provider_retry_after,
+                provider_mmds_ready,
+            ));
+            entries.push(ProcessNetworkPacketIoCaptureEntry {
+                generation: entry.generation,
+                backend,
+                mmds_stack,
+            });
+        }
+
+        if expected_macs.len() != self.reserved_macs.len()
+            || expected_macs
+                .iter()
+                .any(|mac| !self.reserved_macs.contains(mac))
+        {
+            return Err(ProcessCaptureReadyNetworkError::ReservedMacMismatch);
+        }
+
+        Ok(PreparedProcessNetworkCapture {
+            entries,
+            hvf_configs,
+            provider_next_generation: self.next_generation,
+            mmds,
+        })
     }
 
     fn device_profiles(&self) -> BTreeMap<String, NetworkDeviceProfile> {
@@ -8061,6 +8707,24 @@ fn entropy_capture_error_from_boot_run_loop_command<C>(
     }
 }
 
+fn network_capture_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, ProcessCaptureReadyNetworkError>,
+) -> ProcessCaptureReadyNetworkError {
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::WorkerNotPaused
+        | BootRunLoopCommandError::SnapshotQuiescenceActive
+        | BootRunLoopCommandError::AdmissionClosed
+        | BootRunLoopCommandError::QueueFull
+        | BootRunLoopCommandError::QueueClosed
+        | BootRunLoopCommandError::Wakeup { .. }
+        | BootRunLoopCommandError::ResponseClosed => {
+            ProcessCaptureReadyNetworkError::OwnerUnavailable
+        }
+    }
+}
+
 pub(crate) struct BootRunLoopCommandHandle<S>
 where
     S: BootRunLoopSession,
@@ -9089,6 +9753,29 @@ impl
         .map_err(entropy_capture_error_from_boot_run_loop_command)
     }
 
+    pub(crate) fn capture_ready_network_state(
+        &self,
+        configs: Vec<NetworkInterfaceConfig>,
+        mmds_config: Option<MmdsConfig>,
+        mmds_state: MmdsStateHandle,
+    ) -> Result<ProcessCaptureReadyNetworkState, ProcessCaptureReadyNetworkError> {
+        self.run_snapshot_quiesced(move |session| {
+            let guard = session
+                .quiesce_snapshot_auxiliary_work()
+                .map_err(|_| ProcessCaptureReadyNetworkError::OwnerUnavailable)?;
+            let result = session.capture_ready_network_state_at(
+                &configs,
+                mmds_config.as_ref(),
+                &mmds_state,
+                &guard,
+                Instant::now(),
+            );
+            drop(guard);
+            result
+        })
+        .map_err(network_capture_error_from_boot_run_loop_command)
+    }
+
     fn preflight_capture_ready_storage(
         &self,
         configs: CaptureReadyStorageConfigs,
@@ -9790,7 +10477,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use bangbang_runtime::balloon::{
         BalloonConfig, BalloonConfigInput, BalloonHintingCommandError, BalloonHintingStartInput,
@@ -9835,7 +10522,9 @@ mod tests {
         SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedSignalMetrics,
         SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
-    use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
+    use bangbang_runtime::mmds::{
+        MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsVersion,
+    };
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
         GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkDeviceProfile, NetworkInterfaceConfig,
@@ -9927,13 +10616,13 @@ mod tests {
         NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
         NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
         NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
-        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
-        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        NoopProcessNetworkTxPacketSink, ProcessCaptureReadyNetworkError, ProcessHvfBootSession,
+        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
+        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
+        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
+        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
+        ProcessVmm, ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
+        SnapshotCreateSession, SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, require_native_v1_composite_record,
         snapshot_destination_machine_config,
     };
@@ -11021,6 +11710,11 @@ mod tests {
         snapshot_serial_preflight_calls: usize,
         last_snapshot_serial_config: Option<SerialConfig>,
         snapshot_serial_preflight_failure: bool,
+        snapshot_network_preflight_calls: usize,
+        last_snapshot_network_configs: Option<Vec<NetworkInterfaceConfig>>,
+        last_snapshot_mmds_config: Option<Option<MmdsConfig>>,
+        last_snapshot_mmds_state: Option<MmdsStateHandle>,
+        snapshot_network_preflight_failure: bool,
         snapshot_publication_failure: bool,
     }
 
@@ -11051,6 +11745,11 @@ mod tests {
                 snapshot_serial_preflight_calls: 0,
                 last_snapshot_serial_config: None,
                 snapshot_serial_preflight_failure: false,
+                snapshot_network_preflight_calls: 0,
+                last_snapshot_network_configs: None,
+                last_snapshot_mmds_config: None,
+                last_snapshot_mmds_state: None,
+                snapshot_network_preflight_failure: false,
                 snapshot_publication_failure: false,
             }
         }
@@ -11088,6 +11787,11 @@ mod tests {
             self
         }
 
+        fn with_snapshot_network_preflight_failure(mut self) -> Self {
+            self.snapshot_network_preflight_failure = true;
+            self
+        }
+
         const fn failure(source: BackendError) -> Self {
             Self {
                 result: FakeStartResult::Failure(source),
@@ -11110,6 +11814,11 @@ mod tests {
                 snapshot_serial_preflight_calls: 0,
                 last_snapshot_serial_config: None,
                 snapshot_serial_preflight_failure: false,
+                snapshot_network_preflight_calls: 0,
+                last_snapshot_network_configs: None,
+                last_snapshot_mmds_config: None,
+                last_snapshot_mmds_state: None,
+                snapshot_network_preflight_failure: false,
                 snapshot_publication_failure: false,
             }
         }
@@ -11136,6 +11845,11 @@ mod tests {
                 snapshot_serial_preflight_calls: 0,
                 last_snapshot_serial_config: None,
                 snapshot_serial_preflight_failure: false,
+                snapshot_network_preflight_calls: 0,
+                last_snapshot_network_configs: None,
+                last_snapshot_mmds_config: None,
+                last_snapshot_mmds_state: None,
+                snapshot_network_preflight_failure: false,
                 snapshot_publication_failure: false,
             }
         }
@@ -11246,6 +11960,25 @@ mod tests {
             self.last_snapshot_serial_config = Some(config);
             if self.snapshot_serial_preflight_failure {
                 Err(HvfArm64BootSerialCaptureError::OwnerUnavailable)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn preflight_snapshot_v1_network(
+            &mut self,
+            _session: &mut Self::Session,
+            configs: Vec<NetworkInterfaceConfig>,
+            mmds_config: Option<MmdsConfig>,
+            mmds_state: MmdsStateHandle,
+        ) -> Result<(), ProcessCaptureReadyNetworkError> {
+            self.snapshot_preflight_trace.push("network");
+            self.snapshot_network_preflight_calls += 1;
+            self.last_snapshot_network_configs = Some(configs);
+            self.last_snapshot_mmds_config = Some(mmds_config);
+            self.last_snapshot_mmds_state = Some(mmds_state);
+            if self.snapshot_network_preflight_failure {
+                Err(ProcessCaptureReadyNetworkError::OwnerUnavailable)
             } else {
                 Ok(())
             }
@@ -13281,6 +14014,12 @@ mod tests {
             create_vmm.starter.last_snapshot_serial_config,
             Some(create_vmm.controller.serial_config().clone())
         );
+        assert_eq!(create_vmm.starter.snapshot_network_preflight_calls, 1);
+        assert_eq!(
+            create_vmm.starter.last_snapshot_network_configs,
+            Some(Vec::new())
+        );
+        assert_eq!(create_vmm.starter.last_snapshot_mmds_config, Some(None));
         let session = create_vmm
             .started_session
             .as_ref()
@@ -14419,6 +15158,219 @@ mod tests {
         replacement_callback.publish_for_test(Some(1));
         assert!(provider.take_scheduled_packet_readiness());
         assert!(provider.has_packet_readiness(test_boot_network_device().interface()));
+    }
+
+    #[test]
+    fn process_network_capture_quiesces_callbacks_and_retains_reused_generation() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let callbacks = factory.packet_callbacks();
+        let mut provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect("capture vmnet provider should build");
+        let callback = recorded_packet_callback(&callbacks, "eth0");
+        let mmds_state = MmdsStateHandle::default();
+
+        let publication_guard = provider
+            .quiesce_capture_publication()
+            .expect("capture should quiesce callback publication");
+        callback.publish_for_test(Some(2));
+        assert!(!provider.take_scheduled_packet_readiness());
+        let first = provider
+            .prepare_capture(&configs, None, &mmds_state, None, Instant::now())
+            .expect("stable vmnet ownership should prepare for capture");
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].generation, 0);
+        assert!(matches!(
+            first.entries[0].backend,
+            super::ProcessCaptureReadyNetworkBackend::Vmnet(_)
+        ));
+        assert!(first.entries[0].mmds_stack.is_none());
+        assert_eq!(first.hvf_configs[0].config(), &configs[0]);
+        assert_eq!(
+            first.hvf_configs[0].profile(),
+            provider.entries[0].device_profile
+        );
+        assert_eq!(first.provider_next_generation, 1);
+        let debug = format!("{:?}", first.entries[0]);
+        assert!(!debug.contains(configs[0].iface_id()));
+        assert!(!debug.contains(configs[0].host_dev_name()));
+
+        drop(publication_guard);
+        assert!(provider.take_scheduled_packet_readiness());
+
+        let mut removed = provider
+            .take_interface("eth0")
+            .expect("captured generation should be removable");
+        removed
+            .stop()
+            .expect("captured generation should stop cleanly");
+        drop(removed);
+        let prepared = provider
+            .prepare_entry_with_factory(
+                &configs[0],
+                super::ProcessNetworkPacketIoEntryClass::Vmnet,
+                false,
+                &mut factory,
+            )
+            .expect("same-ID replacement should prepare");
+        provider.publish_prepared(prepared);
+        let replacement = provider
+            .prepare_capture(&configs, None, &mmds_state, None, Instant::now())
+            .expect("same-ID replacement should capture");
+        assert!(replacement.entries[0].generation > first.entries[0].generation);
+        assert!(replacement.provider_next_generation > replacement.entries[0].generation);
+    }
+
+    #[test]
+    fn process_network_capture_rolls_back_partial_callback_quiescence() {
+        let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "vmnet:shared")]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let callbacks = factory.packet_callbacks();
+        let provider =
+            ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                &configs,
+                None,
+                &mut factory,
+            )
+            .expect("two-interface vmnet provider should build");
+        let held = match &provider.entries[1].packet_io {
+            super::ProcessNetworkPacketIo::Vmnet(packet_io) => packet_io
+                .quiesce_readiness_publication()
+                .expect("second callback generation should quiesce"),
+            super::ProcessNetworkPacketIo::MmdsOnly(_) => {
+                panic!("vmnet config should own vmnet packet I/O")
+            }
+        };
+
+        assert!(matches!(
+            provider.quiesce_capture_publication(),
+            Err(ProcessCaptureReadyNetworkError::PublicationQuiescence)
+        ));
+        recorded_packet_callback(&callbacks, "eth0").publish_for_test(Some(1));
+        assert!(
+            provider.entries[0].packet_io.take_scheduled_readiness(),
+            "the first guard acquired before failure must roll back"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn process_network_capture_keeps_only_fresh_mmds_identity_for_v1_and_v2() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+
+        for version in [MmdsVersion::V1, MmdsVersion::V2] {
+            let mmds_state = MmdsStateHandle::default();
+            mmds_state
+                .with_mut(|state| {
+                    state.put_config(
+                        MmdsConfigInput::new(vec!["eth0".to_string()]).with_version(version),
+                        &configs,
+                    )
+                })
+                .expect("MMDS state should lock")
+                .expect("MMDS config should install");
+            let mmds_config = mmds_state
+                .config()
+                .expect("MMDS state should lock")
+                .expect("MMDS config should exist");
+            let metrics = SharedMmdsMetrics::default();
+            let detour = ProcessMmdsPacketDetourConfig::from_mmds_config(
+                mmds_state.clone(),
+                &mmds_config,
+                metrics.clone(),
+            );
+            let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+            let provider =
+                ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                    &configs,
+                    Some(&detour),
+                    &mut factory,
+                )
+                .expect("MMDS-only provider should build");
+            let guard = provider
+                .quiesce_capture_publication()
+                .expect("MMDS-only capture should require no callback guards");
+            let captured = provider
+                .prepare_capture(
+                    &configs,
+                    Some(&mmds_config),
+                    &mmds_state,
+                    Some(&metrics),
+                    Instant::now(),
+                )
+                .expect("MMDS ownership should prepare for capture");
+            assert_eq!(captured.entries.len(), 1);
+            assert!(matches!(
+                captured.entries[0].backend,
+                super::ProcessCaptureReadyNetworkBackend::MmdsOnly
+            ));
+            let descriptor = captured.entries[0]
+                .mmds_stack
+                .expect("selected MMDS interface should retain fresh identity");
+            assert_eq!(
+                descriptor.local_mac_address(),
+                bangbang_runtime::mmds::DEFAULT_MMDS_MAC_ADDRESS
+            );
+            assert_eq!(
+                descriptor.ipv4_address(),
+                mmds_config.effective_ipv4_address()
+            );
+            assert_eq!(
+                descriptor.tcp_port(),
+                bangbang_runtime::mmds::MMDS_GUEST_TCP_PORT
+            );
+            assert_eq!(
+                captured.mmds.as_ref().map(|state| state.config.version()),
+                Some(version)
+            );
+            assert!(matches!(
+                provider.prepare_capture(
+                    &configs,
+                    Some(&mmds_config),
+                    &mmds_state,
+                    Some(&SharedMmdsMetrics::default()),
+                    Instant::now(),
+                ),
+                Err(ProcessCaptureReadyNetworkError::MmdsMismatch)
+            ));
+
+            let wrong_configs = network_configs([("eth1", "vmnet:shared")]);
+            assert!(matches!(
+                provider.prepare_capture(
+                    &wrong_configs,
+                    Some(&mmds_config),
+                    &mmds_state,
+                    Some(&metrics),
+                    Instant::now(),
+                ),
+                Err(ProcessCaptureReadyNetworkError::MmdsMismatch)
+            ));
+
+            let mut no_detour_factory = RecordingVmnetPacketIoBackendFactory::default();
+            let no_detour_provider =
+                ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory(
+                    &configs,
+                    None,
+                    &mut no_detour_factory,
+                )
+                .expect("provider without MMDS detour should build");
+            assert!(matches!(
+                no_detour_provider.prepare_capture(
+                    &configs,
+                    None,
+                    &mmds_state,
+                    None,
+                    Instant::now(),
+                ),
+                Err(ProcessCaptureReadyNetworkError::MmdsMismatch)
+            ));
+            drop(guard);
+        }
     }
 
     #[test]
@@ -19560,6 +20512,14 @@ mod tests {
             .expect("broad snapshot memory hotplug should configure");
         vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
             .expect("broad snapshot entropy should configure");
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+        ))
+        .expect("broad snapshot network should configure");
+        vmm.handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+            "eth0".to_string(),
+        ])))
+        .expect("broad snapshot MMDS should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("broad snapshot fake session should start");
         vmm.handle_action(VmmAction::Pause)
@@ -19602,6 +20562,26 @@ mod tests {
             vmm.starter.last_snapshot_serial_config,
             Some(vmm.controller.serial_config().clone())
         );
+        assert_eq!(vmm.starter.snapshot_network_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_network_configs.as_deref(),
+            Some(vmm.controller.network_interface_configs())
+        );
+        assert_eq!(
+            vmm.starter.last_snapshot_mmds_config,
+            Some(
+                vmm.controller
+                    .mmds_config()
+                    .expect("MMDS state should lock")
+            )
+        );
+        assert!(
+            vmm.starter
+                .last_snapshot_mmds_state
+                .as_ref()
+                .expect("network preflight should receive MMDS ownership")
+                .shares_state_with(&vmm.controller.mmds_state_handle())
+        );
         let session = vmm
             .started_session
             .as_ref()
@@ -19622,10 +20602,17 @@ mod tests {
             MemoryHotplug,
             Entropy,
             Serial,
+            Network,
         }
 
-        const COMPLETE_TRACE: &[&str] =
-            &["storage", "balloon", "memory-hotplug", "entropy", "serial"];
+        const COMPLETE_TRACE: &[&str] = &[
+            "storage",
+            "balloon",
+            "memory-hotplug",
+            "entropy",
+            "serial",
+            "network",
+        ];
         let cases = [
             (
                 FailureStage::Storage,
@@ -19657,6 +20644,12 @@ mod tests {
                 FailureStage::Serial,
                 "serial",
                 FakeStarter::success(174).with_snapshot_serial_preflight_failure(),
+                &COMPLETE_TRACE[..5],
+            ),
+            (
+                FailureStage::Network,
+                "network",
+                FakeStarter::success(175).with_snapshot_network_preflight_failure(),
                 COMPLETE_TRACE,
             ),
         ];
@@ -19732,6 +20725,7 @@ mod tests {
                 }
                 FailureStage::Entropy => vmm.starter.snapshot_entropy_preflight_failure = false,
                 FailureStage::Serial => vmm.starter.snapshot_serial_preflight_failure = false,
+                FailureStage::Network => vmm.starter.snapshot_network_preflight_failure = false,
             }
 
             let retry_error = vmm
@@ -19965,6 +20959,81 @@ mod tests {
             .started_session
             .as_ref()
             .expect("serial preflight failure should retain the paused session");
+        assert_eq!(session.native_snapshot_publication_count, 0);
+        assert_eq!(session.native_snapshot_producer_count, 0);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn network_preflight_failure_is_typed_and_precedes_publication() {
+        let state_path = missing_temp_child_path("network-preflight.state");
+        let memory_path = state_path.with_file_name("network-preflight.memory");
+        let parent = state_path
+            .parent()
+            .expect("missing network preflight path should have a parent");
+        let mut vmm = snapshot_profile_vmm(
+            FakeStarter::success(176).with_snapshot_network_preflight_failure(),
+        );
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+        ))
+        .expect("network preflight fixture should configure");
+        vmm.handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+            "eth0".to_string(),
+        ])))
+        .expect("network preflight MMDS fixture should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("network preflight fake session should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("network preflight fake session should pause");
+
+        let error = vmm
+            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
+                SnapshotType::Full,
+                &state_path,
+                &memory_path,
+            )))
+            .expect_err("network preflight failure should stop before publication");
+
+        assert_eq!(
+            error,
+            VmmActionError::SnapshotCreate(BackendError::Hypervisor(
+                "native-v1 network preflight failed: network capture owner is unavailable"
+                    .to_string()
+            ))
+        );
+        assert_eq!(vmm.starter.snapshot_storage_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_balloon_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_memory_hotplug_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_entropy_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_serial_preflight_calls, 1);
+        assert_eq!(vmm.starter.snapshot_network_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_network_configs.as_deref(),
+            Some(vmm.controller.network_interface_configs())
+        );
+        assert_eq!(
+            vmm.starter.last_snapshot_mmds_config,
+            Some(
+                vmm.controller
+                    .mmds_config()
+                    .expect("MMDS state should lock")
+            )
+        );
+        assert!(
+            vmm.starter
+                .last_snapshot_mmds_state
+                .as_ref()
+                .expect("network preflight should receive MMDS state ownership")
+                .shares_state_with(&vmm.controller.mmds_state_handle())
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("network preflight failure should retain the paused session");
         assert_eq!(session.native_snapshot_publication_count, 0);
         assert_eq!(session.native_snapshot_producer_count, 0);
         assert_eq!(vmm.instance_info().state, InstanceState::Paused);

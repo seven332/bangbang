@@ -7480,6 +7480,11 @@ mod macos_arm64 {
             r#""iface_id":"eth0""#,
             "GET /vm/config after network reuse",
         );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            "paused reused runtime MMDS network capture over product PCI",
+        );
         write_block_marker_at(
             &control_backing_path,
             bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE * 2,
@@ -9896,6 +9901,28 @@ mod macos_arm64 {
         if !case.wait_for_guest_completion_before_network_patch {
             assert_direct_rootfs_mmds_guest_completion(&mut bangbang, &data_backing_path, case);
         }
+
+        let pause_context = format!(
+            "PATCH /vm Paused before MMDS network capture {}",
+            case.request_context
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            &pause_context,
+        );
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            &format!("paused MMDS network capture {}", case.request_context),
+        );
+        let resume_context = format!(
+            "PATCH /vm Resumed after MMDS network capture {}",
+            case.request_context
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            &resume_context,
+        );
 
         let shutdown_context = format!("bangbang direct rootfs {}", case.request_context);
         assert_clean_shutdown(bangbang.terminate(), &socket_path, &shutdown_context);

@@ -59,10 +59,12 @@ use bangbang_runtime::metrics::{
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId};
 use bangbang_runtime::network::{
-    NetworkInterfaceUpdate, NetworkInterfaceUpdateError, NetworkMmioLayout,
-    NetworkRuntimeMutationError, PreparedNetworkDevice, VIRTIO_NET_DEVICE_ID,
-    VIRTIO_NET_QUEUE_SIZES, VirtioNetworkConfigSpace, VirtioNetworkDevice,
-    VirtioNetworkDeviceNotificationError, attach_network_metrics_to_mmio_handler,
+    NetworkDeviceProfile, NetworkInterfaceConfig, NetworkInterfaceUpdate,
+    NetworkInterfaceUpdateError, NetworkMmioLayout, NetworkRuntimeMutationError,
+    PreparedNetworkDevice, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_QUEUE_SIZES, VirtioNetworkConfigSpace,
+    VirtioNetworkDevice, VirtioNetworkDeviceNotificationError, VirtioNetworkMmioCaptureState,
+    VirtioNetworkPciCaptureState, VirtioNetworkRetryCaptureState,
+    attach_network_metrics_to_mmio_handler,
 };
 use bangbang_runtime::pci::{
     PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE, PciBarAddressSpace, PciBarAllocator,
@@ -105,9 +107,10 @@ use bangbang_runtime::startup::{
     Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
     Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, OpenedBlockDeviceLiveUpdate,
     VmStartupResources, capture_balloon_state_for_device, capture_entropy_state_for_device_at,
-    capture_memory_hotplug_state_for_device, capture_ready_serial_state_for_device,
-    inject_serial_receive_bytes_for_device, memory_hotplug_status_for_device,
-    pending_serial_interrupt_intent_for_device, record_serial_host_input_error_for_device,
+    capture_memory_hotplug_state_for_device, capture_network_state_for_device_at,
+    capture_ready_serial_state_for_device, inject_serial_receive_bytes_for_device,
+    memory_hotplug_status_for_device, pending_serial_interrupt_intent_for_device,
+    record_serial_host_input_error_for_device,
     refresh_vhost_user_block_config_for_devices_with_signal, replace_arm64_boot_vmgenid,
     serial_receive_capacity_for_device, take_serial_input_ready_intent_for_device,
     take_serial_interrupt_intent_for_device, update_live_block_device_for_devices_with_opened,
@@ -648,10 +651,19 @@ struct HvfArm64BootPciBlockDevice {
     _metrics_lease: Option<BlockDeviceMetricsLease>,
 }
 
+/// Whether a product PCI network endpoint was installed during boot or by a
+/// later runtime hotplug transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64BootNetworkDeviceOrigin {
+    Startup,
+    Runtime,
+}
+
 #[derive(Debug)]
 struct HvfArm64BootPciNetworkDevice {
     iface_id: String,
     host_dev_name: String,
+    origin: HvfArm64BootNetworkDeviceOrigin,
     published: PublishedPciNetwork,
     queue_deliveries: usize,
     retry_deadline: Option<Instant>,
@@ -1361,6 +1373,7 @@ impl HvfArm64BootPciDataDevices {
         self.network.push(HvfArm64BootPciNetworkDevice {
             iface_id,
             host_dev_name,
+            origin: HvfArm64BootNetworkDeviceOrigin::Runtime,
             published,
             queue_deliveries: 0,
             retry_deadline: None,
@@ -3571,7 +3584,7 @@ impl Drop for HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard {
 pub struct HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
     block: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
     pmem: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
-    _network: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
+    network: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
     entropy: HvfArm64BootLimiterRetryWakeupSchedulerQuiescenceGuard,
 }
 
@@ -3599,6 +3612,19 @@ impl HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
             SnapshotV1BlockRetryState::Immediate => VirtioRngRetryCaptureState::Immediate,
             SnapshotV1BlockRetryState::After { remaining_nanos } => {
                 VirtioRngRetryCaptureState::After { remaining_nanos }
+            }
+        })
+    }
+
+    pub fn network_retry_state_at(
+        &self,
+        now: Instant,
+    ) -> Result<VirtioNetworkRetryCaptureState, HvfArm64BootLimiterRetrySnapshotError> {
+        snapshot_limiter_retry_state_at(&self.network, now).map(|state| match state {
+            SnapshotV1BlockRetryState::None => VirtioNetworkRetryCaptureState::None,
+            SnapshotV1BlockRetryState::Immediate => VirtioNetworkRetryCaptureState::Immediate,
+            SnapshotV1BlockRetryState::After { remaining_nanos } => {
+                VirtioNetworkRetryCaptureState::After { remaining_nanos }
             }
         })
     }
@@ -4253,6 +4279,229 @@ impl std::error::Error for HvfArm64BootEntropyCaptureError {
     }
 }
 
+/// Process-observed facts needed to validate one HVF network owner. Cached
+/// packet bytes and protocol deadlines are deliberately not copied into the
+/// resulting capture state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64BootNetworkCaptureConfig {
+    config: NetworkInterfaceConfig,
+    profile: NetworkDeviceProfile,
+    provider_cached_rx_len: Option<usize>,
+    provider_retry_after: Option<Duration>,
+    provider_mmds_ready: bool,
+}
+
+impl HvfArm64BootNetworkCaptureConfig {
+    pub const fn new(
+        config: NetworkInterfaceConfig,
+        profile: NetworkDeviceProfile,
+        provider_cached_rx_len: Option<usize>,
+        provider_retry_after: Option<Duration>,
+        provider_mmds_ready: bool,
+    ) -> Self {
+        Self {
+            config,
+            profile,
+            provider_cached_rx_len,
+            provider_retry_after,
+            provider_mmds_ready,
+        }
+    }
+
+    pub const fn config(&self) -> &NetworkInterfaceConfig {
+        &self.config
+    }
+
+    pub const fn profile(&self) -> NetworkDeviceProfile {
+        self.profile
+    }
+
+    pub const fn provider_cached_rx_len(&self) -> Option<usize> {
+        self.provider_cached_rx_len
+    }
+
+    pub const fn provider_retry_after(&self) -> Option<Duration> {
+        self.provider_retry_after
+    }
+
+    pub const fn provider_mmds_ready(&self) -> bool {
+        self.provider_mmds_ready
+    }
+}
+
+impl fmt::Debug for HvfArm64BootNetworkCaptureConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfArm64BootNetworkCaptureConfig")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum HvfArm64BootNetworkTransportCaptureState {
+    Mmio {
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        state: Box<VirtioNetworkMmioCaptureState>,
+    },
+    Pci {
+        origin: HvfArm64BootNetworkDeviceOrigin,
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+        state: Box<VirtioNetworkPciCaptureState>,
+    },
+}
+
+impl HvfArm64BootNetworkTransportCaptureState {
+    pub fn mmio_state(&self) -> Option<&VirtioNetworkMmioCaptureState> {
+        match self {
+            Self::Mmio { state, .. } => Some(state.as_ref()),
+            Self::Pci { .. } => None,
+        }
+    }
+
+    pub fn pci_state(&self) -> Option<&VirtioNetworkPciCaptureState> {
+        match self {
+            Self::Pci { state, .. } => Some(state.as_ref()),
+            Self::Mmio { .. } => None,
+        }
+    }
+
+    pub const fn source_rx_retry_normalized(&self) -> bool {
+        match self {
+            Self::Mmio { state, .. } => state.device().source_rx_retry_normalized(),
+            Self::Pci { state, .. } => state.device().source_rx_retry_normalized(),
+        }
+    }
+
+    pub const fn source_rx_cache_normalized(&self) -> bool {
+        match self {
+            Self::Mmio { state, .. } => state.device().source_rx_cache_normalized(),
+            Self::Pci { state, .. } => state.device().source_rx_cache_normalized(),
+        }
+    }
+
+    pub const fn tx_retry(&self) -> VirtioNetworkRetryCaptureState {
+        match self {
+            Self::Mmio { state, .. } => state.device().tx_retry(),
+            Self::Pci { state, .. } => state.device().tx_retry(),
+        }
+    }
+}
+
+impl fmt::Debug for HvfArm64BootNetworkTransportCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Mmio { .. } => "NetworkTransportCaptureState::Mmio(<redacted>)",
+            Self::Pci { .. } => "NetworkTransportCaptureState::Pci(<redacted>)",
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64BootNetworkInterfaceCaptureState {
+    config: NetworkInterfaceConfig,
+    profile: NetworkDeviceProfile,
+    transport: HvfArm64BootNetworkTransportCaptureState,
+}
+
+impl HvfArm64BootNetworkInterfaceCaptureState {
+    pub const fn config(&self) -> &NetworkInterfaceConfig {
+        &self.config
+    }
+
+    pub const fn profile(&self) -> NetworkDeviceProfile {
+        self.profile
+    }
+
+    pub const fn transport(&self) -> &HvfArm64BootNetworkTransportCaptureState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for HvfArm64BootNetworkInterfaceCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfArm64BootNetworkInterfaceCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Ordered, detached HVF network state. The source-work flag records only that
+/// source-owned RX/protocol work was validated and normalized away.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64BootNetworkCaptureState {
+    interfaces: Vec<HvfArm64BootNetworkInterfaceCaptureState>,
+    source_work_normalized: bool,
+}
+
+impl HvfArm64BootNetworkCaptureState {
+    pub fn interfaces(&self) -> &[HvfArm64BootNetworkInterfaceCaptureState] {
+        &self.interfaces
+    }
+
+    pub const fn source_work_normalized(&self) -> bool {
+        self.source_work_normalized
+    }
+}
+
+impl fmt::Debug for HvfArm64BootNetworkCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfArm64BootNetworkCaptureState")
+            .field("interface_count", &self.interfaces.len())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64BootNetworkCaptureError {
+    OwnerUnavailable,
+    WrongQuiescenceGuard,
+    RetryState,
+    InventoryMismatch,
+    Allocation,
+    GuestMemory,
+    MmioDispatcherBusy,
+    MmioDispatcherPoisoned,
+    MmioCapture,
+    PciPlacement,
+    PciCapture,
+    RetryMismatch,
+}
+
+impl fmt::Display for HvfArm64BootNetworkCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::OwnerUnavailable => "network capture owner is unavailable",
+            Self::WrongQuiescenceGuard => {
+                "network capture quiescence guard belongs to another session"
+            }
+            Self::RetryState => "network retry-state capture failed",
+            Self::InventoryMismatch => "network capture ownership inventory is inconsistent",
+            Self::Allocation => "network capture allocation failed",
+            Self::GuestMemory => "network capture guest memory is unavailable",
+            Self::MmioDispatcherBusy => "network capture MMIO dispatcher is busy",
+            Self::MmioDispatcherPoisoned => "network capture MMIO dispatcher is poisoned",
+            Self::MmioCapture => "MMIO network state capture failed",
+            Self::PciPlacement => "PCI network placement is unavailable",
+            Self::PciCapture => "PCI network state capture failed",
+            Self::RetryMismatch => "network capture retry ownership is inconsistent",
+        })
+    }
+}
+
+impl std::error::Error for HvfArm64BootNetworkCaptureError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureReadyNetworkOwner {
+    Mmio { index: usize },
+    Pci { index: usize },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureReadyBlockOwner {
     Mmio {
@@ -4767,6 +5016,14 @@ struct HvfArm64BootEntropyCaptureOwner<'a> {
     retry_wakeup_scheduler: &'a HvfArm64BootLimiterRetryWakeupScheduler,
 }
 
+struct HvfArm64BootNetworkCaptureOwner<'a> {
+    backend: &'a HvfBackend,
+    mmio_dispatcher: &'a Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &'a Arm64BootRuntimeResources,
+    pci_data_devices: &'a Option<HvfArm64BootPciDataDevices>,
+    retry_wakeup_scheduler: &'a HvfArm64BootLimiterRetryWakeupScheduler,
+}
+
 fn capture_ready_entropy_state_at(
     owner: HvfArm64BootEntropyCaptureOwner<'_>,
     config: Option<EntropyConfig>,
@@ -4879,6 +5136,316 @@ fn capture_ready_entropy_state_at(
         retry,
         transport,
     }))
+}
+
+fn capture_ready_network_state_at(
+    owner: HvfArm64BootNetworkCaptureOwner<'_>,
+    configs: &[HvfArm64BootNetworkCaptureConfig],
+    guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    now: Instant,
+) -> Result<HvfArm64BootNetworkCaptureState, HvfArm64BootNetworkCaptureError> {
+    let HvfArm64BootNetworkCaptureOwner {
+        backend,
+        mmio_dispatcher,
+        runtime_resources,
+        pci_data_devices,
+        retry_wakeup_scheduler,
+    } = owner;
+    if !Arc::ptr_eq(&guard.network.shared, &retry_wakeup_scheduler.shared) {
+        return Err(HvfArm64BootNetworkCaptureError::WrongQuiescenceGuard);
+    }
+    let shared_retry = guard
+        .network_retry_state_at(now)
+        .map_err(|_| HvfArm64BootNetworkCaptureError::RetryState)?;
+    let pci_network_count = pci_data_devices
+        .as_ref()
+        .map_or(0, |devices| devices.network.len());
+    if !runtime_resources.pci_network_devices.is_empty()
+        || (!runtime_resources.network_devices.is_empty() && pci_network_count != 0)
+        || runtime_resources.network_devices.len() + pci_network_count != configs.len()
+    {
+        return Err(HvfArm64BootNetworkCaptureError::InventoryMismatch);
+    }
+
+    let mut owners = Vec::new();
+    owners
+        .try_reserve_exact(configs.len())
+        .map_err(|_| HvfArm64BootNetworkCaptureError::Allocation)?;
+    let mut interfaces = Vec::new();
+    interfaces
+        .try_reserve_exact(configs.len())
+        .map_err(|_| HvfArm64BootNetworkCaptureError::Allocation)?;
+
+    for capture_config in configs {
+        let config = capture_config.config();
+        let mut mmio_matches = runtime_resources
+            .network_devices
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| device.registration.iface_id() == config.iface_id());
+        let mmio_match = mmio_matches.next().map(|(index, _)| index);
+        let duplicate_mmio = mmio_matches.next().is_some();
+        let mut pci_matches = pci_data_devices
+            .as_ref()
+            .into_iter()
+            .flat_map(|devices| devices.network.iter().enumerate())
+            .filter(|(_, device)| device.iface_id == config.iface_id());
+        let pci_match = pci_matches.next().map(|(index, _)| index);
+        let duplicate_pci = pci_matches.next().is_some();
+        let owner = match (mmio_match, duplicate_mmio, pci_match, duplicate_pci) {
+            (Some(index), false, None, false) => CaptureReadyNetworkOwner::Mmio { index },
+            (None, false, Some(index), false) => CaptureReadyNetworkOwner::Pci { index },
+            _ => return Err(HvfArm64BootNetworkCaptureError::InventoryMismatch),
+        };
+        if owners.contains(&owner) {
+            return Err(HvfArm64BootNetworkCaptureError::InventoryMismatch);
+        }
+        let host_dev_name_matches = match owner {
+            CaptureReadyNetworkOwner::Mmio { index } => runtime_resources
+                .network_devices
+                .get(index)
+                .is_some_and(|device| {
+                    device.registration.host_dev_name() == config.host_dev_name()
+                }),
+            CaptureReadyNetworkOwner::Pci { index } => pci_data_devices
+                .as_ref()
+                .and_then(|devices| devices.network.get(index))
+                .is_some_and(|device| device.host_dev_name == config.host_dev_name()),
+        };
+        if !host_dev_name_matches {
+            return Err(HvfArm64BootNetworkCaptureError::InventoryMismatch);
+        }
+        owners.push(owner);
+    }
+
+    let memory = backend
+        .mapped_guest_memory()
+        .map_err(|_| HvfArm64BootNetworkCaptureError::GuestMemory)?;
+    let mut dispatcher = if owners
+        .iter()
+        .any(|owner| matches!(owner, CaptureReadyNetworkOwner::Mmio { .. }))
+    {
+        Some(
+            lock_boot_mmio_dispatcher(mmio_dispatcher).map_err(|error| match error {
+                HvfArm64BootMmioDispatcherError::Busy => {
+                    HvfArm64BootNetworkCaptureError::MmioDispatcherBusy
+                }
+                HvfArm64BootMmioDispatcherError::Poisoned => {
+                    HvfArm64BootNetworkCaptureError::MmioDispatcherPoisoned
+                }
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let mut expected_shared_retry = None;
+    let mut any_provider_mmds_ready = false;
+    let mut any_source_work_normalized = false;
+    for (capture_config, owner) in configs.iter().zip(owners.iter().copied()) {
+        let config = capture_config.config();
+        let (transport, validation, owner_retry) = match owner {
+            CaptureReadyNetworkOwner::Mmio { index } => {
+                let device = runtime_resources
+                    .network_devices
+                    .get(index)
+                    .ok_or(HvfArm64BootNetworkCaptureError::InventoryMismatch)?;
+                let dispatcher = dispatcher
+                    .as_deref_mut()
+                    .ok_or(HvfArm64BootNetworkCaptureError::InventoryMismatch)?;
+                let (state, validation) = capture_network_state_for_device_at(
+                    device,
+                    dispatcher,
+                    config,
+                    capture_config.profile(),
+                    memory,
+                    capture_config.provider_cached_rx_len(),
+                    now,
+                )
+                .map_err(|_| HvfArm64BootNetworkCaptureError::MmioCapture)?;
+                (
+                    HvfArm64BootNetworkTransportCaptureState::Mmio {
+                        region: device.registration.region(),
+                        interrupt_line: device.fdt_device.interrupt_line,
+                        state: Box::new(state),
+                    },
+                    validation,
+                    None,
+                )
+            }
+            CaptureReadyNetworkOwner::Pci { index } => {
+                let device = pci_data_devices
+                    .as_ref()
+                    .and_then(|devices| devices.network.get(index))
+                    .ok_or(HvfArm64BootNetworkCaptureError::InventoryMismatch)?;
+                let (state, validation) = device
+                    .published
+                    .endpoint()
+                    .capture_network_state_at(
+                        config,
+                        capture_config.profile(),
+                        memory,
+                        capture_config.provider_cached_rx_len(),
+                        now,
+                    )
+                    .map_err(|_| HvfArm64BootNetworkCaptureError::PciCapture)?;
+                let sbdf = device
+                    .published
+                    .sbdf()
+                    .ok_or(HvfArm64BootNetworkCaptureError::PciPlacement)?;
+                let bar_range = device
+                    .published
+                    .bar_range()
+                    .ok_or(HvfArm64BootNetworkCaptureError::PciPlacement)?;
+                (
+                    HvfArm64BootNetworkTransportCaptureState::Pci {
+                        origin: device.origin,
+                        sbdf,
+                        bar_range,
+                        state: Box::new(state),
+                    },
+                    validation,
+                    Some(network_retry_state_at(device.retry_deadline, now)?),
+                )
+            }
+        };
+
+        let mut expected_retry = None;
+        retain_earliest_network_retry(&mut expected_retry, transport.tx_retry());
+        if let Some(rx_retry) = validation.source_rx_retry() {
+            retain_earliest_network_retry(&mut expected_retry, rx_retry);
+        }
+        if let Some(provider_retry_after) = capture_config.provider_retry_after() {
+            retain_earliest_network_retry(
+                &mut expected_retry,
+                network_retry_state_from_duration(provider_retry_after)?,
+            );
+        }
+        let expected_retry = expected_retry.unwrap_or(VirtioNetworkRetryCaptureState::None);
+        if let Some(owner_retry) = owner_retry
+            && !network_retry_matches_expected(
+                owner_retry,
+                expected_retry,
+                capture_config.provider_mmds_ready(),
+            )
+        {
+            return Err(HvfArm64BootNetworkCaptureError::RetryMismatch);
+        }
+        retain_earliest_network_retry(&mut expected_shared_retry, expected_retry);
+        any_provider_mmds_ready |= capture_config.provider_mmds_ready();
+        let source_work = transport.source_rx_cache_normalized()
+            || validation.source_rx_retry().is_some()
+            || capture_config.provider_retry_after().is_some();
+        any_source_work_normalized |= source_work || capture_config.provider_mmds_ready();
+        interfaces.push(HvfArm64BootNetworkInterfaceCaptureState {
+            config: config.clone(),
+            profile: capture_config.profile(),
+            transport,
+        });
+    }
+
+    let expected_shared_retry =
+        expected_shared_retry.unwrap_or(VirtioNetworkRetryCaptureState::None);
+    if runtime_resources.network_devices.is_empty() {
+        let earliest_pci_retry = pci_data_devices
+            .as_ref()
+            .into_iter()
+            .flat_map(|devices| devices.network.iter())
+            .filter_map(|device| device.retry_deadline)
+            .min();
+        if !network_retry_matches_expected(
+            shared_retry,
+            network_retry_state_at(earliest_pci_retry, now)?,
+            any_provider_mmds_ready,
+        ) {
+            return Err(HvfArm64BootNetworkCaptureError::RetryMismatch);
+        }
+    }
+    if !network_retry_matches_expected(shared_retry, expected_shared_retry, any_provider_mmds_ready)
+    {
+        return Err(HvfArm64BootNetworkCaptureError::RetryMismatch);
+    }
+
+    Ok(HvfArm64BootNetworkCaptureState {
+        interfaces,
+        source_work_normalized: any_source_work_normalized,
+    })
+}
+
+fn retain_earliest_network_retry(
+    current: &mut Option<VirtioNetworkRetryCaptureState>,
+    candidate: VirtioNetworkRetryCaptureState,
+) {
+    *current = match (*current, candidate) {
+        (current, VirtioNetworkRetryCaptureState::None) => current,
+        (None | Some(VirtioNetworkRetryCaptureState::None), candidate) => Some(candidate),
+        (Some(VirtioNetworkRetryCaptureState::Immediate), _)
+        | (_, VirtioNetworkRetryCaptureState::Immediate) => {
+            Some(VirtioNetworkRetryCaptureState::Immediate)
+        }
+        (
+            Some(VirtioNetworkRetryCaptureState::After {
+                remaining_nanos: current,
+            }),
+            VirtioNetworkRetryCaptureState::After {
+                remaining_nanos: candidate,
+            },
+        ) => Some(VirtioNetworkRetryCaptureState::After {
+            remaining_nanos: current.min(candidate),
+        }),
+    };
+}
+
+fn network_retry_state_from_duration(
+    duration: Duration,
+) -> Result<VirtioNetworkRetryCaptureState, HvfArm64BootNetworkCaptureError> {
+    let remaining_nanos = u64::try_from(duration.as_nanos())
+        .map_err(|_| HvfArm64BootNetworkCaptureError::RetryState)?;
+    if remaining_nanos == 0 {
+        Ok(VirtioNetworkRetryCaptureState::Immediate)
+    } else {
+        Ok(VirtioNetworkRetryCaptureState::After { remaining_nanos })
+    }
+}
+
+fn network_retry_matches_expected(
+    actual: VirtioNetworkRetryCaptureState,
+    expected: VirtioNetworkRetryCaptureState,
+    provider_mmds_ready: bool,
+) -> bool {
+    // Device, per-PCI-owner, and shared deadlines are materialized by separate
+    // monotonic-clock reads, so their remaining nanoseconds can legitimately
+    // differ. Validate the retry disposition here; the exact reconstructible
+    // TX delay is retained once in the detached device state.
+    match (actual, expected) {
+        (VirtioNetworkRetryCaptureState::None, VirtioNetworkRetryCaptureState::None)
+        | (VirtioNetworkRetryCaptureState::Immediate, VirtioNetworkRetryCaptureState::Immediate)
+        | (
+            VirtioNetworkRetryCaptureState::After { .. },
+            VirtioNetworkRetryCaptureState::After { .. },
+        ) => true,
+        (VirtioNetworkRetryCaptureState::Immediate, _) if provider_mmds_ready => true,
+        _ => false,
+    }
+}
+
+fn network_retry_state_at(
+    deadline: Option<Instant>,
+    now: Instant,
+) -> Result<VirtioNetworkRetryCaptureState, HvfArm64BootNetworkCaptureError> {
+    let Some(deadline) = deadline else {
+        return Ok(VirtioNetworkRetryCaptureState::None);
+    };
+    let Some(remaining) = deadline.checked_duration_since(now) else {
+        return Ok(VirtioNetworkRetryCaptureState::Immediate);
+    };
+    let remaining_nanos = u64::try_from(remaining.as_nanos())
+        .map_err(|_| HvfArm64BootNetworkCaptureError::RetryState)?;
+    if remaining_nanos == 0 {
+        Ok(VirtioNetworkRetryCaptureState::Immediate)
+    } else {
+        Ok(VirtioNetworkRetryCaptureState::After { remaining_nanos })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5853,7 +6420,7 @@ fn quiesce_limiter_retry_wakeups(
     Ok(HvfArm64BootLimiterRetryWakeupQuiescenceGuard {
         block: block_guard,
         pmem: pmem_guard,
-        _network: network_guard,
+        network: network_guard,
         entropy: entropy_guard,
     })
 }
@@ -6408,6 +6975,26 @@ impl HvfArm64BootSession<'_> {
                 retry_wakeup_scheduler: &self.entropy_retry_wakeup_scheduler,
             },
             config,
+            guard,
+            now,
+        )
+    }
+
+    pub fn capture_ready_network_state_at(
+        &self,
+        configs: &[HvfArm64BootNetworkCaptureConfig],
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<HvfArm64BootNetworkCaptureState, HvfArm64BootNetworkCaptureError> {
+        capture_ready_network_state_at(
+            HvfArm64BootNetworkCaptureOwner {
+                backend: self.backend,
+                mmio_dispatcher: &self.mmio_dispatcher,
+                runtime_resources: &self.runtime_resources,
+                pci_data_devices: &self.pci_data_devices,
+                retry_wakeup_scheduler: &self.network_retry_wakeup_scheduler,
+            },
+            configs,
             guard,
             now,
         )
@@ -8715,6 +9302,26 @@ impl OwnedHvfArm64BootSession {
                 retry_wakeup_scheduler: &self.entropy_retry_wakeup_scheduler,
             },
             config,
+            guard,
+            now,
+        )
+    }
+
+    pub fn capture_ready_network_state_at(
+        &self,
+        configs: &[HvfArm64BootNetworkCaptureConfig],
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<HvfArm64BootNetworkCaptureState, HvfArm64BootNetworkCaptureError> {
+        capture_ready_network_state_at(
+            HvfArm64BootNetworkCaptureOwner {
+                backend: &self.backend,
+                mmio_dispatcher: &self.mmio_dispatcher,
+                runtime_resources: &self.runtime_resources,
+                pci_data_devices: &self.pci_data_devices,
+                retry_wakeup_scheduler: &self.network_retry_wakeup_scheduler,
+            },
+            configs,
             guard,
             now,
         )
@@ -16563,6 +17170,7 @@ fn prepare_pci_data_devices(
             manager.network.push(HvfArm64BootPciNetworkDevice {
                 iface_id,
                 host_dev_name,
+                origin: HvfArm64BootNetworkDeviceOrigin::Startup,
                 published,
                 queue_deliveries: 0,
                 retry_deadline: None,
@@ -16952,9 +17560,9 @@ mod tests {
     use bangbang_runtime::network::{
         NetworkInterfaceConfigInput, NetworkMmioLayout, NetworkRateLimiterConfig,
         NetworkTokenBucketConfig, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_QUEUE_INDEX,
-        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRxPacket,
-        VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
-        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRetryCaptureState,
+        VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
+        VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
         VirtioNetworkTxPacketSinkError,
     };
     use bangbang_runtime::pci::{PciBarAddressSpace, PciBarAllocator};
@@ -18119,6 +18727,63 @@ mod tests {
         assert!(!state.deferred_publication);
         drop(state);
         scheduler.stop();
+    }
+
+    #[test]
+    fn network_capture_retry_matching_uses_logical_dispositions() {
+        use VirtioNetworkRetryCaptureState::{After, Immediate, None};
+
+        assert!(super::network_retry_matches_expected(None, None, false));
+        assert!(super::network_retry_matches_expected(
+            After {
+                remaining_nanos: 90
+            },
+            After {
+                remaining_nanos: 100,
+            },
+            false,
+        ));
+        assert!(!super::network_retry_matches_expected(
+            None,
+            After {
+                remaining_nanos: 100,
+            },
+            false,
+        ));
+        assert!(super::network_retry_matches_expected(Immediate, None, true,));
+        assert!(!super::network_retry_matches_expected(
+            Immediate, None, false,
+        ));
+    }
+
+    #[test]
+    fn network_capture_retry_aggregation_selects_the_earliest_disposition() {
+        use VirtioNetworkRetryCaptureState::{After, Immediate, None};
+
+        let mut retry = Option::None;
+        super::retain_earliest_network_retry(&mut retry, None);
+        assert_eq!(retry, Option::None);
+        super::retain_earliest_network_retry(
+            &mut retry,
+            After {
+                remaining_nanos: 100,
+            },
+        );
+        super::retain_earliest_network_retry(
+            &mut retry,
+            After {
+                remaining_nanos: 90,
+            },
+        );
+        assert_eq!(
+            retry,
+            Some(After {
+                remaining_nanos: 90
+            })
+        );
+        super::retain_earliest_network_retry(&mut retry, Immediate);
+        super::retain_earliest_network_retry(&mut retry, After { remaining_nanos: 1 });
+        assert_eq!(retry, Some(Immediate));
     }
 
     #[test]

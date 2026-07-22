@@ -1930,8 +1930,12 @@ through the main `uds_path`, sends distinct guest payloads on both streams,
 waits for distinct host replies, and writes
 `BANGBANG_VSOCK_HOST_MULTISTREAM_OK` only after both streams complete. These
 checks prove the kernel mounted the virtio-block root drive as `/`, give
-executable-boundary MMDS fetch coverage through the process-local MMDS-only
-packet path, prove guest-visible virtio-rng reads plus limiter retry and
+executable-boundary MMDS v1/v2 fetch coverage through the process-local
+MMDS-only packet path, and pause, traverse the complete network capture-ready
+producer, and resume after real guest exchange plus live limiter updates. The
+capture validates transport, generation, queue, features, limiter, metrics,
+and MMDS identity while excluding live TCP/ARP/output/timer state. The checks
+also prove guest-visible virtio-rng reads plus limiter retry and
 capture-ready MMIO/PCI ownership through `/dev/hwrng`, prove
 guest virtio-balloon driver binding, prove guest-visible virtio-mem driver
 binding plus a guest-completed and public-API-observed requested/plugged
@@ -1947,8 +1951,10 @@ interrupts, PVTime artifact restore or cross-host clock portability, or broader
 RTC-adjacent behavior beyond the checked PL031/VMGenID/VMClock/PVTime contract is
 supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
-Entropy optional-device encoding, restore, migration/clone, and cross-host
-token-clock portability remain the exact Wave 6 handoff.
+Entropy and network optional-device encoding, restore, migration/clone, and
+cross-host policy remain the exact Wave 6 #1490 handoff; the network producer
+intentionally requests a fresh lossy destination rather than serializing peer
+packets, callbacks, active protocol sessions, or source clock deadlines.
 
 For vsock specifically, this evidence validates the **implemented supported live MMIO-or-PCI startup/Unix-socket subset**:
 dynamic 64-KiB credit windows with wrapping

@@ -3922,6 +3922,95 @@ pub struct SharedNetworkInterfaceMetricsRegistry {
     per_interface: Arc<Mutex<NetworkInterfaceMetricsRegistryState>>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceMetricsCaptureEntry {
+    generation: u64,
+    iface_id: String,
+    metrics: NetworkInterfaceMetrics,
+}
+
+impl NetworkInterfaceMetricsCaptureEntry {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn iface_id(&self) -> &str {
+        &self.iface_id
+    }
+
+    pub const fn metrics(&self) -> NetworkInterfaceMetrics {
+        self.metrics
+    }
+}
+
+impl fmt::Debug for NetworkInterfaceMetricsCaptureEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NetworkInterfaceMetricsCaptureEntry")
+            .field("generation", &self.generation)
+            .field("iface_id", &"<redacted>")
+            .field("metrics", &"<captured>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceMetricsCaptureState {
+    aggregate: NetworkInterfaceMetrics,
+    entries: Vec<NetworkInterfaceMetricsCaptureEntry>,
+    next_generation: u64,
+}
+
+impl NetworkInterfaceMetricsCaptureState {
+    pub const fn aggregate(&self) -> NetworkInterfaceMetrics {
+        self.aggregate
+    }
+
+    pub fn entries(&self) -> &[NetworkInterfaceMetricsCaptureEntry] {
+        &self.entries
+    }
+
+    pub const fn next_generation(&self) -> u64 {
+        self.next_generation
+    }
+}
+
+impl fmt::Debug for NetworkInterfaceMetricsCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NetworkInterfaceMetricsCaptureState")
+            .field("entry_count", &self.entries.len())
+            .field("next_generation", &self.next_generation)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkInterfaceMetricsCaptureError {
+    Allocation,
+    ReservationInFlight,
+    CapacityMismatch,
+    DuplicateInterface,
+    DuplicateGeneration,
+    InvalidGeneration,
+}
+
+impl fmt::Display for NetworkInterfaceMetricsCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation => "network metrics capture allocation failed",
+            Self::ReservationInFlight => "network metrics ownership reservation is in flight",
+            Self::CapacityMismatch => "network metrics ownership exceeds its bounded capacity",
+            Self::DuplicateInterface => "network metrics capture has a duplicate interface",
+            Self::DuplicateGeneration => "network metrics capture has a duplicate generation",
+            Self::InvalidGeneration => "network metrics capture generation cursor is invalid",
+        })
+    }
+}
+
+impl std::error::Error for NetworkInterfaceMetricsCaptureError {}
+
 #[derive(Debug, Default)]
 struct NetworkInterfaceMetricsRegistryState {
     entries: Vec<NetworkInterfaceMetricsRegistryEntry>,
@@ -4367,6 +4456,53 @@ impl SharedNetworkInterfaceMetricsRegistry {
         }
         snapshot
     }
+
+    /// Captures every live generation, including entries whose counters are
+    /// all zero, for snapshot continuity validation.
+    pub fn capture_state(
+        &self,
+    ) -> Result<NetworkInterfaceMetricsCaptureState, NetworkInterfaceMetricsCaptureError> {
+        let state = lock_network_metrics_registry(&self.per_interface);
+        if !state.reservations.is_empty() {
+            return Err(NetworkInterfaceMetricsCaptureError::ReservationInFlight);
+        }
+        if state.entries.len() > state.capacity {
+            return Err(NetworkInterfaceMetricsCaptureError::CapacityMismatch);
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(state.entries.len())
+            .map_err(|_| NetworkInterfaceMetricsCaptureError::Allocation)?;
+        for entry in &state.entries {
+            if entry.generation >= state.next_generation {
+                return Err(NetworkInterfaceMetricsCaptureError::InvalidGeneration);
+            }
+            if entries
+                .iter()
+                .any(|captured: &NetworkInterfaceMetricsCaptureEntry| {
+                    captured.iface_id == entry.iface_id
+                })
+            {
+                return Err(NetworkInterfaceMetricsCaptureError::DuplicateInterface);
+            }
+            if entries
+                .iter()
+                .any(|captured| captured.generation == entry.generation)
+            {
+                return Err(NetworkInterfaceMetricsCaptureError::DuplicateGeneration);
+            }
+            entries.push(NetworkInterfaceMetricsCaptureEntry {
+                generation: entry.generation,
+                iface_id: entry.iface_id.clone(),
+                metrics: entry.metrics.snapshot(),
+            });
+        }
+        Ok(NetworkInterfaceMetricsCaptureState {
+            aggregate: self.aggregate.snapshot(),
+            entries,
+            next_generation: state.next_generation,
+        })
+    }
 }
 
 fn lock_network_metrics_registry(
@@ -4576,6 +4712,11 @@ pub struct SharedMmdsMetrics {
 }
 
 impl SharedMmdsMetrics {
+    #[doc(hidden)]
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn record_rx_accepted(&self) {
         record_atomic_metric(&self.inner.rx_accepted, 1);
     }
@@ -8414,10 +8555,10 @@ mod tests {
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MemoryHotplugMetricOperation,
         MetricsConfigError, MetricsConfigInput, MetricsDiagnostics, MetricsFlushError,
         MetricsOutput, MetricsState, MmdsMetrics, NetworkInterfaceMetrics,
-        NetworkInterfaceMetricsByInterface, NetworkInterfaceMetricsRegistryError,
-        PmemDeviceMetrics, PmemDeviceMetricsByDevice, PmemDeviceMetricsRegistryError,
-        RtcDeviceMetrics, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        NetworkInterfaceMetricsByInterface, NetworkInterfaceMetricsCaptureError,
+        NetworkInterfaceMetricsRegistryError, PmemDeviceMetrics, PmemDeviceMetricsByDevice,
+        PmemDeviceMetricsRegistryError, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
         SharedMemoryHotplugDeviceMetrics, SharedMemoryHotplugLatencyMetricsInner,
         SharedMmdsMetrics, SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
         SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
@@ -9979,6 +10120,70 @@ mod tests {
             NetworkInterfaceMetrics::default()
         );
         assert!(second.per_interface_snapshot().is_empty());
+    }
+
+    #[test]
+    fn network_metrics_capture_is_complete_stable_and_generation_aware() {
+        let registry = SharedNetworkInterfaceMetricsRegistry::from_interface_ids_with_capacity(
+            ["eth0", "eth1"],
+            3,
+        )
+        .expect("capture metrics registry should allocate");
+        registry.record_queue_events_for_interface("eth0", 2, 3);
+
+        let first = registry
+            .capture_state()
+            .expect("stable metrics ownership should capture");
+        let second = registry
+            .capture_state()
+            .expect("unchanged metrics ownership should recapture");
+        assert_eq!(first, second);
+        assert_eq!(first.entries().len(), 2);
+        assert_eq!(first.entries()[0].iface_id(), "eth0");
+        assert_eq!(first.entries()[0].generation(), 0);
+        assert_eq!(first.entries()[0].metrics().rx_queue_event_count(), 2);
+        assert_eq!(first.entries()[1].iface_id(), "eth1");
+        assert_eq!(
+            first.entries()[1].metrics(),
+            NetworkInterfaceMetrics::default(),
+            "zero-counter generations must remain in the capture"
+        );
+        assert_eq!(first.next_generation(), 2);
+        assert_eq!(first.aggregate().tx_queue_event_count(), 3);
+        assert!(!format!("{first:?}").contains("eth0"));
+
+        let reservation = registry
+            .prepare_interface("eth2")
+            .expect("capture reservation should prepare");
+        assert_eq!(
+            registry.capture_state(),
+            Err(NetworkInterfaceMetricsCaptureError::ReservationInFlight)
+        );
+        drop(reservation);
+        registry
+            .capture_state()
+            .expect("abandoned reservation should roll back capture exclusion");
+
+        let old_generation = first.entries()[1].generation();
+        let old_lease = registry
+            .claim_interface_lease("eth1")
+            .expect("startup metrics generation should be claimable");
+        drop(old_lease);
+        let replacement = registry
+            .prepare_interface("eth1")
+            .expect("same-ID replacement metrics should prepare")
+            .publish();
+        let replaced = registry
+            .capture_state()
+            .expect("replacement metrics generation should capture");
+        let replacement_entry = replaced
+            .entries()
+            .iter()
+            .find(|entry| entry.iface_id() == "eth1")
+            .expect("replacement capture should include eth1");
+        assert!(replacement_entry.generation() > old_generation);
+        assert!(replaced.next_generation() > replacement_entry.generation());
+        drop(replacement);
     }
 
     #[test]

@@ -5382,6 +5382,289 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn capture_ready_network_traverses_signed_mmio_and_pci_owners() {
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootNetworkCaptureConfig, HvfArm64BootNetworkCaptureError,
+        HvfArm64BootNetworkDeviceOrigin, HvfArm64BootNetworkTransportCaptureState,
+        HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::{
+        NetworkDeviceProfile, NetworkInterfaceConfigInput, NetworkMmioLayout,
+        NetworkRateLimiterConfig, NetworkTokenBucketConfig, PreparedNetworkDevice,
+        VirtioNetworkRateLimiterCaptureState,
+    };
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("capture-ready-network-kernel", &image)
+        .expect("network capture kernel should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("network capture boot source should configure");
+    let limiter = NetworkRateLimiterConfig::new(
+        Some(NetworkTokenBucketConfig::new(4096, Some(8192), 100)),
+        Some(NetworkTokenBucketConfig::new(64, None, 100)),
+    );
+    controller
+        .handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "private-network-backend")
+                .with_guest_mac("02:00:00:00:00:41")
+                .with_mtu(1400)
+                .with_rx_rate_limiter(limiter)
+                .with_tx_rate_limiter(limiter),
+        ))
+        .expect("startup capture network should configure");
+    let startup_configs = controller.network_interface_configs().to_vec();
+    let capture_configs = |configs: &[bangbang_runtime::network::NetworkInterfaceConfig]| {
+        configs
+            .iter()
+            .map(|config| {
+                HvfArm64BootNetworkCaptureConfig::new(
+                    config.clone(),
+                    NetworkDeviceProfile::from_config(config),
+                    None,
+                    None,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let base_session_config = || {
+        HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            test_rtc_mmio_layout(),
+        )
+    };
+
+    let mut mmio_session = OwnedHvfArm64BootSession::new(&controller, base_session_config())
+        .expect("signed MMIO network session should prepare");
+    let mmio_guard = mmio_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("MMIO network retry publisher should quiesce");
+    let now = Instant::now();
+    let mmio_first = mmio_session
+        .capture_ready_network_state_at(&capture_configs(&startup_configs), &mmio_guard, now)
+        .expect("signed MMIO network should become capture-ready");
+    let mmio_second = mmio_session
+        .capture_ready_network_state_at(&capture_configs(&startup_configs), &mmio_guard, now)
+        .expect("signed MMIO network capture should repeat");
+    assert_eq!(mmio_first, mmio_second);
+    assert_eq!(mmio_first.interfaces().len(), 1);
+    let HvfArm64BootNetworkTransportCaptureState::Mmio {
+        region,
+        interrupt_line,
+        state,
+    } = mmio_first.interfaces()[0].transport()
+    else {
+        panic!("MMIO network should retain MMIO ownership");
+    };
+    assert_eq!(region.range().start(), GuestAddress::new(0x6000_0000));
+    assert!(interrupt_line.raw_value() > 0);
+    assert!(state.device().active_rx_queue().is_none());
+    assert!(state.device().active_tx_queue().is_none());
+    assert!(state.device().rx_rate_limiter().is_configured());
+    assert!(state.device().tx_rate_limiter().is_configured());
+    assert!(!state.transport().is_device_activated());
+    let mmio_device = state.device().clone();
+    let debug = format!("{mmio_first:?}");
+    assert!(!debug.contains("private-network-backend"));
+    assert!(!debug.contains("02:00:00:00:00:41"));
+    assert!(matches!(
+        mmio_session.capture_ready_network_state_at(&[], &mmio_guard, now),
+        Err(HvfArm64BootNetworkCaptureError::InventoryMismatch)
+    ));
+    drop(mmio_guard);
+    mmio_session
+        .shutdown()
+        .expect("signed MMIO network session should shut down");
+
+    let mut pci_session =
+        OwnedHvfArm64BootSession::new(&controller, base_session_config().with_pci_enabled())
+            .expect("signed PCI network session should prepare");
+    let pci_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI network retry publisher should quiesce");
+    let pci_now = Instant::now();
+    let pci_capture_configs = capture_configs(&startup_configs);
+    let pci_startup = pci_session
+        .capture_ready_network_state_at(&pci_capture_configs, &pci_guard, pci_now)
+        .expect("signed startup PCI network should become capture-ready");
+    let pci_repeated = pci_session
+        .capture_ready_network_state_at(&pci_capture_configs, &pci_guard, pci_now)
+        .expect("signed startup PCI network capture should repeat");
+    assert_eq!(pci_startup, pci_repeated);
+    let HvfArm64BootNetworkTransportCaptureState::Pci {
+        origin,
+        sbdf,
+        bar_range,
+        state,
+    } = pci_startup.interfaces()[0].transport()
+    else {
+        panic!("PCI network should retain PCI ownership");
+    };
+    assert_eq!(*origin, HvfArm64BootNetworkDeviceOrigin::Startup);
+    assert!(sbdf.device() > 0);
+    assert_eq!(
+        bar_range.size(),
+        bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE
+    );
+    let pci_device = state.device();
+    assert_eq!(pci_device.profile(), mmio_device.profile());
+    assert_eq!(
+        pci_device.available_features(),
+        mmio_device.available_features()
+    );
+    assert_eq!(
+        pci_device.negotiated_features(),
+        mmio_device.negotiated_features()
+    );
+    assert_eq!(pci_device.active_rx_queue(), mmio_device.active_rx_queue());
+    assert_eq!(pci_device.active_tx_queue(), mmio_device.active_tx_queue());
+    assert_eq!(
+        pci_device.source_rx_cache_normalized(),
+        mmio_device.source_rx_cache_normalized()
+    );
+    assert_eq!(
+        pci_device.source_rx_retry_normalized(),
+        mmio_device.source_rx_retry_normalized()
+    );
+    assert_eq!(pci_device.tx_retry(), mmio_device.tx_retry());
+    let limiter_shape = |limiter: VirtioNetworkRateLimiterCaptureState| {
+        (
+            limiter
+                .bandwidth()
+                .map(|bucket| (bucket.config(), bucket.budget(), bucket.one_time_burst())),
+            limiter
+                .ops()
+                .map(|bucket| (bucket.config(), bucket.budget(), bucket.one_time_burst())),
+        )
+    };
+    assert_eq!(
+        limiter_shape(pci_device.rx_rate_limiter()),
+        limiter_shape(mmio_device.rx_rate_limiter())
+    );
+    assert_eq!(
+        limiter_shape(pci_device.tx_rate_limiter()),
+        limiter_shape(mmio_device.tx_rate_limiter())
+    );
+    drop(pci_guard);
+
+    controller
+        .handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth1", "eth1", "runtime-private-backend")
+                .with_guest_mac("02:00:00:00:00:42"),
+        ))
+        .expect("runtime capture network should join controller inventory");
+    let runtime_config = controller.network_interface_configs()[1].clone();
+    pci_session
+        .insert_runtime_network_device(PreparedNetworkDevice::from_config(&runtime_config))
+        .expect("runtime PCI network should publish");
+    let all_configs = controller.network_interface_configs().to_vec();
+    let all_capture_configs = capture_configs(&all_configs);
+    let runtime_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("runtime PCI network retry publisher should quiesce");
+    let duplicate_capture_configs = vec![
+        all_capture_configs[0].clone(),
+        all_capture_configs[0].clone(),
+    ];
+    assert!(matches!(
+        pci_session.capture_ready_network_state_at(
+            &duplicate_capture_configs,
+            &runtime_guard,
+            Instant::now(),
+        ),
+        Err(HvfArm64BootNetworkCaptureError::InventoryMismatch)
+    ));
+    let runtime_capture = pci_session
+        .capture_ready_network_state_at(&all_capture_configs, &runtime_guard, Instant::now())
+        .expect("startup/runtime PCI network inventory should capture");
+    assert_eq!(runtime_capture.interfaces().len(), 2);
+    let origins = runtime_capture
+        .interfaces()
+        .iter()
+        .map(|interface| match interface.transport() {
+            HvfArm64BootNetworkTransportCaptureState::Pci { origin, .. } => *origin,
+            HvfArm64BootNetworkTransportCaptureState::Mmio { .. } => {
+                panic!("PCI inventory must not capture an MMIO owner")
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        origins,
+        [
+            HvfArm64BootNetworkDeviceOrigin::Startup,
+            HvfArm64BootNetworkDeviceOrigin::Runtime,
+        ]
+    );
+    drop(runtime_guard);
+
+    let removed = pci_session
+        .prepare_runtime_network_device_removal("eth1")
+        .expect("runtime PCI network removal should prepare");
+    let missing_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("partially removed inventory retry publisher should quiesce");
+    assert!(matches!(
+        pci_session.capture_ready_network_state_at(
+            &all_capture_configs,
+            &missing_guard,
+            Instant::now(),
+        ),
+        Err(HvfArm64BootNetworkCaptureError::PciCapture)
+    ));
+    drop(missing_guard);
+    pci_session
+        .rollback_runtime_network_device_removal(removed)
+        .expect("failed capture topology should remain rollback-safe");
+
+    let removed = pci_session
+        .prepare_runtime_network_device_removal("eth1")
+        .expect("runtime PCI network replacement removal should prepare");
+    pci_session
+        .commit_runtime_network_device_removal(removed)
+        .expect("runtime PCI network replacement removal should commit");
+    pci_session
+        .insert_runtime_network_device(PreparedNetworkDevice::from_config(&runtime_config))
+        .expect("same-ID runtime PCI network should republish");
+    let replacement_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("replacement PCI network retry publisher should quiesce");
+    let replacement = pci_session
+        .capture_ready_network_state_at(&all_capture_configs, &replacement_guard, Instant::now())
+        .expect("same-ID replacement PCI network should capture");
+    assert!(matches!(
+        replacement.interfaces()[1].transport(),
+        HvfArm64BootNetworkTransportCaptureState::Pci {
+            origin: HvfArm64BootNetworkDeviceOrigin::Runtime,
+            ..
+        }
+    ));
+    drop(replacement_guard);
+    pci_session
+        .shutdown()
+        .expect("signed PCI network session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn capture_ready_balloon_traverses_signed_mmio_and_pci_owners() {
     use bangbang_hvf::{
         HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonDeviceConfig,
