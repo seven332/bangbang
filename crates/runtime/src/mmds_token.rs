@@ -419,8 +419,8 @@ mod tests {
             assert!(authority.is_valid(token));
         }
         assert!(
-            &decoded_token(&minimum)[..MMDS_TOKEN_NONCE_BYTES]
-                != &decoded_token(&maximum)[..MMDS_TOKEN_NONCE_BYTES]
+            decoded_token(&minimum)[..MMDS_TOKEN_NONCE_BYTES]
+                != decoded_token(&maximum)[..MMDS_TOKEN_NONCE_BYTES]
         );
     }
 
@@ -526,7 +526,7 @@ mod tests {
                 .as_ref()
                 .expect("rotated authority should have a key")
                 .as_ref()
-                != &old_key
+                != old_key
         );
         assert_eq!(authority.num_encrypted_tokens, 1);
         assert!(!authority.is_valid(&old_token));
@@ -556,7 +556,7 @@ mod tests {
                 .as_ref()
                 .expect("old key should remain")
                 .as_ref()
-                == &old_key
+                == old_key
         );
         assert_eq!(authority.num_encrypted_tokens, u32::MAX);
         assert!(authority.is_valid(&old_token));
@@ -585,7 +585,7 @@ mod tests {
                 .as_ref()
                 .expect("old key should remain")
                 .as_ref()
-                == &old_key
+                == old_key
         );
         assert_eq!(authority.num_encrypted_tokens, u32::MAX);
         assert!(authority.is_valid(&old_token));
@@ -656,7 +656,7 @@ mod tests {
                     .as_ref()
                     .expect("old key should remain")
                     .as_ref()
-                    == &old_key
+                    == old_key
             );
             assert_eq!(authority.num_encrypted_tokens, u32::MAX);
             authority.set_now_millis(1_000);
