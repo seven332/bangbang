@@ -1000,9 +1000,23 @@ packet, partial-batch, and latency producers feed bounded per-interface and
 aggregate metrics. Callback generations are retired, disabled, and drained
 before vmnet stop and reuse.
 
+Each MMDS-selected interface owns an independent bounded Ethernet/ARP/IPv4/TCP
+session while sharing only the process-local metadata and token authority. The
+session matches the pinned 30-connection, 100-reset, 2,500-byte receive-buffer,
+single-response, MSS/window, ordered-stream, eviction, close/reset, response-
+segmentation, ACK-progress, 1.2-second retransmission, and 15-retry timeout
+contract. One generated frame is retained until guest RX publication commits;
+ARP output takes priority over reset and TCP output. Future protocol deadlines
+join the existing per-interface limiter scheduler, so retransmission and
+timeout cleanup do not depend on another guest TX notification and no separate
+timer thread is created.
+
 Current signed Network/MMDS scenarios select every configured interface in MMDS
 config, so startup uses process-local MMDS-only packet I/O without opening
-vmnet; they do not prove direct vmnet or external packet movement. Non-MMDS-only
+vmnet. The direct-rootfs gate renews a v2 token, receives a segmented 49,152-byte
+response, deliberately drops one response ACK, and observes retransmitted
+response bytes before completing over both selected transports. These cases do not
+prove direct vmnet or external packet movement. Non-MMDS-only
 startup conditionally uses the internal direct-vmnet foundation, which requires
 Apple's restricted networking authorization plus operator-owned firewall,
 routing/NAT, resource, and distribution policy. See the
@@ -1087,7 +1101,7 @@ top-level aggregate `net` and non-empty per-interface
 packet/byte counts, activation/config and queue failures, no-buffer and
 remaining-request facts, limiter events/throttles, source-MAC observations,
 vmnet read/write calls and partial batches, and bounded latency aggregates; a top-level `mmds` object for
-implemented guest MMDS packet detour and response queue activity; a top-level
+implemented guest MMDS packet/session, retransmission, and delivery activity; a top-level
 `vsock` object for implemented virtio-vsock RX/TX queue activity, packet
 counts, byte counts, connection cleanup counters, and classifiable queue/event
 failures; a top-level `entropy` object with Firecracker-shaped counters for

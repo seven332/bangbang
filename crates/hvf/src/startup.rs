@@ -2046,6 +2046,11 @@ impl HvfArm64BootPciDataDevices {
                     }
                 }
             }
+            if let Some(provider) = packet_io.as_deref()
+                && let Some(protocol_retry_after) = provider.packet_retry_after(interface)
+            {
+                retain_earliest_retry(&mut retry_after, Some(protocol_retry_after));
+            }
             device.retry_deadline = retry_after.map(limiter_retry_deadline_after);
         }
         self.network_retry_deadline()
@@ -11058,6 +11063,15 @@ impl HvfArm64BootNetworkNotificationDispatches {
         }
     }
 
+    fn new_with_retry_after(
+        devices: Vec<HvfArm64BootNetworkNotificationDispatch>,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        let mut dispatches = Self::new(devices);
+        retain_earliest_retry(&mut dispatches.rate_limiter_retry_after, retry_after);
+        dispatches
+    }
+
     fn from_pci_retry(rate_limiter_retry_after: Option<Duration>) -> Self {
         Self {
             devices: Vec::new(),
@@ -13456,6 +13470,7 @@ fn collect_network_notification_dispatches(
     dispatches: Arm64BootNetworkNotificationDispatches,
 ) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
 {
+    let retry_after = dispatches.rate_limiter_retry_after();
     let runtime_dispatches = dispatches.into_vec();
     let mut devices = Vec::new();
     devices
@@ -13468,7 +13483,7 @@ fn collect_network_notification_dispatches(
         devices.push(HvfArm64BootNetworkNotificationDispatch::new(dispatch, None));
     }
 
-    Ok(HvfArm64BootNetworkNotificationDispatches::new(devices))
+    Ok(HvfArm64BootNetworkNotificationDispatches::new_with_retry_after(devices, retry_after))
 }
 
 fn collect_vsock_notification_dispatches(
@@ -14388,6 +14403,7 @@ fn signal_network_queue_interrupts(
     signaler: &dyn InterruptSink,
 ) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
 {
+    let retry_after = dispatches.rate_limiter_retry_after();
     let runtime_dispatches = dispatches.into_vec();
     let mut devices = Vec::new();
     devices
@@ -14408,7 +14424,7 @@ fn signal_network_queue_interrupts(
         ));
     }
 
-    Ok(HvfArm64BootNetworkNotificationDispatches::new(devices))
+    Ok(HvfArm64BootNetworkNotificationDispatches::new_with_retry_after(devices, retry_after))
 }
 
 fn signal_vsock_queue_interrupts(
@@ -18633,6 +18649,7 @@ mod tests {
         tx_sink: RecordingTxPacketSink,
         rx_source: EmptyRxPacketSource,
         requested_ifaces: Vec<String>,
+        protocol_retry_after: Option<Duration>,
         fail: bool,
     }
 
@@ -18643,8 +18660,14 @@ mod tests {
                 tx_sink: RecordingTxPacketSink::default(),
                 rx_source: EmptyRxPacketSource::default(),
                 requested_ifaces: Vec::new(),
+                protocol_retry_after: None,
                 fail: false,
             }
+        }
+
+        fn with_protocol_retry_after(mut self, retry_after: Duration) -> Self {
+            self.protocol_retry_after = Some(retry_after);
+            self
         }
 
         fn failing_for(iface_id: &str) -> Self {
@@ -18656,6 +18679,17 @@ mod tests {
     }
 
     impl Arm64BootNetworkPacketIoProvider for RecordingNetworkPacketIoProvider {
+        fn packet_retry_after(
+            &self,
+            interface: bangbang_runtime::startup::Arm64BootNetworkInterface<'_>,
+        ) -> Option<Duration> {
+            if interface.iface_id() == self.iface_id {
+                self.protocol_retry_after
+            } else {
+                None
+            }
+        }
+
         fn packet_io(
             &mut self,
             interface: bangbang_runtime::startup::Arm64BootNetworkInterface<'_>,
@@ -23529,6 +23563,36 @@ mod tests {
                 .processed_frames(),
             1
         );
+    }
+
+    #[test]
+    fn network_protocol_retry_survives_collection_and_interrupt_signaling() {
+        let retry_after = Duration::from_millis(725);
+
+        let dispatch_once = || {
+            let (mut memory, mut runtime, mut mmio_dispatcher) =
+                boot_runtime_with_networks(&[("eth0", "tap0")]);
+            let mut provider = RecordingNetworkPacketIoProvider::for_iface("eth0")
+                .with_protocol_retry_after(retry_after);
+            let dispatches = dispatch_boot_network_notifications_with_packet_io(
+                &mut memory,
+                &mut runtime,
+                &mut mmio_dispatcher,
+                &mut provider,
+            );
+            assert!(provider.requested_ifaces.is_empty());
+            assert_eq!(dispatches.rate_limiter_retry_after(), Some(retry_after));
+            dispatches
+        };
+
+        let collected = collect_network_notification_dispatches(dispatch_once())
+            .expect("protocol retry should survive collection");
+        assert_eq!(collected.rate_limiter_retry_after(), Some(retry_after));
+
+        let (_lines, sink) = RecordingSink::successful();
+        let signaled = signal_network_queue_interrupts(dispatch_once(), sink.as_ref())
+            .expect("protocol retry should survive interrupt signaling");
+        assert_eq!(signaled.rate_limiter_retry_after(), Some(retry_after));
     }
 
     #[test]

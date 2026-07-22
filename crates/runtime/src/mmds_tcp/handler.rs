@@ -51,7 +51,6 @@ struct PendingReset {
 }
 
 /// Fixed-capacity MMDS TCP connection and reset handler.
-#[derive(Debug)]
 pub struct MmdsTcpHandler {
     local_port: u16,
     connections: Vec<ConnectionEntry>,
@@ -60,6 +59,21 @@ pub struct MmdsTcpHandler {
     pending_reset_limit: usize,
     next_connection: usize,
     last_timestamp: u64,
+}
+
+impl fmt::Debug for MmdsTcpHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsTcpHandler")
+            .field("local_port", &self.local_port)
+            .field("connection_count", &self.connections.len())
+            .field("connection_limit", &self.connection_limit)
+            .field("pending_reset_count", &self.pending_resets.len())
+            .field("pending_reset_limit", &self.pending_reset_limit)
+            .field("next_connection", &self.next_connection)
+            .field("last_timestamp", &self.last_timestamp)
+            .finish()
+    }
 }
 
 impl MmdsTcpHandler {
@@ -136,7 +150,7 @@ impl MmdsTcpHandler {
                 .is_some_and(|entry| entry.endpoint.is_done())
             {
                 self.remove_connection(index);
-                return Ok(HandlerReceiveEvent::EndpointDone);
+                return Ok(HandlerReceiveEvent::EndpointDone { status });
             }
             return Ok(HandlerReceiveEvent::ExistingConnection { status });
         }
@@ -362,7 +376,7 @@ impl MmdsTcpHandler {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandlerReceiveEvent {
     /// An endpoint became done and was removed.
-    EndpointDone,
+    EndpointDone { status: super::ReceiveStatus },
     /// Existing connection accepted or classified a segment.
     ExistingConnection { status: super::ReceiveStatus },
     /// A new endpoint was created.

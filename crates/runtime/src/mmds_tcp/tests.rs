@@ -889,6 +889,39 @@ fn endpoint_holds_one_response_and_replays_from_partial_ack() {
 }
 
 #[test]
+fn payload_and_endpoint_debug_surfaces_redact_buffered_bytes() {
+    let protected = b"private-mmds-payload";
+    let payload_source = PayloadSource::new(protected, 7);
+    let payload_debug = format!("{payload_source:?}");
+    assert!(!payload_debug.contains("private-mmds-payload"));
+    assert!(payload_debug.contains("[REDACTED]"));
+    assert!(payload_debug.contains(&format!("len: {}", protected.len())));
+
+    let remote_initial = 1_000;
+    let local_initial = 5_000;
+    let mut endpoint = establish_endpoint(remote_initial, local_initial, None, 0);
+    let request = b"GET / HTTP/1.1\r\nX-Private: private-mmds-payload\r\n\r\n";
+    let request_bytes = basic_segment(
+        remote_initial.wrapping_add(1),
+        local_initial.wrapping_add(1),
+        TcpFlags::ACK,
+        4_096,
+        request,
+    );
+    let request_segment = TcpSegment::parse(&request_bytes).expect("request segment parses");
+    endpoint
+        .receive_segment(&request_segment, 1, |_| {
+            Ok::<_, CallbackError>(protected.to_vec())
+        })
+        .expect("request should populate endpoint response state");
+
+    let endpoint_debug = format!("{endpoint:?}");
+    assert!(!endpoint_debug.contains("private-mmds-payload"));
+    assert!(endpoint_debug.contains("receive_buffer: \"[REDACTED]\""));
+    assert!(endpoint_debug.contains(&format!("response: Some({})", protected.len())));
+}
+
+#[test]
 fn endpoint_resets_on_callback_response_or_receive_bound_failure() {
     let remote_initial = 10;
     let local_initial = 20;

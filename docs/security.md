@@ -2239,19 +2239,17 @@ responses without echoing malformed request bytes, and serialize process-local
 HTTP response bytes for guest delivery while preserving only accepted
 `HTTP/1.0` or `HTTP/1.1` status-line versions. Malformed request lines and
 unsupported versions use the default safe parse-error response without echoing
-arbitrary version tokens. It can synthesize deterministic
-Ethernet/ARP replies, Ethernet/IPv4/TCP SYN-ACK frames, and Ethernet/IPv4/TCP
-response frames carrying those bytes, expose queued response frames through the
-matching virtio-net RX source, and schedule one bounded post-TX RX retry when
-that source reports a queued response. It also has a stateless process-local
+arbitrary version tokens. One bounded interface-local network stack serializes
+ARP and TCP output around those HTTP bytes and retains exactly one generated
+frame until guest RX publication commits. It also has a stateless process-local
 MMDS v2 token authority matching Firecracker v1.16.0's AES-256-GCM envelope:
 a 12-byte random nonce, encrypted 8-byte little-endian monotonic expiry, and
 16-byte authentication tag encoded as exactly 48 standard-Base64 characters.
 The immutable `microvmid=<instance-id>` additional-authentication data binds
 each token to the controller instance that created it. Keys and AAD are
 zeroizing and debug-redacted. Instance/startup configuration and internal HTTP,
-request-buffer, response-queue, normalized-packet, staged-frame, and RX-packet
-debug views redact identities and packet contents while retaining only safe
+session, normalized-packet, staged-frame, and RX-packet debug views redact
+identities and packet contents while retaining only safe
 shape, count, and length diagnostics. The authority rotates before encrypting
 beyond `u32::MAX` tokens under one key, and failed first-use or rotation
 attempts do not replace the current key or advance its counter. Validation
@@ -2266,55 +2264,51 @@ moves each opaque token through fixed scratch sectors while both VMs are
 paused, requires `401 Unauthorized` when each guest presents its peer's token,
 then proves each guest's own token remains valid. The host and guest emit only
 static coordination markers, and dynamic token bytes are checked absent from
-stdout, stderr, and failure diagnostics. The runtime can
-classify ARP requests for the configured MMDS IPv4 address and raw
-Ethernet/IPv4/TCP guest packet bytes as MMDS candidates only when they target
-the configured MMDS IPv4 address and TCP port `80`; malformed, truncated,
-fragmented, non-TCP, and non-MMDS packets are ignored as non-candidates. For
-pure empty-payload TCP SYN candidates, the runtime can synthesize deterministic
-SYN-ACK frames, and pure empty-payload TCP ACK-only candidates that acknowledge
-that deterministic SYN-ACK are consumed without queueing a response. Pure
-empty-payload TCP FIN close candidates queue
-deterministic ACK and FIN-ACK frames without touching MMDS data or token state.
-Unsupported empty-payload TCP control candidates queue deterministic RST frames
-without touching MMDS data or token state, and guest-sent packets carrying RST
-are consumed without response even when they also carry payload bytes.
-For non-empty candidate TCP payloads that acknowledge that deterministic
-SYN-ACK and do not carry unsupported SYN or FIN payload control flags, the
-runtime can produce the same process-local HTTP response bytes as the existing
-guest HTTP helper, including token PUT and MMDS v2 GET token enforcement.
-Non-empty candidates carrying SYN or FIN are not interpreted as process-local
-MMDS HTTP requests. The process vmnet TX path detours
-MMDS ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
-ACK-only packets that acknowledge bangbang's deterministic SYN-ACK, pure
-empty-payload MMDS FIN close packets, unsupported empty-payload MMDS control
-packets, guest-sent MMDS packets carrying RST, and non-empty candidates on
-interfaces listed in the MMDS config when they acknowledge bangbang's
-deterministic SYN-ACK and do not carry unsupported SYN or FIN payload control
-flags,
-buffers split request headers in bounded per-interface process
-state only when each fragment starts at the next expected TCP sequence number,
-rejects non-contiguous buffered fragments before appending guest bytes,
-synthesizes response frames from deterministic ARP context, deterministic
-SYN-ACK context, minimal FIN close context, minimal RST context, or the first
-TCP request fragment context, retains those frames in bounded per-interface
-queues, delivers queued frames through the matching virtio-net RX source with a
-bounded post-TX RX retry, and does not forward handled request payloads to
-vmnet. When every configured network interface is listed in MMDS config,
-startup can use a process-local MMDS-only packet path that reuses the same
-detour and response-queue logic, drops non-MMDS TX frames, and does not open
-vmnet resources. This still does
-not manage a full ARP cache, emit gratuitous ARP, implement ARP
-timeouts/retries, validate broader TCP ACK numbers beyond the narrow ACK-only
-and non-empty payload SYN-ACK acknowledgement paths, reassemble out-of-order TCP
-data, track TCP state, implement retransmission policy, implement a full
-stateful RST policy, or handle session timeouts. Consistent with Firecracker
-v1.16.0's
+stdout, stderr, and failure diagnostics.
+
+The runtime first performs Firecracker's speculative target test over a valid
+Ethernet header: an ARP target protocol address or IPv4 destination must equal
+the configured MMDS address. VLAN-tagged and non-target traffic are not owned;
+a target-classified frame is consumed before external egress even if its full
+ARP, IPv4, or TCP parse later fails. Exact Ethernet/IPv4 ARP requests update one
+pending reply and the interface's last remote MAC. IPv4 parsing requires an
+exact total length, deliberately tolerates an unverified header checksum for
+offload compatibility, treats non-TCP as unusual consumed traffic, and parses
+each fragment independently without reassembly. A parseable first fragment may
+reach TCP while a later fragment normally fails TCP parsing; neither is
+forwarded to vmnet.
+
+Every MMDS-selected interface owns a separate TCP handler bound to port `80`,
+with at most 30 connections, 100 pending resets, a 2,500-byte request buffer per
+endpoint, and one response per endpoint. The handler validates MSS, sequence and
+ACK progress, receive and remote windows, in-order data, duplicate/out-of-window
+traffic, FIN/RST state, and 40-second bounded eviction. Responses are segmented
+to the negotiated MSS and remote window; unacknowledged output is retransmitted
+after 1.2 seconds and the fifteenth timeout resets and removes the connection.
+ARP replies precede reset and connection output. Exactly one serialized frame
+is retained across repeated peeks and limiter/no-buffer outcomes until the
+guest used-ring publication consumes it, so delivery metrics cannot double
+count a retry.
+
+Only future protocol timeouts enter the existing generation-owned network
+scheduler; immediate or retained output remains packet readiness. The earliest
+protocol and limiter deadline is rearmed across ordinary pause/resume, canceled
+on terminal shutdown, and recomputed after PCI DELETE so a removed generation
+cannot wake a same-ID replacement. No MMDS timer thread or callback-side guest
+mutation exists. All interfaces share the process-local metadata/token state
+and top-level metrics but not ARP, TCP, reset, response, or retained-frame state.
+All-MMDS configurations use the same stack through MMDS-only packet I/O, drop
+non-MMDS TX, and open no vmnet resource. Signed direct-rootfs MMIO and PCI
+coverage renews a v2 token, receives a segmented 49,152-byte response, drops one
+ACK, and observes retransmission before completion.
+
+The stack still does not implement a general ARP cache, gratuitous ARP, ARP
+timeouts/retries, or IPv4 fragment reassembly; capture/restore deliberately
+starts fresh network and MMDS sessions under the owning snapshot work.
+Consistent with Firecracker v1.16.0's
 [MMDS security considerations](https://github.com/firecracker-microvm/firecracker/blob/v1.16.0/docs/mmds/mmds-design.md#security-considerations),
 this detour is not an outbound firewall: guest traffic remains untrusted, and
-host policy must block access to restricted host addresses. Future guest-visible
-MMDS work must continue validating device, packet, token, and TCP/session inputs
-before expanding the guest-visible data path.
+host policy must block access to restricted host addresses.
 
 ## Multi-Process Operation
 
@@ -2371,19 +2365,15 @@ The current scaffold does not implement:
   packet descriptor, single-packet system read/write backend boundaries, a
   cleanup-owning packet backend for retaining stop-on-drop ownership while
   delegating packet I/O, and an internal virtio-net adapter that can move
-  packets between vmnet and the runtime packet traits, detour configured MMDS
-  ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
-  ACK-only packets that acknowledge bangbang's deterministic SYN-ACK, pure
-  empty-payload MMDS FIN close packets, unsupported empty-payload MMDS control
-  packets, guest-sent MMDS packets carrying RST, and non-empty MMDS TX payloads
-  that acknowledge bangbang's deterministic SYN-ACK before vmnet forwarding,
-  buffer contiguous split MMDS request headers,
-  synthesize deterministic ARP replies, MMDS SYN-ACK frames, minimal MMDS RST
-  frames, and MMDS TCP response frames, retain bounded per-interface MMDS
-  response queues, and expose queued responses through virtio-net RX with
-  bounded post-TX retry, plus an MMDS-only adapter that can reuse those queues
-  without opening vmnet when every configured interface is listed in MMDS
-  config, plus a bounded per-interface registry that owns independent adapters,
+  packets between vmnet and the runtime packet traits, detour speculatively
+  targeted MMDS traffic before external egress, and share one bounded
+  interface-local ARP/IPv4/TCP stack between TX classification and RX delivery.
+  The stack owns 30 connections, 100 resets, fixed 2,500-byte receive buffers,
+  one response per endpoint, segmentation/flow control/ACK/FIN/RST state,
+  retransmission and eviction deadlines, and one commit-retained output frame.
+  Protocol deadlines merge into the existing generation-safe owner scheduler.
+  An MMDS-only adapter reuses the same stack without opening vmnet when every
+  configured interface is listed in MMDS config, plus a bounded per-interface registry that owns independent adapters,
   explicit vmnet stop/drop, and exact generation take/restore, and an internal `host_dev_name` mapping for
   `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
   model stores at most 16 configured network interfaces. Startup revalidates

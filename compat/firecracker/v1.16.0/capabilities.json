@@ -9488,7 +9488,7 @@
     {
       "id": "semantic.mmds:tcp-token-session-and-isolation",
       "family": "network-and-mmds",
-      "summary": "The current subset implements Firecracker-shaped MMDS v1/v2 HTTP behavior plus stateless AES-256-GCM v2 tokens bound to immutable instance identity, current-key rotation, strict validation, and signed two-process peer-token rejection without token diagnostics. Audit complete TCP/session behavior, reassembly/retransmission/timeouts, broader interface policy, and snapshot state.",
+      "summary": "The current live subset implements Firecracker-shaped MMDS v1/v2 HTTP behavior, stateless AES-256-GCM v2 tokens bound to immutable instance identity, and independent bounded per-interface TCP sessions with exact target ownership, flow control, segmentation, retransmission, timeout, eviction, reset, delivery, scheduler, and signed lossy long-response behavior. Audit capture-ready state, contained aggregate evidence, final interface-policy reconciliation, and snapshot handoff.",
       "source_refs": [
         "corpus:mmds-design",
         "corpus:mmds-user-guide"
@@ -9498,7 +9498,7 @@
     {
       "id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
       "family": "network-and-mmds",
-      "summary": "The current live subset implements virtio-net queues, typed vmnet results and lifecycle, generation-scoped callback readiness, bounded RX/TX batches with explicit partial counts, MMDS/limiter/result ordering, metrics, PCI ownership, and terminal cleanup. Audit direct virtio headers and offloads, external egress/connectivity and host resource policy, broader MMDS TCP behavior, and network snapshot state.",
+      "summary": "The current live subset implements virtio-net queues and portable headers/offloads, typed vmnet results and lifecycle, generation-scoped callback readiness, bounded RX/TX batches with explicit partial counts, complete MMDS session ordering and timers, metrics, PCI ownership, and terminal cleanup. Audit external egress/connectivity and host resource policy, capture-ready state, contained aggregate evidence, and network snapshot handoff.",
       "source_refs": [
         "corpus:network-performance",
         "corpus:network-setup",

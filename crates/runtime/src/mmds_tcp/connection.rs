@@ -96,10 +96,21 @@ impl BitOrAssign for ReceiveStatus {
 }
 
 /// Caller-owned bytes and the sequence number of their first byte.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct PayloadSource<'a> {
     bytes: &'a [u8],
     initial_sequence_number: u32,
+}
+
+impl fmt::Debug for PayloadSource<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PayloadSource")
+            .field("bytes", &"[REDACTED]")
+            .field("len", &self.bytes.len())
+            .field("initial_sequence_number", &self.initial_sequence_number)
+            .finish()
+    }
 }
 
 impl<'a> PayloadSource<'a> {
