@@ -9,7 +9,7 @@ HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
 `GET /vm/config`, `GET /machine-config`, pre-boot `PUT /machine-config`
 configuration storage, pre-boot `PUT /boot-source` configuration storage, pre-boot `PUT /drives/{drive_id}`
 configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage plus an internal virtio-vsock config-space, packet header model, TX descriptor packet parser, TX available-ring drain helper with used-ring descriptor completion, prepared device resource, host Unix socket listener owner, accepted host stream owner, bounded accepted-stream polling and retention, accepted-stream `CONNECT <PORT>` handshake reader, host local port allocator, retained host connection table model with pending host-initiated request packet headers, RX delivery and late RX retry for host request packet headers, guest `RESPONSE` acknowledgement for retained host-initiated connections, guest `RST` cleanup and guest `SHUTDOWN` partial-state/full-cleanup for retained host-initiated and guest-initiated connections, bounded guest-visible `RST` queueing for unsupported or orphan host-destined guest packets, bounded guest-initiated `uds_path_<PORT>` connection handling with guest `RESPONSE` or `RST` header delivery, guest `RW` payload forwarding to retained host streams for established host-initiated or guest-initiated connections with bounded four-packet per-connection guest-to-host retry buffering, bounded four-packet per-connection host-to-guest `RW` backlog and delivery from established retained streams into guest RX buffers, minimal guest `CREDIT_UPDATE` consumption and `CREDIT_REQUEST` responses with guest-visible `CREDIT_UPDATE` headers for established retained streams, MMIO registration helper, MMIO handler skeleton with active queue metadata retention, handler-level RX/TX notification dispatch, no-op event notification handling, startup FDT attachment, boot-runtime/HVF RX/TX notification dispatch with queue interrupt signaling, and boot-runtime/HVF no-op event notification handling, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, pre-boot `PUT /serial` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a macOS-gated internal vmnet descriptor, lifecycle, start owner, concrete system start/stop backend, and packet descriptor boundary model for future host networking, a backend-neutral VM trait, a minimal VMM action/data model with internal
-`InstanceStart` preflight, transactional startup executor, and successful-start state transition helpers, an internal MMDS guest ARP/TCP packet classifier, process-local packet-payload HTTP exchange, process vmnet TX detour, internal MMDS ARP and TCP response-frame synthesis, bounded ordered split-request buffering, and queued virtio-net RX delivery with bounded post-TX retry, backend-neutral guest
+`InstanceStart` preflight, transactional startup executor, and successful-start state transition helpers, an internal per-interface MMDS network stack with speculative Ethernet/ARP/IPv4 ownership, bounded Firecracker-shaped TCP sessions, retained frame delivery, and scheduler-integrated retransmission, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
@@ -1266,7 +1266,7 @@ compatibility targets.
 | `PUT` | `/cpu-config` | supported finite arm64 custom profile; all other categories terminally classified | Parses bounded ordered Firecracker aarch64 custom templates with a 256-entry limit per array, exact 32/64/128-bit ARM identities/bitmaps, fixed seven-word vCPU-feature indexes, stronger duplicate-identity checks, and value-redacted diagnostics. A successful custom PUT replaces static/custom state; empty input clears it. Exact `(baseline & !filter) | value` execution covers eleven U64 ID registers, ACTLR.EnTSO, U64 X0/X4-X30 and reviewed SP/PC/PSTATE fields, U128 Q0-Q31 with explicit little-endian transport, and U32 FPCR/FPSR with fail-closed scalar conversion. ZFR0/SMFR0 require a public macOS 15.2 pre-VM gate; ACTLR filters are limited to bit 1. Every requested typed baseline is read on every owner before any write, targets are common, and each write is immediately reread; boot setup then overrides X0/PC/PSTATE. Any failure destroys the unpublished VM. X1-X3, banked state, all named unsafe/dependency/time/ownership/EL2 public-HVF families, aliases, unnamed encodings, and invalid KVM fields receive stable value-free policy faults; KVM capability, vCPU-feature, demux, firmware, firmware-feature, SVE, and unknown classes have distinct platform faults. Custom contents are omitted from GET and excluded from native-v1 snapshots. See the checked CPU-template contract. |
 | `PUT` | `/network-interfaces/{iface_id}` | pre-boot storage plus PCI-only Running/Paused insertion implemented | Stores up to 16 initial virtio-net configurations before boot without opening host networking resources, including Firecracker-shaped RX/TX bandwidth and ops limiters. Startup preparation attaches configured interfaces over the selected virtio-MMIO/FDT or modern PCI transport. In a live PCI session, a new validated ID/MAC prepares one independent packet-I/O entry using the immutable startup/MMDS policy, checks actual contained vmnet authority, publishes metrics and PCI ownership on the owner thread, and commits live configuration last. Existing entries keep their queues and resources. Duplicate ID/MAC, invalid host config, capacity, authority, command, and publication failures preserve prior state; uncertain cleanup is terminal. Default MMIO rejects runtime insertion. Internal notification dispatch and runtime PATCH retain the same limiter/retry behavior and detailed per-interface/aggregate metrics. External direct-vmnet connectivity and snapshots remain deferred. |
 | `PUT` | `/vsock` | supported target; implemented supported live MMIO-or-PCI startup/Unix-socket subset | Repeated valid pre-boot requests atomically replace stored configuration; post-start PUT is stably rejected without mutation. Direct mode defers opening the ordinary path until startup. Contained mode recognizes only exact `bangbang-grant:<GrantId>/<SocketChild>` references, claims one exact `VsockSocketDirectory` after complete request validation, and retains its scope/anchor without reopening the tag; rejected replacement preserves prior public and private state. Startup either binds and inode-tracks the direct path or exclusively publishes a supplied owner-only listener through the exact anchor, then attaches one guest-visible endpoint over the selected startup transport with three 256-entry queues and cleans up only its own socket. Host initiation uses that main listener. Guest initiation in contained mode uses a session-bound launcher facet fixed once to the anchor/child and carrying only monotonic `u32` ports plus connected stream descriptors; the launcher receives no guest payload and the worker gains no outgoing-network entitlement. The live handler supports bounded handshakes and four-packet directional backlogs, 256 connections per direction, dynamic 64-KiB credit windows with wrapping counters, partial/full shutdown, two-second request/shutdown cleanup, reset/error handling, `EVENT_IDX`, no-op event notifications, and path/payload-redacted diagnostics. Signed Apple Silicon cases verify both initiation directions, ≥1 MiB direct transfers and a 1-MiB granted host-initiated transfer, both peers' write-half-close/EOF, terminal cleanup, two-stream isolation, an outside-container granted API listener, and no steady-state helper or entitlement change. Indirect descriptors are a supported bangbang extension. PATCH, DELETE, runtime hotplug, broader CID routing, full event payloads, runtime PCI hotplug, vhost/KVM, and general performance/artifact parity remain excluded. Native-v1 snapshot UDS override, event-queue `TRANSPORT_RESET`, and post-restore RX gating remain the stable #543 exclusions. |
-| `GET`, `PUT`, `PATCH` | `/mmds` | supported target; control-plane storage, runtime guest-query formatting, internal guest GET response modeling, request parsing, process-local exchange handling, response-byte serialization, process-local token authority, process-local guest token `PUT` modeling, process-local MMDS v2 GET token enforcement, internal guest ARP/TCP packet classification, process-local packet-payload HTTP exchange, process vmnet TX detouring, bounded per-interface contiguous split-request buffering, internal ARP/TCP response-frame synthesis, and signed executable guest fetch paths implemented | Stores bounded in-memory JSON object contents in the process runtime, returns stored JSON for control-plane `GET` or JSON `null` before initialization, applies RFC 7396 merge-patch semantics for `PATCH`, rejects uninitialized `PATCH`, and keeps previous data on oversized update failure. The runtime can also resolve initialized metadata by JSON-pointer path, format JSON or Firecracker-shaped IMDS text, parse process-local guest HTTP `GET` request bytes into URI/output-format/token inputs, map internal guest GET requests to process-local status/content-type/body response values, turn complete process-local guest HTTP request buffers into deterministic HTTP response bytes that preserve accepted `HTTP/1.0` or `HTTP/1.1` status-line versions, generate and validate stateless Firecracker-shaped AES-256-GCM MMDS tokens bound to immutable instance identity, and model process-local guest `PUT /latest/api/token` exchanges as prerequisites for guest-visible delivery. When configured for MMDS v2, process-local guest GET requests require exactly one valid `X-metadata-token` or `X-aws-ec2-metadata-token` value generated by token PUT; missing, duplicate, unknown, or expired tokens return `401 Unauthorized`. The runtime can classify ARP requests for the configured MMDS IPv4 address and raw Ethernet/IPv4/TCP guest packet bytes addressed to that IPv4 address and TCP port 80 while rejecting malformed, truncated, fragmented, non-TCP, or non-MMDS packets, and it can identify pure empty-payload TCP SYN, ACK-only packets that acknowledge bangbang's deterministic SYN-ACK, FIN close, packets carrying guest RST, and unsupported control packets, synthesize SYN-ACK frames for SYN packets, synthesize ACK plus FIN-ACK frames for empty FIN close packets, synthesize minimal RST frames for unsupported empty controls, consume guest RST packets without response even when they also carry payload bytes, and turn non-empty candidate TCP payloads that acknowledge bangbang's deterministic SYN-ACK and do not carry unsupported SYN or FIN payload control flags into the same process-local HTTP response bytes as the guest HTTP helper. Process vmnet packet I/O now detours MMDS ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS ACK-only packets that acknowledge bangbang's deterministic SYN-ACK, pure empty-payload MMDS FIN close packets, guest packets carrying RST, unsupported empty control packets, and non-empty MMDS candidate TX payloads on MMDS-configured interfaces when they acknowledge bangbang's deterministic SYN-ACK and do not carry unsupported SYN or FIN payload control flags. Shared process-local MMDS data remains visible to control-plane and packet paths, while every configured interface detour owns a separate split-request buffer collection and response queue. Each detour buffers split request headers only when every fragment starts at the next expected TCP sequence number, rejects non-contiguous buffered fragments without forwarding them to vmnet, synthesizes deterministic Ethernet/ARP replies, Ethernet/IPv4/TCP SYN-ACK frames, minimal Ethernet/IPv4/TCP FIN close frames, minimal Ethernet/IPv4/TCP RST frames, and Ethernet/IPv4/TCP response frames carrying generated HTTP response bytes, retains those frames in its bounded queue, exposes queued frames through the matching virtio-net RX source before vmnet reads, prioritizes ARP replies before queued TCP responses, and schedules one bounded post-TX RX retry when that source reports a queued response. The signed executable HVF e2e target includes direct-rootfs scenarios that configure `vmnet:shared`, deterministic MMDS data, and MMDS v1 or MMDS v2 before startup, then have the guest fetch `/meta-data/bangbang-marker` through `169.254.169.254` and write host-observable success markers. A two-interface MMDS-only scenario finds both guest devices by configured MAC, binds one request to each, writes distinct fixed marker sectors, and reports both interface metric objects without opening vmnet resources. The v2 scenario first requests `/latest/api/token` with a bounded TTL and uses the returned token header for the metadata fetch. A signed concurrent two-process scenario exchanges the exact opaque token bytes while both VMs are paused, requires each guest to receive `401 Unauthorized` for its peer token, proves its own token remains valid, and checks dynamic tokens absent from process output and failure diagnostics. Full ARP cache management, gratuitous ARP, ARP timeout/retry policy, broader ACK-number validation beyond the narrow ACK-only and non-empty payload SYN-ACK acknowledgement paths, full TCP stream tracking, out-of-order reassembly, retransmission policy, stateful RST policy, session timeout policy, and broader per-interface TCP session state beyond the current split-request buffers remain deferred to future guest-visible MMDS networking work. |
+| `GET`, `PUT`, `PATCH` | `/mmds` | supported target; bounded control-plane storage, guest HTTP/token handling, per-interface Ethernet/ARP/IPv4/TCP sessions, retransmission scheduling, vmnet detouring, MMDS-only packet I/O, and signed executable guest paths implemented | Stores bounded process-local JSON, serves control-plane GET and RFC 7396 PATCH, and preserves prior data on invalid or oversized updates. Guest HTTP supports GET plus token PUT, Firecracker-shaped v1/v2 behavior, stateless instance-bound AES-256-GCM tokens, accepted HTTP/1.0 and HTTP/1.1 response versions, IMDS text or JSON output, and redacted parse failures. Each selected interface owns an independent bounded stack while sharing only VM metadata, token authority, and aggregate metrics. A valid untagged Ethernet frame is speculatively owned from its ARP target or IPv4 destination; targeted malformed packets are consumed, VLAN is unsupported, non-TCP IPv4 is unusual, and IPv4 fragments are handled independently without reassembly. Exact ARP replies precede TCP output. Port 80 TCP follows the pinned 30-connection, 100-reset, 2,500-byte receive-buffer, single-response, MSS/window, sequence/ACK, FIN/RST, eviction, 1.2-second retransmission, and fifteenth-timeout reset rules. One generated frame is retained until guest RX commit; pending resets precede round-robin connection output. MMDS is offered before external vmnet RX, and an all-MMDS configuration never opens vmnet. Immediate readiness and the earliest future protocol deadline flow through generation-safe MMIO/PCI owner scheduling and merge with limiter deadlines across pause, hotplug deletion/reuse, and shutdown. Signed MMIO and PCI guests renew v2 tokens, consume a segmented 49,152-byte response, deliberately drop one ACK, and observe retransmission without external networking or credentials. ARP caching/gratuitous ARP/timeouts, IPv4 fragment reassembly, capture/restore of live network sessions, and positive external vmnet connectivity remain outside this slice. |
 | `PUT` | `/mmds/config` | supported target; control-plane config storage implemented | Parses Firecracker-shaped MMDS config with required `network_interfaces`, optional `version`, optional RFC 3927 usable link-local `ipv4_address`, and optional `imds_compat`; keeps empty or whitespace-only interface IDs as malformed request bodies, but routes empty interface lists to runtime semantic validation before mutation; validates referenced interface IDs against configured network interfaces; stores config before startup; and keeps post-start requests on the normal unsupported-state policy. Broader guest-visible MMDS behavior remains deferred to future MMDS networking work. |
 | `PUT` | `/snapshot/create`, `/snapshot/load` | supported narrow native-v1 Full/File subset | Parses Firecracker-shaped bodies, rejects malformed input first, normalizes deprecated load `mem_file_path` to a `File` backend and dirty tracking to the OR of old/new flags, and keeps paths/overrides redacted through typed API/runtime values. Create is paused-only and admits `Full` for one vCPU, exactly one regular read-only root drive, default serial, and no optional devices or MMDS. Direct mode invokes the path adapter; contained mode validates `bangbang-grant:<GrantId>/<SnapshotOutputChild>` references, retains matching repeatable output-directory anchors, and publishes staging/finals relative to them. Both stream aggregate capture into owner-only staging, exclusively commit memory first and state last, return `204`, and leave the source paused. A tracked source re-protects and advances only after either durable or uncertain-visible Full commit; every pre-visible failure keeps its old epoch, while incomplete rollback prevents resume and tears down safely without misreporting artifact visibility. Load is pre-boot-only and requires successful-action history plus current non-logger/metrics configuration to be pristine. Direct mode opens the committed kind-2 pair by path. Contained mode duplicates state for bounded preinspection, discovers any grant-tagged persisted root, atomically takes every tagged `SnapshotStateInput`, `SnapshotMemoryInput`, and read-only `DriveBacking`, then completes from prepared state and supplied files without tag reopen. Both validate before fresh VM construction, optionally attach a clean destination epoch after image population, commit a real session as `Paused`, and use ordinary resume when `resume_vm` is true. Retryable preparation failures preserve pristine eligibility; uncertain cleanup is terminal. State-invalid requests and unsupported dimensions fail before their established mutation boundaries. Admitted successes, capability rejections, and execution failures record snapshot latency; parser and invalid-state failures do not, and deprecated usage is counted independently. Typed execution faults, logs, metrics, staging records, and response bodies expose no artifact path, grant ID, child, filesystem identity, or guest/HVF value. No Firecracker state-file interoperability, `Diff`, UFFD, realtime adjustment, overrides, optional-device profile, or cross-host portability is claimed. |
 | `GET` | `/balloon` | supported target; pre-boot and runtime config read implemented | Returns the stored Firecracker-shaped balloon configuration after successful `PUT /balloon`, runtime `PATCH /balloon`, or valid runtime `PATCH /balloon/statistics`; returns the balloon-specific unsupported fault when no balloon configuration exists. Runtime derives backend-neutral virtio-balloon identity, features, queues, and config space from stored config. Startup attaches the current endpoint over the selected startup transport, and the HVF boot loop can dispatch inflate, deflate, statistics, free-page hinting, and free-page reporting notifications with interrupt signaling. Inflate/deflate descriptors update internal inflated-page accounting, hinting command descriptors update `guest_cmd`, and completed inflate plus accepted current-command hint and reporting ranges use best-effort inward-aligned Darwin zero/free advice before dispatch returns. Statistics queue reports are parsed and stored for `GET /balloon/statistics`, process-level periodic scheduling can complete a pending statistics descriptor with queue-interrupt intent while the VM is running, and device metrics distinguish discard attempts, reporting-requested bytes, actual advised bytes, skipped edges, and failures. |
@@ -2115,8 +2115,8 @@ chain set before writes, fills all but the final chain, writes the exact
 `num_buffers` only in the first header, and publishes all used entries with one
 `EVENT_IDX` decision. Any capacity, limiter, descriptor, or guest-memory
 failure rolls back queue progress and retains the source packet. Signed MMIO
-and PCI guests negotiate the complete published feature set, submit a 3000-byte
-TCP request that produces three normalized packets, receive and validate a
+and PCI guests negotiate the complete published feature set, submit one bounded
+TCP request that produces multiple normalized packets, receive and validate a
 49152-byte response through merged buffers, and complete after a deliberately
 triggered RX limiter retry. The same run first completes a small MMDS request
 as the older behavioral baseline.
@@ -2187,7 +2187,7 @@ MACs, selects both IDs in MMDS config, finds the Linux devices by MAC, and binds
 one bounded request to each device through a replaced `/32` MMDS route. The two
 results occupy separate fixed data-drive sectors, and both `net_<iface_id>`
 metric objects report RX and TX activity. Focused tests prove the matching
-detours retain independent split-request buffers and response queues while the
+stacks retain independent ARP, TCP, reset, retransmission, and retained-output state while the
 shared data store and top-level `mmds` metrics remain process-local aggregates;
 second-interface packet I/O also retains its own interrupt line and network
 metric key. The case completes without opening vmnet resources or using the
@@ -2399,12 +2399,13 @@ captures and validates one owned packet plan before used-ring publication,
 publishes completions with length 0, delivers normalized frames to an injected
 internal packet sink, preserves one ordered result per guest frame, and marks
 queue interrupt status when descriptor heads complete unless negotiated `EVENT_IDX`
-suppresses the notification. RX dispatch uses an injected internal packet
-source, can perform one bounded post-TX retry, and transactionally reserves all
-chains needed by a merged packet before writing its canonical header and
-payload. It publishes exact per-chain used lengths together, retains the source
-and rolls back queue progress on pre-publication failure, and raises at most one
-queue interrupt according to negotiated `EVENT_IDX`. On macOS,
+suppresses the notification. RX dispatch uses an injected internal packet source
+and transactionally reserves all chains needed by a merged packet before writing
+its canonical header and payload. It publishes exact per-chain used lengths
+together, retains the source and rolls back queue progress on pre-publication
+failure, and raises at most one queue interrupt according to negotiated
+`EVENT_IDX`. Packet readiness and future protocol or limiter deadlines feed the
+same owner scheduler. On macOS,
 the process crate also defines internal vmnet descriptor,
 lifecycle, start owner, packet descriptor, and concrete system start/stop
 backend boundaries with vmnet mode, status, operation error, XPC descriptor
@@ -3607,59 +3608,53 @@ accepted TTL header. When configured for MMDS v2, process-local guest GET
 handling requires exactly one valid `X-metadata-token` or
 `X-aws-ec2-metadata-token` value generated by the token authority; missing,
 duplicate, unknown, or expired tokens return `401 Unauthorized`.
-The runtime can also classify ARP requests for the configured MMDS IPv4 address
-and raw Ethernet/IPv4/TCP guest packet bytes as MMDS candidates only when the
-IPv4 destination matches the configured MMDS address and the TCP destination
-port is `80`. Truncated, malformed, non-IPv4, non-TCP, fragmented, and non-MMDS
-packets are treated as non-candidates without exposing metadata. For pure
-empty-payload candidate TCP SYN packets, the runtime can synthesize
-deterministic SYN-ACK frames, identify pure empty-payload ACK-only packets that
-acknowledge that deterministic SYN-ACK, FIN close, guest packets carrying RST,
-and unsupported control packets, synthesize ACK plus FIN-ACK frames for empty FIN
-close packets, synthesize minimal RST frames for unsupported empty controls,
-consume guest RST packets without response even when they also carry payload
-bytes, and for non-empty candidate TCP payloads that acknowledge that
-deterministic SYN-ACK and do not carry unsupported SYN or FIN payload control
-flags, it can also produce the same process-local HTTP response bytes as the
-existing guest HTTP helper, including token PUT and MMDS v2 GET token
-enforcement. Non-empty candidates carrying SYN or FIN are not interpreted as
-process-local MMDS HTTP requests. The process vmnet packet I/O path detours MMDS
-ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
-ACK-only packets that acknowledge bangbang's deterministic SYN-ACK, pure
-empty-payload MMDS FIN close packets, guest packets carrying RST, unsupported
-empty control packets, and non-empty MMDS candidate TX payloads on configured
-MMDS interfaces when they acknowledge bangbang's deterministic SYN-ACK and do
-not carry unsupported SYN or FIN payload control flags. MMDS data remains
-shared between the API and packet paths, while every configured interface's
-detour owns a separate split-request buffer collection and response queue. The
-detour buffers split request headers only when each fragment starts at the next
-expected TCP sequence number, rejects non-contiguous buffered fragments without
-forwarding them to vmnet,
-synthesizes deterministic Ethernet/ARP replies, Ethernet/IPv4/TCP SYN-ACK
-frames, minimal Ethernet/IPv4/TCP FIN close frames, minimal Ethernet/IPv4/TCP
-RST frames, and Ethernet/IPv4/TCP response frames carrying the generated HTTP
-response bytes, retains those frames in bounded per-interface queues, exposes
-queued frames through the matching
-virtio-net RX source before vmnet reads, prioritizes ARP replies before queued
-TCP responses, and schedules one bounded post-TX RX retry when that source
-reports a queued response. The same path records Firecracker-shaped top-level
-`mmds` metrics for implemented guest packet acceptance, queueing failures, V2
-token rejection, response delivery, and connection lifecycle events. When every
-configured network interface is selected
-by MMDS config, process startup can instead build process-local MMDS-only packet
-I/O that reuses the same detour and response-queue logic, drops non-MMDS TX
-frames, and serves queued MMDS responses without opening vmnet. A focused
-two-entry test sends one TCP tuple's request fragments through different
-interfaces and proves neither buffered state nor queued responses cross the
-provider boundary. A signed guest case then completes the same shared metadata
-fetch through two MAC-selected MMDS-only interfaces with distinct fixed
-markers. Full ARP cache
-management, gratuitous ARP, ARP
-timeout/retry policy, broader ACK-number validation beyond the narrow ACK-only
-and non-empty payload SYN-ACK acknowledgement paths, full TCP stream tracking,
-out-of-order reassembly, retransmission policy, stateful RST policy, session
-timeout policy, and broader per-interface TCP session state beyond the current
-split-request buffers remain deferred.
+The runtime speculatively owns valid untagged Ethernet frames whose ARP target
+protocol address or IPv4 destination matches the configured MMDS address. VLAN
+frames are not recognized. Once a frame is targeted, it is consumed even when
+the exact ARP, IPv4, or TCP parser rejects it, so malformed MMDS traffic cannot
+escape to vmnet. Exact ARP requests produce replies; exact IPv4 packets use the
+declared total length, do not require an IPv4 checksum, and treat fragments as
+independent packets rather than reassembling them. Targeted non-TCP IPv4 packets
+are consumed and recorded as unusual traffic.
+
+Every configured interface owns one independent bounded TCP stack on port 80.
+It follows the pinned Firecracker v1.16.0 limits of 30 live connections, 100
+pending reset replies, and a 2,500-byte receive buffer per endpoint. A connection
+tracks the advertised MSS and receive window, accepts ordered request bytes,
+handles duplicate and out-of-order sequence space without unbounded buffering,
+generates at most one HTTP response, segments output to the peer window and MSS,
+advances on acknowledgements, and implements FIN and RST closure. New SYNs can
+evict an inactive connection after 40 seconds; otherwise overflow receives a
+bounded reset. Unrecognized tuples and unsupported controls use the same bounded
+reset path. Retransmission becomes eligible every 1.2 seconds, and the fifteenth
+timeout closes the endpoint with a reset.
+
+ARP replies have priority over TCP output, while pending TCP resets precede
+round-robin connection output. The stack materializes at most one Ethernet frame
+and retains it unchanged until the virtio-net RX transaction commits, preventing
+short buffers or limiter deferral from consuming protocol state or double-counting
+delivery. MMDS-ready output is offered before external vmnet RX. When every
+configured interface is selected for MMDS, startup constructs MMDS-only packet
+I/O and never opens vmnet; non-MMDS transmit frames are intentionally dropped.
+
+Immediate MMDS readiness and the earliest future TCP retry deadline are propagated
+through the packet-I/O provider. MMIO aggregate scheduling and per-device PCI
+scheduling merge that deadline with RX/TX limiter deadlines, preserve it through
+owner-thread notification and interrupt signaling, and retire it with interface
+hotplug deletion or shutdown. Paused sessions retain protocol state without a
+separate timer thread, and resume re-enters the same owner scheduler.
+
+MMDS data and token authority remain shared within one VM, while connection, ARP,
+reset, retransmission, and retained-output state remain interface-local. Focused
+tests cover malformed and unusual traffic, independent IPv4 fragments, duplicate
+and reordered TCP input, capacity and eviction, reset overflow, response
+segmentation, short RX buffers, rate-limit deferral, retransmission limits, pause,
+delete/reuse, shutdown, and interface isolation. Signed MMIO and PCI guests renew
+a v2 token, receive a segmented 49,152-byte response, deliberately lose one ACK,
+and observe retransmitted response bytes without external networking or
+credentials. Full ARP caching, gratuitous ARP and ARP timeout policy, IPv4
+fragment reassembly, live-session capture/restore, and positive external vmnet
+connectivity remain outside this implementation.
 Process-local guest response-byte serialization preserves accepted `HTTP/1.0`
 or `HTTP/1.1` request versions in response status lines. Malformed request
 lines and unsupported versions use the existing safe parse-error response path
@@ -3719,10 +3714,12 @@ The following Firecracker features are outside the first compatibility tier.
 Their eventual support level should follow the endpoint matrix:
 
 - packet networking beyond the implemented backend-neutral virtio-MMIO/PCI
-  packet semantics, MMDS-only path, and conditional direct-vmnet typed-start,
-  readiness, header-envelope, and bounded batch support, including positive
-  entitled external guest connectivity, host firewall/resource policy, broader
-  MMDS TCP behavior, network snapshot state, and automatic PCI notification
+  packet semantics, MMDS-only path, complete bounded per-interface MMDS TCP
+  sessions, and conditional direct-vmnet typed-start, readiness,
+  header-envelope, and bounded batch support, including positive entitled
+  external guest connectivity, host firewall/resource policy, ARP caching and
+  gratuitous ARP, IPv4 fragment reassembly, network snapshot state, and
+  automatic PCI notification
 - virtio-vsock behavior beyond the **implemented supported live
   virtio-MMIO/Unix-socket subset**. The live subset includes repeatable pre-boot
   PUT with stable post-start rejection, guest/host connection setup, dynamic
@@ -3739,7 +3736,6 @@ Their eventual support level should follow the endpoint matrix:
 - snapshot behavior beyond the implemented narrow native-v1 profile, including
   optional-device state, Diff artifacts, overrides, Firecracker artifact
   compatibility, and cross-host portability
-- full MMDS TCP routing, stream reassembly, and retransmission policy
 - balloon producers outside the implemented queue/discard/reporting activity
   and serialized/restored balloon state; live paired PFN accounting and
   capture-ready ownership are implemented, while absent guest statistics are

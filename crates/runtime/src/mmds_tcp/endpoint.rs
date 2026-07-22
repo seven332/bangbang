@@ -15,7 +15,6 @@ use super::{
 };
 
 /// One bounded HTTP-over-TCP endpoint.
-#[derive(Debug)]
 pub struct Endpoint {
     receive_buffer: [u8; MMDS_TCP_RECEIVE_BUFFER_SIZE],
     receive_buffer_len: usize,
@@ -26,6 +25,26 @@ pub struct Endpoint {
     last_segment_received_at: u64,
     last_timestamp: u64,
     stop_receiving: bool,
+}
+
+impl fmt::Debug for Endpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Endpoint")
+            .field("receive_buffer", &"[REDACTED]")
+            .field("receive_buffer_len", &self.receive_buffer_len)
+            .field(
+                "response",
+                &self.response.as_ref().map(|response| response.len()),
+            )
+            .field("response_initial_sequence", &self.response_initial_sequence)
+            .field("response_len_limit", &self.response_len_limit)
+            .field("connection", &self.connection)
+            .field("last_segment_received_at", &self.last_segment_received_at)
+            .field("last_timestamp", &self.last_timestamp)
+            .field("stop_receiving", &self.stop_receiving)
+            .finish()
+    }
 }
 
 impl Endpoint {

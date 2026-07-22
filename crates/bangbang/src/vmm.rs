@@ -139,9 +139,9 @@ use crate::contained_session::{
 };
 use crate::direct_vhost_user;
 use crate::host_network::virtio_vmnet::{
-    MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour,
-    MmdsResponseQueue, PreparedVmnetVirtioNetworkRxBuffer, VmnetPacketReadinessLease,
-    VmnetVirtioNetworkBatchLimits, VmnetVirtioNetworkPacketIo,
+    MmdsNetworkStackBuildError, MmdsOnlyVirtioNetworkPacketIo,
+    MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour, PreparedVmnetVirtioNetworkRxBuffer,
+    VmnetPacketReadinessLease, VmnetVirtioNetworkBatchLimits, VmnetVirtioNetworkPacketIo,
     VmnetVirtioNetworkPacketIoBuildError, VmnetVirtioNetworkPacketIoStopError,
     VmnetVirtioNetworkPacketProfile,
 };
@@ -4784,8 +4784,15 @@ where
 
     fn has_persistent_readiness(&self) -> bool {
         match self {
-            Self::MmdsOnly(_) => false,
+            Self::MmdsOnly(packet_io) => packet_io.has_mmds_readiness(),
             Self::Vmnet(packet_io) => packet_io.has_persistent_readiness(),
+        }
+    }
+
+    fn packet_retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::MmdsOnly(packet_io) => packet_io.mmds_retry_after(),
+            Self::Vmnet(packet_io) => packet_io.mmds_retry_after(),
         }
     }
 }
@@ -5079,7 +5086,8 @@ fn runtime_network_packet_io_preparation_error(
         ProcessNetworkPacketIoProviderBuildError::CleanupUncertain => {
             "vmnet cleanup could not be confirmed"
         }
-        ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
+        ProcessNetworkPacketIoProviderBuildError::MmdsNetworkStack { .. }
+        | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
         | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour => {
             "MMDS packet-I/O initialization failed"
         }
@@ -5251,10 +5259,15 @@ where
                 VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(
                     |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName { source },
                 )?;
-                let Some(detour) = self
-                    .mmds_detour
-                    .as_ref()
-                    .and_then(|detour| detour.detour_for_interface(iface_id))
+                let Some(detour) =
+                    self.mmds_detour
+                        .as_ref()
+                        .map(|detour| detour.detour_for_interface(iface_id))
+                        .transpose()
+                        .map_err(|source| {
+                            ProcessNetworkPacketIoProviderBuildError::MmdsNetworkStack { source }
+                        })?
+                        .flatten()
                 else {
                     return Err(ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour);
                 };
@@ -5290,6 +5303,15 @@ where
                     PreparedVmnetVirtioNetworkRxBuffer::supported_maximum().map_err(|source| {
                         ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { source }
                     })?;
+                let detour =
+                    self.mmds_detour
+                        .as_ref()
+                        .map(|detour| detour.detour_for_interface(iface_id))
+                        .transpose()
+                        .map_err(|source| {
+                            ProcessNetworkPacketIoProviderBuildError::MmdsNetworkStack { source }
+                        })?
+                        .flatten();
                 let backend = factory.new_backend(iface_id);
                 let (mut backend, interface) =
                     StartedVmnetPacketIoBackend::start(backend, &vmnet_config).map_err(
@@ -5305,10 +5327,6 @@ where
                         Err(_) => Err(ProcessNetworkPacketIoProviderBuildError::CleanupUncertain),
                     };
                 }
-                let detour = self
-                    .mmds_detour
-                    .as_ref()
-                    .and_then(|detour| detour.detour_for_interface(iface_id));
                 let packet_envelope = if parameters.direct_virtio_header_enabled() {
                     VirtioNetworkPacketEnvelope::DirectVirtioHeader
                 } else {
@@ -5791,21 +5809,24 @@ impl ProcessMmdsPacketDetourConfig {
         }
     }
 
-    fn detour_for_interface(&self, iface_id: &str) -> Option<MmdsPacketDetour> {
+    fn detour_for_interface(
+        &self,
+        iface_id: &str,
+    ) -> Result<Option<MmdsPacketDetour>, MmdsNetworkStackBuildError> {
         if !self
             .network_interfaces
             .iter()
             .any(|configured_iface_id| configured_iface_id == iface_id)
         {
-            return None;
+            return Ok(None);
         }
 
-        Some(MmdsPacketDetour::new(
+        MmdsPacketDetour::try_new(
             self.mmds_state.clone(),
             self.mmds_ipv4_address,
-            MmdsResponseQueue::default(),
             self.metrics.clone(),
-        ))
+        )
+        .map(Some)
     }
 
     fn covers_all_interfaces(&self, configs: &[NetworkInterfaceConfig]) -> bool {
@@ -5840,6 +5861,13 @@ where
             .is_some_and(|entry| entry.packet_io.has_persistent_readiness())
     }
 
+    fn packet_retry_after(&self, interface: Arm64BootNetworkInterface<'_>) -> Option<Duration> {
+        self.entries
+            .iter()
+            .find(|entry| entry.iface_id == interface.iface_id())
+            .and_then(|entry| entry.packet_io.packet_retry_after())
+    }
+
     fn packet_io(
         &mut self,
         interface: Arm64BootNetworkInterface<'_>,
@@ -5870,6 +5898,9 @@ enum ProcessNetworkPacketIoProviderBuildError {
     GenerationExhausted,
     MmdsState {
         source: MmdsStateLockError,
+    },
+    MmdsNetworkStack {
+        source: MmdsNetworkStackBuildError,
     },
     HostDeviceName {
         source: VmnetHostDeviceNameConfigError,
@@ -5913,6 +5944,9 @@ impl fmt::Debug for ProcessNetworkPacketIoProviderBuildError {
                 "ProcessNetworkPacketIoProviderBuildError::GenerationExhausted"
             }
             Self::MmdsState { .. } => "ProcessNetworkPacketIoProviderBuildError::MmdsState",
+            Self::MmdsNetworkStack { .. } => {
+                "ProcessNetworkPacketIoProviderBuildError::MmdsNetworkStack"
+            }
             Self::HostDeviceName { .. } => {
                 "ProcessNetworkPacketIoProviderBuildError::HostDeviceName"
             }
@@ -5947,6 +5981,7 @@ impl ProcessNetworkPacketIoProviderBuildError {
             | Self::RegistryCapacity
             | Self::GenerationExhausted
             | Self::MmdsState { .. }
+            | Self::MmdsNetworkStack { .. }
             | Self::HostDeviceName { .. }
             | Self::PacketIoBuild { .. }
             | Self::PacketEvents { .. }
@@ -5977,6 +6012,9 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
             }
             Self::MmdsState { source } => {
                 write!(f, "failed to access MMDS state: {source}")
+            }
+            Self::MmdsNetworkStack { source } => {
+                write!(f, "failed to build MMDS network stack: {source}")
             }
             Self::HostDeviceName { source } => {
                 write!(
@@ -6015,6 +6053,7 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
             Self::NetworkInterfaceCount { source } => Some(source),
             Self::ProviderCapacity { source } => Some(source),
             Self::MmdsState { source } => Some(source),
+            Self::MmdsNetworkStack { source } => Some(source),
             Self::HostDeviceName { source, .. } => Some(source),
             Self::Start { source, .. } => Some(source),
             Self::PacketIoBuild { source, .. } => Some(source),
@@ -14478,16 +14517,19 @@ mod tests {
 
         let eth0 = detour_config
             .detour_for_interface("eth0")
+            .expect("eth0 MMDS session should build")
             .expect("eth0 should have an MMDS detour");
-        assert!(detour_config.detour_for_interface("eth1").is_none());
+        assert!(
+            detour_config
+                .detour_for_interface("eth1")
+                .expect("unconfigured interface lookup should succeed")
+                .is_none()
+        );
         let eth2 = detour_config
             .detour_for_interface("eth2")
+            .expect("eth2 MMDS session should build")
             .expect("eth2 should have an MMDS detour");
-        assert!(
-            !eth0
-                .response_queue()
-                .shares_state_with(&eth2.response_queue())
-        );
+        assert!(!eth0.stack().shares_state_with(&eth2.stack()));
     }
 
     #[test]
@@ -15116,6 +15158,7 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
             | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsNetworkStack { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
@@ -15158,6 +15201,7 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
             | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsNetworkStack { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
@@ -15193,6 +15237,7 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
             | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsNetworkStack { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }
@@ -15228,6 +15273,7 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::RegistryCapacity
             | ProcessNetworkPacketIoProviderBuildError::GenerationExhausted
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsNetworkStack { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ReadinessBridge { .. }

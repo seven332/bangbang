@@ -115,7 +115,7 @@ Virtio-net semantic changes additionally require both
 `boots_signed_mmio_guest_with_complete_virtio_network_semantics` and
 `boots_signed_pci_guest_with_complete_virtio_network_semantics`. Each signed
 case must inspect the actual guest-acknowledged feature bitmap, require every
-published checksum/TSO/UFO/merged-buffer/ring bit, submit one 3000-byte TCP
+published checksum/TSO/UFO/merged-buffer/ring bit, submit one bounded TCP
 request that the host observes as multiple normalized packets, and validate a
 49152-byte response in guest userspace. The response must cross transactional
 merged RX while an ops limiter produces both a throttle and a later retry event;
@@ -1760,7 +1760,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v78.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v86.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -1778,9 +1778,12 @@ first non-loopback guest interface with a link-local address, runs a bounded
 `curl` request for `/meta-data/bangbang-marker`, and writes
 `BANGBANG_MMDS_GUEST_FETCH_OK` to the scratch drive only after the expected
 MMDS value is returned. With `bangbang.virtio-net-semantics=1`, the script
-instead uses one Python socket write at MTU 1500 for the bounded multi-segment
-request, changes the live MTU to 50000, validates every byte of the large MMDS
-response, and emits only static facet and terminal markers. With
+instead uses one corked Python socket write plus a temporary low advertised MSS
+at MTU 1500 for the bounded multi-segment request, renews its v2 token, and
+restores the normal route before requesting the large response. The signed
+harness drops its final cumulative ACK while the guest keeps that connection
+open for five seconds, verifies retransmission, then changes the live MTU to
+50000 and validates every byte of a second merged large response. With
 `bangbang.mmds-v2-fetch=1`, it first requests a v2 token from
 `/latest/api/token`, then fetches the same marker with the token header and
 writes `BANGBANG_MMDS_V2_GUEST_FETCH_OK`. The init script emits only static
@@ -1974,10 +1977,14 @@ public MMDS-only subset over the selected startup transport: guest-visible MTU,
 MMDS v1 and v2 through API and
 metadata-file/no-api startup, limiter-driven guest progress without a second
 queue notification, two MAC-selected interfaces, and two process-local V2
-token/value/queue/metrics/cleanup domains with post-peer-exit survivor
+token/value/session/metrics/cleanup domains with post-peer-exit survivor
 progress. The signed cases use bounded marker/event synchronization, redact
 private values and diagnostics, select every configured interface in MMDS
 config, and therefore do not open vmnet or require its restricted entitlement.
+The direct-rootfs MMIO and PCI cases also renew a v2 token, receive the
+49,152-byte response as multiple TCP segments, deliberately suppress one guest
+ACK, observe retransmitted response bytes after the protocol deadline, and then
+resume ACK progress without an external network credential.
 The separate hidden PCI conformance case and the product all-virtio case reuse
 the same authority-free MMDS packet implementation and prove a modern
 virtio-pci network endpoint. The direct and contained two-round hotplug gates
@@ -1997,11 +2004,11 @@ vmnet backend and register no packet callback or bridge work. Packet-available
 callbacks and bounded batch dispatch are therefore implemented but remain
 outside positive signed vmnet evidence because the signed cases intentionally
 open no vmnet interface. Portable checksum/segmentation semantics, merged RX,
-ring behavior, and limiter/backend metrics have unsigned coverage plus signed
-MMIO and PCI MMDS-only packet-path evidence. Positive direct-header vmnet I/O,
-broader MMDS TCP behavior, automatic PCI notification, external connectivity,
-and network snapshot state remain outside the signed boundary as described by
-their owning issues.
+ring behavior, limiter/backend metrics, bounded MMDS TCP sessions, and merged
+protocol/limiter scheduling have focused unsigned coverage plus signed MMIO and
+PCI MMDS-only packet-path evidence. Positive direct-header vmnet I/O, automatic
+PCI notification, external connectivity, and network snapshot state remain
+outside the signed boundary as described by their owning issues.
 
 For block specifically, this evidence validates the supported public
 file-backed subset over MMIO by default or PCI with `--enable-pci`, including

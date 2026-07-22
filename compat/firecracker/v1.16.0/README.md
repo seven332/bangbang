@@ -512,10 +512,23 @@ MMDS, descriptor, interrupt, and result ordering. Exact retirement disables and
 drains the serial callback queue before stop and reuse. Credential-free tests
 cover the callback, batch, race, owner-loop, and terminal-cleanup contracts;
 signed all-MMDS/networkless gates prove non-regression without claiming an
-entitled vmnet start or external packet movement. Direct virtio headers,
-offloads, broader MMDS TCP, positive #1378 connectivity, and network snapshot
-state keep `semantic.network:virtio-net-vmnet-policy-and-connectivity`
-`audit-required`, so the overlay remains 191/207/3/17.
+entitled vmnet start or external packet movement. That slice left direct virtio
+headers, offloads, MMDS TCP, positive #1378 connectivity, and network snapshot
+state to its dependency-ordered successors.
+
+#1499 closes the live MMDS TCP/session integration slice under #1493. One
+source-attributed bounded stack per configured interface now supplies exact
+speculative Ethernet/ARP/IPv4 ownership, 30 connections, 100 resets, 2,500-byte
+receive buffers, one response, MSS/window flow control, in-order stream
+handling, segmentation, ACK/FIN/RST progress, eviction, 1.2-second
+retransmission, and the fifteenth-timeout reset. It retains one output frame
+until guest RX commit and merges future protocol deadlines with the existing
+generation-safe MMIO/PCI network scheduler. Signed MMIO and PCI guests renew a
+v2 token, receive a segmented 49,152-byte response, deliberately lose one ACK,
+and observe retransmission without vmnet authority. Capture-ready state,
+contained aggregate certification, positive #1378 connectivity, and the final
+35-record audit remain later #1493 slices; no disposition changes in this slice,
+so the overlay remains 191/207/3/17.
 
 ## Commands
 

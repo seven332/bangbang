@@ -69,6 +69,8 @@ const PCI_PMEM_IDENTITIES_MARKER: &[u8] = b"BANGBANG_PCI_PMEM_IDENTITIES_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MMDS_FETCH_MARKER: &[u8] = b"BANGBANG_MMDS_FETCH_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MMDS_V2_RENEW_MARKER: &[u8] = b"BANGBANG_MMDS_V2_RENEW_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PCI_NETWORK_IDENTITIES_MARKER: &[u8] = b"BANGBANG_PCI_NETWORK_IDENTITIES_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VIRTIO_NETWORK_LARGE_TX_MARKER: &[u8] = b"BANGBANG_VIRTIO_NET_LARGE_TX_OK";
@@ -132,10 +134,56 @@ const NETWORK_MMIO_BASE: u64 = 0x6000_0000;
 const VSOCK_MMIO_BASE: u64 = 0x7000_0000;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct SignedGuestNetworkSemanticEvidence {
     maximum_emitted_packets: std::sync::atomic::AtomicUsize,
+    mmds_payload_frames: std::sync::atomic::AtomicUsize,
+    drop_ack_armed: std::sync::atomic::AtomicBool,
+    dropped_ack: std::sync::atomic::AtomicBool,
+    retransmission_observed: std::sync::atomic::AtomicBool,
+    large_response_end_sequence: std::sync::Mutex<Option<u32>>,
+    large_response_frames: std::sync::Mutex<Vec<SignedGuestMmdsFrameFingerprint>>,
+    retransmission_candidate: std::sync::Mutex<Option<SignedGuestMmdsFrameFingerprint>>,
     errors: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, PartialEq, Eq)]
+struct SignedGuestMmdsFrameFingerprint {
+    sequence_number: u32,
+    first_sequence_after: u32,
+    payload: Vec<u8>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for SignedGuestMmdsFrameFingerprint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignedGuestMmdsFrameFingerprint")
+            .field("sequence_number", &self.sequence_number)
+            .field("first_sequence_after", &self.first_sequence_after)
+            .field("payload", &"[REDACTED]")
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for SignedGuestNetworkSemanticEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignedGuestNetworkSemanticEvidence")
+            .field("maximum_emitted_packets", &self.maximum_emitted_packets())
+            .field("mmds_payload_frames", &self.mmds_payload_frames())
+            .field("drop_ack_armed", &"<state>")
+            .field("dropped_ack", &self.dropped_ack())
+            .field("retransmission_observed", &self.retransmission_observed())
+            .field("large_response_end_sequence", &"<state>")
+            .field("large_response_frames", &"<redacted>")
+            .field("retransmission_candidate", &"<redacted>")
+            .field("errors", &"<redacted>")
+            .finish()
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -157,6 +205,125 @@ impl SignedGuestNetworkSemanticEvidence {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn observe_mmds_rx_frame(&self, frame: &[u8]) {
+        let Some(fingerprint) = signed_guest_mmds_payload_fingerprint(frame) else {
+            return;
+        };
+        self.mmds_payload_frames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let large_response_end_sequence = {
+            let mut end_sequence = self
+                .large_response_end_sequence
+                .lock()
+                .expect("signed MMDS response evidence lock should not be poisoned");
+            if end_sequence.is_none() {
+                *end_sequence = signed_guest_large_mmds_response_end_sequence(&fingerprint);
+            }
+            *end_sequence
+        };
+        let is_final_response_frame =
+            large_response_end_sequence == Some(fingerprint.first_sequence_after);
+        let mut frames = self
+            .large_response_frames
+            .lock()
+            .expect("signed MMDS response-frame evidence lock should not be poisoned");
+        if self.dropped_ack.load(std::sync::atomic::Ordering::Acquire)
+            && signed_guest_mmds_payload_repeats(&frames, &fingerprint)
+        {
+            self.retransmission_observed
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.drop_ack_armed
+                .store(false, std::sync::atomic::Ordering::Release);
+        } else if frames.len() < 256 && !frames.iter().any(|candidate| candidate == &fingerprint) {
+            frames.push(fingerprint.clone());
+        }
+        drop(frames);
+        if !is_final_response_frame {
+            return;
+        }
+
+        let mut candidate = self
+            .retransmission_candidate
+            .lock()
+            .expect("signed MMDS retransmission evidence lock should not be poisoned");
+        match candidate.as_ref() {
+            None => {
+                *candidate = Some(fingerprint);
+                self.drop_ack_armed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Some(candidate) if candidate == &fingerprint => {
+                if self.dropped_ack.load(std::sync::atomic::Ordering::Acquire) {
+                    self.retransmission_observed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn should_drop_guest_ack(
+        &self,
+        packet: &bangbang_runtime::network_packet::VirtioNetworkPacketPlan,
+    ) -> Result<bool, bangbang_runtime::network::VirtioNetworkTxPacketSinkError> {
+        if !self
+            .drop_ack_armed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let candidate_end = self
+            .retransmission_candidate
+            .lock()
+            .expect("signed MMDS retransmission evidence lock should not be poisoned")
+            .as_ref()
+            .map(|candidate| candidate.first_sequence_after);
+        let Some(candidate_end) = candidate_end else {
+            return Ok(false);
+        };
+        let mut packet_count = 0_usize;
+        let mut matching_ack = false;
+        let _ = packet
+            .visit_packets(
+                bangbang_runtime::network_packet::VirtioNetworkPacketEnvelope::RawEthernet,
+                |frame| {
+                    packet_count = packet_count.saturating_add(1);
+                    matching_ack =
+                        signed_guest_pure_mmds_ack(frame).is_some_and(|acknowledgement| {
+                            acknowledgement.wrapping_sub(candidate_end) < (1_u32 << 31)
+                        });
+                    std::ops::ControlFlow::<()>::Continue(())
+                },
+            )
+            .map_err(|source| {
+                bangbang_runtime::network::VirtioNetworkTxPacketSinkError::new(source.to_string())
+            })?;
+        let should_drop = packet_count == 1
+            && matching_ack
+            && !self
+                .retransmission_observed
+                .load(std::sync::atomic::Ordering::Acquire);
+        if should_drop {
+            self.dropped_ack
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(should_drop)
+    }
+
+    fn mmds_payload_frames(&self) -> usize {
+        self.mmds_payload_frames
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn dropped_ack(&self) -> bool {
+        self.dropped_ack.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn retransmission_observed(&self) -> bool {
+        self.retransmission_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn record_error(&self, source: &bangbang_runtime::network::VirtioNetworkTxPacketSinkError) {
         let mut errors = self
             .errors
@@ -176,10 +343,124 @@ impl SignedGuestNetworkSemanticEvidence {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn signed_guest_mmds_tcp(frame: &[u8]) -> Option<&[u8]> {
+    if u16::from_be_bytes(frame.get(12..14)?.try_into().ok()?) != 0x0800 {
+        return None;
+    }
+    let ipv4 = frame.get(14..)?;
+    let ipv4_header_len = usize::from(*ipv4.first()? & 0x0f).checked_mul(4)?;
+    if ipv4_header_len < 20 || *ipv4.get(9)? != 6 {
+        return None;
+    }
+    let tcp = ipv4.get(ipv4_header_len..)?;
+    (u16::from_be_bytes(tcp.get(0..2)?.try_into().ok()?) == 80
+        || u16::from_be_bytes(tcp.get(2..4)?.try_into().ok()?) == 80)
+        .then_some(tcp)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn signed_guest_mmds_payload_fingerprint(frame: &[u8]) -> Option<SignedGuestMmdsFrameFingerprint> {
+    let tcp = signed_guest_mmds_tcp(frame)?;
+    if u16::from_be_bytes(tcp.get(0..2)?.try_into().ok()?) != 80 {
+        return None;
+    }
+    let tcp_header_len = usize::from(*tcp.get(12)? >> 4).checked_mul(4)?;
+    let payload = tcp.get(tcp_header_len..)?;
+    if payload.is_empty() {
+        return None;
+    }
+    let sequence_number = u32::from_be_bytes(tcp.get(4..8)?.try_into().ok()?);
+    Some(SignedGuestMmdsFrameFingerprint {
+        sequence_number,
+        first_sequence_after: sequence_number.wrapping_add(u32::try_from(payload.len()).ok()?),
+        payload: payload.to_vec(),
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn signed_guest_large_mmds_response_end_sequence(
+    fingerprint: &SignedGuestMmdsFrameFingerprint,
+) -> Option<u32> {
+    const LARGE_RESPONSE_CONTENT_LEN: usize = 48 * 1024;
+
+    let header_end = fingerprint
+        .payload
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let content_length = fingerprint
+        .payload
+        .get(..header_end)?
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let separator = line.iter().position(|byte| *byte == b':')?;
+            let name = line.get(..separator)?;
+            let value = line.get(separator.checked_add(1)?..)?;
+            name.eq_ignore_ascii_case(b"content-length")
+                .then(|| {
+                    std::str::from_utf8(value)
+                        .ok()?
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .flatten()
+        })?;
+    if content_length != LARGE_RESPONSE_CONTENT_LEN {
+        return None;
+    }
+    let response_len = header_end.checked_add(4)?.checked_add(content_length)?;
+    Some(
+        fingerprint
+            .sequence_number
+            .wrapping_add(u32::try_from(response_len).ok()?),
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn signed_guest_mmds_payload_repeats(
+    originals: &[SignedGuestMmdsFrameFingerprint],
+    candidate: &SignedGuestMmdsFrameFingerprint,
+) -> bool {
+    originals.iter().any(|original| {
+        let offset = candidate
+            .sequence_number
+            .wrapping_sub(original.sequence_number);
+        let Ok(offset) = usize::try_from(offset) else {
+            return false;
+        };
+        let Some(expected) = original.payload.get(offset..) else {
+            return false;
+        };
+        let overlap_len = expected.len().min(candidate.payload.len());
+        overlap_len > 0 && expected.get(..overlap_len) == candidate.payload.get(..overlap_len)
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn signed_guest_pure_mmds_ack(frame: &[u8]) -> Option<u32> {
+    let tcp = signed_guest_mmds_tcp(frame)?;
+    if u16::from_be_bytes(tcp.get(2..4)?.try_into().ok()?) != 80 {
+        return None;
+    }
+    let tcp_header_len = usize::from(*tcp.get(12)? >> 4).checked_mul(4)?;
+    let flags = *tcp.get(13)?;
+    if tcp.get(tcp_header_len..)?.is_empty()
+        && flags & 0x10 != 0
+        && flags & (0x02 | 0x01 | 0x04 | 0x08) == 0
+    {
+        Some(u32::from_be_bytes(tcp.get(8..12)?.try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 struct SignedGuestMmdsTxPacketSink {
     inner: bangbang_runtime::mmds_network::MmdsOnlyVirtioNetworkTxPacketSink,
     evidence: std::sync::Arc<SignedGuestNetworkSemanticEvidence>,
+    drop_staged_ack: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -196,6 +477,9 @@ impl bangbang_runtime::network::VirtioNetworkTxPacketSink for SignedGuestMmdsTxP
             bangbang_runtime::network::VirtioNetworkTxPacketSinkError::new(source.to_string())
         })?;
         self.evidence.observe(&packet)?;
+        if self.evidence.should_drop_guest_ack(&packet)? {
+            return Ok(bangbang_runtime::network::VirtioNetworkTxPacketDisposition::Detoured);
+        }
         let result = self.inner.transmit_prepared_frame(memory, frame, &packet);
         if let Err(source) = &result {
             self.evidence.record_error(source);
@@ -213,6 +497,9 @@ impl bangbang_runtime::network::VirtioNetworkTxPacketSink for SignedGuestMmdsTxP
         bangbang_runtime::network::VirtioNetworkTxPacketSinkError,
     > {
         self.evidence.observe(packet)?;
+        if self.evidence.should_drop_guest_ack(packet)? {
+            return Ok(bangbang_runtime::network::VirtioNetworkTxPacketDisposition::Detoured);
+        }
         let result = self.inner.transmit_prepared_frame(memory, frame, packet);
         if let Err(source) = &result {
             self.evidence.record_error(source);
@@ -236,6 +523,14 @@ impl bangbang_runtime::network::VirtioNetworkTxPacketSink for SignedGuestMmdsTxP
             bangbang_runtime::network::VirtioNetworkTxPacketSinkError::new(source.to_string())
         })?;
         self.evidence.observe(&packet)?;
+        if self.evidence.should_drop_guest_ack(&packet)? {
+            self.drop_staged_ack = true;
+            return Ok(
+                bangbang_runtime::network::VirtioNetworkTxPacketStage::Staged {
+                    flush_before_commit: false,
+                },
+            );
+        }
         let result = self.inner.stage_prepared_frame(memory, frame, &packet);
         if let Err(source) = &result {
             self.evidence.record_error(source);
@@ -253,6 +548,14 @@ impl bangbang_runtime::network::VirtioNetworkTxPacketSink for SignedGuestMmdsTxP
         bangbang_runtime::network::VirtioNetworkTxPacketSinkError,
     > {
         self.evidence.observe(packet)?;
+        if self.evidence.should_drop_guest_ack(packet)? {
+            self.drop_staged_ack = true;
+            return Ok(
+                bangbang_runtime::network::VirtioNetworkTxPacketStage::Staged {
+                    flush_before_commit: false,
+                },
+            );
+        }
         let result = self.inner.stage_prepared_frame(memory, frame, packet);
         if let Err(source) = &result {
             self.evidence.record_error(source);
@@ -261,6 +564,11 @@ impl bangbang_runtime::network::VirtioNetworkTxPacketSink for SignedGuestMmdsTxP
     }
 
     fn commit_staged_frame(&mut self) -> bangbang_runtime::network::VirtioNetworkTxPacketCommit {
+        if std::mem::take(&mut self.drop_staged_ack) {
+            return bangbang_runtime::network::VirtioNetworkTxPacketCommit::Immediate(Ok(
+                bangbang_runtime::network::VirtioNetworkTxPacketDisposition::Detoured,
+            ));
+        }
         let result = self.inner.commit_staged_frame();
         if let bangbang_runtime::network::VirtioNetworkTxPacketCommit::Immediate(Err(source)) =
             &result
@@ -271,6 +579,7 @@ impl bangbang_runtime::network::VirtioNetworkTxPacketSink for SignedGuestMmdsTxP
     }
 
     fn discard_staged_frame(&mut self) {
+        self.drop_staged_ack = false;
         self.inner.discard_staged_frame();
     }
 
@@ -293,9 +602,57 @@ impl bangbang_runtime::network::VirtioNetworkTxPacketSink for SignedGuestMmdsTxP
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
+struct SignedGuestMmdsRxPacketSource {
+    inner: bangbang_runtime::mmds_network::MmdsOnlyVirtioNetworkRxPacketSource,
+    evidence: std::sync::Arc<SignedGuestNetworkSemanticEvidence>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl bangbang_runtime::network::VirtioNetworkRxPacketSource for SignedGuestMmdsRxPacketSource {
+    fn begin_rx_dispatch(&mut self) {
+        self.inner.begin_rx_dispatch();
+    }
+
+    fn host_readiness_hint(&self) -> bool {
+        self.inner.host_readiness_hint()
+    }
+
+    fn retry_after_tx_hint(&self) -> bool {
+        self.inner.retry_after_tx_hint()
+    }
+
+    fn peek_packet(
+        &mut self,
+    ) -> Result<
+        Option<bangbang_runtime::network::VirtioNetworkRxPacket<'_>>,
+        bangbang_runtime::network::VirtioNetworkRxPacketSourceError,
+    > {
+        self.inner.peek_packet()
+    }
+
+    fn consume_packet(&mut self) {
+        let frame = self
+            .inner
+            .peek_packet()
+            .ok()
+            .flatten()
+            .map(|packet| packet.bytes().to_vec());
+        if let Some(frame) = frame {
+            self.evidence.observe_mmds_rx_frame(&frame);
+        }
+        self.inner.consume_packet();
+    }
+
+    fn take_backend_metrics(&mut self) -> bangbang_runtime::network::VirtioNetworkBackendMetrics {
+        self.inner.take_backend_metrics()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
 struct SignedGuestNetworkPacketIoProvider {
     tx_sink: SignedGuestMmdsTxPacketSink,
-    rx_source: bangbang_runtime::mmds_network::MmdsOnlyVirtioNetworkRxPacketSource,
+    rx_source: SignedGuestMmdsRxPacketSource,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -307,9 +664,13 @@ impl SignedGuestNetworkPacketIoProvider {
         Self {
             tx_sink: SignedGuestMmdsTxPacketSink {
                 inner: packet_io.tx_sink,
+                evidence: std::sync::Arc::clone(&evidence),
+                drop_staged_ack: false,
+            },
+            rx_source: SignedGuestMmdsRxPacketSource {
+                inner: packet_io.rx_source,
                 evidence,
             },
-            rx_source: packet_io.rx_source,
         }
     }
 }
@@ -318,6 +679,22 @@ impl SignedGuestNetworkPacketIoProvider {
 impl bangbang_runtime::startup::Arm64BootNetworkPacketIoProvider
     for SignedGuestNetworkPacketIoProvider
 {
+    fn has_packet_readiness(
+        &self,
+        interface: bangbang_runtime::startup::Arm64BootNetworkInterface<'_>,
+    ) -> bool {
+        interface.iface_id() == "eth0" && self.rx_source.inner.has_mmds_readiness()
+    }
+
+    fn packet_retry_after(
+        &self,
+        interface: bangbang_runtime::startup::Arm64BootNetworkInterface<'_>,
+    ) -> Option<std::time::Duration> {
+        (interface.iface_id() == "eth0")
+            .then(|| self.rx_source.inner.mmds_retry_after())
+            .flatten()
+    }
+
     fn packet_io(
         &mut self,
         interface: bangbang_runtime::startup::Arm64BootNetworkInterface<'_>,
@@ -1549,7 +1926,7 @@ fn configure_signed_guest_network_semantics(
 ) {
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::DriveConfigInput;
-    use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput};
+    use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsVersion};
     use bangbang_runtime::network::{
         NetworkInterfaceConfigInput, NetworkRateLimiterConfig, NetworkTokenBucketConfig,
     };
@@ -1570,9 +1947,9 @@ fn configure_signed_guest_network_semantics(
         ))
         .expect("signed MMDS network interface should configure");
     controller
-        .handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
-            "eth0".to_string(),
-        ])))
+        .handle_action(VmmAction::PutMmdsConfig(
+            MmdsConfigInput::new(vec!["eth0".to_string()]).with_version(MmdsVersion::V2),
+        ))
         .expect("signed MMDS interface selection should configure");
     controller
         .handle_action(VmmAction::PutMmds(MmdsContentInput::new(
@@ -1593,16 +1970,14 @@ fn signed_guest_network_packet_io(
 ) -> SignedGuestNetworkPacketIoProvider {
     use bangbang_runtime::metrics::SharedMmdsMetrics;
     use bangbang_runtime::mmds::DEFAULT_MMDS_IPV4_ADDRESS;
-    use bangbang_runtime::mmds_network::{
-        MmdsOnlyVirtioNetworkPacketIo, MmdsPacketDetour, MmdsResponseQueue,
-    };
+    use bangbang_runtime::mmds_network::{MmdsOnlyVirtioNetworkPacketIo, MmdsPacketDetour};
 
-    let detour = MmdsPacketDetour::new(
+    let detour = MmdsPacketDetour::try_new(
         controller.mmds_state_handle(),
         DEFAULT_MMDS_IPV4_ADDRESS,
-        MmdsResponseQueue::default(),
         SharedMmdsMetrics::default(),
-    );
+    )
+    .expect("signed MMDS session should build");
     let packet_io =
         MmdsOnlyVirtioNetworkPacketIo::new(detour).expect("signed MMDS packet I/O should build");
     SignedGuestNetworkPacketIoProvider::new(packet_io, evidence)
@@ -1654,6 +2029,7 @@ fn assert_signed_guest_network_semantics(
     );
     for (marker, description) in [
         (MMDS_FETCH_MARKER, "baseline MMDS fetch"),
+        (MMDS_V2_RENEW_MARKER, "MMDS v2 token renewal"),
         (VIRTIO_NETWORK_LARGE_TX_MARKER, "large guest TCP transmit"),
         (VIRTIO_NETWORK_LARGE_RX_MARKER, "large merged receive"),
         (VIRTIO_NETWORK_SEMANTICS_MARKER, "virtio-net semantic proof"),
@@ -1675,6 +2051,18 @@ fn assert_signed_guest_network_semantics(
     assert!(
         evidence.maximum_emitted_packets() > 1,
         "{transport} large guest TCP request did not exercise software segmentation"
+    );
+    assert!(
+        evidence.mmds_payload_frames() > 1,
+        "{transport} MMDS response did not exercise TCP segmentation"
+    );
+    assert!(
+        evidence.dropped_ack(),
+        "{transport} MMDS loss harness did not withhold a guest ACK"
+    );
+    assert!(
+        evidence.retransmission_observed(),
+        "{transport} MMDS session did not retransmit after the withheld ACK: {evidence:?}"
     );
     assert!(metrics.tx_bytes_count() > 3000);
     assert!(metrics.rx_bytes_count() > 48 * 1024);

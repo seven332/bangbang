@@ -1717,11 +1717,25 @@ impl std::error::Error for Arm64BootPmemNotificationDispatchError {
 #[derive(Debug)]
 pub struct Arm64BootNetworkNotificationDispatches {
     devices: Vec<Arm64BootNetworkNotificationDispatch>,
+    packet_retry_after: Option<Duration>,
 }
 
 impl Arm64BootNetworkNotificationDispatches {
     fn new(devices: Vec<Arm64BootNetworkNotificationDispatch>) -> Self {
-        Self { devices }
+        Self {
+            devices,
+            packet_retry_after: None,
+        }
+    }
+
+    fn new_with_packet_retry_after(
+        devices: Vec<Arm64BootNetworkNotificationDispatch>,
+        packet_retry_after: Option<Duration>,
+    ) -> Self {
+        Self {
+            devices,
+            packet_retry_after,
+        }
     }
 
     pub fn as_slice(&self) -> &[Arm64BootNetworkNotificationDispatch] {
@@ -1750,6 +1764,9 @@ impl Arm64BootNetworkNotificationDispatches {
         self.devices
             .iter()
             .filter_map(Arm64BootNetworkNotificationDispatch::rate_limiter_retry_after)
+            .min()
+            .into_iter()
+            .chain(self.packet_retry_after)
             .min()
     }
 }
@@ -1910,6 +1927,12 @@ pub trait Arm64BootNetworkPacketIoProvider {
     /// consume the condition and is also used during guest/MMIO/limiter work.
     fn has_packet_readiness(&self, _interface: Arm64BootNetworkInterface<'_>) -> bool {
         false
+    }
+
+    /// Returns the next interface-local protocol retry without consuming it.
+    /// Immediate packet output remains a readiness condition instead.
+    fn packet_retry_after(&self, _interface: Arm64BootNetworkInterface<'_>) -> Option<Duration> {
+        None
     }
 
     fn packet_io(
@@ -3384,6 +3407,7 @@ impl Arm64BootRuntimeResources {
     ) -> Result<Arm64BootNetworkNotificationDispatches, Arm64BootNetworkNotificationDispatchError>
     {
         let mut devices = Vec::new();
+        let mut packet_retry_after = None;
         devices
             .try_reserve_exact(self.network_devices.len())
             .map_err(
@@ -3392,12 +3416,12 @@ impl Arm64BootRuntimeResources {
 
         for device in self.network_devices.iter().cloned() {
             let region_id = device.registration.region_id();
+            let interface = Arm64BootNetworkInterface::new(
+                device.registration.iface_id(),
+                device.registration.host_dev_name(),
+            );
             let outcome = match mmio_dispatcher.handler_mut::<VirtioNetworkMmioHandler>(region_id) {
                 Ok(handler) => {
-                    let interface = Arm64BootNetworkInterface::new(
-                        device.registration.iface_id(),
-                        device.registration.host_dev_name(),
-                    );
                     let has_packet_readiness = packet_io.has_packet_readiness(interface);
                     if !handler.has_pending_network_queue_work() && !has_packet_readiness {
                         match handler.dispatch_network_queue_notifications(memory) {
@@ -3433,10 +3457,21 @@ impl Arm64BootRuntimeResources {
                 }
                 Err(source) => Arm64BootNetworkNotificationOutcome::HandlerLookupFailed(source),
             };
+            if let Some(retry_after) = packet_io.packet_retry_after(interface) {
+                packet_retry_after = Some(
+                    packet_retry_after
+                        .map_or(retry_after, |current: Duration| current.min(retry_after)),
+                );
+            }
             devices.push(Arm64BootNetworkNotificationDispatch::new(device, outcome));
         }
 
-        Ok(Arm64BootNetworkNotificationDispatches::new(devices))
+        Ok(
+            Arm64BootNetworkNotificationDispatches::new_with_packet_retry_after(
+                devices,
+                packet_retry_after,
+            ),
+        )
     }
 
     pub fn dispatch_vsock_queue_notifications(
@@ -8231,6 +8266,7 @@ mod tests {
         endpoints: Vec<RecordingNetworkPacketEndpoint>,
         requested_ifaces: Vec<String>,
         ready_ifaces: Vec<String>,
+        retry_after: Vec<(String, Duration)>,
         fail_iface: Option<String>,
     }
 
@@ -8251,6 +8287,11 @@ mod tests {
             self
         }
 
+        fn retry_after(mut self, iface_id: &str, duration: Duration) -> Self {
+            self.retry_after.push((iface_id.to_string(), duration));
+            self
+        }
+
         fn endpoint(&self, iface_id: &str) -> &RecordingNetworkPacketEndpoint {
             self.endpoints
                 .iter()
@@ -8264,6 +8305,16 @@ mod tests {
             self.ready_ifaces
                 .iter()
                 .any(|iface_id| iface_id == interface.iface_id())
+        }
+
+        fn packet_retry_after(
+            &self,
+            interface: super::Arm64BootNetworkInterface<'_>,
+        ) -> Option<Duration> {
+            self.retry_after
+                .iter()
+                .find(|(iface_id, _)| iface_id == interface.iface_id())
+                .map(|(_, duration)| *duration)
         }
 
         fn packet_io(
@@ -13214,6 +13265,49 @@ mod tests {
             .expect("no pending notification should dispatch as no-op");
         assert!(dispatch.drained_notifications().is_empty());
         assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_network_dispatch_merges_earliest_protocol_retry() {
+        let kernel = temp_file("kernel-network-protocol-retry", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        add_network(&mut controller, "eth1", "tap1");
+        let config = Arm64BootResourceConfig {
+            network_interrupt_lines: &[line(33), line(34)],
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        let mut provider = RecordingNetworkPacketIoProvider::default()
+            .with_endpoint("eth0", Vec::new())
+            .with_endpoint("eth1", Vec::new())
+            .retry_after("eth0", Duration::from_secs(5))
+            .retry_after("eth1", Duration::from_millis(750));
+
+        let dispatches = runtime
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("network dispatch result should allocate");
+
+        assert!(provider.requested_ifaces.is_empty());
+        assert_eq!(
+            dispatches.rate_limiter_retry_after(),
+            Some(Duration::from_millis(750))
+        );
+        assert!(
+            dispatches
+                .as_slice()
+                .iter()
+                .all(|dispatch| dispatch.rate_limiter_retry_after().is_none())
+        );
     }
 
     #[test]

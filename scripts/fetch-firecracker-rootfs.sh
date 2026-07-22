@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v78"
+direct_boot_variant="direct-boot-v86"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -1891,27 +1891,45 @@ prove_virtio_network_semantics() {
     write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
     return
   fi
+  if ! ip route replace 169.254.0.0/16 dev "$mmds_iface" \
+    src 169.254.100.2 advmss 256 2>/dev/null; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_ADVMSS
+    write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+    return
+  fi
 
   if ! command -v python3 >/dev/null 2>&1; then
     emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_NO_PYTHON
     write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
     return
   fi
+  if ! request_mmds_v2_token \
+    BANGBANG_VIRTIO_NET_SEMANTICS_FAIL \
+    BANGBANG_VIRTIO_NET_SEMANTICS_FAIL \
+    60; then
+    return
+  fi
+  first_mmds_token=$mmds_token
   baseline_value=$(
-    python3 - <<'PY' 2>/dev/null || true
+    python3 - "$mmds_token" <<'PY' 2>/dev/null || true
 import socket
+import sys
 
 body_marker = b"BANGBANG_MMDS_GUEST_VALUE"
+token = sys.argv[1].encode("ascii")
 request = (
     b"GET /meta-data/bangbang-marker HTTP/1.1\r\n"
     b"Host: 169.254.169.254\r\n"
     b"Accept: */*\r\n"
-    b"X-Bangbang-Padding: " + (b"a" * 3000) + b"\r\n\r\n"
+    b"X-metadata-token: " + token + b"\r\n"
+    b"X-Bangbang-Padding: " + (b"a" * 2200) + b"\r\n\r\n"
 )
 
 with socket.create_connection(("169.254.169.254", 80), timeout=10) as connection:
     connection.settimeout(10)
+    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
     connection.sendall(request)
+    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 0)
     response = bytearray()
     header_end = -1
     content_length = None
@@ -1951,20 +1969,38 @@ PY
   emit_line BANGBANG_MMDS_FETCH_OK
   emit_line BANGBANG_VIRTIO_NET_LARGE_TX_OK
 
-  if ! ip link set dev "$mmds_iface" mtu 50000 2>/dev/null; then
-    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_MTU_50000
+  if ! ip route replace 169.254.0.0/16 dev "$mmds_iface" \
+    src 169.254.100.2 2>/dev/null; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_ROUTE_RESTORE
     write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
     return
   fi
 
-  large_result=$(
-    python3 - <<'PY' 2>/dev/null || true
-import socket
+  if ! request_mmds_v2_token \
+    BANGBANG_VIRTIO_NET_SEMANTICS_FAIL \
+    BANGBANG_VIRTIO_NET_SEMANTICS_FAIL \
+    60; then
+    return
+  fi
+  if [ "$mmds_token" = "$first_mmds_token" ]; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_TOKEN_RENEW
+    write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+    return
+  fi
+  emit_line BANGBANG_MMDS_V2_RENEW_OK
 
+  large_result=$(
+    python3 - "$mmds_token" <<'PY' 2>/dev/null || true
+import socket
+import sys
+import time
+
+token = sys.argv[1].encode("ascii")
 request = (
     b"GET /meta-data/bangbang-large HTTP/1.1\r\n"
     b"Host: 169.254.169.254\r\n"
-    b"Accept: */*\r\n\r\n"
+    b"Accept: */*\r\n"
+    b"X-metadata-token: " + token + b"\r\n\r\n"
 )
 
 with socket.create_connection(("169.254.169.254", 80), timeout=15) as connection:
@@ -1992,6 +2028,8 @@ with socket.create_connection(("169.254.169.254", 80), timeout=15) as connection
             if len(response) >= body_start + content_length:
                 break
 
+    time.sleep(5)
+
 if header_end < 0 or content_length != 49152:
     raise RuntimeError("MMDS large response headers did not match")
 body_start = header_end + 4
@@ -2003,6 +2041,22 @@ PY
   )
   if [ "$large_result" != BANGBANG_VIRTIO_NET_LARGE_RX_OK ]; then
     emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_LARGE_CONTENT
+    write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+    return
+  fi
+
+  if ! ip link set dev "$mmds_iface" mtu 50000 2>/dev/null; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_MTU_50000
+    write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
+    return
+  fi
+  large_merged_result=$(
+    get_mmds_v2_value meta-data/bangbang-large \
+      | python3 -c 'import sys; data = sys.stdin.buffer.read(); print("BANGBANG_VIRTIO_NET_LARGE_MERGED_OK" if len(data) == 49152 and data == b"z" * 49152 else "")' \
+      2>/dev/null || true
+  )
+  if [ "$large_merged_result" != BANGBANG_VIRTIO_NET_LARGE_MERGED_OK ]; then
+    emit_line BANGBANG_VIRTIO_NET_SEMANTICS_FAIL_LARGE_MERGED
     write_vdb_marker BANGBANG_VIRTIO_NET_SEMANTICS_FAIL
     return
   fi

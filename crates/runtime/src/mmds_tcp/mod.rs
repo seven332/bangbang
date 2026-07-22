@@ -10,8 +10,8 @@
 //! Firecracker-specific packet, time, allocation, HTTP, and metrics ownership.
 //! See the colocated `NOTICE.md` and `LICENSE-APACHE-2.0` files.
 //!
-//! This module is staged for the production integration owned by issue #1499.
-//! The current MMDS packet detour does not call it yet.
+//! The per-interface MMDS network stack uses this module for production TCP
+//! session handling and retransmission scheduling.
 
 mod connection;
 mod endpoint;
