@@ -500,6 +500,23 @@ default-stdio session isolation. The checked
 Wave 7 #1491 owns no selected row. No disposition changes, so the overlay
 remains 191/207/3/17.
 
+#1502 closes the direct-vmnet callback/readiness and bounded-packet-batch slice
+under #1493 without promoting the broad network semantic record. Each live
+interface owns a generation-scoped callback lease whose restricted publisher
+coalesces persistent readiness and optional estimates through a capacity-one
+provider bridge. MMIO and PCI owner dispatch route exact-interface readiness
+before vCPU entry; stale generations cannot select reused IDs. Preallocated RX
+and staged TX batches enforce the realized packet/count/byte/virtqueue limits,
+validate explicit partial counts, retain used-ring safety, and preserve limiter,
+MMDS, descriptor, interrupt, and result ordering. Exact retirement disables and
+drains the serial callback queue before stop and reuse. Credential-free tests
+cover the callback, batch, race, owner-loop, and terminal-cleanup contracts;
+signed all-MMDS/networkless gates prove non-regression without claiming an
+entitled vmnet start or external packet movement. Direct virtio headers,
+offloads, broader MMDS TCP, positive #1378 connectivity, and network snapshot
+state keep `semantic.network:virtio-net-vmnet-policy-and-connectivity`
+`audit-required`, so the overlay remains 191/207/3/17.
+
 ## Commands
 
 Validate checked-in delivery state without an upstream checkout:

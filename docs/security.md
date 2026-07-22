@@ -929,15 +929,37 @@ and uncertain; failed stop is never retried or reused. Diagnostics omit MAC,
 UUID, bridge/interface names, returned bounds, XPC contents, raw handles, and
 unknown framework values.
 
-The backend does not register the packet-available event callback and retains
-raw-Ethernet synchronous single-packet reads and writes. Returned batch limits
-are dormant bounds, direct virtio headers stay disabled, and no offload feature
-is advertised. The generic 16-interface configuration cap is not enforcement
-of Apple's per-guest resource policy. Repository tests carry no restricted
-credential fixture. They prove typed reconciliation and bounded lifecycle with
-injected backends, the positive packaging transaction with synthetic tools, the
-real blocked preflight contract without credentials, and signed negative
-runtime shapes, but do not prove direct-vmnet guest connectivity.
+The backend registers only the packet-available event. Its serial callback
+captures a restricted generation publisher, not guest memory, device queues,
+packet bytes, configuration, limiters, or public metrics. It atomically retains
+readiness and a bounded optional estimate, then uses a nonblocking capacity-one
+signal; the estimate is only a hint and a full or disconnected signal path does
+not clear readiness. A separate provider-owned bridge performs the potentially
+locking vCPU wake outside Apple's callback queue. Owner-thread dispatch selects
+the exact live generation, issues at most one realized host batch per pass, and
+parks retained work while the guest has no RX buffer or a limiter is blocked.
+
+RX and TX aggregate storage is allocated before interface publication and is
+bounded by the validated profile, 200 packets, 256 KiB, per-packet size, and
+virtqueue capacity. Read counts and packet lengths are treated as untrusted;
+only a validated initialized prefix becomes visible. TX copies frames before
+used-ring publication, commits them in descriptor order, preserves per-frame
+MMDS effects, and maps a successful short write to an exact forwarded prefix;
+the suffix fails without an ambiguous retry. Direct virtio headers stay
+disabled and no offload feature is advertised.
+
+Teardown marks the exact generation retiring, disables its event, waits for a
+bounded marker on the same serial callback queue, stops vmnet with its finite
+completion wait, and only then drops callback, lease, interface, and wake
+ownership. Disable, drain, or stop uncertainty is terminal and prevents
+ID/MAC/PCI-slot reuse. The generic 16-interface configuration cap is not
+enforcement of Apple's per-guest resource policy. Repository tests carry no
+restricted credential fixture. They prove callback isolation, generation
+retirement, batch/count validation, owner-loop routing, typed reconciliation,
+and bounded lifecycle with injected backends; the positive packaging
+transaction with synthetic tools; the real blocked preflight contract without
+credentials; and signed MMDS-only/networkless runtime shapes. They do not prove
+direct-vmnet guest connectivity.
 
 Configured RX/TX token buckets are implemented as device-local queue admission
 with retained work and session-owned retry wakeups. They are not packet
