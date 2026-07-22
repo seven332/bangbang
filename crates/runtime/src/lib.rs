@@ -18,6 +18,8 @@ pub mod metrics;
 pub mod mmds;
 #[doc(hidden)]
 pub mod mmds_network;
+#[doc(hidden)]
+pub mod mmds_tcp;
 mod mmds_token;
 pub mod mmio;
 pub mod network;
