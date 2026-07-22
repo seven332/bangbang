@@ -4,13 +4,14 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::ops::ControlFlow;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::memory::GuestMemory;
 use crate::metrics::SharedMmdsMetrics;
 use crate::mmds::MmdsStateHandle;
 pub use crate::mmds_stack::{
-    MmdsNetworkStackBuildError, MmdsNetworkStackError, MmdsNetworkStackHandle,
+    MmdsNetworkStackBuildError, MmdsNetworkStackCaptureDescriptor, MmdsNetworkStackCaptureError,
+    MmdsNetworkStackError, MmdsNetworkStackHandle,
 };
 use crate::network::{
     GuestMacAddress, VIRTIO_NET_MAX_BUFFER_SIZE, VirtioNetworkBackendMetrics,
@@ -258,6 +259,31 @@ impl MmdsOnlyVirtioNetworkPacketIo {
 
     pub fn mmds_retry_after(&self) -> Option<Duration> {
         self.rx_source.mmds_retry_after()
+    }
+
+    #[doc(hidden)]
+    pub fn mmds_retry_after_at(&self, now: Instant) -> Option<Duration> {
+        self.rx_source.mmds_retry_after_at(now)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_mmds_ready_at(&self, now: Instant) -> bool {
+        self.rx_source.stack.has_ready_frame_at_instant(now)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_cached_rx_len(&self) -> Option<usize> {
+        self.rx_source.cached_len
+    }
+
+    #[doc(hidden)]
+    pub fn capture_tx_transaction_active(&self) -> bool {
+        self.tx_sink.staged_frame.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn capture_mmds_stack(&self) -> MmdsNetworkStackHandle {
+        self.rx_source.stack.clone()
     }
 }
 
@@ -537,6 +563,14 @@ impl MmdsOnlyVirtioNetworkRxPacketSource {
             None
         } else {
             self.stack.retry_after()
+        }
+    }
+
+    fn mmds_retry_after_at(&self, now: Instant) -> Option<Duration> {
+        if self.cached_len.is_some() {
+            None
+        } else {
+            self.stack.retry_after_at_instant(now)
         }
     }
 }

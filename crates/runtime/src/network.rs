@@ -15,15 +15,22 @@ use crate::mmio::{
 };
 pub use crate::network_packet::VirtioNetworkPacketEnvelope;
 use crate::network_packet::{VirtioNetworkPacketPlan, VirtioNetworkPacketPlanError};
-use crate::token_bucket::{TokenBucket, TokenBucketConfig, TokenBucketSnapshot};
+use crate::token_bucket::{
+    PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
+    TokenBucketSnapshot,
+};
 use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
-    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
-    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError,
+    VirtioMmioQueueRegisters, VirtioMmioQueueState, VirtioMmioRegisterHandler,
+    VirtioMmioRegisterHandlerError, VirtioMmioTransportState,
 };
-use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
+use crate::virtio_pci::{
+    VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError,
+    VirtioPciTransportState,
+};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
@@ -2263,6 +2270,700 @@ impl std::error::Error for VirtioNetworkRxBufferParseError {
     }
 }
 
+/// Detached token-bucket state used by the network capture contract.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioNetworkTokenBucketCaptureState {
+    config: NetworkTokenBucketConfig,
+    budget: u64,
+    one_time_burst: u64,
+    age_nanos: u64,
+}
+
+impl VirtioNetworkTokenBucketCaptureState {
+    const fn from_persisted(
+        config: NetworkTokenBucketConfig,
+        state: PersistedTokenBucketState,
+    ) -> Self {
+        Self {
+            config,
+            budget: state.budget(),
+            one_time_burst: state.one_time_burst(),
+            age_nanos: state.age_nanos(),
+        }
+    }
+
+    pub const fn config(self) -> NetworkTokenBucketConfig {
+        self.config
+    }
+
+    pub const fn budget(self) -> u64 {
+        self.budget
+    }
+
+    pub const fn one_time_burst(self) -> u64 {
+        self.one_time_burst
+    }
+
+    pub const fn age_nanos(self) -> u64 {
+        self.age_nanos
+    }
+}
+
+impl fmt::Debug for VirtioNetworkTokenBucketCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkTokenBucketCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Detached bandwidth and operations limiter state for one direction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioNetworkRateLimiterCaptureState {
+    bandwidth: Option<VirtioNetworkTokenBucketCaptureState>,
+    ops: Option<VirtioNetworkTokenBucketCaptureState>,
+}
+
+impl VirtioNetworkRateLimiterCaptureState {
+    pub const fn bandwidth(self) -> Option<VirtioNetworkTokenBucketCaptureState> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<VirtioNetworkTokenBucketCaptureState> {
+        self.ops
+    }
+
+    pub const fn is_configured(self) -> bool {
+        self.bandwidth.is_some() || self.ops.is_some()
+    }
+}
+
+impl fmt::Debug for VirtioNetworkRateLimiterCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkRateLimiterCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioNetworkRateLimiterCaptureError {
+    MissingRateLimiter,
+    UnexpectedRateLimiter,
+    MissingBandwidthBucket,
+    UnexpectedBandwidthBucket,
+    InvalidBandwidthBucket,
+    MissingOpsBucket,
+    UnexpectedOpsBucket,
+    InvalidOpsBucket,
+}
+
+impl fmt::Display for VirtioNetworkRateLimiterCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingRateLimiter => "configured network rate limiter is missing",
+            Self::UnexpectedRateLimiter => "unconfigured network rate limiter is present",
+            Self::MissingBandwidthBucket => "configured network bandwidth bucket is missing",
+            Self::UnexpectedBandwidthBucket => "unconfigured network bandwidth bucket is present",
+            Self::InvalidBandwidthBucket => "network bandwidth bucket state is invalid",
+            Self::MissingOpsBucket => "configured network operations bucket is missing",
+            Self::UnexpectedOpsBucket => "unconfigured network operations bucket is present",
+            Self::InvalidOpsBucket => "network operations bucket state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for VirtioNetworkRateLimiterCaptureError {}
+
+fn capture_network_token_bucket_state_at(
+    config: Option<NetworkTokenBucketConfig>,
+    bucket: Option<&TokenBucket>,
+    now: Instant,
+    missing: VirtioNetworkRateLimiterCaptureError,
+    unexpected: VirtioNetworkRateLimiterCaptureError,
+    invalid: VirtioNetworkRateLimiterCaptureError,
+) -> Result<Option<VirtioNetworkTokenBucketCaptureState>, VirtioNetworkRateLimiterCaptureError> {
+    match (config, bucket) {
+        (Some(config), Some(bucket)) => bucket
+            .persisted_state_at(config.token_bucket_config(), now)
+            .map(|state| {
+                Some(VirtioNetworkTokenBucketCaptureState::from_persisted(
+                    config, state,
+                ))
+            })
+            .map_err(|_: PersistedTokenBucketStateError| invalid),
+        (Some(_), None) => Err(missing),
+        (None, Some(_)) => Err(unexpected),
+        (None, None) => Ok(None),
+    }
+}
+
+fn capture_network_rate_limiter_state_at(
+    config: Option<NetworkRateLimiterConfig>,
+    limiter: Option<&VirtioNetworkRateLimiter>,
+    now: Instant,
+) -> Result<VirtioNetworkRateLimiterCaptureState, VirtioNetworkRateLimiterCaptureError> {
+    let config = config.and_then(NetworkRateLimiterConfig::normalized);
+    let (config, limiter) = match (config, limiter) {
+        (Some(config), Some(limiter)) => (config, limiter),
+        (Some(_), None) => return Err(VirtioNetworkRateLimiterCaptureError::MissingRateLimiter),
+        (None, Some(_)) => {
+            return Err(VirtioNetworkRateLimiterCaptureError::UnexpectedRateLimiter);
+        }
+        (None, None) => {
+            return Ok(VirtioNetworkRateLimiterCaptureState {
+                bandwidth: None,
+                ops: None,
+            });
+        }
+    };
+
+    let bandwidth = capture_network_token_bucket_state_at(
+        config.bandwidth(),
+        limiter.bandwidth.as_ref(),
+        now,
+        VirtioNetworkRateLimiterCaptureError::MissingBandwidthBucket,
+        VirtioNetworkRateLimiterCaptureError::UnexpectedBandwidthBucket,
+        VirtioNetworkRateLimiterCaptureError::InvalidBandwidthBucket,
+    )?;
+    let ops = capture_network_token_bucket_state_at(
+        config.ops(),
+        limiter.ops.as_ref(),
+        now,
+        VirtioNetworkRateLimiterCaptureError::MissingOpsBucket,
+        VirtioNetworkRateLimiterCaptureError::UnexpectedOpsBucket,
+        VirtioNetworkRateLimiterCaptureError::InvalidOpsBucket,
+    )?;
+    Ok(VirtioNetworkRateLimiterCaptureState { bandwidth, ops })
+}
+
+/// Host-time-free retry disposition for reconstructible network work.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VirtioNetworkRetryCaptureState {
+    None,
+    Immediate,
+    After { remaining_nanos: u64 },
+}
+
+impl VirtioNetworkRetryCaptureState {
+    pub const fn has_retry(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub const fn remaining_nanos(self) -> Option<u64> {
+        match self {
+            Self::None | Self::Immediate => None,
+            Self::After { remaining_nanos } => Some(remaining_nanos),
+        }
+    }
+}
+
+impl fmt::Debug for VirtioNetworkRetryCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let disposition = match self {
+            Self::None => "none",
+            Self::Immediate => "immediate",
+            Self::After { .. } => "delayed",
+        };
+        formatter
+            .debug_tuple("VirtioNetworkRetryCaptureState")
+            .field(&disposition)
+            .finish()
+    }
+}
+
+fn network_retry_capture_state(
+    retry_after: Duration,
+) -> Result<VirtioNetworkRetryCaptureState, VirtioNetworkDeviceCaptureError> {
+    let remaining_nanos = u64::try_from(retry_after.as_nanos())
+        .map_err(|_| VirtioNetworkDeviceCaptureError::RetryDurationOverflow)?;
+    if remaining_nanos == 0 {
+        Ok(VirtioNetworkRetryCaptureState::Immediate)
+    } else {
+        Ok(VirtioNetworkRetryCaptureState::After { remaining_nanos })
+    }
+}
+
+/// Detached queue cursors and negotiated behavior. Ring addresses live in the
+/// paired transport value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioNetworkQueueCaptureState {
+    next_available: u16,
+    next_used: u16,
+    event_idx_enabled: bool,
+    negotiated_features: u64,
+}
+
+impl VirtioNetworkQueueCaptureState {
+    pub const fn next_available(self) -> u16 {
+        self.next_available
+    }
+
+    pub const fn next_used(self) -> u16 {
+        self.next_used
+    }
+
+    pub const fn event_idx_enabled(self) -> bool {
+        self.event_idx_enabled
+    }
+
+    pub const fn negotiated_features(self) -> u64 {
+        self.negotiated_features
+    }
+}
+
+impl fmt::Debug for VirtioNetworkQueueCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkQueueCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioNetworkQueueCaptureError {
+    TransportMismatch,
+    FeatureMismatch,
+    AvailableRingInvalid,
+    UsedRingInvalid,
+    QueueRangeInvalid,
+    QueueRangesOverlap,
+    UsedCursorMismatch,
+    AvailableCursorOutOfBounds,
+    UnpublishedDescriptorCountMismatch,
+    PendingDescriptorMissing,
+    PendingDescriptorDuplicated,
+}
+
+impl fmt::Display for VirtioNetworkQueueCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TransportMismatch => "active network queue does not match its transport",
+            Self::FeatureMismatch => "active network queue feature state does not match transport",
+            Self::AvailableRingInvalid => "network available ring is invalid",
+            Self::UsedRingInvalid => "network used ring is invalid",
+            Self::QueueRangeInvalid => "network queue range is invalid",
+            Self::QueueRangesOverlap => "network queue ranges overlap",
+            Self::UsedCursorMismatch => "network used cursor does not match guest memory",
+            Self::AvailableCursorOutOfBounds => {
+                "network available cursor is inconsistent with guest memory"
+            }
+            Self::UnpublishedDescriptorCountMismatch => {
+                "network queue has consumed-but-unpublished descriptors"
+            }
+            Self::PendingDescriptorMissing => {
+                "rate-limited network queue does not retain an available descriptor"
+            }
+            Self::PendingDescriptorDuplicated => {
+                "rate-limited network queue retains its descriptor more than once"
+            }
+        })
+    }
+}
+
+impl std::error::Error for VirtioNetworkQueueCaptureError {}
+
+fn capture_network_queue_state(
+    transport: &VirtioMmioQueueState,
+    available: &VirtqueueAvailableRing,
+    used: &VirtqueueUsedRing,
+    event_idx_enabled: bool,
+    negotiated_features: u64,
+    memory: &GuestMemory,
+    pending_rate_limited_queue: bool,
+) -> Result<VirtioNetworkQueueCaptureState, VirtioNetworkQueueCaptureError> {
+    if !transport.ready()
+        || transport.size() != available.queue_size()
+        || transport.descriptor_table() != available.descriptor_table()
+        || transport.driver_ring() != available.available_ring()
+        || transport.device_ring() != used.used_ring()
+        || available.queue_size() != used.queue_size()
+    {
+        return Err(VirtioNetworkQueueCaptureError::TransportMismatch);
+    }
+    let expected_event_idx =
+        virtio_feature_enabled(negotiated_features, VIRTIO_RING_FEATURE_EVENT_IDX);
+    let expected_indirect =
+        virtio_feature_enabled(negotiated_features, VIRTIO_RING_FEATURE_INDIRECT_DESC);
+    if event_idx_enabled != expected_event_idx
+        || available.descriptor_chain_options().indirect_descriptors() != expected_indirect
+    {
+        return Err(VirtioNetworkQueueCaptureError::FeatureMismatch);
+    }
+    available
+        .validate_mapped(memory)
+        .map_err(|_| VirtioNetworkQueueCaptureError::AvailableRingInvalid)?;
+    used.validate_mapped(memory)
+        .map_err(|_| VirtioNetworkQueueCaptureError::UsedRingInvalid)?;
+    let ranges = network_queue_ranges(available, used)?;
+    if ranges[0].overlaps(ranges[1])
+        || ranges[0].overlaps(ranges[2])
+        || ranges[1].overlaps(ranges[2])
+    {
+        return Err(VirtioNetworkQueueCaptureError::QueueRangesOverlap);
+    }
+
+    let used_index = used
+        .used_index(memory)
+        .map_err(|_| VirtioNetworkQueueCaptureError::UsedRingInvalid)?;
+    if used_index != used.next_used() {
+        return Err(VirtioNetworkQueueCaptureError::UsedCursorMismatch);
+    }
+    let available_index = available
+        .available_index(memory)
+        .map_err(|_| VirtioNetworkQueueCaptureError::AvailableRingInvalid)?;
+    let available_count = available_index.wrapping_sub(available.next_avail());
+    if available_count > available.queue_size() {
+        return Err(VirtioNetworkQueueCaptureError::AvailableCursorOutOfBounds);
+    }
+    if available.next_avail().wrapping_sub(used.next_used()) != 0 {
+        return Err(VirtioNetworkQueueCaptureError::UnpublishedDescriptorCountMismatch);
+    }
+    if pending_rate_limited_queue {
+        let mut cursor = available.clone();
+        let pending = cursor
+            .pop_descriptor_chain(memory)
+            .map_err(|_| VirtioNetworkQueueCaptureError::AvailableRingInvalid)?
+            .ok_or(VirtioNetworkQueueCaptureError::PendingDescriptorMissing)?;
+        let pending_head = descriptor_chain_head(&pending)
+            .ok_or(VirtioNetworkQueueCaptureError::PendingDescriptorMissing)?;
+        while let Some(chain) = cursor
+            .pop_descriptor_chain(memory)
+            .map_err(|_| VirtioNetworkQueueCaptureError::AvailableRingInvalid)?
+        {
+            if descriptor_chain_head(&chain) == Some(pending_head) {
+                return Err(VirtioNetworkQueueCaptureError::PendingDescriptorDuplicated);
+            }
+        }
+    }
+
+    Ok(VirtioNetworkQueueCaptureState {
+        next_available: available.next_avail(),
+        next_used: used.next_used(),
+        event_idx_enabled,
+        negotiated_features,
+    })
+}
+
+fn network_queue_ranges(
+    available: &VirtqueueAvailableRing,
+    used: &VirtqueueUsedRing,
+) -> Result<[GuestMemoryRange; 3], VirtioNetworkQueueCaptureError> {
+    Ok([
+        available
+            .descriptor_table_range()
+            .map_err(|_| VirtioNetworkQueueCaptureError::QueueRangeInvalid)?,
+        available
+            .available_ring_range()
+            .map_err(|_| VirtioNetworkQueueCaptureError::QueueRangeInvalid)?,
+        used.used_ring_range()
+            .map_err(|_| VirtioNetworkQueueCaptureError::QueueRangeInvalid)?,
+    ])
+}
+
+fn validate_network_queue_pair_ranges(
+    rx: &VirtioNetworkRxQueue,
+    tx: &VirtioNetworkTxQueue,
+) -> Result<(), VirtioNetworkQueueCaptureError> {
+    let rx_ranges = network_queue_ranges(&rx.available, &rx.used)?;
+    let tx_ranges = network_queue_ranges(&tx.available, &tx.used)?;
+    if rx_ranges.iter().any(|rx_range| {
+        tx_ranges
+            .iter()
+            .any(|tx_range| rx_range.overlaps(*tx_range))
+    }) {
+        return Err(VirtioNetworkQueueCaptureError::QueueRangesOverlap);
+    }
+    Ok(())
+}
+
+/// Encoding-independent, detached virtio-net device state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioNetworkDeviceCaptureState {
+    profile: NetworkDeviceProfile,
+    available_features: u64,
+    negotiated_features: u64,
+    active_rx_queue: Option<VirtioNetworkQueueCaptureState>,
+    active_tx_queue: Option<VirtioNetworkQueueCaptureState>,
+    rx_rate_limiter: VirtioNetworkRateLimiterCaptureState,
+    tx_rate_limiter: VirtioNetworkRateLimiterCaptureState,
+    source_rx_cache_normalized: bool,
+    source_rx_retry_normalized: bool,
+    tx_retry: VirtioNetworkRetryCaptureState,
+}
+
+/// Ephemeral source-side facts used by the owning backend to validate its
+/// retry scheduler. This value is deliberately not embedded in the detached
+/// device state because cached RX work is not reconstructible.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioNetworkCaptureValidation {
+    source_rx_retry: Option<VirtioNetworkRetryCaptureState>,
+}
+
+struct VirtioNetworkDeviceCaptureInput<'a> {
+    config: &'a NetworkInterfaceConfig,
+    profile: NetworkDeviceProfile,
+    config_space: &'a VirtioNetworkConfigSpace,
+    device_registers: &'a VirtioMmioDeviceRegisters,
+    queue_registers: &'a VirtioMmioQueueRegisters,
+    transport_activated: bool,
+    memory: &'a GuestMemory,
+    provider_cached_rx_len: Option<usize>,
+    now: Instant,
+}
+
+impl VirtioNetworkCaptureValidation {
+    pub const fn source_rx_retry(self) -> Option<VirtioNetworkRetryCaptureState> {
+        self.source_rx_retry
+    }
+}
+
+impl fmt::Debug for VirtioNetworkCaptureValidation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkCaptureValidation")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl VirtioNetworkDeviceCaptureState {
+    pub const fn profile(&self) -> NetworkDeviceProfile {
+        self.profile
+    }
+
+    pub const fn available_features(&self) -> u64 {
+        self.available_features
+    }
+
+    pub const fn negotiated_features(&self) -> u64 {
+        self.negotiated_features
+    }
+
+    pub const fn active_rx_queue(&self) -> Option<VirtioNetworkQueueCaptureState> {
+        self.active_rx_queue
+    }
+
+    pub const fn active_tx_queue(&self) -> Option<VirtioNetworkQueueCaptureState> {
+        self.active_tx_queue
+    }
+
+    pub const fn rx_rate_limiter(&self) -> VirtioNetworkRateLimiterCaptureState {
+        self.rx_rate_limiter
+    }
+
+    pub const fn tx_rate_limiter(&self) -> VirtioNetworkRateLimiterCaptureState {
+        self.tx_rate_limiter
+    }
+
+    /// Reports that a source-owned cached RX packet was validated and
+    /// deliberately excluded from fresh, lossy restore state.
+    pub const fn source_rx_cache_normalized(&self) -> bool {
+        self.source_rx_cache_normalized
+    }
+
+    /// Reports that source-only cached RX work was validated and deliberately
+    /// normalized out of the reconstructible retry state.
+    pub const fn source_rx_retry_normalized(&self) -> bool {
+        self.source_rx_retry_normalized
+    }
+
+    pub const fn tx_retry(&self) -> VirtioNetworkRetryCaptureState {
+        self.tx_retry
+    }
+}
+
+impl fmt::Debug for VirtioNetworkDeviceCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkDeviceCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioNetworkMmioCaptureState {
+    device: VirtioNetworkDeviceCaptureState,
+    transport: VirtioMmioTransportState,
+}
+
+impl VirtioNetworkMmioCaptureState {
+    pub const fn device(&self) -> &VirtioNetworkDeviceCaptureState {
+        &self.device
+    }
+
+    pub const fn transport(&self) -> &VirtioMmioTransportState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for VirtioNetworkMmioCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkMmioCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioNetworkPciCaptureState {
+    device: VirtioNetworkDeviceCaptureState,
+    transport: VirtioPciTransportState,
+}
+
+impl VirtioNetworkPciCaptureState {
+    pub const fn device(&self) -> &VirtioNetworkDeviceCaptureState {
+        &self.device
+    }
+
+    pub const fn transport(&self) -> &VirtioPciTransportState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for VirtioNetworkPciCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioNetworkPciCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioNetworkDeviceCaptureError {
+    DeviceIdMismatch,
+    RequestedProfileMismatch,
+    ConfigSpaceMismatch,
+    AvailableFeaturesMismatch,
+    NegotiatedFeaturesUnsupported,
+    RequiredFeatureNotAcknowledged,
+    ActivationMismatch,
+    QueueCountMismatch,
+    QueueMaxSizeMismatch,
+    RxQueue(VirtioNetworkQueueCaptureError),
+    TxQueue(VirtioNetworkQueueCaptureError),
+    QueueRangesOverlap,
+    RxRateLimiter(VirtioNetworkRateLimiterCaptureError),
+    TxRateLimiter(VirtioNetworkRateLimiterCaptureError),
+    PendingRxWithoutCache,
+    PendingRxWithoutRateLimiter,
+    CachedRxPacketInvalid,
+    PendingTxWithoutRateLimiter,
+    PendingTxFrameInvalid,
+    RetryDurationOverflow,
+}
+
+impl fmt::Display for VirtioNetworkDeviceCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceIdMismatch => {
+                formatter.write_str("virtio-net transport has the wrong device id")
+            }
+            Self::RequestedProfileMismatch => {
+                formatter.write_str("virtio-net requested and realized profiles disagree")
+            }
+            Self::ConfigSpaceMismatch => {
+                formatter.write_str("virtio-net config space does not match the realized profile")
+            }
+            Self::AvailableFeaturesMismatch => {
+                formatter.write_str("virtio-net available features do not match the device profile")
+            }
+            Self::NegotiatedFeaturesUnsupported => {
+                formatter.write_str("virtio-net negotiated unsupported features")
+            }
+            Self::RequiredFeatureNotAcknowledged => {
+                formatter.write_str("active virtio-net transport did not acknowledge VERSION_1")
+            }
+            Self::ActivationMismatch => {
+                formatter.write_str("virtio-net device and transport activation state disagree")
+            }
+            Self::QueueCountMismatch => {
+                formatter.write_str("virtio-net transport must contain exactly two queues")
+            }
+            Self::QueueMaxSizeMismatch => {
+                formatter.write_str("virtio-net queue maximum size is invalid")
+            }
+            Self::RxQueue(source) => write!(
+                formatter,
+                "virtio-net RX queue is not capture-ready: {source}"
+            ),
+            Self::TxQueue(source) => write!(
+                formatter,
+                "virtio-net TX queue is not capture-ready: {source}"
+            ),
+            Self::QueueRangesOverlap => {
+                formatter.write_str("virtio-net RX and TX queue ranges overlap")
+            }
+            Self::RxRateLimiter(source) => write!(
+                formatter,
+                "virtio-net RX limiter is not capture-ready: {source}"
+            ),
+            Self::TxRateLimiter(source) => write!(
+                formatter,
+                "virtio-net TX limiter is not capture-ready: {source}"
+            ),
+            Self::PendingRxWithoutCache => {
+                formatter.write_str("virtio-net RX retry has no retained provider packet")
+            }
+            Self::PendingRxWithoutRateLimiter => {
+                formatter.write_str("virtio-net RX retry has no configured limiter")
+            }
+            Self::CachedRxPacketInvalid => {
+                formatter.write_str("virtio-net cached RX packet length is invalid")
+            }
+            Self::PendingTxWithoutRateLimiter => {
+                formatter.write_str("virtio-net TX retry has no configured limiter")
+            }
+            Self::PendingTxFrameInvalid => {
+                formatter.write_str("virtio-net TX retry descriptor is invalid")
+            }
+            Self::RetryDurationOverflow => {
+                formatter.write_str("virtio-net retry duration is out of bounds")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioNetworkDeviceCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RxQueue(source) | Self::TxQueue(source) => Some(source),
+            Self::RxRateLimiter(source) | Self::TxRateLimiter(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioNetworkPciCaptureError {
+    Device(VirtioNetworkDeviceCaptureError),
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Display for VirtioNetworkPciCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Device(_) => "PCI virtio-net device capture failed",
+            Self::Endpoint(_) => "PCI virtio-net transport capture failed",
+        })
+    }
+}
+
+impl std::error::Error for VirtioNetworkPciCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Device(source) => Some(source),
+            Self::Endpoint(source) => Some(source),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct VirtioNetworkDevice {
     active_rx_queue: Option<VirtioNetworkRxQueue>,
@@ -2373,6 +3074,229 @@ impl VirtioNetworkDevice {
 
     pub const fn has_pending_rate_limited_queue_work(&self) -> bool {
         self.pending_rate_limited_rx_queue || self.pending_rate_limited_tx_queue
+    }
+
+    fn capture_state_at(
+        &self,
+        input: VirtioNetworkDeviceCaptureInput<'_>,
+    ) -> Result<
+        (
+            VirtioNetworkDeviceCaptureState,
+            VirtioNetworkCaptureValidation,
+        ),
+        VirtioNetworkDeviceCaptureError,
+    > {
+        let VirtioNetworkDeviceCaptureInput {
+            config,
+            profile,
+            config_space,
+            device_registers,
+            queue_registers,
+            transport_activated,
+            memory,
+            provider_cached_rx_len,
+            now,
+        } = input;
+        if device_registers.device_id() != VIRTIO_NET_DEVICE_ID {
+            return Err(VirtioNetworkDeviceCaptureError::DeviceIdMismatch);
+        }
+        if config
+            .guest_mac()
+            .is_some_and(|requested| profile.guest_mac() != Some(requested))
+            || config
+                .mtu()
+                .is_some_and(|requested| profile.mtu() != Some(requested))
+            || !profile.feature_capabilities().is_dependency_complete()
+        {
+            return Err(VirtioNetworkDeviceCaptureError::RequestedProfileMismatch);
+        }
+        if config_space.guest_mac != profile.guest_mac()
+            || config_space.mtu != profile.mtu()
+            || config_space.network_features != profile.feature_capabilities().feature_bits()
+        {
+            return Err(VirtioNetworkDeviceCaptureError::ConfigSpaceMismatch);
+        }
+        let available_features = config_space.available_features();
+        if device_registers.device_features() != available_features {
+            return Err(VirtioNetworkDeviceCaptureError::AvailableFeaturesMismatch);
+        }
+        let negotiated_features = device_registers.driver_features();
+        if negotiated_features & !available_features != 0 {
+            return Err(VirtioNetworkDeviceCaptureError::NegotiatedFeaturesUnsupported);
+        }
+        let queues_active = match (&self.active_rx_queue, &self.active_tx_queue) {
+            (Some(_), Some(_)) => true,
+            (None, None) => false,
+            _ => return Err(VirtioNetworkDeviceCaptureError::ActivationMismatch),
+        };
+        if queues_active != transport_activated {
+            return Err(VirtioNetworkDeviceCaptureError::ActivationMismatch);
+        }
+        if transport_activated
+            && !virtio_feature_enabled(negotiated_features, VIRTIO_FEATURE_VERSION_1)
+        {
+            return Err(VirtioNetworkDeviceCaptureError::RequiredFeatureNotAcknowledged);
+        }
+        if queue_registers.queue_count() != VIRTIO_NET_QUEUE_COUNT {
+            return Err(VirtioNetworkDeviceCaptureError::QueueCountMismatch);
+        }
+        let rx_transport = queue_registers
+            .queue(VIRTIO_NET_RX_QUEUE_INDEX_U32)
+            .map_err(|_| VirtioNetworkDeviceCaptureError::QueueCountMismatch)?;
+        let tx_transport = queue_registers
+            .queue(VIRTIO_NET_TX_QUEUE_INDEX_U32)
+            .map_err(|_| VirtioNetworkDeviceCaptureError::QueueCountMismatch)?;
+        if rx_transport.max_size() != VIRTIO_NET_QUEUE_SIZE
+            || tx_transport.max_size() != VIRTIO_NET_QUEUE_SIZE
+        {
+            return Err(VirtioNetworkDeviceCaptureError::QueueMaxSizeMismatch);
+        }
+        let provider_cached_rx_used_len = match provider_cached_rx_len {
+            Some(0) => return Err(VirtioNetworkDeviceCaptureError::CachedRxPacketInvalid),
+            Some(packet_len) => Some(
+                rx_packet_used_len(packet_len)
+                    .map_err(|_| VirtioNetworkDeviceCaptureError::CachedRxPacketInvalid)?,
+            ),
+            None => None,
+        };
+        if self.pending_rate_limited_rx_queue && provider_cached_rx_used_len.is_none() {
+            return Err(VirtioNetworkDeviceCaptureError::PendingRxWithoutCache);
+        }
+
+        let rx_rate_limiter = capture_network_rate_limiter_state_at(
+            config.rx_rate_limiter(),
+            self.rx_rate_limiter.as_ref(),
+            now,
+        )
+        .map_err(VirtioNetworkDeviceCaptureError::RxRateLimiter)?;
+        let tx_rate_limiter = capture_network_rate_limiter_state_at(
+            config.tx_rate_limiter(),
+            self.tx_rate_limiter.as_ref(),
+            now,
+        )
+        .map_err(VirtioNetworkDeviceCaptureError::TxRateLimiter)?;
+        if self.pending_rate_limited_rx_queue && !rx_rate_limiter.is_configured() {
+            return Err(VirtioNetworkDeviceCaptureError::PendingRxWithoutRateLimiter);
+        }
+        if self.pending_rate_limited_tx_queue && !tx_rate_limiter.is_configured() {
+            return Err(VirtioNetworkDeviceCaptureError::PendingTxWithoutRateLimiter);
+        }
+
+        let active_rx_queue = match self.active_rx_queue.as_ref() {
+            Some(queue) => {
+                if queue.negotiated_features != negotiated_features {
+                    return Err(VirtioNetworkDeviceCaptureError::RxQueue(
+                        VirtioNetworkQueueCaptureError::FeatureMismatch,
+                    ));
+                }
+                Some(
+                    capture_network_queue_state(
+                        rx_transport,
+                        &queue.available,
+                        &queue.used,
+                        queue.event_idx_enabled,
+                        queue.negotiated_features,
+                        memory,
+                        self.pending_rate_limited_rx_queue,
+                    )
+                    .map_err(VirtioNetworkDeviceCaptureError::RxQueue)?,
+                )
+            }
+            None => None,
+        };
+        let active_tx_queue = match self.active_tx_queue.as_ref() {
+            Some(queue) => {
+                if queue.negotiated_features != negotiated_features {
+                    return Err(VirtioNetworkDeviceCaptureError::TxQueue(
+                        VirtioNetworkQueueCaptureError::FeatureMismatch,
+                    ));
+                }
+                Some(
+                    capture_network_queue_state(
+                        tx_transport,
+                        &queue.available,
+                        &queue.used,
+                        queue.event_idx_enabled,
+                        queue.negotiated_features,
+                        memory,
+                        self.pending_rate_limited_tx_queue,
+                    )
+                    .map_err(VirtioNetworkDeviceCaptureError::TxQueue)?,
+                )
+            }
+            None => None,
+        };
+        if let (Some(rx), Some(tx)) = (&self.active_rx_queue, &self.active_tx_queue) {
+            validate_network_queue_pair_ranges(rx, tx)
+                .map_err(|_| VirtioNetworkDeviceCaptureError::QueueRangesOverlap)?;
+        }
+
+        let source_rx_retry = if self.pending_rate_limited_rx_queue {
+            let bytes_written_to_guest = provider_cached_rx_used_len
+                .ok_or(VirtioNetworkDeviceCaptureError::PendingRxWithoutCache)?;
+            let mut limiter = self
+                .rx_rate_limiter
+                .clone()
+                .ok_or(VirtioNetworkDeviceCaptureError::PendingRxWithoutRateLimiter)?;
+            match limiter.reduce_at(u64::from(bytes_written_to_guest), now) {
+                VirtioNetworkRateLimiterReduction::Allowed(_) => {
+                    Some(VirtioNetworkRetryCaptureState::Immediate)
+                }
+                VirtioNetworkRateLimiterReduction::Throttled { retry_after } => {
+                    Some(network_retry_capture_state(retry_after)?)
+                }
+            }
+        } else {
+            None
+        };
+
+        let tx_retry = if self.pending_rate_limited_tx_queue {
+            let queue = self
+                .active_tx_queue
+                .as_ref()
+                .ok_or(VirtioNetworkDeviceCaptureError::ActivationMismatch)?;
+            let mut available = queue.available.clone();
+            let chain = available
+                .pop_descriptor_chain(memory)
+                .map_err(|_| VirtioNetworkDeviceCaptureError::PendingTxFrameInvalid)?
+                .ok_or(VirtioNetworkDeviceCaptureError::PendingTxFrameInvalid)?;
+            let frame = VirtioNetworkTxFrame::parse_with_features(
+                memory,
+                &chain,
+                queue.negotiated_features,
+            )
+            .map_err(|_| VirtioNetworkDeviceCaptureError::PendingTxFrameInvalid)?;
+            let mut limiter = self
+                .tx_rate_limiter
+                .clone()
+                .ok_or(VirtioNetworkDeviceCaptureError::PendingTxWithoutRateLimiter)?;
+            match limiter.reduce_at(frame.frame_len(), now) {
+                VirtioNetworkRateLimiterReduction::Allowed(_) => {
+                    VirtioNetworkRetryCaptureState::Immediate
+                }
+                VirtioNetworkRateLimiterReduction::Throttled { retry_after } => {
+                    network_retry_capture_state(retry_after)?
+                }
+            }
+        } else {
+            VirtioNetworkRetryCaptureState::None
+        };
+
+        Ok((
+            VirtioNetworkDeviceCaptureState {
+                profile,
+                available_features,
+                negotiated_features,
+                active_rx_queue,
+                active_tx_queue,
+                rx_rate_limiter,
+                tx_rate_limiter,
+                source_rx_cache_normalized: provider_cached_rx_used_len.is_some(),
+                source_rx_retry_normalized: source_rx_retry.is_some(),
+                tx_retry,
+            },
+            VirtioNetworkCaptureValidation { source_rx_retry },
+        ))
     }
 
     pub fn update_rate_limiters(&mut self, update: &NetworkInterfaceUpdate) {
@@ -4983,6 +5907,42 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
 }
 
 impl VirtioNetworkMmioHandler {
+    pub fn capture_network_state_at(
+        &self,
+        config: &NetworkInterfaceConfig,
+        profile: NetworkDeviceProfile,
+        memory: &GuestMemory,
+        provider_cached_rx_len: Option<usize>,
+        now: Instant,
+    ) -> Result<
+        (
+            VirtioNetworkMmioCaptureState,
+            VirtioNetworkCaptureValidation,
+        ),
+        VirtioNetworkDeviceCaptureError,
+    > {
+        let (device, validation) =
+            self.activation_handler()
+                .capture_state_at(VirtioNetworkDeviceCaptureInput {
+                    config,
+                    profile,
+                    config_space: self.device_config_handler(),
+                    device_registers: self.device_registers(),
+                    queue_registers: self.queue_registers(),
+                    transport_activated: self.is_device_activated(),
+                    memory,
+                    provider_cached_rx_len,
+                    now,
+                })?;
+        Ok((
+            VirtioNetworkMmioCaptureState {
+                device,
+                transport: self.transport_state(),
+            },
+            validation,
+        ))
+    }
+
     pub fn attach_network_metrics(&mut self, metrics: SharedNetworkInterfaceMetrics) {
         self.device_config_handler_mut()
             .attach_metrics(metrics.clone());
@@ -5028,6 +5988,39 @@ pub fn network_mmio_driver_features(
 }
 
 impl VirtioPciEndpoint<VirtioNetworkConfigSpace, VirtioNetworkDevice> {
+    pub fn capture_network_state_at(
+        &self,
+        config: &NetworkInterfaceConfig,
+        profile: NetworkDeviceProfile,
+        memory: &GuestMemory,
+        provider_cached_rx_len: Option<usize>,
+        now: Instant,
+    ) -> Result<
+        (VirtioNetworkPciCaptureState, VirtioNetworkCaptureValidation),
+        VirtioNetworkPciCaptureError,
+    > {
+        let (device, transport) = self
+            .capture_transport_with(|registers, queues, config_space, device, activated| {
+                device.capture_state_at(VirtioNetworkDeviceCaptureInput {
+                    config,
+                    profile,
+                    config_space,
+                    device_registers: registers,
+                    queue_registers: queues,
+                    transport_activated: activated,
+                    memory,
+                    provider_cached_rx_len,
+                    now,
+                })
+            })
+            .map_err(VirtioNetworkPciCaptureError::Endpoint)?;
+        let (device, validation) = device.map_err(VirtioNetworkPciCaptureError::Device)?;
+        Ok((
+            VirtioNetworkPciCaptureState { device, transport },
+            validation,
+        ))
+    }
+
     pub fn update_network_rate_limiters(
         &self,
         update: &NetworkInterfaceUpdate,
@@ -6953,13 +7946,14 @@ mod tests {
         VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
         VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
         VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkBackendMetrics, VirtioNetworkConfigSpace,
-        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
+        VirtioNetworkDevice, VirtioNetworkDeviceActivationError, VirtioNetworkDeviceCaptureError,
         VirtioNetworkDeviceNotificationError, VirtioNetworkFeatureCapabilities,
         VirtioNetworkLatencyAggregate, VirtioNetworkMmioHandler, VirtioNetworkPacketEnvelope,
-        VirtioNetworkRateLimiter, VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError,
-        VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
-        VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
-        VirtioNetworkTxPacketCommit, VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
+        VirtioNetworkRateLimiter, VirtioNetworkRetryCaptureState, VirtioNetworkRxBuffer,
+        VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
+        VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
+        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketCommit,
+        VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
         VirtioNetworkTxPacketSinkError, VirtioNetworkTxPacketStage, VirtioNetworkTxQueue,
         VirtioNetworkTxQueueDispatchError,
     };
@@ -7323,6 +8317,41 @@ mod tests {
 
     fn configure_network_handler_queues(handler: &mut VirtioNetworkMmioHandler) {
         put_network_handler_in_queue_config_state(handler);
+        configure_network_handler_queue(
+            handler,
+            VIRTIO_NET_RX_QUEUE_INDEX
+                .try_into()
+                .expect("RX queue index should fit"),
+            TEST_QUEUE_SIZE,
+        );
+        configure_network_handler_queue(
+            handler,
+            VIRTIO_NET_TX_QUEUE_INDEX
+                .try_into()
+                .expect("TX queue index should fit"),
+            TEST_QUEUE_SIZE,
+        );
+    }
+
+    fn configure_network_handler_queues_for_capture(handler: &mut VirtioNetworkMmioHandler) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("capture handler should accept ACKNOWLEDGE");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("capture handler should accept DRIVER");
+        handler
+            .write_register(VirtioMmioRegister::DriverFeaturesSel, 1)
+            .expect("VERSION_1 feature selector should write");
+        handler
+            .write_register(VirtioMmioRegister::DriverFeatures, 1)
+            .expect("VERSION_1 feature should negotiate");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("capture handler should accept FEATURES_OK");
         configure_network_handler_queue(
             handler,
             VIRTIO_NET_RX_QUEUE_INDEX
@@ -11350,6 +12379,71 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_capture_is_stable_owned_and_rejects_profile_drift() {
+        let handler = network_activation_handler();
+        let memory = tx_frame_memory();
+        let config = input()
+            .with_guest_mac(test_guest_mac().to_string())
+            .validate()
+            .expect("capture network config should validate");
+        let profile = NetworkDeviceProfile::from_config(&config);
+        let now = Instant::now();
+
+        let (first, first_validation) = handler
+            .capture_network_state_at(&config, profile, &memory, None, now)
+            .expect("inactive MMIO network should be capture-ready");
+        let (second, second_validation) = handler
+            .capture_network_state_at(&config, profile, &memory, None, now)
+            .expect("repeated capture should remain stable");
+
+        assert_eq!(first, second);
+        assert_eq!(first_validation, second_validation);
+        assert_eq!(first_validation.source_rx_retry(), None);
+        assert_eq!(first.device().profile(), profile);
+        assert!(first.device().active_rx_queue().is_none());
+        assert!(first.device().active_tx_queue().is_none());
+        assert!(!first.device().rx_rate_limiter().is_configured());
+        assert!(!first.device().tx_rate_limiter().is_configured());
+        assert!(!first.device().source_rx_cache_normalized());
+        assert!(!first.device().source_rx_retry_normalized());
+        assert_eq!(
+            first.device().tx_retry(),
+            VirtioNetworkRetryCaptureState::None
+        );
+        assert!(!first.transport().is_device_activated());
+        let debug = format!("{first:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&test_guest_mac().to_string()));
+        assert!(!debug.contains(config.host_dev_name()));
+
+        assert!(matches!(
+            handler.capture_network_state_at(
+                &config,
+                NetworkDeviceProfile::new(None, None),
+                &memory,
+                None,
+                now,
+            ),
+            Err(VirtioNetworkDeviceCaptureError::RequestedProfileMismatch)
+        ));
+
+        let (with_cached_rx, cached_validation) = handler
+            .capture_network_state_at(&config, profile, &memory, Some(4), now)
+            .expect("bounded cached RX should normalize without retaining bytes");
+        assert!(with_cached_rx.device().source_rx_cache_normalized());
+        assert!(!with_cached_rx.device().source_rx_retry_normalized());
+        assert_eq!(cached_validation.source_rx_retry(), None);
+        assert_ne!(first, with_cached_rx);
+        for invalid_len in [0, usize::MAX] {
+            assert!(matches!(
+                handler
+                    .capture_network_state_at(&config, profile, &memory, Some(invalid_len), now,),
+                Err(VirtioNetworkDeviceCaptureError::CachedRxPacketInvalid)
+            ));
+        }
+    }
+
+    #[test]
     fn virtio_network_notifications_without_pending_work_are_noop() {
         let mut memory = tx_frame_memory();
         let mut device = VirtioNetworkDevice::new();
@@ -12622,7 +13716,7 @@ mod tests {
             vec![0x20, 0x21, 0x22, 0x23],
         ]);
 
-        configure_network_handler_queues(&mut handler);
+        configure_network_handler_queues_for_capture(&mut handler);
         activate_network_handler(&mut handler);
         write_rx_descriptors(
             &mut memory,
@@ -12680,6 +13774,60 @@ mod tests {
             [0xa5; 16]
         );
         assert!(handler.has_pending_network_queue_work());
+
+        let config = input()
+            .with_guest_mac(test_guest_mac().to_string())
+            .with_rx_rate_limiter(rate_limiter)
+            .validate()
+            .expect("RX capture config should validate");
+        let profile = NetworkDeviceProfile::from_config(&config);
+        let (captured, validation) = handler
+            .capture_network_state_at(&config, profile, &memory, Some(4), now)
+            .expect("cached rate-limited RX should be capture-ready");
+        let (captured_again, validation_again) = handler
+            .capture_network_state_at(&config, profile, &memory, Some(4), now)
+            .expect("cached RX capture should be stable at one instant");
+        assert_eq!(captured, captured_again);
+        assert_eq!(validation, validation_again);
+        assert_eq!(
+            validation.source_rx_retry(),
+            Some(VirtioNetworkRetryCaptureState::After {
+                remaining_nanos: 100_000_000,
+            })
+        );
+        assert_eq!(
+            captured
+                .device()
+                .active_rx_queue()
+                .map(|queue| (queue.next_available(), queue.next_used())),
+            Some((1, 1))
+        );
+        assert!(captured.device().source_rx_retry_normalized());
+        assert_eq!(
+            captured.device().tx_retry(),
+            VirtioNetworkRetryCaptureState::None
+        );
+        let (_, due_validation) = handler
+            .capture_network_state_at(
+                &config,
+                profile,
+                &memory,
+                Some(4),
+                now + Duration::from_millis(100),
+            )
+            .expect("due cached RX work should capture as immediate");
+        assert_eq!(
+            due_validation.source_rx_retry(),
+            Some(VirtioNetworkRetryCaptureState::Immediate)
+        );
+        assert!(matches!(
+            handler.capture_network_state_at(&config, profile, &memory, None, now),
+            Err(VirtioNetworkDeviceCaptureError::PendingRxWithoutCache)
+        ));
+        assert!(matches!(
+            handler.capture_network_state_at(&config, profile, &memory, Some(0), now),
+            Err(VirtioNetworkDeviceCaptureError::CachedRxPacketInvalid)
+        ));
 
         let limiter_after_first = handler
             .activation_handler()
@@ -12782,7 +13930,7 @@ mod tests {
         let mut sink = RecordingTxPacketSink::default();
         let mut source = RecordingRxPacketSource::default();
 
-        configure_network_handler_queues(&mut handler);
+        configure_network_handler_queues_for_capture(&mut handler);
         activate_network_handler(&mut handler);
         write_two_tx_frames(&mut memory);
 
@@ -12817,6 +13965,49 @@ mod tests {
         assert_eq!(read_tx_used_index(&memory), 1);
         assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
         assert!(handler.has_pending_network_queue_work());
+
+        let config = input()
+            .with_guest_mac(test_guest_mac().to_string())
+            .with_tx_rate_limiter(rate_limiter)
+            .validate()
+            .expect("TX capture config should validate");
+        let profile = NetworkDeviceProfile::from_config(&config);
+        let (captured, validation) = handler
+            .capture_network_state_at(&config, profile, &memory, None, now)
+            .expect("rate-limited TX should be capture-ready");
+        let (captured_again, validation_again) = handler
+            .capture_network_state_at(&config, profile, &memory, None, now)
+            .expect("pending TX capture should be stable at one instant");
+        assert_eq!(captured, captured_again);
+        assert_eq!(validation, validation_again);
+        assert_eq!(validation.source_rx_retry(), None);
+        assert_eq!(
+            captured
+                .device()
+                .active_tx_queue()
+                .map(|queue| (queue.next_available(), queue.next_used())),
+            Some((1, 1))
+        );
+        assert_eq!(
+            captured.device().tx_retry(),
+            VirtioNetworkRetryCaptureState::After {
+                remaining_nanos: 100_000_000,
+            }
+        );
+        assert!(!captured.device().source_rx_retry_normalized());
+        let (due, _) = handler
+            .capture_network_state_at(
+                &config,
+                profile,
+                &memory,
+                None,
+                now + Duration::from_millis(100),
+            )
+            .expect("due TX work should capture as immediate");
+        assert_eq!(
+            due.device().tx_retry(),
+            VirtioNetworkRetryCaptureState::Immediate
+        );
 
         let limiter_after_first = handler
             .activation_handler()

@@ -41,6 +41,9 @@ const VMNET_READINESS_MAX_EPOCH: u64 = u64::MAX >> 1;
 struct VmnetPacketReadinessState {
     generation: u64,
     active: AtomicBool,
+    quiesced: AtomicBool,
+    publication_in_flight: AtomicUsize,
+    deferred_publication: AtomicBool,
     event: AtomicU64,
     scheduled: AtomicBool,
     estimated_packets: AtomicUsize,
@@ -53,6 +56,15 @@ impl fmt::Debug for VmnetPacketReadinessState {
             .debug_struct("VmnetPacketReadinessState")
             .field("generation", &self.generation)
             .field("active", &self.active.load(Ordering::Acquire))
+            .field("quiesced", &self.quiesced.load(Ordering::Acquire))
+            .field(
+                "publication_in_flight",
+                &self.publication_in_flight.load(Ordering::Acquire),
+            )
+            .field(
+                "deferred_publication",
+                &self.deferred_publication.load(Ordering::Acquire),
+            )
             .field("ready", &self.is_ready())
             .field("scheduled", &self.scheduled.load(Ordering::Acquire))
             .finish()
@@ -90,6 +102,31 @@ impl VmnetPacketReadinessState {
                 .clamp(1, VMNET_MAX_PACKETS_PER_OPERATION),
             Ordering::Release,
         );
+        self.try_publish_event();
+    }
+
+    fn try_publish_event(&self) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        if self.quiesced.load(Ordering::Acquire) {
+            self.publication_in_flight.fetch_add(1, Ordering::AcqRel);
+            if self.active.load(Ordering::Acquire) {
+                self.defer_publication();
+            }
+            self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        self.publication_in_flight.fetch_add(1, Ordering::AcqRel);
+        if !self.active.load(Ordering::Acquire) {
+            self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        if self.quiesced.load(Ordering::Acquire) {
+            self.defer_publication();
+            self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
         let previous = self
             .event
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |event| {
@@ -100,6 +137,23 @@ impl VmnetPacketReadinessState {
             .unwrap_or_else(|event| event);
         if previous & VMNET_READINESS_READY_BIT == 0 {
             self.schedule_if_ready();
+        }
+        self.publication_in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn defer_publication(&self) {
+        self.deferred_publication.store(true, Ordering::Release);
+        // A guard may have dropped after the callback's first quiesced read but
+        // before it marked the edge deferred. Recheck and self-flush that race.
+        self.flush_deferred_if_running();
+    }
+
+    fn flush_deferred_if_running(&self) {
+        if !self.active.load(Ordering::Acquire) || self.quiesced.load(Ordering::Acquire) {
+            return;
+        }
+        if self.deferred_publication.swap(false, Ordering::AcqRel) {
+            self.try_publish_event();
         }
     }
 
@@ -130,6 +184,10 @@ impl VmnetPacketReadinessState {
 
     fn retire(&self) {
         self.active.store(false, Ordering::Release);
+        while self.publication_in_flight.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
+        self.deferred_publication.store(false, Ordering::Release);
         self.scheduled.store(false, Ordering::Release);
         self.event
             .fetch_and(!VMNET_READINESS_READY_BIT, Ordering::AcqRel);
@@ -158,6 +216,9 @@ impl VmnetPacketReadinessLease {
         let state = Arc::new(VmnetPacketReadinessState {
             generation,
             active: AtomicBool::new(true),
+            quiesced: AtomicBool::new(false),
+            publication_in_flight: AtomicUsize::new(0),
+            deferred_publication: AtomicBool::new(false),
             event: AtomicU64::new(0),
             scheduled: AtomicBool::new(false),
             estimated_packets: AtomicUsize::new(1),
@@ -182,6 +243,73 @@ impl VmnetPacketReadinessLease {
 
     pub(crate) fn take_scheduled(&self) -> bool {
         self.state.take_scheduled()
+    }
+
+    pub(crate) fn quiesce_publication(
+        &self,
+    ) -> Result<VmnetPacketReadinessQuiescenceGuard, VmnetPacketReadinessQuiescenceError> {
+        if !self.state.active.load(Ordering::Acquire) {
+            return Err(VmnetPacketReadinessQuiescenceError::Inactive);
+        }
+        self.state
+            .quiesced
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| VmnetPacketReadinessQuiescenceError::AlreadyQuiesced)?;
+        while self.state.publication_in_flight.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
+        if !self.state.active.load(Ordering::Acquire) {
+            self.state.quiesced.store(false, Ordering::Release);
+            return Err(VmnetPacketReadinessQuiescenceError::Inactive);
+        }
+        Ok(VmnetPacketReadinessQuiescenceGuard {
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VmnetPacketReadinessQuiescenceError {
+    Inactive,
+    AlreadyQuiesced,
+}
+
+impl fmt::Display for VmnetPacketReadinessQuiescenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Inactive => "vmnet readiness publication owner is inactive",
+            Self::AlreadyQuiesced => "vmnet readiness publication is already quiesced",
+        })
+    }
+}
+
+impl std::error::Error for VmnetPacketReadinessQuiescenceError {}
+
+#[must_use = "dropping the guard resumes vmnet readiness publication"]
+pub(crate) struct VmnetPacketReadinessQuiescenceGuard {
+    state: Arc<VmnetPacketReadinessState>,
+}
+
+impl VmnetPacketReadinessQuiescenceGuard {
+    pub(crate) fn generation(&self) -> u64 {
+        self.state.generation
+    }
+}
+
+impl fmt::Debug for VmnetPacketReadinessQuiescenceGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VmnetPacketReadinessQuiescenceGuard")
+            .field("generation", &self.state.generation)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for VmnetPacketReadinessQuiescenceGuard {
+    fn drop(&mut self) {
+        self.state.quiesced.store(false, Ordering::Release);
+        self.state.flush_deferred_if_running();
     }
 }
 
@@ -623,6 +751,42 @@ where
 
     pub(crate) fn mmds_retry_after(&self) -> Option<Duration> {
         self.rx_source.mmds_retry_after()
+    }
+
+    pub(crate) fn mmds_retry_after_at(&self, now: Instant) -> Option<Duration> {
+        self.rx_source.mmds_retry_after_at(now)
+    }
+
+    pub(crate) fn capture_mmds_ready_at(&self, now: Instant) -> bool {
+        self.rx_source
+            .mmds_stack
+            .as_ref()
+            .is_some_and(|stack| stack.has_ready_frame_at_instant(now))
+    }
+
+    pub(crate) fn capture_cached_rx_len(&self) -> Option<usize> {
+        self.rx_source.cached_packet().map(|packet| packet.len())
+    }
+
+    pub(crate) fn capture_tx_transaction_active(&self) -> bool {
+        self.tx_sink.staged_frame.is_some()
+            || self.tx_sink.committed_packet_count != 0
+            || self.tx_sink.committed_emitted_len != 0
+            || !self.tx_sink.committed_ranges.is_empty()
+            || !self.tx_sink.committed_frames.is_empty()
+    }
+
+    pub(crate) fn capture_mmds_stack(&self) -> Option<MmdsNetworkStackHandle> {
+        self.rx_source.mmds_stack.clone()
+    }
+
+    pub(crate) fn quiesce_readiness_publication(
+        &self,
+    ) -> Result<VmnetPacketReadinessQuiescenceGuard, VmnetPacketReadinessQuiescenceError> {
+        self.readiness_lease
+            .as_ref()
+            .ok_or(VmnetPacketReadinessQuiescenceError::Inactive)?
+            .quiesce_publication()
     }
 }
 
@@ -1482,6 +1646,15 @@ where
             .as_ref()
             .and_then(MmdsNetworkStackHandle::retry_after)
     }
+
+    fn mmds_retry_after_at(&self, now: Instant) -> Option<Duration> {
+        if self.cached_packet_source == Some(CachedRxPacketSource::MmdsResponse) {
+            return None;
+        }
+        self.mmds_stack
+            .as_ref()
+            .and_then(|stack| stack.retry_after_at_instant(now))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1784,6 +1957,7 @@ mod tests {
     use std::ptr;
     use std::sync::Arc;
     use std::sync::mpsc::{TryRecvError, sync_channel};
+    use std::thread;
 
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
@@ -2434,6 +2608,106 @@ mod tests {
         disconnected_state.publish(Some(1));
         assert!(disconnected_state.is_ready());
         assert!(disconnected_lease.take_scheduled());
+    }
+
+    #[test]
+    fn packet_readiness_quiescence_defers_and_flushes_one_coalesced_edge() {
+        let (signal, receiver) = sync_channel(2);
+        let (lease, callback) = super::VmnetPacketReadinessLease::new(30, signal);
+        let state = Arc::clone(&lease.state);
+        let guard = lease
+            .quiesce_publication()
+            .expect("active readiness publication should quiesce");
+        assert_eq!(guard.generation(), 30);
+        assert!(matches!(
+            lease.quiesce_publication(),
+            Err(super::VmnetPacketReadinessQuiescenceError::AlreadyQuiesced)
+        ));
+
+        callback.publish_for_test(Some(7));
+        callback.publish_for_test(Some(3));
+        assert_eq!(state.snapshot(), 0);
+        assert!(!lease.take_scheduled());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(
+            state
+                .deferred_publication
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
+        drop(guard);
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(lease.take_scheduled());
+        assert!(state.is_ready());
+        assert_eq!(state.snapshot() >> 1, 1);
+        assert_eq!(
+            state
+                .estimated_packets
+                .load(std::sync::atomic::Ordering::Acquire),
+            3
+        );
+        assert!(!format!("{state:?}").contains("private"));
+    }
+
+    #[test]
+    fn packet_readiness_callback_racing_quiescence_never_loses_an_edge() {
+        for generation in 100..228 {
+            let (signal, receiver) = sync_channel(2);
+            let (lease, callback) = super::VmnetPacketReadinessLease::new(generation, signal);
+            let publisher = thread::spawn(move || callback.publish_for_test(Some(1)));
+            let guard = lease
+                .quiesce_publication()
+                .expect("racing callback should either finish or defer");
+            publisher
+                .join()
+                .expect("racing callback thread should finish");
+
+            let during_capture = lease.state.snapshot();
+            assert!(during_capture == 0 || during_capture & 1 == 1);
+            drop(guard);
+
+            assert!(lease.state.is_ready());
+            assert!(lease.take_scheduled());
+            assert_eq!(receiver.try_recv(), Ok(()));
+            assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        }
+    }
+
+    #[test]
+    fn retired_packet_readiness_cancels_deferred_publication() {
+        let (signal, receiver) = sync_channel(1);
+        let (lease, callback) = super::VmnetPacketReadinessLease::new(31, signal);
+        let guard = lease
+            .quiesce_publication()
+            .expect("active readiness owner should quiesce");
+        callback.publish_for_test(Some(1));
+        lease.retire();
+        drop(guard);
+
+        assert!(!lease.state.is_ready());
+        assert!(!lease.take_scheduled());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(matches!(
+            lease.quiesce_publication(),
+            Err(super::VmnetPacketReadinessQuiescenceError::Inactive)
+        ));
+    }
+
+    #[test]
+    fn retirement_racing_packet_readiness_publication_leaves_no_edge() {
+        for generation in 300..428 {
+            let (signal, _receiver) = sync_channel(2);
+            let (lease, callback) = super::VmnetPacketReadinessLease::new(generation, signal);
+            let publisher = thread::spawn(move || callback.publish_for_test(Some(1)));
+            lease.retire();
+            publisher
+                .join()
+                .expect("racing readiness callback should finish");
+
+            assert!(!lease.state.is_ready());
+            assert!(!lease.take_scheduled());
+        }
     }
 
     #[test]

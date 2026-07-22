@@ -101,6 +101,60 @@ impl fmt::Debug for MmdsNetworkStackHandle {
     }
 }
 
+/// Detached reconstructible identity for one fresh MMDS network stack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MmdsNetworkStackCaptureDescriptor {
+    local_mac_address: EthernetMacAddress,
+    ipv4_address: Ipv4Addr,
+    tcp_port: u16,
+}
+
+impl MmdsNetworkStackCaptureDescriptor {
+    pub const fn local_mac_address(self) -> EthernetMacAddress {
+        self.local_mac_address
+    }
+
+    pub const fn ipv4_address(self) -> Ipv4Addr {
+        self.ipv4_address
+    }
+
+    pub const fn tcp_port(self) -> u16 {
+        self.tcp_port
+    }
+}
+
+impl fmt::Debug for MmdsNetworkStackCaptureDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmdsNetworkStackCaptureDescriptor")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmdsNetworkStackCaptureError {
+    Poisoned,
+    StateMismatch,
+    MetricsMismatch,
+    AddressMismatch,
+    PortMismatch,
+}
+
+impl fmt::Display for MmdsNetworkStackCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Poisoned => "MMDS network stack capture lock is poisoned",
+            Self::StateMismatch => "MMDS network stack uses a different metadata state",
+            Self::MetricsMismatch => "MMDS network stack uses different metrics ownership",
+            Self::AddressMismatch => "MMDS network stack address is inconsistent",
+            Self::PortMismatch => "MMDS network stack TCP port is inconsistent",
+        })
+    }
+}
+
+impl std::error::Error for MmdsNetworkStackCaptureError {}
+
 impl MmdsNetworkStackHandle {
     /// Builds one production session with an OS-seeded initial sequence stream.
     pub fn try_new(
@@ -276,9 +330,21 @@ impl MmdsNetworkStackHandle {
         }
     }
 
+    /// Readiness at one shared monotonic instant.
+    #[doc(hidden)]
+    pub fn has_ready_frame_at_instant(&self, now: Instant) -> bool {
+        self.has_ready_frame_at(self.ticks_at(now))
+    }
+
     /// Future protocol retry duration, excluding immediate or retained output.
     pub fn retry_after(&self) -> Option<Duration> {
         self.retry_after_at(self.now_ticks())
+    }
+
+    /// Future protocol retry duration at one shared monotonic instant.
+    #[doc(hidden)]
+    pub fn retry_after_at_instant(&self, now: Instant) -> Option<Duration> {
+        self.retry_after_at(self.ticks_at(now))
     }
 
     /// Future protocol retry duration at an injected tick.
@@ -286,6 +352,37 @@ impl MmdsNetworkStackHandle {
     pub fn retry_after_at(&self, now: u64) -> Option<Duration> {
         let state = self.state.try_lock().ok()?;
         state.retry_after_at(now)
+    }
+
+    /// Captures only the identity needed to construct a fresh, lossy MMDS
+    /// session. Peer, ARP, TCP, output, clock, and sequence state stay live in
+    /// the source and are not returned.
+    pub fn capture_descriptor(
+        &self,
+        expected_state: &MmdsStateHandle,
+        expected_metrics: &SharedMmdsMetrics,
+    ) -> Result<MmdsNetworkStackCaptureDescriptor, MmdsNetworkStackCaptureError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MmdsNetworkStackCaptureError::Poisoned)?;
+        if !state.mmds_state.shares_state_with(expected_state) {
+            return Err(MmdsNetworkStackCaptureError::StateMismatch);
+        }
+        if !state.metrics.shares_state_with(expected_metrics) {
+            return Err(MmdsNetworkStackCaptureError::MetricsMismatch);
+        }
+        if state.mmds_ipv4_address != self.mmds_ipv4_address {
+            return Err(MmdsNetworkStackCaptureError::AddressMismatch);
+        }
+        if state.tcp_handler.local_port() != MMDS_GUEST_TCP_PORT {
+            return Err(MmdsNetworkStackCaptureError::PortMismatch);
+        }
+        Ok(MmdsNetworkStackCaptureDescriptor {
+            local_mac_address: DEFAULT_MMDS_MAC_ADDRESS,
+            ipv4_address: state.mmds_ipv4_address,
+            tcp_port: state.tcp_handler.local_port(),
+        })
     }
 
     #[doc(hidden)]
@@ -342,7 +439,12 @@ impl MmdsNetworkStackHandle {
     }
 
     fn now_ticks(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        self.ticks_at(Instant::now())
+    }
+
+    fn ticks_at(&self, now: Instant) -> u64 {
+        let elapsed = now.checked_duration_since(self.epoch).unwrap_or_default();
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
     }
 }
 
@@ -1004,7 +1106,7 @@ impl std::error::Error for MmdsNetworkStackError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mmds::MmdsContentInput;
+    use crate::mmds::{DEFAULT_MMDS_IPV4_ADDRESS, MmdsContentInput};
     use crate::mmds_tcp::MMDS_TCP_RETRANSMISSION_PERIOD_TICKS;
 
     const REMOTE_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
@@ -1135,6 +1237,61 @@ mod tests {
             .expect("MMDS output should be ready");
         frame.truncate(len);
         frame
+    }
+
+    #[test]
+    fn capture_descriptor_excludes_live_tcp_output_timers_and_validates_owners() {
+        let mmds_state = MmdsStateHandle::default();
+        let metrics = SharedMmdsMetrics::default();
+        let stack = stack_with_state(mmds_state.clone(), metrics.clone(), 0x1234_5678);
+        let initial = stack
+            .capture_descriptor(&mmds_state, &metrics)
+            .expect("fresh MMDS stack identity should capture");
+
+        stack
+            .detour_frame_at(&tcp_frame(100, 0, SYN, b""), 10)
+            .expect("SYN should create live protocol state");
+        assert_eq!(
+            stack
+                .connection_count()
+                .expect("connection count should remain readable"),
+            1
+        );
+        let response = next_frame(&stack, 10);
+        assert_eq!(
+            stack
+                .retained_frame_len()
+                .expect("retained response should remain readable"),
+            Some(response.len())
+        );
+        let with_retained_output = stack
+            .capture_descriptor(&mmds_state, &metrics)
+            .expect("active TCP and retained output should be normalized out");
+        assert_eq!(initial, with_retained_output);
+
+        stack
+            .consume_frame(response.len())
+            .expect("SYN-ACK should consume");
+        assert!(stack.retry_after_at(10).is_some());
+        let with_protocol_timer = stack
+            .capture_descriptor(&mmds_state, &metrics)
+            .expect("active protocol timer should be normalized out");
+        assert_eq!(initial, with_protocol_timer);
+        assert_eq!(initial.local_mac_address(), DEFAULT_MMDS_MAC_ADDRESS);
+        assert_eq!(initial.ipv4_address(), DEFAULT_MMDS_IPV4_ADDRESS);
+        assert_eq!(initial.tcp_port(), MMDS_GUEST_TCP_PORT);
+        let debug = format!("{initial:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&DEFAULT_MMDS_IPV4_ADDRESS.to_string()));
+
+        assert_eq!(
+            stack.capture_descriptor(&MmdsStateHandle::default(), &metrics),
+            Err(MmdsNetworkStackCaptureError::StateMismatch)
+        );
+        assert_eq!(
+            stack.capture_descriptor(&mmds_state, &SharedMmdsMetrics::default()),
+            Err(MmdsNetworkStackCaptureError::MetricsMismatch)
+        );
     }
 
     #[test]

@@ -65,11 +65,13 @@ use crate::mmio::{
     MmioRegionId, MmioRegistrationError, MmioRegistrationLease, MmioRegistrationOwner,
 };
 use crate::network::{
-    NetworkDeviceProfile, NetworkInterfaceUpdate, NetworkInterfaceUpdateError,
-    NetworkMmioDeviceRegistration, NetworkMmioLayout, NetworkMmioRegistrationError,
-    PreparedNetworkDevice, PreparedNetworkDeviceError, PreparedNetworkDevices,
+    NetworkDeviceProfile, NetworkInterfaceConfig, NetworkInterfaceUpdate,
+    NetworkInterfaceUpdateError, NetworkMmioDeviceRegistration, NetworkMmioLayout,
+    NetworkMmioRegistrationError, PreparedNetworkDevice, PreparedNetworkDeviceError,
+    PreparedNetworkDevices, VirtioNetworkCaptureValidation, VirtioNetworkDeviceCaptureError,
     VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError,
-    VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource, VirtioNetworkTxPacketSink,
+    VirtioNetworkMmioCaptureState, VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource,
+    VirtioNetworkTxPacketSink,
 };
 use crate::pci::{
     Arm64PciAddressPlan, PciBarAddressSpace, PciBarAllocator, PciClassCode, PciFunctionLease,
@@ -4080,6 +4082,52 @@ impl fmt::Display for Arm64BootEntropyCaptureError {
 }
 
 impl std::error::Error for Arm64BootEntropyCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::Device(source) => Some(source),
+        }
+    }
+}
+
+pub fn capture_network_state_for_device_at(
+    device: &Arm64BootNetworkDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: &NetworkInterfaceConfig,
+    profile: NetworkDeviceProfile,
+    memory: &GuestMemory,
+    provider_cached_rx_len: Option<usize>,
+    now: Instant,
+) -> Result<
+    (
+        VirtioNetworkMmioCaptureState,
+        VirtioNetworkCaptureValidation,
+    ),
+    Arm64BootNetworkCaptureError,
+> {
+    mmio_dispatcher
+        .handler_mut::<VirtioNetworkMmioHandler>(device.registration.region_id())
+        .map_err(|source| Arm64BootNetworkCaptureError::HandlerLookup { source })?
+        .capture_network_state_at(config, profile, memory, provider_cached_rx_len, now)
+        .map_err(Arm64BootNetworkCaptureError::Device)
+}
+
+#[derive(Debug)]
+pub enum Arm64BootNetworkCaptureError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    Device(VirtioNetworkDeviceCaptureError),
+}
+
+impl fmt::Display for Arm64BootNetworkCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::HandlerLookup { .. } => "failed to locate a boot network MMIO handler",
+            Self::Device(_) => "boot network MMIO capture failed",
+        })
+    }
+}
+
+impl std::error::Error for Arm64BootNetworkCaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::HandlerLookup { source } => Some(source),

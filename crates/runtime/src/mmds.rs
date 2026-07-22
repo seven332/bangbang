@@ -851,6 +851,11 @@ impl MmdsStateHandle {
     pub fn config(&self) -> Result<Option<MmdsConfig>, MmdsStateLockError> {
         self.with(|state| state.config().cloned())
     }
+
+    #[doc(hidden)]
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

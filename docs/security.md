@@ -1175,7 +1175,13 @@ is resource-specific:
   rejects live vhost-user first; otherwise it closes and drains every Async
   generation, publishes all completions, delivers their MMIO SPI or PCI MSI-X
   interrupts, captures the detached state, and reopens every generation before
-  returning a redacted in-memory handoff. MMIO publication releases the
+  returning a redacted in-memory handoff. The later network traversal
+  generation-binds configuration, packet I/O, metrics, optional MMDS identity,
+  and deterministic MMIO/PCI owners while callback publication is quiesced.
+  It validates exact queue/feature/limiter state and one reconstructible TX
+  retry, but excludes raw handles, callbacks, cached peer RX, active TCP/ARP,
+  retained MMDS output, token secrets, borrows, and absolute clock values. MMIO
+  publication releases the
   dispatcher before GIC delivery so the normal dispatcher/GIC lock order is
   preserved. This occurs before contained output claims, staging, or
   native-state capture. Unsupported profiles then fail before artifact I/O. An
