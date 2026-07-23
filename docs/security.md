@@ -1719,8 +1719,8 @@ is resource-specific:
   identity, feature/activation state, queue cursors, and the range-checked
   host-local cursor; live sockets, connections, accepts, payloads, deadlines,
   guest-memory borrows, and the ACK gate are excluded. Full state/ring/resource
-  validation precedes consumption of the caller-supplied listener, and a
-  reconstructed destination starts with empty connection work and an armed
+  validation precedes consumption of the caller-supplied listener/connector,
+  and a reconstructed destination starts with empty connection work and an armed
   snapshot-origin gate. Quiesced owner traversal, destination authority and UDS
   override, record certification, native-v1 encoding/placement, public
   invocation, and restored-guest proof remain #1516-#1518/#1490 work; the live
@@ -2491,7 +2491,7 @@ The current scaffold does not implement:
   **implemented supported live MMIO-or-PCI startup/Unix-socket subset** still is not full
   containment: there is no global host-path broker, PATCH/DELETE/runtime
   hotplug, broader CID routing, or broader event type. The private redacted
-  MMIO/PCI capture and listener-parameterized empty-state reconstruction layer
+  MMIO/PCI capture and listener/connector-parameterized empty-state reconstruction layer
   grants no path authority and persists no live peer work. Quiesced capture,
   destination authority/override, certification, native-v1 encoding/placement,
   public invocation, and restored-guest proof remain #1516-#1518/#1490 work.

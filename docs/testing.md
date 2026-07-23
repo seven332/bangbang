@@ -1995,8 +1995,9 @@ DELETE, runtime hotplug, and broader CID routing are not supported. Focused
 capture tests now cover repeatable inactive/active MMIO values, endpoint-locked
 PCI state including masked MSI-X reset intent, all three saved queue cursors and
 `EVENT_IDX`, smaller valid queue sizes, malformed identity/feature/activation/
-ring/range/cursor/reset mutations, redaction, and listener-parameterized
-reconstruction with empty live work and an armed RX gate. Quiesced owner
+ring/range/cursor/reset mutations, redaction, and
+listener/connector-parameterized reconstruction with empty live work and an armed
+RX gate. Quiesced owner
 traversal, destination UDS authority/override, record certification, native-v1
 encoding/placement, public invocation, and the restored-guest proof remain
 #1516-#1518/#1490 work.

@@ -505,6 +505,10 @@ impl SuppliedVsockListener {
             .map_err(|error| VsockHostSocketOwnerError::SetNonblocking(error.kind()))
     }
 
+    const fn has_guest_connector(&self) -> bool {
+        self.guest_connector.is_some()
+    }
+
     fn into_parts(self) -> (UnixListener, Option<Box<dyn VsockGuestConnector>>) {
         (self.listener, self.guest_connector)
     }
@@ -514,7 +518,9 @@ impl SuppliedVsockListener {
 ///
 /// The selector binds caller intent to the supplied listener but is not proof
 /// of filesystem authority. Resource preparation and override policy remain at
-/// the owning process boundary.
+/// the owning process boundary. Snapshot reconstruction also requires the
+/// listener to carry an authority-supplied guest connector and rejects an
+/// incomplete resource before consuming it.
 pub struct VirtioVsockReconstructionResource {
     selector: VsockBackendSelector,
     listener: Option<SuppliedVsockListener>,
@@ -7734,6 +7740,7 @@ pub enum VirtioVsockReconstructionError {
     Capture(VirtioVsockDeviceCaptureError),
     ResourceSelectorMismatch,
     ResourceConsumed,
+    GuestConnectorMissing,
     HostSocket(VsockHostSocketOwnerError),
     QueueBuild {
         queue_index: usize,
@@ -7753,6 +7760,8 @@ impl fmt::Display for VirtioVsockReconstructionError {
             Self::ResourceConsumed => {
                 formatter.write_str("vsock reconstruction resource was already consumed")
             }
+            Self::GuestConnectorMissing => formatter
+                .write_str("vsock reconstruction resource has no guest connection authority"),
             Self::HostSocket(_) => {
                 formatter.write_str("failed to adopt supplied vsock reconstruction resource")
             }
@@ -7776,7 +7785,10 @@ impl std::error::Error for VirtioVsockReconstructionError {
             Self::HostSocket(source) => Some(source),
             Self::QueueBuild { source, .. } => Some(source),
             Self::HandlerBuild(source) => Some(source),
-            Self::ResourceSelectorMismatch | Self::ResourceConsumed | Self::Transport => None,
+            Self::ResourceSelectorMismatch
+            | Self::ResourceConsumed
+            | Self::GuestConnectorMissing
+            | Self::Transport => None,
         }
     }
 }
@@ -8140,6 +8152,9 @@ fn reconstruct_vsock_snapshot_device(
         .listener
         .as_ref()
         .ok_or(VirtioVsockReconstructionError::ResourceConsumed)?;
+    if !prepared_listener.has_guest_connector() {
+        return Err(VirtioVsockReconstructionError::GuestConnectorMissing);
+    }
     prepared_listener
         .prepare_for_adoption()
         .map_err(VirtioVsockReconstructionError::HostSocket)?;
@@ -11528,7 +11543,10 @@ mod tests {
             .expect("reconstruction listener should bind before handoff");
         fs::remove_file(&listener_path)
             .expect("reconstruction listener path should unlink after bind");
-        VirtioVsockReconstructionResource::new(selector, SuppliedVsockListener::new(listener))
+        let listener = SuppliedVsockListener::new(listener).with_guest_connector(
+            RecordingGuestConnector::new(Arc::new(Mutex::new(Vec::new()))),
+        );
+        VirtioVsockReconstructionResource::new(selector, listener)
     }
 
     fn reconstruction_resource_with_connector(
@@ -26240,6 +26258,28 @@ mod tests {
         );
 
         let selector = captured.device().backend_selector().clone();
+        let incomplete_listener_path = unique_socket_path("restore-no-connector");
+        let incomplete_listener = UnixListener::bind(&incomplete_listener_path)
+            .expect("incomplete reconstruction listener should bind");
+        fs::remove_file(&incomplete_listener_path)
+            .expect("incomplete reconstruction listener should unlink after bind");
+        let mut incomplete_resource = VirtioVsockReconstructionResource::new(
+            selector.clone(),
+            SuppliedVsockListener::new(incomplete_listener),
+        );
+        let error = captured
+            .reconstruct_snapshot_handler(&memory, &mut incomplete_resource)
+            .expect_err("snapshot reconstruction must require guest connection authority");
+        assert!(matches!(
+            error,
+            VirtioVsockReconstructionError::GuestConnectorMissing
+        ));
+        assert!(
+            !incomplete_resource.is_consumed(),
+            "connector validation must precede listener consumption"
+        );
+        assert!(!error.to_string().contains(path.to_string_lossy().as_ref()));
+
         let mut resource = reconstruction_resource(selector, "restore-idle-fd");
         let reconstructed = captured
             .reconstruct_snapshot_handler(&memory, &mut resource)

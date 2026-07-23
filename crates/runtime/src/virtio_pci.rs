@@ -2871,7 +2871,7 @@ impl std::error::Error for VirtioPciEndpointError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::mpsc::{self, TryRecvError};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2896,10 +2896,19 @@ mod tests {
         VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES,
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockReconstructionResource,
         VirtioVsockRestoredTransportResetSignal, VirtioVsockTransportResetAttempt, VsockConfig,
-        VsockConfigInput,
+        VsockConfigInput, VsockGuestConnector,
     };
 
     const TEST_VSOCK_PCI_UDS_PATH: &str = "/tmp/bangbang-vsock-pci-capture.sock";
+
+    #[derive(Debug)]
+    struct RejectingVsockGuestConnector;
+
+    impl VsockGuestConnector for RejectingVsockGuestConnector {
+        fn connect(&mut self, _host_port: u32) -> std::io::Result<UnixStream> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+    }
 
     type TestEndpoint =
         VirtioPciEndpoint<UnsupportedVirtioDeviceConfig, NoopVirtioDeviceActivation>;
@@ -3971,7 +3980,7 @@ mod tests {
             .expect("PCI reconstruction listener path should unlink after bind");
         let mut resource = VirtioVsockReconstructionResource::new(
             active_first.device().backend_selector().clone(),
-            SuppliedVsockListener::new(listener),
+            SuppliedVsockListener::new(listener).with_guest_connector(RejectingVsockGuestConnector),
         );
         let reconstructed = active_first
             .reconstruct_snapshot_device(&memory, &mut resource)

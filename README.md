@@ -1080,8 +1080,8 @@ redacted immutable MMIO/PCI capture values for CID, features, activation, all
 three queue cursors, `EVENT_IDX`, the host-local cursor, and the logical backend
 selector. Capture validates transport and guest rings fail closed, reports
 source-only connection/reset normalization separately, and can rebuild fresh
-empty device state from an externally supplied listener while rearming the
-snapshot-origin RX gate. Quiesced owner traversal, destination UDS authority and
+empty device state from an externally supplied listener/connector while rearming
+the snapshot-origin RX gate. Quiesced owner traversal, destination UDS authority and
 override, record certification, native-v1 encoding/placement, public invocation,
 and end-to-end restored-guest proof remain #1516-#1518/#1490 work; this does not
 claim general performance, Firecracker artifact, or snapshot parity.
