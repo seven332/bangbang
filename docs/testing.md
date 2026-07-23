@@ -1061,11 +1061,14 @@ then fixes the union at 85 unique records with a 77-terminal/eight-Wave-6
 split. Its audit test rejects family drift, overlap, stale #1440/#1481 handoffs,
 wrong #1490 URLs, any selected #1491 row, and missing focused or signed evidence.
 
-After the checked network/MMDS closure, the current overlay contains 220
+At the checked network/MMDS closure checkpoint, the overlay contained 220
 `implemented-and-verified`, 178 `audit-required`, three
 `missing-platform-feasible`, and 17 `proven-platform-impossible` outcomes. Its
 35-record selector promotes 29 formerly audited rows and retains exactly four
-for #1378, #1490, or #1491 outcomes.
+for #1378, #1490, or #1491 outcomes. The subsequent checked vsock closure
+promotes eight API/live rows from its exact 14-record selector and retains six
+precise #1490 artifact/restore/clone outcomes, so the current overlay contains
+228/170/3/17 outcomes.
 
 Run its two focused gates with:
 
@@ -2022,8 +2025,10 @@ stale-safe direct publication and exact cleanup, transactional contained
 directory/broker reservation with no ambient fallback, cancellation rollback,
 single-use runtime consumption, retryable preactivation failure, and terminal
 postactivation failure. Public native-v1 records still omit vsock
-encoding/placement and public load rejects overrides; record certification and
-the restored-guest proof remain #1518/#1490 work.
+encoding/placement and public load rejects overrides. The checked vsock ledger
+certifies the eight API/live records; the exact six aggregate invocation,
+restored acknowledgement/reconnect/override, clone/version, and portability
+outcomes remain #1490 work.
 The signed transfer is a compatibility/progress gate, not a general performance,
 Firecracker artifact, or snapshot-parity claim.
 

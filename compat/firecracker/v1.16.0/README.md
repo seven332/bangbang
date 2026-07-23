@@ -87,6 +87,10 @@ claims mechanically visible.
   complete live/capture-ready outcomes, and retains four explicit #1378,
   #1490, or #1491 handoffs for external vmnet, restore/clone, and performance
   work.
+- [`vsock-contract.md`](vsock-contract.md) is the #1518 checked aggregate vsock
+  ledger. It pins the exact 14 directly named records, promotes eight complete
+  API/live outcomes, and retains six explicit #1490 optional-device encoding,
+  public restore, clone/version, and portability handoffs.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -544,7 +548,15 @@ evidence. The checked [`network-mmds-contract.md`](network-mmds-contract.md)
 selects exactly 35 records: 31 are terminal and four remain `audit-required`
 only for #1378 external vmnet connectivity, #1490 encoding/restore/clone
 freshness, or #1491 performance/observability work. It promotes 29 previously
-audited records, so the current overlay is 220/178/3/17.
+audited records, so the overlay at that checkpoint was 220/178/3/17.
+
+#1513 through #1517 subsequently align Firecracker's live connection/port
+policy, reset/RX acknowledgement ordering, validated MMIO/PCI capture,
+quiesced source ownership, and direct/contained destination resources. #1518
+reconciles those producers with the API and signed live evidence in the checked
+[`vsock-contract.md`](vsock-contract.md). Its exact 14-record selector promotes
+eight API/live rows and retains six precise Wave 6 #1490 outcomes, so the
+current overlay is 228/170/3/17.
 
 ## Commands
 
