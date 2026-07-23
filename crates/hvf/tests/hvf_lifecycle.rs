@@ -6053,6 +6053,567 @@ fn activate_and_notify_entropy_capture_queue(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VSOCK_CAPTURE_QUEUE_SIZE: u16 = 256;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VSOCK_CAPTURE_QUEUE_RINGS: [(
+    bangbang_runtime::memory::GuestAddress,
+    bangbang_runtime::memory::GuestAddress,
+    bangbang_runtime::memory::GuestAddress,
+); 3] = [
+    (
+        bangbang_runtime::memory::GuestAddress::new(0x8060_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8061_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8062_0000),
+    ),
+    (
+        bangbang_runtime::memory::GuestAddress::new(0x8063_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8064_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8065_0000),
+    ),
+    (
+        bangbang_runtime::memory::GuestAddress::new(0x8066_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8067_0000),
+        bangbang_runtime::memory::GuestAddress::new(0x8068_0000),
+    ),
+];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VSOCK_CAPTURE_EVENT_PAYLOAD: bangbang_runtime::memory::GuestAddress =
+    bangbang_runtime::memory::GuestAddress::new(0x8069_0000);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_vsock_capture_mmio(
+    dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher,
+    address: bangbang_runtime::memory::GuestAddress,
+    data: &[u8],
+) {
+    use bangbang_runtime::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioOperation};
+
+    let access = dispatcher
+        .lookup(
+            address,
+            u64::try_from(data.len()).expect("vsock MMIO write length should fit u64"),
+        )
+        .expect("vsock MMIO write should resolve");
+    let outcome = dispatcher
+        .dispatch(
+            MmioOperation::write(
+                access,
+                MmioAccessBytes::new(data).expect("vsock MMIO bytes should validate"),
+            )
+            .expect("vsock MMIO operation should validate"),
+        )
+        .expect("vsock MMIO write should dispatch");
+    assert!(matches!(outcome, MmioDispatchOutcome::Write));
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_vsock_capture_event(
+    memory: &mut bangbang_runtime::memory::GuestMemory,
+    descriptor_index: u16,
+    available_index: u16,
+) {
+    use bangbang_runtime::virtio_queue::{VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE};
+
+    let (descriptor_table, available_ring, _) = VSOCK_CAPTURE_QUEUE_RINGS[2];
+    let descriptor = descriptor_table
+        .checked_add(u64::from(descriptor_index) * VIRTQUEUE_DESCRIPTOR_SIZE as u64)
+        .expect("vsock event descriptor address should fit");
+    let payload = VSOCK_CAPTURE_EVENT_PAYLOAD
+        .checked_add(u64::from(descriptor_index) * 8)
+        .expect("vsock event payload address should fit");
+    memory
+        .write_slice(&payload.raw_value().to_le_bytes(), descriptor)
+        .expect("vsock event descriptor address should write");
+    memory
+        .write_slice(&4_u32.to_le_bytes(), descriptor.checked_add(8).unwrap())
+        .expect("vsock event descriptor length should write");
+    memory
+        .write_slice(
+            &VIRTQUEUE_DESC_F_WRITE.to_le_bytes(),
+            descriptor.checked_add(12).unwrap(),
+        )
+        .expect("vsock event descriptor flags should write");
+    memory
+        .write_slice(&0_u16.to_le_bytes(), descriptor.checked_add(14).unwrap())
+        .expect("vsock event descriptor next index should write");
+    memory
+        .write_slice(&[0xff; 4], payload)
+        .expect("vsock event payload should initialize");
+    let available_head = available_ring
+        .checked_add(4 + u64::from(available_index - 1) * 2)
+        .expect("vsock available head address should fit");
+    memory
+        .write_slice(&descriptor_index.to_le_bytes(), available_head)
+        .expect("vsock event available head should write");
+    memory
+        .write_slice(
+            &available_index.to_le_bytes(),
+            available_ring.checked_add(2).unwrap(),
+        )
+        .expect("vsock event available index should write");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn activate_vsock_capture_queues(
+    session: &mut bangbang_hvf::OwnedHvfArm64BootSession,
+    transport_base: bangbang_runtime::memory::GuestAddress,
+    pci: bool,
+) {
+    use bangbang_runtime::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+    };
+
+    let dispatcher = session.mmio_dispatcher();
+    let memory = session
+        .guest_memory_mut()
+        .expect("signed vsock guest memory should remain mapped");
+    for (_, available_ring, used_ring) in VSOCK_CAPTURE_QUEUE_RINGS {
+        memory
+            .write_slice(&[0; 4], available_ring)
+            .expect("vsock available ring header should initialize");
+        memory
+            .write_slice(&[0; 4], used_ring)
+            .expect("vsock used ring header should initialize");
+    }
+    write_vsock_capture_event(memory, 0, 1);
+
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("signed vsock MMIO dispatcher should not be poisoned");
+    let write =
+        |dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher, offset: u64, data: &[u8]| {
+            write_vsock_capture_mmio(
+                dispatcher,
+                transport_base
+                    .checked_add(offset)
+                    .expect("vsock transport address should not overflow"),
+                data,
+            );
+        };
+    let features_ok = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    let driver_ok = features_ok | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+    if pci {
+        write(
+            &mut dispatcher,
+            0x14,
+            &[u8::try_from(VIRTIO_DEVICE_STATUS_ACKNOWLEDGE).unwrap()],
+        );
+        write(
+            &mut dispatcher,
+            0x14,
+            &[
+                u8::try_from(VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER)
+                    .unwrap(),
+            ],
+        );
+        write(&mut dispatcher, 0x08, &1_u32.to_le_bytes());
+        write(&mut dispatcher, 0x0c, &1_u32.to_le_bytes());
+        write(&mut dispatcher, 0x14, &[u8::try_from(features_ok).unwrap()]);
+        for (queue_index, (descriptor, available, used)) in
+            VSOCK_CAPTURE_QUEUE_RINGS.into_iter().enumerate()
+        {
+            write(
+                &mut dispatcher,
+                0x16,
+                &u16::try_from(queue_index).unwrap().to_le_bytes(),
+            );
+            write(
+                &mut dispatcher,
+                0x18,
+                &VSOCK_CAPTURE_QUEUE_SIZE.to_le_bytes(),
+            );
+            write(
+                &mut dispatcher,
+                0x20,
+                &u32::try_from(descriptor.raw_value()).unwrap().to_le_bytes(),
+            );
+            write(
+                &mut dispatcher,
+                0x28,
+                &u32::try_from(available.raw_value()).unwrap().to_le_bytes(),
+            );
+            write(
+                &mut dispatcher,
+                0x30,
+                &u32::try_from(used.raw_value()).unwrap().to_le_bytes(),
+            );
+            write(&mut dispatcher, 0x1c, &1_u16.to_le_bytes());
+        }
+        write(&mut dispatcher, 0x14, &[u8::try_from(driver_ok).unwrap()]);
+    } else {
+        for status in [
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        ] {
+            write(
+                &mut dispatcher,
+                VirtioMmioRegister::Status.offset(),
+                &status.to_le_bytes(),
+            );
+        }
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::DriverFeaturesSel.offset(),
+            &1_u32.to_le_bytes(),
+        );
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::DriverFeatures.offset(),
+            &1_u32.to_le_bytes(),
+        );
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::Status.offset(),
+            &features_ok.to_le_bytes(),
+        );
+        for (queue_index, (descriptor, available, used)) in
+            VSOCK_CAPTURE_QUEUE_RINGS.into_iter().enumerate()
+        {
+            write(
+                &mut dispatcher,
+                VirtioMmioRegister::QueueSel.offset(),
+                &u32::try_from(queue_index).unwrap().to_le_bytes(),
+            );
+            for (register, value) in [
+                (
+                    VirtioMmioRegister::QueueNum,
+                    u32::from(VSOCK_CAPTURE_QUEUE_SIZE),
+                ),
+                (
+                    VirtioMmioRegister::QueueDescLow,
+                    u32::try_from(descriptor.raw_value()).unwrap(),
+                ),
+                (
+                    VirtioMmioRegister::QueueDriverLow,
+                    u32::try_from(available.raw_value()).unwrap(),
+                ),
+                (
+                    VirtioMmioRegister::QueueDeviceLow,
+                    u32::try_from(used.raw_value()).unwrap(),
+                ),
+                (VirtioMmioRegister::QueueReady, 1),
+            ] {
+                write(&mut dispatcher, register.offset(), &value.to_le_bytes());
+            }
+        }
+        write(
+            &mut dispatcher,
+            VirtioMmioRegister::Status.offset(),
+            &driver_ok.to_le_bytes(),
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn notify_vsock_capture_event_queue(
+    session: &mut bangbang_hvf::OwnedHvfArm64BootSession,
+    transport_base: bangbang_runtime::memory::GuestAddress,
+    pci: bool,
+) {
+    use bangbang_runtime::virtio_mmio::VirtioMmioRegister;
+    use bangbang_runtime::virtio_pci::VIRTIO_PCI_NOTIFICATION_OFFSET;
+    use bangbang_runtime::vsock::VIRTIO_VSOCK_EVENT_QUEUE_INDEX;
+
+    let dispatcher = session.mmio_dispatcher();
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("signed vsock MMIO dispatcher should not be poisoned");
+    let (offset, bytes) = if pci {
+        (
+            VIRTIO_PCI_NOTIFICATION_OFFSET,
+            u16::try_from(VIRTIO_VSOCK_EVENT_QUEUE_INDEX)
+                .unwrap()
+                .to_le_bytes()
+                .to_vec(),
+        )
+    } else {
+        (
+            VirtioMmioRegister::QueueNotify.offset(),
+            u32::try_from(VIRTIO_VSOCK_EVENT_QUEUE_INDEX)
+                .unwrap()
+                .to_le_bytes()
+                .to_vec(),
+        )
+    };
+    write_vsock_capture_mmio(
+        &mut dispatcher,
+        transport_base.checked_add(offset).unwrap(),
+        &bytes,
+    );
+    drop(dispatcher);
+    session
+        .dispatch_vsock_queue_notifications_and_signal_interrupts()
+        .expect("signed vsock event acknowledgement should dispatch");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn capture_ready_vsock_resets_signed_mmio_and_pci_owners() {
+    use bangbang_hvf::{
+        HvfArm64BootSessionConfig, HvfArm64BootVsockCaptureDisposition,
+        HvfArm64BootVsockCaptureStage, HvfArm64BootVsockTransportState, OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE;
+    use bangbang_runtime::vsock::{
+        VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, VirtioVsockTransportResetAttempt, VsockConfigInput,
+        VsockMmioLayout,
+    };
+
+    // The wrapper already runs this direct-listener case as a signed binary.
+    // Its App Sandbox replay intentionally has no network server entitlement;
+    // supplied-listener containment is covered by the production process tests.
+    if is_app_sandbox_hvf_lifecycle_replay() {
+        return;
+    }
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("capture-ready-vsock-kernel", &image)
+        .expect("vsock capture kernel should create");
+    let socket_id = NEXT_HVF_TEST_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let socket_path =
+        std::env::temp_dir().join(format!("bb-vsock-{}-{socket_id}.sock", std::process::id()));
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("vsock capture boot source should configure");
+    controller
+        .handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+            42,
+            path_text(&socket_path),
+        )))
+        .expect("vsock capture device should configure");
+    let vsock_config = controller
+        .vsock_config()
+        .cloned()
+        .expect("vsock capture config should exist");
+    let base_session_config = || {
+        HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            test_rtc_mmio_layout(),
+        )
+    };
+
+    let mut mmio_session = OwnedHvfArm64BootSession::new(&controller, base_session_config())
+        .expect("signed MMIO vsock session should prepare");
+    let mmio_metrics = mmio_session.shared_vsock_device_metrics();
+    let mmio_idle_guard = mmio_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("MMIO vsock auxiliary work should quiesce");
+    let mmio_idle = mmio_session
+        .capture_ready_vsock_state(Some(vsock_config.clone()), &mmio_metrics, &mmio_idle_guard)
+        .expect("inactive MMIO vsock should capture")
+        .expect("configured MMIO vsock should be present");
+    let HvfArm64BootVsockTransportState::Mmio { region, state, .. } = mmio_idle.transport() else {
+        panic!("MMIO vsock should retain MMIO ownership");
+    };
+    let mmio_base = region.range().start();
+    assert_eq!(mmio_base, GuestAddress::new(0x7000_0000));
+    assert_eq!(
+        mmio_idle.validation().reset_attempt(),
+        VirtioVsockTransportResetAttempt::Inactive
+    );
+    assert!(!state.device().is_activated());
+    assert_eq!(mmio_idle.config(), &vsock_config);
+    drop(mmio_idle_guard);
+
+    activate_vsock_capture_queues(&mut mmio_session, mmio_base, false);
+    let mmio_guard = mmio_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("active MMIO vsock auxiliary work should quiesce");
+    let mmio = mmio_session
+        .capture_ready_vsock_state(Some(vsock_config.clone()), &mmio_metrics, &mmio_guard)
+        .expect("active MMIO vsock should reset and capture")
+        .expect("active MMIO vsock should be present");
+    assert!(matches!(
+        mmio.validation().reset_attempt(),
+        VirtioVsockTransportResetAttempt::Published(_)
+    ));
+    assert!(!mmio.validation().source_work().dropped_any_source_work());
+    let active_mmio = mmio
+        .transport()
+        .mmio_state()
+        .expect("active MMIO vsock should retain MMIO state");
+    let queues = active_mmio
+        .device()
+        .active_queues()
+        .expect("active MMIO capture should retain all queues");
+    assert_eq!(queues.event().next_available(), 1);
+    assert_eq!(queues.event().next_used(), 1);
+    let mut reset_payload = [0_u8; 4];
+    mmio_session
+        .guest_memory()
+        .expect("MMIO vsock guest memory should remain mapped")
+        .read_slice(&mut reset_payload, VSOCK_CAPTURE_EVENT_PAYLOAD)
+        .expect("MMIO reset payload should read");
+    assert_eq!(
+        u32::from_le_bytes(reset_payload),
+        VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
+    );
+    assert_eq!(mmio_metrics.snapshot().ev_queue_event_fails(), 0);
+    drop(mmio_guard);
+
+    notify_vsock_capture_event_queue(&mut mmio_session, mmio_base, false);
+    let mmio_empty_guard = mmio_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("MMIO empty-event reset capture should quiesce");
+    let mmio_empty = mmio_session
+        .capture_ready_vsock_state(Some(vsock_config.clone()), &mmio_metrics, &mmio_empty_guard)
+        .expect("active MMIO vsock with an empty event queue should capture")
+        .expect("configured MMIO vsock should remain present");
+    assert_eq!(
+        mmio_empty.validation().reset_attempt(),
+        VirtioVsockTransportResetAttempt::QueueEmpty
+    );
+    assert!(
+        !mmio_empty
+            .validation()
+            .source_work()
+            .dropped_any_source_work()
+    );
+    drop(mmio_empty_guard);
+    assert_eq!(mmio_metrics.snapshot().ev_queue_event_fails(), 1);
+
+    for (descriptor_index, stage) in [
+        HvfArm64BootVsockCaptureStage::InterruptDelivery,
+        HvfArm64BootVsockCaptureStage::Capture,
+        HvfArm64BootVsockCaptureStage::Handoff,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let descriptor_index = u16::try_from(descriptor_index + 1)
+            .expect("vsock cancellation descriptor index should fit in u16");
+        write_vsock_capture_event(
+            mmio_session
+                .guest_memory_mut()
+                .expect("MMIO vsock guest memory should remain mapped"),
+            descriptor_index,
+            descriptor_index + 1,
+        );
+        let mmio_cancel_guard = mmio_session
+            .quiesce_limiter_retry_wakeups()
+            .expect("MMIO cancellation capture should quiesce");
+        let cancelled = mmio_session
+            .capture_ready_vsock_state_with_cancel(
+                Some(vsock_config.clone()),
+                &mmio_metrics,
+                &mmio_cancel_guard,
+                |candidate| candidate == stage,
+            )
+            .expect_err("post-reset cancellation should report after validation");
+        assert_eq!(
+            cancelled.disposition(),
+            HvfArm64BootVsockCaptureDisposition::Recoverable
+        );
+        assert_eq!(cancelled.stage(), stage);
+        drop(mmio_cancel_guard);
+        notify_vsock_capture_event_queue(&mut mmio_session, mmio_base, false);
+    }
+    mmio_session
+        .shutdown()
+        .expect("signed MMIO vsock session should shut down");
+    drop(mmio_session);
+    assert!(!socket_path.exists());
+
+    let mut pci_session =
+        OwnedHvfArm64BootSession::new(&controller, base_session_config().with_pci_enabled())
+            .expect("signed PCI vsock session should prepare");
+    let pci_metrics = pci_session.shared_vsock_device_metrics();
+    let pci_idle_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI vsock auxiliary work should quiesce");
+    let pci_idle = pci_session
+        .capture_ready_vsock_state(Some(vsock_config.clone()), &pci_metrics, &pci_idle_guard)
+        .expect("inactive PCI vsock should capture")
+        .expect("configured PCI vsock should be present");
+    let HvfArm64BootVsockTransportState::Pci {
+        sbdf,
+        bar_range,
+        state,
+    } = pci_idle.transport()
+    else {
+        panic!("PCI vsock should retain PCI ownership");
+    };
+    let pci_base = bar_range.start();
+    assert!(sbdf.device() > 0);
+    assert_eq!(bar_range.size(), VIRTIO_PCI_CAPABILITY_BAR_SIZE);
+    assert_eq!(
+        pci_idle.validation().reset_attempt(),
+        VirtioVsockTransportResetAttempt::Inactive
+    );
+    assert!(!state.device().is_activated());
+    drop(pci_idle_guard);
+
+    activate_vsock_capture_queues(&mut pci_session, pci_base, true);
+    let pci_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("active PCI vsock auxiliary work should quiesce");
+    let pci = pci_session
+        .capture_ready_vsock_state(Some(vsock_config.clone()), &pci_metrics, &pci_guard)
+        .expect("active PCI vsock should reset and capture")
+        .expect("active PCI vsock should be present");
+    assert!(matches!(
+        pci.validation().reset_attempt(),
+        VirtioVsockTransportResetAttempt::Published(_)
+    ));
+    assert!(!pci.validation().source_work().dropped_any_source_work());
+    let active_pci = pci
+        .transport()
+        .pci_state()
+        .expect("active PCI vsock should retain PCI state");
+    let queues = active_pci
+        .device()
+        .active_queues()
+        .expect("active PCI capture should retain all queues");
+    assert_eq!(queues.event().next_available(), 1);
+    assert_eq!(queues.event().next_used(), 1);
+    assert_eq!(pci_metrics.snapshot().ev_queue_event_fails(), 0);
+    drop(pci_guard);
+    notify_vsock_capture_event_queue(&mut pci_session, pci_base, true);
+    let pci_empty_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI empty-event reset capture should quiesce");
+    let pci_empty = pci_session
+        .capture_ready_vsock_state(Some(vsock_config), &pci_metrics, &pci_empty_guard)
+        .expect("active PCI vsock with an empty event queue should capture")
+        .expect("configured PCI vsock should remain present");
+    assert_eq!(
+        pci_empty.validation().reset_attempt(),
+        VirtioVsockTransportResetAttempt::QueueEmpty
+    );
+    assert!(
+        !pci_empty
+            .validation()
+            .source_work()
+            .dropped_any_source_work()
+    );
+    drop(pci_empty_guard);
+    assert_eq!(pci_metrics.snapshot().ev_queue_event_fails(), 1);
+    pci_session
+        .shutdown()
+        .expect("signed PCI vsock session should shut down");
+    drop(pci_session);
+    assert!(!socket_path.exists());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn capture_ready_entropy_traverses_signed_mmio_and_pci_owners() {
     use std::time::Instant;

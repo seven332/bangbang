@@ -1721,10 +1721,13 @@ is resource-specific:
   guest-memory borrows, and the ACK gate are excluded. Full state/ring/resource
   validation precedes consumption of the caller-supplied listener/connector,
   and a reconstructed destination starts with empty connection work and an armed
-  snapshot-origin gate. Quiesced owner traversal, destination authority and UDS
-  override, record certification, native-v1 encoding/placement, public
-  invocation, and restored-guest proof remain #1516-#1518/#1490 work; the live
-  subset and internal producer are not a public snapshot-containment claim.
+  snapshot-origin gate. The paused source producer now validates one exact
+  MMIO-or-PCI owner, publishes reset, captures, and normalizes connection work
+  under one lease before the unchanged optional-device rejection. Destination
+  authority and UDS override, record certification, native-v1
+  encoding/placement, and restored-guest proof remain #1517-#1518/#1490 work;
+  the live subset and internal producer are not a public snapshot-containment
+  claim.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink. The `--metrics-path` startup CLI flag uses the same
   sink and host-path error redaction rules before the API socket is served.
@@ -2492,9 +2495,11 @@ The current scaffold does not implement:
   containment: there is no global host-path broker, PATCH/DELETE/runtime
   hotplug, broader CID routing, or broader event type. The private redacted
   MMIO/PCI capture and listener/connector-parameterized empty-state reconstruction layer
-  grants no path authority and persists no live peer work. Quiesced capture,
-  destination authority/override, certification, native-v1 encoding/placement,
-  public invocation, and restored-guest proof remain #1516-#1518/#1490 work.
+  grants no path authority and persists no live peer work. Production quiesced
+  capture now validates one exact source owner, publishes reset, and detaches
+  connection work while retaining listener/connector authority for fresh
+  traffic. Destination authority/override, certification, native-v1
+  encoding/placement, and restored-guest proof remain #1517-#1518/#1490 work.
 - log rotation, syslog, journald, tracing, remote telemetry, or process-global
   panic/fatal observability durability
 - a public serial streaming API, generalized serial artifact encoding/restore,

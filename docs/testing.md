@@ -1781,7 +1781,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v86.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v87.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -1934,6 +1934,17 @@ EOF and process-owned listener cleanup. With
 AF_VSOCK streams to distinct host ports before payload exchange, sends distinct
 guest payloads on both streams, waits for distinct host replies, and writes
 `BANGBANG_VSOCK_GUEST_MULTISTREAM_OK` only after both streams complete. When
+the boot args include `bangbang.vsock-snapshot-reset=1`, Python instead keeps
+one guest-initiated connection blocked while the harness proves pause alone
+does not close it. The harness invokes public snapshot creation while paused;
+the request still receives the supported-profile rejection and leaves no state,
+memory, or staging artifact, but only after the production vsock preflight has
+published `TRANSPORT_RESET`, captured state, and detached source-only work.
+After resume, the guest must observe non-timeout termination of the old socket,
+connect to a distinct host port, and complete a fresh marker/ack exchange before
+writing `BANGBANG_VSOCK_SNAPSHOT_RESET_OK`. Separate signed MMIO and product-PCI
+cases exercise this sequence.
+When
 the boot args include `bangbang.vsock-host-connect=1`, Python instead binds and
 listens on the test AF_VSOCK port, writes
 `BANGBANG_VSOCK_HOST_CONNECT_READY` only after the guest listener is ready,
@@ -1989,7 +2000,8 @@ supported bangbang extension. Focused runtime tests additionally validate the
 real event queue's reset payload and used-ring transaction, EVENT_IDX state,
 mandatory MMIO queue intent and PCI queue-2 delivery, typed empty/malformed
 failures and metrics, runtime-only restored-origin acknowledgement gate, TX
-progress, preserved RX work, and post-ack drain. Repeated pre-boot `PUT /vsock`
+progress, preserved RX work, post-ack drain, and EVENT_IDX rearming against a
+pre-filled event ring. Repeated pre-boot `PUT /vsock`
 replaces stored configuration and post-start PUT is stably rejected; PATCH,
 DELETE, runtime hotplug, and broader CID routing are not supported. Focused
 capture tests now cover repeatable inactive/active MMIO values, endpoint-locked
@@ -1997,10 +2009,16 @@ PCI state including masked MSI-X reset intent, all three saved queue cursors and
 `EVENT_IDX`, smaller valid queue sizes, malformed identity/feature/activation/
 ring/range/cursor/reset mutations, redaction, and
 listener/connector-parameterized reconstruction with empty live work and an armed
-RX gate. Quiesced owner
-traversal, destination UDS authority/override, record certification, native-v1
-encoding/placement, public invocation, and the restored-guest proof remain
-#1516-#1518/#1490 work.
+RX gate. Production quiesced traversal cross-checks the controller, runtime,
+HVF MMIO-or-PCI owner, CID, selector, placement, activation, metrics owner, and
+guest memory; it keeps reset-attempt and source-normalization evidence separate
+while detaching connection work only after validation and retaining the source
+listener/connector for fresh traffic. Signed HVF coverage exercises
+inactive, published, empty-queue, cancellation, ack, and both transport owners.
+The process tests above prove the real Linux reset/reconnect boundary and the
+unchanged public rejection with zero artifacts. Destination UDS
+authority/override, record certification, native-v1 encoding/placement, and the
+restored-guest proof remain #1517-#1518/#1490 work.
 The signed transfer is a compatibility/progress gate, not a general performance,
 Firecracker artifact, or snapshot-parity claim.
 

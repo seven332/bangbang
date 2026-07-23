@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v86"
+direct_boot_variant="direct-boot-v87"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -3468,6 +3468,135 @@ PY
   fi
 }
 
+fetch_vsock_snapshot_reset_marker() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_NO_PYTHON
+    write_vdb_marker BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_NO_PYTHON
+    return
+  fi
+
+  vsock_result=$(
+    python3 - <<'PY' 2>/dev/null || true
+import socket
+import sys
+import time
+
+HOST_CID = getattr(socket, "VMADDR_CID_HOST", 2)
+OLD_PORT = 5011
+FRESH_PORT = 5012
+OLD_READY = b"BANGBANG_VSOCK_SNAPSHOT_OLD_READY"
+FRESH_READY = b"BANGBANG_VSOCK_SNAPSHOT_FRESH_READY"
+FRESH_ACK = b"BANGBANG_VSOCK_SNAPSHOT_FRESH_ACK"
+SOCKET_TIMEOUT = 30.0
+RECONNECT_TIMEOUT = 10.0
+
+
+def fail(reason):
+    print(f"BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_{reason}")
+    sys.exit(1)
+
+
+def connect(port):
+    try:
+        stream = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    except OSError:
+        fail(f"SOCKET_{port}")
+    stream.settimeout(SOCKET_TIMEOUT)
+    try:
+        stream.connect((HOST_CID, port))
+    except OSError:
+        stream.close()
+        fail(f"CONNECT_{port}")
+    return stream
+
+
+def connect_after_reset(port):
+    deadline = time.monotonic() + RECONNECT_TIMEOUT
+    while True:
+        try:
+            stream = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        except OSError:
+            fail(f"SOCKET_{port}")
+        stream.settimeout(1.0)
+        try:
+            stream.connect((HOST_CID, port))
+            stream.settimeout(SOCKET_TIMEOUT)
+            return stream
+        except OSError:
+            stream.close()
+            if time.monotonic() >= deadline:
+                fail(f"RECONNECT_{port}")
+            time.sleep(0.05)
+
+
+def recv_exact(stream, size):
+    data = bytearray()
+    while len(data) < size:
+        try:
+            chunk = stream.recv(size - len(data))
+        except socket.timeout:
+            fail("FRESH_ACK_TIMEOUT")
+        except OSError:
+            fail("FRESH_ACK_RECV")
+        if not chunk:
+            fail("FRESH_ACK_EOF")
+        data.extend(chunk)
+    return bytes(data)
+
+
+if not hasattr(socket, "AF_VSOCK"):
+    fail("NO_AF_VSOCK")
+
+old_stream = connect(OLD_PORT)
+try:
+    try:
+        old_stream.sendall(OLD_READY)
+    except OSError:
+        fail("OLD_READY_SEND")
+
+    try:
+        old_data = old_stream.recv(1)
+    except socket.timeout:
+        fail("OLD_RESET_TIMEOUT")
+    except OSError:
+        pass
+    else:
+        if old_data:
+            fail("OLD_UNEXPECTED_DATA")
+finally:
+    old_stream.close()
+
+fresh_stream = connect_after_reset(FRESH_PORT)
+try:
+    try:
+        fresh_stream.sendall(FRESH_READY)
+    except OSError:
+        fail("FRESH_READY_SEND")
+    if recv_exact(fresh_stream, len(FRESH_ACK)) != FRESH_ACK:
+        fail("FRESH_ACK_CONTENT")
+finally:
+    fresh_stream.close()
+
+print("BANGBANG_VSOCK_SNAPSHOT_RESET_OK")
+PY
+  )
+
+  case "$vsock_result" in
+    BANGBANG_VSOCK_SNAPSHOT_RESET_OK)
+      emit_line BANGBANG_VSOCK_SNAPSHOT_RESET_OK
+      write_vdb_marker BANGBANG_VSOCK_SNAPSHOT_RESET_OK
+      ;;
+    BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_*)
+      emit_line "$vsock_result"
+      write_vdb_marker "$vsock_result"
+      ;;
+    *)
+      emit_line BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_EMPTY
+      write_vdb_marker BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_EMPTY
+      ;;
+  esac
+}
+
 fetch_multi_vsock_marker() {
   if ! command -v python3 >/dev/null 2>&1; then
     emit_line BANGBANG_VSOCK_GUEST_MULTISTREAM_FAIL_NO_PYTHON
@@ -4164,6 +4293,8 @@ elif cmdline_has bangbang.virtio-net-semantics=1; then
   prove_virtio_network_semantics
 elif cmdline_has bangbang.mmds-fetch=1; then
   fetch_mmds_marker
+elif cmdline_has bangbang.vsock-snapshot-reset=1; then
+  fetch_vsock_snapshot_reset_marker
 elif cmdline_has bangbang.vsock-guest-connect=1; then
   fetch_vsock_marker
 elif cmdline_has bangbang.vsock-guest-multistream=1; then

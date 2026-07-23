@@ -228,6 +228,12 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_VSOCK_GUEST_STREAM_SEED: u8 = 0x3d;
     const DIRECT_ROOTFS_VSOCK_HOST_STREAM_SEED: u8 = 0xa7;
     const DIRECT_ROOTFS_VSOCK_PORT: u32 = 5005;
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_OLD_PORT: u32 = 5011;
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_PORT: u32 = 5012;
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_OLD_READY: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_OLD_READY";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_READY: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_FRESH_READY";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_ACK: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_FRESH_ACK";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_SUCCESS: &[u8] = b"BANGBANG_VSOCK_SNAPSHOT_RESET_OK";
     const DIRECT_ROOTFS_VSOCK_MULTISTREAM_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_MULTISTREAM_OK";
     const DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES: &[(u32, &[u8], &[u8])] = &[
         (
@@ -291,6 +297,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_MMDS_CONTENT: &str =
         r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_GUEST_VALUE"}}"#;
     const DIRECT_ROOTFS_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-connect=1";
+    const DIRECT_ROOTFS_VSOCK_SNAPSHOT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rootwait init=/bangbang-direct-rootfs-init bangbang.vsock-snapshot-reset=1";
     const DIRECT_ROOTFS_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
     const DIRECT_ROOTFS_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
     const DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-multistream=1";
@@ -8944,6 +8951,263 @@ mod macos_arm64 {
         assert!(
             !uds_path.exists(),
             "bangbang shutdown should remove its owned main vsock listener path"
+        );
+    }
+
+    #[test]
+    fn signed_executable_resets_live_vsock_before_unsupported_snapshot_over_mmio() {
+        run_signed_vsock_snapshot_reset(false);
+    }
+
+    #[test]
+    fn signed_executable_resets_live_vsock_before_unsupported_snapshot_over_product_pci() {
+        run_signed_vsock_snapshot_reset(true);
+    }
+
+    fn run_signed_vsock_snapshot_reset(enable_pci: bool) {
+        let transport = if enable_pci { "product PCI" } else { "MMIO" };
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let data_backing_path = test_dir.path().join("vsock-reset.img");
+        let uds_path = test_dir.path().join("vs.sock");
+        let old_port_path = vsock_port_path(&uds_path, DIRECT_ROOTFS_VSOCK_SNAPSHOT_OLD_PORT);
+        let fresh_port_path = vsock_port_path(&uds_path, DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_PORT);
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&data_backing_path);
+        let old_listener = UnixListener::bind(&old_port_path).unwrap_or_else(|err| {
+            panic!(
+                "{transport} old vsock listener should bind before startup: {:?}",
+                err.kind()
+            )
+        });
+        let fresh_listener = UnixListener::bind(&fresh_port_path).unwrap_or_else(|err| {
+            panic!(
+                "{transport} fresh vsock listener should bind before startup: {:?}",
+                err.kind()
+            )
+        });
+
+        let mut bangbang = if enable_pci {
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--enable-pci"])
+        } else {
+            BangbangProcess::start(&socket_path, &instance_id)
+        };
+
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            &format!("PUT /machine-config vsock snapshot reset {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/boot-source",
+                &format!(
+                    r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+                    json_string(path_text(&kernel_path)),
+                    json_string(DIRECT_ROOTFS_VSOCK_SNAPSHOT_BOOT_ARGS)
+                ),
+            ),
+            &format!("PUT /boot-source vsock snapshot reset {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/drives/rootfs",
+                &format!(
+                    r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+                    json_string(path_text(&rootfs_path))
+                ),
+            ),
+            &format!("PUT /drives/rootfs vsock snapshot reset {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/drives/data",
+                &format!(
+                    r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false}}"#,
+                    json_string(path_text(&data_backing_path))
+                ),
+            ),
+            &format!("PUT /drives/data vsock snapshot reset {transport}"),
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/vsock",
+                &format!(
+                    r#"{{"guest_cid":3,"uds_path":{}}}"#,
+                    json_string(path_text(&uds_path))
+                ),
+            ),
+            &format!("PUT /vsock snapshot reset {transport}"),
+        );
+        assert!(
+            !uds_path.exists(),
+            "{transport} PUT /vsock should not bind the main listener before startup"
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            &format!("start vsock snapshot reset {transport}"),
+        );
+
+        let mut old_stream = wait_for_unix_listener_accept(&old_listener, GUEST_EXECUTION_TIMEOUT)
+            .unwrap_or_else(|err| {
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "{transport} guest did not establish the old vsock connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            });
+        drop(old_listener);
+        old_stream
+            .set_nonblocking(false)
+            .expect("old vsock stream should use blocking I/O");
+        old_stream
+            .set_read_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+            .expect("old vsock stream read timeout should set");
+        let mut old_ready = vec![0; DIRECT_ROOTFS_VSOCK_SNAPSHOT_OLD_READY.len()];
+        old_stream.read_exact(&mut old_ready).unwrap_or_else(|err| {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} old vsock connection did not publish readiness: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        });
+        assert_eq!(
+            old_ready, DIRECT_ROOTFS_VSOCK_SNAPSHOT_OLD_READY,
+            "{transport} old vsock readiness payload should match"
+        );
+
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            &format!("pause live vsock before snapshot reset {transport}"),
+        );
+        old_stream
+            .set_nonblocking(true)
+            .expect("paused old vsock stream should allow a nonblocking probe");
+        let mut unexpected = [0; 1];
+        match old_stream.read(&mut unexpected) {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(0) => panic!("{transport} pause alone unexpectedly closed the old vsock stream"),
+            Ok(bytes) => panic!(
+                "{transport} old vsock stream produced {bytes} unexpected byte(s) while paused"
+            ),
+            Err(err) => panic!(
+                "{transport} old vsock stream probe failed while paused: {:?}",
+                err.kind()
+            ),
+        }
+        old_stream
+            .set_nonblocking(false)
+            .expect("old vsock stream should return to blocking I/O");
+
+        assert_capture_ready_snapshot_rejected_without_artifacts(
+            &socket_path,
+            test_dir.path(),
+            &format!("paused {transport} vsock capture-ready preflight"),
+        );
+        assert_no_content_response(
+            &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            &format!("resume after vsock snapshot reset {transport}"),
+        );
+
+        if let Err(err) = read_unix_stream_eof(&mut old_stream) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} host did not observe reset-driven EOF on the old vsock connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        let mut fresh_stream =
+            wait_for_unix_listener_accept(&fresh_listener, GUEST_EXECUTION_TIMEOUT)
+                .unwrap_or_else(|err| {
+                    let prefix = file_prefix_lossy(&data_backing_path, 128);
+                    let output = bangbang.force_stop_and_collect();
+                    panic!(
+                        "{transport} guest did not establish a fresh vsock connection after reset: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                        output.status, output.stdout, output.stderr
+                    );
+                });
+        drop(fresh_listener);
+        fresh_stream
+            .set_nonblocking(false)
+            .expect("fresh vsock stream should use blocking I/O");
+        fresh_stream
+            .set_read_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+            .expect("fresh vsock stream read timeout should set");
+        fresh_stream
+            .set_write_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+            .expect("fresh vsock stream write timeout should set");
+        let mut fresh_ready = vec![0; DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_READY.len()];
+        fresh_stream.read_exact(&mut fresh_ready).unwrap_or_else(|err| {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} fresh vsock connection did not publish readiness: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        });
+        assert_eq!(
+            fresh_ready, DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_READY,
+            "{transport} fresh vsock readiness payload should match"
+        );
+        fresh_stream
+            .write_all(DIRECT_ROOTFS_VSOCK_SNAPSHOT_FRESH_ACK)
+            .unwrap_or_else(|err| {
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "{transport} host did not acknowledge the fresh vsock connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            });
+        shutdown_unix_stream_write(&fresh_stream).unwrap_or_else(|err| {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} host did not half-close the fresh vsock connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        });
+        if let Err(err) = read_unix_stream_eof(&mut fresh_stream) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} host did not observe EOF on the fresh vsock connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_VSOCK_SNAPSHOT_SUCCESS,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} guest did not confirm reset and fresh reconnection: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            &format!("bangbang vsock snapshot reset {transport}"),
+        );
+        assert!(
+            !uds_path.exists(),
+            "{transport} shutdown should remove the process-owned main vsock listener"
         );
     }
 

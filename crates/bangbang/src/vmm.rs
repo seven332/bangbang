@@ -14,6 +14,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use bangbang_hvf::HvfArm64BootVsockCaptureErrorKind;
 use bangbang_hvf::{
     HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonCaptureState,
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyCaptureError,
@@ -28,7 +30,9 @@ use bangbang_hvf::{
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialCaptureError, HvfArm64BootSerialDeviceConfig,
     HvfArm64BootSessionConfig, HvfArm64BootSnapshotV1CaptureStage,
     HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootSnapshotV1StateCaptureError,
-    HvfArm64BootStorageCaptureError, HvfArm64BootTimerDeviceConfig, HvfSnapshotV1Bundle,
+    HvfArm64BootStorageCaptureError, HvfArm64BootTimerDeviceConfig,
+    HvfArm64BootVsockCaptureDisposition, HvfArm64BootVsockCaptureError,
+    HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState, HvfSnapshotV1Bundle,
     HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
     HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfVcpuRunCoordinatorError,
     OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError, PreparedHvfArm64BootPciNetworkRemoval,
@@ -123,7 +127,7 @@ use bangbang_runtime::startup::{
 use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
 #[cfg(target_os = "macos")]
 use bangbang_runtime::vsock::SuppliedVsockListener;
-use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
+use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{
     BackendError, HotUnplugDeviceKind, VmStateTransition, VmmAction, VmmActionError, VmmController,
     VmmData,
@@ -306,6 +310,15 @@ pub(crate) trait InstanceStartExecutor {
         Ok(())
     }
 
+    fn preflight_snapshot_v1_vsock(
+        &mut self,
+        _session: &mut Self::Session,
+        _config: Option<VsockConfig>,
+        _cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<(), HvfArm64BootVsockCaptureError> {
+        Ok(())
+    }
+
     fn publish_snapshot_v1(
         &mut self,
         session: &mut Self::Session,
@@ -422,6 +435,7 @@ pub(crate) enum NativeV1SnapshotPublicationError {
     EntropyPreflight(HvfArm64BootEntropyCaptureError),
     SerialPreflight(HvfArm64BootSerialCaptureError),
     NetworkPreflight(ProcessCaptureReadyNetworkError),
+    VsockPreflight(HvfArm64BootVsockCaptureError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -452,6 +466,9 @@ impl fmt::Display for NativeV1SnapshotPublicationError {
             Self::NetworkPreflight(source) => {
                 write!(f, "native-v1 network preflight failed: {source}")
             }
+            Self::VsockPreflight(source) => {
+                write!(f, "native-v1 vsock preflight failed: {source}")
+            }
             Self::Resource(source) => {
                 write!(
                     f,
@@ -477,6 +494,7 @@ impl std::error::Error for NativeV1SnapshotPublicationError {
             Self::EntropyPreflight(source) => Some(source),
             Self::SerialPreflight(source) => Some(source),
             Self::NetworkPreflight(source) => Some(source),
+            Self::VsockPreflight(source) => Some(source),
             Self::Resource(source) => Some(source),
             Self::Transaction(source) => Some(source),
             Self::SessionUnavailable | Self::ConfigurationUnavailable => None,
@@ -3791,6 +3809,10 @@ where
                 mmds_state,
             )
             .map_err(NativeV1SnapshotPublicationError::NetworkPreflight)?;
+        let vsock_config = self.controller.vsock_config().cloned();
+        self.starter
+            .preflight_snapshot_v1_vsock(session, vsock_config, cancellation.clone())
+            .map_err(NativeV1SnapshotPublicationError::VsockPreflight)?;
 
         self.controller
             .preflight_create_snapshot_profile()
@@ -4201,6 +4223,17 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     ) -> Result<(), ProcessCaptureReadyNetworkError> {
         session
             .capture_ready_network_state(vmnet_authority, configs, mmds_config, mmds_state)
+            .map(|_| ())
+    }
+
+    fn preflight_snapshot_v1_vsock(
+        &mut self,
+        session: &mut Self::Session,
+        config: Option<VsockConfig>,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<(), HvfArm64BootVsockCaptureError> {
+        session
+            .preflight_capture_ready_vsock(config, cancellation)
             .map(|_| ())
     }
 
@@ -4690,6 +4723,19 @@ impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
         guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
     ) -> Result<Option<HvfArm64BootBalloonCaptureState>, HvfArm64BootBalloonCaptureError> {
         self.session.capture_ready_balloon_state(config, guard)
+    }
+
+    fn capture_ready_vsock_state_with_cancel(
+        &mut self,
+        config: Option<VsockConfig>,
+        expected_metrics: &SharedVsockDeviceMetrics,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        cancellation: &NativeV1SnapshotCaptureCancellation,
+    ) -> Result<Option<HvfArm64BootVsockCaptureState>, HvfArm64BootVsockCaptureError> {
+        self.session
+            .capture_ready_vsock_state_with_cancel(config, expected_metrics, guard, |_| {
+                cancellation.is_cancelled()
+            })
     }
 
     fn capture_ready_memory_hotplug_state(
@@ -8962,6 +9008,28 @@ fn storage_capture_error_from_boot_run_loop_command<C>(
     }
 }
 
+fn vsock_capture_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, HvfArm64BootVsockCaptureError>,
+) -> HvfArm64BootVsockCaptureError {
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        BootRunLoopCommandError::WorkerNotPaused
+        | BootRunLoopCommandError::SnapshotQuiescenceActive
+        | BootRunLoopCommandError::QueueFull => HvfArm64BootVsockCaptureError::owner_unavailable(
+            HvfArm64BootVsockCaptureDisposition::Recoverable,
+        ),
+        BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::AdmissionClosed
+        | BootRunLoopCommandError::QueueClosed
+        | BootRunLoopCommandError::Wakeup { .. }
+        | BootRunLoopCommandError::ResponseClosed => {
+            HvfArm64BootVsockCaptureError::owner_unavailable(
+                HvfArm64BootVsockCaptureDisposition::Terminal,
+            )
+        }
+    }
+}
+
 fn balloon_capture_error_from_boot_run_loop_command<C>(
     err: BootRunLoopCommandError<C, HvfArm64BootBalloonCaptureError>,
 ) -> HvfArm64BootBalloonCaptureError {
@@ -10105,6 +10173,59 @@ impl
         .map_err(network_capture_error_from_boot_run_loop_command)
     }
 
+    fn preflight_capture_ready_vsock(
+        &self,
+        config: Option<VsockConfig>,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<Option<HvfArm64BootVsockCaptureState>, HvfArm64BootVsockCaptureError> {
+        let expected_metrics = self.vsock_device_metrics.clone().ok_or_else(|| {
+            HvfArm64BootVsockCaptureError::owner_unavailable(
+                HvfArm64BootVsockCaptureDisposition::Terminal,
+            )
+        })?;
+        let active_capture = self
+            .register_snapshot_capture(cancellation.clone())
+            .map_err(|_| {
+                HvfArm64BootVsockCaptureError::owner_unavailable(
+                    HvfArm64BootVsockCaptureDisposition::Recoverable,
+                )
+            })?;
+        if !cancellation.begin_operation() {
+            return Err(HvfArm64BootVsockCaptureError::cancelled(
+                HvfArm64BootVsockCaptureStage::Inventory,
+            ));
+        }
+
+        let result = self.run_snapshot_quiesced(move |session| {
+            let _active_capture = active_capture;
+            let guard = session.quiesce_snapshot_auxiliary_work().map_err(|_| {
+                HvfArm64BootVsockCaptureError::owner_unavailable(
+                    HvfArm64BootVsockCaptureDisposition::Terminal,
+                )
+            })?;
+            let result = session.capture_ready_vsock_state_with_cancel(
+                config,
+                &expected_metrics,
+                &guard,
+                &cancellation,
+            );
+            drop(guard);
+            result
+        });
+        let result = result.map_err(vsock_capture_error_from_boot_run_loop_command);
+        if let Err(source) = &result
+            && source.is_terminal()
+        {
+            self.status.record(BootRunLoopWorkerStatus::Failed(
+                "terminal vsock capture failure".to_string(),
+            ));
+            self.admission.shutdown();
+            self.pause_gate.shutdown();
+            let _ = self.control.request_stop();
+        }
+        result
+    }
+
     fn preflight_capture_ready_storage(
         &self,
         configs: CaptureReadyStorageConfigs,
@@ -10894,7 +11015,7 @@ mod tests {
         Arm64BootPmemDevice, VmStartupResources,
     };
     use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
-    use bangbang_runtime::vsock::VsockConfigInput;
+    use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
     use bangbang_runtime::{
         BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
         VmmActionError, VmmController, VmmData,
@@ -10939,20 +11060,22 @@ mod tests {
         HvfArm64BootBalloonCaptureError, HvfArm64BootEntropyCaptureError,
         HvfArm64BootMemoryHotplugCaptureError, HvfArm64BootSerialCaptureError,
         HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootStorageCaptureError,
-        HvfInstanceStartExecutor, InstanceStartError, InstanceStartExecutor,
-        NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
-        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
-        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
-        NativeV1SnapshotPublicationTransactionError, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, ProcessCaptureReadyNetworkError, ProcessHvfBootSession,
-        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
-        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
-        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
-        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
-        ProcessVmm, ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
-        SnapshotCreateSession, SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        HvfArm64BootVsockCaptureDisposition, HvfArm64BootVsockCaptureError,
+        HvfArm64BootVsockCaptureErrorKind, HvfArm64BootVsockCaptureStage, HvfInstanceStartExecutor,
+        InstanceStartError, InstanceStartExecutor, NativeV1SnapshotCaptureCancellation,
+        NativeV1SnapshotCaptureError, NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
+        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
+        NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
+        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink,
+        ProcessCaptureReadyNetworkError, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
+        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
+        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
+        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
+        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
+        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, require_native_v1_composite_record,
-        snapshot_destination_machine_config,
+        snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -12058,6 +12181,10 @@ mod tests {
         last_snapshot_mmds_config: Option<Option<MmdsConfig>>,
         last_snapshot_mmds_state: Option<MmdsStateHandle>,
         snapshot_network_preflight_failure: bool,
+        snapshot_vsock_preflight_calls: usize,
+        last_snapshot_vsock_config: Option<Option<VsockConfig>>,
+        last_snapshot_vsock_cancellation: Option<NativeV1SnapshotCaptureCancellation>,
+        snapshot_vsock_preflight_failure: Option<HvfArm64BootVsockCaptureError>,
         snapshot_publication_failure: bool,
     }
 
@@ -12095,6 +12222,10 @@ mod tests {
                 last_snapshot_mmds_config: None,
                 last_snapshot_mmds_state: None,
                 snapshot_network_preflight_failure: false,
+                snapshot_vsock_preflight_calls: 0,
+                last_snapshot_vsock_config: None,
+                last_snapshot_vsock_cancellation: None,
+                snapshot_vsock_preflight_failure: None,
                 snapshot_publication_failure: false,
             }
         }
@@ -12137,6 +12268,14 @@ mod tests {
             self
         }
 
+        fn with_snapshot_vsock_preflight_failure(mut self) -> Self {
+            self.snapshot_vsock_preflight_failure =
+                Some(HvfArm64BootVsockCaptureError::owner_unavailable(
+                    HvfArm64BootVsockCaptureDisposition::Recoverable,
+                ));
+            self
+        }
+
         const fn failure(source: BackendError) -> Self {
             Self {
                 result: FakeStartResult::Failure(source),
@@ -12166,6 +12305,10 @@ mod tests {
                 last_snapshot_mmds_config: None,
                 last_snapshot_mmds_state: None,
                 snapshot_network_preflight_failure: false,
+                snapshot_vsock_preflight_calls: 0,
+                last_snapshot_vsock_config: None,
+                last_snapshot_vsock_cancellation: None,
+                snapshot_vsock_preflight_failure: None,
                 snapshot_publication_failure: false,
             }
         }
@@ -12199,6 +12342,10 @@ mod tests {
                 last_snapshot_mmds_config: None,
                 last_snapshot_mmds_state: None,
                 snapshot_network_preflight_failure: false,
+                snapshot_vsock_preflight_calls: 0,
+                last_snapshot_vsock_config: None,
+                last_snapshot_vsock_cancellation: None,
+                snapshot_vsock_preflight_failure: None,
                 snapshot_publication_failure: false,
             }
         }
@@ -12334,6 +12481,22 @@ mod tests {
                 Err(ProcessCaptureReadyNetworkError::OwnerUnavailable)
             } else {
                 Ok(())
+            }
+        }
+
+        fn preflight_snapshot_v1_vsock(
+            &mut self,
+            _session: &mut Self::Session,
+            config: Option<VsockConfig>,
+            cancellation: NativeV1SnapshotCaptureCancellation,
+        ) -> Result<(), HvfArm64BootVsockCaptureError> {
+            self.snapshot_preflight_trace.push("vsock");
+            self.snapshot_vsock_preflight_calls += 1;
+            self.last_snapshot_vsock_config = Some(config);
+            self.last_snapshot_vsock_cancellation = Some(cancellation);
+            match self.snapshot_vsock_preflight_failure {
+                Some(error) => Err(error),
+                None => Ok(()),
             }
         }
 
@@ -12550,6 +12713,54 @@ mod tests {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("fake run loop command failed")
         }
+    }
+
+    #[test]
+    fn vsock_capture_command_failures_preserve_retry_safety() {
+        let recoverable = [
+            BootRunLoopCommandError::WorkerNotPaused,
+            BootRunLoopCommandError::SnapshotQuiescenceActive,
+            BootRunLoopCommandError::QueueFull,
+        ];
+        for error in recoverable {
+            let mapped =
+                vsock_capture_error_from_boot_run_loop_command::<FakeRunLoopCommandError>(error);
+            assert_eq!(
+                mapped.disposition(),
+                HvfArm64BootVsockCaptureDisposition::Recoverable
+            );
+            assert_eq!(
+                mapped.kind(),
+                HvfArm64BootVsockCaptureErrorKind::OwnerUnavailable
+            );
+        }
+
+        let terminal = [
+            BootRunLoopCommandError::WorkerNotRunning,
+            BootRunLoopCommandError::AdmissionClosed,
+            BootRunLoopCommandError::QueueClosed,
+            BootRunLoopCommandError::Wakeup {
+                source: FakeRunLoopCommandError,
+            },
+            BootRunLoopCommandError::ResponseClosed,
+        ];
+        for error in terminal {
+            let mapped = vsock_capture_error_from_boot_run_loop_command(error);
+            assert!(mapped.is_terminal());
+            assert_eq!(
+                mapped.kind(),
+                HvfArm64BootVsockCaptureErrorKind::OwnerUnavailable
+            );
+        }
+
+        let source =
+            HvfArm64BootVsockCaptureError::cancelled(HvfArm64BootVsockCaptureStage::Capture);
+        assert_eq!(
+            vsock_capture_error_from_boot_run_loop_command::<FakeRunLoopCommandError>(
+                BootRunLoopCommandError::Command { source }
+            ),
+            source
+        );
     }
 
     #[derive(Debug)]
@@ -21140,6 +21351,11 @@ mod tests {
             "eth0".to_string(),
         ])))
         .expect("broad snapshot MMDS should configure");
+        vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+            42,
+            "/private/broad-vsock.sock",
+        )))
+        .expect("broad snapshot vsock should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("broad snapshot fake session should start");
         vmm.handle_action(VmmAction::Pause)
@@ -21204,6 +21420,30 @@ mod tests {
                 .expect("network preflight should receive MMDS ownership")
                 .shares_state_with(&vmm.controller.mmds_state_handle())
         );
+        assert_eq!(vmm.starter.snapshot_vsock_preflight_calls, 1);
+        assert_eq!(
+            vmm.starter.last_snapshot_vsock_config.as_ref(),
+            Some(&vmm.controller.vsock_config().cloned())
+        );
+        assert!(
+            vmm.starter
+                .last_snapshot_vsock_cancellation
+                .as_ref()
+                .expect("vsock preflight should receive snapshot cancellation ownership")
+                .same_operation(&vmm.snapshot_capture_cancellation)
+        );
+        assert_eq!(
+            vmm.starter.snapshot_preflight_trace,
+            [
+                "storage",
+                "balloon",
+                "memory-hotplug",
+                "entropy",
+                "serial",
+                "network",
+                "vsock",
+            ]
+        );
         let session = vmm
             .started_session
             .as_ref()
@@ -21225,6 +21465,7 @@ mod tests {
             Entropy,
             Serial,
             Network,
+            Vsock,
         }
 
         const COMPLETE_TRACE: &[&str] = &[
@@ -21234,6 +21475,7 @@ mod tests {
             "entropy",
             "serial",
             "network",
+            "vsock",
         ];
         let cases = [
             (
@@ -21272,6 +21514,12 @@ mod tests {
                 FailureStage::Network,
                 "network",
                 FakeStarter::success(175).with_snapshot_network_preflight_failure(),
+                &COMPLETE_TRACE[..6],
+            ),
+            (
+                FailureStage::Vsock,
+                "vsock",
+                FakeStarter::success(176).with_snapshot_vsock_preflight_failure(),
                 COMPLETE_TRACE,
             ),
         ];
@@ -21348,6 +21596,7 @@ mod tests {
                 FailureStage::Entropy => vmm.starter.snapshot_entropy_preflight_failure = false,
                 FailureStage::Serial => vmm.starter.snapshot_serial_preflight_failure = false,
                 FailureStage::Network => vmm.starter.snapshot_network_preflight_failure = false,
+                FailureStage::Vsock => vmm.starter.snapshot_vsock_preflight_failure = None,
             }
 
             let retry_error = vmm
