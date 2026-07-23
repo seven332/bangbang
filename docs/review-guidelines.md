@@ -375,11 +375,23 @@ and stay `Removing` until exact acknowledgement commit after local zero and
 future protection work. Explicit teardown must wake waiters and drain
 already-linearized guards, while destructors remain nonblocking and retain
 mapping lifetime safely.
-Keep Mach task/thread ports and host virtual addresses inside the VMM, reject
-unmodified Linux UFFD wire traffic, and require pre-resource rejection for
-bypass profiles. Native-v1 `Uffd` must remain rejected until the restore gate, and
-`corpus:snapshot-page-faults` must remain nonterminal until signed
-host/guest/removal/failure/cleanup certification completes.
+Review the HVF host adapter as a task-wide authority boundary. MIG input must
+come from the public active SDK; installation must capture only bad access,
+construct all aliases before protection, and roll every partial owner back.
+The original mapping must stay hidden until one exact alias page is complete
+and ordered. Address ownership and ARM64 fault form must be revalidated before
+coordinator/source access. Unowned and unsupported messages must preserve the
+captured legacy/Mach behavior, flavor, returned state, and port disposition.
+Shutdown must drain admitted callbacks and restore only while still current;
+do not claim public Mach provides compare-and-swap restoration or that a task
+handler precedes thread-specific handlers. Owned callback failure must retain
+the fixed supervised exit, while unrelated faults must never be swallowed.
+
+Keep Mach task/thread ports, aliases, and host virtual addresses inside the
+VMM, reject unmodified Linux UFFD wire traffic, and require pre-resource
+rejection for bypass profiles. Native-v1 `Uffd` must remain rejected until the
+restore gate, and `corpus:snapshot-page-faults` must remain nonterminal until
+signed guest/removal/failure/cleanup certification completes.
 
 Run
 `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`

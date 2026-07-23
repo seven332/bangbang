@@ -8,6 +8,8 @@ mod dirty;
 mod exit;
 mod ffi;
 mod gic;
+mod lazy_host_fault;
+mod mach_lazy;
 mod memory;
 mod mmio;
 mod psci;
@@ -52,6 +54,11 @@ pub use gic::{
     HvfGicMsiSignalError, HvfGicMsiSignaler, HvfGicRedistributor, HvfGicRegion,
     HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicTimerInterrupts,
     HvfInterruptLineAllocationError,
+};
+pub use lazy_host_fault::{
+    HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfLazyHostFaultBridge, HvfLazyHostFaultError,
+    HvfLazyHostFaultShutdown, HvfLazyHostFaultStage, HvfLazyPageContents, HvfLazyPageRequest,
+    HvfLazyPageResolution, HvfLazyPageResolver, HvfLazyPageSource, HvfLazyPageSourceError,
 };
 pub use memory::{
     HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions,

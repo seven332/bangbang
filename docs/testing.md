@@ -1113,15 +1113,16 @@ moves one exact corpus record to #1527-owned
 `missing-platform-feasible`, making the current overlay 228/169/4/17 without
 changing native-v1 rejection.
 
-Snapshot paging feasibility, its standalone protocol, and its internal
-lazy-anonymous-memory coordinator are guarded separately from public runtime
-integration. The inventory test pins the upstream contract, public macOS
-environment, signed prototype output, unchanged entitlement floor, stable
-pre-access rejection anchors, exact delivery owner, protocol/coordinator
-source and documentation anchors, and nonterminal status. The pager package
-covers canonical framing, every split/coalesced boundary, adversarial input,
-negotiation, exact out-of-order matching, cancellation, shutdown, timeout/EOF,
-redaction, and two inherited-stream child-process sessions.
+Snapshot paging feasibility, its standalone protocol, internal
+lazy-anonymous-memory coordinator, and task-local host fault bridge are guarded
+separately from public runtime integration. The inventory test pins the
+upstream contract, public macOS environment, signed prototype output, unchanged
+entitlement floor, stable pre-access rejection anchors, exact delivery owner,
+protocol/coordinator/host-bridge source and documentation anchors, and
+nonterminal status. The pager package covers canonical framing, every
+split/coalesced boundary, adversarial input, negotiation, exact out-of-order
+matching, cancellation, shutdown, timeout/EOF, redaction, and two
+inherited-stream child-process sessions.
 
 The runtime lazy-memory tests use barriers, channels/condition wakeups, and
 bounded yield polling rather than sleeps. They cover absent private-anonymous
@@ -1141,10 +1142,29 @@ cargo test -p bangbang-runtime native_v1_load_policy_rejects_each_unsupported_di
 cargo test -p bangbang returns_fault_for_snapshot_endpoint --locked
 ```
 
+HVF host-fault unit tests use the real public Mach server for ordinary accesses
+and deterministic coordinator entry for failure paths. They cover host-page
+preflight, exact data/zero publication, read-to-write permission upgrade,
+source/content/coordinator terminalization, owner-busy alias rollback,
+admitted-action shutdown, redaction, and cleanup. The signed lifecycle cases
+then exercise real read-first, write-first, aligned atomic, and raw-pointer
+faults. A native prior handler repairs an unowned protected page after the
+bridge forwards it; that handler then replaces the bridge so shutdown proves
+it does not clobber a later owner. The lifecycle repeats, and an isolated child
+observes the exact fixed exit status for owned source failure. Run both the
+ordinary signed binary and the production App Sandbox replay:
+
+```sh
+cargo test -p bangbang-hvf --lib --all-features --locked lazy_host_fault
+scripts/run-integration-tests.sh --test hvf_lifecycle -- lazy_host_fault_integration::
+scripts/run-integration-tests.sh --test app_sandbox -- lazy_host_fault_integration::
+```
+
 The final #1527 certification must run the complete signed wrapper without
 `--allow-unsupported` and exercise the production pager path before promotion.
-The retained prototypes, standalone protocol, internal coordinator, and ledger
-are not production fault/broker/restore implementation evidence.
+The retained prototypes, standalone protocol, internal coordinator, host-only
+bridge, and ledger are not complete broker/guest/removal/restore implementation
+evidence.
 
 Run its two focused gates with:
 

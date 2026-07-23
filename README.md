@@ -400,10 +400,26 @@ regions behind a distinct `LazyGuestMemory` type: compact page states,
 strictly increasing generations, bounded duplicate-fault coalescing, scoped
 exact data/zero publication, retired-request accounting, acknowledged removal,
 and fail-closed teardown are implemented without exposing ordinary initialized
-memory APIs. It does not read a source, install Mach/HVF permissions, contact a
-peer, or change the native-v1 gate. Host/HVF fault delivery, launcher
-brokerage, transport/removal/failure wiring, consumer gating, restore, and
-certification remain deferred under #1527.
+memory APIs.
+
+On macOS Apple Silicon, `bangbang-hvf` now supplies the internal host half of
+that protection boundary. Public-SDK `mach_exc.defs` stubs receive only
+task-local bad-access exceptions; a private non-copying writable alias fills
+the complete page while the original stays inaccessible, then the shared
+resolver publishes least read/write permission and commits the coordinator
+generation. Unowned and unsupported exceptions are forwarded to the captured
+prior handler, shutdown restores it only while the bridge still owns the task
+slot, and an owned internal failure exits the supervised worker with fixed
+status 70. All task/thread ports, aliases, and host addresses stay inside the
+process. Signed tests cover reads, writes, atomics, raw pointers, forwarding,
+replacement, repeated teardown, and terminal failure both directly and under
+the production App Sandbox entitlement floor.
+
+This internal bridge accepts only a trusted in-process page source; it does not
+connect the pager transport, install HVF guest permissions, handle peer-driven
+removal/failure, audit bypassing consumers, or change the native-v1 gate. Guest
+fault delivery, launcher brokerage, transport/removal/failure wiring, consumer
+gating, restore, and final certification remain deferred under #1527.
 
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
@@ -1323,8 +1339,9 @@ artifact/restore/clone handoffs. The
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 then moves its one exact corpus record to feasible-but-undelivered #1527
 ownership while preserving native-v1 rejection. Its standalone protocol slice
-and backend-neutral coordinated lazy-anonymous-memory slice are implemented
-and tested without promoting the aggregate capability.
+backend-neutral coordinated lazy-anonymous-memory slice, and task-local public
+Mach host-fault bridge are implemented and tested without promoting the
+aggregate capability.
 The repository-wide disposition counts remain 228/169/4/17.
 
 ## Build And Test

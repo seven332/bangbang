@@ -130,6 +130,11 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "crates/runtime/src/lazy_memory.rs",
         "LazyGuestMemory",
         "cargo test -p bangbang-runtime lazy_memory",
+        "Implemented task-local host fault bridge",
+        "crates/hvf/src/lazy_host_fault.rs",
+        "task_swap_exception_ports",
+        "fixed status 70",
+        "lazy_host_fault_integration::",
         "BBPAGER\\0",
         "cargo test -p bangbang-pager",
         "classify_v1_load_request",
@@ -196,6 +201,81 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         assert!(
             lazy_source.contains(required),
             "lazy-memory coordinator must retain {required}"
+        );
+    }
+
+    let hvf_manifest = std::fs::read_to_string(repository_root.join("crates/hvf/Cargo.toml"))
+        .expect("checked HVF manifest must be readable");
+    assert!(
+        hvf_manifest.contains("bangbang-pager = { path = \"../pager\" }")
+            && hvf_manifest.contains("bangbang-runtime = { path = \"../runtime\" }"),
+        "host adapter must retain only its direct coordinator/protocol type dependencies"
+    );
+
+    let hvf_build = std::fs::read_to_string(repository_root.join("crates/hvf/build.rs"))
+        .expect("checked HVF build script must be readable");
+    for required in [
+        "mach/mach_exc.defs",
+        "bangbang_mach_exc_user.c",
+        "bangbang_mach_exc_server.c",
+        "xcrun",
+        "MACH_LAZY_FAULT_SHIM_SOURCE",
+    ] {
+        assert!(
+            hvf_build.contains(required),
+            "HVF public-Mach build must retain {required}"
+        );
+    }
+
+    let mach_source =
+        std::fs::read_to_string(repository_root.join("crates/hvf/native/mach_lazy_fault.c"))
+            .expect("checked Mach host-fault source must be readable");
+    for required in [
+        "mach_make_memory_entry_64",
+        "mach_vm_map",
+        "task_swap_exception_ports",
+        "EXC_MASK_BAD_ACCESS",
+        "forward_exception",
+        "restore_previous_if_current",
+        "BANGBANG_MACH_TERMINAL_EXIT_CODE = 70",
+    ] {
+        assert!(
+            mach_source.contains(required),
+            "Mach host-fault source must retain {required}"
+        );
+    }
+
+    let host_bridge =
+        std::fs::read_to_string(repository_root.join("crates/hvf/src/lazy_host_fault.rs"))
+            .expect("checked host-fault bridge source must be readable");
+    for required in [
+        "pub trait HvfLazyPageSource",
+        "pub struct HvfLazyPageResolver",
+        "pub struct HvfLazyHostFaultBridge",
+        "resolve_host_address",
+        "assume_initialized_by_platform",
+        "owner_busy_install_rolls_back_candidate_aliases_without_protection",
+        "shutdown_waits_for_an_admitted_host_population",
+        "public_diagnostics_redact_fault_authority_and_contents",
+    ] {
+        assert!(
+            host_bridge.contains(required),
+            "host-fault bridge must retain {required}"
+        );
+    }
+
+    let signed_lifecycle =
+        std::fs::read_to_string(repository_root.join("crates/hvf/tests/hvf_lifecycle.rs"))
+            .expect("signed HVF lifecycle source must be readable");
+    for required in [
+        "task_local_lazy_fault_bridge_populates_real_host_accesses_and_repeats",
+        "task_local_lazy_fault_bridge_forwards_and_preserves_a_later_owner",
+        "task_local_lazy_fault_bridge_uses_fixed_terminal_exit_on_owned_failure",
+        "bangbang_mach_test_handler_reinstall",
+    ] {
+        assert!(
+            signed_lifecycle.contains(required),
+            "signed host-fault evidence must retain {required}"
         );
     }
 

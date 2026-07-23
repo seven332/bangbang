@@ -86,6 +86,461 @@ fn app_sandbox_hvf_lifecycle_replay_requires_exact_bundle_layout() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod lazy_host_fault_integration {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use bangbang_hvf::{
+        HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfLazyHostFaultBridge, HvfLazyPageContents,
+        HvfLazyPageRequest, HvfLazyPageSource, HvfLazyPageSourceError,
+    };
+    use bangbang_pager::{
+        MAX_FRAME_BYTES, PageAccess, PagerLimits, PagerOperations, PagerRegionId,
+    };
+    use bangbang_runtime::lazy_memory::{
+        LazyGuestMemory, LazyGuestMemoryLimits, LazyGuestMemoryRegion, LazyPageState,
+    };
+    use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
+
+    use super::{HVF_LIFECYCLE_TEST_LOCK, host_page_size};
+
+    const GUEST_BASE: u64 = 0x9000_0000;
+    const SOURCE_BASE: u64 = 0x20_0000;
+    const TEST_VALUE: u64 = 0x3141_5926_5358_9793;
+    const TERMINAL_CHILD_ENV: &str = "BANGBANG_SIGNED_MACH_LAZY_TERMINAL_CHILD";
+
+    enum SignedSourceReply {
+        Data(Vec<u8>),
+        Zero,
+        Failure,
+    }
+
+    struct SignedLazySource {
+        requests: Mutex<Vec<HvfLazyPageRequest>>,
+        reply: SignedSourceReply,
+    }
+
+    impl SignedLazySource {
+        fn data(page: Vec<u8>) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                reply: SignedSourceReply::Data(page),
+            }
+        }
+
+        fn zero() -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                reply: SignedSourceReply::Zero,
+            }
+        }
+
+        fn failure() -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                reply: SignedSourceReply::Failure,
+            }
+        }
+    }
+
+    impl HvfLazyPageSource for SignedLazySource {
+        fn page(
+            &self,
+            request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            self.requests
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            match &self.reply {
+                SignedSourceReply::Data(page) => Ok(HvfLazyPageContents::data(page.clone())),
+                SignedSourceReply::Zero => Ok(HvfLazyPageContents::zero()),
+                SignedSourceReply::Failure => Err(HvfLazyPageSourceError::failed()),
+            }
+        }
+    }
+
+    fn lazy_memory(page_count: u64) -> Arc<LazyGuestMemory> {
+        let page_size = u32::try_from(host_page_size().expect("host page size should be valid"))
+            .expect("host page size should fit u32");
+        let pager = PagerLimits::new(
+            page_size,
+            1,
+            2,
+            u32::try_from(MAX_FRAME_BYTES).expect("maximum frame size should fit u32"),
+            PagerOperations::v1(),
+        )
+        .expect("signed pager limits should validate");
+        let limits = LazyGuestMemoryLimits::new(pager, page_count, 8)
+            .expect("signed lazy-memory limits should validate");
+        let region_size = u64::from(page_size)
+            .checked_mul(page_count)
+            .expect("signed lazy region size should fit");
+        let range = GuestMemoryRange::new(GuestAddress::new(GUEST_BASE), region_size)
+            .expect("signed guest range should validate");
+        let region = LazyGuestMemoryRegion::new(
+            PagerRegionId::new(1).expect("signed region id should validate"),
+            range,
+            SOURCE_BASE,
+            page_size,
+        )
+        .expect("signed lazy-memory region should validate");
+        Arc::new(
+            LazyGuestMemory::new(limits, vec![region])
+                .expect("signed lazy memory should construct"),
+        )
+    }
+
+    struct AnonymousTestPage {
+        pointer: NonNull<c_void>,
+        length: usize,
+    }
+
+    impl AnonymousTestPage {
+        fn new(length: usize) -> Self {
+            // SAFETY: the arguments request one private anonymous mapping. The
+            // returned pointer is checked before this owner retains it.
+            let pointer = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    length,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(
+                pointer,
+                libc::MAP_FAILED,
+                "anonymous forwarding target should map"
+            );
+            Self {
+                pointer: NonNull::new(pointer).expect("successful mmap should be non-null"),
+                length,
+            }
+        }
+
+        fn as_ptr(&self) -> *mut c_void {
+            self.pointer.as_ptr()
+        }
+
+        fn protect_none(&self) {
+            // SAFETY: this owner retains the complete page-aligned mapping for
+            // the exact length supplied to mmap.
+            let status =
+                unsafe { libc::mprotect(self.pointer.as_ptr(), self.length, libc::PROT_NONE) };
+            assert_eq!(status, 0, "forwarding target should become inaccessible");
+        }
+    }
+
+    impl Drop for AnonymousTestPage {
+        fn drop(&mut self) {
+            // SAFETY: this is the one retained mmap allocation and Drop runs
+            // after the test handler has stopped using its address.
+            let _ = unsafe { libc::munmap(self.pointer.as_ptr(), self.length) };
+        }
+    }
+
+    unsafe extern "C" {
+        fn bangbang_mach_test_handler_install(
+            target: *mut c_void,
+            target_size: usize,
+            output: *mut *mut c_void,
+        ) -> i32;
+        fn bangbang_mach_test_handler_reinstall(handler: *mut c_void) -> i32;
+        fn bangbang_mach_test_handler_is_current(handler: *mut c_void, current: *mut bool) -> i32;
+        fn bangbang_mach_test_handler_handled_count(handler: *const c_void) -> usize;
+        fn bangbang_mach_test_handler_shutdown(handler: *mut c_void, restored: *mut bool) -> i32;
+    }
+
+    struct MachTestHandler {
+        raw: Option<NonNull<c_void>>,
+    }
+
+    impl MachTestHandler {
+        fn install(target: &AnonymousTestPage) -> Self {
+            let mut output = std::ptr::null_mut();
+            // SAFETY: the target outlives this owner, and output is a writable
+            // opaque-owner slot. The native helper retains no Rust reference.
+            let status = unsafe {
+                bangbang_mach_test_handler_install(target.as_ptr(), target.length, &mut output)
+            };
+            assert_eq!(status, 0, "test exception handler should install");
+            Self {
+                raw: Some(
+                    NonNull::new(output)
+                        .expect("successful test-handler install should return an owner"),
+                ),
+            }
+        }
+
+        fn reinstall(&self) {
+            let raw = self.raw.expect("test handler should be live");
+            // SAFETY: raw names the live native owner retained by this value.
+            let status = unsafe { bangbang_mach_test_handler_reinstall(raw.as_ptr()) };
+            assert_eq!(status, 0, "test exception handler should reinstall");
+        }
+
+        fn is_current(&self) -> bool {
+            let raw = self.raw.expect("test handler should be live");
+            let mut current = false;
+            // SAFETY: raw is live and current is a writable out-parameter.
+            let status =
+                unsafe { bangbang_mach_test_handler_is_current(raw.as_ptr(), &mut current) };
+            assert_eq!(status, 0, "current exception owner should query");
+            current
+        }
+
+        fn handled_count(&self) -> usize {
+            let raw = self.raw.expect("test handler should be live");
+            // SAFETY: raw is retained for this read-only count query.
+            unsafe { bangbang_mach_test_handler_handled_count(raw.as_ptr()) }
+        }
+
+        fn shutdown(&mut self) -> bool {
+            let raw = self.raw.expect("test handler should be live");
+            let mut restored = false;
+            // SAFETY: raw is uniquely shut down here and restored is writable.
+            let status =
+                unsafe { bangbang_mach_test_handler_shutdown(raw.as_ptr(), &mut restored) };
+            assert_eq!(status, 0, "test exception handler should shut down");
+            self.raw = None;
+            restored
+        }
+    }
+
+    impl Drop for MachTestHandler {
+        fn drop(&mut self) {
+            let Some(raw) = self.raw else {
+                return;
+            };
+            let mut restored = false;
+            // SAFETY: this best-effort cleanup owns the remaining native
+            // handler, and the out-parameter remains valid for the call.
+            let status =
+                unsafe { bangbang_mach_test_handler_shutdown(raw.as_ptr(), &mut restored) };
+            if status == 0 {
+                self.raw = None;
+            }
+        }
+    }
+
+    #[test]
+    fn task_local_lazy_fault_bridge_populates_real_host_accesses_and_repeats() {
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let page_size = usize::try_from(host_page_size().expect("host page size should be valid"))
+            .expect("host page size should fit usize");
+
+        for iteration in 0..2_u64 {
+            let memory = lazy_memory(4);
+            let pointer = memory.mapping_regions()[0]
+                .host_address()
+                .as_ptr()
+                .cast::<u8>();
+            let mut page = vec![0_u8; page_size];
+            page[..std::mem::size_of::<u64>()]
+                .copy_from_slice(&(TEST_VALUE + iteration).to_ne_bytes());
+            let source = Arc::new(SignedLazySource::data(page));
+            let bridge = HvfLazyHostFaultBridge::install(
+                Arc::clone(&memory),
+                Arc::<SignedLazySource>::clone(&source),
+            )
+            .expect("signed lazy host-fault bridge should install");
+
+            // SAFETY: the bridge owns this retained first page and repairs its
+            // read protection fault before the instruction retries.
+            let read_value = unsafe { std::ptr::read_volatile(pointer.cast::<u64>()) };
+            assert_eq!(read_value, TEST_VALUE + iteration);
+
+            let written = 0xa5a5_5a5a_d1d1_e2e2_u64 + iteration;
+            // SAFETY: the second retained page is valid for one u64 and the
+            // bridge resolves its write-first fault before retry.
+            unsafe {
+                std::ptr::write_volatile(pointer.add(page_size).cast::<u64>(), written);
+            }
+
+            // SAFETY: the third retained page is aligned for AtomicU64. Its
+            // load and later store permissions are mediated before retry.
+            let atomic_old = unsafe {
+                (&*pointer.add(page_size * 2).cast::<AtomicU64>()).fetch_add(1, Ordering::SeqCst)
+            };
+            assert_eq!(atomic_old, TEST_VALUE + iteration);
+
+            let raw = (0x8877_6655_4433_2211_u64 + iteration).to_ne_bytes();
+            // SAFETY: the fourth retained page has room for the complete raw
+            // value and is repaired before the raw-pointer store retries.
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), pointer.add(page_size * 3), raw.len());
+            }
+
+            let region_id = PagerRegionId::new(1).expect("signed region id should validate");
+            for index in 0..4_u64 {
+                assert_eq!(
+                    memory
+                        .page_state(
+                            region_id,
+                            u64::try_from(page_size).expect("page size should fit u64") * index,
+                        )
+                        .expect("signed lazy page state should resolve"),
+                    LazyPageState::Present
+                );
+            }
+
+            let requests = source
+                .requests
+                .lock()
+                .expect("signed request log should not be poisoned");
+            assert_eq!(requests.len(), 4);
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.access())
+                    .collect::<Vec<_>>(),
+                [
+                    PageAccess::Read,
+                    PageAccess::Write,
+                    PageAccess::Read,
+                    PageAccess::Write,
+                ]
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.offset())
+                    .collect::<Vec<_>>(),
+                (0..4_u64)
+                    .map(|index| {
+                        u64::try_from(page_size).expect("page size should fit u64") * index
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert!(requests.iter().all(|request| {
+                request.source_offset() == SOURCE_BASE + request.offset()
+                    && request.length()
+                        == u32::try_from(page_size).expect("page size should fit u32")
+            }));
+            drop(requests);
+
+            assert!(
+                bridge
+                    .shutdown()
+                    .expect("signed lazy bridge should shut down")
+                    .prior_handler_restored()
+            );
+            // SAFETY: shutdown restores the retained mapping to read/write.
+            unsafe {
+                assert_eq!(
+                    std::ptr::read_volatile(pointer.add(page_size).cast::<u64>()),
+                    written
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn task_local_lazy_fault_bridge_forwards_and_preserves_a_later_owner() {
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let page_size = usize::try_from(host_page_size().expect("host page size should be valid"))
+            .expect("host page size should fit usize");
+        let forwarding_target = AnonymousTestPage::new(page_size);
+        // SAFETY: the fresh read/write mapping is aligned and large enough for
+        // one u64 initialization.
+        unsafe {
+            std::ptr::write_volatile(forwarding_target.as_ptr().cast::<u64>(), TEST_VALUE);
+        }
+        let mut prior_handler = MachTestHandler::install(&forwarding_target);
+        assert!(prior_handler.is_current());
+
+        let memory = lazy_memory(1);
+        let source = Arc::new(SignedLazySource::zero());
+        let bridge =
+            HvfLazyHostFaultBridge::install(memory, Arc::<SignedLazySource>::clone(&source))
+                .expect("bridge should capture the test prior handler");
+        assert!(!prior_handler.is_current());
+
+        forwarding_target.protect_none();
+        // SAFETY: this address is intentionally outside the bridge-owned lazy
+        // ranges. The bridge must forward it to the captured test handler,
+        // which restores this retained mapping before the instruction retries.
+        let forwarded =
+            unsafe { std::ptr::read_volatile(forwarding_target.as_ptr().cast::<u64>()) };
+        assert_eq!(forwarded, TEST_VALUE);
+        assert_eq!(prior_handler.handled_count(), 1);
+        assert!(
+            source
+                .requests
+                .lock()
+                .expect("signed request log should not be poisoned")
+                .is_empty(),
+            "an unowned host address must not reach the lazy coordinator"
+        );
+
+        prior_handler.reinstall();
+        assert!(prior_handler.is_current());
+        assert!(
+            !bridge
+                .shutdown()
+                .expect("bridge should shut down under a later owner")
+                .prior_handler_restored(),
+            "bridge shutdown must preserve the handler that replaced it"
+        );
+        assert!(prior_handler.is_current());
+        assert!(
+            prior_handler.shutdown(),
+            "test handler should restore the configuration captured before the bridge"
+        );
+    }
+
+    #[test]
+    fn task_local_lazy_fault_bridge_uses_fixed_terminal_exit_on_owned_failure() {
+        if std::env::var_os(TERMINAL_CHILD_ENV).is_none() {
+            let executable =
+                std::env::current_exe().expect("signed lifecycle executable should resolve");
+            let output = std::process::Command::new(executable)
+                .args([
+                    "--exact",
+                    "lazy_host_fault_integration::task_local_lazy_fault_bridge_uses_fixed_terminal_exit_on_owned_failure",
+                    "--nocapture",
+                ])
+                .env(TERMINAL_CHILD_ENV, "1")
+                .output()
+                .expect("signed terminal child should launch");
+            assert_eq!(
+                output.status.code(),
+                Some(HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE),
+                "owned failure should take the fixed terminal exit\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let memory = lazy_memory(1);
+        let pointer = memory.mapping_regions()[0]
+            .host_address()
+            .as_ptr()
+            .cast::<u8>();
+        let source = Arc::new(SignedLazySource::failure());
+        let _bridge = HvfLazyHostFaultBridge::install(memory, source)
+            .expect("terminal child bridge should install");
+        // SAFETY: this retained owned page deliberately faults. The source
+        // failure must terminate the process before this instruction returns.
+        let _ = unsafe { std::ptr::read_volatile(pointer) };
+        panic!("owned terminal fault unexpectedly returned");
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn temporary_virtual_block_fixture_preserves_rw_ro_bytes_and_exact_cleanup() {
     use std::sync::Arc;

@@ -13,7 +13,10 @@ emitted, described, or loaded by any public process path. The public lifecycle
 and CLI remain native-v1 until later Wave 6 work explicitly changes them.
 Separately, `LazyGuestMemory` is the backend-neutral private-anonymous
 coordinator for the external-paging roadmap; it is not the v2 File/COW loader
-and is not connected to a public restore path yet.
+and is not connected to a public restore path yet. `bangbang-hvf` now binds
+that coordinator to task-local public-Mach host faults through a trusted
+in-process content-source interface; pager transport, guest faults, and public
+restore remain separate later gates.
 
 ## Current Status
 
@@ -88,8 +91,8 @@ path.
   snapshot-specific rejection boundaries. The checked
   [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
   separately records a feasible public macOS equivalent plus the internal
-  protocol and lazy-memory ownership slices under #1527; neither changes this
-  runtime gate.
+  protocol, lazy-memory ownership, and task-local host fault slices under
+  #1527; none changes this runtime gate.
   Full/File load can enable a clean destination dirty epoch, independently of
   the source, and a tracked source resets only after visible Full publication.
   Parser and invalid-lifecycle failures still do not record snapshot latency;
@@ -1289,13 +1292,25 @@ failure, abandoned work, poison, generation exhaustion, and teardown close
 admission and wake waiters; explicit termination drains already-linearized
 actions while destructors stay nonblocking.
 
-This is still internal ownership, not a usable restore backend. It installs no
-Mach exception port or HVF permission, opens no peer or source, and exposes no
-native-v1 API success. Later integrations keep Mach task/thread ports inside
-the VMM, use HVF for guest faults, connect the coordinator to the protocol, and
-have the launcher supply only the connected stream. Native-v1 `Uffd` remains
-rejected before resource access until #1527's restore gate; host/guest fault
-delivery, brokerage, peer removal/failure, consumer gating, restore, and signed
+`bangbang-hvf` now supplies the host adapter for this internal ownership. It
+generates public `mach_exc` stubs from the active SDK, atomically captures the
+prior task bad-access configuration, retains non-copying writable aliases,
+protects original mappings, and resolves exact owned read/write faults through
+the same coordinator. Complete bytes become visible only after alias copy and
+an ordering fence. Unowned or unsupported exceptions forward to the prior
+legacy/Mach behavior, shutdown restores only while still current, and an owned
+failure exits the supervised worker with fixed status 70. Task/thread ports
+and host addresses remain inside the process. Signed direct and App Sandbox
+tests cover reads, writes, atomics, raw pointers, forwarding, later-owner
+preservation, repeated cleanup, and terminal failure.
+
+This is still not a usable restore backend. The adapter accepts a trusted
+in-process content source but opens no peer or pager transport, installs no HVF
+guest permission, and exposes no native-v1 API success. Later integrations use
+HVF for guest faults, connect the coordinator to the protocol, and have the
+launcher supply only the connected stream. Native-v1 `Uffd` remains rejected
+before resource access until #1527's restore gate; guest fault delivery,
+brokerage, peer removal/failure, consumer gating, restore, and final signed
 certification remain nonterminal.
 
 ### Implemented public native-v1 restore order

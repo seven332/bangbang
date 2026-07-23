@@ -458,6 +458,24 @@ impl LazyGuestMemoryTarget<'_> {
         *self.initialized = true;
         Ok(())
     }
+
+    /// Records that one platform-private write path initialized this target.
+    ///
+    /// # Safety
+    ///
+    /// Before calling this method, the caller must prove that its private write
+    /// path (such as a retained same-object alias) addresses the same memory
+    /// object and exact byte range as this target, that every target byte has
+    /// been initialized through that path, and that those writes happen before
+    /// any platform permission exposes the original mapping to uncoordinated
+    /// access. All involved mappings must remain valid for the complete call.
+    pub unsafe fn assume_initialized_by_platform(&mut self) -> Result<(), LazyGuestMemoryError> {
+        if *self.initialized {
+            return Err(LazyGuestMemoryError::ContentAlreadyInstalled);
+        }
+        *self.initialized = true;
+        Ok(())
+    }
 }
 
 impl fmt::Debug for LazyGuestMemoryTarget<'_> {
@@ -575,6 +593,11 @@ impl LazyGuestMemory {
     /// Returns mapping metadata for later in-process backend adapters.
     pub fn mapping_regions(&self) -> &[GuestMemoryRegion] {
         self.inner.memory.regions()
+    }
+
+    /// Returns the exact coordinator page size selected by the pager limits.
+    pub fn page_size(&self) -> u32 {
+        self.inner.limits.pager.page_size()
     }
 
     /// Returns the exact immutable coordinator region count.
@@ -2175,6 +2198,7 @@ mod tests {
         let memory = owner(2, 2, 4);
 
         assert_eq!(memory.region_count(), 1);
+        assert_eq!(memory.page_size(), PAGE_SIZE);
         assert_eq!(memory.mapping_regions().len(), 1);
         assert_eq!(
             memory.mapping_regions()[0].backing(),
@@ -2199,6 +2223,42 @@ mod tests {
             0
         );
         assert_eq!(read_page(&memory, 0), vec![0; PAGE_SIZE as usize]);
+    }
+
+    #[test]
+    fn platform_alias_proof_marks_one_exact_publication_once() {
+        let memory = owner(1, 1, 1);
+        let population = fault(&memory, 0, PageAccess::Read);
+        let mut publication = population
+            .begin_publication()
+            .expect("test population should enter publication");
+        let mut target = publication
+            .target()
+            .expect("test publication target should resolve");
+        let installed = vec![0x5a; PAGE_SIZE as usize];
+        // SAFETY: the target is live for exactly PAGE_SIZE bytes and the test
+        // writes every byte before recording the platform publication proof.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                installed.as_ptr(),
+                target.host_address().as_ptr().cast::<u8>(),
+                installed.len(),
+            );
+            target
+                .assume_initialized_by_platform()
+                .expect("first platform proof should succeed");
+        }
+        // SAFETY: this second call intentionally exercises duplicate-proof
+        // rejection while the same exact initialized target remains live.
+        let duplicate = unsafe { target.assume_initialized_by_platform() };
+        assert!(matches!(
+            duplicate,
+            Err(LazyGuestMemoryError::ContentAlreadyInstalled)
+        ));
+        publication
+            .commit()
+            .expect("platform-proven publication should commit");
+        assert_eq!(read_page(&memory, 0), installed);
     }
 
     #[test]

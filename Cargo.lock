@@ -135,6 +135,7 @@ dependencies = [
 name = "bangbang-hvf"
 version = "0.1.0"
 dependencies = [
+ "bangbang-pager",
  "bangbang-runtime",
  "cc",
  "device_tree",
