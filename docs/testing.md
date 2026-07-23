@@ -1106,8 +1106,29 @@ At the checked network/MMDS closure checkpoint, the overlay contained 220
 35-record selector promotes 29 formerly audited rows and retains exactly four
 for #1378, #1490, or #1491 outcomes. The subsequent checked vsock closure
 promotes eight API/live rows from its exact 14-record selector and retains six
-precise #1490 artifact/restore/clone outcomes, so the current overlay contains
-228/170/3/17 outcomes.
+precise #1490 artifact/restore/clone outcomes, so that checkpoint contained
+228/170/3/17 outcomes. The subsequent checked
+[snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
+moves one exact corpus record to #1527-owned
+`missing-platform-feasible`, making the current overlay 228/169/4/17 without
+changing native-v1 rejection.
+
+Snapshot paging feasibility is guarded separately from implementation. Its
+focused inventory test pins the upstream contract, public macOS environment,
+signed host/guest/removal/peer-loss/cleanup output, unchanged App Sandbox and
+Hypervisor entitlement floor, stable pre-access rejection anchors, exact
+delivery owner, and nonterminal status:
+
+```sh
+cargo test -p bangbang-firecracker-capability-audit --test checked_inventory snapshot_paging_feasibility_policy_is_stable --locked
+cargo test -p bangbang-runtime native_v1_load_policy_rejects_each_unsupported_dimension --locked
+cargo test -p bangbang returns_fault_for_snapshot_endpoint --locked
+```
+
+The final #1527 certification must run the complete signed wrapper without
+`--allow-unsupported` and exercise the production pager path before promotion.
+The retained prototypes and this ledger are not production implementation
+evidence.
 
 Run its two focused gates with:
 

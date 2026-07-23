@@ -80,8 +80,12 @@ path.
   corrected request. Failures after an uncertain construction/cleanup boundary
   latch the process terminal. Create/load execution faults are typed and
   snapshot-specific while diagnostics remain path- and value-redacted.
-- `Diff`, UFFD, realtime adjustment, overrides, unsupported device profiles,
-  and incompatible artifacts retain snapshot-specific rejection boundaries.
+- `Diff`, native-v1 `Uffd` runtime success, realtime adjustment, overrides,
+  unsupported device profiles, and incompatible artifacts retain
+  snapshot-specific rejection boundaries. The checked
+  [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
+  separately records a feasible public macOS equivalent under #1527; it does
+  not change this runtime gate.
   Full/File load can enable a clean destination dirty epoch, independently of
   the source, and a tracked source resets only after visible Full publication.
   Parser and invalid-lifecycle failures still do not record snapshot latency;
@@ -317,8 +321,12 @@ the complete state and memory artifacts outside this codec. After validation,
 the retained inode must remain immutable for the mapping lifetime; macOS offers
 no seal for an arbitrary external regular file, so concurrent external mutation
 or truncation violates the loader contract. Public native-v2 create/load,
-transactional pair publication, machine/vCPU/device state, Diff/merge, UFFD,
-and clone/portability policy remain follow-on work.
+transactional pair publication, machine/vCPU/device state, Diff/merge,
+UFFD-equivalent runtime integration, and clone/portability policy remain
+follow-on work. The public feasibility decision is recorded separately in the
+checked
+[snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md);
+File/COW remains a distinct backend.
 
 ## Native V1 Guest-Memory Image and Binding
 
@@ -1232,6 +1240,34 @@ generation clears. Complete rollback retains the old epoch; incomplete rollback
 blocks resume and requires teardown. Machine/load tracking flags are enabled.
 `Diff` artifact serialization, merging/restore, UFFD, and broader snapshot
 compatibility remain outside native-v1.
+
+### Public UFFD-equivalent feasibility
+
+The checked
+[snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
+pins Firecracker v1.16.0's external anonymous-memory/UFFD descriptor contract
+and the #1527 public-macOS evidence. Signed probes on arm64 macOS 26.5.2 with
+the public macOS 26.5 SDK established two independent protection planes:
+zero-permission HVF mappings produce exact guest IPA exits, while a task-local
+server generated from public `mach_exc.defs` can resolve an owned host fault
+inside the production App Sandbox entitlement floor. Host `PROT_NONE` alone
+does not trap guest access.
+
+The combined signed and production-entitlement probe delegated page contents
+and removal state to a socket-connected child and passed host and guest
+population, removal/refault-to-zero, peer-death detection, and cleanup.
+External Mach exception handling was rejected because it exports task-wide
+authority, fails unsafely on handler loss, and cannot use the tested production
+App Sandbox discovery path. A public custom Mach memory-object pager was also
+rejected by SDK, XNU, and runtime evidence.
+
+This proves an observable equivalent is feasible, not that Linux UFFD
+descriptor/wire traffic is accepted. The later design keeps Mach task/thread
+ports inside the VMM, uses HVF for guest faults, routes both planes through one
+generation-aware coordinator, and gives an external peer only bounded
+offset-based `bangbang-pager-v1` requests over a launcher-connected stream.
+Native-v1 `Uffd` remains rejected before resource access until #1527's restore
+gate; inventory remains nonterminal until signed certification.
 
 ### Implemented public native-v1 restore order
 

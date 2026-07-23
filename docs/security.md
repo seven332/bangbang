@@ -2115,6 +2115,34 @@ dispatcher lock order. Snapshot capture, preflight, and control-plane mutation
 retain the nonblocking busy policy, so this does not turn their admission checks
 into unbounded waits.
 
+## UFFD-Equivalent Pager Authority Boundary
+
+The checked
+[snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
+records positive public-macOS feasibility, not a shipped pager. Native-v1
+`Uffd` still rejects before path, socket, artifact, or backend access.
+
+The accepted later boundary uses two in-worker protection planes: public Mach
+task exceptions mediate host accesses to owned absent guest pages, and HVF
+stage-two permissions mediate guest accesses. Task and thread ports remain
+inside the worker because an exception receiver has whole-task authority, not
+UFFD's registered-range authority. Unrelated exceptions must be forwarded and
+the prior task configuration conditionally restored.
+
+The external content owner receives neither task ports nor host virtual
+addresses. The launcher reduces the configured Unix path to one connected
+stream, and the worker exposes only versioned, bounded, offset-based
+`bangbang-pager-v1` requests. This adds no ambient network entitlement,
+dynamic Mach service, root requirement, private API, entitlement weakening, or
+host-wide setting.
+
+Handler failure while a host instruction is suspended is a mandatory
+fail-closed supervision gate. Later implementation must bound I/O and take one
+documented terminal path; it may not fabricate zero or stale contents, fall
+through accidentally to `SIGBUS`, swallow a genuine crash, or wait
+indefinitely. External/shared mappings that bypass the task-local bridge remain
+pre-resource rejections until independently certified.
+
 ## Guest Data Exposure
 
 The guest is untrusted. vCPU execution, guest memory contents, virtqueue

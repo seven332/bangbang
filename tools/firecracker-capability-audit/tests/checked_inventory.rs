@@ -46,6 +46,110 @@ fn checked_source_manifest_is_canonical_and_deterministic() {
 }
 
 #[test]
+fn snapshot_paging_feasibility_policy_is_stable() {
+    const CAPABILITY_ID: &str = "corpus:snapshot-page-faults";
+    const DELIVERY_ISSUE: &str = "https://github.com/seven332/bangbang/issues/1527";
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let capability = inventory
+        .capabilities
+        .iter()
+        .find(|capability| capability.id == CAPABILITY_ID)
+        .expect("snapshot page-fault corpus record must exist");
+
+    assert_eq!(
+        capability.source_refs,
+        [CAPABILITY_ID],
+        "snapshot paging must retain its exact pinned source identity"
+    );
+    assert_eq!(
+        capability.disposition,
+        Disposition::MissingPlatformFeasible,
+        "snapshot paging must remain feasible but nonterminal until certification"
+    );
+    assert_eq!(
+        capability.delivery_issue.as_deref(),
+        Some(DELIVERY_ISSUE),
+        "snapshot paging must retain its challenged delivery owner"
+    );
+    assert!(
+        capability.implementation.is_empty()
+            && capability.validation.is_empty()
+            && capability.exclusion.is_none(),
+        "feasibility evidence must not masquerade as terminal capability evidence"
+    );
+    assert!(
+        capability.summary.contains(DELIVERY_ISSUE)
+            && capability
+                .summary
+                .contains("Native-v1 Uffd remains rejected")
+            && capability.summary.contains("not Linux UFFD"),
+        "snapshot paging summary must retain owner, runtime, and compatibility limits"
+    );
+
+    let contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/snapshot-paging-contract.md"),
+    )
+    .expect("checked snapshot paging contract must be readable");
+    let rows = contract
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "snapshot paging ledger must have one row");
+    assert!(
+        rows[0].starts_with(&format!("| `{CAPABILITY_ID}` |"))
+            && rows[0].contains("`missing-platform-feasible`")
+            && rows[0].contains(DELIVERY_ISSUE)
+            && rows[0].ends_with("| `nonterminal` |"),
+        "snapshot paging ledger row must pin identity, status, owner, and result"
+    );
+
+    for required in [
+        "d83d72b710361a10294480131377b1b00b163af8",
+        "handling-page-faults-on-snapshot-resume.md",
+        "mach_memory_object_memory_entry_64",
+        "hv_vm_protect",
+        "guest_bypassed_host_protection=true",
+        "guest_population value=0x31415926",
+        "host_population value=0x00000000 faults=1",
+        "removed_guest_population value=0x00000000",
+        "handler_death_detected=true",
+        "cleanup=complete",
+        "com.apple.security.app-sandbox",
+        "com.apple.security.hypervisor",
+        "bangbang-pager-v1",
+        "classify_v1_load_request",
+        "native_v1_load_policy_rejects_each_unsupported_dimension",
+        "returns_fault_for_snapshot_endpoint",
+        "signed_executable_creates_and_restores_native_v1_snapshot_across_processes",
+        "https://github.com/seven332/bangbang/issues/1555",
+    ] {
+        assert!(
+            contract.contains(required),
+            "snapshot paging contract must pin {required}"
+        );
+    }
+
+    let count = |disposition| {
+        inventory
+            .capabilities
+            .iter()
+            .filter(|capability| capability.disposition == disposition)
+            .count()
+    };
+    assert_eq!(count(Disposition::ImplementedAndVerified), 228);
+    assert_eq!(count(Disposition::AuditRequired), 169);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 4);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
+}
+
+#[test]
 fn network_mmds_closure_policy_is_stable() {
     const TERMINAL: [&str; 31] = [
         "api-operation:GET /mmds",
@@ -265,8 +369,8 @@ fn network_mmds_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 228);
-    assert_eq!(count(Disposition::AuditRequired), 170);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
+    assert_eq!(count(Disposition::AuditRequired), 169);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 4);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
 
@@ -477,8 +581,8 @@ fn vsock_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 228);
-    assert_eq!(count(Disposition::AuditRequired), 170);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
+    assert_eq!(count(Disposition::AuditRequired), 169);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 4);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
 
@@ -747,8 +851,8 @@ fn delivery_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 228);
-    assert_eq!(count(Disposition::AuditRequired), 170);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
+    assert_eq!(count(Disposition::AuditRequired), 169);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 4);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
     for id in IMPLEMENTED_ORIGINAL {
