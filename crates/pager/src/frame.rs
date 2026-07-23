@@ -1343,6 +1343,39 @@ mod tests {
             ),
             Err(PagerError::UnexpectedEof)
         );
+
+        let region = PagerRegion::new(
+            PagerRegionId::new(2).expect("region should be nonzero"),
+            0,
+            u64::from(MIN_PAGE_SIZE),
+            MIN_PAGE_SIZE,
+        )
+        .expect("region should be valid");
+        let mut body_reserved =
+            encode_frame(&PagerFrame::new(session(), PagerMessage::Region(region)))
+                .expect("region should encode");
+        *body_reserved
+            .get_mut(HEADER_BYTES + SESSION_BYTES + 4)
+            .expect("region reserved byte should exist") = 1;
+        assert_eq!(decode_frame(&body_reserved), Err(PagerError::InvalidFrame));
+
+        let mut zero_session = encoded.clone();
+        zero_session
+            .get_mut(HEADER_BYTES..HEADER_BYTES + SESSION_BYTES)
+            .expect("session field should exist")
+            .fill(0);
+        assert_eq!(decode_frame(&zero_session), Err(PagerError::InvalidFrame));
+
+        let mut zero_request = encode_frame(&PagerFrame::new(
+            session(),
+            PagerMessage::PageRequest(page()),
+        ))
+        .expect("page request should encode");
+        zero_request
+            .get_mut(HEADER_BYTES + SESSION_BYTES..HEADER_BYTES + SESSION_BYTES + 8)
+            .expect("request identity should exist")
+            .fill(0);
+        assert_eq!(decode_frame(&zero_request), Err(PagerError::InvalidFrame));
     }
 
     #[test]
@@ -1374,6 +1407,120 @@ mod tests {
             Err(PagerError::Poisoned)
         );
         assert_eq!(decoder.finish(), Err(PagerError::Poisoned));
+    }
+
+    #[test]
+    fn exact_global_edges_succeed_and_one_over_edges_fail() {
+        let global_frame =
+            u32::try_from(MAX_FRAME_BYTES).expect("maximum frame size should fit u32");
+        let minimum_frame = u32::try_from(HEADER_BYTES + PAGE_METADATA_BYTES)
+            .expect("metadata size should fit u32")
+            .checked_add(MIN_PAGE_SIZE)
+            .expect("minimum frame should fit");
+        assert!(
+            PagerLimits::new(MIN_PAGE_SIZE, 1, 1, minimum_frame, PagerOperations::v1(),).is_ok()
+        );
+        assert!(
+            PagerLimits::new(
+                MAX_PAGE_SIZE,
+                MAX_REGIONS,
+                MAX_IN_FLIGHT,
+                global_frame,
+                PagerOperations::v1(),
+            )
+            .is_ok()
+        );
+
+        for invalid in [
+            PagerLimits::new(MIN_PAGE_SIZE, 0, 1, minimum_frame, PagerOperations::v1()),
+            PagerLimits::new(
+                MIN_PAGE_SIZE,
+                MAX_REGIONS + 1,
+                1,
+                minimum_frame,
+                PagerOperations::v1(),
+            ),
+            PagerLimits::new(MIN_PAGE_SIZE, 1, 0, minimum_frame, PagerOperations::v1()),
+            PagerLimits::new(
+                MIN_PAGE_SIZE,
+                1,
+                MAX_IN_FLIGHT + 1,
+                minimum_frame,
+                PagerOperations::v1(),
+            ),
+            PagerLimits::new(
+                MIN_PAGE_SIZE,
+                1,
+                1,
+                minimum_frame - 1,
+                PagerOperations::v1(),
+            ),
+            PagerLimits::new(
+                MAX_PAGE_SIZE,
+                MAX_REGIONS,
+                MAX_IN_FLIGHT,
+                global_frame + 1,
+                PagerOperations::v1(),
+            ),
+        ] {
+            assert_eq!(invalid, Err(PagerError::InvalidConfiguration));
+        }
+        assert_eq!(
+            PagerOperations::from_bits(V1_OPERATIONS | (1 << 31)),
+            Err(PagerError::InvalidConfiguration)
+        );
+
+        let mut maximum_page = page();
+        maximum_page.length = MAX_PAGE_SIZE;
+        let maximum = PagerFrame::new(
+            session(),
+            PagerMessage::PageData(
+                PagerPageResponse(maximum_page),
+                vec![0xa5; MAX_PAGE_SIZE as usize],
+            ),
+        );
+        let encoded = encode_frame(&maximum).expect("maximum frame should encode");
+        assert_eq!(encoded.len(), MAX_FRAME_BYTES);
+        assert_eq!(decode_frame(&encoded), Ok(maximum));
+
+        maximum_page.length = MAX_PAGE_SIZE + 1;
+        let one_over = PagerFrame::new(
+            session(),
+            PagerMessage::PageData(
+                PagerPageResponse(maximum_page),
+                vec![0xa5; MAX_PAGE_SIZE as usize + 1],
+            ),
+        );
+        assert_eq!(encode_frame(&one_over), Err(PagerError::LimitExceeded));
+
+        let page_size = u64::from(MIN_PAGE_SIZE);
+        let largest_aligned = u64::MAX - (u64::MAX % page_size);
+        assert!(
+            PagerRegion::new(
+                PagerRegionId::new(1).expect("region should be nonzero"),
+                largest_aligned - page_size,
+                page_size,
+                MIN_PAGE_SIZE,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            PagerRegion::new(
+                PagerRegionId::new(1).expect("region should be nonzero"),
+                largest_aligned,
+                page_size,
+                MIN_PAGE_SIZE,
+            ),
+            Err(PagerError::InvalidConfiguration)
+        );
+        assert_eq!(
+            PagerSessionId::from_bytes([0; SESSION_BYTES]),
+            Err(PagerError::InvalidConfiguration)
+        );
+        assert_eq!(
+            PagerRequestId::new(0),
+            Err(PagerError::InvalidConfiguration)
+        );
     }
 
     #[test]

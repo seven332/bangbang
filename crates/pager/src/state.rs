@@ -963,6 +963,14 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            VmmSession::new(
+                session(1),
+                limits(2),
+                vec![region(1, 0), region(2, u64::from(MIN_PAGE_SIZE))]
+            )
+            .is_err()
+        );
 
         let (mut vmm, mut peer) = active(2);
         let generation = PagerGeneration::new(1).expect("generation should be nonzero");
