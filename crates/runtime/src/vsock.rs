@@ -13590,6 +13590,17 @@ mod tests {
             device.host_local_port_cursor().last_used(),
             active_key.local_port().raw()
         );
+        let first_notification = super::VirtioVsockDeviceNotificationDispatch::new(
+            Vec::new(),
+            first,
+            super::VirtioVsockGuestTxControlDispatch::empty(),
+            None,
+            None,
+        );
+        assert_vsock_metrics_for_notification(
+            &first_notification,
+            VsockDeviceMetrics::default().with_conn_event_fails(1),
+        );
 
         let second = device.poll_host_request_connections();
 
