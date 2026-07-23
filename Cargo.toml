@@ -3,6 +3,7 @@ members = [
     "crates/api",
     "crates/hvf",
     "crates/launcher",
+    "crates/pager",
     "crates/runtime",
     "crates/session",
     "crates/vhost-user",

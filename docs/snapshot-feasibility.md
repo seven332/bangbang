@@ -1262,12 +1262,16 @@ App Sandbox discovery path. A public custom Mach memory-object pager was also
 rejected by SDK, XNU, and runtime evidence.
 
 This proves an observable equivalent is feasible, not that Linux UFFD
-descriptor/wire traffic is accepted. The later design keeps Mach task/thread
-ports inside the VMM, uses HVF for guest faults, routes both planes through one
-generation-aware coordinator, and gives an external peer only bounded
-offset-based `bangbang-pager-v1` requests over a launcher-connected stream.
-Native-v1 `Uffd` remains rejected before resource access until #1527's restore
-gate; inventory remains nonterminal until signed certification.
+descriptor/wire traffic is accepted. The standalone
+[`bangbang-pager-v1` protocol](snapshot-pager-protocol.md) now implements the
+closed bounded offset-only wire, exact negotiation and request matching,
+role-specific state machines, and already-connected deadline transport. The
+later integrations keep Mach task/thread ports inside the VMM, use HVF for
+guest faults, route both planes through one generation-aware coordinator, and
+have the launcher supply only the connected stream. Native-v1 `Uffd` remains
+rejected before resource access until #1527's restore gate; memory/fault,
+brokerage, removal, consumer, restore, and signed-certification work remains
+nonterminal.
 
 ### Implemented public native-v1 restore order
 

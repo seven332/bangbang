@@ -1,9 +1,9 @@
 # Firecracker v1.16.0 Snapshot Paging Contract
 
 This ledger records the #1527 public-macOS feasibility decision for the pinned
-Firecracker snapshot page-fault corpus. It is a delivery-time record, not an
-implementation claim: bangbang still rejects native-v1 `Uffd` before artifact
-or backend access.
+Firecracker snapshot page-fault corpus and the completed #1547 standalone
+protocol slice. It is not an aggregate runtime implementation claim: bangbang
+still rejects native-v1 `Uffd` before artifact or backend access.
 
 ## Pinned upstream contract
 
@@ -133,7 +133,45 @@ records the complete probe audit, and its
 accepts the resulting delivery boundary. Prototype sources are workflow
 evidence, not checked production implementation.
 
-## Decision and delivery boundary
+## Implemented standalone protocol
+
+The dedicated `crates/pager` package now implements the shared
+`bangbang-pager-v1` codec, VMM/peer state machines, and absolute-deadline
+transport over only an already-connected Unix stream. The normative wire and
+lifecycle are in
+[`docs/snapshot-pager-protocol.md`](../../../docs/snapshot-pager-protocol.md).
+
+Its 24-byte `BBPAGER\0` v1 header bounds every advertised body before
+allocation. A random nonzero 32-byte session binds every frame. Negotiated
+limits cover a 4 KiB–2 MiB power-of-two page, 1–128 exact regions, 1–256
+combined requests, maximum frame size, and the complete closed operation mask.
+Regions and work carry only nonzero opaque identities, generations, aligned
+offsets, and lengths—never host virtual addresses or paths.
+
+Request IDs are strictly increasing across page and removal work. Responses
+may complete out of order only when the complete stored tuple matches.
+Cancellation is session-wide and terminal; shutdown requires all work to
+drain. The transport uses one absolute deadline across partial I/O, suppresses
+`SIGPIPE`, and becomes poisoned after timeout, EOF, truncation, malformed input,
+or transport failure. V1 carries no peer strings, so malformed UTF-8 and
+peer-diagnostic leakage are excluded by construction.
+
+Focused unit tests cover every kind, every split boundary, coalescing,
+exact/invalid bounds, reserved fields, Linux-UFFD-shaped input, handshake and
+region validation, replay/cross-session/mismatch, out-of-order completion,
+in-flight exhaustion, cancellation, shutdown, timeout/EOF, broken pipe, and
+redaction. `crates/pager/tests/protocol_process.rs` uses an inherited connected
+stream to complete real data/zero/removal/shutdown and cancellation child
+sessions:
+
+```sh
+cargo test -p bangbang-pager --all-targets --all-features --locked
+```
+
+The crate does not open a socket path, transfer a descriptor, map guest memory,
+mediate a Mach/HVF fault, grant source authority, or change API behavior.
+
+## Decision and remaining delivery boundary
 
 Public macOS APIs can reproduce the observable external-demand-paging
 contract, but not Linux UFFD descriptor or wire compatibility. Linux transfers
@@ -141,12 +179,12 @@ a kernel fault descriptor and performs no later socket request/response;
 macOS must have the VMM translate both protection planes into a new bounded
 protocol.
 
-The approved later implementation keeps these boundaries:
+The approved complete implementation keeps these boundaries:
 
 - Mach task exceptions and all task/thread ports remain inside the worker.
 - HVF stage-two exits cover guest read, write, and instruction faults.
 - Both paths use one bounded, generation-aware page coordinator.
-- A path-selected external peer speaks versioned, offset-only
+- An external peer speaks the implemented versioned, offset-only
   `bangbang-pager-v1`; requests never expose host virtual addresses.
 - The launcher connects outside the App Sandbox and passes only the connected
   stream/source authority through the existing contained boundary.
@@ -180,17 +218,16 @@ VM construction. The focused
 case additionally proves private UFFD paths remain redacted.
 
 Delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527)
-retains nine implementation/certification gates after this record:
+retains eight integration/certification gates after the #1547 protocol:
 
-1. [#1547](https://github.com/seven332/bangbang/issues/1547) defines the pager protocol.
-2. [#1548](https://github.com/seven332/bangbang/issues/1548) adds coordinated lazy anonymous memory.
-3. [#1549](https://github.com/seven332/bangbang/issues/1549) bridges host faults.
-4. [#1550](https://github.com/seven332/bangbang/issues/1550) bridges HVF guest faults.
-5. [#1551](https://github.com/seven332/bangbang/issues/1551) brokers the contained peer.
-6. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
-7. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
-8. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
-9. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
+1. [#1548](https://github.com/seven332/bangbang/issues/1548) adds coordinated lazy anonymous memory.
+2. [#1549](https://github.com/seven332/bangbang/issues/1549) bridges host faults.
+3. [#1550](https://github.com/seven332/bangbang/issues/1550) bridges HVF guest faults.
+4. [#1551](https://github.com/seven332/bangbang/issues/1551) brokers the contained peer.
+5. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
+6. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
+7. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
+8. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
 
 There is no public `Uffd` success before #1554 and no
 `implemented-and-verified` inventory result before #1555. Delivery-time
@@ -201,4 +238,4 @@ continues to reject it.
 
 | Capability identity | Disposition | Delivery owner | Evidence | Result |
 | --- | --- | --- | --- | --- |
-| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; unchanged pre-access rejection | `nonterminal` |
+| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol and process tests; unchanged pre-access rejection | `nonterminal` |

@@ -124,6 +124,10 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "com.apple.security.app-sandbox",
         "com.apple.security.hypervisor",
         "bangbang-pager-v1",
+        "crates/pager",
+        "docs/snapshot-pager-protocol.md",
+        "BBPAGER\\0",
+        "cargo test -p bangbang-pager",
         "classify_v1_load_request",
         "native_v1_load_policy_rejects_each_unsupported_dimension",
         "returns_fault_for_snapshot_endpoint",
@@ -133,6 +137,46 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         assert!(
             contract.contains(required),
             "snapshot paging contract must pin {required}"
+        );
+    }
+
+    let pager_manifest = std::fs::read_to_string(repository_root.join("crates/pager/Cargo.toml"))
+        .expect("checked pager manifest must be readable");
+    assert!(
+        pager_manifest.contains("name = \"bangbang-pager\"")
+            && pager_manifest.contains("getrandom = \"0.3\"")
+            && pager_manifest.contains("libc = \"0.2\""),
+        "pager package identity and narrow dependencies must remain pinned"
+    );
+
+    let pager_source = std::fs::read_to_string(repository_root.join("crates/pager/src/frame.rs"))
+        .expect("checked pager framing source must be readable");
+    for required in [
+        "*b\"BBPAGER\\0\"",
+        "pub const HEADER_BYTES: usize = 24",
+        "pub const MIN_PAGE_SIZE: u32 = 4 * 1024",
+        "pub const MAX_PAGE_SIZE: u32 = 2 * 1024 * 1024",
+        "pub struct PagerFrameDecoder",
+    ] {
+        assert!(
+            pager_source.contains(required),
+            "pager source must retain {required}"
+        );
+    }
+
+    let protocol = std::fs::read_to_string(repository_root.join("docs/snapshot-pager-protocol.md"))
+        .expect("checked pager protocol document must be readable");
+    for required in [
+        "`BBPAGER\\0`",
+        "2,097,248",
+        "strictly increasing request IDs",
+        "Cancellation is session-wide and terminal",
+        "Orderly shutdown is drain-only",
+        "not Linux UFFD descriptor or wire compatibility",
+    ] {
+        assert!(
+            protocol.contains(required),
+            "pager protocol document must retain {required}"
         );
     }
 

@@ -12,6 +12,7 @@ and test rules:
 - [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md)
 - [Firecracker v1.16.0 Capability Inventory](compat/firecracker/v1.16.0/README.md)
 - [Snapshot Feasibility](docs/snapshot-feasibility.md)
+- [`bangbang-pager-v1` Protocol](docs/snapshot-pager-protocol.md)
 - [macOS Host Security Model](docs/security.md)
 - [Testing Guide](docs/testing.md)
 - [Pull Request Review Guidelines](docs/review-guidelines.md)
@@ -169,6 +170,8 @@ crates/runtime    Backend-neutral VM model, memory, MMIO, boot, and device helpe
 crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
 crates/launcher   Production app bundle, nested-worker validation, and supervision
+crates/pager      Closed bangbang-pager-v1 codec, state machines, and
+                  already-connected deadline-bounded Unix transport
 crates/session    Private launcher-worker protocol and runtime namespace ownership
 crates/vhost-user Strict vhost-user frontend protocol, SCM_RIGHTS framing,
                   and portable pipe queue notifiers used by direct block startup
@@ -388,7 +391,11 @@ portability remain unsupported. Native-v1 `Uffd` also remains rejected before
 resource access. The checked
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 records that a public macOS observable equivalent is feasible under #1527; it
-is not Linux UFFD wire compatibility or shipped runtime support.
+is not Linux UFFD wire compatibility or shipped runtime support. The standalone
+[`bangbang-pager-v1` contract](docs/snapshot-pager-protocol.md) now implements
+the closed offset-only wire, role state machines, and already-connected
+deadline transport. Guest-memory, host/HVF fault, launcher brokerage, removal,
+consumer, restore, and certification integration remain deferred under #1527.
 
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
@@ -1307,8 +1314,9 @@ exact 14-record set to eight terminal API/live outcomes and six precise #1490
 artifact/restore/clone handoffs. The
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 then moves its one exact corpus record to feasible-but-undelivered #1527
-ownership while preserving native-v1 rejection. The repository-wide
-disposition counts are now 228/169/4/17.
+ownership while preserving native-v1 rejection. Its standalone protocol slice
+is implemented and process-tested without promoting the aggregate capability.
+The repository-wide disposition counts remain 228/169/4/17.
 
 ## Build And Test
 

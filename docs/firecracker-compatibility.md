@@ -804,13 +804,15 @@ Those eight promotions moved the global counts at that checkpoint to
 228/170/3/17. #1491 retains repository-wide performance/observability work,
 not a directly owned live vsock row.
 
-After #1546, the checked
+After #1547, the checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 moves only `corpus:snapshot-page-faults` from `audit-required` to
 `missing-platform-feasible` with #1527 as its delivery owner. This records
-positive public-macOS feasibility, not runtime support: native-v1 `Uffd` still
-rejects before resource access and the planned `bangbang-pager-v1` protocol is
-not Linux UFFD wire-compatible. The current global counts are 228/169/4/17.
+positive public-macOS feasibility plus an implemented standalone
+`bangbang-pager-v1` codec/state/connected-transport slice, not runtime support:
+native-v1 `Uffd` still rejects before resource access, the protocol is not
+Linux UFFD wire-compatible, and memory/fault/broker/restore integration remains
+open. The current global counts remain 228/169/4/17.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
