@@ -583,12 +583,14 @@ binding, and proves the exact final length. Run it with
 
 The signed `hvf_lifecycle` lazy-memory case writes a 64-MiB image, drops the
 source allocation, loads the retained file mapping, and proves bounded resident
-and fault growth before guest entry. The guest demand-faults a distant page,
-writes it through COW, resumes after the dirty write fault, executes two HVC
-exits, and leaves the source bytes unchanged. It also proves a clean initial
-dirty epoch, the exact dirtied page, ordinary unmap/destroy, and post-VM-destroy
-owner cleanup. Run it only through `scripts/run-integration-tests.sh`; unsigned
-workspace tests must not execute real HVF.
+and fault growth before guest entry. The guest's first access writes a distant
+untouched page, proving the lazy File/COW level-two translation exit is owned by
+the dirty tracker; it then resumes, reads back the value, executes two HVC
+exits, and leaves the source bytes unchanged. The test also proves a clean
+initial dirty epoch, the exact dirtied page, ordinary unmap/destroy, and
+post-VM-destroy owner cleanup. Run it only through
+`scripts/run-integration-tests.sh`; unsigned workspace tests must not execute
+real HVF.
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,

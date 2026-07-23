@@ -4733,7 +4733,6 @@ fn maps_native_v2_file_memory_on_demand_with_cow_dirty_and_cleanup() {
     const TARGET_OFFSET: u64 = IMAGE_BYTES - 64 * 1024;
     const TEST_VALUE: u32 = 0x5aa5_c33c;
     const INITIAL_TARGET: [u8; 4] = [0x13, 0x37, 0x42, 0x99];
-    const LDR_W3_X0: u32 = 0xb940_0003;
     const LDR_W2_X0: u32 = 0xb940_0002;
     const HVC_ZERO: u32 = 0xd400_0002;
 
@@ -4747,10 +4746,6 @@ fn maps_native_v2_file_memory_on_demand_with_cow_dirty_and_cleanup() {
         .checked_add(TARGET_OFFSET)
         .expect("distant target should fit");
     let mut guest_code = arm64_store_u32_and_hvc_program(guest_target.raw_value(), TEST_VALUE);
-    guest_code.splice(
-        6 * std::mem::size_of::<u32>()..6 * std::mem::size_of::<u32>(),
-        LDR_W3_X0.to_le_bytes(),
-    );
     guest_code.truncate(guest_code.len() - std::mem::size_of::<u32>());
     guest_code.extend_from_slice(&LDR_W2_X0.to_le_bytes());
     guest_code.extend_from_slice(&HVC_ZERO.to_le_bytes());
