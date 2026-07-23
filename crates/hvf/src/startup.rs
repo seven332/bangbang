@@ -24694,7 +24694,7 @@ mod tests {
             .dispatch()
             .outcome()
             .dispatched()
-            .expect("event notification should be accepted as no-op dispatch");
+            .expect("ungated event acknowledgement should dispatch");
         assert_eq!(
             dispatch.drained_notifications(),
             [VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
