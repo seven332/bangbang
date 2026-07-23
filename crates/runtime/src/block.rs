@@ -26,7 +26,8 @@ use bangbang_vhost_user::{
 
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryError,
-    GuestMemoryRange, GuestMemorySharedBacking, GuestMemorySharedBackingError,
+    GuestMemoryRange, GuestMemoryRegionBacking, GuestMemorySharedBacking,
+    GuestMemorySharedBackingError,
 };
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
@@ -5582,12 +5583,25 @@ impl fmt::Debug for VhostUserBlockMemoryRegion {
 }
 
 impl VhostUserBlockMemoryRegion {
+    fn require_shared_memory_profile(
+        memory: &GuestMemory,
+    ) -> Result<(), PreparedVhostUserBlockMemoryError> {
+        if memory.backing() != GuestMemoryBacking::Shared
+            || memory
+                .regions()
+                .iter()
+                .any(|region| region.backing() != GuestMemoryRegionBacking::Shared)
+        {
+            Err(PreparedVhostUserBlockMemoryError::AnonymousMemory)
+        } else {
+            Ok(())
+        }
+    }
+
     fn preflight_guest_memory(
         memory: &GuestMemory,
     ) -> Result<(), PreparedVhostUserBlockMemoryError> {
-        if memory.backing() != GuestMemoryBacking::Shared {
-            return Err(PreparedVhostUserBlockMemoryError::AnonymousMemory);
-        }
+        Self::require_shared_memory_profile(memory)?;
         if memory.shared_export_regions().next().is_none() {
             return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);
         }
@@ -5606,9 +5620,7 @@ impl VhostUserBlockMemoryRegion {
     fn from_guest_memory(
         memory: &GuestMemory,
     ) -> Result<Vec<Self>, PreparedVhostUserBlockMemoryError> {
-        if memory.backing() != GuestMemoryBacking::Shared {
-            return Err(PreparedVhostUserBlockMemoryError::AnonymousMemory);
-        }
+        Self::require_shared_memory_profile(memory)?;
         let region_count = memory.shared_export_regions().count();
         if region_count == 0 {
             return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);
@@ -8549,8 +8561,9 @@ mod tests {
         VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
         VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
         VIRTIO_RING_FEATURE_INDIRECT_DESC, VhostUserBlockConfigRefreshError,
-        VhostUserBlockConfigSignalError, VhostUserBlockNotificationError, VhostUserBlockState,
-        VirtioBlockBackend, VirtioBlockBackendKind, VirtioBlockConfigSpace, VirtioBlockDevice,
+        VhostUserBlockConfigSignalError, VhostUserBlockMemoryRegion,
+        VhostUserBlockNotificationError, VhostUserBlockState, VirtioBlockBackend,
+        VirtioBlockBackendKind, VirtioBlockConfigSpace, VirtioBlockDevice,
         VirtioBlockDeviceActivationError, VirtioBlockDeviceCaptureError, VirtioBlockDeviceId,
         VirtioBlockDeviceNotificationError, VirtioBlockLiveUpdateError, VirtioBlockQueue,
         VirtioBlockQueueBuildError, VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError,
@@ -13801,7 +13814,7 @@ mod tests {
     }
 
     #[test]
-    fn vhost_user_block_rejects_anonymous_guest_memory_before_activation() {
+    fn vhost_user_block_rejects_non_shared_guest_memory_before_activation() {
         let (frontend_stream, peer_stream) =
             UnixStream::pair().expect("vhost-user stream pair should open");
         let peer = spawn_test_vhost_user_discovery_peer(
@@ -13840,6 +13853,26 @@ mod tests {
             }
         ));
         assert!(!error.to_string().contains("private"));
+
+        let private_backing = temp_file(
+            "private-file-memory",
+            &vec![0_u8; usize::try_from(TEST_MEMORY_SIZE).expect("test size should fit")],
+        );
+        let private_memory = GuestMemory::from_private_file_ranges(
+            &[(
+                GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                    .expect("private test range should validate"),
+                0,
+            )],
+            Arc::new(File::open(private_backing.as_path()).expect("backing should open")),
+            GuestMemoryBacking::Shared,
+        )
+        .expect("private memory with a shared dynamic profile should map");
+        assert_eq!(private_memory.backing(), GuestMemoryBacking::Shared);
+        assert!(matches!(
+            VhostUserBlockMemoryRegion::preflight_guest_memory(&private_memory),
+            Err(PreparedVhostUserBlockMemoryError::AnonymousMemory)
+        ));
     }
 
     #[test]
