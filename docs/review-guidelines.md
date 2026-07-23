@@ -363,6 +363,18 @@ Review standalone protocol changes against the normative
 header/kind set, pre-allocation bounds, random session binding, monotonic
 request IDs, exact response tuples, terminal cancellation, drained shutdown,
 absolute deadlines, poison-on-stream-failure, and value-redacted diagnostics.
+Review `LazyGuestMemory` changes as a distinct ownership boundary: ordinary
+initialized-memory APIs must remain unavailable; page metadata must stay
+compact; operations and waiters must remain independently bounded; duplicate
+faults may coalesce contents but not later permissions; generation validation
+must precede scoped publication; and current abandoned work must fail closed.
+A population superseded by removal must retain its negotiated protocol slot
+until response/drop/terminal retirement. Removal must reserve a different slot
+before mutation, serialize with an already-started publication/removal action,
+and stay `Removing` until exact acknowledgement commit after local zero and
+future protection work. Explicit teardown must wake waiters and drain
+already-linearized guards, while destructors remain nonblocking and retain
+mapping lifetime safely.
 Keep Mach task/thread ports and host virtual addresses inside the VMM, reject
 unmodified Linux UFFD wire traffic, and require pre-resource rejection for
 bypass profiles. Native-v1 `Uffd` must remain rejected until the restore gate, and

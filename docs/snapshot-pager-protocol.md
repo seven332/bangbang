@@ -1,8 +1,10 @@
 # `bangbang-pager-v1` Protocol
 
 This document is the normative wire, lifecycle, and failure contract shared by
-the future bangbang VMM snapshot coordinator and its external page-content
-peer. The implementation is the standalone `bangbang-pager` crate.
+the bangbang VMM snapshot coordinator and its future external page-content
+peer. The wire implementation is the standalone `bangbang-pager` crate; the
+backend-neutral anonymous-memory coordinator is
+`bangbang_runtime::lazy_memory`.
 
 The crate adopts an already connected Unix stream. It does not select or open a
 path, launch a process, transfer a descriptor, grant source authority, map
@@ -138,6 +140,58 @@ exactly and does not infer ordering between generations.
 There is no automatic request retry or replay. A later integration may begin a
 new restore only with a new random session and freshly assigned request IDs.
 
+## Runtime anonymous-memory coordinator
+
+`crates/runtime/src/lazy_memory.rs` implements the in-process ownership half of
+the contract without opening a transport. `LazyGuestMemory` is deliberately
+distinct from ordinary initialized `GuestMemory`: it transactionally allocates
+validated private-anonymous regions, begins every selected page logically
+absent, and exposes no ordinary safe read, write, atomic, discard, shared
+export, or snapshot-image API.
+
+Construction validates the exact negotiated region count, page size, combined
+in-flight limit, unique region IDs, ordered nonoverlapping guest ranges,
+aligned nonoverlapping source ranges, checked page counts, a caller-selected
+total-page bound, and a separate local waiter bound before publishing the
+owner. One byte-sized tag per selected page records `Absent`, `Loading`,
+`Publishing`, `Present`, or `Removing`; the owner-wide terminal phase overlays
+every page. Active protocol operations and duplicate-fault completion records
+use pre-reserved vectors bounded by negotiated and local limits. There is no
+per-page mutex, generation object, channel, or waiter allocation.
+
+The first absent fault returns one non-cloneable population ticket containing
+the immutable region, generation, access, source offset, guest range, and
+length tuple. Duplicate read or write faults join that generation and wait on
+one condition variable. This coalesces page contents only: later Mach/HVF
+bridges must re-evaluate each fault's permissions after wakeup. A response may
+enter a scoped publication guard only for the exact current ticket. Its target
+accepts exactly one full data page or zero page, and commit is the only
+`Publishing` to `Present` transition.
+
+Every issued population or removal occupies one negotiated in-flight slot.
+When removal supersedes a loading page, the old population becomes a counted
+retired operation until its exact stale response is consumed, its ticket is
+dropped, or terminal teardown abandons the session. Removal reserves a
+distinct slot before changing any page. Its scoped guard zeroes the complete
+range and leaves it `Removing`; only explicit validated `Removed`
+acknowledgement commit makes the range `Absent` and admits a newer refault
+generation.
+
+Requested cancellation, peer failure, abandoned current work, generation
+exhaustion, synchronization poison, and teardown all close admission and wake
+waiters with a stable value-redacted result. Explicit termination waits for
+publication/removal actions that already crossed their linearization point;
+destructors close admission without blocking and guards retain mapping
+lifetime until their own cleanup. Those actions are non-reentrant: a thread
+must not request overlapping removal or synchronized termination while it
+retains the guard that such an operation must drain.
+
+This coordinator installs no Mach exception port, changes no HVF mapping or
+permission, reads no snapshot source, opens no peer, and changes no API
+behavior. Its logical absence is not a delivered fault path until the later
+host/HVF, peer, consumer, and native-v1 restore slices bind those integration
+points.
+
 ## Cancellation, terminal failure, and shutdown
 
 Cancellation is session-wide and terminal. `Cancel` abandons every outstanding
@@ -186,8 +240,13 @@ The crate currently implements and tests:
 - already-connected absolute-deadline Unix transport; and
 - real child-process exchanges over an inherited connected stream.
 
-Still deferred are socket brokerage, source grants, anonymous guest-memory
-publication, host Mach exception mediation, HVF guest-fault mediation,
+The runtime additionally implements and deterministically tests bounded
+private-anonymous region ownership, duplicate-fault coalescing, exact
+publication, retired-operation accounting, acknowledged removal, terminal
+wakeup, poison recovery, resource limits, and repeated cleanup.
+
+Still deferred are transport/coordinator wiring, socket brokerage, source
+grants, host Mach exception mediation, HVF guest-fault mediation, peer-driven
 removal/failure integration, consumer gating, native-v1 restore activation,
 and signed end-to-end certification. Until those #1527 slices complete,
 native-v1 `Uffd` remains rejected before resource access and the checked
