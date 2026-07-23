@@ -550,6 +550,25 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
         Ok((device, transport))
     }
 
+    /// Captures device and transport state while permitting one validated
+    /// device-local source normalization under the same endpoint lock.
+    pub(crate) fn capture_transport_with_mut<R>(
+        &self,
+        capture: impl FnOnce(&VirtioMmioDeviceRegisters, &VirtioQueues, &C, &mut A, bool) -> R,
+    ) -> Result<(R, VirtioPciTransportState), VirtioPciEndpointError> {
+        let mut state = self.lock_active()?;
+        let core = &mut state.core;
+        let device = capture(
+            &core.device,
+            &core.queues,
+            &core.device_config,
+            &mut core.activation,
+            core.device_activated,
+        );
+        let transport = clone_transport_state(&state);
+        Ok((device, transport))
+    }
+
     pub fn admit_device_work(
         &self,
     ) -> Result<VirtioPciEndpointWork<'_, C, A>, VirtioPciEndpointError> {
@@ -3965,6 +3984,12 @@ mod tests {
         );
         assert!(fixture.signals[2].lock().unwrap().is_empty());
         assert_eq!(read_vsock_event_used_index(&memory), 1);
+        let (normalized, normalized_validation) = fixture
+            .endpoint
+            .capture_and_normalize_vsock_state(&config, &memory, reset_attempt)
+            .expect("PCI capture should normalize source work under the endpoint lock");
+        assert_eq!(normalized, active_first);
+        assert_eq!(normalized_validation, active_validation);
 
         let listener_path = std::path::Path::new("/tmp").join(format!(
             "bb-pci-{}-{:x}.sock",

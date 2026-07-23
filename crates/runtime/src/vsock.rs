@@ -11,6 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::memory::{
@@ -6958,17 +6959,23 @@ impl VirtioVsockEventQueue {
             .validate_mapped(memory)
             .map_err(|source| VirtioVsockTransportResetError::UsedRing { source })?;
 
-        let notification_suppression = if self.event_idx_enabled {
-            VirtqueueNotificationSuppression::EventIdx {
-                used_event: self
-                    .available
-                    .used_event(memory)
-                    .map_err(|source| VirtioVsockTransportResetError::AvailableRing { source })?,
-                avail_event: self.available.next_avail(),
-            }
-        } else {
-            VirtqueueNotificationSuppression::Disabled
-        };
+        let notification_suppression =
+            if self.event_idx_enabled {
+                VirtqueueNotificationSuppression::EventIdx {
+                    used_event: self.available.used_event(memory).map_err(|source| {
+                        VirtioVsockTransportResetError::AvailableRing { source }
+                    })?,
+                    // The event queue is intentionally not drained: Linux usually
+                    // pre-publishes the whole ring. Match Firecracker's
+                    // enable_notification() and arm the guest's next publish after
+                    // its current avail.idx, not after our one-entry cursor.
+                    avail_event: self.available.available_index(memory).map_err(|source| {
+                        VirtioVsockTransportResetError::AvailableRing { source }
+                    })?,
+                }
+            } else {
+                VirtqueueNotificationSuppression::Disabled
+            };
 
         memory
             .write_slice(
@@ -8295,6 +8302,7 @@ impl VirtioVsockPendingRxPacket {
 
 #[derive(Debug)]
 pub struct VirtioVsockDevice {
+    capture_owner_identity: Arc<()>,
     guest_cid: u32,
     active_rx_queue: Option<VirtioVsockRxQueue>,
     active_tx_queue: Option<VirtioVsockTxQueue>,
@@ -8318,6 +8326,7 @@ impl VirtioVsockDevice {
 
     fn with_guest_cid(guest_cid: u32) -> Self {
         Self {
+            capture_owner_identity: Arc::new(()),
             guest_cid,
             active_rx_queue: None,
             active_tx_queue: None,
@@ -8355,6 +8364,14 @@ impl VirtioVsockDevice {
 
     pub const fn guest_cid(&self) -> u32 {
         self.guest_cid
+    }
+
+    pub(crate) fn capture_owner_identity(&self) -> Arc<()> {
+        Arc::clone(&self.capture_owner_identity)
+    }
+
+    pub(crate) fn shares_capture_owner_identity(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.capture_owner_identity, identity)
     }
 
     pub fn is_activated(&self) -> bool {
@@ -8690,6 +8707,40 @@ impl VirtioVsockDevice {
                 source_work,
             },
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_and_normalize_state(
+        &mut self,
+        config: &VsockConfig,
+        config_space: &VirtioVsockConfigSpace,
+        device_registers: &crate::virtio_mmio::VirtioMmioDeviceRegisters,
+        queues: &[VirtioMmioQueueState],
+        transport_activated: bool,
+        memory: &GuestMemory,
+        reset_attempt: VirtioVsockTransportResetAttempt,
+    ) -> Result<
+        (VirtioVsockDeviceCaptureState, VirtioVsockCaptureValidation),
+        VirtioVsockDeviceCaptureError,
+    > {
+        let capture = self.capture_state(
+            config,
+            config_space,
+            device_registers,
+            queues,
+            transport_activated,
+            memory,
+            reset_attempt,
+        )?;
+        self.normalize_source_work();
+        Ok(capture)
+    }
+
+    fn normalize_source_work(&mut self) {
+        self.pending_host_connections.clear();
+        self.host_connections.connections.clear();
+        self.guest_connections.connections.clear();
+        self.pending_guest_reset_packets.clear();
     }
 
     #[cfg(test)]
@@ -10630,6 +10681,32 @@ impl VirtioVsockMmioHandler {
         let capture = VirtioVsockMmioCaptureState::try_from_parts(device, transport, memory)?;
         Ok((capture, validation))
     }
+
+    /// Captures the exact device/transport state and detaches all source-only
+    /// connection work after validation succeeds.
+    pub fn capture_and_normalize_vsock_state(
+        &mut self,
+        config: &VsockConfig,
+        memory: &GuestMemory,
+        reset_attempt: VirtioVsockTransportResetAttempt,
+    ) -> Result<
+        (VirtioVsockMmioCaptureState, VirtioVsockCaptureValidation),
+        VirtioVsockDeviceCaptureError,
+    > {
+        let transport = self.transport_state();
+        let config_space = *self.device_config_handler();
+        let (device, validation) = self.activation_handler_mut().capture_and_normalize_state(
+            config,
+            &config_space,
+            transport.device_registers(),
+            transport.queues(),
+            transport.is_device_activated(),
+            memory,
+            reset_attempt,
+        )?;
+        let capture = VirtioVsockMmioCaptureState::try_from_parts(device, transport, memory)?;
+        Ok((capture, validation))
+    }
 }
 
 impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioVsockDevice> {
@@ -10754,6 +10831,37 @@ impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
             .capture_transport_with(|registers, queues, config_space, device, activated| {
                 let queues = vsock_transport_queues(queues)?;
                 device.capture_state(
+                    config,
+                    config_space,
+                    registers,
+                    &queues,
+                    activated,
+                    memory,
+                    reset_attempt,
+                )
+            })
+            .map_err(VirtioVsockPciCaptureError::Endpoint)?;
+        let (device, validation) = device.map_err(VirtioVsockPciCaptureError::Device)?;
+        let capture = VirtioVsockPciCaptureState::try_from_parts(device, transport, memory)
+            .map_err(VirtioVsockPciCaptureError::Device)?;
+        Ok((capture, validation))
+    }
+
+    /// Captures the exact device/transport state and detaches all source-only
+    /// connection work under the same endpoint lock after validation succeeds.
+    pub fn capture_and_normalize_vsock_state(
+        &self,
+        config: &VsockConfig,
+        memory: &GuestMemory,
+        reset_attempt: VirtioVsockTransportResetAttempt,
+    ) -> Result<
+        (VirtioVsockPciCaptureState, VirtioVsockCaptureValidation),
+        VirtioVsockPciCaptureError,
+    > {
+        let (device, transport) = self
+            .capture_transport_with_mut(|registers, queues, config_space, device, activated| {
+                let queues = vsock_transport_queues(queues)?;
+                device.capture_and_normalize_state(
                     config,
                     config_space,
                     registers,
@@ -17979,7 +18087,7 @@ mod tests {
             3,
             TestDescriptor::writable(TEST_VSOCK_EVENT_PAYLOAD, 8, None),
         );
-        write_vsock_event_available_heads(&mut memory, &[3]);
+        write_vsock_event_available_heads(&mut memory, &[3, 4, 5]);
         // Normal EVENT_IDX completion notification would be suppressed for this
         // value, but transport reset must still be signaled.
         write_vsock_event_available_used_event(&mut memory, 1);
@@ -18013,7 +18121,8 @@ mod tests {
         assert_eq!(read_vsock_event_used_element(&memory, 0), (3, 8));
         assert_eq!(
             read_guest_u16(&memory, vsock_event_used_ring_avail_event_address()),
-            1
+            3,
+            "reset publication must arm notification after the guest's current avail.idx"
         );
         let event_queue = handler
             .activation_handler()
@@ -18381,6 +18490,12 @@ mod tests {
         let first_queues = configured_vsock_queue_registers(Some(4), true);
         let second_queues = configured_vsock_queue_registers(Some(8), true);
         let mut device = VirtioVsockDevice::new();
+        let capture_owner_identity = device.capture_owner_identity();
+        assert!(device.shares_capture_owner_identity(&capture_owner_identity));
+        assert!(
+            !VirtioVsockDevice::new().shares_capture_owner_identity(&capture_owner_identity),
+            "a replacement device must not satisfy the retained capture-owner identity"
+        );
 
         device
             .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &first_queues))
@@ -18390,6 +18505,7 @@ mod tests {
         VirtioMmioDeviceActivationHandler::reset(&mut device);
 
         assert!(!device.is_activated());
+        assert!(device.shares_capture_owner_identity(&capture_owner_identity));
         assert!(device.active_rx_queue().is_none());
         assert!(device.active_tx_queue().is_none());
         assert!(device.active_event_queue().is_none());
@@ -25678,8 +25794,8 @@ mod tests {
             );
         }
 
-        let (pending, _pending_client) = accepted_host_connection("capture-pending");
-        let (active, _active_client, request) =
+        let (pending, mut pending_client) = accepted_host_connection("capture-pending");
+        let (active, mut active_client, request) =
             accepted_host_connection_with_request("capture-active", 5000);
         let guest_connector_ports = Arc::new(Mutex::new(Vec::new()));
         let active_key = {
@@ -25784,6 +25900,48 @@ mod tests {
         assert_eq!(read_vsock_event_used_index(&memory), 1);
         assert!(handler.activation_handler().pending_event_ack());
         assert!(!format!("{first_validation:?}").contains(path.to_string_lossy().as_ref()));
+
+        let (normalized_capture, normalized_validation) = handler
+            .capture_and_normalize_vsock_state(&config, &memory, reset_attempt)
+            .expect("validated capture should detach source-only vsock work");
+        assert_eq!(normalized_capture, first);
+        assert_eq!(normalized_validation, first_validation);
+        assert_eq!(
+            handler.activation_handler().pending_host_connection_count(),
+            0
+        );
+        assert_eq!(handler.activation_handler().active_connection_count(), 0);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+        assert_eq!(handler.activation_handler().earliest_deadline(), None);
+        assert_eq!(
+            handler.activation_handler().host_local_port_cursor(),
+            first.device().host_local_port_cursor(),
+            "source normalization must retain the captured host-local port cursor"
+        );
+        assert!(handler.activation_handler().pending_event_ack());
+        assert_stream_closed(
+            &mut pending_client,
+            "source normalization should close pending host accepts",
+        );
+        assert_stream_closed(
+            &mut active_client,
+            "source normalization should close active host connections",
+        );
+
+        let (recaptured, recaptured_validation) = handler
+            .capture_vsock_state(&config, &memory, reset_attempt)
+            .expect("normalized source should remain capture-valid");
+        assert_eq!(recaptured, first);
+        assert!(
+            !recaptured_validation
+                .source_work()
+                .dropped_any_source_work()
+        );
 
         drop(handler);
         assert!(!path.exists());

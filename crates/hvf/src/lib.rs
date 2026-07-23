@@ -119,8 +119,11 @@ pub use startup::{
     HvfArm64BootStorageCaptureErrorKind, HvfArm64BootStorageCaptureStage,
     HvfArm64BootTimeIdentityRestoreError, HvfArm64BootTimerDeviceConfig,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
-    HvfArm64BootVsockNotificationDispatch, HvfArm64BootVsockNotificationDispatchError,
-    HvfArm64BootVsockNotificationDispatches, OwnedHvfArm64BootSession,
+    HvfArm64BootVsockCaptureDisposition, HvfArm64BootVsockCaptureError,
+    HvfArm64BootVsockCaptureErrorKind, HvfArm64BootVsockCaptureStage,
+    HvfArm64BootVsockCaptureState, HvfArm64BootVsockNotificationDispatch,
+    HvfArm64BootVsockNotificationDispatchError, HvfArm64BootVsockNotificationDispatches,
+    HvfArm64BootVsockTransportState, OwnedHvfArm64BootSession,
     PreparedHvfArm64BootPciNetworkRemoval, RestoredHvfArm64BootSession,
 };
 pub use topology::{

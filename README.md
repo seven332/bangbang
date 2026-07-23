@@ -1081,10 +1081,19 @@ three queue cursors, `EVENT_IDX`, the host-local cursor, and the logical backend
 selector. Capture validates transport and guest rings fail closed, reports
 source-only connection/reset normalization separately, and can rebuild fresh
 empty device state from an externally supplied listener/connector while rearming
-the snapshot-origin RX gate. Quiesced owner traversal, destination UDS authority and
-override, record certification, native-v1 encoding/placement, public invocation,
-and end-to-end restored-guest proof remain #1516-#1518/#1490 work; this does not
-claim general performance, Firecracker artifact, or snapshot parity.
+the snapshot-origin RX gate. The paused native-v1 producer now reconciles the
+controller config, runtime registration, exact MMIO-or-PCI owner, CID, selector,
+placement, activation, metrics owner, and mapped memory under the existing
+quiescence lease. It publishes a reset, validates one immutable capture, and
+detaches pending accepts, live connections, pending packets, and their
+wakeups/deadlines from that same observation while retaining listener and
+connector authority for fresh traffic. Typed redacted failures preserve
+recoverable versus terminal process policy. Public create invokes this producer
+before its unchanged optional-device rejection, so it creates no vsock artifact
+and makes no load promise. Destination UDS authority/override, record
+certification, native-v1 encoding/placement, and end-to-end restored-guest proof
+remain #1517-#1518/#1490 work; this does not claim general performance,
+Firecracker artifact, or snapshot parity.
 
 Configure metrics output before boot:
 

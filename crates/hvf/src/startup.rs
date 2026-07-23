@@ -6,6 +6,7 @@ use std::io::{self, Write as _};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
@@ -103,13 +104,17 @@ use bangbang_runtime::startup::{
     Arm64BootRtcDeviceConfig as RuntimeArm64BootRtcDeviceConfig, Arm64BootRuntimeResources,
     Arm64BootSerialCaptureError, Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootSerialRuntimeError, Arm64BootVmClockDevice, Arm64BootVmGenIdDevice,
-    Arm64BootVmGenIdReplacementError, Arm64BootVsockNotificationDispatch,
-    Arm64BootVsockNotificationDispatchError, Arm64BootVsockNotificationDispatches,
+    Arm64BootVmGenIdReplacementError,
+    Arm64BootVsockCaptureError as RuntimeArm64BootVsockCaptureError, Arm64BootVsockDevice,
+    Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
+    Arm64BootVsockNotificationDispatches,
+    Arm64BootVsockTransportResetError as RuntimeArm64BootVsockTransportResetError,
     Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, OpenedBlockDeviceLiveUpdate,
     VmStartupResources, capture_balloon_state_for_device, capture_entropy_state_for_device_at,
     capture_memory_hotplug_state_for_device, capture_network_state_for_device_at,
-    capture_ready_serial_state_for_device, inject_serial_receive_bytes_for_device,
-    memory_hotplug_status_for_device, pending_serial_interrupt_intent_for_device,
+    capture_ready_serial_state_for_device, capture_vsock_state_for_device,
+    inject_serial_receive_bytes_for_device, memory_hotplug_status_for_device,
+    pending_serial_interrupt_intent_for_device, prepare_vsock_transport_reset_for_device,
     record_serial_host_input_error_for_device,
     refresh_vhost_user_block_config_for_devices_with_signal, replace_arm64_boot_vmgenid,
     serial_receive_capacity_for_device, take_serial_input_ready_intent_for_device,
@@ -133,8 +138,9 @@ use bangbang_runtime::virtio_pci::{
 };
 use bangbang_runtime::vmclock::VmClockRestoreUpdateError;
 use bangbang_runtime::vsock::{
-    VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockConfigSpace, VirtioVsockDevice,
-    VsockHostWakeup, VsockMmioLayout,
+    VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockCaptureValidation,
+    VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockMmioCaptureState,
+    VirtioVsockPciCaptureState, VsockConfig, VsockHostWakeup, VsockMmioLayout,
 };
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
@@ -689,6 +695,8 @@ struct HvfArm64BootPciBalloonDevice {
 
 #[derive(Debug)]
 struct HvfArm64BootPciVsockDevice {
+    guest_cid: u32,
+    uds_path: PathBuf,
     published: PublishedPciVsock,
     queue_deliveries: usize,
 }
@@ -3841,6 +3849,199 @@ impl fmt::Display for HvfArm64BootStorageCaptureError {
 
 impl std::error::Error for HvfArm64BootStorageCaptureError {}
 
+/// Exact transport placement paired with one validated, resource-free vsock
+/// capture. Host selectors and queue state stay redacted from diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub enum HvfArm64BootVsockTransportState {
+    Mmio {
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        state: Box<VirtioVsockMmioCaptureState>,
+    },
+    Pci {
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+        state: Box<VirtioVsockPciCaptureState>,
+    },
+}
+
+impl HvfArm64BootVsockTransportState {
+    pub fn mmio_state(&self) -> Option<&VirtioVsockMmioCaptureState> {
+        match self {
+            Self::Mmio { state, .. } => Some(state.as_ref()),
+            Self::Pci { .. } => None,
+        }
+    }
+
+    pub fn pci_state(&self) -> Option<&VirtioVsockPciCaptureState> {
+        match self {
+            Self::Pci { state, .. } => Some(state.as_ref()),
+            Self::Mmio { .. } => None,
+        }
+    }
+}
+
+impl fmt::Debug for HvfArm64BootVsockTransportState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mmio { .. } => formatter.write_str("VsockTransportState::Mmio(<redacted>)"),
+            Self::Pci { .. } => formatter.write_str("VsockTransportState::Pci(<redacted>)"),
+        }
+    }
+}
+
+/// One capture-ready vsock state plus non-durable reset and source-work
+/// normalization evidence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64BootVsockCaptureState {
+    config: VsockConfig,
+    validation: VirtioVsockCaptureValidation,
+    transport: HvfArm64BootVsockTransportState,
+}
+
+impl HvfArm64BootVsockCaptureState {
+    pub const fn config(&self) -> &VsockConfig {
+        &self.config
+    }
+
+    pub const fn validation(&self) -> VirtioVsockCaptureValidation {
+        self.validation
+    }
+
+    pub const fn transport(&self) -> &HvfArm64BootVsockTransportState {
+        &self.transport
+    }
+}
+
+impl fmt::Debug for HvfArm64BootVsockCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfArm64BootVsockCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Observable boundaries of the quiesced vsock reset/capture transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64BootVsockCaptureStage {
+    Inventory,
+    Reset,
+    InterruptDelivery,
+    Capture,
+    Handoff,
+}
+
+/// Whether a failed capture can safely resume and retry the paused source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64BootVsockCaptureDisposition {
+    Recoverable,
+    Terminal,
+}
+
+/// Stable, redacted failure classes for vsock capture ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64BootVsockCaptureErrorKind {
+    OwnerUnavailable,
+    WrongQuiescenceGuard,
+    ConfigurationAbsent,
+    OwnerMissing,
+    DuplicateOwner,
+    WrongTransport,
+    IdentityMismatch,
+    MetricsOwnerMismatch,
+    GuestMemory,
+    MmioDispatcherBusy,
+    MmioDispatcherPoisoned,
+    PciPlacement,
+    Reset,
+    InterruptDelivery,
+    Capture,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64BootVsockCaptureError {
+    kind: HvfArm64BootVsockCaptureErrorKind,
+    stage: HvfArm64BootVsockCaptureStage,
+    disposition: HvfArm64BootVsockCaptureDisposition,
+}
+
+impl HvfArm64BootVsockCaptureError {
+    const fn new(
+        kind: HvfArm64BootVsockCaptureErrorKind,
+        stage: HvfArm64BootVsockCaptureStage,
+        disposition: HvfArm64BootVsockCaptureDisposition,
+    ) -> Self {
+        Self {
+            kind,
+            stage,
+            disposition,
+        }
+    }
+
+    pub const fn kind(self) -> HvfArm64BootVsockCaptureErrorKind {
+        self.kind
+    }
+
+    pub const fn stage(self) -> HvfArm64BootVsockCaptureStage {
+        self.stage
+    }
+
+    pub const fn disposition(self) -> HvfArm64BootVsockCaptureDisposition {
+        self.disposition
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self.disposition,
+            HvfArm64BootVsockCaptureDisposition::Terminal
+        )
+    }
+
+    #[doc(hidden)]
+    pub const fn owner_unavailable(disposition: HvfArm64BootVsockCaptureDisposition) -> Self {
+        Self::new(
+            HvfArm64BootVsockCaptureErrorKind::OwnerUnavailable,
+            HvfArm64BootVsockCaptureStage::Inventory,
+            disposition,
+        )
+    }
+
+    #[doc(hidden)]
+    pub const fn cancelled(stage: HvfArm64BootVsockCaptureStage) -> Self {
+        Self::new(
+            HvfArm64BootVsockCaptureErrorKind::Cancelled,
+            stage,
+            HvfArm64BootVsockCaptureDisposition::Recoverable,
+        )
+    }
+}
+
+impl fmt::Debug for HvfArm64BootVsockCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfArm64BootVsockCaptureError")
+            .field("kind", &self.kind)
+            .field("stage", &self.stage)
+            .field("disposition", &self.disposition)
+            .field("details", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfArm64BootVsockCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "vsock capture failed at {:?}: {:?} ({:?})",
+            self.stage, self.kind, self.disposition
+        )
+    }
+}
+
+impl std::error::Error for HvfArm64BootVsockCaptureError {}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum HvfArm64BootBalloonTransportState {
     Mmio {
@@ -4817,6 +5018,446 @@ fn capture_ready_serial_state(
         })?;
     capture_ready_serial_state_for_device(serial, &mut dispatcher, &config)
         .map_err(|source| HvfArm64BootSerialCaptureError::Capture { source })
+}
+
+struct HvfArm64BootVsockCaptureOwner<'a> {
+    backend: &'a mut HvfBackend,
+    mmio_dispatcher: &'a Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &'a Arm64BootRuntimeResources,
+    pci_data_devices: &'a Option<HvfArm64BootPciDataDevices>,
+    retry_wakeup_scheduler: &'a HvfArm64BootLimiterRetryWakeupScheduler,
+    session_metrics: &'a SharedVsockDeviceMetrics,
+    gic: &'a HvfGicMetadata,
+    vsock_interrupt_line: Option<GuestInterruptLine>,
+}
+
+enum HvfArm64BootVsockCaptureTransportOwner<'a> {
+    Mmio {
+        device: &'a Arm64BootVsockDevice,
+        interrupt_line: GuestInterruptLine,
+    },
+    Pci {
+        device: &'a HvfArm64BootPciVsockDevice,
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HvfArm64BootVsockInventoryPresence {
+    Absent,
+    Mmio,
+    Pci,
+}
+
+fn vsock_capture_error(
+    kind: HvfArm64BootVsockCaptureErrorKind,
+    stage: HvfArm64BootVsockCaptureStage,
+    terminal: bool,
+) -> HvfArm64BootVsockCaptureError {
+    HvfArm64BootVsockCaptureError::new(
+        kind,
+        stage,
+        if terminal {
+            HvfArm64BootVsockCaptureDisposition::Terminal
+        } else {
+            HvfArm64BootVsockCaptureDisposition::Recoverable
+        },
+    )
+}
+
+fn cancelled_vsock_capture(stage: HvfArm64BootVsockCaptureStage) -> HvfArm64BootVsockCaptureError {
+    vsock_capture_error(HvfArm64BootVsockCaptureErrorKind::Cancelled, stage, false)
+}
+
+fn validate_vsock_inventory_presence(
+    configured: bool,
+    mmio_owner: bool,
+    pci_owner: bool,
+    unconsumed_pci_owner: bool,
+) -> Result<HvfArm64BootVsockInventoryPresence, HvfArm64BootVsockCaptureError> {
+    if !configured {
+        return if !mmio_owner && !pci_owner && !unconsumed_pci_owner {
+            Ok(HvfArm64BootVsockInventoryPresence::Absent)
+        } else {
+            Err(vsock_capture_error(
+                HvfArm64BootVsockCaptureErrorKind::ConfigurationAbsent,
+                HvfArm64BootVsockCaptureStage::Inventory,
+                true,
+            ))
+        };
+    }
+    if unconsumed_pci_owner {
+        return Err(vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::WrongTransport,
+            HvfArm64BootVsockCaptureStage::Inventory,
+            true,
+        ));
+    }
+    match (mmio_owner, pci_owner) {
+        (false, false) => Err(vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::OwnerMissing,
+            HvfArm64BootVsockCaptureStage::Inventory,
+            true,
+        )),
+        (true, true) => Err(vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::DuplicateOwner,
+            HvfArm64BootVsockCaptureStage::Inventory,
+            true,
+        )),
+        (true, false) => Ok(HvfArm64BootVsockInventoryPresence::Mmio),
+        (false, true) => Ok(HvfArm64BootVsockInventoryPresence::Pci),
+    }
+}
+
+fn map_vsock_mmio_dispatcher_error(
+    error: HvfArm64BootMmioDispatcherError,
+    stage: HvfArm64BootVsockCaptureStage,
+    reset_started: bool,
+) -> HvfArm64BootVsockCaptureError {
+    match error {
+        HvfArm64BootMmioDispatcherError::Busy => vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::MmioDispatcherBusy,
+            stage,
+            reset_started,
+        ),
+        HvfArm64BootMmioDispatcherError::Poisoned => vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::MmioDispatcherPoisoned,
+            stage,
+            true,
+        ),
+    }
+}
+
+fn map_vsock_mmio_transport_reset_error(
+    error: RuntimeArm64BootVsockTransportResetError,
+) -> HvfArm64BootVsockCaptureError {
+    match error {
+        RuntimeArm64BootVsockTransportResetError::HandlerLookup { .. } => vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::OwnerUnavailable,
+            HvfArm64BootVsockCaptureStage::Reset,
+            true,
+        ),
+        RuntimeArm64BootVsockTransportResetError::Device(_) => vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::Reset,
+            HvfArm64BootVsockCaptureStage::Reset,
+            true,
+        ),
+    }
+}
+
+fn map_vsock_mmio_capture_error(
+    error: RuntimeArm64BootVsockCaptureError,
+) -> HvfArm64BootVsockCaptureError {
+    match error {
+        RuntimeArm64BootVsockCaptureError::HandlerLookup { .. } => vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::OwnerUnavailable,
+            HvfArm64BootVsockCaptureStage::Capture,
+            true,
+        ),
+        RuntimeArm64BootVsockCaptureError::HandlerChanged => vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::IdentityMismatch,
+            HvfArm64BootVsockCaptureStage::Capture,
+            true,
+        ),
+        RuntimeArm64BootVsockCaptureError::Device(_) => vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::Capture,
+            HvfArm64BootVsockCaptureStage::Capture,
+            true,
+        ),
+    }
+}
+
+fn retain_vsock_cancellation(
+    cancellation: &mut Option<HvfArm64BootVsockCaptureStage>,
+    stage: HvfArm64BootVsockCaptureStage,
+    is_cancelled: &mut impl FnMut(HvfArm64BootVsockCaptureStage) -> bool,
+) {
+    if cancellation.is_none() && is_cancelled(stage) {
+        *cancellation = Some(stage);
+    }
+}
+
+fn capture_ready_vsock_state_with_cancel(
+    owner: HvfArm64BootVsockCaptureOwner<'_>,
+    config: Option<VsockConfig>,
+    expected_metrics: &SharedVsockDeviceMetrics,
+    guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    mut is_cancelled: impl FnMut(HvfArm64BootVsockCaptureStage) -> bool,
+) -> Result<Option<HvfArm64BootVsockCaptureState>, HvfArm64BootVsockCaptureError> {
+    if !Arc::ptr_eq(&guard.block.shared, &owner.retry_wakeup_scheduler.shared) {
+        return Err(vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::WrongQuiescenceGuard,
+            HvfArm64BootVsockCaptureStage::Inventory,
+            false,
+        ));
+    }
+    if !owner.session_metrics.shares_state_with(expected_metrics) {
+        return Err(vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::MetricsOwnerMismatch,
+            HvfArm64BootVsockCaptureStage::Inventory,
+            true,
+        ));
+    }
+    if is_cancelled(HvfArm64BootVsockCaptureStage::Inventory) {
+        return Err(cancelled_vsock_capture(
+            HvfArm64BootVsockCaptureStage::Inventory,
+        ));
+    }
+
+    let mmio = owner.runtime_resources.vsock_device.as_ref();
+    let pci = owner
+        .pci_data_devices
+        .as_ref()
+        .and_then(|devices| devices.vsock.as_ref());
+    let unconsumed_pci = owner.runtime_resources.pci_vsock_device.is_some();
+    let inventory = validate_vsock_inventory_presence(
+        config.is_some(),
+        mmio.is_some(),
+        pci.is_some(),
+        unconsumed_pci,
+    )?;
+    let Some(config) = config else {
+        debug_assert_eq!(inventory, HvfArm64BootVsockInventoryPresence::Absent);
+        return Ok(None);
+    };
+    let transport_owner = match inventory {
+        HvfArm64BootVsockInventoryPresence::Absent => {
+            return Err(vsock_capture_error(
+                HvfArm64BootVsockCaptureErrorKind::OwnerMissing,
+                HvfArm64BootVsockCaptureStage::Inventory,
+                true,
+            ));
+        }
+        HvfArm64BootVsockInventoryPresence::Mmio => {
+            let device = mmio.ok_or_else(|| {
+                vsock_capture_error(
+                    HvfArm64BootVsockCaptureErrorKind::OwnerUnavailable,
+                    HvfArm64BootVsockCaptureStage::Inventory,
+                    true,
+                )
+            })?;
+            let Some(interrupt_line) = owner.vsock_interrupt_line else {
+                return Err(vsock_capture_error(
+                    HvfArm64BootVsockCaptureErrorKind::WrongTransport,
+                    HvfArm64BootVsockCaptureStage::Inventory,
+                    true,
+                ));
+            };
+            let registration = &device.registration;
+            if registration.guest_cid() != config.guest_cid()
+                || registration.uds_path() != config.uds_path()
+                || device.fdt_device.interrupt_line != interrupt_line
+                || device.fdt_device.region.base != registration.address().raw_value()
+                || device.fdt_device.region.size != registration.region().range().size()
+            {
+                return Err(vsock_capture_error(
+                    HvfArm64BootVsockCaptureErrorKind::IdentityMismatch,
+                    HvfArm64BootVsockCaptureStage::Inventory,
+                    true,
+                ));
+            }
+            HvfArm64BootVsockCaptureTransportOwner::Mmio {
+                device,
+                interrupt_line,
+            }
+        }
+        HvfArm64BootVsockInventoryPresence::Pci => {
+            let device = pci.ok_or_else(|| {
+                vsock_capture_error(
+                    HvfArm64BootVsockCaptureErrorKind::OwnerUnavailable,
+                    HvfArm64BootVsockCaptureStage::Inventory,
+                    true,
+                )
+            })?;
+            if owner.vsock_interrupt_line.is_some() {
+                return Err(vsock_capture_error(
+                    HvfArm64BootVsockCaptureErrorKind::WrongTransport,
+                    HvfArm64BootVsockCaptureStage::Inventory,
+                    true,
+                ));
+            }
+            if device.guest_cid != config.guest_cid()
+                || device.uds_path.as_path() != config.uds_path()
+            {
+                return Err(vsock_capture_error(
+                    HvfArm64BootVsockCaptureErrorKind::IdentityMismatch,
+                    HvfArm64BootVsockCaptureStage::Inventory,
+                    true,
+                ));
+            }
+            let sbdf = device.published.sbdf().ok_or_else(|| {
+                vsock_capture_error(
+                    HvfArm64BootVsockCaptureErrorKind::PciPlacement,
+                    HvfArm64BootVsockCaptureStage::Inventory,
+                    true,
+                )
+            })?;
+            let bar_range = device.published.bar_range().ok_or_else(|| {
+                vsock_capture_error(
+                    HvfArm64BootVsockCaptureErrorKind::PciPlacement,
+                    HvfArm64BootVsockCaptureStage::Inventory,
+                    true,
+                )
+            })?;
+            HvfArm64BootVsockCaptureTransportOwner::Pci {
+                device,
+                sbdf,
+                bar_range,
+            }
+        }
+    };
+
+    if is_cancelled(HvfArm64BootVsockCaptureStage::Reset) {
+        return Err(cancelled_vsock_capture(
+            HvfArm64BootVsockCaptureStage::Reset,
+        ));
+    }
+
+    let memory = owner.backend.mapped_guest_memory_mut().map_err(|_| {
+        vsock_capture_error(
+            HvfArm64BootVsockCaptureErrorKind::GuestMemory,
+            HvfArm64BootVsockCaptureStage::Reset,
+            true,
+        )
+    })?;
+    let mut pending_cancellation = None;
+
+    let (transport, validation) = match transport_owner {
+        HvfArm64BootVsockCaptureTransportOwner::Mmio {
+            device,
+            interrupt_line,
+        } => {
+            let registration = &device.registration;
+
+            let mut dispatcher =
+                lock_boot_mmio_dispatcher(owner.mmio_dispatcher).map_err(|error| {
+                    map_vsock_mmio_dispatcher_error(
+                        error,
+                        HvfArm64BootVsockCaptureStage::Reset,
+                        false,
+                    )
+                })?;
+            let (reset_attempt, handler_identity) = prepare_vsock_transport_reset_for_device(
+                device,
+                &mut dispatcher,
+                memory,
+                owner.session_metrics,
+            )
+            .map_err(map_vsock_mmio_transport_reset_error)?;
+
+            retain_vsock_cancellation(
+                &mut pending_cancellation,
+                HvfArm64BootVsockCaptureStage::InterruptDelivery,
+                &mut is_cancelled,
+            );
+            if reset_attempt.needs_queue_interrupt() {
+                drop(dispatcher);
+                let delivered = HvfGicSpiSignaler::from_metadata(owner.gic).is_ok_and(|signaler| {
+                    signal_queue_interrupt(interrupt_line, &signaler).is_ok()
+                });
+                if !delivered {
+                    owner.session_metrics.record_event_queue_signal_failure();
+                    return Err(vsock_capture_error(
+                        HvfArm64BootVsockCaptureErrorKind::InterruptDelivery,
+                        HvfArm64BootVsockCaptureStage::InterruptDelivery,
+                        true,
+                    ));
+                }
+                dispatcher = lock_boot_mmio_dispatcher(owner.mmio_dispatcher).map_err(|error| {
+                    map_vsock_mmio_dispatcher_error(
+                        error,
+                        HvfArm64BootVsockCaptureStage::Capture,
+                        true,
+                    )
+                })?;
+            }
+
+            retain_vsock_cancellation(
+                &mut pending_cancellation,
+                HvfArm64BootVsockCaptureStage::Capture,
+                &mut is_cancelled,
+            );
+            let (state, validation) = capture_vsock_state_for_device(
+                device,
+                &mut dispatcher,
+                &config,
+                memory,
+                reset_attempt,
+                handler_identity,
+            )
+            .map_err(map_vsock_mmio_capture_error)?;
+            (
+                HvfArm64BootVsockTransportState::Mmio {
+                    region: registration.region(),
+                    interrupt_line,
+                    state: Box::new(state),
+                },
+                validation,
+            )
+        }
+        HvfArm64BootVsockCaptureTransportOwner::Pci {
+            device,
+            sbdf,
+            bar_range,
+        } => {
+            let reset_attempt = device
+                .published
+                .endpoint()
+                .prepare_vsock_transport_reset(memory, owner.session_metrics)
+                .map_err(|_| {
+                    vsock_capture_error(
+                        HvfArm64BootVsockCaptureErrorKind::Reset,
+                        HvfArm64BootVsockCaptureStage::Reset,
+                        true,
+                    )
+                })?;
+            retain_vsock_cancellation(
+                &mut pending_cancellation,
+                HvfArm64BootVsockCaptureStage::InterruptDelivery,
+                &mut is_cancelled,
+            );
+            retain_vsock_cancellation(
+                &mut pending_cancellation,
+                HvfArm64BootVsockCaptureStage::Capture,
+                &mut is_cancelled,
+            );
+            let (state, validation) = device
+                .published
+                .endpoint()
+                .capture_and_normalize_vsock_state(&config, memory, reset_attempt)
+                .map_err(|_| {
+                    vsock_capture_error(
+                        HvfArm64BootVsockCaptureErrorKind::Capture,
+                        HvfArm64BootVsockCaptureStage::Capture,
+                        true,
+                    )
+                })?;
+            (
+                HvfArm64BootVsockTransportState::Pci {
+                    sbdf,
+                    bar_range,
+                    state: Box::new(state),
+                },
+                validation,
+            )
+        }
+    };
+
+    retain_vsock_cancellation(
+        &mut pending_cancellation,
+        HvfArm64BootVsockCaptureStage::Handoff,
+        &mut is_cancelled,
+    );
+    if let Some(stage) = pending_cancellation {
+        return Err(cancelled_vsock_capture(stage));
+    }
+
+    Ok(Some(HvfArm64BootVsockCaptureState {
+        config,
+        validation,
+        transport,
+    }))
 }
 
 fn capture_ready_balloon_state(
@@ -6924,6 +7565,40 @@ impl HvfArm64BootSession<'_> {
             &self.block_retry_wakeup_scheduler,
             config,
             guard,
+        )
+    }
+
+    pub fn capture_ready_vsock_state(
+        &mut self,
+        config: Option<VsockConfig>,
+        expected_metrics: &SharedVsockDeviceMetrics,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<HvfArm64BootVsockCaptureState>, HvfArm64BootVsockCaptureError> {
+        self.capture_ready_vsock_state_with_cancel(config, expected_metrics, guard, |_| false)
+    }
+
+    pub fn capture_ready_vsock_state_with_cancel(
+        &mut self,
+        config: Option<VsockConfig>,
+        expected_metrics: &SharedVsockDeviceMetrics,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        is_cancelled: impl FnMut(HvfArm64BootVsockCaptureStage) -> bool,
+    ) -> Result<Option<HvfArm64BootVsockCaptureState>, HvfArm64BootVsockCaptureError> {
+        capture_ready_vsock_state_with_cancel(
+            HvfArm64BootVsockCaptureOwner {
+                backend: self.backend,
+                mmio_dispatcher: &self.mmio_dispatcher,
+                runtime_resources: &self.runtime_resources,
+                pci_data_devices: &self.pci_data_devices,
+                retry_wakeup_scheduler: &self.block_retry_wakeup_scheduler,
+                session_metrics: &self.vsock_device_metrics,
+                gic: &self.gic,
+                vsock_interrupt_line: self.vsock_interrupt_line,
+            },
+            config,
+            expected_metrics,
+            guard,
+            is_cancelled,
         )
     }
 
@@ -9251,6 +9926,40 @@ impl OwnedHvfArm64BootSession {
             &self.block_retry_wakeup_scheduler,
             config,
             guard,
+        )
+    }
+
+    pub fn capture_ready_vsock_state(
+        &mut self,
+        config: Option<VsockConfig>,
+        expected_metrics: &SharedVsockDeviceMetrics,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    ) -> Result<Option<HvfArm64BootVsockCaptureState>, HvfArm64BootVsockCaptureError> {
+        self.capture_ready_vsock_state_with_cancel(config, expected_metrics, guard, |_| false)
+    }
+
+    pub fn capture_ready_vsock_state_with_cancel(
+        &mut self,
+        config: Option<VsockConfig>,
+        expected_metrics: &SharedVsockDeviceMetrics,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        is_cancelled: impl FnMut(HvfArm64BootVsockCaptureStage) -> bool,
+    ) -> Result<Option<HvfArm64BootVsockCaptureState>, HvfArm64BootVsockCaptureError> {
+        capture_ready_vsock_state_with_cancel(
+            HvfArm64BootVsockCaptureOwner {
+                backend: &mut self.backend,
+                mmio_dispatcher: &self.mmio_dispatcher,
+                runtime_resources: &self.runtime_resources,
+                pci_data_devices: &self.pci_data_devices,
+                retry_wakeup_scheduler: &self.block_retry_wakeup_scheduler,
+                session_metrics: &self.vsock_device_metrics,
+                gic: &self.gic,
+                vsock_interrupt_line: self.vsock_interrupt_line,
+            },
+            config,
+            expected_metrics,
+            guard,
+            is_cancelled,
         )
     }
 
@@ -17239,7 +17948,7 @@ fn prepare_pci_data_devices(
         }
 
         if let Some(prepared) = vsock {
-            let (_, _, config_space, device) = prepared.into_parts();
+            let (guest_cid, uds_path, config_space, device) = prepared.into_parts();
             let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
@@ -17267,6 +17976,8 @@ fn prepare_pci_data_devices(
                 })?
             };
             manager.vsock = Some(HvfArm64BootPciVsockDevice {
+                guest_cid,
+                uds_path,
                 published,
                 queue_deliveries: 0,
             });
@@ -18824,6 +19535,501 @@ mod tests {
 
         first.stop();
         second.stop();
+    }
+
+    #[test]
+    fn vsock_capture_classifies_complete_inventory_and_dispatcher_failures() {
+        use super::{
+            HvfArm64BootVsockCaptureErrorKind as ErrorKind,
+            HvfArm64BootVsockInventoryPresence as Presence,
+        };
+
+        #[derive(Clone, Copy)]
+        enum Expected {
+            Presence(Presence),
+            Error(ErrorKind),
+        }
+
+        for (configured, mmio, pci, unconsumed_pci, expected) in [
+            (
+                false,
+                false,
+                false,
+                false,
+                Expected::Presence(Presence::Absent),
+            ),
+            (
+                false,
+                true,
+                false,
+                false,
+                Expected::Error(ErrorKind::ConfigurationAbsent),
+            ),
+            (
+                false,
+                false,
+                true,
+                false,
+                Expected::Error(ErrorKind::ConfigurationAbsent),
+            ),
+            (
+                false,
+                true,
+                true,
+                false,
+                Expected::Error(ErrorKind::ConfigurationAbsent),
+            ),
+            (
+                false,
+                false,
+                false,
+                true,
+                Expected::Error(ErrorKind::ConfigurationAbsent),
+            ),
+            (
+                false,
+                true,
+                false,
+                true,
+                Expected::Error(ErrorKind::ConfigurationAbsent),
+            ),
+            (
+                false,
+                false,
+                true,
+                true,
+                Expected::Error(ErrorKind::ConfigurationAbsent),
+            ),
+            (
+                false,
+                true,
+                true,
+                true,
+                Expected::Error(ErrorKind::ConfigurationAbsent),
+            ),
+            (
+                true,
+                false,
+                false,
+                false,
+                Expected::Error(ErrorKind::OwnerMissing),
+            ),
+            (true, true, false, false, Expected::Presence(Presence::Mmio)),
+            (true, false, true, false, Expected::Presence(Presence::Pci)),
+            (
+                true,
+                true,
+                true,
+                false,
+                Expected::Error(ErrorKind::DuplicateOwner),
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                Expected::Error(ErrorKind::WrongTransport),
+            ),
+            (
+                true,
+                true,
+                false,
+                true,
+                Expected::Error(ErrorKind::WrongTransport),
+            ),
+            (
+                true,
+                false,
+                true,
+                true,
+                Expected::Error(ErrorKind::WrongTransport),
+            ),
+            (
+                true,
+                true,
+                true,
+                true,
+                Expected::Error(ErrorKind::WrongTransport),
+            ),
+        ] {
+            let result =
+                super::validate_vsock_inventory_presence(configured, mmio, pci, unconsumed_pci);
+            match expected {
+                Expected::Presence(expected) => assert_eq!(
+                    result.expect("valid inventory should select one transport presence"),
+                    expected
+                ),
+                Expected::Error(expected) => {
+                    let error = result.expect_err("inventory mismatch should fail closed");
+                    assert_eq!(error.kind(), expected);
+                    assert_eq!(
+                        error.stage(),
+                        super::HvfArm64BootVsockCaptureStage::Inventory
+                    );
+                    assert!(error.is_terminal());
+                }
+            }
+        }
+
+        let busy_before_reset = super::map_vsock_mmio_dispatcher_error(
+            super::HvfArm64BootMmioDispatcherError::Busy,
+            super::HvfArm64BootVsockCaptureStage::Reset,
+            false,
+        );
+        assert_eq!(busy_before_reset.kind(), ErrorKind::MmioDispatcherBusy);
+        assert!(!busy_before_reset.is_terminal());
+
+        let busy_after_reset = super::map_vsock_mmio_dispatcher_error(
+            super::HvfArm64BootMmioDispatcherError::Busy,
+            super::HvfArm64BootVsockCaptureStage::Capture,
+            true,
+        );
+        assert_eq!(busy_after_reset.kind(), ErrorKind::MmioDispatcherBusy);
+        assert!(busy_after_reset.is_terminal());
+
+        let poisoned = super::map_vsock_mmio_dispatcher_error(
+            super::HvfArm64BootMmioDispatcherError::Poisoned,
+            super::HvfArm64BootVsockCaptureStage::Reset,
+            false,
+        );
+        assert_eq!(poisoned.kind(), ErrorKind::MmioDispatcherPoisoned);
+        assert!(poisoned.is_terminal());
+
+        let missing_handler = || bangbang_runtime::mmio::MmioHandlerLookupError::MissingHandler {
+            region_id: MmioRegionId::new(9_999),
+        };
+        let reset_owner_loss = super::map_vsock_mmio_transport_reset_error(
+            super::RuntimeArm64BootVsockTransportResetError::HandlerLookup {
+                source: missing_handler(),
+            },
+        );
+        assert_eq!(reset_owner_loss.kind(), ErrorKind::OwnerUnavailable);
+        assert_eq!(
+            reset_owner_loss.stage(),
+            super::HvfArm64BootVsockCaptureStage::Reset
+        );
+        assert!(reset_owner_loss.is_terminal());
+
+        let capture_owner_loss = super::map_vsock_mmio_capture_error(
+            super::RuntimeArm64BootVsockCaptureError::HandlerLookup {
+                source: missing_handler(),
+            },
+        );
+        assert_eq!(capture_owner_loss.kind(), ErrorKind::OwnerUnavailable);
+        assert_eq!(
+            capture_owner_loss.stage(),
+            super::HvfArm64BootVsockCaptureStage::Capture
+        );
+        assert!(capture_owner_loss.is_terminal());
+
+        let changed_handler = super::map_vsock_mmio_capture_error(
+            super::RuntimeArm64BootVsockCaptureError::HandlerChanged,
+        );
+        assert_eq!(changed_handler.kind(), ErrorKind::IdentityMismatch);
+        assert!(changed_handler.is_terminal());
+
+        let corrupt_reset = super::map_vsock_mmio_transport_reset_error(
+            super::RuntimeArm64BootVsockTransportResetError::Device(
+                bangbang_runtime::vsock::VirtioVsockTransportResetError::EmptyDescriptorChain,
+            ),
+        );
+        assert_eq!(corrupt_reset.kind(), ErrorKind::Reset);
+        assert!(corrupt_reset.is_terminal());
+
+        let corrupt_capture =
+            super::map_vsock_mmio_capture_error(super::RuntimeArm64BootVsockCaptureError::Device(
+                bangbang_runtime::vsock::VirtioVsockDeviceCaptureError::ConfigCidMismatch,
+            ));
+        assert_eq!(corrupt_capture.kind(), ErrorKind::Capture);
+        assert!(corrupt_capture.is_terminal());
+    }
+
+    #[test]
+    fn quiesced_vsock_capture_validates_inventory_before_mutation() {
+        let block_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let pmem_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let network_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let entropy_token = HvfArm64BootLimiterRetryWakeupToken::default();
+        let mut block_scheduler = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let mut pmem_scheduler = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let mut network_scheduler = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let mut entropy_scheduler = HvfArm64BootLimiterRetryWakeupScheduler::inactive();
+        let guard = quiesce_limiter_retry_wakeups(
+            HvfArm64BootLimiterRetryWakeupOwner::new(&block_token, &block_scheduler),
+            HvfArm64BootLimiterRetryWakeupOwner::new(&pmem_token, &pmem_scheduler),
+            HvfArm64BootLimiterRetryWakeupOwner::new(&network_token, &network_scheduler),
+            HvfArm64BootLimiterRetryWakeupOwner::new(&entropy_token, &entropy_scheduler),
+        )
+        .expect("vsock capture fixture should quiesce auxiliary schedulers");
+        let metrics = SharedVsockDeviceMetrics::default();
+        let gic = gic_with_spi_range(32, 224);
+        let mut backend = super::HvfBackend::new();
+        let (_memory, runtime, dispatcher) = boot_runtime_without_drives();
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        let no_pci = None;
+
+        let wrong_guard = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &dispatcher,
+                runtime_resources: &runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &pmem_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: None,
+            },
+            None,
+            &metrics,
+            &guard,
+            |_| false,
+        )
+        .expect_err("a guard from another scheduler owner should be rejected");
+        assert_eq!(
+            wrong_guard.kind(),
+            super::HvfArm64BootVsockCaptureErrorKind::WrongQuiescenceGuard
+        );
+        assert_eq!(
+            wrong_guard.disposition(),
+            super::HvfArm64BootVsockCaptureDisposition::Recoverable
+        );
+
+        let absent = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &dispatcher,
+                runtime_resources: &runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &block_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: None,
+            },
+            None,
+            &metrics,
+            &guard,
+            |_| false,
+        )
+        .expect("an absent config and owner should capture as absent");
+        assert!(absent.is_none());
+
+        let requested_path = temp_path("missing-vsock-owner.sock");
+        let requested = VsockConfigInput::new(42, requested_path.to_string_lossy().into_owned())
+            .validate()
+            .expect("test vsock config should validate");
+        let missing = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &dispatcher,
+                runtime_resources: &runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &block_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: None,
+            },
+            Some(requested),
+            &metrics,
+            &guard,
+            |_| false,
+        )
+        .expect_err("a configured vsock without an owner should fail closed");
+        assert_eq!(
+            missing.kind(),
+            super::HvfArm64BootVsockCaptureErrorKind::OwnerMissing
+        );
+        assert!(missing.is_terminal());
+
+        let mismatched_metrics = SharedVsockDeviceMetrics::default();
+        let mismatch = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &dispatcher,
+                runtime_resources: &runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &block_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: None,
+            },
+            None,
+            &mismatched_metrics,
+            &guard,
+            |_| false,
+        )
+        .expect_err("an unrelated metrics owner should fail closed");
+        assert_eq!(
+            mismatch.kind(),
+            super::HvfArm64BootVsockCaptureErrorKind::MetricsOwnerMismatch
+        );
+        assert!(mismatch.is_terminal());
+
+        let cancelled = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &dispatcher,
+                runtime_resources: &runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &block_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: None,
+            },
+            None,
+            &metrics,
+            &guard,
+            |stage| stage == super::HvfArm64BootVsockCaptureStage::Inventory,
+        )
+        .expect_err("pre-inventory cancellation should be recoverable");
+        assert_eq!(
+            cancelled.disposition(),
+            super::HvfArm64BootVsockCaptureDisposition::Recoverable
+        );
+        assert_eq!(
+            cancelled.stage(),
+            super::HvfArm64BootVsockCaptureStage::Inventory
+        );
+
+        let kernel = temp_file("kernel-vsock-capture-inventory", &arm64_image());
+        let socket_path = temp_path("vc.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 42, &socket_path);
+        let expected = controller
+            .vsock_config()
+            .cloned()
+            .expect("configured vsock should be retained");
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_boot_resource_config_with_network_and_vsock_lines(&[], &[], Some(line(35))),
+        )
+        .expect("MMIO vsock capture fixture should assemble");
+        let parts = resources.into_parts();
+        let mmio_dispatcher = Arc::new(Mutex::new(parts.mmio_dispatcher));
+
+        let configuration_absent = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &mmio_dispatcher,
+                runtime_resources: &parts.runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &block_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: Some(line(35)),
+            },
+            None,
+            &metrics,
+            &guard,
+            |_| false,
+        )
+        .expect_err("an MMIO owner without controller config should fail closed");
+        assert_eq!(
+            configuration_absent.kind(),
+            super::HvfArm64BootVsockCaptureErrorKind::ConfigurationAbsent
+        );
+
+        let wrong_transport = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &mmio_dispatcher,
+                runtime_resources: &parts.runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &block_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: None,
+            },
+            Some(expected.clone()),
+            &metrics,
+            &guard,
+            |_| false,
+        )
+        .expect_err("MMIO ownership without its interrupt route should fail closed");
+        assert_eq!(
+            wrong_transport.kind(),
+            super::HvfArm64BootVsockCaptureErrorKind::WrongTransport
+        );
+
+        let wrong_identity_path = temp_path("wrong-vsock-selector.sock");
+        let wrong_identity =
+            VsockConfigInput::new(43, wrong_identity_path.to_string_lossy().into_owned())
+                .validate()
+                .expect("mismatched test config should validate");
+        let identity = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &mmio_dispatcher,
+                runtime_resources: &parts.runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &block_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: Some(line(35)),
+            },
+            Some(wrong_identity),
+            &metrics,
+            &guard,
+            |_| false,
+        )
+        .expect_err("CID and selector drift should fail closed");
+        assert_eq!(
+            identity.kind(),
+            super::HvfArm64BootVsockCaptureErrorKind::IdentityMismatch
+        );
+
+        let reset_cancelled = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &mmio_dispatcher,
+                runtime_resources: &parts.runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &block_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: Some(line(35)),
+            },
+            Some(expected.clone()),
+            &metrics,
+            &guard,
+            |stage| stage == super::HvfArm64BootVsockCaptureStage::Reset,
+        )
+        .expect_err("pre-reset cancellation should not require mapped guest memory");
+        assert_eq!(
+            reset_cancelled.stage(),
+            super::HvfArm64BootVsockCaptureStage::Reset
+        );
+        assert!(!reset_cancelled.is_terminal());
+
+        let guest_memory = super::capture_ready_vsock_state_with_cancel(
+            super::HvfArm64BootVsockCaptureOwner {
+                backend: &mut backend,
+                mmio_dispatcher: &mmio_dispatcher,
+                runtime_resources: &parts.runtime,
+                pci_data_devices: &no_pci,
+                retry_wakeup_scheduler: &block_scheduler,
+                session_metrics: &metrics,
+                gic: &gic,
+                vsock_interrupt_line: Some(line(35)),
+            },
+            Some(expected),
+            &metrics,
+            &guard,
+            |_| false,
+        )
+        .expect_err("capture without mapped guest memory should fail closed");
+        assert_eq!(
+            guest_memory.kind(),
+            super::HvfArm64BootVsockCaptureErrorKind::GuestMemory
+        );
+        assert!(guest_memory.is_terminal());
+        assert!(!format!("{guest_memory:?}").contains(socket_path.to_string_lossy().as_ref()));
+        assert!(!guest_memory.to_string().contains("42"));
+
+        drop(guard);
+        block_scheduler.stop();
+        pmem_scheduler.stop();
+        network_scheduler.stop();
+        entropy_scheduler.stop();
     }
 
     #[test]

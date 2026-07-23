@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, TryReserveError};
 use std::fmt;
 use std::fs::File;
 use std::os::fd::RawFd;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::VmmController;
@@ -59,7 +60,9 @@ use crate::memory_hotplug::{
     VirtioMemMmioLayout, VirtioMemMmioRegistrationError, VirtioMemMutationExecutor,
     VirtioMemPrepareError,
 };
-use crate::metrics::{SharedMemoryHotplugDeviceMetrics, SharedRtcDeviceMetrics};
+use crate::metrics::{
+    SharedMemoryHotplugDeviceMetrics, SharedRtcDeviceMetrics, SharedVsockDeviceMetrics,
+};
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
     MmioRegionId, MmioRegistrationError, MmioRegistrationLease, MmioRegistrationOwner,
@@ -105,8 +108,10 @@ use crate::storage_capture::{
 use crate::vmclock::VmClockAbi;
 use crate::vsock::{
     PreparedVsockDevice, PreparedVsockDeviceError, SuppliedVsockListener,
+    VirtioVsockCaptureValidation, VirtioVsockDeviceCaptureError,
     VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError,
-    VirtioVsockMmioHandler, VsockMmioDeviceRegistration, VsockMmioLayout,
+    VirtioVsockMmioCaptureState, VirtioVsockMmioHandler, VirtioVsockTransportResetAttempt,
+    VirtioVsockTransportResetError, VsockConfig, VsockMmioDeviceRegistration, VsockMmioLayout,
     VsockMmioRegistrationError,
 };
 
@@ -3957,6 +3962,121 @@ pub fn capture_balloon_state_for_device(
         .map_err(|source| Arm64BootBalloonCaptureError::HandlerLookup { source })?
         .capture_balloon_state(config, memory)
         .map_err(Arm64BootBalloonCaptureError::Device)
+}
+
+/// Publishes one source-side transport reset through the exact boot vsock
+/// registration selected during startup.
+pub fn prepare_vsock_transport_reset_for_device(
+    device: &Arm64BootVsockDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    memory: &mut GuestMemory,
+    metrics: &SharedVsockDeviceMetrics,
+) -> Result<
+    (
+        VirtioVsockTransportResetAttempt,
+        Arm64BootVsockMmioHandlerIdentity,
+    ),
+    Arm64BootVsockTransportResetError,
+> {
+    let handler = mmio_dispatcher
+        .handler_mut::<VirtioVsockMmioHandler>(device.registration.region_id())
+        .map_err(|source| Arm64BootVsockTransportResetError::HandlerLookup { source })?;
+    let identity =
+        Arm64BootVsockMmioHandlerIdentity(handler.activation_handler().capture_owner_identity());
+    let attempt = handler
+        .prepare_vsock_transport_reset(memory, metrics)
+        .map_err(Arm64BootVsockTransportResetError::Device)?;
+    Ok((attempt, identity))
+}
+
+/// Captures one boot vsock device through the exact startup registration after
+/// the caller has completed any required reset interrupt delivery.
+pub fn capture_vsock_state_for_device(
+    device: &Arm64BootVsockDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: &VsockConfig,
+    memory: &GuestMemory,
+    reset_attempt: VirtioVsockTransportResetAttempt,
+    expected_handler: Arm64BootVsockMmioHandlerIdentity,
+) -> Result<(VirtioVsockMmioCaptureState, VirtioVsockCaptureValidation), Arm64BootVsockCaptureError>
+{
+    let handler = mmio_dispatcher
+        .handler_mut::<VirtioVsockMmioHandler>(device.registration.region_id())
+        .map_err(|source| Arm64BootVsockCaptureError::HandlerLookup { source })?;
+    if !handler
+        .activation_handler()
+        .shares_capture_owner_identity(&expected_handler.0)
+    {
+        return Err(Arm64BootVsockCaptureError::HandlerChanged);
+    }
+    handler
+        .capture_and_normalize_vsock_state(config, memory, reset_attempt)
+        .map_err(Arm64BootVsockCaptureError::Device)
+}
+
+/// Opaque identity for proving that a boot-MMIO vsock handler remained the
+/// same while its dispatcher lock was released for GIC delivery.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct Arm64BootVsockMmioHandlerIdentity(Arc<()>);
+
+impl fmt::Debug for Arm64BootVsockMmioHandlerIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Arm64BootVsockMmioHandlerIdentity(<redacted>)")
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootVsockTransportResetError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    Device(VirtioVsockTransportResetError),
+}
+
+impl fmt::Display for Arm64BootVsockTransportResetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::HandlerLookup { .. } => {
+                "failed to locate the boot vsock MMIO handler for transport reset"
+            }
+            Self::Device(_) => "boot vsock MMIO transport reset failed",
+        })
+    }
+}
+
+impl std::error::Error for Arm64BootVsockTransportResetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::Device(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootVsockCaptureError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    HandlerChanged,
+    Device(VirtioVsockDeviceCaptureError),
+}
+
+impl fmt::Display for Arm64BootVsockCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::HandlerLookup { .. } => "failed to locate the boot vsock MMIO handler",
+            Self::HandlerChanged => "boot vsock MMIO handler identity changed",
+            Self::Device(_) => "boot vsock MMIO capture failed",
+        })
+    }
+}
+
+impl std::error::Error for Arm64BootVsockCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::Device(source) => Some(source),
+            Self::HandlerChanged => None,
+        }
+    }
 }
 
 #[derive(Debug)]

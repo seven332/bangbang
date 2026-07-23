@@ -5095,6 +5095,11 @@ pub struct SharedVsockDeviceMetrics {
 }
 
 impl SharedVsockDeviceMetrics {
+    #[doc(hidden)]
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn record_activation_failure(&self) {
         record_atomic_metric(&self.inner.activate_fails, 1);
     }
@@ -10524,7 +10529,11 @@ mod tests {
     #[test]
     fn shared_vsock_device_metrics_snapshot_is_per_instance() {
         let first = SharedVsockDeviceMetrics::default();
+        let first_clone = first.clone();
         let second = SharedVsockDeviceMetrics::default();
+
+        assert!(first.shares_state_with(&first_clone));
+        assert!(!first.shares_state_with(&second));
 
         first.record_activation_failure();
         first.record_config_failure();
