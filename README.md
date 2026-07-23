@@ -386,6 +386,16 @@ additional drives, serialized/restorable optional-device snapshot state,
 active SVE/SME/debug state, EL2 GIC CPU-interface state, and cross-host
 portability remain unsupported.
 
+Separately, the runtime library defines the allocation-free first-pass grammar
+for a future bangbang-native v2 arm64 state container. The initial `2.0.0`
+production catalog is structural only: its canonical state is empty, unknown
+explicitly nonsemantic extensions can be validated, and every required feature
+or semantic component rejects. No public create, load, describe, or version
+path emits or accepts v2 yet, and recognizing a pinned Firecracker bitcode
+prefix reports incompatibility rather than claiming decode or translation.
+The exact wire and compatibility contract is documented in
+[Snapshot Feasibility](docs/snapshot-feasibility.md#native-v2-structural-state-foundation).
+
 ## Process CLI
 
 Run the VMM process skeleton and API server:

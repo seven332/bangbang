@@ -5,6 +5,12 @@ Firecracker-shaped snapshot APIs on macOS with Hypervisor.framework. bangbang
 supports one narrow public native-v1 full-snapshot profile; broader Firecracker
 snapshot and migration compatibility remains out of scope.
 
+The runtime library also has an isolated bangbang-native v2 structural state
+foundation. Its initial `2.0.0` production catalog contains no required feature
+or semantic component, so it is not loadable VM state and is not emitted,
+described, or loaded by any public process path. The public lifecycle and CLI
+remain native-v1 until later Wave 6 work explicitly changes them.
+
 ## Current Status
 
 bangbang implements a bangbang-native outer state envelope, read-only version
@@ -165,6 +171,81 @@ so every future payload decoder must remain safe for attacker-controlled input.
 The inspection CLI still treats the payload as opaque. The runtime additionally
 recognizes both commit kinds below, while the HVF crate alone validates the
 backend-specific composite payload.
+
+## Native V2 Structural State Foundation
+
+Native v2 is a bangbang-owned, arm64-specific state container. It is designed
+for future typed component codecs without changing any native-v1 bytes or
+production path in this slice. All numeric fields are little-endian. The fixed
+header is 64 bytes:
+
+| Offset | Width | Field | Native-v2 rule |
+| ---: | ---: | --- | --- |
+| 0 | 8 | magic | bytes `BANGV2A\0` |
+| 8 | 2 | version major | `2` |
+| 10 | 2 | version minor | compatibility-bearing minor |
+| 12 | 2 | version patch | nonsemantic patch; canonical writer emits `0` |
+| 14 | 2 | header bytes | exact `64` |
+| 16 | 4 | flags | must be zero |
+| 20 | 4 | required-feature count | at most `256` |
+| 24 | 4 | component count | at most `4096` |
+| 28 | 4 | reserved | must be zero |
+| 32 | 8 | total length | exact complete state-file length, including CRC |
+| 40 | 8 | required-feature offset | exact `64` |
+| 48 | 8 | component-directory offset | exact end of the feature table |
+| 56 | 8 | component-payload offset | exact end of the directory |
+
+The header is followed by zero or more sorted, unique, nonzero `u32`
+required-feature identifiers. Each component-directory entry is exactly 32
+bytes:
+
+| Entry offset | Width | Field | Native-v2 rule |
+| ---: | ---: | --- | --- |
+| 0 | 4 | kind | nonzero component kind identifier |
+| 4 | 4 | instance | instance identifier within the kind |
+| 8 | 4 | flags | `0` semantic; exact bit 0 means nonsemantic |
+| 12 | 4 | reserved | must be zero |
+| 16 | 8 | payload offset | exact next packed payload offset |
+| 24 | 8 | payload length | nonzero |
+
+Component keys `(kind, instance)` are strictly increasing. Payloads follow in
+directory order and are contiguous: gaps, overlap, padding, wraparound, and
+trailing bytes are invalid. The final eight bytes are CRC-64/Jones over every
+preceding state-container byte. The current complete-file policy is 16 MiB;
+raising that policy requires an explicit compatibility review and minor-version
+decision. The CRC detects accidental corruption but authenticates neither this
+state nor a separately stored guest-memory image.
+
+Compatibility is fail-closed. A reader requires major `2` and rejects a newer
+minor. For an older or equal minor it requires every mandatory feature and
+semantic component kind to exist in the reader catalog at that minor.
+Explicitly nonsemantic components may remain unknown after their complete
+directory and payload ranges validate. Patch changes do not alter semantics.
+The initial production `2.0.0` catalogs are empty: the canonical emitted
+fixture is the 64-byte header plus its eight-byte CRC, nonsemantic extensions
+can be structurally represented, and every required feature or semantic
+component rejects. No future identifier or minor is reserved by this
+foundation.
+
+Decoding first checks the fixed header, version, count caps, checked length and
+offset arithmetic, exact length, whole-state CRC, complete feature inventory,
+and complete component directory. This pass borrows the bounded input and
+performs no count-proportional vector, string, map, or payload allocation.
+Only after success do bounded borrowed iterators and lookups expose validated
+components to trusted future typed codecs. Diagnostics can report stable
+version, architecture, count, and limit information, but redact feature and
+component identifiers and payload bytes.
+
+The production encoder enforces the current catalogs, computes every size with
+checked arithmetic, performs one fallible exact output reservation, and emits
+only canonical bytes. Its generic catalog-aware encoder remains private and is
+used only for grammar tests. The library family dispatcher delegates exact
+`BANGSNAP` input to the unchanged v1 decoder and `BANGV2A\0` input to this v2
+decoder. It recognizes only the arm64/x86_64 bitcode family prefixes derived
+from Firecracker v1.16.0 at pinned commit
+`d83d72b710361a10294480131377b1b00b163af8` to return a named incompatible-format
+result; this is not bitcode decoding, validity proof, translation, or
+Firecracker artifact compatibility.
 
 ## Native V1 Guest-Memory Image and Binding
 

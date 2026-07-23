@@ -1231,6 +1231,21 @@ is resource-specific:
   it is not authentication, and a party that can rewrite the file can recompute
   it. Future payload schemas must therefore stay memory-safe and fail closed
   even for checksum-valid attacker-controlled bytes.
+- Native-v2 structural state is currently a library-only, non-loadable format
+  foundation. Its first pass treats all bytes as hostile, caps the complete
+  file at 16 MiB, caps feature and component counts before table traversal,
+  uses checked conversions and arithmetic, requires canonical packed ranges
+  and exact EOF, and validates the whole-state CRC before publishing a borrowed
+  view. The pass performs no count-proportional allocation. The `2.0.0`
+  production catalogs contain no required feature or semantic component, so
+  unknown mandatory behavior fails closed; only explicitly marked
+  nonsemantic extensions can survive complete structural validation. Errors
+  and `Debug` omit identifiers, payloads, format magic, guest contents, and raw
+  state. CRC-64/Jones is corruption detection rather than authentication and
+  does not cover any future external guest-memory bytes. The Firecracker
+  prefix classifier proves only an incompatible family and never deserializes
+  or translates upstream bitcode. No public create, describe, load, or VM
+  action consumes v2 in this slice.
 - Native guest-memory bindings and images are also untrusted. The binding caps
   metadata at 4,096 exact GPA ranges / 98,376 encoded bytes and memory data at
   the current 1,022-GiB arm64 policy, checks every conversion, alignment,

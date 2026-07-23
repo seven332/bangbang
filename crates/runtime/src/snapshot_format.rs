@@ -4,6 +4,10 @@ use std::fmt;
 
 use crc64::crc64;
 
+use crate::snapshot_format_v2::{
+    NATIVE_V2_ARM64_MAGIC, SnapshotV2DecodeError, SnapshotV2State, decode_snapshot_v2_state,
+};
+
 const SNAPSHOT_MAGIC: [u8; 8] = *b"BANGSNAP";
 const SNAPSHOT_MAGIC_OFFSET: usize = 0;
 const SNAPSHOT_VERSION_MAJOR_OFFSET: usize = 8;
@@ -237,6 +241,115 @@ impl fmt::Display for SnapshotFormatError {
 
 impl std::error::Error for SnapshotFormatError {}
 
+// Firecracker v1.16.0 commit d83d72b710361a10294480131377b1b00b163af8
+// `src/vmm/src/snapshot/mod.rs` fixes these architecture-specific `u64`
+// magics. bitcode 0.6.9 places its leading field marker before the magic's
+// little-endian bytes. These prefixes classify a family only.
+const FIRECRACKER_AARCH64_BITCODE_MAGIC_PREFIX: [u8; 9] =
+    [0x00, 0x00, 0x00, 0xaa, 0xaa, 0x84, 0x19, 0x10, 0x07];
+const FIRECRACKER_X86_64_BITCODE_MAGIC_PREFIX: [u8; 9] =
+    [0x00, 0x00, 0x00, 0x64, 0x86, 0x84, 0x19, 0x10, 0x07];
+
+/// A fully validated native state-file family borrowing its input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NativeSnapshotState<'state> {
+    /// Exact bangbang-native v1 outer envelope.
+    V1(SnapshotEnvelope<'state>),
+    /// Compatible bangbang-native v2 structural container.
+    V2(SnapshotV2State<'state>),
+}
+
+impl NativeSnapshotState<'_> {
+    /// Returns the embedded semantic state-format version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        match self {
+            Self::V1(envelope) => envelope.metadata().version(),
+            Self::V2(state) => state.metadata().version(),
+        }
+    }
+
+    /// Returns the architecture identified by the native state family.
+    pub const fn architecture(&self) -> SnapshotArchitecture {
+        match self {
+            Self::V1(envelope) => envelope.metadata().architecture(),
+            Self::V2(state) => state.metadata().architecture(),
+        }
+    }
+}
+
+impl fmt::Debug for NativeSnapshotState<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V1(envelope) => formatter.debug_tuple("V1").field(envelope).finish(),
+            Self::V2(state) => formatter.debug_tuple("V2").field(state).finish(),
+        }
+    }
+}
+
+/// Native state-family dispatch or validation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeSnapshotFormatError {
+    /// A bangbang-native v1 envelope is invalid.
+    NativeV1(SnapshotFormatError),
+    /// A bangbang-native v2 container is invalid or incompatible.
+    NativeV2(SnapshotV2DecodeError),
+    /// Input carries the pinned Firecracker bitcode format-family prefix.
+    IncompatibleFirecrackerFormat,
+    /// Input belongs to no supported native state-file family.
+    IncompatibleFormat,
+}
+
+impl fmt::Display for NativeSnapshotFormatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NativeV1(source) => write!(formatter, "invalid native-v1 state: {source}"),
+            Self::NativeV2(source) => write!(formatter, "invalid native-v2 state: {source}"),
+            Self::IncompatibleFirecrackerFormat => {
+                formatter.write_str("Firecracker snapshot state format is incompatible")
+            }
+            Self::IncompatibleFormat => {
+                formatter.write_str("snapshot state format is incompatible")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeSnapshotFormatError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NativeV1(source) => Some(source),
+            Self::NativeV2(source) => Some(source),
+            Self::IncompatibleFirecrackerFormat | Self::IncompatibleFormat => None,
+        }
+    }
+}
+
+/// Classifies and validates one supported native state-file family.
+///
+/// The Firecracker branch recognizes only the pinned bitcode format-family
+/// prefix. It does not claim that the remaining bytes form a valid Firecracker
+/// snapshot and never attempts bitcode deserialization.
+pub fn decode_native_snapshot_state(
+    bytes: &[u8],
+) -> Result<NativeSnapshotState<'_>, NativeSnapshotFormatError> {
+    if bytes.starts_with(&SNAPSHOT_MAGIC) {
+        return decode_snapshot_envelope(bytes)
+            .map(NativeSnapshotState::V1)
+            .map_err(NativeSnapshotFormatError::NativeV1);
+    }
+    if bytes.starts_with(&NATIVE_V2_ARM64_MAGIC) {
+        return decode_snapshot_v2_state(bytes)
+            .map(NativeSnapshotState::V2)
+            .map_err(NativeSnapshotFormatError::NativeV2);
+    }
+    if bytes.starts_with(&FIRECRACKER_AARCH64_BITCODE_MAGIC_PREFIX)
+        || bytes.starts_with(&FIRECRACKER_X86_64_BITCODE_MAGIC_PREFIX)
+    {
+        return Err(NativeSnapshotFormatError::IncompatibleFirecrackerFormat);
+    }
+    Err(NativeSnapshotFormatError::IncompatibleFormat)
+}
+
 /// Encodes an opaque payload in the native-v1 snapshot envelope.
 pub fn encode_snapshot_envelope(payload: &[u8]) -> Result<Vec<u8>, SnapshotFormatError> {
     let payload_length =
@@ -394,21 +507,25 @@ mod tests {
     use super::*;
 
     const TEST_PAYLOAD: &[u8] = b"state";
+    const NATIVE_V1_FIXTURE: [u8; 45] = [
+        0x42, 0x41, 0x4e, 0x47, 0x53, 0x4e, 0x41, 0x50, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x73, 0x74, 0x61, 0x74, 0x65, 0x9e, 0xf0, 0xc0, 0x25, 0xe2, 0x0a, 0x82, 0x32,
+    ];
 
     #[test]
     fn native_v1_encoding_matches_golden_bytes() {
         let encoded = encode_snapshot_envelope(TEST_PAYLOAD).expect("fixture should encode");
-        let expected = [
-            0x42, 0x41, 0x4e, 0x47, 0x53, 0x4e, 0x41, 0x50, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x73, 0x74, 0x61, 0x74, 0x65, 0x9e, 0xf0, 0xc0, 0x25, 0xe2,
-            0x0a, 0x82, 0x32,
-        ];
-
-        assert_eq!(encoded, expected);
+        assert_eq!(encoded, NATIVE_V1_FIXTURE);
         assert_eq!(
             encode_snapshot_envelope(TEST_PAYLOAD).expect("fixture should re-encode"),
-            expected
+            NATIVE_V1_FIXTURE
+        );
+        assert_eq!(
+            decode_snapshot_envelope(&NATIVE_V1_FIXTURE)
+                .expect("immutable fixture should decode")
+                .payload(),
+            TEST_PAYLOAD
         );
     }
 

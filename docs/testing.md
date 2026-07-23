@@ -553,6 +553,21 @@ fixed write stage and successive 1 MiB chunks, prove that no binding escapes,
 and then reuse a fresh writer successfully. Run the focused module with
 `cargo test -p bangbang-runtime snapshot_memory --locked`.
 
+Native-v2 structural state tests pin an independent exact 72-byte empty
+`2.0.0` fixture and keep the named native-v1 fixture byte-for-byte stable. A
+private catalog-aware test codec exercises multiple required features,
+semantic components, instances, and an ignorable nonsemantic extension while
+the empty production catalog rejects every required feature and semantic
+component. The mutation corpus covers every fixed header field, both count
+caps, exact/trailing/oversized lengths, all three offsets, CRC and every
+truncation, feature zero/order/duplicate/unknown cases, and component
+key/order/flag/reserved/empty/gap/overlap/wrap/trailing-range cases. It also
+checks patch/minor/major policy, introduction-minor catalogs, borrowed views,
+redacted diagnostics, allocation failure, native-v1/v2 family dispatch, and
+named Firecracker-family incompatibility without invoking a typed decoder or
+resource action. Run the focused surface with
+`cargo test -p bangbang-runtime snapshot_format --locked`.
+
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,
 non-empty backend state, and envelope composition. They must reject every
