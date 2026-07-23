@@ -1710,11 +1710,12 @@ is resource-specific:
   and leaves paths and packet contents out of diagnostics. Restored-origin
   signaling arms the same gate without mutating queue state; while gated, TX
   stays live and every eligible RX source remains buffered without consuming
-  guest descriptors until the first valid event-queue kick. Signed Apple Silicon cases incrementally
-  verify at least 1 MiB in each direction for both initiation paths,
-  write-half-close/EOF, terminal cleanup, and two-stream isolation. PATCH,
-  DELETE, runtime hotplug, broader CID routing, general performance/artifact
-  parity, and broader event types remain outside this boundary. Public native-v1
+  guest descriptors until the first valid event-queue kick. Signed Apple
+  Silicon cases incrementally verify at least 1 MiB in each direction for both
+  initiation paths, write-half-close/EOF, terminal cleanup, and two-stream
+  isolation. PATCH, DELETE, runtime hotplug, broader CID routing, general
+  performance/artifact parity, and broader event types remain outside this
+  boundary. Public native-v1
   invocation, durable capture, UDS override, restored resource reconstruction,
   and restored-guest proof remain #1515-#1518/#1490 work; the live subset is not
   a snapshot-containment claim.

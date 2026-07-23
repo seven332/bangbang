@@ -1991,11 +1991,11 @@ mandatory MMIO queue intent and PCI queue-2 delivery, typed empty/malformed
 failures and metrics, runtime-only restored-origin acknowledgement gate, TX
 progress, preserved RX work, and post-ack drain. Repeated pre-boot `PUT /vsock`
 replaces stored configuration and post-start PUT is stably rejected; PATCH,
-DELETE, runtime hotplug, and broader CID routing are not supported. Public native-v1 invocation,
-durable capture, UDS override, restored resource reconstruction, and the
-restored-guest proof remain #1515-#1518/#1490 work. The signed transfer is a
-compatibility/progress gate, not a general performance, Firecracker artifact,
-or snapshot-parity claim.
+DELETE, runtime hotplug, and broader CID routing are not supported. Public
+native-v1 invocation, durable capture, UDS override, restored resource
+reconstruction, and the restored-guest proof remain #1515-#1518/#1490 work.
+The signed transfer is a compatibility/progress gate, not a general performance,
+Firecracker artifact, or snapshot-parity claim.
 
 The production-bundle socket-directory cases exercise the same guest protocol
 through contained host authority. Host initiation enters through the supplied
