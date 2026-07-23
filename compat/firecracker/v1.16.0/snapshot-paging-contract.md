@@ -2,8 +2,9 @@
 
 This ledger records the #1527 public-macOS feasibility decision for the pinned
 Firecracker snapshot page-fault corpus and the completed #1547 standalone
-protocol slice. It is not an aggregate runtime implementation claim: bangbang
-still rejects native-v1 `Uffd` before artifact or backend access.
+protocol plus #1548 coordinated lazy-anonymous-memory slices. It is not an
+aggregate runtime implementation claim: bangbang still rejects native-v1
+`Uffd` before artifact or backend access.
 
 ## Pinned upstream contract
 
@@ -171,6 +172,62 @@ cargo test -p bangbang-pager --all-targets --all-features --locked
 The crate does not open a socket path, transfer a descriptor, map guest memory,
 mediate a Mach/HVF fault, grant source authority, or change API behavior.
 
+## Implemented coordinated lazy anonymous memory
+
+`crates/runtime/src/lazy_memory.rs` now implements the backend-neutral mapping
+owner and page lifecycle shared by the later host and guest fault bridges.
+`LazyGuestMemory` is a distinct type rather than a lazy mode on initialized
+`GuestMemory`; it transactionally allocates validated private-anonymous regions
+but exposes no ordinary safe read/write/atomic/discard/export surface and reads
+no source contents.
+
+Before owner publication, construction validates the negotiated region/page/
+in-flight tuple, unique IDs, ordered nonoverlapping guest ranges, aligned
+nonoverlapping source ranges, checked page counts, a caller-bounded total page
+count, and an independent waiter bound. One byte-sized tag per selected page
+records `Absent`, `Loading`, `Publishing`, `Present`, or `Removing`, with an
+owner-wide terminal overlay. Active operations and waiter completions live in
+fallibly pre-reserved vectors capped by negotiated/local limits; there is no
+per-page lock, generation allocation, channel, or waiter allocation.
+
+The first absent fault returns one non-cloneable ticket with exact immutable
+region, generation, access, offset, guest range, and length metadata.
+Duplicates join that generation on one condition variable and observe one
+content outcome. Read/write coalescing is content-only: later Mach/HVF bridges
+must re-evaluate every woken fault's permissions. Consuming the exact current
+ticket enters `Publishing`; a scoped target accepts one exact page of data or
+zeroes and commit alone makes the page `Present`.
+
+Issued population and removal tickets occupy negotiated protocol slots. If
+removal makes a loading generation stale, that population becomes a counted
+retired operation until its exact response is consumed, its ticket is dropped,
+or terminal teardown abandons the session. Removal waits for overlapping
+actions already linearized, then reserves a distinct slot before any page
+mutation, records superseded outcomes, and returns one scoped exact-range
+guard. Local zeroing leaves pages `Removing`; only explicit simulated/future
+validated `Removed`
+acknowledgement commit makes them `Absent` and permits one newer refault
+generation.
+
+Requested cancellation, peer failure, abandoned current tickets/guards,
+generation exhaustion, poisoned synchronization, and teardown close admission
+and wake waiters with stable value-redacted outcomes. Explicit termination
+waits for already-linearized publication/removal actions; destructors are
+nonblocking and guards retain the mapping until cleanup. Deterministic runtime
+tests cover bounds, every state, exact data/zero publication, many duplicate
+faults, capacity reuse, retired operations, response replay/mismatch, removal
+races/acknowledgement, cancellation/failure/teardown/poison, generation
+exhaustion, redaction, and repeated construction/destruction:
+
+```sh
+cargo test -p bangbang-runtime lazy_memory --all-features --locked
+```
+
+This slice installs no Mach exception port, HVF mapping/protection, socket,
+source authority, peer state machine, native-v1 restore route, or public API
+success. Logical absence becomes enforceable against untrusted access only
+after the later host/HVF bridges and consumer audit bind those adapters.
+
 ## Decision and remaining delivery boundary
 
 Public macOS APIs can reproduce the observable external-demand-paging
@@ -218,16 +275,15 @@ VM construction. The focused
 case additionally proves private UFFD paths remain redacted.
 
 Delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527)
-retains eight integration/certification gates after the #1547 protocol:
+retains seven integration/certification gates after the #1548 coordinator:
 
-1. [#1548](https://github.com/seven332/bangbang/issues/1548) adds coordinated lazy anonymous memory.
-2. [#1549](https://github.com/seven332/bangbang/issues/1549) bridges host faults.
-3. [#1550](https://github.com/seven332/bangbang/issues/1550) bridges HVF guest faults.
-4. [#1551](https://github.com/seven332/bangbang/issues/1551) brokers the contained peer.
-5. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
-6. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
-7. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
-8. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
+1. [#1549](https://github.com/seven332/bangbang/issues/1549) bridges host faults.
+2. [#1550](https://github.com/seven332/bangbang/issues/1550) bridges HVF guest faults.
+3. [#1551](https://github.com/seven332/bangbang/issues/1551) brokers the contained peer.
+4. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
+5. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
+6. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
+7. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
 
 There is no public `Uffd` success before #1554 and no
 `implemented-and-verified` inventory result before #1555. Delivery-time
@@ -238,4 +294,4 @@ continues to reject it.
 
 | Capability identity | Disposition | Delivery owner | Evidence | Result |
 | --- | --- | --- | --- | --- |
-| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol and process tests; unchanged pre-access rejection | `nonterminal` |
+| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol/process tests and `crates/runtime/src/lazy_memory.rs` coordinator/concurrency tests; unchanged pre-access rejection | `nonterminal` |

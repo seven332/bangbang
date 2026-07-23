@@ -166,7 +166,8 @@ optional-device snapshot serialization/restore and portability outcomes.
 
 ```text
 crates/api        Firecracker-compatible API request and response surface
-crates/runtime    Backend-neutral VM model, memory, MMIO, boot, and device helpers
+crates/runtime    Backend-neutral VM model, eager/lazy memory ownership, MMIO,
+                  boot, and device helpers
 crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
 crates/launcher   Production app bundle, nested-worker validation, and supervision
@@ -394,8 +395,15 @@ records that a public macOS observable equivalent is feasible under #1527; it
 is not Linux UFFD wire compatibility or shipped runtime support. The standalone
 [`bangbang-pager-v1` contract](docs/snapshot-pager-protocol.md) now implements
 the closed offset-only wire, role state machines, and already-connected
-deadline transport. Guest-memory, host/HVF fault, launcher brokerage, removal,
-consumer, restore, and certification integration remain deferred under #1527.
+deadline transport. The runtime now also owns validated private-anonymous lazy
+regions behind a distinct `LazyGuestMemory` type: compact page states,
+strictly increasing generations, bounded duplicate-fault coalescing, scoped
+exact data/zero publication, retired-request accounting, acknowledged removal,
+and fail-closed teardown are implemented without exposing ordinary initialized
+memory APIs. It does not read a source, install Mach/HVF permissions, contact a
+peer, or change the native-v1 gate. Host/HVF fault delivery, launcher
+brokerage, transport/removal/failure wiring, consumer gating, restore, and
+certification remain deferred under #1527.
 
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
@@ -1315,7 +1323,8 @@ artifact/restore/clone handoffs. The
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 then moves its one exact corpus record to feasible-but-undelivered #1527
 ownership while preserving native-v1 rejection. Its standalone protocol slice
-is implemented and process-tested without promoting the aggregate capability.
+and backend-neutral coordinated lazy-anonymous-memory slice are implemented
+and tested without promoting the aggregate capability.
 The repository-wide disposition counts remain 228/169/4/17.
 
 ## Build And Test

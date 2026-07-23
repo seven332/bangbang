@@ -804,15 +804,20 @@ Those eight promotions moved the global counts at that checkpoint to
 228/170/3/17. #1491 retains repository-wide performance/observability work,
 not a directly owned live vsock row.
 
-After #1547, the checked
+After #1548, the checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 moves only `corpus:snapshot-page-faults` from `audit-required` to
 `missing-platform-feasible` with #1527 as its delivery owner. This records
 positive public-macOS feasibility plus an implemented standalone
-`bangbang-pager-v1` codec/state/connected-transport slice, not runtime support:
-native-v1 `Uffd` still rejects before resource access, the protocol is not
-Linux UFFD wire-compatible, and memory/fault/broker/restore integration remains
-open. The current global counts remain 228/169/4/17.
+`bangbang-pager-v1` codec/state/connected-transport slice and a distinct
+backend-neutral `LazyGuestMemory` owner for bounded private-anonymous regions.
+The latter implements compact page state, duplicate-content coalescing, exact
+generation publication, retired-request capacity, acknowledged removal, and
+fail-closed termination, but installs no Mach/HVF protection and contacts no
+peer. This is still not runtime support: native-v1 `Uffd` rejects before
+resource access, the protocol is not Linux UFFD wire-compatible, and
+fault/broker/consumer/restore integration remains open. The current global
+counts remain 228/169/4/17.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
@@ -1349,7 +1354,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /snapshot/create` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /snapshot/load` | `snapshot_path` | required; redacted, opened or grant-adopted after preflight | The direct native-v1 loader opens it only after pristine/profile preflight. In contained mode an exact file tag selects `SnapshotStateInput`/`ReadOnly`; it is duplicated for bounded state decode without consumption and later atomically adopted with every tagged memory/root input. Diagnostics expose neither form. |
 | `PUT /snapshot/load` | `mem_backend` | required unless deprecated `mem_file_path` is present; redacted | Parsed as a strict `backend_path`/`backend_type` object. Exactly one backend form is required. Direct `File` uses the no-follow loader; a contained exact tag selects `SnapshotMemoryInput`/`ReadOnly` and is loaded from its atomically adopted descriptor. |
-| `PUT /snapshot/load` | `mem_backend.backend_type` | required when `mem_backend` is present | Accepts `File` and `Uffd`; only `File` passes the current native-v1 gate, while `Uffd` returns the same pre-resource snapshot-specific unsupported fault. The checked snapshot paging contract records a feasible public macOS equivalent under #1527, not current success or Linux wire compatibility. |
+| `PUT /snapshot/load` | `mem_backend.backend_type` | required when `mem_backend` is present | Accepts `File` and `Uffd`; only `File` passes the current native-v1 gate, while `Uffd` returns the same pre-resource snapshot-specific unsupported fault. The checked snapshot paging contract records a feasible public macOS equivalent plus internal protocol and lazy-anonymous-memory ownership slices under #1527, not current success or Linux wire compatibility. |
 | `PUT /snapshot/load` | `mem_file_path` | deprecated-compatible alternative; normalized | Must not be combined with `mem_backend`; it is normalized to a redacted `File` backend and retains deprecated-usage provenance. |
 | `PUT /snapshot/load` | `enable_diff_snapshots` | deprecated-compatible optional boolean; normalized and implemented for tracking | ORed with `track_dirty_pages`; only true counts as deprecated usage. The effective value activates destination tracking but does not enable Diff artifact serialization. |
 | `PUT /snapshot/load` | `track_dirty_pages` | optional boolean; implemented | The destination request overrides the source snapshot's active flag. Tracking attaches after image population and before mapping/protection, runner creation, VMGenID replacement, VMClock update, or guest progress. |

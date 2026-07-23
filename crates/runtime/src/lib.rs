@@ -8,6 +8,7 @@ pub mod cpu;
 pub mod entropy;
 pub mod fdt;
 pub mod interrupt;
+pub mod lazy_memory;
 pub mod logger;
 pub mod machine;
 pub mod memory;

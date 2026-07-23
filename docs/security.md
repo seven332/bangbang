@@ -2119,9 +2119,10 @@ into unbounded waits.
 
 The checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
-records positive public-macOS feasibility and one implemented standalone
-protocol slice, not a shipped pager. Native-v1 `Uffd` still rejects before
-path, socket, artifact, or backend access.
+records positive public-macOS feasibility plus implemented standalone protocol
+and internal anonymous-memory ownership slices, not a shipped pager.
+Native-v1 `Uffd` still rejects before path, socket, artifact, or backend
+access.
 
 The accepted complete boundary uses two in-worker protection planes: public Mach
 task exceptions mediate host accesses to owned absent guest pages, and HVF
@@ -2142,6 +2143,34 @@ or transport failure. Later launcher work reduces the configured Unix path to
 that connected stream. This adds no ambient network entitlement, dynamic Mach
 service, root requirement, private API, entitlement weakening, or host-wide
 setting.
+
+The runtime's `LazyGuestMemory` is a separate owner rather than an alternate
+mode on ordinary initialized `GuestMemory`. It allocates only private anonymous
+mappings, exposes no ordinary safe memory access/export/discard API, and
+validates all guest/source regions and resource limits before publishing the
+owner. Logical absence is represented by compact page state; this slice does
+not yet install `PROT_NONE` or HVF permissions, so only trusted later adapters
+may use the scoped mapping address exposed for integration.
+
+The coordinator's active-operation vector is capped by the negotiated protocol
+limit and its waiter count by a separate local limit. Duplicate faults share
+one generation and one condition variable. A stale response cannot obtain a
+publication target, and a removal cannot reuse the stale request's protocol
+slot: superseded work remains counted until exact response/drop/terminal
+retirement. Removal reserves a separate slot before mutation, holds the range
+in `Removing` after local zeroing, and makes it absent only after explicit
+acknowledgement. These rules prevent stale snapshot bytes from reappearing
+after discard and prevent operation-bound oversubscription.
+
+Population and removal mapping access is available only through non-cloneable
+RAII guards. Exact-size copy/zero helpers reject partial or repeated
+installation. Abandoned current work, generation exhaustion, poisoned
+synchronization, peer failure, cancellation, and teardown close the complete
+owner and wake waiters; they do not fabricate contents. Explicit termination
+waits for actions already linearized outside the mutex, while destructor
+closure stays nonblocking and each guard retains the mapping until cleanup.
+Public diagnostics redact regions, generations, addresses, limits, contents,
+and terminal detail.
 
 Handler failure while a host instruction is suspended is a mandatory
 fail-closed supervision gate. The protocol already bounds I/O and forbids

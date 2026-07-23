@@ -126,6 +126,10 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "bangbang-pager-v1",
         "crates/pager",
         "docs/snapshot-pager-protocol.md",
+        "Implemented coordinated lazy anonymous memory",
+        "crates/runtime/src/lazy_memory.rs",
+        "LazyGuestMemory",
+        "cargo test -p bangbang-runtime lazy_memory",
         "BBPAGER\\0",
         "cargo test -p bangbang-pager",
         "classify_v1_load_request",
@@ -149,6 +153,14 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "pager package identity and narrow dependencies must remain pinned"
     );
 
+    let runtime_manifest =
+        std::fs::read_to_string(repository_root.join("crates/runtime/Cargo.toml"))
+            .expect("checked runtime manifest must be readable");
+    assert!(
+        runtime_manifest.contains("bangbang-pager = { path = \"../pager\" }"),
+        "runtime must retain its narrow pager type dependency"
+    );
+
     let pager_source = std::fs::read_to_string(repository_root.join("crates/pager/src/frame.rs"))
         .expect("checked pager framing source must be readable");
     for required in [
@@ -164,6 +176,29 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         );
     }
 
+    let lazy_source =
+        std::fs::read_to_string(repository_root.join("crates/runtime/src/lazy_memory.rs"))
+            .expect("checked lazy-memory coordinator source must be readable");
+    for required in [
+        "pub struct LazyGuestMemory",
+        "pub struct LazyPagePopulation",
+        "pub struct LazyPagePublication",
+        "pub struct LazyPageRemoval",
+        "enum PageTag",
+        "PopulationStage::Retired",
+        "duplicate_faults_coalesce_to_one_generation_and_result",
+        "removal_reserves_a_distinct_slot_before_superseding_loading",
+        "removal_stays_counted_and_removing_until_acknowledged",
+        "requested_peer_and_teardown_outcomes_wake_waiters",
+        "generation_exhaustion_is_owner_terminal",
+        "repeated_construction_and_destruction_leaves_no_retained_work",
+    ] {
+        assert!(
+            lazy_source.contains(required),
+            "lazy-memory coordinator must retain {required}"
+        );
+    }
+
     let protocol = std::fs::read_to_string(repository_root.join("docs/snapshot-pager-protocol.md"))
         .expect("checked pager protocol document must be readable");
     for required in [
@@ -172,6 +207,9 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "strictly increasing request IDs",
         "Cancellation is session-wide and terminal",
         "Orderly shutdown is drain-only",
+        "Runtime anonymous-memory coordinator",
+        "retired-operation accounting",
+        "only explicit validated `Removed`",
         "not Linux UFFD descriptor or wire compatibility",
     ] {
         assert!(

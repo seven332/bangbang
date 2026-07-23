@@ -11,6 +11,9 @@ component; the current `2.1.0` profile adds one state-bound, demand-paged
 File/COW memory image. It is still not complete loadable VM state and is not
 emitted, described, or loaded by any public process path. The public lifecycle
 and CLI remain native-v1 until later Wave 6 work explicitly changes them.
+Separately, `LazyGuestMemory` is the backend-neutral private-anonymous
+coordinator for the external-paging roadmap; it is not the v2 File/COW loader
+and is not connected to a public restore path yet.
 
 ## Current Status
 
@@ -84,8 +87,9 @@ path.
   unsupported device profiles, and incompatible artifacts retain
   snapshot-specific rejection boundaries. The checked
   [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
-  separately records a feasible public macOS equivalent under #1527; it does
-  not change this runtime gate.
+  separately records a feasible public macOS equivalent plus the internal
+  protocol and lazy-memory ownership slices under #1527; neither changes this
+  runtime gate.
   Full/File load can enable a clean destination dirty epoch, independently of
   the source, and a tracked source resets only after visible Full publication.
   Parser and invalid-lifecycle failures still do not record snapshot latency;
@@ -1265,13 +1269,34 @@ This proves an observable equivalent is feasible, not that Linux UFFD
 descriptor/wire traffic is accepted. The standalone
 [`bangbang-pager-v1` protocol](snapshot-pager-protocol.md) now implements the
 closed bounded offset-only wire, exact negotiation and request matching,
-role-specific state machines, and already-connected deadline transport. The
-later integrations keep Mach task/thread ports inside the VMM, use HVF for
-guest faults, route both planes through one generation-aware coordinator, and
+role-specific state machines, and already-connected deadline transport.
+
+`bangbang_runtime::lazy_memory` now supplies the one backend-neutral
+generation-aware coordinator shared by the later fault planes. It
+transactionally owns private-anonymous mappings through a type distinct from
+initialized `GuestMemory`, records one compact state byte per selected page,
+and bounds outstanding protocol operations and local waiters separately. The
+first fault owns one immutable population ticket; duplicates coalesce only
+content and re-evaluate their later permissions. Exact scoped guards serialize
+data/zero publication and removal without holding the coordinator lock during
+the bounded mapping action.
+
+A locally superseded population remains a counted retired protocol operation
+until response consumption, ticket drop, or terminal teardown. Removal must
+reserve its own slot before mutation and remains `Removing` after local zeroing
+until explicit peer-acknowledgement commit. Requested cancellation, peer
+failure, abandoned work, poison, generation exhaustion, and teardown close
+admission and wake waiters; explicit termination drains already-linearized
+actions while destructors stay nonblocking.
+
+This is still internal ownership, not a usable restore backend. It installs no
+Mach exception port or HVF permission, opens no peer or source, and exposes no
+native-v1 API success. Later integrations keep Mach task/thread ports inside
+the VMM, use HVF for guest faults, connect the coordinator to the protocol, and
 have the launcher supply only the connected stream. Native-v1 `Uffd` remains
-rejected before resource access until #1527's restore gate; memory/fault,
-brokerage, removal, consumer, restore, and signed-certification work remains
-nonterminal.
+rejected before resource access until #1527's restore gate; host/guest fault
+delivery, brokerage, peer removal/failure, consumer gating, restore, and signed
+certification remain nonterminal.
 
 ### Implemented public native-v1 restore order
 
