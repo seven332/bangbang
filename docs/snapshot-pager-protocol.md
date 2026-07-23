@@ -4,12 +4,14 @@ This document is the normative wire, lifecycle, and failure contract shared by
 the bangbang VMM snapshot coordinator and its future external page-content
 peer. The wire implementation is the standalone `bangbang-pager` crate; the
 backend-neutral anonymous-memory coordinator is
-`bangbang_runtime::lazy_memory`.
+`bangbang_runtime::lazy_memory`. The separate
+`bangbang_hvf::HvfLazyHostFaultBridge` now implements task-local host fault
+mediation against that coordinator, but it is not yet connected to this wire.
 
 The crate adopts an already connected Unix stream. It does not select or open a
 path, launch a process, transfer a descriptor, grant source authority, map
 guest memory, own a Mach/HVF object, or make native-v1 `Uffd` succeed. Those
-integration steps remain under delivery parent
+remaining integration steps stay under delivery parent
 [#1527](https://github.com/seven332/bangbang/issues/1527).
 
 ## Compatibility boundary
@@ -162,8 +164,8 @@ per-page mutex, generation object, channel, or waiter allocation.
 The first absent fault returns one non-cloneable population ticket containing
 the immutable region, generation, access, source offset, guest range, and
 length tuple. Duplicate read or write faults join that generation and wait on
-one condition variable. This coalesces page contents only: later Mach/HVF
-bridges must re-evaluate each fault's permissions after wakeup. A response may
+one condition variable. This coalesces page contents only: the host and later
+HVF bridges must re-evaluate each fault's permissions after wakeup. A response may
 enter a scoped publication guard only for the exact current ticket. Its target
 accepts exactly one full data page or zero page, and commit is the only
 `Publishing` to `Present` transition.
@@ -245,9 +247,16 @@ private-anonymous region ownership, duplicate-fault coalescing, exact
 publication, retired-operation accounting, acknowledged removal, terminal
 wakeup, poison recovery, resource limits, and repeated cleanup.
 
+The HVF crate additionally implements and signs the task-local public-Mach
+host adapter: it keeps ports and addresses in-process, publishes complete pages
+through a private alias and this coordinator, forwards unrelated exceptions,
+restores conditionally, and fails closed with fixed worker exit status 70. Its
+current `HvfLazyPageSource` is a trusted in-process boundary; it does not adopt
+or drive a `PagerTransport`.
+
 Still deferred are transport/coordinator wiring, socket brokerage, source
-grants, host Mach exception mediation, HVF guest-fault mediation, peer-driven
-removal/failure integration, consumer gating, native-v1 restore activation,
-and signed end-to-end certification. Until those #1527 slices complete,
-native-v1 `Uffd` remains rejected before resource access and the checked
-capability remains `missing-platform-feasible`.
+grants, HVF guest-fault mediation, peer-driven removal/failure integration,
+consumer gating, native-v1 restore activation, and final signed end-to-end
+certification. Until those #1527 slices complete, native-v1 `Uffd` remains
+rejected before resource access and the checked capability remains
+`missing-platform-feasible`.

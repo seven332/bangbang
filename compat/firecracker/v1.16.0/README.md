@@ -92,14 +92,14 @@ claims mechanically visible.
   API/live outcomes, and retains six explicit #1490 optional-device encoding,
   public restore, clone/version, and portability handoffs.
 - [`snapshot-paging-contract.md`](snapshot-paging-contract.md) is the
-  #1546/#1547/#1548 checked public-macOS UFFD-equivalent feasibility,
-  standalone protocol, and coordinated lazy-anonymous-memory ledger. It pins
-  the exact page-fault corpus, upstream observable contract, signed prototype
-  evidence, implemented bounded `bangbang-pager-v1`
-  wire/state/connected-transport slice, distinct runtime anonymous mapping
-  owner/page lifecycle, current pre-access rejection, security boundary, and
-  remaining #1527 gates without claiming Linux wire compatibility or runtime
-  support.
+  #1546/#1547/#1548/#1549 checked public-macOS UFFD-equivalent feasibility,
+  standalone protocol, coordinated lazy-anonymous-memory, and task-local host
+  fault ledger. It pins the exact page-fault corpus, upstream observable
+  contract, signed prototype evidence, implemented bounded
+  `bangbang-pager-v1` wire/state/connected-transport slice, distinct runtime
+  anonymous mapping owner/page lifecycle, public-Mach host bridge, current
+  pre-access rejection, security boundary, and remaining #1527 gates without
+  claiming Linux wire compatibility or runtime support.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -577,8 +577,11 @@ standalone closed protocol crate and real inherited-stream process coverage
 without changing that aggregate disposition. #1548 adds the distinct bounded
 private-anonymous owner, compact page coordinator, duplicate-content
 coalescing, retired-operation accounting, acknowledged removal, and terminal
-concurrency tests. It still installs no fault plane or public restore behavior,
-so the current overlay remains 228/169/4/17.
+concurrency tests. #1549 adds the public-Mach task-local host protection plane,
+private complete-before-visible aliases, coordinator/source adapter,
+forwarding/conditional restoration, and signed direct/App Sandbox failure and
+lifecycle evidence. Guest faults, peer wiring, consumer certification, and
+public restore remain open, so the current overlay remains 228/169/4/17.
 
 ## Commands
 

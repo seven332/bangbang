@@ -2126,10 +2126,10 @@ access.
 
 The accepted complete boundary uses two in-worker protection planes: public Mach
 task exceptions mediate host accesses to owned absent guest pages, and HVF
-stage-two permissions mediate guest accesses. Task and thread ports remain
-inside the worker because an exception receiver has whole-task authority, not
-UFFD's registered-range authority. Unrelated exceptions must be forwarded and
-the prior task configuration conditionally restored.
+stage-two permissions mediate guest accesses. The first plane is now
+implemented in `bangbang-hvf`; the guest plane remains a separate delivery
+gate. Task and thread ports stay inside the worker because an exception
+receiver has whole-task authority, not UFFD's registered-range authority.
 
 The external content owner receives neither task ports nor host virtual
 addresses. The implemented
@@ -2148,9 +2148,37 @@ The runtime's `LazyGuestMemory` is a separate owner rather than an alternate
 mode on ordinary initialized `GuestMemory`. It allocates only private anonymous
 mappings, exposes no ordinary safe memory access/export/discard API, and
 validates all guest/source regions and resource limits before publishing the
-owner. Logical absence is represented by compact page state; this slice does
-not yet install `PROT_NONE` or HVF permissions, so only trusted later adapters
-may use the scoped mapping address exposed for integration.
+owner. Logical absence is represented by compact page state. The runtime type
+itself installs no protection; the HVF host adapter is the first trusted user
+of its scoped mapping metadata.
+
+On macOS Apple Silicon, the host adapter generates its MIG ABI from the active
+public SDK's `mach_exc.defs`. Installation creates private non-copying writable
+aliases, uses `task_swap_exception_ports` to atomically capture/install only
+the task bad-access slot, and then transactionally protects the original
+mappings. One process-global bangbang owner prevents ambiguous internal
+stacking. Partial installation restores permissions and releases every
+alias/port/thread before returning.
+
+The callback claims only ARM64 read/write protection faults whose address
+belongs to a retained lazy region. It revalidates the range in Rust before
+coordinator access. The trusted in-process source sees only opaque
+region/generation/access and aligned offset/length metadata—never host
+addresses, task/thread ports, aliases, or memory-entry rights. Complete data or
+zero bytes are written through the alias while the original remains hidden; a
+sequentially consistent fence precedes least host permission and exact
+coordinator commit. A read-populated page stays read-only until a real write
+fault upgrades it.
+
+Every unowned address and unsupported exception form forwards to the captured
+legacy or Mach default/state/state-identity behavior, including returned thread
+state, flavor, and local right cleanup. Quiesced shutdown drains admitted
+resolution and restores the captured handler only if the bridge still owns the
+exact task slot, so a later owner is preserved. Public Mach has no
+compare-and-swap exception-port restore; an independently concurrent
+replacement therefore retains a documented check-to-set race and must not race
+bangbang lifecycle. Task handlers also run after a thread-specific handler, so
+the supported worker installs no competing per-thread bad-access owner.
 
 The coordinator's active-operation vector is capped by the negotiated protocol
 limit and its waiter count by a separate local limit. Duplicate faults share
@@ -2172,13 +2200,15 @@ closure stays nonblocking and each guard retains the mapping until cleanup.
 Public diagnostics redact regions, generations, addresses, limits, contents,
 and terminal detail.
 
-Handler failure while a host instruction is suspended is a mandatory
-fail-closed supervision gate. The protocol already bounds I/O and forbids
-automatic replay; later fault/supervision integration must take one documented
-terminal cleanup path. It may not fabricate zero or stale contents, fall
-through accidentally to `SIGBUS`, swallow a genuine crash, or wait
-indefinitely. External/shared mappings that bypass the task-local bridge remain
-pre-resource rejections until independently certified.
+Handler failure while a host instruction is suspended takes the implemented
+fail-closed supervision gate. An owned callback error or unwind terminalizes
+the coordinator and exits the worker with fixed status 70; it cannot fabricate
+zero or stale contents, fall through accidentally to `SIGBUS`, or swallow an
+unrelated crash. The protocol already bounds I/O and forbids automatic replay;
+the later peer integration must map timeout/EOF/death onto this one terminal
+path rather than wait indefinitely. External/shared mappings that bypass the
+task-local bridge remain pre-resource rejections until independently
+certified.
 
 ## Guest Data Exposure
 

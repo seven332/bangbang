@@ -2,9 +2,9 @@
 
 This ledger records the #1527 public-macOS feasibility decision for the pinned
 Firecracker snapshot page-fault corpus and the completed #1547 standalone
-protocol plus #1548 coordinated lazy-anonymous-memory slices. It is not an
-aggregate runtime implementation claim: bangbang still rejects native-v1
-`Uffd` before artifact or backend access.
+protocol, #1548 coordinated lazy-anonymous-memory, and #1549 task-local host
+fault slices. It is not an aggregate runtime implementation claim: bangbang
+still rejects native-v1 `Uffd` before artifact or backend access.
 
 ## Pinned upstream contract
 
@@ -175,7 +175,7 @@ mediate a Mach/HVF fault, grant source authority, or change API behavior.
 ## Implemented coordinated lazy anonymous memory
 
 `crates/runtime/src/lazy_memory.rs` now implements the backend-neutral mapping
-owner and page lifecycle shared by the later host and guest fault bridges.
+owner and page lifecycle shared by the host and later guest fault bridges.
 `LazyGuestMemory` is a distinct type rather than a lazy mode on initialized
 `GuestMemory`; it transactionally allocates validated private-anonymous regions
 but exposes no ordinary safe read/write/atomic/discard/export surface and reads
@@ -225,8 +225,79 @@ cargo test -p bangbang-runtime lazy_memory --all-features --locked
 
 This slice installs no Mach exception port, HVF mapping/protection, socket,
 source authority, peer state machine, native-v1 restore route, or public API
-success. Logical absence becomes enforceable against untrusted access only
-after the later host/HVF bridges and consumer audit bind those adapters.
+success. The coordinator alone does not enforce logical absence; the host
+adapter below binds one protection plane, while guest access and bypassing
+consumers remain gated on later HVF and consumer-audit slices.
+
+## Implemented task-local host fault bridge
+
+`crates/hvf/src/lazy_host_fault.rs` now implements the host protection adapter
+for macOS Apple Silicon. The build resolves the active public macOS SDK and
+generates `mach_exc` user/server stubs from `mach/mach_exc.defs` into
+`OUT_DIR`; no generated SDK source, private declaration, entitlement, service,
+or external exception right is checked in or required.
+
+Installation first validates that every coordinator page is an integral number
+of host pages and creates a private non-copying writable alias for each retained
+anonymous mapping with `mach_make_memory_entry_64` and `mach_vm_map`. It then
+uses `task_swap_exception_ports` to atomically install only
+`EXC_MASK_BAD_ACCESS` with 64-bit Mach exception codes while capturing the
+prior task configuration, and transactionally protects the original mappings
+with no host access. One process-global bangbang owner prevents ambiguous
+stacking. Every partial failure restores permissions, stops any created server,
+releases aliases and rights, and preserves the previous configuration.
+
+The native callback accepts only exact ARM64 read/write data-abort protection
+faults whose FAR matches the Mach fault address. Rust revalidates that address
+against one retained host range before translating it to a guest address. The
+shared `HvfLazyPageResolver` acquires the coordinator generation, presents a
+trusted in-process source only the opaque region/generation/access and aligned
+offset tuple, validates an exact data/zero page, and writes the complete page
+through the private alias while the original remains inaccessible. A
+sequentially consistent fence precedes least read-only/read-write permission,
+the narrow platform-initialization proof, and coordinator commit. A later
+write to a read-populated page upgrades only host permission.
+
+Unowned addresses and unsupported exception forms never reach the source.
+They are forwarded to the captured legacy or Mach default/state/
+state-identity handler with its exact behavior, flavor, returned thread state,
+and local port-right cleanup. Task/thread ports, memory-entry rights, aliases,
+host addresses, and page bytes never leave the worker.
+
+Shutdown closes resolver admission, waits already-admitted resolution, restores
+the original mappings, and restores the captured task handler only if the
+bridge still owns the exact bad-access slot. A later owner is preserved. Public
+Mach supplies no compare-and-swap exception-port restore, so an independently
+concurrent replacement retains a documented check-to-set race; bangbang
+serializes its own single owner and requires external owners not to race its
+lifecycle. Task exception handling also follows any thread-specific handler,
+so the supported worker installs no competing per-thread bad-access owner.
+
+An owned callback error or unwind terminalizes the coordinator and exits the
+supervised worker with fixed status 70; it cannot fabricate zero/stale bytes,
+return into accidental `SIGBUS`, or wait without the later bounded source
+policy. Complete external-peer timeout/death and removal behavior remain
+#1552.
+
+Focused tests cover host-page validation, exact data/zero and permission paths,
+source/content/coordinator failure, owner-busy rollback, admitted-action
+shutdown, redaction, and repeated cleanup. The signed `hvf_lifecycle` binary
+then performs real read-first, write-first, aligned atomic, and raw-pointer
+faults, forwards an unowned fault to a real prior Mach handler, preserves that
+handler after it replaces the bridge, repeats the lifecycle, and observes the
+fixed terminal exit in a child. The same cases pass under the production App
+Sandbox entitlement floor:
+
+```sh
+cargo test -p bangbang-hvf --lib --all-features --locked lazy_host_fault
+scripts/run-integration-tests.sh --test hvf_lifecycle -- lazy_host_fault_integration::
+scripts/run-integration-tests.sh --test app_sandbox -- lazy_host_fault_integration::
+```
+
+This slice does not connect `bangbang-pager-v1`, grant external source
+authority, install HVF guest permissions, integrate peer-driven removal or
+failure, certify every memory consumer, make native-v1 `Uffd` succeed, or
+promote the aggregate capability.
 
 ## Decision and remaining delivery boundary
 
@@ -275,15 +346,14 @@ VM construction. The focused
 case additionally proves private UFFD paths remain redacted.
 
 Delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527)
-retains seven integration/certification gates after the #1548 coordinator:
+retains six integration/certification gates after the #1549 host bridge:
 
-1. [#1549](https://github.com/seven332/bangbang/issues/1549) bridges host faults.
-2. [#1550](https://github.com/seven332/bangbang/issues/1550) bridges HVF guest faults.
-3. [#1551](https://github.com/seven332/bangbang/issues/1551) brokers the contained peer.
-4. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
-5. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
-6. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
-7. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
+1. [#1550](https://github.com/seven332/bangbang/issues/1550) bridges HVF guest faults.
+2. [#1551](https://github.com/seven332/bangbang/issues/1551) brokers the contained peer.
+3. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
+4. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
+5. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
+6. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
 
 There is no public `Uffd` success before #1554 and no
 `implemented-and-verified` inventory result before #1555. Delivery-time
@@ -294,4 +364,4 @@ continues to reject it.
 
 | Capability identity | Disposition | Delivery owner | Evidence | Result |
 | --- | --- | --- | --- | --- |
-| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol/process tests and `crates/runtime/src/lazy_memory.rs` coordinator/concurrency tests; unchanged pre-access rejection | `nonterminal` |
+| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol/process tests, `crates/runtime/src/lazy_memory.rs` coordinator/concurrency tests, and `crates/hvf/src/lazy_host_fault.rs` focused plus signed/App Sandbox host-fault tests; unchanged pre-access rejection | `nonterminal` |

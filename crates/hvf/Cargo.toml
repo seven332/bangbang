@@ -5,6 +5,7 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+bangbang-pager = { path = "../pager" }
 bangbang-runtime = { path = "../runtime" }
 libc = "0.2"
 
