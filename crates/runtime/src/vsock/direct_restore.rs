@@ -168,11 +168,6 @@ pub struct PreparedDirectVsockRestore {
 }
 
 impl PreparedDirectVsockRestore {
-    /// Borrows the single-use reconstruction resource.
-    pub const fn resource_mut(&mut self) -> &mut VirtioVsockReconstructionResource {
-        &mut self.resource
-    }
-
     /// Splits the resource from the cleanup authority for process ownership.
     pub fn into_parts(self) -> (VirtioVsockReconstructionResource, DirectVsockSocketGuard) {
         (self.resource, self.guard)
@@ -225,28 +220,17 @@ fn prepare_direct_vsock_restore_with(
     let destination = destination_selector.path().to_path_buf();
     let existing = destination_entry(&destination)?;
     if let Some(existing) = existing {
-        match nonblocking_unix_stream_connect(&destination) {
-            Ok(stream) => {
-                drop(stream);
-                return Err(DirectVsockRestoreError::ActiveSocket);
-            }
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
-            Err(_) => return Err(DirectVsockRestoreError::ActiveSocket),
-        }
-        if socket_identity(&destination)
-            .map_err(|error| DirectVsockRestoreError::PathCheck(error.kind()))?
-            != Some(existing)
-        {
-            return Err(DirectVsockRestoreError::PathChanged);
-        }
+        confirm_stale_destination(&destination, existing)?;
     }
 
     let (listener, temporary, new_identity) = bind_temporary_socket(&destination)?;
     let publication = match existing {
         None => publish_absent(&temporary, &destination, new_identity),
         Some(stale_identity) => {
-            before_stale_exchange();
-            publish_over_stale(&temporary, &destination, new_identity, stale_identity)
+            confirm_stale_destination(&destination, stale_identity).and_then(|()| {
+                before_stale_exchange();
+                publish_over_stale(&temporary, &destination, new_identity, stale_identity)
+            })
         }
     };
     if let Err(error) = publication {
@@ -283,6 +267,32 @@ fn destination_entry(path: &Path) -> Result<Option<SocketIdentity>, DirectVsockR
         Ok(_) => Err(DirectVsockRestoreError::UnrelatedEntry),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(DirectVsockRestoreError::PathCheck(error.kind())),
+    }
+}
+
+fn confirm_stale_destination(
+    path: &Path,
+    expected: SocketIdentity,
+) -> Result<(), DirectVsockRestoreError> {
+    if socket_identity(path).map_err(|error| DirectVsockRestoreError::PathCheck(error.kind()))?
+        != Some(expected)
+    {
+        return Err(DirectVsockRestoreError::PathChanged);
+    }
+    match nonblocking_unix_stream_connect(path) {
+        Ok(stream) => {
+            drop(stream);
+            return Err(DirectVsockRestoreError::ActiveSocket);
+        }
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+        Err(_) => return Err(DirectVsockRestoreError::ActiveSocket),
+    }
+    if socket_identity(path).map_err(|error| DirectVsockRestoreError::PathCheck(error.kind()))?
+        == Some(expected)
+    {
+        Ok(())
+    } else {
+        Err(DirectVsockRestoreError::PathChanged)
     }
 }
 
