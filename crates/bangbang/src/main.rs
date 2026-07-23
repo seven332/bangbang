@@ -27,6 +27,8 @@ mod test_support;
 #[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
 mod vmm;
+#[cfg(target_os = "macos")]
+mod vsock_restore;
 
 #[cfg(target_os = "macos")]
 use anchored_socket::bind as bind_anchored_socket;

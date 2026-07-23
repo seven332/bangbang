@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::block::{DriveConfig, DriveConfigs};
 use crate::machine::MachineConfig;
 use crate::serial::SerialConfig;
+use crate::vsock::{VsockBackendSelector, VsockBackendSelectorError};
 
 const REDACTED: &str = "<redacted>";
 
@@ -172,6 +173,98 @@ impl fmt::Debug for SnapshotVsockOverride {
             .field("uds_path", &REDACTED)
             .finish()
     }
+}
+
+/// Logical vsock selectors resolved before destination authority is accessed.
+///
+/// The captured selector continues to bind reconstruction to serialized state,
+/// while the destination selector identifies where the restored backend will
+/// be prepared. Neither selector proves access to a host resource.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotVsockSelectors {
+    captured: VsockBackendSelector,
+    destination: VsockBackendSelector,
+}
+
+impl SnapshotVsockSelectors {
+    /// Returns the selector recorded in captured device state.
+    pub const fn captured(&self) -> &VsockBackendSelector {
+        &self.captured
+    }
+
+    /// Returns the selected destination backend.
+    pub const fn destination(&self) -> &VsockBackendSelector {
+        &self.destination
+    }
+
+    /// Splits the pair into owned selectors for a single-use resource.
+    pub fn into_parts(self) -> (VsockBackendSelector, VsockBackendSelector) {
+        (self.captured, self.destination)
+    }
+}
+
+impl fmt::Debug for SnapshotVsockSelectors {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotVsockSelectors")
+            .field("selectors", &REDACTED)
+            .finish()
+    }
+}
+
+/// Pure selector-resolution failure reported before destination resource access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotVsockSelectorError {
+    /// An override cannot create a device that is absent from captured state.
+    OverrideWithoutDevice,
+    /// The requested destination selector is not a valid AF_UNIX selector.
+    InvalidOverride(VsockBackendSelectorError),
+}
+
+impl fmt::Display for SnapshotVsockSelectorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OverrideWithoutDevice => {
+                formatter.write_str("vsock override specified without a captured vsock device")
+            }
+            Self::InvalidOverride(source) => {
+                write!(formatter, "vsock override selector is invalid: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotVsockSelectorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidOverride(source) => Some(source),
+            Self::OverrideWithoutDevice => None,
+        }
+    }
+}
+
+/// Resolves captured and override selectors without touching host resources.
+pub fn resolve_snapshot_vsock_selectors(
+    captured: Option<&VsockBackendSelector>,
+    requested_override: Option<&SnapshotVsockOverride>,
+) -> Result<Option<SnapshotVsockSelectors>, SnapshotVsockSelectorError> {
+    let Some(captured) = captured else {
+        return match requested_override {
+            Some(_) => Err(SnapshotVsockSelectorError::OverrideWithoutDevice),
+            None => Ok(None),
+        };
+    };
+
+    let destination = requested_override
+        .map(|requested| VsockBackendSelector::try_from_path(requested.uds_path()))
+        .transpose()
+        .map_err(SnapshotVsockSelectorError::InvalidOverride)?
+        .unwrap_or_else(|| captured.clone());
+
+    Ok(Some(SnapshotVsockSelectors {
+        captured: captured.clone(),
+        destination,
+    }))
 }
 
 /// Normalized input for snapshot creation.
@@ -625,6 +718,55 @@ mod tests {
             );
         }
         assert!(debug.contains(REDACTED));
+    }
+
+    #[test]
+    fn snapshot_vsock_selectors_resolve_before_resource_access_and_redact_values() {
+        let captured_path = "/private/captured-vsock.sock";
+        let override_path = "/private/destination-vsock.sock";
+        let captured = VsockBackendSelector::try_from_path(captured_path)
+            .expect("captured selector should validate");
+
+        assert_eq!(resolve_snapshot_vsock_selectors(None, None), Ok(None));
+        assert_eq!(
+            resolve_snapshot_vsock_selectors(
+                None,
+                Some(&SnapshotVsockOverride::new(override_path))
+            ),
+            Err(SnapshotVsockSelectorError::OverrideWithoutDevice)
+        );
+
+        let original = resolve_snapshot_vsock_selectors(Some(&captured), None)
+            .expect("original selector should resolve")
+            .expect("captured device should produce selectors");
+        assert_eq!(original.captured(), &captured);
+        assert_eq!(original.destination(), &captured);
+
+        let overridden = resolve_snapshot_vsock_selectors(
+            Some(&captured),
+            Some(&SnapshotVsockOverride::new(override_path)),
+        )
+        .expect("override should resolve")
+        .expect("captured device should produce selectors");
+        assert_eq!(overridden.captured(), &captured);
+        assert_eq!(overridden.destination().path(), Path::new(override_path));
+
+        let invalid = resolve_snapshot_vsock_selectors(
+            Some(&captured),
+            Some(&SnapshotVsockOverride::new("bad\nselector")),
+        )
+        .expect_err("invalid override should be rejected");
+        assert_eq!(
+            invalid,
+            SnapshotVsockSelectorError::InvalidOverride(
+                VsockBackendSelectorError::ControlCharacter
+            )
+        );
+
+        let diagnostic = format!("{overridden:?} {invalid:?} {invalid}");
+        assert!(!diagnostic.contains(captured_path));
+        assert!(!diagnostic.contains(override_path));
+        assert!(!diagnostic.contains("bad\nselector"));
     }
 
     #[test]

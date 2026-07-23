@@ -1090,10 +1090,17 @@ wakeups/deadlines from that same observation while retaining listener and
 connector authority for fresh traffic. Typed redacted failures preserve
 recoverable versus terminal process policy. Public create invokes this producer
 before its unchanged optional-device rejection, so it creates no vsock artifact
-and makes no load promise. Destination UDS authority/override, record
-certification, native-v1 encoding/placement, and end-to-end restored-guest proof
-remain #1517-#1518/#1490 work; this does not claim general performance,
-Firecracker artifact, or snapshot parity.
+and makes no load promise. Internal destination restore now resolves the
+captured selector and optional override before resource access. Direct mode
+prepares an owner-only listener with stale-safe atomic replacement and exact
+identity cleanup; contained mode reserves the exact directory grant and
+session-bound broker endpoint, rolls both back before activation, and never
+falls back to an ambient path. A single-use process transaction transfers the
+resource only when runtime reconstruction consumes it and retains cleanup
+ownership for the active device. Public native-v1 records still do not encode
+or place vsock, and public load continues to reject overrides. Record
+certification and end-to-end restored-guest proof remain #1518/#1490 work; this
+does not claim general performance, Firecracker artifact, or snapshot parity.
 
 Configure metrics output before boot:
 

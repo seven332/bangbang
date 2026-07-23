@@ -2016,9 +2016,14 @@ while detaching connection work only after validation and retaining the source
 listener/connector for fresh traffic. Signed HVF coverage exercises
 inactive, published, empty-queue, cancellation, ack, and both transport owners.
 The process tests above prove the real Linux reset/reconnect boundary and the
-unchanged public rejection with zero artifacts. Destination UDS
-authority/override, record certification, native-v1 encoding/placement, and the
-restored-guest proof remain #1517-#1518/#1490 work.
+unchanged public rejection with zero artifacts. Focused destination tests prove
+pure captured/override selector resolution before resource access, owner-only
+stale-safe direct publication and exact cleanup, transactional contained
+directory/broker reservation with no ambient fallback, cancellation rollback,
+single-use runtime consumption, retryable preactivation failure, and terminal
+postactivation failure. Public native-v1 records still omit vsock
+encoding/placement and public load rejects overrides; record certification and
+the restored-guest proof remain #1518/#1490 work.
 The signed transfer is a compatibility/progress gate, not a general performance,
 Firecracker artifact, or snapshot-parity claim.
 

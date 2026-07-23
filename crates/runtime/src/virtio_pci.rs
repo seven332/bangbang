@@ -2914,8 +2914,8 @@ mod tests {
         PreparedVsockDevice, SuppliedVsockListener, VIRTIO_FEATURE_VERSION_1,
         VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES,
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockReconstructionResource,
-        VirtioVsockRestoredTransportResetSignal, VirtioVsockTransportResetAttempt, VsockConfig,
-        VsockConfigInput, VsockGuestConnector,
+        VirtioVsockRestoredTransportResetSignal, VirtioVsockTransportResetAttempt,
+        VsockBackendSelector, VsockConfig, VsockConfigInput, VsockGuestConnector,
     };
 
     const TEST_VSOCK_PCI_UDS_PATH: &str = "/tmp/bangbang-vsock-pci-capture.sock";
@@ -4003,8 +4003,13 @@ mod tests {
             UnixListener::bind(&listener_path).expect("PCI reconstruction listener should bind");
         fs::remove_file(&listener_path)
             .expect("PCI reconstruction listener path should unlink after bind");
-        let mut resource = VirtioVsockReconstructionResource::new(
+        let destination_path = std::path::Path::new("/tmp")
+            .join(format!("bb-pci-destination-{}.sock", std::process::id()));
+        let destination_selector = VsockBackendSelector::try_from_path(&destination_path)
+            .expect("PCI destination selector should validate");
+        let mut resource = VirtioVsockReconstructionResource::with_destination_selector(
             active_first.device().backend_selector().clone(),
+            destination_selector,
             SuppliedVsockListener::new(listener).with_guest_connector(RejectingVsockGuestConnector),
         );
         let reconstructed = active_first
@@ -4012,6 +4017,7 @@ mod tests {
             .expect("PCI capture should rebuild device components without placement");
         assert!(resource.is_consumed());
         assert_eq!(reconstructed.guest_cid(), 42);
+        assert_eq!(reconstructed.uds_path(), destination_path);
         assert!(reconstructed.device().is_activated());
         assert!(reconstructed.device().pending_event_ack());
         assert_eq!(

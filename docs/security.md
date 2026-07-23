@@ -1723,11 +1723,16 @@ is resource-specific:
   and a reconstructed destination starts with empty connection work and an armed
   snapshot-origin gate. The paused source producer now validates one exact
   MMIO-or-PCI owner, publishes reset, captures, and normalizes connection work
-  under one lease before the unchanged optional-device rejection. Destination
-  authority and UDS override, record certification, native-v1
-  encoding/placement, and restored-guest proof remain #1517-#1518/#1490 work;
-  the live subset and internal producer are not a public snapshot-containment
-  claim.
+  under one lease before the unchanged optional-device rejection. Internal
+  destination preparation resolves the captured selector and override before
+  authority access. Direct publication is owner-only, stale-safe, atomic, and
+  identity-cleaned; contained publication reserves the exact directory grant
+  and session-bound broker endpoint, rolls them back before activation, and has
+  no ambient-path fallback. A single-use process transaction keeps cleanup
+  ownership through runtime adoption. Public native-v1 records still omit
+  vsock encoding and placement and public load rejects overrides. Record
+  certification and restored-guest proof remain #1518/#1490 work; the live
+  subset and internal producer are not a public snapshot-containment claim.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink. The `--metrics-path` startup CLI flag uses the same
   sink and host-path error redaction rules before the API socket is served.
@@ -2498,8 +2503,12 @@ The current scaffold does not implement:
   grants no path authority and persists no live peer work. Production quiesced
   capture now validates one exact source owner, publishes reset, and detaches
   connection work while retaining listener/connector authority for fresh
-  traffic. Destination authority/override, certification, native-v1
-  encoding/placement, and restored-guest proof remain #1517-#1518/#1490 work.
+  traffic. Internal destination preparation now validates the captured and
+  optional override selectors before resource access, uses owner-only
+  stale-safe direct publication or exact transactional contained authority,
+  and transfers cleanup ownership through one single-use runtime adoption.
+  Public native-v1 encoding/placement, record certification, and restored-guest
+  proof remain #1518/#1490 work.
 - log rotation, syslog, journald, tracing, remote telemetry, or process-global
   panic/fatal observability durability
 - a public serial streaming API, generalized serial artifact encoding/restore,
