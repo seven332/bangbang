@@ -778,6 +778,67 @@ mod platform {
         pub(crate) child: SocketChild,
     }
 
+    /// One exact socket-directory grant reserved until launcher activation.
+    pub(crate) struct PreparedSocketDirectoryClaim {
+        authority: DirectoryGrantAuthority,
+        directory: Option<GrantedDirectory>,
+        grant_id: GrantId,
+        child: SocketChild,
+    }
+
+    impl std::fmt::Debug for PreparedSocketDirectoryClaim {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PreparedSocketDirectoryClaim")
+                .field("authority", &"<redacted>")
+                .field("directory", &self.directory.as_ref().map(|_| "<reserved>"))
+                .field("grant_id", &"<redacted>")
+                .field("child", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl PreparedSocketDirectoryClaim {
+        pub(crate) fn directory(&self) -> Result<&GrantedDirectory, GrantClaimError> {
+            self.directory.as_ref().ok_or(GrantClaimError)
+        }
+
+        pub(crate) fn child(&self) -> &SocketChild {
+            &self.child
+        }
+
+        pub(crate) fn commit(mut self) -> ClaimedSocketDirectory {
+            let Some(directory) = self.directory.take() else {
+                abort_vhost_user_claim_invariant();
+            };
+            ClaimedSocketDirectory {
+                directory,
+                grant_id: self.grant_id.clone(),
+                child: self.child.clone(),
+            }
+        }
+    }
+
+    impl Drop for PreparedSocketDirectoryClaim {
+        fn drop(&mut self) {
+            let Some(directory) = self.directory.take() else {
+                return;
+            };
+            let Ok(mut registry) = self.authority.registry.try_borrow_mut() else {
+                abort_vhost_user_claim_invariant();
+            };
+            let Some(registry) = registry.as_mut() else {
+                abort_vhost_user_claim_invariant();
+            };
+            if registry
+                .restore_scoped_directory(self.grant_id.clone(), directory)
+                .is_err()
+            {
+                abort_vhost_user_claim_invariant();
+            }
+        }
+    }
+
     /// One durable per-drive lease on a retained vhost-user directory child.
     #[derive(Clone)]
     pub(crate) struct ClaimedVhostUserSocket {
@@ -1147,6 +1208,30 @@ mod platform {
             }))
         }
 
+        pub(crate) fn prepare_socket_directory(
+            &self,
+            reference: &Path,
+            role: ResourceRole,
+        ) -> Result<Option<PreparedSocketDirectoryClaim>, GrantClaimError> {
+            let Some((grant_id, child)) = socket_directory_reference(reference)? else {
+                return Ok(None);
+            };
+            let directory = self
+                .registry
+                .try_borrow_mut()
+                .map_err(|_| GrantClaimError)?
+                .as_mut()
+                .ok_or(GrantClaimError)?
+                .take_scoped_directory(&grant_id, role)
+                .map_err(|_| GrantClaimError)?;
+            Ok(Some(PreparedSocketDirectoryClaim {
+                authority: self.clone(),
+                directory: Some(directory),
+                grant_id,
+                child,
+            }))
+        }
+
         pub(crate) fn claim_snapshot_outputs(
             &self,
             state_reference: &Path,
@@ -1254,6 +1339,73 @@ mod platform {
         pub(crate) launcher_pid: libc::pid_t,
     }
 
+    /// One launcher broker endpoint reserved until its activation boundary.
+    pub(crate) struct PreparedSocketBrokerEndpoint {
+        authority: SocketBrokerAuthority,
+        endpoint: Option<SocketBrokerEndpoint>,
+    }
+
+    impl std::fmt::Debug for PreparedSocketBrokerEndpoint {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PreparedSocketBrokerEndpoint")
+                .field("authority", &"<redacted>")
+                .field("endpoint", &self.endpoint.as_ref().map(|_| "<reserved>"))
+                .finish()
+        }
+    }
+
+    impl PreparedSocketBrokerEndpoint {
+        pub(crate) fn endpoint(&self) -> Result<&SocketBrokerEndpoint, GrantClaimError> {
+            if !self
+                .authority
+                .state
+                .try_borrow()
+                .map_err(|_| GrantClaimError)?
+                .active
+            {
+                return Err(GrantClaimError);
+            }
+            self.endpoint.as_ref().ok_or(GrantClaimError)
+        }
+
+        pub(crate) fn commit(mut self) -> Result<SocketBrokerEndpoint, GrantClaimError> {
+            if !self
+                .authority
+                .state
+                .try_borrow()
+                .map_err(|_| GrantClaimError)?
+                .active
+            {
+                return Err(GrantClaimError);
+            }
+            self.endpoint.take().ok_or(GrantClaimError)
+        }
+    }
+
+    impl Drop for PreparedSocketBrokerEndpoint {
+        fn drop(&mut self) {
+            let Some(endpoint) = self.endpoint.take() else {
+                return;
+            };
+            let Ok(mut state) = self.authority.state.try_borrow_mut() else {
+                abort_vhost_user_claim_invariant();
+            };
+            if !state.active {
+                return;
+            }
+            if state.endpoint.is_some() {
+                abort_vhost_user_claim_invariant();
+            }
+            state.endpoint = Some(endpoint);
+        }
+    }
+
+    struct SocketBrokerAuthorityState {
+        endpoint: Option<SocketBrokerEndpoint>,
+        active: bool,
+    }
+
     impl std::fmt::Debug for SocketBrokerEndpoint {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -1268,7 +1420,7 @@ mod platform {
     /// Owner-thread one-time authority for the private launcher broker endpoint.
     #[derive(Clone)]
     pub(crate) struct SocketBrokerAuthority {
-        endpoint: Rc<RefCell<Option<SocketBrokerEndpoint>>>,
+        state: Rc<RefCell<SocketBrokerAuthorityState>>,
     }
 
     impl std::fmt::Debug for SocketBrokerAuthority {
@@ -1283,25 +1435,44 @@ mod platform {
     impl SocketBrokerAuthority {
         fn new(socket: UnixDatagram, session: SessionId, launcher_pid: libc::pid_t) -> Self {
             Self {
-                endpoint: Rc::new(RefCell::new(Some(SocketBrokerEndpoint {
-                    socket,
-                    session,
-                    launcher_pid,
-                }))),
+                state: Rc::new(RefCell::new(SocketBrokerAuthorityState {
+                    endpoint: Some(SocketBrokerEndpoint {
+                        socket,
+                        session,
+                        launcher_pid,
+                    }),
+                    active: true,
+                })),
             }
         }
 
         pub(crate) fn take_endpoint(&self) -> Result<SocketBrokerEndpoint, GrantClaimError> {
-            self.endpoint
-                .try_borrow_mut()
-                .map_err(|_| GrantClaimError)?
-                .take()
-                .ok_or(GrantClaimError)
+            let mut state = self.state.try_borrow_mut().map_err(|_| GrantClaimError)?;
+            if !state.active {
+                return Err(GrantClaimError);
+            }
+            state.endpoint.take().ok_or(GrantClaimError)
+        }
+
+        pub(crate) fn prepare_endpoint(
+            &self,
+        ) -> Result<PreparedSocketBrokerEndpoint, GrantClaimError> {
+            let mut state = self.state.try_borrow_mut().map_err(|_| GrantClaimError)?;
+            if !state.active {
+                return Err(GrantClaimError);
+            }
+            let endpoint = state.endpoint.take().ok_or(GrantClaimError)?;
+            drop(state);
+            Ok(PreparedSocketBrokerEndpoint {
+                authority: self.clone(),
+                endpoint: Some(endpoint),
+            })
         }
 
         fn invalidate(&self) {
-            if let Ok(mut endpoint) = self.endpoint.try_borrow_mut() {
-                endpoint.take();
+            if let Ok(mut state) = self.state.try_borrow_mut() {
+                state.active = false;
+                state.endpoint.take();
             }
         }
     }
@@ -2632,6 +2803,7 @@ mod platform {
     pub(crate) use tests::{
         TestDirectory as TestVhostDirectory, empty_grant_authority_for_vhost_test,
         file_grant_authority_for_test, vhost_directory_authority_for_test,
+        vsock_directory_authority_for_test,
     };
 
     #[cfg(test)]
@@ -2667,8 +2839,8 @@ mod platform {
 
         use super::{
             BlockControlBrokerAuthority, BlockControlResponse, DirectoryGrantAuthority,
-            GrantAuthority, GrantClaimError, VhostUserBrokerAuthority, VhostUserBrokerConnectError,
-            checked_observed_geometry, exact_resource_limit,
+            GrantAuthority, GrantClaimError, SocketBrokerAuthority, VhostUserBrokerAuthority,
+            VhostUserBrokerConnectError, checked_observed_geometry, exact_resource_limit,
         };
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -2877,7 +3049,7 @@ mod platform {
                 .registry
         }
 
-        fn vhost_directory_registry() -> (GrantRegistry, TestDirectory) {
+        fn directory_registry(id: &str, role: ResourceRole) -> (GrantRegistry, TestDirectory) {
             let directory = TestDirectory::new();
             let bookmark = create_implicit_bookmark(directory.path(), true)
                 .expect("directory bookmark should create");
@@ -2901,8 +3073,13 @@ mod platform {
             };
             let session = SessionId::from_bytes([41; 32]);
             let batch = BatchId::from_bytes([42; 16]);
-            let grant_id = GrantId::parse("vhost-directory").expect("grant ID should parse");
+            let grant_id = GrantId::parse(id).expect("grant ID should parse");
             let bookmark_bytes = u32::try_from(bookmark.len()).expect("bookmark should fit");
+            let access = if role == ResourceRole::VhostUserSocketDirectory {
+                GrantAccess::ConnectChildren
+            } else {
+                GrantAccess::CreateChildren
+            };
             let mut staged = StagedGrantBatch::new(session);
             staged
                 .accept(received(
@@ -2924,8 +3101,8 @@ mod platform {
                     1,
                     GrantRecord::ScopedDirectory {
                         id: grant_id.clone(),
-                        role: ResourceRole::VhostUserSocketDirectory,
-                        access: GrantAccess::ConnectChildren,
+                        role,
+                        access,
                         identity,
                         bookmark_bytes,
                         fragment_count: 1,
@@ -2964,6 +3141,10 @@ mod platform {
             (registry, directory)
         }
 
+        fn vhost_directory_registry() -> (GrantRegistry, TestDirectory) {
+            directory_registry("vhost-directory", ResourceRole::VhostUserSocketDirectory)
+        }
+
         pub(crate) fn empty_grant_authority_for_vhost_test() -> GrantAuthority {
             GrantAuthority::new(Default::default())
         }
@@ -2976,6 +3157,16 @@ mod platform {
         pub(crate) fn vhost_directory_authority_for_test()
         -> (DirectoryGrantAuthority, TestDirectory) {
             let (mut registry, directory) = vhost_directory_registry();
+            (
+                DirectoryGrantAuthority::new(registry.take_directory_registry()),
+                directory,
+            )
+        }
+
+        pub(crate) fn vsock_directory_authority_for_test()
+        -> (DirectoryGrantAuthority, TestDirectory) {
+            let (mut registry, directory) =
+                directory_registry("vsock-directory", ResourceRole::VsockSocketDirectory);
             (
                 DirectoryGrantAuthority::new(registry.take_directory_registry()),
                 directory,
@@ -3340,6 +3531,95 @@ mod platform {
                     ))
                     .is_err()
             );
+        }
+
+        #[test]
+        fn prepared_socket_directory_claim_rolls_back_and_commit_consumes_exact_authority() {
+            let (mut registry, _directory) =
+                directory_registry("vsock-directory", ResourceRole::VsockSocketDirectory);
+            let authority = DirectoryGrantAuthority::new(registry.take_directory_registry());
+            let reference = Path::new("bangbang-grant:vsock-directory/restored.sock");
+
+            assert!(
+                authority
+                    .prepare_socket_directory(
+                        Path::new("/tmp/ordinary.sock"),
+                        ResourceRole::VsockSocketDirectory,
+                    )
+                    .expect("ordinary paths should be recognized without access")
+                    .is_none()
+            );
+            let prepared = authority
+                .prepare_socket_directory(reference, ResourceRole::VsockSocketDirectory)
+                .expect("exact grant should prepare")
+                .expect("explicit reference should reserve authority");
+            assert_eq!(prepared.child().as_bytes(), b"restored.sock");
+            let diagnostic = format!("{prepared:?}");
+            assert!(!diagnostic.contains("vsock-directory"));
+            assert!(!diagnostic.contains("restored.sock"));
+            assert!(
+                authority
+                    .prepare_socket_directory(reference, ResourceRole::VsockSocketDirectory)
+                    .is_err(),
+                "reserved authority must not be claimed twice"
+            );
+            drop(prepared);
+
+            let committed = authority
+                .prepare_socket_directory(reference, ResourceRole::VsockSocketDirectory)
+                .expect("aborted reservation should restore authority")
+                .expect("restored exact grant should prepare")
+                .commit();
+            assert_eq!(committed.child.as_bytes(), b"restored.sock");
+            assert!(
+                authority
+                    .prepare_socket_directory(reference, ResourceRole::VsockSocketDirectory)
+                    .is_err(),
+                "committed authority must remain consumed"
+            );
+        }
+
+        #[test]
+        fn prepared_socket_broker_endpoint_rolls_back_until_commit() {
+            let (worker, launcher) = UnixDatagram::pair().expect("broker pair should create");
+            let authority = SocketBrokerAuthority::new(
+                worker,
+                SessionId::from_bytes([91; 32]),
+                // SAFETY: This test authenticates the other endpoint in the same process.
+                unsafe { libc::getpid() },
+            );
+
+            let prepared = authority
+                .prepare_endpoint()
+                .expect("broker endpoint should reserve");
+            assert!(authority.prepare_endpoint().is_err());
+            assert!(!format!("{prepared:?}").contains("91"));
+            drop(prepared);
+
+            let committed = authority
+                .prepare_endpoint()
+                .expect("aborted endpoint should be reusable")
+                .commit()
+                .expect("active broker reservation should commit");
+            assert!(authority.prepare_endpoint().is_err());
+            drop(committed);
+            drop(launcher);
+
+            let (worker, launcher) = UnixDatagram::pair().expect("broker pair should create");
+            let authority = SocketBrokerAuthority::new(
+                worker,
+                SessionId::from_bytes([92; 32]),
+                // SAFETY: This test authenticates the other endpoint in the same process.
+                unsafe { libc::getpid() },
+            );
+            let prepared = authority
+                .prepare_endpoint()
+                .expect("endpoint should reserve before invalidation");
+            authority.invalidate();
+            assert!(prepared.endpoint().is_err());
+            assert!(prepared.commit().is_err());
+            assert!(authority.prepare_endpoint().is_err());
+            drop(launcher);
         }
 
         #[test]
@@ -3847,6 +4127,9 @@ mod platform {
     #[derive(Debug)]
     pub(crate) struct ClaimedSocketDirectory;
 
+    #[derive(Debug)]
+    pub(crate) struct PreparedSocketDirectoryClaim;
+
     impl GrantAuthority {
         pub(crate) fn claim_read_only_file(
             &self,
@@ -3920,6 +4203,17 @@ mod platform {
                 None => Ok(None),
             }
         }
+
+        pub(crate) fn prepare_socket_directory(
+            &self,
+            reference: &Path,
+            _role: ResourceRole,
+        ) -> Result<Option<PreparedSocketDirectoryClaim>, GrantClaimError> {
+            match socket_directory_reference(reference)? {
+                Some(_) => Err(GrantClaimError),
+                None => Ok(None),
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -3983,15 +4277,16 @@ mod platform {
 
 pub(crate) use platform::{
     ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
-    PreparedDriveBackingClaim, PreparedFileGrantClaim,
+    PreparedDriveBackingClaim, PreparedFileGrantClaim, PreparedSocketDirectoryClaim,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use platform::{
-    ClaimedVhostUserSocket, PreparedVhostUserSocketClaim, SnapshotStagingRecordTracker,
-    SocketBrokerAuthority, SocketBrokerEndpoint, VhostUserBrokerAuthority,
+    ClaimedVhostUserSocket, PreparedSocketBrokerEndpoint, PreparedVhostUserSocketClaim,
+    SnapshotStagingRecordTracker, SocketBrokerAuthority, SocketBrokerEndpoint,
+    VhostUserBrokerAuthority,
 };
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{
     TestVhostDirectory, empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
-    vhost_directory_authority_for_test,
+    vhost_directory_authority_for_test, vsock_directory_authority_for_test,
 };

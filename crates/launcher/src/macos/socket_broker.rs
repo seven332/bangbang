@@ -571,4 +571,38 @@ mod tests {
             Err(LauncherError::SocketBroker)
         );
     }
+
+    #[test]
+    fn broker_rejects_another_activation_after_completion() {
+        let (launcher, worker) = UnixDatagram::pair().expect("broker pair should open");
+        launcher
+            .set_nonblocking(true)
+            .expect("launcher endpoint should become nonblocking");
+        let mut broker = LauncherSocketBroker::new(session());
+        broker.state = BrokerState::Complete;
+        broker.next_sequence = 3;
+        send_socket_broker_message(
+            &worker,
+            &SocketBrokerMessage::Activate {
+                session: session(),
+                sequence: 3,
+                child: SocketChild::parse("second.sock").expect("child should parse"),
+            },
+            None,
+        )
+        .expect("second activation should send");
+        // SAFETY: The test process owns both authenticated socketpair peers.
+        let pid = unsafe { libc::getpid() };
+
+        assert_eq!(
+            broker.drain(
+                &launcher,
+                pid,
+                LauncherState::ReadyToProceed,
+                false,
+                &empty_grants(),
+            ),
+            Err(LauncherError::SocketBroker)
+        );
+    }
 }

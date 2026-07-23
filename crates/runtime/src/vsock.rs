@@ -1,5 +1,12 @@
 //! Backend-neutral vsock configuration model.
 
+mod direct_restore;
+
+pub use direct_restore::{
+    DirectVsockRestoreCleanupError, DirectVsockRestoreError, DirectVsockSocketGuard,
+    PreparedDirectVsockRestore, prepare_direct_vsock_restore,
+};
+
 use std::collections::{HashMap, HashSet, TryReserveError, VecDeque, hash_map::Entry};
 use std::fmt;
 use std::fs;
@@ -523,20 +530,48 @@ impl SuppliedVsockListener {
 /// listener to carry an authority-supplied guest connector and rejects an
 /// incomplete resource before consuming it.
 pub struct VirtioVsockReconstructionResource {
-    selector: VsockBackendSelector,
+    captured_selector: VsockBackendSelector,
+    destination_selector: VsockBackendSelector,
     listener: Option<SuppliedVsockListener>,
 }
 
 impl VirtioVsockReconstructionResource {
     pub fn new(selector: VsockBackendSelector, listener: SuppliedVsockListener) -> Self {
         Self {
-            selector,
+            captured_selector: selector.clone(),
+            destination_selector: selector,
             listener: Some(listener),
         }
     }
 
+    /// Creates a resource that validates one captured selector and binds another.
+    pub fn with_destination_selector(
+        captured_selector: VsockBackendSelector,
+        destination_selector: VsockBackendSelector,
+        listener: SuppliedVsockListener,
+    ) -> Self {
+        Self {
+            captured_selector,
+            destination_selector,
+            listener: Some(listener),
+        }
+    }
+
+    pub const fn captured_selector(&self) -> &VsockBackendSelector {
+        &self.captured_selector
+    }
+
+    /// Returns the captured selector used for serialized-state validation.
+    ///
+    /// This retains the original single-selector accessor; callers preparing
+    /// an override should use [`Self::destination_selector`] for the selected
+    /// destination.
     pub const fn selector(&self) -> &VsockBackendSelector {
-        &self.selector
+        self.captured_selector()
+    }
+
+    pub const fn destination_selector(&self) -> &VsockBackendSelector {
+        &self.destination_selector
     }
 
     pub const fn is_consumed(&self) -> bool {
@@ -8108,7 +8143,7 @@ fn reconstruct_vsock_snapshot_device(
 ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
     validate_vsock_capture_state(state, device_registers, queues, transport_activated, memory)
         .map_err(VirtioVsockReconstructionError::Capture)?;
-    if resource.selector() != state.backend_selector() {
+    if resource.captured_selector() != state.backend_selector() {
         return Err(VirtioVsockReconstructionError::ResourceSelectorMismatch);
     }
     let queues =
@@ -8154,7 +8189,7 @@ fn reconstruct_vsock_snapshot_device(
     let guest_cid = u32::try_from(state.guest_cid()).map_err(|_| {
         VirtioVsockReconstructionError::Capture(VirtioVsockDeviceCaptureError::GuestCidInvalid)
     })?;
-    let uds_path = state.backend_selector().path().to_path_buf();
+    let uds_path = resource.destination_selector().path().to_path_buf();
     let prepared_listener = resource
         .listener
         .as_ref()
@@ -11424,6 +11459,7 @@ mod tests {
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
         MmioRegionId,
     };
+    use crate::snapshot::{SnapshotVsockOverride, resolve_snapshot_vsock_selectors};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
@@ -11476,7 +11512,7 @@ mod tests {
         VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
         VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
         is_transient_host_socket_accept_error, is_transient_host_socket_read_error,
-        parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
+        parse_vsock_host_connect_request, prepare_direct_vsock_restore, virtio_vsock_mmio_handler,
     };
 
     static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -26484,6 +26520,112 @@ mod tests {
         drop(reconstructed);
         drop(source);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn virtio_vsock_reconstruction_validates_captured_selector_and_uses_destination_selector() {
+        let captured_path = unique_socket_path("restore-source");
+        let destination_path = unique_socket_path("restore-target");
+        let captured_config = valid_vsock_config(42, captured_path.to_string_lossy());
+        let source = virtio_vsock_mmio_handler_with_host_socket(42, &captured_path);
+        let memory = vsock_tx_memory();
+        let (captured, _) = source
+            .capture_vsock_state(
+                &captured_config,
+                &memory,
+                VirtioVsockTransportResetAttempt::Inactive,
+            )
+            .expect("inactive source should capture");
+        let captured_selector = captured.device().backend_selector().clone();
+        let destination_selector = VsockBackendSelector::try_from_path(&destination_path)
+            .expect("destination selector should validate");
+
+        let listener_path = unique_socket_path("restore-override-fd");
+        let listener = UnixListener::bind(&listener_path)
+            .expect("reconstruction listener should bind before handoff");
+        fs::remove_file(&listener_path)
+            .expect("reconstruction listener path should unlink after bind");
+        let supplied = SuppliedVsockListener::new(listener).with_guest_connector(
+            RecordingGuestConnector::new(Arc::new(Mutex::new(Vec::new()))),
+        );
+        let mut resource = VirtioVsockReconstructionResource::with_destination_selector(
+            captured_selector.clone(),
+            destination_selector.clone(),
+            supplied,
+        );
+
+        assert_eq!(resource.captured_selector(), &captured_selector);
+        assert_eq!(resource.destination_selector(), &destination_selector);
+        let reconstructed = captured
+            .reconstruct_snapshot_device(&memory, &mut resource)
+            .expect("matching source with overridden destination should reconstruct");
+        assert!(resource.is_consumed());
+        assert_eq!(reconstructed.uds_path(), destination_path);
+        assert_eq!(
+            reconstructed.device().host_socket_path.as_deref(),
+            Some(destination_path.as_path())
+        );
+
+        drop(reconstructed);
+        drop(source);
+        assert!(!captured_path.exists());
+    }
+
+    #[test]
+    fn direct_restore_resource_routes_host_and_guest_streams_after_reconstruction() {
+        let captured_path = unique_socket_path("direct-source");
+        let destination_path = unique_socket_path("direct-target");
+        let captured_config = valid_vsock_config(42, captured_path.to_string_lossy());
+        let source = virtio_vsock_mmio_handler_with_host_socket(42, &captured_path);
+        let memory = vsock_tx_memory();
+        let (captured, _) = source
+            .capture_vsock_state(
+                &captured_config,
+                &memory,
+                VirtioVsockTransportResetAttempt::Inactive,
+            )
+            .expect("inactive source should capture");
+        let selectors = resolve_snapshot_vsock_selectors(
+            Some(captured.device().backend_selector()),
+            Some(&SnapshotVsockOverride::new(&destination_path)),
+        )
+        .expect("direct override should resolve")
+        .expect("captured device should produce selectors");
+        let prepared = prepare_direct_vsock_restore(selectors)
+            .expect("direct restore resource should prepare");
+        let (mut resource, guard) = prepared.into_parts();
+        let reconstructed = captured
+            .reconstruct_snapshot_device(&memory, &mut resource)
+            .expect("direct resource should reconstruct the device");
+        let (_, _, _, mut device) = reconstructed.into_parts();
+
+        let _host_client =
+            UnixStream::connect(&destination_path).expect("host client should connect");
+        assert!(
+            device
+                .accept_host_connection()
+                .expect("restored direct listener should accept")
+                .is_some()
+        );
+
+        let guest_listener = guest_connection_listener(&destination_path, 52);
+        assert!(matches!(
+            device.connect_guest_connection_request_packet(&guest_request_tx_packet(42, 52, 4000)),
+            Some(super::VsockGuestConnectionRequestOutcome::Retained { .. })
+        ));
+        let _guest_peer = guest_listener.accept();
+
+        drop(device);
+        assert!(
+            destination_path.exists(),
+            "guard must own published cleanup"
+        );
+        guard
+            .cleanup()
+            .expect("direct guard should clean exact socket");
+        assert!(!destination_path.exists());
+        drop(source);
+        assert!(!captured_path.exists());
     }
 
     #[test]

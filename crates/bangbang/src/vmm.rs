@@ -126,7 +126,7 @@ use bangbang_runtime::startup::{
 };
 use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
 #[cfg(target_os = "macos")]
-use bangbang_runtime::vsock::SuppliedVsockListener;
+use bangbang_runtime::vsock::{SuppliedVsockListener, VsockBackendSelector};
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{
     BackendError, HotUnplugDeviceKind, VmStateTransition, VmmAction, VmmActionError, VmmController,
@@ -161,6 +161,11 @@ use crate::host_network::vmnet::{
     StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VmnetHostDeviceNameConfigError,
     VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceParameters,
     VmnetInterfaceStartDisposition, VmnetInterfaceStartError, VmnetMode, VmnetPacketIoBackend,
+};
+#[cfg(target_os = "macos")]
+use crate::vsock_restore::{
+    PreparedVsockRestoreResource, VsockRestoreDisposition, VsockRestoreError,
+    prepare_vsock_restore_resource,
 };
 
 #[cfg(test)]
@@ -543,6 +548,8 @@ pub(crate) enum NativeV1SnapshotLoadError {
     Preflight(VmmActionError),
     ProcessTerminal,
     Resource(GrantClaimError),
+    #[cfg(target_os = "macos")]
+    VsockResource(VsockRestoreError),
     Artifact(SnapshotArtifactLoadError),
     Prepare(PrepareHvfSnapshotV1LoadError),
     ProcessPreparation(BackendError),
@@ -559,6 +566,11 @@ impl NativeV1SnapshotLoadError {
         match self {
             Self::Restore(source) => source.disposition(),
             Self::ProcessTerminal => HvfSnapshotV1RestoreDisposition::Terminal,
+            #[cfg(target_os = "macos")]
+            Self::VsockResource(source) => match source.disposition() {
+                VsockRestoreDisposition::Retryable => HvfSnapshotV1RestoreDisposition::Retryable,
+                VsockRestoreDisposition::Terminal => HvfSnapshotV1RestoreDisposition::Terminal,
+            },
             Self::WorkerStart { cleanup, .. } if !cleanup.is_complete() => {
                 HvfSnapshotV1RestoreDisposition::Terminal
             }
@@ -579,6 +591,10 @@ impl fmt::Display for NativeV1SnapshotLoadError {
             Self::Preflight(source) => write!(f, "native-v1 load preflight failed: {source}"),
             Self::ProcessTerminal => f.write_str("native-v1 load process is terminal"),
             Self::Resource(source) => write!(f, "native-v1 resource adoption failed: {source}"),
+            #[cfg(target_os = "macos")]
+            Self::VsockResource(source) => {
+                write!(f, "native-v1 vsock resource preparation failed: {source}")
+            }
             Self::Artifact(source) => write!(f, "native-v1 artifact load failed: {source}"),
             Self::Prepare(source) => write!(f, "native-v1 preparation failed: {source}"),
             Self::ProcessPreparation(source) => {
@@ -600,6 +616,8 @@ impl std::error::Error for NativeV1SnapshotLoadError {
         match self {
             Self::Preflight(source) => Some(source),
             Self::Resource(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::VsockResource(source) => Some(source),
             Self::Artifact(source) => Some(source),
             Self::Prepare(source) => Some(source),
             Self::ProcessPreparation(source) => Some(source),
@@ -3547,6 +3565,23 @@ where
     S: InstanceStartExecutor,
 {
     #[cfg(target_os = "macos")]
+    fn prepare_snapshot_vsock_restore(
+        &self,
+        captured: Option<&VsockBackendSelector>,
+        input: &SnapshotLoadInput,
+    ) -> Result<Option<PreparedVsockRestoreResource>, NativeV1SnapshotLoadError> {
+        prepare_vsock_restore_resource(
+            captured,
+            input.vsock_override(),
+            self.directory_grant_authority.as_ref(),
+            self.socket_broker_authority.as_ref(),
+            self.socket_namespace.as_ref(),
+            || self.snapshot_capture_cancellation.is_cancelled(),
+        )
+        .map_err(NativeV1SnapshotLoadError::VsockResource)
+    }
+
+    #[cfg(target_os = "macos")]
     fn prepare_contained_snapshot_v1_load(
         &self,
         input: &SnapshotLoadInput,
@@ -3676,6 +3711,16 @@ where
         self.controller
             .preflight_load_snapshot(input)
             .map_err(NativeV1SnapshotLoadError::Preflight)?;
+
+        #[cfg(target_os = "macos")]
+        if let Some(unintegrated) = self.prepare_snapshot_vsock_restore(None, input)? {
+            // Native-v1 artifacts do not encode vsock yet. Keep the public
+            // gate fail-closed while exercising the exact #1490 handoff.
+            let _ = unintegrated
+                .abort()
+                .map_err(NativeV1SnapshotLoadError::VsockResource)?;
+            return Err(NativeV1SnapshotLoadError::ProcessTerminal);
+        }
 
         let prepared = self.prepare_contained_snapshot_v1_load(input)?;
         let result = match prepared {

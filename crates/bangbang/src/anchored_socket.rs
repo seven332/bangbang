@@ -21,7 +21,10 @@ use bangbang_session::macos::socket_broker::{
 use bangbang_session::macos::{set_cloexec, verify_peer, verify_peer_pid};
 use bangbang_session::{ObjectIdentity, ResourceRole, SocketChild};
 
-use crate::contained_session::{ClaimedSocketDirectory, SocketBrokerEndpoint};
+use crate::contained_session::{
+    ClaimedSocketDirectory, PreparedSocketBrokerEndpoint, PreparedSocketDirectoryClaim,
+    SocketBrokerEndpoint,
+};
 
 const BINDER_ARGUMENT: &str = "--bangbang-internal-socket-binder-v1";
 const BINDER_FD: RawFd = 5;
@@ -56,6 +59,9 @@ unsafe extern "C" {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnchoredSocketError {
     Binder,
+    Broker,
+    Cancelled,
+    Cleanup,
     CrossFilesystem,
     Invalid,
     Io(io::ErrorKind),
@@ -336,41 +342,147 @@ pub(crate) fn bind(
     role: ResourceRole,
     broker: Option<SocketBrokerEndpoint>,
 ) -> Result<BoundAnchoredSocket, AnchoredSocketError> {
+    bind_inner(
+        namespace,
+        SocketDirectoryClaim::Committed(claim),
+        role,
+        broker.map(SocketBrokerClaim::Committed),
+        || false,
+    )
+}
+
+/// Binds a restore vsock while retaining reusable authority until activation.
+pub(crate) fn bind_prepared_vsock(
+    namespace: WorkerSocketNamespace,
+    claim: PreparedSocketDirectoryClaim,
+    broker: PreparedSocketBrokerEndpoint,
+    cancelled: impl FnOnce() -> bool,
+) -> Result<BoundAnchoredSocket, AnchoredSocketError> {
+    bind_inner(
+        namespace,
+        SocketDirectoryClaim::Prepared(claim),
+        ResourceRole::VsockSocketDirectory,
+        Some(SocketBrokerClaim::Prepared(broker)),
+        cancelled,
+    )
+}
+
+enum SocketDirectoryClaim {
+    Committed(ClaimedSocketDirectory),
+    Prepared(PreparedSocketDirectoryClaim),
+}
+
+impl SocketDirectoryClaim {
+    fn directory_anchor_fd(&self) -> Result<RawFd, AnchoredSocketError> {
+        match self {
+            Self::Committed(claim) => Ok(claim.directory.anchor_fd()),
+            Self::Prepared(claim) => claim
+                .directory()
+                .map(|directory| directory.anchor_fd())
+                .map_err(|_| AnchoredSocketError::Invalid),
+        }
+    }
+
+    fn directory_device(&self) -> Result<u64, AnchoredSocketError> {
+        match self {
+            Self::Committed(claim) => Ok(claim.directory.identity().device),
+            Self::Prepared(claim) => claim
+                .directory()
+                .map(|directory| directory.identity().device)
+                .map_err(|_| AnchoredSocketError::Invalid),
+        }
+    }
+
+    fn child(&self) -> &SocketChild {
+        match self {
+            Self::Committed(claim) => &claim.child,
+            Self::Prepared(claim) => claim.child(),
+        }
+    }
+
+    fn commit(self) -> ClaimedSocketDirectory {
+        match self {
+            Self::Committed(claim) => claim,
+            Self::Prepared(claim) => claim.commit(),
+        }
+    }
+}
+
+enum SocketBrokerClaim {
+    Committed(SocketBrokerEndpoint),
+    Prepared(PreparedSocketBrokerEndpoint),
+}
+
+impl SocketBrokerClaim {
+    fn endpoint(&self) -> Result<&SocketBrokerEndpoint, AnchoredSocketError> {
+        match self {
+            Self::Committed(endpoint) => Ok(endpoint),
+            Self::Prepared(endpoint) => endpoint
+                .endpoint()
+                .map_err(|_| AnchoredSocketError::Invalid),
+        }
+    }
+
+    fn commit(self) -> Result<SocketBrokerEndpoint, AnchoredSocketError> {
+        match self {
+            Self::Committed(endpoint) => Ok(endpoint),
+            Self::Prepared(endpoint) => endpoint.commit().map_err(|_| AnchoredSocketError::Invalid),
+        }
+    }
+}
+
+fn bind_inner(
+    namespace: WorkerSocketNamespace,
+    claim: SocketDirectoryClaim,
+    role: ResourceRole,
+    broker: Option<SocketBrokerClaim>,
+    cancelled: impl FnOnce() -> bool,
+) -> Result<BoundAnchoredSocket, AnchoredSocketError> {
     if broker.is_some() != (role == ResourceRole::VsockSocketDirectory) {
         return Err(AnchoredSocketError::Invalid);
     }
-    if namespace.identity().device != claim.directory.identity().device {
+    if namespace.identity().device != claim.directory_device()? {
         return Err(AnchoredSocketError::CrossFilesystem);
     }
+    let directory_anchor = claim.directory_anchor_fd()?;
     let staging = socket_staging_name(role).map_err(|_| AnchoredSocketError::Invalid)?;
     ensure_relative_absent(namespace.anchor_fd(), staging)?;
 
-    let (listener, identity) = spawn_binder(&namespace, role).inspect_err(|_| {
-        let _ = unlink_relative_if_socket_at(namespace.anchor_fd(), staging, None);
-    })?;
+    let (listener, identity) = match spawn_binder(&namespace, role) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            cleanup_staged_socket_checked(&namespace, staging, None)?;
+            return Err(error);
+        }
+    };
     let staged_identity = match relative_socket_identity(namespace.anchor_fd(), staging) {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = unlink_relative_if_socket_at(namespace.anchor_fd(), staging, Some(identity));
+            cleanup_staged_socket_checked(&namespace, staging, Some(identity))?;
             return Err(error);
         }
     };
     if staged_identity != identity {
-        let _ = unlink_relative_if_socket_at(namespace.anchor_fd(), staging, Some(identity));
+        cleanup_staged_socket_checked(&namespace, staging, Some(identity))?;
         return Err(AnchoredSocketError::PathChanged);
     }
 
-    let record = SocketOwnershipRecord::new(role, claim.child.clone(), identity)
-        .map_err(|_| AnchoredSocketError::Invalid)?;
+    let record = match SocketOwnershipRecord::new(role, claim.child().clone(), identity) {
+        Ok(record) => record,
+        Err(_) => {
+            cleanup_staged_socket_checked(&namespace, staging, Some(identity))?;
+            return Err(AnchoredSocketError::Invalid);
+        }
+    };
     if namespace.write_socket_record(&record).is_err() {
-        let _ = unlink_relative_if_socket_at(namespace.anchor_fd(), staging, Some(identity));
+        cleanup_staged_record_checked(&namespace, staging, &record)?;
         return Err(AnchoredSocketError::Invalid);
     }
 
-    let child = match child_cstring(&claim.child) {
+    let child = match child_cstring(claim.child()) {
         Ok(child) => child,
         Err(error) => {
-            cleanup_staged_record(&namespace, staging, &record);
+            cleanup_staged_record_checked(&namespace, staging, &record)?;
             return Err(error);
         }
     };
@@ -379,14 +491,14 @@ pub(crate) fn bind(
         renameatx_np(
             namespace.anchor_fd(),
             staging.as_ptr(),
-            claim.directory.anchor_fd(),
+            directory_anchor,
             child.as_ptr(),
             RENAME_EXCL,
         )
     };
     if published != 0 {
         let error = io::Error::last_os_error();
-        cleanup_staged_record(&namespace, staging, &record);
+        cleanup_staged_record_checked(&namespace, staging, &record)?;
         return if matches!(
             error.kind(),
             io::ErrorKind::AlreadyExists | io::ErrorKind::AddrInUse
@@ -398,23 +510,52 @@ pub(crate) fn bind(
     }
 
     if !matches!(
-        relative_socket_identity(claim.directory.anchor_fd(), &child),
+        relative_socket_identity(directory_anchor, &child),
         Ok(final_identity) if final_identity == identity
     ) {
-        cleanup_published_record(&namespace, &claim, &record);
+        cleanup_published_claim_checked(&namespace, &claim, &record)?;
         return Err(AnchoredSocketError::PathChanged);
     }
 
-    let connector = if role == ResourceRole::VsockSocketDirectory {
-        match spawn_connector(&claim, broker.ok_or(AnchoredSocketError::Invalid)?) {
-            Ok(connector) => Some(connector),
-            Err(error) => {
+    if role == ResourceRole::VsockSocketDirectory {
+        let prepared = broker
+            .as_ref()
+            .ok_or(AnchoredSocketError::Invalid)
+            .and_then(SocketBrokerClaim::endpoint)
+            .and_then(prepare_connector_endpoint);
+        if let Err(error) = prepared {
+            cleanup_published_claim_checked(&namespace, &claim, &record)?;
+            return Err(error);
+        }
+    }
+    if cancelled() {
+        cleanup_published_claim_checked(&namespace, &claim, &record)?;
+        return Err(AnchoredSocketError::Cancelled);
+    }
+
+    let (claim, connector) = if role == ResourceRole::VsockSocketDirectory {
+        let endpoint = match broker
+            .ok_or(AnchoredSocketError::Invalid)
+            .and_then(SocketBrokerClaim::commit)
+        {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                cleanup_published_claim_checked(&namespace, &claim, &record)?;
+                return Err(AnchoredSocketError::Broker);
+            }
+        };
+        // The authenticated launcher may observe activation after this point,
+        // so neither authority is restored on subsequent failures.
+        let claim = claim.commit();
+        match spawn_connector(&claim, endpoint) {
+            Ok(connector) => (claim, Some(connector)),
+            Err(_) => {
                 cleanup_published_record(&namespace, &claim, &record);
-                return Err(error);
+                return Err(AnchoredSocketError::Broker);
             }
         }
     } else {
-        None
+        (claim.commit(), None)
     };
 
     Ok(BoundAnchoredSocket {
@@ -506,16 +647,7 @@ fn spawn_connector(
     claim: &ClaimedSocketDirectory,
     endpoint: SocketBrokerEndpoint,
 ) -> Result<AnchoredVsockConnector, AnchoredSocketError> {
-    endpoint
-        .socket
-        .set_read_timeout(Some(BINDER_TIMEOUT))
-        .map_err(|error| AnchoredSocketError::Io(error.kind()))?;
-    endpoint
-        .socket
-        .set_write_timeout(Some(BINDER_TIMEOUT))
-        .map_err(|error| AnchoredSocketError::Io(error.kind()))?;
-    verify_peer_pid(endpoint.socket.as_raw_fd(), endpoint.launcher_pid)
-        .map_err(|_| AnchoredSocketError::Binder)?;
+    prepare_connector_endpoint(&endpoint)?;
     let activate = SocketBrokerMessage::Activate {
         session: endpoint.session,
         sequence: 1,
@@ -543,6 +675,20 @@ fn spawn_connector(
         next_sequence: 2,
         healthy: true,
     })
+}
+
+fn prepare_connector_endpoint(endpoint: &SocketBrokerEndpoint) -> Result<(), AnchoredSocketError> {
+    endpoint
+        .socket
+        .set_read_timeout(Some(BINDER_TIMEOUT))
+        .map_err(|error| AnchoredSocketError::Io(error.kind()))?;
+    endpoint
+        .socket
+        .set_write_timeout(Some(BINDER_TIMEOUT))
+        .map_err(|error| AnchoredSocketError::Io(error.kind()))?;
+    verify_peer_pid(endpoint.socket.as_raw_fd(), endpoint.launcher_pid)
+        .map_err(|_| AnchoredSocketError::Binder)?;
+    Ok(())
 }
 
 fn helper_hello(kind: u8) -> Result<[u8; HELLO_BYTES], AnchoredSocketError> {
@@ -1120,15 +1266,27 @@ fn unlink_socket_if_owned(
     unlink_relative_if_socket_at(directory, &child, Some(identity))
 }
 
-fn cleanup_staged_record(
+fn cleanup_staged_socket_checked(
+    namespace: &WorkerSocketNamespace,
+    staging: &std::ffi::CStr,
+    identity: Option<ObjectIdentity>,
+) -> Result<(), AnchoredSocketError> {
+    checked_cleanup(unlink_relative_if_socket_at(
+        namespace.anchor_fd(),
+        staging,
+        identity,
+    ))
+}
+
+fn cleanup_staged_record_checked(
     namespace: &WorkerSocketNamespace,
     staging: &std::ffi::CStr,
     record: &SocketOwnershipRecord,
-) {
-    if unlink_relative_if_socket_at(namespace.anchor_fd(), staging, Some(record.identity())).is_ok()
-    {
-        let _ = namespace.clear_socket_record(record);
-    }
+) -> Result<(), AnchoredSocketError> {
+    cleanup_staged_socket_checked(namespace, staging, Some(record.identity()))?;
+    namespace
+        .clear_socket_record(record)
+        .map_err(|_| AnchoredSocketError::Cleanup)
 }
 
 fn cleanup_published_record(
@@ -1143,6 +1301,31 @@ fn cleanup_published_record(
         Ok(()) | Err(AnchoredSocketError::Invalid | AnchoredSocketError::PathChanged)
     ) {
         let _ = namespace.clear_socket_record(record);
+    }
+}
+
+fn cleanup_published_claim_checked(
+    namespace: &WorkerSocketNamespace,
+    claim: &SocketDirectoryClaim,
+    record: &SocketOwnershipRecord,
+) -> Result<(), AnchoredSocketError> {
+    let directory = claim
+        .directory_anchor_fd()
+        .map_err(|_| AnchoredSocketError::Cleanup)?;
+    checked_cleanup(unlink_socket_if_owned(
+        directory,
+        claim.child(),
+        record.identity(),
+    ))?;
+    namespace
+        .clear_socket_record(record)
+        .map_err(|_| AnchoredSocketError::Cleanup)
+}
+
+fn checked_cleanup(result: Result<(), AnchoredSocketError>) -> Result<(), AnchoredSocketError> {
+    match result {
+        Ok(()) | Err(AnchoredSocketError::Invalid | AnchoredSocketError::PathChanged) => Ok(()),
+        Err(_) => Err(AnchoredSocketError::Cleanup),
     }
 }
 
