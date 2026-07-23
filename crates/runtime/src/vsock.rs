@@ -25,10 +25,14 @@ use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
-    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
-    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueRegisters,
+    VirtioMmioQueueState, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    VirtioMmioTransportState,
 };
-use crate::virtio_pci::{VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError};
+use crate::virtio_pci::{
+    VirtioPciDeviceOperationError, VirtioPciEndpoint, VirtioPciEndpointError,
+    VirtioPciTransportState,
+};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
@@ -158,6 +162,69 @@ impl VsockConfig {
         &self.uds_path
     }
 }
+
+/// Logical Firecracker-compatible backend selector without host authority.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VsockBackendSelector {
+    path: PathBuf,
+}
+
+impl VsockBackendSelector {
+    /// Validates one logical UDS selector without opening or claiming it.
+    pub fn try_from_path(path: impl AsRef<Path>) -> Result<Self, VsockBackendSelectorError> {
+        let path = path.as_ref();
+        let Some(path_text) = path.to_str() else {
+            return Err(VsockBackendSelectorError::NotUtf8);
+        };
+        if path_text.is_empty() {
+            return Err(VsockBackendSelectorError::Empty);
+        }
+        if has_control_character(path_text) {
+            return Err(VsockBackendSelectorError::ControlCharacter);
+        }
+        unix_socket_address(path).map_err(|_| VsockBackendSelectorError::InvalidSocketAddress)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Returns the logical selector. The value does not grant path access.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl fmt::Debug for VsockBackendSelector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VsockBackendSelector")
+            .field("path", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockBackendSelectorError {
+    Empty,
+    NotUtf8,
+    ControlCharacter,
+    InvalidSocketAddress,
+}
+
+impl fmt::Display for VsockBackendSelectorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "vsock backend selector is empty",
+            Self::NotUtf8 => "vsock backend selector is not UTF-8",
+            Self::ControlCharacter => "vsock backend selector contains a control character",
+            Self::InvalidSocketAddress => {
+                "vsock backend selector does not fit an AF_UNIX socket address"
+            }
+        })
+    }
+}
+
+impl std::error::Error for VsockBackendSelectorError {}
 
 impl TryFrom<VsockConfigInput> for VsockConfig {
     type Error = VsockConfigError;
@@ -345,18 +412,23 @@ impl VsockHostSocketOwner {
         path: impl AsRef<Path>,
         listener: SuppliedVsockListener,
     ) -> Result<(Self, Option<Box<dyn VsockGuestConnector>>), VsockHostSocketOwnerError> {
+        listener.prepare_for_adoption()?;
+        Ok(Self::from_prepared_supplied(path, listener))
+    }
+
+    fn from_prepared_supplied(
+        path: impl AsRef<Path>,
+        listener: SuppliedVsockListener,
+    ) -> (Self, Option<Box<dyn VsockGuestConnector>>) {
         let (listener, connector) = listener.into_parts();
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| VsockHostSocketOwnerError::SetNonblocking(error.kind()))?;
-        Ok((
+        (
             Self {
                 listener,
                 path: path.as_ref().to_path_buf(),
                 direct_identity: None,
             },
             connector,
-        ))
+        )
     }
 
     pub(crate) fn accept_host_connection(
@@ -427,8 +499,60 @@ impl SuppliedVsockListener {
         self
     }
 
+    fn prepare_for_adoption(&self) -> Result<(), VsockHostSocketOwnerError> {
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|error| VsockHostSocketOwnerError::SetNonblocking(error.kind()))
+    }
+
+    const fn has_guest_connector(&self) -> bool {
+        self.guest_connector.is_some()
+    }
+
     fn into_parts(self) -> (UnixListener, Option<Box<dyn VsockGuestConnector>>) {
         (self.listener, self.guest_connector)
+    }
+}
+
+/// Move-only destination resource prepared for one logical vsock selector.
+///
+/// The selector binds caller intent to the supplied listener but is not proof
+/// of filesystem authority. Resource preparation and override policy remain at
+/// the owning process boundary. Snapshot reconstruction also requires the
+/// listener to carry an authority-supplied guest connector and rejects an
+/// incomplete resource before consuming it.
+pub struct VirtioVsockReconstructionResource {
+    selector: VsockBackendSelector,
+    listener: Option<SuppliedVsockListener>,
+}
+
+impl VirtioVsockReconstructionResource {
+    pub fn new(selector: VsockBackendSelector, listener: SuppliedVsockListener) -> Self {
+        Self {
+            selector,
+            listener: Some(listener),
+        }
+    }
+
+    pub const fn selector(&self) -> &VsockBackendSelector {
+        &self.selector
+    }
+
+    pub const fn is_consumed(&self) -> bool {
+        self.listener.is_none()
+    }
+
+    fn take_listener(&mut self) -> Option<SuppliedVsockListener> {
+        self.listener.take()
+    }
+}
+
+impl fmt::Debug for VirtioVsockReconstructionResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockReconstructionResource")
+            .field("state", &"<redacted>")
+            .finish()
     }
 }
 
@@ -2367,6 +2491,17 @@ impl VsockHostConnectionTable {
             .min()
     }
 
+    fn has_pending_connection_work(&self) -> bool {
+        self.connections.values().any(|connection| {
+            connection.has_pending_request_packet()
+                || connection.has_pending_host_rw_packet()
+                || connection.has_pending_credit_request_packet()
+                || connection.has_pending_credit_update_packet()
+                || connection.has_pending_local_shutdown_packet()
+                || connection.has_pending_guest_rw_writes()
+        })
+    }
+
     fn expire_connections(&mut self, now: Instant, guest_cid: u32) -> Vec<VirtioVsockPacketHeader> {
         let keys = self
             .connections
@@ -3947,6 +4082,17 @@ impl VsockGuestConnectionTable {
             .filter_map(VsockGuestConnection::deadline)
             .map(|deadline| deadline.at)
             .min()
+    }
+
+    fn has_pending_connection_work(&self) -> bool {
+        self.connections.values().any(|connection| {
+            connection.has_pending_response_packet()
+                || connection.has_pending_host_rw_packet()
+                || connection.has_pending_credit_request_packet()
+                || connection.has_pending_credit_update_packet()
+                || connection.has_pending_local_shutdown_packet()
+                || connection.has_pending_guest_rw_writes()
+        })
     }
 
     fn expire_connections(&mut self, now: Instant, guest_cid: u32) -> Vec<VirtioVsockPacketHeader> {
@@ -5943,6 +6089,34 @@ impl VirtioVsockRxQueue {
         })
     }
 
+    fn from_capture_state(
+        queue: VirtioMmioQueueState,
+        state: VirtioVsockQueueCaptureState,
+        indirect_descriptors_enabled: bool,
+    ) -> Result<Self, VirtioVsockQueueBuildError> {
+        validate_active_vsock_queue(queue)?;
+        let available = VirtqueueAvailableRing::with_next_avail(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+            state.next_available(),
+        )
+        .map_err(|source| VirtioVsockQueueBuildError::AvailableRing { source })?
+        .with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new()
+                .with_indirect_descriptors(indirect_descriptors_enabled),
+        );
+        let used =
+            VirtqueueUsedRing::with_next_used(queue.device_ring(), queue.size(), state.next_used())
+                .map_err(|source| VirtioVsockQueueBuildError::UsedRing { source })?;
+        Ok(Self {
+            queue_state: queue,
+            available,
+            used,
+            event_idx_enabled: state.event_idx_enabled(),
+        })
+    }
+
     pub const fn queue_state(&self) -> VirtioMmioQueueState {
         self.queue_state
     }
@@ -6345,6 +6519,34 @@ impl VirtioVsockTxQueue {
         })
     }
 
+    fn from_capture_state(
+        queue: VirtioMmioQueueState,
+        state: VirtioVsockQueueCaptureState,
+        indirect_descriptors_enabled: bool,
+    ) -> Result<Self, VirtioVsockQueueBuildError> {
+        validate_active_vsock_queue(queue)?;
+        let available = VirtqueueAvailableRing::with_next_avail(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+            state.next_available(),
+        )
+        .map_err(|source| VirtioVsockQueueBuildError::AvailableRing { source })?
+        .with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new()
+                .with_indirect_descriptors(indirect_descriptors_enabled),
+        );
+        let used =
+            VirtqueueUsedRing::with_next_used(queue.device_ring(), queue.size(), state.next_used())
+                .map_err(|source| VirtioVsockQueueBuildError::UsedRing { source })?;
+        Ok(Self {
+            queue_state: queue,
+            available,
+            used,
+            event_idx_enabled: state.event_idx_enabled(),
+        })
+    }
+
     pub const fn queue_state(&self) -> VirtioMmioQueueState {
         self.queue_state
     }
@@ -6646,6 +6848,34 @@ impl VirtioVsockEventQueue {
         })
     }
 
+    fn from_capture_state(
+        queue: VirtioMmioQueueState,
+        state: VirtioVsockQueueCaptureState,
+        indirect_descriptors_enabled: bool,
+    ) -> Result<Self, VirtioVsockQueueBuildError> {
+        validate_active_vsock_queue(queue)?;
+        let available = VirtqueueAvailableRing::with_next_avail(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+            state.next_available(),
+        )
+        .map_err(|source| VirtioVsockQueueBuildError::AvailableRing { source })?
+        .with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new()
+                .with_indirect_descriptors(indirect_descriptors_enabled),
+        );
+        let used =
+            VirtqueueUsedRing::with_next_used(queue.device_ring(), queue.size(), state.next_used())
+                .map_err(|source| VirtioVsockQueueBuildError::UsedRing { source })?;
+        Ok(Self {
+            queue_state: queue,
+            available,
+            used,
+            event_idx_enabled: state.event_idx_enabled(),
+        })
+    }
+
     pub const fn queue_state(&self) -> VirtioMmioQueueState {
         self.queue_state
     }
@@ -6935,6 +7165,634 @@ impl std::error::Error for VirtioVsockTransportResetError {
     }
 }
 
+/// Detached runtime-owned cursors for one active vsock queue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockQueueCaptureState {
+    next_available: u16,
+    next_used: u16,
+    event_idx_enabled: bool,
+}
+
+impl VirtioVsockQueueCaptureState {
+    pub const fn new(next_available: u16, next_used: u16, event_idx_enabled: bool) -> Self {
+        Self {
+            next_available,
+            next_used,
+            event_idx_enabled,
+        }
+    }
+
+    pub const fn next_available(self) -> u16 {
+        self.next_available
+    }
+
+    pub const fn next_used(self) -> u16 {
+        self.next_used
+    }
+
+    pub const fn event_idx_enabled(self) -> bool {
+        self.event_idx_enabled
+    }
+}
+
+impl fmt::Debug for VirtioVsockQueueCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockQueueCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// All-or-none detached cursor state for the three active vsock queues.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockActiveQueuesCaptureState {
+    rx: VirtioVsockQueueCaptureState,
+    tx: VirtioVsockQueueCaptureState,
+    event: VirtioVsockQueueCaptureState,
+}
+
+impl VirtioVsockActiveQueuesCaptureState {
+    pub const fn new(
+        rx: VirtioVsockQueueCaptureState,
+        tx: VirtioVsockQueueCaptureState,
+        event: VirtioVsockQueueCaptureState,
+    ) -> Self {
+        Self { rx, tx, event }
+    }
+
+    pub const fn rx(self) -> VirtioVsockQueueCaptureState {
+        self.rx
+    }
+
+    pub const fn tx(self) -> VirtioVsockQueueCaptureState {
+        self.tx
+    }
+
+    pub const fn event(self) -> VirtioVsockQueueCaptureState {
+        self.event
+    }
+}
+
+impl fmt::Debug for VirtioVsockActiveQueuesCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockActiveQueuesCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Encoding-independent, resource-free Firecracker-compatible vsock state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioVsockDeviceCaptureState {
+    guest_cid: u64,
+    available_features: u64,
+    negotiated_features: u64,
+    active_queues: Option<VirtioVsockActiveQueuesCaptureState>,
+    backend_selector: VsockBackendSelector,
+    host_local_port_cursor: VsockHostLocalPortCursor,
+}
+
+impl VirtioVsockDeviceCaptureState {
+    pub fn try_from_parts(
+        guest_cid: u64,
+        available_features: u64,
+        negotiated_features: u64,
+        active_queues: Option<VirtioVsockActiveQueuesCaptureState>,
+        backend_selector: VsockBackendSelector,
+        host_local_port_cursor: VsockHostLocalPortCursor,
+    ) -> Result<Self, VirtioVsockDeviceCaptureError> {
+        let state = Self {
+            guest_cid,
+            available_features,
+            negotiated_features,
+            active_queues,
+            backend_selector,
+            host_local_port_cursor,
+        };
+        state.validate_intrinsic()?;
+        Ok(state)
+    }
+
+    pub const fn guest_cid(&self) -> u64 {
+        self.guest_cid
+    }
+
+    pub const fn available_features(&self) -> u64 {
+        self.available_features
+    }
+
+    pub const fn negotiated_features(&self) -> u64 {
+        self.negotiated_features
+    }
+
+    pub const fn is_activated(&self) -> bool {
+        self.active_queues.is_some()
+    }
+
+    pub const fn active_queues(&self) -> Option<VirtioVsockActiveQueuesCaptureState> {
+        self.active_queues
+    }
+
+    pub const fn backend_selector(&self) -> &VsockBackendSelector {
+        &self.backend_selector
+    }
+
+    pub const fn host_local_port_cursor(&self) -> VsockHostLocalPortCursor {
+        self.host_local_port_cursor
+    }
+
+    fn validate_intrinsic(&self) -> Result<(), VirtioVsockDeviceCaptureError> {
+        let guest_cid = u32::try_from(self.guest_cid)
+            .map_err(|_| VirtioVsockDeviceCaptureError::GuestCidInvalid)?;
+        if guest_cid < MIN_GUEST_CID {
+            return Err(VirtioVsockDeviceCaptureError::GuestCidInvalid);
+        }
+        let expected_features = VirtioVsockConfigSpace::new(self.guest_cid).available_features();
+        if self.available_features != expected_features {
+            return Err(VirtioVsockDeviceCaptureError::AvailableFeaturesMismatch);
+        }
+        if self.negotiated_features & !self.available_features != 0 {
+            return Err(VirtioVsockDeviceCaptureError::NegotiatedFeaturesUnsupported);
+        }
+        if self.is_activated()
+            && !virtio_feature_enabled(self.negotiated_features, VIRTIO_FEATURE_VERSION_1)
+        {
+            return Err(VirtioVsockDeviceCaptureError::RequiredFeatureNotAcknowledged);
+        }
+        VsockBackendSelector::try_from_path(self.backend_selector.path())
+            .map_err(VirtioVsockDeviceCaptureError::BackendSelector)?;
+        VsockHostLocalPortCursor::try_from_last_used(self.host_local_port_cursor.last_used())
+            .map_err(|_| VirtioVsockDeviceCaptureError::HostLocalPortCursorInvalid)?;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for VirtioVsockDeviceCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockDeviceCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Bounded evidence for source-only work omitted from reconstructed state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockSourceWorkNormalization {
+    dropped_pending_accepts: usize,
+    dropped_host_connections: usize,
+    dropped_guest_connections: usize,
+    dropped_guest_reset_packets: usize,
+    dropped_pending_connection_work: bool,
+    dropped_deadlines: bool,
+}
+
+impl VirtioVsockSourceWorkNormalization {
+    pub const fn dropped_pending_accepts(self) -> usize {
+        self.dropped_pending_accepts
+    }
+
+    pub const fn dropped_host_connections(self) -> usize {
+        self.dropped_host_connections
+    }
+
+    pub const fn dropped_guest_connections(self) -> usize {
+        self.dropped_guest_connections
+    }
+
+    pub const fn dropped_guest_reset_packets(self) -> usize {
+        self.dropped_guest_reset_packets
+    }
+
+    pub const fn dropped_pending_connection_work(self) -> bool {
+        self.dropped_pending_connection_work
+    }
+
+    pub const fn dropped_deadlines(self) -> bool {
+        self.dropped_deadlines
+    }
+
+    pub const fn dropped_any_source_work(self) -> bool {
+        self.dropped_pending_accepts != 0
+            || self.dropped_host_connections != 0
+            || self.dropped_guest_connections != 0
+            || self.dropped_guest_reset_packets != 0
+            || self.dropped_pending_connection_work
+            || self.dropped_deadlines
+    }
+}
+
+impl fmt::Debug for VirtioVsockSourceWorkNormalization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockSourceWorkNormalization")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Non-durable evidence returned beside one valid vsock capture.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockCaptureValidation {
+    reset_attempt: VirtioVsockTransportResetAttempt,
+    source_work: VirtioVsockSourceWorkNormalization,
+}
+
+impl VirtioVsockCaptureValidation {
+    pub const fn reset_attempt(self) -> VirtioVsockTransportResetAttempt {
+        self.reset_attempt
+    }
+
+    pub const fn source_work(self) -> VirtioVsockSourceWorkNormalization {
+        self.source_work
+    }
+}
+
+impl fmt::Debug for VirtioVsockCaptureValidation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockCaptureValidation")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioVsockMmioCaptureState {
+    device: VirtioVsockDeviceCaptureState,
+    transport: VirtioMmioTransportState,
+}
+
+impl VirtioVsockMmioCaptureState {
+    pub fn try_from_parts(
+        device: VirtioVsockDeviceCaptureState,
+        transport: VirtioMmioTransportState,
+        memory: &GuestMemory,
+    ) -> Result<Self, VirtioVsockDeviceCaptureError> {
+        validate_vsock_capture_state(
+            &device,
+            transport.device_registers(),
+            transport.queues(),
+            transport.is_device_activated(),
+            memory,
+        )?;
+        Ok(Self { device, transport })
+    }
+
+    pub const fn device(&self) -> &VirtioVsockDeviceCaptureState {
+        &self.device
+    }
+
+    pub const fn transport(&self) -> &VirtioMmioTransportState {
+        &self.transport
+    }
+
+    pub fn reconstruct_snapshot_device(
+        &self,
+        memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+    ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
+        let queues = vsock_transport_queue_slice(self.transport.queues())
+            .map_err(VirtioVsockReconstructionError::Capture)?;
+        reconstruct_vsock_snapshot_device(
+            &self.device,
+            self.transport.device_registers(),
+            &queues,
+            self.transport.is_device_activated(),
+            memory,
+            resource,
+        )
+    }
+
+    pub fn reconstruct_snapshot_handler(
+        &self,
+        memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+    ) -> Result<VirtioVsockMmioHandler, VirtioVsockReconstructionError> {
+        let prepared = self.reconstruct_snapshot_device(memory, resource)?;
+        let (_, _, config_space, device) = prepared.into_parts();
+        let activation_is_active = device.is_activated();
+        let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
+            VIRTIO_VSOCK_DEVICE_ID,
+            config_space.available_features(),
+            &VIRTIO_VSOCK_QUEUE_SIZES,
+            config_space,
+            device,
+        )
+        .map_err(VirtioVsockReconstructionError::HandlerBuild)?;
+        handler
+            .restore_transport_state(&self.transport, activation_is_active)
+            .map_err(|_| VirtioVsockReconstructionError::Transport)?;
+        if activation_is_active {
+            handler.mark_queue_interrupt_pending(VIRTIO_VSOCK_EVENT_QUEUE_INDEX as u16);
+        }
+        Ok(handler)
+    }
+}
+
+impl fmt::Debug for VirtioVsockMmioCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockMmioCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VirtioVsockPciCaptureState {
+    device: VirtioVsockDeviceCaptureState,
+    transport: VirtioPciTransportState,
+}
+
+impl VirtioVsockPciCaptureState {
+    pub fn try_from_parts(
+        device: VirtioVsockDeviceCaptureState,
+        transport: VirtioPciTransportState,
+        memory: &GuestMemory,
+    ) -> Result<Self, VirtioVsockDeviceCaptureError> {
+        let queues = vsock_transport_queues(transport.queues())?;
+        validate_vsock_capture_state(
+            &device,
+            transport.device_registers(),
+            &queues,
+            transport.is_device_activated(),
+            memory,
+        )?;
+        Ok(Self { device, transport })
+    }
+
+    pub const fn device(&self) -> &VirtioVsockDeviceCaptureState {
+        &self.device
+    }
+
+    pub const fn transport(&self) -> &VirtioPciTransportState {
+        &self.transport
+    }
+
+    /// Rebuilds validated device/config components for later PCI placement.
+    ///
+    /// BAR leases, interrupt routes, and endpoint installation are deliberately
+    /// not created here because they are destination-owned aggregate resources.
+    pub fn reconstruct_snapshot_device(
+        &self,
+        memory: &GuestMemory,
+        resource: &mut VirtioVsockReconstructionResource,
+    ) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
+        let queues = vsock_transport_queues(self.transport.queues())
+            .map_err(VirtioVsockReconstructionError::Capture)?;
+        reconstruct_vsock_snapshot_device(
+            &self.device,
+            self.transport.device_registers(),
+            &queues,
+            self.transport.is_device_activated(),
+            memory,
+            resource,
+        )
+    }
+}
+
+impl fmt::Debug for VirtioVsockPciCaptureState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockPciCaptureState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioVsockQueueCaptureError {
+    TransportMismatch,
+    FeatureMismatch,
+    AvailableRingInvalid,
+    UsedRingInvalid,
+    QueueRangeInvalid,
+    QueueRangesOverlap,
+    UsedCursorMismatch,
+    AvailableCursorOutOfBounds,
+    UnpublishedDescriptorCountMismatch,
+}
+
+impl fmt::Display for VirtioVsockQueueCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TransportMismatch => "active vsock queue does not match its transport",
+            Self::FeatureMismatch => "active vsock queue feature state does not match transport",
+            Self::AvailableRingInvalid => "vsock available ring is invalid",
+            Self::UsedRingInvalid => "vsock used ring is invalid",
+            Self::QueueRangeInvalid => "vsock queue range is invalid",
+            Self::QueueRangesOverlap => "vsock queue ranges overlap",
+            Self::UsedCursorMismatch => "vsock used cursor does not match guest memory",
+            Self::AvailableCursorOutOfBounds => {
+                "vsock available cursor is inconsistent with guest memory"
+            }
+            Self::UnpublishedDescriptorCountMismatch => {
+                "vsock queue has consumed-but-unpublished descriptors"
+            }
+        })
+    }
+}
+
+impl std::error::Error for VirtioVsockQueueCaptureError {}
+
+#[derive(Debug)]
+pub enum VirtioVsockDeviceCaptureError {
+    DeviceIdMismatch,
+    GuestCidInvalid,
+    ConfigCidMismatch,
+    DeviceCidMismatch,
+    BackendSelector(VsockBackendSelectorError),
+    BackendSelectorMismatch,
+    AvailableFeaturesMismatch,
+    NegotiatedFeaturesUnsupported,
+    RequiredFeatureNotAcknowledged,
+    ActivationMismatch,
+    QueueCountMismatch,
+    QueueMaxSizeMismatch,
+    QueueSizeInvalid,
+    RxQueue(VirtioVsockQueueCaptureError),
+    TxQueue(VirtioVsockQueueCaptureError),
+    EventQueue(VirtioVsockQueueCaptureError),
+    QueueRangesOverlap,
+    HostLocalPortCursorInvalid,
+    InactiveResetAttemptMismatch,
+    ActiveResetAttemptMissing,
+    PublishedResetWithoutGate,
+    EmptyResetAttemptWithPendingDescriptor,
+}
+
+impl fmt::Display for VirtioVsockDeviceCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceIdMismatch => {
+                formatter.write_str("vsock transport has the wrong device id")
+            }
+            Self::GuestCidInvalid => formatter.write_str("vsock capture guest CID is invalid"),
+            Self::ConfigCidMismatch => {
+                formatter.write_str("vsock configuration and config-space CID disagree")
+            }
+            Self::DeviceCidMismatch => {
+                formatter.write_str("vsock device and config-space CID disagree")
+            }
+            Self::BackendSelector(source) => {
+                write!(
+                    formatter,
+                    "vsock logical backend selector is invalid: {source}"
+                )
+            }
+            Self::BackendSelectorMismatch => {
+                formatter.write_str("vsock device and configuration backend selectors disagree")
+            }
+            Self::AvailableFeaturesMismatch => {
+                formatter.write_str("vsock transport available features do not match the device")
+            }
+            Self::NegotiatedFeaturesUnsupported => {
+                formatter.write_str("vsock negotiated unsupported features")
+            }
+            Self::RequiredFeatureNotAcknowledged => {
+                formatter.write_str("active vsock transport did not acknowledge VERSION_1")
+            }
+            Self::ActivationMismatch => {
+                formatter.write_str("vsock device and transport activation state disagree")
+            }
+            Self::QueueCountMismatch => {
+                formatter.write_str("vsock transport must contain exactly three queues")
+            }
+            Self::QueueMaxSizeMismatch => {
+                formatter.write_str("vsock queue maximum size is invalid")
+            }
+            Self::QueueSizeInvalid => {
+                formatter.write_str("vsock queue configured size or readiness is invalid")
+            }
+            Self::RxQueue(source) => {
+                write!(formatter, "vsock RX queue is not capture-ready: {source}")
+            }
+            Self::TxQueue(source) => {
+                write!(formatter, "vsock TX queue is not capture-ready: {source}")
+            }
+            Self::EventQueue(source) => {
+                write!(
+                    formatter,
+                    "vsock event queue is not capture-ready: {source}"
+                )
+            }
+            Self::QueueRangesOverlap => {
+                formatter.write_str("vsock queue ranges overlap across queues")
+            }
+            Self::HostLocalPortCursorInvalid => {
+                formatter.write_str("vsock host-local port cursor is invalid")
+            }
+            Self::InactiveResetAttemptMismatch => {
+                formatter.write_str("inactive vsock capture has a non-inactive reset attempt")
+            }
+            Self::ActiveResetAttemptMissing => {
+                formatter.write_str("active vsock capture has no reset attempt")
+            }
+            Self::PublishedResetWithoutGate => formatter
+                .write_str("published vsock reset capture does not have the source RX gate armed"),
+            Self::EmptyResetAttemptWithPendingDescriptor => formatter
+                .write_str("empty vsock reset capture still has an available event descriptor"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockDeviceCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendSelector(source) => Some(source),
+            Self::RxQueue(source) | Self::TxQueue(source) | Self::EventQueue(source) => {
+                Some(source)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioVsockPciCaptureError {
+    Device(VirtioVsockDeviceCaptureError),
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Display for VirtioVsockPciCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Device(_) => "PCI vsock device capture failed",
+            Self::Endpoint(_) => "PCI vsock transport capture failed",
+        })
+    }
+}
+
+impl std::error::Error for VirtioVsockPciCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Device(source) => Some(source),
+            Self::Endpoint(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioVsockReconstructionError {
+    Capture(VirtioVsockDeviceCaptureError),
+    ResourceSelectorMismatch,
+    ResourceConsumed,
+    GuestConnectorMissing,
+    HostSocket(VsockHostSocketOwnerError),
+    QueueBuild {
+        queue_index: usize,
+        source: VirtioVsockQueueBuildError,
+    },
+    HandlerBuild(VirtioMmioRegisterHandlerError),
+    Transport,
+}
+
+impl fmt::Display for VirtioVsockReconstructionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Capture(_) => formatter.write_str("vsock captured state is invalid"),
+            Self::ResourceSelectorMismatch => {
+                formatter.write_str("vsock reconstruction resource selector does not match state")
+            }
+            Self::ResourceConsumed => {
+                formatter.write_str("vsock reconstruction resource was already consumed")
+            }
+            Self::GuestConnectorMissing => formatter
+                .write_str("vsock reconstruction resource has no guest connection authority"),
+            Self::HostSocket(_) => {
+                formatter.write_str("failed to adopt supplied vsock reconstruction resource")
+            }
+            Self::QueueBuild { queue_index, .. } => {
+                write!(formatter, "failed to rebuild vsock queue {queue_index}")
+            }
+            Self::HandlerBuild(_) => {
+                formatter.write_str("failed to build reconstructed vsock MMIO handler")
+            }
+            Self::Transport => {
+                formatter.write_str("failed to restore reconstructed vsock MMIO transport")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockReconstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture(source) => Some(source),
+            Self::HostSocket(source) => Some(source),
+            Self::QueueBuild { source, .. } => Some(source),
+            Self::HandlerBuild(source) => Some(source),
+            Self::ResourceSelectorMismatch
+            | Self::ResourceConsumed
+            | Self::GuestConnectorMissing
+            | Self::Transport => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum VirtioVsockQueueBuildError {
     QueueNotReady,
@@ -6989,6 +7847,340 @@ fn validate_active_vsock_queue(
     }
 
     Ok(())
+}
+
+fn vsock_transport_queues(
+    queues: &VirtioMmioQueueRegisters,
+) -> Result<[VirtioMmioQueueState; VIRTIO_VSOCK_QUEUE_COUNT], VirtioVsockDeviceCaptureError> {
+    if queues.queue_count() != VIRTIO_VSOCK_QUEUE_COUNT {
+        return Err(VirtioVsockDeviceCaptureError::QueueCountMismatch);
+    }
+    Ok([
+        *queues
+            .queue(VIRTIO_VSOCK_RX_QUEUE_INDEX_U32)
+            .map_err(|_| VirtioVsockDeviceCaptureError::QueueCountMismatch)?,
+        *queues
+            .queue(VIRTIO_VSOCK_TX_QUEUE_INDEX_U32)
+            .map_err(|_| VirtioVsockDeviceCaptureError::QueueCountMismatch)?,
+        *queues
+            .queue(VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32)
+            .map_err(|_| VirtioVsockDeviceCaptureError::QueueCountMismatch)?,
+    ])
+}
+
+fn vsock_transport_queue_slice(
+    queues: &[VirtioMmioQueueState],
+) -> Result<[VirtioMmioQueueState; VIRTIO_VSOCK_QUEUE_COUNT], VirtioVsockDeviceCaptureError> {
+    queues
+        .try_into()
+        .map_err(|_| VirtioVsockDeviceCaptureError::QueueCountMismatch)
+}
+
+fn validate_vsock_queue_profile(
+    queue: VirtioMmioQueueState,
+    transport_activated: bool,
+) -> Result<(), VirtioVsockDeviceCaptureError> {
+    if queue.max_size() != VIRTIO_VSOCK_QUEUE_SIZE {
+        return Err(VirtioVsockDeviceCaptureError::QueueMaxSizeMismatch);
+    }
+    if queue.size() != 0 && (queue.size() > queue.max_size() || !queue.size().is_power_of_two()) {
+        return Err(VirtioVsockDeviceCaptureError::QueueSizeInvalid);
+    }
+    if (queue.ready() && queue.size() == 0)
+        || (transport_activated && (!queue.ready() || queue.size() == 0))
+    {
+        return Err(VirtioVsockDeviceCaptureError::QueueSizeInvalid);
+    }
+    Ok(())
+}
+
+fn vsock_queue_ranges(
+    available: &VirtqueueAvailableRing,
+    used: &VirtqueueUsedRing,
+) -> Result<[GuestMemoryRange; 3], VirtioVsockQueueCaptureError> {
+    Ok([
+        available
+            .descriptor_table_range()
+            .map_err(|_| VirtioVsockQueueCaptureError::QueueRangeInvalid)?,
+        available
+            .available_ring_range()
+            .map_err(|_| VirtioVsockQueueCaptureError::QueueRangeInvalid)?,
+        used.used_ring_range()
+            .map_err(|_| VirtioVsockQueueCaptureError::QueueRangeInvalid)?,
+    ])
+}
+
+fn validate_vsock_queue_rings(
+    available: &VirtqueueAvailableRing,
+    used: &VirtqueueUsedRing,
+    memory: &GuestMemory,
+) -> Result<([GuestMemoryRange; 3], u16), VirtioVsockQueueCaptureError> {
+    available
+        .validate_mapped(memory)
+        .map_err(|_| VirtioVsockQueueCaptureError::AvailableRingInvalid)?;
+    used.validate_mapped(memory)
+        .map_err(|_| VirtioVsockQueueCaptureError::UsedRingInvalid)?;
+    let ranges = vsock_queue_ranges(available, used)?;
+    if ranges[0].overlaps(ranges[1])
+        || ranges[0].overlaps(ranges[2])
+        || ranges[1].overlaps(ranges[2])
+    {
+        return Err(VirtioVsockQueueCaptureError::QueueRangesOverlap);
+    }
+
+    let used_index = used
+        .used_index(memory)
+        .map_err(|_| VirtioVsockQueueCaptureError::UsedRingInvalid)?;
+    if used_index != used.next_used() {
+        return Err(VirtioVsockQueueCaptureError::UsedCursorMismatch);
+    }
+    let available_index = available
+        .available_index(memory)
+        .map_err(|_| VirtioVsockQueueCaptureError::AvailableRingInvalid)?;
+    let available_count = available_index.wrapping_sub(available.next_avail());
+    if available_count > available.queue_size() {
+        return Err(VirtioVsockQueueCaptureError::AvailableCursorOutOfBounds);
+    }
+    if available.next_avail().wrapping_sub(used.next_used()) != 0 {
+        return Err(VirtioVsockQueueCaptureError::UnpublishedDescriptorCountMismatch);
+    }
+    Ok((ranges, available_count))
+}
+
+fn validate_vsock_queue_capture_state(
+    transport: VirtioMmioQueueState,
+    state: VirtioVsockQueueCaptureState,
+    negotiated_features: u64,
+    memory: &GuestMemory,
+) -> Result<([GuestMemoryRange; 3], u16), VirtioVsockQueueCaptureError> {
+    if !transport.ready() || transport.size() == 0 {
+        return Err(VirtioVsockQueueCaptureError::TransportMismatch);
+    }
+    let expected_event_idx =
+        virtio_feature_enabled(negotiated_features, VIRTIO_RING_FEATURE_EVENT_IDX);
+    if state.event_idx_enabled() != expected_event_idx {
+        return Err(VirtioVsockQueueCaptureError::FeatureMismatch);
+    }
+    let indirect_descriptors_enabled =
+        virtio_feature_enabled(negotiated_features, VIRTIO_RING_FEATURE_INDIRECT_DESC);
+    let available = VirtqueueAvailableRing::with_next_avail(
+        transport.descriptor_table(),
+        transport.driver_ring(),
+        transport.size(),
+        state.next_available(),
+    )
+    .map_err(|_| VirtioVsockQueueCaptureError::AvailableRingInvalid)?
+    .with_descriptor_chain_options(
+        VirtqueueDescriptorChainOptions::new()
+            .with_indirect_descriptors(indirect_descriptors_enabled),
+    );
+    let used = VirtqueueUsedRing::with_next_used(
+        transport.device_ring(),
+        transport.size(),
+        state.next_used(),
+    )
+    .map_err(|_| VirtioVsockQueueCaptureError::UsedRingInvalid)?;
+    validate_vsock_queue_rings(&available, &used, memory)
+}
+
+fn capture_vsock_queue_state(
+    transport: VirtioMmioQueueState,
+    queue_state: VirtioMmioQueueState,
+    available: &VirtqueueAvailableRing,
+    used: &VirtqueueUsedRing,
+    event_idx_enabled: bool,
+    negotiated_features: u64,
+    memory: &GuestMemory,
+) -> Result<(VirtioVsockQueueCaptureState, [GuestMemoryRange; 3], u16), VirtioVsockQueueCaptureError>
+{
+    if transport != queue_state
+        || !transport.ready()
+        || transport.size() != available.queue_size()
+        || transport.descriptor_table() != available.descriptor_table()
+        || transport.driver_ring() != available.available_ring()
+        || transport.device_ring() != used.used_ring()
+        || available.queue_size() != used.queue_size()
+    {
+        return Err(VirtioVsockQueueCaptureError::TransportMismatch);
+    }
+    let expected_event_idx =
+        virtio_feature_enabled(negotiated_features, VIRTIO_RING_FEATURE_EVENT_IDX);
+    let expected_indirect =
+        virtio_feature_enabled(negotiated_features, VIRTIO_RING_FEATURE_INDIRECT_DESC);
+    if event_idx_enabled != expected_event_idx
+        || available.descriptor_chain_options().indirect_descriptors() != expected_indirect
+    {
+        return Err(VirtioVsockQueueCaptureError::FeatureMismatch);
+    }
+    let (ranges, available_count) = validate_vsock_queue_rings(available, used, memory)?;
+    Ok((
+        VirtioVsockQueueCaptureState::new(
+            available.next_avail(),
+            used.next_used(),
+            event_idx_enabled,
+        ),
+        ranges,
+        available_count,
+    ))
+}
+
+fn validate_vsock_queue_range_sets(
+    ranges: [[GuestMemoryRange; 3]; VIRTIO_VSOCK_QUEUE_COUNT],
+) -> Result<(), VirtioVsockDeviceCaptureError> {
+    for (first_index, first_ranges) in ranges.iter().enumerate() {
+        for second_ranges in ranges.iter().skip(first_index + 1) {
+            if first_ranges
+                .iter()
+                .any(|first| second_ranges.iter().any(|second| first.overlaps(*second)))
+            {
+                return Err(VirtioVsockDeviceCaptureError::QueueRangesOverlap);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_vsock_capture_state(
+    state: &VirtioVsockDeviceCaptureState,
+    device_registers: &crate::virtio_mmio::VirtioMmioDeviceRegisters,
+    queues: &[VirtioMmioQueueState],
+    transport_activated: bool,
+    memory: &GuestMemory,
+) -> Result<(), VirtioVsockDeviceCaptureError> {
+    state.validate_intrinsic()?;
+    if device_registers.device_id() != VIRTIO_VSOCK_DEVICE_ID {
+        return Err(VirtioVsockDeviceCaptureError::DeviceIdMismatch);
+    }
+    if device_registers.device_features() != state.available_features() {
+        return Err(VirtioVsockDeviceCaptureError::AvailableFeaturesMismatch);
+    }
+    if device_registers.driver_features() != state.negotiated_features() {
+        return Err(VirtioVsockDeviceCaptureError::NegotiatedFeaturesUnsupported);
+    }
+    if state.is_activated() != transport_activated {
+        return Err(VirtioVsockDeviceCaptureError::ActivationMismatch);
+    }
+    let queues = vsock_transport_queue_slice(queues)?;
+    for queue in queues {
+        validate_vsock_queue_profile(queue, transport_activated)?;
+    }
+    let Some(active_queues) = state.active_queues() else {
+        return Ok(());
+    };
+    let (rx_ranges, _) = validate_vsock_queue_capture_state(
+        queues[VIRTIO_VSOCK_RX_QUEUE_INDEX],
+        active_queues.rx(),
+        state.negotiated_features(),
+        memory,
+    )
+    .map_err(VirtioVsockDeviceCaptureError::RxQueue)?;
+    let (tx_ranges, _) = validate_vsock_queue_capture_state(
+        queues[VIRTIO_VSOCK_TX_QUEUE_INDEX],
+        active_queues.tx(),
+        state.negotiated_features(),
+        memory,
+    )
+    .map_err(VirtioVsockDeviceCaptureError::TxQueue)?;
+    let (event_ranges, _) = validate_vsock_queue_capture_state(
+        queues[VIRTIO_VSOCK_EVENT_QUEUE_INDEX],
+        active_queues.event(),
+        state.negotiated_features(),
+        memory,
+    )
+    .map_err(VirtioVsockDeviceCaptureError::EventQueue)?;
+    validate_vsock_queue_range_sets([rx_ranges, tx_ranges, event_ranges])
+}
+
+fn reconstruct_vsock_snapshot_device(
+    state: &VirtioVsockDeviceCaptureState,
+    device_registers: &crate::virtio_mmio::VirtioMmioDeviceRegisters,
+    queues: &[VirtioMmioQueueState],
+    transport_activated: bool,
+    memory: &GuestMemory,
+    resource: &mut VirtioVsockReconstructionResource,
+) -> Result<PreparedVsockDevice, VirtioVsockReconstructionError> {
+    validate_vsock_capture_state(state, device_registers, queues, transport_activated, memory)
+        .map_err(VirtioVsockReconstructionError::Capture)?;
+    if resource.selector() != state.backend_selector() {
+        return Err(VirtioVsockReconstructionError::ResourceSelectorMismatch);
+    }
+    let queues =
+        vsock_transport_queue_slice(queues).map_err(VirtioVsockReconstructionError::Capture)?;
+    let indirect_descriptors_enabled = virtio_feature_enabled(
+        state.negotiated_features(),
+        VIRTIO_RING_FEATURE_INDIRECT_DESC,
+    );
+    let active_queues = state
+        .active_queues()
+        .map(|active| {
+            let rx = VirtioVsockRxQueue::from_capture_state(
+                queues[VIRTIO_VSOCK_RX_QUEUE_INDEX],
+                active.rx(),
+                indirect_descriptors_enabled,
+            )
+            .map_err(|source| VirtioVsockReconstructionError::QueueBuild {
+                queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX,
+                source,
+            })?;
+            let tx = VirtioVsockTxQueue::from_capture_state(
+                queues[VIRTIO_VSOCK_TX_QUEUE_INDEX],
+                active.tx(),
+                indirect_descriptors_enabled,
+            )
+            .map_err(|source| VirtioVsockReconstructionError::QueueBuild {
+                queue_index: VIRTIO_VSOCK_TX_QUEUE_INDEX,
+                source,
+            })?;
+            let event = VirtioVsockEventQueue::from_capture_state(
+                queues[VIRTIO_VSOCK_EVENT_QUEUE_INDEX],
+                active.event(),
+                indirect_descriptors_enabled,
+            )
+            .map_err(|source| VirtioVsockReconstructionError::QueueBuild {
+                queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
+                source,
+            })?;
+            Ok::<_, VirtioVsockReconstructionError>((rx, tx, event))
+        })
+        .transpose()?;
+
+    let guest_cid = u32::try_from(state.guest_cid()).map_err(|_| {
+        VirtioVsockReconstructionError::Capture(VirtioVsockDeviceCaptureError::GuestCidInvalid)
+    })?;
+    let uds_path = state.backend_selector().path().to_path_buf();
+    let prepared_listener = resource
+        .listener
+        .as_ref()
+        .ok_or(VirtioVsockReconstructionError::ResourceConsumed)?;
+    if !prepared_listener.has_guest_connector() {
+        return Err(VirtioVsockReconstructionError::GuestConnectorMissing);
+    }
+    prepared_listener
+        .prepare_for_adoption()
+        .map_err(VirtioVsockReconstructionError::HostSocket)?;
+    let listener = resource
+        .take_listener()
+        .ok_or(VirtioVsockReconstructionError::ResourceConsumed)?;
+    let (owner, guest_connector) =
+        VsockHostSocketOwner::from_prepared_supplied(&uds_path, listener);
+    let mut device = VirtioVsockDevice::with_host_socket_owner(guest_cid, owner);
+    device.guest_connector = guest_connector;
+    device.host_connections =
+        VsockHostConnectionTable::from_local_port_cursor(state.host_local_port_cursor());
+    if let Some((rx, tx, event)) = active_queues {
+        device.active_rx_queue = Some(rx);
+        device.active_tx_queue = Some(tx);
+        device.active_event_queue = Some(event);
+        let signal = device.signal_restored_transport_reset();
+        debug_assert_eq!(signal, VirtioVsockRestoredTransportResetSignal::Signaled);
+    }
+    let config_space = VirtioVsockConfigSpace::new(state.guest_cid());
+    Ok(PreparedVsockDevice {
+        guest_cid,
+        uds_path,
+        config_space,
+        device,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7161,6 +8353,10 @@ impl VirtioVsockDevice {
         self.host_socket_path = Some(path.as_ref().to_path_buf());
     }
 
+    pub const fn guest_cid(&self) -> u32 {
+        self.guest_cid
+    }
+
     pub fn is_activated(&self) -> bool {
         self.active_rx_queue.is_some()
             && self.active_tx_queue.is_some()
@@ -7330,6 +8526,170 @@ impl VirtioVsockDevice {
     /// Returns the detached last-used host-local port cursor.
     pub const fn host_local_port_cursor(&self) -> VsockHostLocalPortCursor {
         self.host_connections.local_port_cursor()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_state(
+        &self,
+        config: &VsockConfig,
+        config_space: &VirtioVsockConfigSpace,
+        device_registers: &crate::virtio_mmio::VirtioMmioDeviceRegisters,
+        queues: &[VirtioMmioQueueState],
+        transport_activated: bool,
+        memory: &GuestMemory,
+        reset_attempt: VirtioVsockTransportResetAttempt,
+    ) -> Result<
+        (VirtioVsockDeviceCaptureState, VirtioVsockCaptureValidation),
+        VirtioVsockDeviceCaptureError,
+    > {
+        let guest_cid = config_space.guest_cid();
+        if guest_cid != u64::from(config.guest_cid()) {
+            return Err(VirtioVsockDeviceCaptureError::ConfigCidMismatch);
+        }
+        if guest_cid != u64::from(self.guest_cid) {
+            return Err(VirtioVsockDeviceCaptureError::DeviceCidMismatch);
+        }
+        let backend_selector = VsockBackendSelector::try_from_path(config.uds_path())
+            .map_err(VirtioVsockDeviceCaptureError::BackendSelector)?;
+        if self.host_socket_path.as_deref() != Some(config.uds_path()) {
+            return Err(VirtioVsockDeviceCaptureError::BackendSelectorMismatch);
+        }
+
+        let available_features = config_space.available_features();
+        if device_registers.device_id() != VIRTIO_VSOCK_DEVICE_ID {
+            return Err(VirtioVsockDeviceCaptureError::DeviceIdMismatch);
+        }
+        if device_registers.device_features() != available_features {
+            return Err(VirtioVsockDeviceCaptureError::AvailableFeaturesMismatch);
+        }
+        let negotiated_features = device_registers.driver_features();
+        if negotiated_features & !available_features != 0 {
+            return Err(VirtioVsockDeviceCaptureError::NegotiatedFeaturesUnsupported);
+        }
+
+        let queues = vsock_transport_queue_slice(queues)?;
+        for queue in queues {
+            validate_vsock_queue_profile(queue, transport_activated)?;
+        }
+        let queues_active = match (
+            self.active_rx_queue.as_ref(),
+            self.active_tx_queue.as_ref(),
+            self.active_event_queue.as_ref(),
+        ) {
+            (Some(_), Some(_), Some(_)) => true,
+            (None, None, None) => false,
+            _ => return Err(VirtioVsockDeviceCaptureError::ActivationMismatch),
+        };
+        if queues_active != transport_activated {
+            return Err(VirtioVsockDeviceCaptureError::ActivationMismatch);
+        }
+        if queues_active && !virtio_feature_enabled(negotiated_features, VIRTIO_FEATURE_VERSION_1) {
+            return Err(VirtioVsockDeviceCaptureError::RequiredFeatureNotAcknowledged);
+        }
+
+        let mut event_available_count = None;
+        let active_queues = match (
+            self.active_rx_queue.as_ref(),
+            self.active_tx_queue.as_ref(),
+            self.active_event_queue.as_ref(),
+        ) {
+            (Some(rx), Some(tx), Some(event)) => {
+                let (rx_state, rx_ranges, _) = capture_vsock_queue_state(
+                    queues[VIRTIO_VSOCK_RX_QUEUE_INDEX],
+                    rx.queue_state(),
+                    rx.available_ring(),
+                    rx.used_ring(),
+                    rx.event_idx_enabled(),
+                    negotiated_features,
+                    memory,
+                )
+                .map_err(VirtioVsockDeviceCaptureError::RxQueue)?;
+                let (tx_state, tx_ranges, _) = capture_vsock_queue_state(
+                    queues[VIRTIO_VSOCK_TX_QUEUE_INDEX],
+                    tx.queue_state(),
+                    tx.available_ring(),
+                    tx.used_ring(),
+                    tx.event_idx_enabled(),
+                    negotiated_features,
+                    memory,
+                )
+                .map_err(VirtioVsockDeviceCaptureError::TxQueue)?;
+                let (event_state, event_ranges, available_count) = capture_vsock_queue_state(
+                    queues[VIRTIO_VSOCK_EVENT_QUEUE_INDEX],
+                    event.queue_state(),
+                    event.available_ring(),
+                    event.used_ring(),
+                    event.event_idx_enabled(),
+                    negotiated_features,
+                    memory,
+                )
+                .map_err(VirtioVsockDeviceCaptureError::EventQueue)?;
+                validate_vsock_queue_range_sets([rx_ranges, tx_ranges, event_ranges])?;
+                event_available_count = Some(available_count);
+                Some(VirtioVsockActiveQueuesCaptureState::new(
+                    rx_state,
+                    tx_state,
+                    event_state,
+                ))
+            }
+            (None, None, None) => None,
+            _ => return Err(VirtioVsockDeviceCaptureError::ActivationMismatch),
+        };
+
+        match (queues_active, reset_attempt) {
+            (false, VirtioVsockTransportResetAttempt::Inactive) if !self.pending_event_ack => {}
+            (false, _) => {
+                return Err(VirtioVsockDeviceCaptureError::InactiveResetAttemptMismatch);
+            }
+            (true, VirtioVsockTransportResetAttempt::Inactive) => {
+                return Err(VirtioVsockDeviceCaptureError::ActiveResetAttemptMissing);
+            }
+            (true, VirtioVsockTransportResetAttempt::Published(_)) if !self.pending_event_ack => {
+                return Err(VirtioVsockDeviceCaptureError::PublishedResetWithoutGate);
+            }
+            (true, VirtioVsockTransportResetAttempt::QueueEmpty)
+                if event_available_count != Some(0) =>
+            {
+                return Err(VirtioVsockDeviceCaptureError::EmptyResetAttemptWithPendingDescriptor);
+            }
+            (true, _) => {}
+        }
+
+        let state = VirtioVsockDeviceCaptureState::try_from_parts(
+            guest_cid,
+            available_features,
+            negotiated_features,
+            active_queues,
+            backend_selector,
+            self.host_local_port_cursor(),
+        )?;
+        validate_vsock_capture_state(
+            &state,
+            device_registers,
+            &queues,
+            transport_activated,
+            memory,
+        )?;
+
+        let dropped_host_connections = self.host_connections.len();
+        let dropped_guest_connections = self.guest_connections.len();
+        let dropped_guest_reset_packets = self.pending_guest_reset_packets.len();
+        let source_work = VirtioVsockSourceWorkNormalization {
+            dropped_pending_accepts: self.pending_host_connections.len(),
+            dropped_host_connections,
+            dropped_guest_connections,
+            dropped_guest_reset_packets,
+            dropped_pending_connection_work: self.host_connections.has_pending_connection_work()
+                || self.guest_connections.has_pending_connection_work(),
+            dropped_deadlines: self.earliest_deadline().is_some(),
+        };
+        Ok((
+            state,
+            VirtioVsockCaptureValidation {
+                reset_attempt,
+                source_work,
+            },
+        ))
     }
 
     #[cfg(test)]
@@ -9245,6 +10605,33 @@ impl std::error::Error for VirtioVsockDeviceNotificationError {
     }
 }
 
+impl VirtioVsockMmioHandler {
+    /// Captures device and canonical MMIO transport state from one immutable
+    /// handler observation after the caller's reset attempt.
+    pub fn capture_vsock_state(
+        &self,
+        config: &VsockConfig,
+        memory: &GuestMemory,
+        reset_attempt: VirtioVsockTransportResetAttempt,
+    ) -> Result<
+        (VirtioVsockMmioCaptureState, VirtioVsockCaptureValidation),
+        VirtioVsockDeviceCaptureError,
+    > {
+        let transport = self.transport_state();
+        let (device, validation) = self.activation_handler().capture_state(
+            config,
+            self.device_config_handler(),
+            transport.device_registers(),
+            transport.queues(),
+            transport.is_device_activated(),
+            memory,
+            reset_attempt,
+        )?;
+        let capture = VirtioVsockMmioCaptureState::try_from_parts(device, transport, memory)?;
+        Ok((capture, validation))
+    }
+}
+
 impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioVsockDevice> {
     /// Publishes one source-side transport reset before snapshot capture.
     pub fn prepare_vsock_transport_reset(
@@ -9353,6 +10740,36 @@ impl VirtioMmioDeviceActivationHandler for VirtioVsockDevice {
 }
 
 impl VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice> {
+    /// Captures device and canonical PCI transport state under one endpoint lock.
+    pub fn capture_vsock_state(
+        &self,
+        config: &VsockConfig,
+        memory: &GuestMemory,
+        reset_attempt: VirtioVsockTransportResetAttempt,
+    ) -> Result<
+        (VirtioVsockPciCaptureState, VirtioVsockCaptureValidation),
+        VirtioVsockPciCaptureError,
+    > {
+        let (device, transport) = self
+            .capture_transport_with(|registers, queues, config_space, device, activated| {
+                let queues = vsock_transport_queues(queues)?;
+                device.capture_state(
+                    config,
+                    config_space,
+                    registers,
+                    &queues,
+                    activated,
+                    memory,
+                    reset_attempt,
+                )
+            })
+            .map_err(VirtioVsockPciCaptureError::Endpoint)?;
+        let (device, validation) = device.map_err(VirtioVsockPciCaptureError::Device)?;
+        let capture = VirtioVsockPciCaptureState::try_from_parts(device, transport, memory)
+            .map_err(VirtioVsockPciCaptureError::Device)?;
+        Ok((capture, validation))
+    }
+
     /// Publishes one source-side transport reset before snapshot capture.
     pub fn prepare_vsock_transport_reset(
         &self,
@@ -9884,6 +11301,7 @@ mod tests {
     use std::io;
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
     use std::path::PathBuf;
@@ -9904,8 +11322,9 @@ mod tests {
         VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
         VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
         VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
-        VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
-        VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+        VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioQueueState,
+        VirtioMmioRegister, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+        VirtioMmioTransportState,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_INDIRECT, VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE,
@@ -9928,25 +11347,28 @@ mod tests {
         VSOCK_CONNECTION_LIMIT, VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VSOCK_HOST_LOCAL_PORT_BASE,
         VSOCK_HOST_LOCAL_PORT_CAPACITY, VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
         VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED, VSOCK_PENDING_HOST_CONNECTION_LIMIT,
-        VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
+        VirtioVsockActiveQueuesCaptureState, VirtioVsockConfigSpace, VirtioVsockDevice,
+        VirtioVsockDeviceActivationError, VirtioVsockDeviceCaptureError,
         VirtioVsockGuestCreditDispatch, VirtioVsockGuestRequestDispatch,
         VirtioVsockGuestResetDispatch, VirtioVsockGuestResponseDispatch,
         VirtioVsockGuestRstDispatch, VirtioVsockGuestRwDispatch, VirtioVsockGuestShutdownDispatch,
-        VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
-        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VirtioVsockRxBufferParseError,
-        VirtioVsockRxPacketKind, VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError,
-        VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError, VirtioVsockTxPacket,
-        VirtioVsockTxPacketParseError, VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError,
-        VsockConfigError, VsockConfigInput, VsockGuestConnectionKey, VsockGuestConnectionTable,
-        VsockGuestConnectionTableError, VsockGuestConnector, VsockHostConnectHandshakeError,
-        VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostConnectionKey,
-        VsockHostConnectionTable, VsockHostConnectionTableError, VsockHostLocalPort,
-        VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortCursor,
-        VsockHostLocalPortCursorError, VsockHostLocalPortError, VsockHostSocketAcceptError,
-        VsockHostSocketOwner, VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout,
-        VsockMmioRegistrationError, is_transient_host_socket_accept_error,
-        is_transient_host_socket_read_error, parse_vsock_host_connect_request,
-        virtio_vsock_mmio_handler,
+        VirtioVsockHostRequestDispatch, VirtioVsockMmioCaptureState, VirtioVsockMmioHandler,
+        VirtioVsockPacketHeader, VirtioVsockPacketLengthError, VirtioVsockQueueBuildError,
+        VirtioVsockQueueCaptureError, VirtioVsockQueueCaptureState, VirtioVsockReconstructionError,
+        VirtioVsockReconstructionResource, VirtioVsockRxBufferParseError, VirtioVsockRxPacketKind,
+        VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError, VirtioVsockTransportResetAttempt,
+        VirtioVsockTransportResetError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
+        VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockBackendSelector,
+        VsockBackendSelectorError, VsockConfigError, VsockConfigInput, VsockGuestConnectionKey,
+        VsockGuestConnectionTable, VsockGuestConnectionTableError, VsockGuestConnector,
+        VsockHostConnectHandshakeError, VsockHostConnectRequest, VsockHostConnectRequestError,
+        VsockHostConnectionKey, VsockHostConnectionTable, VsockHostConnectionTableError,
+        VsockHostLocalPort, VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError,
+        VsockHostLocalPortCursor, VsockHostLocalPortCursorError, VsockHostLocalPortError,
+        VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
+        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        is_transient_host_socket_accept_error, is_transient_host_socket_read_error,
+        parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
     };
 
     static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -10110,6 +11532,36 @@ mod tests {
             "bb-vsock-{short_name}-{now:x}-{}-{id:x}.sock",
             std::process::id()
         ))
+    }
+
+    fn reconstruction_resource(
+        selector: VsockBackendSelector,
+        name: &str,
+    ) -> VirtioVsockReconstructionResource {
+        let listener_path = unique_socket_path(name);
+        let listener = UnixListener::bind(&listener_path)
+            .expect("reconstruction listener should bind before handoff");
+        fs::remove_file(&listener_path)
+            .expect("reconstruction listener path should unlink after bind");
+        let listener = SuppliedVsockListener::new(listener).with_guest_connector(
+            RecordingGuestConnector::new(Arc::new(Mutex::new(Vec::new()))),
+        );
+        VirtioVsockReconstructionResource::new(selector, listener)
+    }
+
+    fn reconstruction_resource_with_connector(
+        selector: VsockBackendSelector,
+        name: &str,
+        ports: Arc<Mutex<Vec<u32>>>,
+    ) -> VirtioVsockReconstructionResource {
+        let listener_path = unique_socket_path(name);
+        let listener = UnixListener::bind(&listener_path)
+            .expect("reconstruction listener should bind before handoff");
+        fs::remove_file(&listener_path)
+            .expect("reconstruction listener path should unlink after bind");
+        let listener = SuppliedVsockListener::new(listener)
+            .with_guest_connector(RecordingGuestConnector::new(ports));
+        VirtioVsockReconstructionResource::new(selector, listener)
     }
 
     fn accepted_host_connection(name: &str) -> (super::VsockHostAcceptedConnection, UnixStream) {
@@ -10962,6 +12414,43 @@ mod tests {
             .expect("DRIVER_OK should activate vsock device");
     }
 
+    fn activate_vsock_handler_with_event_idx_and_size(
+        handler: &mut VirtioVsockMmioHandler,
+        queue_size: u16,
+    ) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("status should accept ACKNOWLEDGE");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("status should accept DRIVER");
+        handler
+            .write_register(
+                VirtioMmioRegister::DriverFeatures,
+                1_u32 << VIRTIO_RING_FEATURE_EVENT_IDX,
+            )
+            .expect("EVENT_IDX should negotiate");
+        handler
+            .write_register(VirtioMmioRegister::DriverFeaturesSel, 1)
+            .expect("VERSION_1 feature page should select");
+        handler
+            .write_register(
+                VirtioMmioRegister::DriverFeatures,
+                1_u32 << (VIRTIO_FEATURE_VERSION_1 - 32),
+            )
+            .expect("VERSION_1 should negotiate");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("status should accept FEATURES_OK");
+        configure_vsock_queues_with_size(handler, queue_size);
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("DRIVER_OK should activate vsock device");
+    }
+
     fn activate_vsock_handler_with_event_idx_and_indirect(handler: &mut VirtioVsockMmioHandler) {
         advance_handler_to_features_ok_with_queue_features(
             handler,
@@ -11094,6 +12583,38 @@ mod tests {
 
     fn vsock_device_registers() -> VirtioMmioDeviceRegisters {
         VirtioMmioDeviceRegisters::new(VIRTIO_VSOCK_DEVICE_ID, 0)
+    }
+
+    fn rebuilt_mmio_transport(
+        original: &VirtioMmioTransportState,
+        device: VirtioMmioDeviceRegisters,
+        queues: Vec<VirtioMmioQueueState>,
+        device_activated: bool,
+    ) -> VirtioMmioTransportState {
+        VirtioMmioTransportState::from_parts(
+            device,
+            original.queue_select(),
+            queues,
+            original.pending_notifications().to_vec(),
+            original.interrupt_status(),
+            device_activated,
+        )
+    }
+
+    fn queue_state_with_addresses(
+        queue: VirtioMmioQueueState,
+        descriptor_table: GuestAddress,
+        driver_ring: GuestAddress,
+        device_ring: GuestAddress,
+    ) -> VirtioMmioQueueState {
+        VirtioMmioQueueState::from_parts(
+            queue.max_size(),
+            queue.size(),
+            queue.ready(),
+            descriptor_table,
+            driver_ring,
+            device_ring,
+        )
     }
 
     fn vsock_handler_for_config(config: VirtioVsockConfigSpace) -> VirtioVsockMmioHandler {
@@ -24009,5 +25530,944 @@ mod tests {
             ));
             assert!(!device.is_activated());
         }
+    }
+
+    #[test]
+    fn vsock_backend_selector_is_validated_and_redacted() {
+        let secret = "/tmp/capture-secret-vsock.sock";
+        let selector = VsockBackendSelector::try_from_path(secret)
+            .expect("ordinary logical selector should validate");
+
+        assert_eq!(selector.path(), Path::new(secret));
+        assert_eq!(
+            format!("{selector:?}"),
+            "VsockBackendSelector { path: \"<redacted>\" }"
+        );
+        assert!(!format!("{selector:?}").contains(secret));
+        assert_eq!(
+            VsockBackendSelector::try_from_path("").unwrap_err(),
+            VsockBackendSelectorError::Empty
+        );
+        assert_eq!(
+            VsockBackendSelector::try_from_path("/tmp/control\n.sock").unwrap_err(),
+            VsockBackendSelectorError::ControlCharacter
+        );
+        let non_utf8 = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+        assert_eq!(
+            VsockBackendSelector::try_from_path(non_utf8).unwrap_err(),
+            VsockBackendSelectorError::NotUtf8
+        );
+        let socket_path_capacity = super::unix_socket_address(Path::new("x"))
+            .expect("single-byte selector should fit")
+            .address
+            .sun_path
+            .len();
+        assert_eq!(
+            VsockBackendSelector::try_from_path("x".repeat(socket_path_capacity)).unwrap_err(),
+            VsockBackendSelectorError::InvalidSocketAddress
+        );
+
+        let resource = reconstruction_resource(selector, "selector-debug");
+        assert_eq!(
+            format!("{resource:?}"),
+            "VirtioVsockReconstructionResource { state: \"<redacted>\" }"
+        );
+        assert!(!format!("{resource:?}").contains(secret));
+    }
+
+    #[test]
+    fn virtio_vsock_mmio_capture_is_exact_repeatable_and_redacted_while_inactive() {
+        let path = unique_socket_path("capture-idle");
+        let config = valid_vsock_config(42, path.to_string_lossy());
+        let handler = virtio_vsock_mmio_handler_with_host_socket(42, &path);
+        let memory = vsock_tx_memory();
+
+        let (first, first_validation) = handler
+            .capture_vsock_state(&config, &memory, VirtioVsockTransportResetAttempt::Inactive)
+            .expect("inactive vsock capture should succeed");
+        let (second, second_validation) = handler
+            .capture_vsock_state(&config, &memory, VirtioVsockTransportResetAttempt::Inactive)
+            .expect("repeat inactive vsock capture should succeed");
+
+        assert_eq!(first, second);
+        assert_eq!(first_validation, second_validation);
+        assert_eq!(first.device().guest_cid(), 42);
+        assert_eq!(first.device().negotiated_features(), 0);
+        assert!(!first.device().is_activated());
+        assert_eq!(first.device().active_queues(), None);
+        assert_eq!(first.device().backend_selector().path(), path);
+        assert_eq!(
+            first.device().host_local_port_cursor().last_used(),
+            VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED
+        );
+        assert!(!first.transport().is_device_activated());
+        assert_eq!(
+            first_validation.reset_attempt(),
+            VirtioVsockTransportResetAttempt::Inactive
+        );
+        assert!(!first_validation.source_work().dropped_any_source_work());
+        assert_eq!(
+            format!("{first:?}"),
+            "VirtioVsockMmioCaptureState { state: \"<redacted>\" }"
+        );
+        assert_eq!(
+            format!("{:?}", first.device()),
+            "VirtioVsockDeviceCaptureState { state: \"<redacted>\" }"
+        );
+        assert!(!format!("{first:?}").contains(path.to_string_lossy().as_ref()));
+
+        drop(handler);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn virtio_vsock_mmio_capture_retains_active_cursors_and_normalization_evidence() {
+        let path = unique_socket_path("capture-live");
+        let config = valid_vsock_config(42, path.to_string_lossy());
+        let mut handler = virtio_vsock_mmio_handler_with_host_socket(42, &path);
+        let mut memory = vsock_tx_memory();
+        let metrics = SharedVsockDeviceMetrics::default();
+        activate_vsock_handler_with_event_idx_and_size(&mut handler, TEST_VSOCK_QUEUE_SIZE);
+
+        {
+            let device = handler.activation_handler_mut();
+            let rx_state = device
+                .active_rx_queue
+                .as_ref()
+                .expect("active RX queue should exist")
+                .queue_state();
+            let tx_state = device
+                .active_tx_queue
+                .as_ref()
+                .expect("active TX queue should exist")
+                .queue_state();
+            device.active_rx_queue = Some(
+                VirtioVsockRxQueue::from_capture_state(
+                    rx_state,
+                    VirtioVsockQueueCaptureState::new(2, 2, true),
+                    false,
+                )
+                .expect("test RX cursors should rebuild"),
+            );
+            device.active_tx_queue = Some(
+                VirtioVsockTxQueue::from_capture_state(
+                    tx_state,
+                    VirtioVsockQueueCaptureState::new(3, 3, true),
+                    false,
+                )
+                .expect("test TX cursors should rebuild"),
+            );
+        }
+        for (available_ring, used_ring, cursor) in [
+            (TEST_VSOCK_RX_AVAILABLE_RING, TEST_VSOCK_RX_USED_RING, 2),
+            (TEST_VSOCK_TX_AVAILABLE_RING, TEST_VSOCK_TX_USED_RING, 3),
+        ] {
+            write_guest_u16(
+                &mut memory,
+                available_ring
+                    .checked_add(2)
+                    .expect("available index address should fit"),
+                cursor,
+            );
+            write_guest_u16(
+                &mut memory,
+                used_ring
+                    .checked_add(2)
+                    .expect("used index address should fit"),
+                cursor,
+            );
+        }
+
+        let (pending, _pending_client) = accepted_host_connection("capture-pending");
+        let (active, _active_client, request) =
+            accepted_host_connection_with_request("capture-active", 5000);
+        let guest_connector_ports = Arc::new(Mutex::new(Vec::new()));
+        let active_key = {
+            let device = handler.activation_handler_mut();
+            device.pending_host_connections.push_back(pending);
+            device.guest_connector = Some(Box::new(RecordingGuestConnector::new(Arc::clone(
+                &guest_connector_ports,
+            ))));
+            assert!(matches!(
+                device.connect_guest_connection_request_packet(&guest_request_tx_packet(
+                    42, 52, 4000
+                )),
+                Some(super::VsockGuestConnectionRequestOutcome::Retained { .. })
+            ));
+            let key = device
+                .insert_accepted_host_connection(active, request)
+                .expect("source host connection should insert");
+            let request = device
+                .host_connections
+                .take_pending_request_packet_header(key, 42)
+                .expect("source request should start its deadline");
+            assert_eq!(request.operation(), VIRTIO_VSOCK_OP_REQUEST);
+            device
+                .host_connections
+                .connections
+                .get_mut(&key)
+                .expect("source host connection should remain present")
+                .credit
+                .pending_credit_request_packet = true;
+            device
+                .pending_guest_reset_packets
+                .push_back(VirtioVsockPacketHeader::new());
+            key
+        };
+        write_vsock_event_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(TEST_VSOCK_EVENT_PAYLOAD, 4, None),
+        );
+        write_vsock_event_available_heads(&mut memory, &[0]);
+        let reset_attempt = handler
+            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .expect("active reset should publish before capture");
+
+        let (first, first_validation) = handler
+            .capture_vsock_state(&config, &memory, reset_attempt)
+            .expect("active vsock capture should succeed");
+        let (second, second_validation) = handler
+            .capture_vsock_state(&config, &memory, reset_attempt)
+            .expect("repeat active vsock capture should succeed");
+
+        assert_eq!(first, second);
+        assert_eq!(first_validation, second_validation);
+        assert!(first.device().is_activated());
+        assert_eq!(first.device().guest_cid(), 42);
+        assert_eq!(
+            first.device().host_local_port_cursor().last_used(),
+            active_key.local_port().raw()
+        );
+        let queues = first
+            .device()
+            .active_queues()
+            .expect("active capture should contain all queue cursors");
+        assert_eq!(
+            (queues.rx().next_available(), queues.rx().next_used()),
+            (2, 2)
+        );
+        assert_eq!(
+            (queues.tx().next_available(), queues.tx().next_used()),
+            (3, 3)
+        );
+        assert_eq!(
+            (queues.event().next_available(), queues.event().next_used()),
+            (1, 1)
+        );
+        assert!(queues.rx().event_idx_enabled());
+        assert!(queues.tx().event_idx_enabled());
+        assert!(queues.event().event_idx_enabled());
+        assert!(
+            first
+                .transport()
+                .queues()
+                .iter()
+                .all(|queue| queue.size() == TEST_VSOCK_QUEUE_SIZE && queue.ready())
+        );
+        assert_eq!(first_validation.reset_attempt(), reset_attempt);
+        let normalized = first_validation.source_work();
+        assert_eq!(normalized.dropped_pending_accepts(), 1);
+        assert_eq!(normalized.dropped_host_connections(), 1);
+        assert_eq!(normalized.dropped_guest_connections(), 1);
+        assert_eq!(normalized.dropped_guest_reset_packets(), 1);
+        assert!(normalized.dropped_pending_connection_work());
+        assert!(normalized.dropped_deadlines());
+        assert!(normalized.dropped_any_source_work());
+        assert_eq!(
+            guest_connector_ports
+                .lock()
+                .expect("source connector observations should remain readable")
+                .as_slice(),
+            &[52]
+        );
+        assert_eq!(read_vsock_event_used_index(&memory), 1);
+        assert!(handler.activation_handler().pending_event_ack());
+        assert!(!format!("{first_validation:?}").contains(path.to_string_lossy().as_ref()));
+
+        drop(handler);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn virtio_vsock_capture_rejects_malformed_device_transport_and_ring_state() {
+        let path = unique_socket_path("capture-invalid");
+        let config = valid_vsock_config(42, path.to_string_lossy());
+        let mut handler = virtio_vsock_mmio_handler_with_host_socket(42, &path);
+        let memory = vsock_tx_memory();
+        activate_vsock_handler_with_event_idx_and_size(&mut handler, TEST_VSOCK_QUEUE_SIZE);
+        let (captured, _) = handler
+            .capture_vsock_state(
+                &config,
+                &memory,
+                VirtioVsockTransportResetAttempt::QueueEmpty,
+            )
+            .expect("baseline active capture should validate");
+        let device = captured.device().clone();
+        let transport = captured.transport().clone();
+
+        let mut invalid = device.clone();
+        invalid.guest_cid = u64::from(MIN_GUEST_CID - 1);
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(invalid, transport.clone(), &memory),
+            Err(VirtioVsockDeviceCaptureError::GuestCidInvalid)
+        ));
+
+        let mut invalid = device.clone();
+        invalid.available_features ^= 1;
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(invalid, transport.clone(), &memory),
+            Err(VirtioVsockDeviceCaptureError::AvailableFeaturesMismatch)
+        ));
+
+        let mut invalid = device.clone();
+        invalid.negotiated_features |= 1_u64 << 63;
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(invalid, transport.clone(), &memory),
+            Err(VirtioVsockDeviceCaptureError::NegotiatedFeaturesUnsupported)
+        ));
+
+        let mut invalid = device.clone();
+        invalid.negotiated_features &= !(1_u64 << VIRTIO_FEATURE_VERSION_1);
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(invalid, transport.clone(), &memory),
+            Err(VirtioVsockDeviceCaptureError::RequiredFeatureNotAcknowledged)
+        ));
+
+        let mut invalid = device.clone();
+        invalid.backend_selector = VsockBackendSelector {
+            path: PathBuf::new(),
+        };
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(invalid, transport.clone(), &memory),
+            Err(VirtioVsockDeviceCaptureError::BackendSelector(
+                VsockBackendSelectorError::Empty
+            ))
+        ));
+
+        let mut invalid = device.clone();
+        invalid.host_local_port_cursor = VsockHostLocalPortCursor { last_used: 0 };
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(invalid, transport.clone(), &memory),
+            Err(VirtioVsockDeviceCaptureError::HostLocalPortCursorInvalid)
+        ));
+
+        let active = device
+            .active_queues()
+            .expect("baseline device should be active");
+        let mut invalid = device.clone();
+        invalid.active_queues = Some(VirtioVsockActiveQueuesCaptureState::new(
+            active.rx(),
+            active.tx(),
+            VirtioVsockQueueCaptureState::new(
+                active.event().next_available(),
+                active.event().next_used(),
+                false,
+            ),
+        ));
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(invalid, transport.clone(), &memory),
+            Err(VirtioVsockDeviceCaptureError::EventQueue(
+                VirtioVsockQueueCaptureError::FeatureMismatch
+            ))
+        ));
+
+        let original_registers = *transport.device_registers();
+        let wrong_device = VirtioMmioDeviceRegisters::new(
+            VIRTIO_VSOCK_DEVICE_ID + 1,
+            original_registers.device_features(),
+        )
+        .with_runtime_state(
+            [
+                original_registers.device_features_select(),
+                original_registers.driver_features_select(),
+            ],
+            original_registers.driver_features(),
+            original_registers.status(),
+        );
+        let wrong_identity =
+            rebuilt_mmio_transport(&transport, wrong_device, transport.queues().to_vec(), true);
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(device.clone(), wrong_identity, &memory),
+            Err(VirtioVsockDeviceCaptureError::DeviceIdMismatch)
+        ));
+
+        let inactive_transport = rebuilt_mmio_transport(
+            &transport,
+            original_registers,
+            transport.queues().to_vec(),
+            false,
+        );
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(
+                device.clone(),
+                inactive_transport,
+                &memory
+            ),
+            Err(VirtioVsockDeviceCaptureError::ActivationMismatch)
+        ));
+
+        let short_queues = transport.queues()[..2].to_vec();
+        let short_transport =
+            rebuilt_mmio_transport(&transport, original_registers, short_queues, true);
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(device.clone(), short_transport, &memory),
+            Err(VirtioVsockDeviceCaptureError::QueueCountMismatch)
+        ));
+
+        let mut queues = transport.queues().to_vec();
+        let rx = queues[VIRTIO_VSOCK_RX_QUEUE_INDEX];
+        queues[VIRTIO_VSOCK_RX_QUEUE_INDEX] = VirtioMmioQueueState::from_parts(
+            VIRTIO_VSOCK_QUEUE_SIZE / 2,
+            rx.size(),
+            rx.ready(),
+            rx.descriptor_table(),
+            rx.driver_ring(),
+            rx.device_ring(),
+        );
+        let wrong_max = rebuilt_mmio_transport(&transport, original_registers, queues, true);
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(device.clone(), wrong_max, &memory),
+            Err(VirtioVsockDeviceCaptureError::QueueMaxSizeMismatch)
+        ));
+
+        for (size, ready) in [(3, true), (TEST_VSOCK_QUEUE_SIZE, false)] {
+            let mut queues = transport.queues().to_vec();
+            let rx = queues[VIRTIO_VSOCK_RX_QUEUE_INDEX];
+            queues[VIRTIO_VSOCK_RX_QUEUE_INDEX] = VirtioMmioQueueState::from_parts(
+                rx.max_size(),
+                size,
+                ready,
+                rx.descriptor_table(),
+                rx.driver_ring(),
+                rx.device_ring(),
+            );
+            let invalid_transport =
+                rebuilt_mmio_transport(&transport, original_registers, queues, true);
+            assert!(matches!(
+                VirtioVsockMmioCaptureState::try_from_parts(
+                    device.clone(),
+                    invalid_transport,
+                    &memory
+                ),
+                Err(VirtioVsockDeviceCaptureError::QueueSizeInvalid)
+            ));
+        }
+
+        let mut queues = transport.queues().to_vec();
+        let rx = queues[VIRTIO_VSOCK_RX_QUEUE_INDEX];
+        queues[VIRTIO_VSOCK_RX_QUEUE_INDEX] = queue_state_with_addresses(
+            rx,
+            rx.descriptor_table(),
+            rx.descriptor_table(),
+            rx.device_ring(),
+        );
+        let within_overlap = rebuilt_mmio_transport(&transport, original_registers, queues, true);
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(device.clone(), within_overlap, &memory),
+            Err(VirtioVsockDeviceCaptureError::RxQueue(
+                VirtioVsockQueueCaptureError::QueueRangesOverlap
+            ))
+        ));
+
+        let mut queues = transport.queues().to_vec();
+        let rx = queues[VIRTIO_VSOCK_RX_QUEUE_INDEX];
+        let tx = queues[VIRTIO_VSOCK_TX_QUEUE_INDEX];
+        queues[VIRTIO_VSOCK_TX_QUEUE_INDEX] = queue_state_with_addresses(
+            tx,
+            rx.descriptor_table(),
+            tx.driver_ring(),
+            tx.device_ring(),
+        );
+        let across_overlap = rebuilt_mmio_transport(&transport, original_registers, queues, true);
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(device.clone(), across_overlap, &memory),
+            Err(VirtioVsockDeviceCaptureError::QueueRangesOverlap)
+        ));
+
+        let mut queues = transport.queues().to_vec();
+        let rx = queues[VIRTIO_VSOCK_RX_QUEUE_INDEX];
+        queues[VIRTIO_VSOCK_RX_QUEUE_INDEX] = queue_state_with_addresses(
+            rx,
+            rx.descriptor_table(),
+            rx.driver_ring(),
+            GuestAddress::new(TEST_VSOCK_TX_MEMORY_SIZE + 0x1000),
+        );
+        let unmapped = rebuilt_mmio_transport(&transport, original_registers, queues, true);
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(device.clone(), unmapped, &memory),
+            Err(VirtioVsockDeviceCaptureError::RxQueue(
+                VirtioVsockQueueCaptureError::UsedRingInvalid
+            ))
+        ));
+
+        let mut queues = transport.queues().to_vec();
+        let rx = queues[VIRTIO_VSOCK_RX_QUEUE_INDEX];
+        queues[VIRTIO_VSOCK_RX_QUEUE_INDEX] = queue_state_with_addresses(
+            rx,
+            rx.descriptor_table(),
+            GuestAddress::new(TEST_VSOCK_TX_MEMORY_SIZE + 0x1000),
+            rx.device_ring(),
+        );
+        let unmapped = rebuilt_mmio_transport(&transport, original_registers, queues, true);
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(device.clone(), unmapped, &memory),
+            Err(VirtioVsockDeviceCaptureError::RxQueue(
+                VirtioVsockQueueCaptureError::AvailableRingInvalid
+            ))
+        ));
+
+        let mut used_drift = vsock_tx_memory();
+        write_guest_u16(
+            &mut used_drift,
+            TEST_VSOCK_RX_USED_RING
+                .checked_add(2)
+                .expect("RX used index address should fit"),
+            1,
+        );
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(
+                device.clone(),
+                transport.clone(),
+                &used_drift
+            ),
+            Err(VirtioVsockDeviceCaptureError::RxQueue(
+                VirtioVsockQueueCaptureError::UsedCursorMismatch
+            ))
+        ));
+
+        let mut available_ahead = vsock_tx_memory();
+        write_guest_u16(
+            &mut available_ahead,
+            TEST_VSOCK_RX_AVAILABLE_RING
+                .checked_add(2)
+                .expect("RX available index address should fit"),
+            TEST_VSOCK_QUEUE_SIZE + 1,
+        );
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(
+                device.clone(),
+                transport.clone(),
+                &available_ahead
+            ),
+            Err(VirtioVsockDeviceCaptureError::RxQueue(
+                VirtioVsockQueueCaptureError::AvailableCursorOutOfBounds
+            ))
+        ));
+
+        let mut unpublished_memory = vsock_tx_memory();
+        write_guest_u16(
+            &mut unpublished_memory,
+            TEST_VSOCK_RX_AVAILABLE_RING
+                .checked_add(2)
+                .expect("RX available index address should fit"),
+            1,
+        );
+        let mut unpublished = device.clone();
+        unpublished.active_queues = Some(VirtioVsockActiveQueuesCaptureState::new(
+            VirtioVsockQueueCaptureState::new(1, 0, true),
+            active.tx(),
+            active.event(),
+        ));
+        assert!(matches!(
+            VirtioVsockMmioCaptureState::try_from_parts(
+                unpublished,
+                transport.clone(),
+                &unpublished_memory
+            ),
+            Err(VirtioVsockDeviceCaptureError::RxQueue(
+                VirtioVsockQueueCaptureError::UnpublishedDescriptorCountMismatch
+            ))
+        ));
+
+        handler.activation_handler_mut().guest_cid = 43;
+        assert!(matches!(
+            handler.capture_vsock_state(
+                &config,
+                &memory,
+                VirtioVsockTransportResetAttempt::QueueEmpty
+            ),
+            Err(VirtioVsockDeviceCaptureError::DeviceCidMismatch)
+        ));
+        handler.activation_handler_mut().guest_cid = 42;
+
+        let active_event = handler
+            .activation_handler_mut()
+            .active_event_queue
+            .take()
+            .expect("active event queue should exist");
+        assert!(matches!(
+            handler.capture_vsock_state(
+                &config,
+                &memory,
+                VirtioVsockTransportResetAttempt::QueueEmpty
+            ),
+            Err(VirtioVsockDeviceCaptureError::ActivationMismatch)
+        ));
+        handler.activation_handler_mut().active_event_queue = Some(active_event);
+
+        let live_rx = handler
+            .activation_handler_mut()
+            .active_rx_queue
+            .as_mut()
+            .expect("live RX queue should exist");
+        live_rx.queue_state = queue_state_with_addresses(
+            live_rx.queue_state,
+            GuestAddress::new(0x8000),
+            live_rx.queue_state.driver_ring(),
+            live_rx.queue_state.device_ring(),
+        );
+        assert!(matches!(
+            handler.capture_vsock_state(
+                &config,
+                &memory,
+                VirtioVsockTransportResetAttempt::QueueEmpty
+            ),
+            Err(VirtioVsockDeviceCaptureError::RxQueue(
+                VirtioVsockQueueCaptureError::TransportMismatch
+            ))
+        ));
+
+        drop(handler);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn virtio_vsock_capture_rejects_config_and_reset_origin_mismatches() {
+        let path = unique_socket_path("capture-origin");
+        let config = valid_vsock_config(42, path.to_string_lossy());
+        let memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler_with_host_socket(42, &path);
+
+        assert!(matches!(
+            handler.capture_vsock_state(
+                &config,
+                &memory,
+                VirtioVsockTransportResetAttempt::QueueEmpty
+            ),
+            Err(VirtioVsockDeviceCaptureError::InactiveResetAttemptMismatch)
+        ));
+        let wrong_cid = valid_vsock_config(43, path.to_string_lossy());
+        assert!(matches!(
+            handler.capture_vsock_state(
+                &wrong_cid,
+                &memory,
+                VirtioVsockTransportResetAttempt::Inactive
+            ),
+            Err(VirtioVsockDeviceCaptureError::ConfigCidMismatch)
+        ));
+        let secret_path = unique_socket_path("capture-secret");
+        let wrong_selector = valid_vsock_config(42, secret_path.to_string_lossy());
+        let selector_error = handler
+            .capture_vsock_state(
+                &wrong_selector,
+                &memory,
+                VirtioVsockTransportResetAttempt::Inactive,
+            )
+            .expect_err("live and external selectors must agree");
+        assert!(matches!(
+            selector_error,
+            VirtioVsockDeviceCaptureError::BackendSelectorMismatch
+        ));
+        assert!(
+            !selector_error
+                .to_string()
+                .contains(secret_path.to_string_lossy().as_ref())
+        );
+
+        activate_vsock_handler_with_event_idx_and_size(&mut handler, TEST_VSOCK_QUEUE_SIZE);
+        assert!(matches!(
+            handler.capture_vsock_state(
+                &config,
+                &memory,
+                VirtioVsockTransportResetAttempt::Inactive
+            ),
+            Err(VirtioVsockDeviceCaptureError::ActiveResetAttemptMissing)
+        ));
+
+        let publisher_path = unique_socket_path("capture-publisher");
+        let mut publisher = virtio_vsock_mmio_handler_with_host_socket(42, &publisher_path);
+        let mut publisher_memory = vsock_tx_memory();
+        activate_vsock_handler_with_event_idx_and_size(&mut publisher, TEST_VSOCK_QUEUE_SIZE);
+        write_vsock_event_descriptor(
+            &mut publisher_memory,
+            0,
+            TestDescriptor::writable(TEST_VSOCK_EVENT_PAYLOAD, 4, None),
+        );
+        write_vsock_event_available_heads(&mut publisher_memory, &[0]);
+        let published = publisher
+            .prepare_vsock_transport_reset(
+                &mut publisher_memory,
+                &SharedVsockDeviceMetrics::default(),
+            )
+            .expect("publisher should create a typed reset result");
+        assert!(matches!(
+            handler.capture_vsock_state(&config, &memory, published),
+            Err(VirtioVsockDeviceCaptureError::PublishedResetWithoutGate)
+        ));
+
+        let mut pending_event_memory = vsock_tx_memory();
+        write_vsock_event_descriptor(
+            &mut pending_event_memory,
+            0,
+            TestDescriptor::writable(TEST_VSOCK_EVENT_PAYLOAD, 4, None),
+        );
+        write_vsock_event_available_heads(&mut pending_event_memory, &[0]);
+        assert!(matches!(
+            handler.capture_vsock_state(
+                &config,
+                &pending_event_memory,
+                VirtioVsockTransportResetAttempt::QueueEmpty
+            ),
+            Err(VirtioVsockDeviceCaptureError::EmptyResetAttemptWithPendingDescriptor)
+        ));
+
+        drop(publisher);
+        assert!(!publisher_path.exists());
+        drop(handler);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn virtio_vsock_inactive_reconstruction_validates_before_consuming_resource() {
+        let path = unique_socket_path("restore-idle");
+        let config = valid_vsock_config(42, path.to_string_lossy());
+        let source = virtio_vsock_mmio_handler_with_host_socket(42, &path);
+        let memory = vsock_tx_memory();
+        let (captured, _) = source
+            .capture_vsock_state(&config, &memory, VirtioVsockTransportResetAttempt::Inactive)
+            .expect("inactive source should capture");
+
+        let wrong_path = unique_socket_path("restore-wrong");
+        let wrong_selector = VsockBackendSelector::try_from_path(&wrong_path)
+            .expect("wrong logical selector should still validate");
+        let mut wrong_resource = reconstruction_resource(wrong_selector, "restore-wrong-fd");
+        let error = captured
+            .reconstruct_snapshot_handler(&memory, &mut wrong_resource)
+            .expect_err("selector mismatch should reject reconstruction");
+        assert!(matches!(
+            error,
+            VirtioVsockReconstructionError::ResourceSelectorMismatch
+        ));
+        assert!(!wrong_resource.is_consumed());
+        assert!(!error.to_string().contains(path.to_string_lossy().as_ref()));
+        assert!(
+            !error
+                .to_string()
+                .contains(wrong_path.to_string_lossy().as_ref())
+        );
+
+        let selector = captured.device().backend_selector().clone();
+        let incomplete_listener_path = unique_socket_path("restore-no-connector");
+        let incomplete_listener = UnixListener::bind(&incomplete_listener_path)
+            .expect("incomplete reconstruction listener should bind");
+        fs::remove_file(&incomplete_listener_path)
+            .expect("incomplete reconstruction listener should unlink after bind");
+        let mut incomplete_resource = VirtioVsockReconstructionResource::new(
+            selector.clone(),
+            SuppliedVsockListener::new(incomplete_listener),
+        );
+        let error = captured
+            .reconstruct_snapshot_handler(&memory, &mut incomplete_resource)
+            .expect_err("snapshot reconstruction must require guest connection authority");
+        assert!(matches!(
+            error,
+            VirtioVsockReconstructionError::GuestConnectorMissing
+        ));
+        assert!(
+            !incomplete_resource.is_consumed(),
+            "connector validation must precede listener consumption"
+        );
+        assert!(!error.to_string().contains(path.to_string_lossy().as_ref()));
+
+        let mut resource = reconstruction_resource(selector, "restore-idle-fd");
+        let reconstructed = captured
+            .reconstruct_snapshot_handler(&memory, &mut resource)
+            .expect("matching supplied resource should reconstruct inactive handler");
+
+        assert!(resource.is_consumed());
+        assert!(!reconstructed.is_device_activated());
+        assert!(!reconstructed.activation_handler().is_activated());
+        assert!(!reconstructed.activation_handler().pending_event_ack());
+        assert_eq!(
+            reconstructed
+                .activation_handler()
+                .pending_host_connection_count(),
+            0
+        );
+        assert!(
+            reconstructed
+                .activation_handler()
+                .host_connections
+                .is_empty()
+        );
+        assert!(
+            reconstructed
+                .activation_handler()
+                .guest_connections
+                .is_empty()
+        );
+        assert!(
+            reconstructed
+                .activation_handler()
+                .pending_guest_reset_packets
+                .is_empty()
+        );
+        let (recaptured, validation) = reconstructed
+            .capture_vsock_state(&config, &memory, VirtioVsockTransportResetAttempt::Inactive)
+            .expect("inactive reconstructed handler should recapture");
+        assert_eq!(recaptured, captured);
+        assert!(!validation.source_work().dropped_any_source_work());
+        assert!(matches!(
+            captured.reconstruct_snapshot_handler(&memory, &mut resource),
+            Err(VirtioVsockReconstructionError::ResourceConsumed)
+        ));
+
+        drop(reconstructed);
+        drop(source);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn virtio_vsock_active_reconstruction_restores_cursors_empty_work_and_rx_gate() {
+        let path = unique_socket_path("restore-live");
+        let config = valid_vsock_config(42, path.to_string_lossy());
+        let mut source = virtio_vsock_mmio_handler_with_host_socket(42, &path);
+        let memory = vsock_tx_memory();
+        activate_vsock_handler_with_event_idx_and_size(&mut source, TEST_VSOCK_QUEUE_SIZE);
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("restore-cursor", 5000);
+        let saved_port = source
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("source connection should advance the host-local cursor")
+            .local_port()
+            .raw();
+        let (captured, validation) = source
+            .capture_vsock_state(
+                &config,
+                &memory,
+                VirtioVsockTransportResetAttempt::QueueEmpty,
+            )
+            .expect("active source should capture after empty reset attempt");
+        assert_eq!(validation.source_work().dropped_host_connections(), 1);
+
+        let selector = captured.device().backend_selector().clone();
+        let connector_ports = Arc::new(Mutex::new(Vec::new()));
+        let mut resource = reconstruction_resource_with_connector(
+            selector,
+            "restore-live-fd",
+            Arc::clone(&connector_ports),
+        );
+        let mut invalid_memory = vsock_tx_memory();
+        write_guest_u16(
+            &mut invalid_memory,
+            TEST_VSOCK_RX_USED_RING
+                .checked_add(2)
+                .expect("RX used index address should fit"),
+            1,
+        );
+        assert!(matches!(
+            captured.reconstruct_snapshot_handler(&invalid_memory, &mut resource),
+            Err(VirtioVsockReconstructionError::Capture(
+                VirtioVsockDeviceCaptureError::RxQueue(
+                    VirtioVsockQueueCaptureError::UsedCursorMismatch
+                )
+            ))
+        ));
+        assert!(
+            !resource.is_consumed(),
+            "guest-memory validation must precede listener consumption"
+        );
+        let mut reconstructed = captured
+            .reconstruct_snapshot_handler(&memory, &mut resource)
+            .expect("active snapshot should reconstruct with supplied resource");
+
+        assert!(resource.is_consumed());
+        assert!(reconstructed.is_device_activated());
+        let device = reconstructed.activation_handler();
+        assert!(device.is_activated());
+        assert_eq!(device.guest_cid(), 42);
+        assert!(device.pending_event_ack());
+        assert_eq!(device.pending_host_connection_count(), 0);
+        assert!(device.host_connections.is_empty());
+        assert!(device.guest_connections.is_empty());
+        assert!(device.pending_guest_reset_packets.is_empty());
+        assert_eq!(device.earliest_deadline(), None);
+        assert_eq!(device.host_local_port_cursor().last_used(), saved_port);
+        let saved_queues = captured.device().active_queues().unwrap();
+        assert_eq!(
+            device
+                .active_rx_dispatch_queue()
+                .unwrap()
+                .available_ring()
+                .next_avail(),
+            saved_queues.rx().next_available()
+        );
+        assert_eq!(
+            device
+                .active_tx_dispatch_queue()
+                .unwrap()
+                .used_ring()
+                .next_used(),
+            saved_queues.tx().next_used()
+        );
+        assert_eq!(
+            device
+                .active_event_dispatch_queue()
+                .unwrap()
+                .event_idx_enabled(),
+            saved_queues.event().event_idx_enabled()
+        );
+        assert_ne!(
+            read_interrupt_status(&reconstructed) & DeviceInterruptKind::Queue.status().bits(),
+            0,
+            "active snapshot reconstruction must re-signal the reset gate"
+        );
+
+        let (recaptured, normalized) = reconstructed
+            .capture_vsock_state(
+                &config,
+                &memory,
+                VirtioVsockTransportResetAttempt::QueueEmpty,
+            )
+            .expect("reconstructed active device should remain capture-valid");
+        assert_eq!(recaptured.device(), captured.device());
+        assert!(!normalized.source_work().dropped_any_source_work());
+
+        let (next, _next_client, next_request) =
+            accepted_host_connection_with_request("restore-next", 5001);
+        let next_port = reconstructed
+            .activation_handler_mut()
+            .insert_accepted_host_connection(next, next_request)
+            .expect("fresh destination table should allocate after saved cursor")
+            .local_port()
+            .raw();
+        assert_eq!(next_port, saved_port + 1);
+
+        notify_vsock_queue(&mut reconstructed, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+        reconstructed
+            .dispatch_vsock_queue_notifications(&mut vsock_tx_memory())
+            .expect("event acknowledgement should clear reconstructed RX gate");
+        assert!(!reconstructed.activation_handler().pending_event_ack());
+
+        let guest_key = VsockGuestConnectionKey::new(52, 4000);
+        assert!(matches!(
+            reconstructed
+                .activation_handler_mut()
+                .connect_guest_connection_request_packet(&guest_request_tx_packet(42, 52, 4000)),
+            Some(super::VsockGuestConnectionRequestOutcome::Retained { key }) if key == guest_key
+        ));
+        assert_eq!(
+            connector_ports
+                .lock()
+                .expect("reconstructed connector observations should remain readable")
+                .as_slice(),
+            &[52]
+        );
+
+        drop(reconstructed);
+        drop(source);
+        assert!(!path.exists());
     }
 }

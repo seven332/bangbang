@@ -2870,6 +2870,8 @@ impl std::error::Error for VirtioPciEndpointError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::mpsc::{self, TryRecvError};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2890,10 +2892,23 @@ mod tests {
     };
     use crate::virtio_queue::{VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE};
     use crate::vsock::{
-        VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockConfigSpace,
-        VirtioVsockDevice, VirtioVsockRestoredTransportResetSignal,
-        VirtioVsockTransportResetAttempt,
+        PreparedVsockDevice, SuppliedVsockListener, VIRTIO_FEATURE_VERSION_1,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES,
+        VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockReconstructionResource,
+        VirtioVsockRestoredTransportResetSignal, VirtioVsockTransportResetAttempt, VsockConfig,
+        VsockConfigInput, VsockGuestConnector,
     };
+
+    const TEST_VSOCK_PCI_UDS_PATH: &str = "/tmp/bangbang-vsock-pci-capture.sock";
+
+    #[derive(Debug)]
+    struct RejectingVsockGuestConnector;
+
+    impl VsockGuestConnector for RejectingVsockGuestConnector {
+        fn connect(&mut self, _host_port: u32) -> std::io::Result<UnixStream> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+    }
 
     type TestEndpoint =
         VirtioPciEndpoint<UnsupportedVirtioDeviceConfig, NoopVirtioDeviceActivation>;
@@ -3096,7 +3111,8 @@ mod tests {
         }
         let registry = GuestMessageInterruptRegistry::new(routes)
             .expect("vsock test message registry should validate");
-        let config = VirtioVsockConfigSpace::new(42);
+        let prepared = PreparedVsockDevice::from_config(&vsock_pci_config());
+        let (_, _, config, device) = prepared.into_parts();
         let endpoint = VirtioPciEndpoint::new(
             VirtioPciIdentity::new(
                 VirtioDeviceType::new(VIRTIO_VSOCK_DEVICE_ID)
@@ -3105,7 +3121,7 @@ mod tests {
             ),
             &VIRTIO_VSOCK_QUEUE_SIZES,
             config,
-            VirtioVsockDevice::new(),
+            device,
             false,
             &bar,
             registry,
@@ -3118,6 +3134,12 @@ mod tests {
             messages,
             signals,
         }
+    }
+
+    fn vsock_pci_config() -> VsockConfig {
+        VsockConfigInput::new(42, TEST_VSOCK_PCI_UDS_PATH)
+            .validate()
+            .expect("PCI vsock test configuration should validate")
     }
 
     fn configure_vsock_endpoint(
@@ -3153,6 +3175,30 @@ mod tests {
 
         bar_write(&mut bar, &bus, base, 0x14, &[1]).expect("ACKNOWLEDGE should write");
         bar_write(&mut bar, &bus, base, 0x14, &[3]).expect("DRIVER should write");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_COMMON_DRIVER_FEATURE,
+            &(1_u32 << VIRTIO_RING_FEATURE_EVENT_IDX).to_le_bytes(),
+        )
+        .expect("EVENT_IDX should negotiate");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_COMMON_DRIVER_FEATURE_SELECT,
+            &1_u32.to_le_bytes(),
+        )
+        .expect("VERSION_1 feature page should select");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_COMMON_DRIVER_FEATURE,
+            &(1_u32 << (VIRTIO_FEATURE_VERSION_1 - 32)).to_le_bytes(),
+        )
+        .expect("VERSION_1 should negotiate");
         bar_write(&mut bar, &bus, base, 0x14, &[11]).expect("FEATURES_OK should write");
         for queue_index in 0..VIRTIO_VSOCK_QUEUE_SIZES.len() {
             let queue_index_u16 = u16::try_from(queue_index).expect("vsock queue index should fit");
@@ -3841,6 +3887,112 @@ mod tests {
             .trigger(VirtioInterruptIntent::Configuration)
             .unwrap();
         assert_eq!(fixture.signals[0].lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn vsock_pci_capture_is_exact_for_inactive_and_masked_reset_state() {
+        let fixture = vsock_fixture();
+        let config = vsock_pci_config();
+        let mut memory = vsock_event_memory();
+
+        let (inactive_first, inactive_validation) = fixture
+            .endpoint
+            .capture_vsock_state(&config, &memory, VirtioVsockTransportResetAttempt::Inactive)
+            .expect("inactive PCI vsock should capture under one endpoint lock");
+        let (inactive_second, repeated_validation) = fixture
+            .endpoint
+            .capture_vsock_state(&config, &memory, VirtioVsockTransportResetAttempt::Inactive)
+            .expect("repeat inactive PCI capture should be exact");
+        assert_eq!(inactive_first, inactive_second);
+        assert_eq!(inactive_validation, repeated_validation);
+        assert!(!inactive_first.device().is_activated());
+        assert!(!inactive_first.transport().is_device_activated());
+        assert_eq!(
+            inactive_first.device().backend_selector().path(),
+            std::path::Path::new(TEST_VSOCK_PCI_UDS_PATH)
+        );
+        assert_eq!(
+            format!("{inactive_first:?}"),
+            "VirtioVsockPciCaptureState { state: \"<redacted>\" }"
+        );
+        assert!(!format!("{inactive_first:?}").contains(TEST_VSOCK_PCI_UDS_PATH));
+
+        let event_message = fixture.messages[2];
+        configure_vsock_endpoint(&fixture, event_message, true);
+        publish_vsock_event_descriptor(&mut memory, 8);
+        let reset_attempt = fixture
+            .endpoint
+            .prepare_vsock_transport_reset(&mut memory, &SharedVsockDeviceMetrics::default())
+            .expect("masked PCI reset should publish before capture");
+        let (active_first, active_validation) = fixture
+            .endpoint
+            .capture_vsock_state(&config, &memory, reset_attempt)
+            .expect("active PCI vsock should capture device and transport atomically");
+        let (active_second, repeated_validation) = fixture
+            .endpoint
+            .capture_vsock_state(&config, &memory, reset_attempt)
+            .expect("repeat active PCI capture should be exact");
+
+        assert_eq!(active_first, active_second);
+        assert_eq!(active_validation, repeated_validation);
+        assert_eq!(active_validation.reset_attempt(), reset_attempt);
+        assert!(!active_validation.source_work().dropped_any_source_work());
+        assert!(active_first.device().is_activated());
+        assert!(active_first.transport().is_device_activated());
+        let queues = active_first
+            .device()
+            .active_queues()
+            .expect("active PCI capture should retain all queue cursors");
+        assert_eq!(
+            (queues.rx().next_available(), queues.rx().next_used()),
+            (0, 0)
+        );
+        assert_eq!(
+            (queues.tx().next_available(), queues.tx().next_used()),
+            (0, 0)
+        );
+        assert_eq!(
+            (queues.event().next_available(), queues.event().next_used()),
+            (1, 1)
+        );
+        assert!(queues.rx().event_idx_enabled());
+        assert!(queues.tx().event_idx_enabled());
+        assert!(queues.event().event_idx_enabled());
+        assert_ne!(
+            active_first.transport().msix_state().pending_words()[0] & (1_u64 << 2),
+            0,
+            "masked reset interrupt must remain in canonical PCI state"
+        );
+        assert!(fixture.signals[2].lock().unwrap().is_empty());
+        assert_eq!(read_vsock_event_used_index(&memory), 1);
+
+        let listener_path = std::path::Path::new("/tmp").join(format!(
+            "bb-pci-{}-{:x}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after the Unix epoch")
+                .as_nanos()
+        ));
+        let listener =
+            UnixListener::bind(&listener_path).expect("PCI reconstruction listener should bind");
+        fs::remove_file(&listener_path)
+            .expect("PCI reconstruction listener path should unlink after bind");
+        let mut resource = VirtioVsockReconstructionResource::new(
+            active_first.device().backend_selector().clone(),
+            SuppliedVsockListener::new(listener).with_guest_connector(RejectingVsockGuestConnector),
+        );
+        let reconstructed = active_first
+            .reconstruct_snapshot_device(&memory, &mut resource)
+            .expect("PCI capture should rebuild device components without placement");
+        assert!(resource.is_consumed());
+        assert_eq!(reconstructed.guest_cid(), 42);
+        assert!(reconstructed.device().is_activated());
+        assert!(reconstructed.device().pending_event_ack());
+        assert_eq!(
+            reconstructed.device().host_local_port_cursor(),
+            active_first.device().host_local_port_cursor()
+        );
     }
 
     #[test]

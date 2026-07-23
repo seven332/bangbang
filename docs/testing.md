@@ -1991,9 +1991,16 @@ mandatory MMIO queue intent and PCI queue-2 delivery, typed empty/malformed
 failures and metrics, runtime-only restored-origin acknowledgement gate, TX
 progress, preserved RX work, and post-ack drain. Repeated pre-boot `PUT /vsock`
 replaces stored configuration and post-start PUT is stably rejected; PATCH,
-DELETE, runtime hotplug, and broader CID routing are not supported. Public
-native-v1 invocation, durable capture, UDS override, restored resource
-reconstruction, and the restored-guest proof remain #1515-#1518/#1490 work.
+DELETE, runtime hotplug, and broader CID routing are not supported. Focused
+capture tests now cover repeatable inactive/active MMIO values, endpoint-locked
+PCI state including masked MSI-X reset intent, all three saved queue cursors and
+`EVENT_IDX`, smaller valid queue sizes, malformed identity/feature/activation/
+ring/range/cursor/reset mutations, redaction, and
+listener/connector-parameterized reconstruction with empty live work and an armed
+RX gate. Quiesced owner
+traversal, destination UDS authority/override, record certification, native-v1
+encoding/placement, public invocation, and the restored-guest proof remain
+#1516-#1518/#1490 work.
 The signed transfer is a compatibility/progress gate, not a general performance,
 Firecracker artifact, or snapshot-parity claim.
 
