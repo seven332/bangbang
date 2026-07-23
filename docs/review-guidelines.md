@@ -354,6 +354,17 @@ platform evidence plus current Challenge result for
 than inferring support from parser recognition, stable rejection, historical
 issue closure, or family-level prose.
 
+For the checked
+[snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md),
+review feasibility and implementation as separate claims. File/COW, eager
+population, or parser recognition must never be relabeled as UFFD-equivalent.
+Keep Mach task/thread ports and host virtual addresses inside the VMM, reject
+unmodified Linux UFFD wire traffic, and require bounded offset-only peer
+messages plus pre-resource rejection for bypass profiles. Native-v1 `Uffd`
+must remain rejected until the restore gate, and
+`corpus:snapshot-page-faults` must remain nonterminal until signed
+host/guest/removal/failure/cleanup certification completes.
+
 Run
 `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`
 when the PR changes Firecracker-facing behavior or inventory data. Final parent
