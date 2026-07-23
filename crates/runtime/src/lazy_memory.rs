@@ -604,6 +604,9 @@ impl LazyGuestMemory {
     }
 
     /// Starts one aligned, nonempty, single-region removal.
+    ///
+    /// This waits for overlapping publication/removal guards. Callers must not
+    /// retain such a guard on the same thread while invoking this method.
     pub fn begin_removal(
         &self,
         region: PagerRegionId,
@@ -644,6 +647,9 @@ impl LazyGuestMemory {
     }
 
     /// Closes admission and waits for already-linearized actions.
+    ///
+    /// Actions are non-reentrant: call this only from a thread that retains no
+    /// publication or removal guard for this owner.
     pub fn terminate(
         &self,
         reason: LazyGuestMemoryTerminalReason,
@@ -1184,6 +1190,7 @@ impl LazyGuestMemoryInner {
             self.changed.notify_all();
             return Err(self.phase_error(&state));
         }
+        self.require_action_locked(&mut state)?;
         let index = publishing_operation(&state.operations, location, generation)
             .ok_or(LazyGuestMemoryError::InvalidLifecycle)?;
         let waiters = match state.operations.get(index).map(|operation| &operation.kind) {
@@ -1203,7 +1210,7 @@ impl LazyGuestMemoryInner {
             CompletionOutcome::Present,
             waiters,
         );
-        state.action_count = state.action_count.saturating_sub(1);
+        state.action_count -= 1;
         self.finalize_if_drained_locked(&mut state);
         self.changed.notify_all();
         Ok(())
@@ -1509,6 +1516,7 @@ impl LazyGuestMemoryInner {
             self.changed.notify_all();
             return Err(self.phase_error(&state));
         }
+        self.require_action_locked(&mut state)?;
         let index = removal_operation(
             &state.operations,
             region_index,
@@ -1531,7 +1539,7 @@ impl LazyGuestMemoryInner {
             *page = PageTag::Absent;
         }
         state.operations.remove(index);
-        state.action_count = state.action_count.saturating_sub(1);
+        state.action_count -= 1;
         self.finalize_if_drained_locked(&mut state);
         self.changed.notify_all();
         Ok(())
@@ -1646,6 +1654,18 @@ impl LazyGuestMemoryInner {
         }
     }
 
+    fn require_action_locked(
+        &self,
+        state: &mut CoordinatorState,
+    ) -> Result<(), LazyGuestMemoryError> {
+        if state.action_count != 0 {
+            return Ok(());
+        }
+        self.begin_closing_locked(state, LazyGuestMemoryTerminalReason::TransitionFailure);
+        self.changed.notify_all();
+        Err(LazyGuestMemoryError::InvalidLifecycle)
+    }
+
     fn phase_error(&self, state: &CoordinatorState) -> LazyGuestMemoryError {
         LazyGuestMemoryError::Terminal {
             reason: state
@@ -1689,7 +1709,11 @@ impl LazyGuestMemoryInner {
             .position(|operation| operation.generation == generation && operation.kind.is_action())
         {
             state.operations.remove(index);
-            state.action_count = state.action_count.saturating_sub(1);
+            if state.action_count == 0 {
+                self.begin_closing_locked(state, LazyGuestMemoryTerminalReason::TransitionFailure);
+            } else {
+                state.action_count -= 1;
+            }
         }
         self.finalize_if_drained_locked(state);
     }

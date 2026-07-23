@@ -182,7 +182,9 @@ exhaustion, synchronization poison, and teardown all close admission and wake
 waiters with a stable value-redacted result. Explicit termination waits for
 publication/removal actions that already crossed their linearization point;
 destructors close admission without blocking and guards retain mapping
-lifetime until their own cleanup.
+lifetime until their own cleanup. Those actions are non-reentrant: a thread
+must not request overlapping removal or synchronized termination while it
+retains the guard that such an operation must drain.
 
 This coordinator installs no Mach exception port, changes no HVF mapping or
 permission, reads no snapshot source, opens no peer, and changes no API
