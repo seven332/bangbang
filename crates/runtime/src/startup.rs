@@ -13017,9 +13017,9 @@ mod tests {
     }
 
     #[test]
-    fn boot_runtime_vsock_notification_dispatch_accepts_event_queue_as_noop() {
-        let kernel = temp_file("kernel-vsock-event-noop", &arm64_image());
-        let socket_path = missing_path("vsock-event-noop.sock");
+    fn boot_runtime_vsock_notification_dispatch_accepts_event_ack_when_ungated() {
+        let kernel = temp_file("kernel-vsock-event-ack", &arm64_image());
+        let socket_path = missing_path("vsock-event-ack.sock");
         let mut controller = controller_with_kernel(kernel.path());
         add_vsock(&mut controller, 44, &socket_path);
         let config = Arm64BootResourceConfig {
@@ -13046,14 +13046,14 @@ mod tests {
 
         let dispatches = runtime
             .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
-            .expect("vsock dispatch result should allocate");
+            .expect("vsock event acknowledgement should dispatch");
 
         assert_eq!(dispatches.len(), 1);
         assert!(!dispatches.needs_queue_interrupt());
         let dispatch = dispatches.as_slice()[0]
             .outcome()
             .dispatched()
-            .expect("event queue should be accepted as no-op dispatch");
+            .expect("event acknowledgement should be accepted while ungated");
         assert_eq!(
             dispatch.drained_notifications(),
             [VIRTIO_VSOCK_EVENT_QUEUE_INDEX]

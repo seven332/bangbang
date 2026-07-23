@@ -1643,9 +1643,9 @@ is resource-specific:
   guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the
   runtime has an internal Firecracker-shaped packet header model plus TX
-  descriptor packet parser. Startup-level dispatch can drain RX, TX, and no-op
-  event queue notifications, complete descriptor heads, and signal the
-  allocated vsock queue interrupt line when completed descriptors require it.
+  descriptor packet parser. Startup-level dispatch can drain RX, TX, and event
+  queue acknowledgements, complete descriptor heads, and signal the allocated
+  vsock queue interrupt line when completed descriptors require it.
   The runtime can
   also parse host `CONNECT <PORT>` requests, allocate Firecracker-shaped host
   local ports, retain host-initiated accepted streams in an internal table,
@@ -1703,14 +1703,21 @@ is resource-specific:
   never treats a configured path as globally unique, and transport failures and
   signed test diagnostics omit Unix paths and payload bytes. `EVENT_IDX` is
   implemented for RX/TX notification suppression; indirect descriptors are a
-  supported bangbang extension, while the event queue otherwise remains a no-op
-  live notification surface. Signed Apple Silicon cases incrementally verify at
-  least 1 MiB in each direction for both initiation paths, write-half-close/EOF,
-  terminal cleanup, and two-stream isolation. PATCH, DELETE, runtime hotplug,
-  broader CID routing, general performance/artifact parity, and full event
-  payload dispatch remain outside this boundary. Native-v1 snapshot UDS
-  override, event-queue `TRANSPORT_RESET`, and post-restore RX gating are the
-  stable #543 exclusions; the live subset is not a snapshot-containment claim.
+  supported bangbang extension. The event queue validates available, descriptor,
+  payload, and used-ring memory before publishing the four-byte
+  `TRANSPORT_RESET` value. Publication is committed before its mandatory MMIO
+  queue intent or PCI queue-2 signal, arms a runtime-only acknowledgement gate,
+  and leaves paths and packet contents out of diagnostics. Restored-origin
+  signaling arms the same gate without mutating queue state; while gated, TX
+  stays live and every eligible RX source remains buffered without consuming
+  guest descriptors until the first valid event-queue kick. Signed Apple Silicon cases incrementally
+  verify at least 1 MiB in each direction for both initiation paths,
+  write-half-close/EOF, terminal cleanup, and two-stream isolation. PATCH,
+  DELETE, runtime hotplug, broader CID routing, general performance/artifact
+  parity, and broader event types remain outside this boundary. Public native-v1
+  invocation, durable capture, UDS override, restored resource reconstruction,
+  and restored-guest proof remain #1515-#1518/#1490 work; the live subset is not
+  a snapshot-containment claim.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink. The `--metrics-path` startup CLI flag uses the same
   sink and host-path error redaction rules before the API socket is served.
@@ -2471,13 +2478,14 @@ The current scaffold does not implement:
   Startup preparation
   creates a nonblocking host Unix listener at `uds_path` and cleans it up only
   while the path still matches the created socket inode. `EVENT_IDX` is active
-  on RX/TX, indirect descriptors are a supported bangbang extension, and event
-  queue notifications otherwise remain no-op dispatch metadata. This
+  on RX/TX, indirect descriptors are a supported bangbang extension, and the
+  event queue supports validated `TRANSPORT_RESET` publication plus guest
+  acknowledgement of the runtime-only restored-origin RX gate. This
   **implemented supported live MMIO-or-PCI startup/Unix-socket subset** still is not full
   containment: there is no global host-path broker, PATCH/DELETE/runtime
-  hotplug, broader CID routing, or full event payload dispatch. Native-v1
-  snapshot UDS override, event-queue `TRANSPORT_RESET`, and post-restore RX
-  gating remain #543 exclusions.
+  hotplug, broader CID routing, or broader event type. Public native-v1
+  invocation, durable capture, UDS override, restored resource reconstruction,
+  and restored-guest proof remain #1515-#1518/#1490 work.
 - log rotation, syslog, journald, tracing, remote telemetry, or process-global
   panic/fatal observability durability
 - a public serial streaming API, generalized serial artifact encoding/restore,

@@ -2876,16 +2876,23 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::memory::GuestMemoryRange;
+    use crate::memory::{GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::message_interrupt::{
         GuestMessageInterrupt, GuestMessageInterruptResources, GuestMessageInterruptResourcesError,
         GuestMessageInterruptSignalError, RegistryGuestMessageInterruptResources,
     };
+    use crate::metrics::SharedVsockDeviceMetrics;
     use crate::mmio::{MmioBus, MmioHandler};
     use crate::pci::{PciBarAddressSpace, PciBarAllocator};
     use crate::virtio::{
         NoopVirtioDeviceActivation, UnsupportedVirtioDeviceConfig, VirtioDeviceActivationError,
         VirtioDeviceResetError,
+    };
+    use crate::virtio_queue::{VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE};
+    use crate::vsock::{
+        VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockConfigSpace,
+        VirtioVsockDevice, VirtioVsockRestoredTransportResetSignal,
+        VirtioVsockTransportResetAttempt,
     };
 
     type TestEndpoint =
@@ -2941,6 +2948,14 @@ mod tests {
 
     struct TestFixture {
         endpoint: TestEndpoint,
+        bar: PciBarLease,
+        _allocator: PciBarAllocator,
+        messages: Vec<GuestMessage>,
+        signals: Vec<Arc<Mutex<Vec<GuestMessage>>>>,
+    }
+
+    struct VsockTestFixture {
+        endpoint: VirtioPciEndpoint<VirtioVsockConfigSpace, VirtioVsockDevice>,
         bar: PciBarLease,
         _allocator: PciBarAllocator,
         messages: Vec<GuestMessage>,
@@ -3050,6 +3065,172 @@ mod tests {
             messages,
             signals,
         }
+    }
+
+    fn vsock_fixture() -> VsockTestFixture {
+        let range = GuestMemoryRange::new(
+            GuestAddress::new(0x5_0000_0000),
+            VIRTIO_PCI_CAPABILITY_BAR_SIZE * 2,
+        )
+        .expect("vsock test BAR allocator range should validate");
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, range);
+        let bar = allocator
+            .allocate(VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+            .expect("vsock test BAR should allocate");
+        let vector_count = VIRTIO_VSOCK_QUEUE_SIZES.len() + 1;
+        let mut messages = Vec::new();
+        let mut signals = Vec::new();
+        let mut routes: Vec<Arc<dyn GuestMessageInterrupt>> = Vec::new();
+        for index in 0..vector_count {
+            let message = GuestMessage::new(
+                0x0800_0080,
+                u32::try_from(128 + index).expect("vsock test vector should fit"),
+            );
+            let recording = Arc::new(Mutex::new(Vec::new()));
+            routes.push(Arc::new(RecordingRoute {
+                message,
+                signals: Arc::clone(&recording),
+            }));
+            messages.push(message);
+            signals.push(recording);
+        }
+        let registry = GuestMessageInterruptRegistry::new(routes)
+            .expect("vsock test message registry should validate");
+        let config = VirtioVsockConfigSpace::new(42);
+        let endpoint = VirtioPciEndpoint::new(
+            VirtioPciIdentity::new(
+                VirtioDeviceType::new(VIRTIO_VSOCK_DEVICE_ID)
+                    .expect("vsock device type should validate"),
+                config.available_features(),
+            ),
+            &VIRTIO_VSOCK_QUEUE_SIZES,
+            config,
+            VirtioVsockDevice::new(),
+            false,
+            &bar,
+            registry,
+        )
+        .expect("vsock endpoint should initialize");
+        VsockTestFixture {
+            endpoint,
+            bar,
+            _allocator: allocator,
+            messages,
+            signals,
+        }
+    }
+
+    fn configure_vsock_endpoint(
+        fixture: &VsockTestFixture,
+        event_message: GuestMessage,
+        masked: bool,
+    ) {
+        let bus = bar_bus_for_bar(&fixture.bar);
+        let base = fixture.bar.range().start();
+        let mut bar = fixture.endpoint.bar_handler();
+        let event_vector = 2_u16;
+        let event_entry =
+            VIRTIO_PCI_MSIX_TABLE_OFFSET + u64::from(event_vector) * MSIX_TABLE_ENTRY_SIZE;
+
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            event_entry,
+            &event_message.address().to_le_bytes(),
+        )
+        .expect("event MSI-X address should write");
+        let data_and_control =
+            (u64::from(u32::from(masked)) << 32) | u64::from(event_message.data());
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            event_entry + 8,
+            &data_and_control.to_le_bytes(),
+        )
+        .expect("event MSI-X data and mask should write");
+
+        bar_write(&mut bar, &bus, base, 0x14, &[1]).expect("ACKNOWLEDGE should write");
+        bar_write(&mut bar, &bus, base, 0x14, &[3]).expect("DRIVER should write");
+        bar_write(&mut bar, &bus, base, 0x14, &[11]).expect("FEATURES_OK should write");
+        for queue_index in 0..VIRTIO_VSOCK_QUEUE_SIZES.len() {
+            let queue_index_u16 = u16::try_from(queue_index).expect("vsock queue index should fit");
+            let queue_base = 0x1000_u64
+                + u64::try_from(queue_index).expect("vsock queue index should fit") * 0x1000;
+            bar_write(&mut bar, &bus, base, 0x16, &queue_index_u16.to_le_bytes())
+                .expect("queue select should write");
+            bar_write(&mut bar, &bus, base, 0x18, &8_u16.to_le_bytes())
+                .expect("queue size should write");
+            bar_write(&mut bar, &bus, base, 0x1a, &queue_index_u16.to_le_bytes())
+                .expect("queue vector should write");
+            bar_write(
+                &mut bar,
+                &bus,
+                base,
+                0x20,
+                &u32::try_from(queue_base)
+                    .expect("descriptor address should fit")
+                    .to_le_bytes(),
+            )
+            .expect("descriptor address should write");
+            bar_write(
+                &mut bar,
+                &bus,
+                base,
+                0x28,
+                &u32::try_from(queue_base + 0x200)
+                    .expect("available address should fit")
+                    .to_le_bytes(),
+            )
+            .expect("available address should write");
+            bar_write(
+                &mut bar,
+                &bus,
+                base,
+                0x30,
+                &u32::try_from(queue_base + 0x400)
+                    .expect("used address should fit")
+                    .to_le_bytes(),
+            )
+            .expect("used address should write");
+            bar_write(&mut bar, &bus, base, 0x1c, &1_u16.to_le_bytes())
+                .expect("queue enable should write");
+        }
+        bar_write(&mut bar, &bus, base, 0x14, &[15]).expect("DRIVER_OK should activate");
+    }
+
+    fn vsock_event_memory() -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), 0x20_000)
+                .expect("vsock test memory range should validate"),
+        ])
+        .expect("vsock test memory layout should validate");
+        GuestMemory::allocate(&layout).expect("vsock test memory should allocate")
+    }
+
+    fn publish_vsock_event_descriptor(memory: &mut GuestMemory, descriptor_len: u32) {
+        let mut descriptor = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        descriptor[..8].copy_from_slice(&0x9000_u64.to_le_bytes());
+        descriptor[8..12].copy_from_slice(&descriptor_len.to_le_bytes());
+        descriptor[12..14].copy_from_slice(&VIRTQUEUE_DESC_F_WRITE.to_le_bytes());
+        memory
+            .write_slice(&descriptor, GuestAddress::new(0x3000))
+            .expect("event descriptor should write");
+        memory
+            .write_slice(&0_u16.to_le_bytes(), GuestAddress::new(0x3204))
+            .expect("event available head should write");
+        memory
+            .write_slice(&1_u16.to_le_bytes(), GuestAddress::new(0x3202))
+            .expect("event available index should write");
+    }
+
+    fn read_vsock_event_used_index(memory: &GuestMemory) -> u16 {
+        let mut bytes = [0; 2];
+        memory
+            .read_slice(&mut bytes, GuestAddress::new(0x3402))
+            .expect("event used index should read");
+        u16::from_le_bytes(bytes)
     }
 
     fn registry_resources(vector_count: usize) -> RegistryGuestMessageInterruptResources {
@@ -3660,6 +3841,139 @@ mod tests {
             .trigger(VirtioInterruptIntent::Configuration)
             .unwrap();
         assert_eq!(fixture.signals[0].lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn vsock_transport_reset_routes_event_queue_msix_and_preserves_masked_pending() {
+        let fixture = vsock_fixture();
+        let event_message = fixture.messages[2];
+        configure_vsock_endpoint(&fixture, event_message, true);
+        let mut memory = vsock_event_memory();
+        let metrics = SharedVsockDeviceMetrics::default();
+        publish_vsock_event_descriptor(&mut memory, 8);
+
+        let attempt = fixture
+            .endpoint
+            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .expect("masked transport reset should complete");
+
+        assert!(matches!(
+            attempt,
+            VirtioVsockTransportResetAttempt::Published(_)
+        ));
+        assert_eq!(read_vsock_event_used_index(&memory), 1);
+        assert!(
+            fixture
+                .endpoint
+                .inner
+                .state
+                .lock()
+                .expect("endpoint state should be healthy")
+                .core
+                .activation
+                .pending_event_ack()
+        );
+        assert!(fixture.signals[2].lock().unwrap().is_empty());
+        let bus = bar_bus_for_bar(&fixture.bar);
+        let base = fixture.bar.range().start();
+        let mut bar = fixture.endpoint.bar_handler();
+        assert_eq!(
+            u64::from_le_bytes(
+                bar_read(&mut bar, &bus, base, VIRTIO_PCI_MSIX_PBA_OFFSET, 8)
+                    .try_into()
+                    .expect("PBA word should fit")
+            ),
+            1_u64 << 2
+        );
+
+        let event_entry = VIRTIO_PCI_MSIX_TABLE_OFFSET + 2 * MSIX_TABLE_ENTRY_SIZE;
+        bar_write(&mut bar, &bus, base, event_entry + 12, &0_u32.to_le_bytes())
+            .expect("event vector should unmask");
+
+        assert_eq!(
+            fixture.signals[2]
+                .lock()
+                .expect("event signal list should be healthy")
+                .as_slice(),
+            [event_message]
+        );
+        assert_eq!(metrics.snapshot().ev_queue_event_fails(), 0);
+    }
+
+    #[test]
+    fn vsock_restored_signal_routes_event_queue_msix_without_queue_mutation() {
+        let fixture = vsock_fixture();
+        let event_message = fixture.messages[2];
+        configure_vsock_endpoint(&fixture, event_message, false);
+        let memory = vsock_event_memory();
+        let metrics = SharedVsockDeviceMetrics::default();
+
+        let signal = fixture
+            .endpoint
+            .signal_restored_vsock_transport_reset(&metrics)
+            .expect("restored reset should signal");
+
+        assert_eq!(signal, VirtioVsockRestoredTransportResetSignal::Signaled);
+        assert_eq!(read_vsock_event_used_index(&memory), 0);
+        assert!(
+            fixture
+                .endpoint
+                .inner
+                .state
+                .lock()
+                .expect("endpoint state should be healthy")
+                .core
+                .activation
+                .pending_event_ack()
+        );
+        assert_eq!(
+            fixture.signals[2]
+                .lock()
+                .expect("event signal list should be healthy")
+                .as_slice(),
+            [event_message]
+        );
+        assert_eq!(metrics.snapshot().ev_queue_event_fails(), 0);
+    }
+
+    #[test]
+    fn vsock_transport_reset_preserves_publication_when_msix_delivery_fails() {
+        let fixture = vsock_fixture();
+        let unknown_message = GuestMessage::new(0xdead_beef, 0x1234);
+        configure_vsock_endpoint(&fixture, unknown_message, false);
+        let mut memory = vsock_event_memory();
+        let metrics = SharedVsockDeviceMetrics::default();
+        publish_vsock_event_descriptor(&mut memory, 4);
+
+        let error = fixture
+            .endpoint
+            .prepare_vsock_transport_reset(&mut memory, &metrics)
+            .expect_err("unknown MSI-X tuple should fail after reset publication");
+
+        assert!(matches!(
+            error.completed_device_operation(),
+            Some(VirtioVsockTransportResetAttempt::Published(_))
+        ));
+        assert!(matches!(
+            error.endpoint_error(),
+            Some(VirtioPciEndpointError::MessageRegistry {
+                source: GuestMessageInterruptRegistryError::UnknownMessage
+            })
+        ));
+        assert_eq!(read_vsock_event_used_index(&memory), 1);
+        assert!(
+            fixture
+                .endpoint
+                .inner
+                .state
+                .lock()
+                .expect("endpoint state should be healthy")
+                .core
+                .activation
+                .pending_event_ack()
+        );
+        assert_eq!(metrics.snapshot().ev_queue_event_fails(), 1);
+        assert!(!format!("{error:?}").contains("deadbeef"));
     }
 
     #[test]
