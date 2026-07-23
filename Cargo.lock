@@ -156,6 +156,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bangbang-pager"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "libc",
+]
+
+[[package]]
 name = "bangbang-runtime"
 version = "0.1.0"
 dependencies = [

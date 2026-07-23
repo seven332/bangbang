@@ -1113,13 +1113,17 @@ moves one exact corpus record to #1527-owned
 `missing-platform-feasible`, making the current overlay 228/169/4/17 without
 changing native-v1 rejection.
 
-Snapshot paging feasibility is guarded separately from implementation. Its
-focused inventory test pins the upstream contract, public macOS environment,
-signed host/guest/removal/peer-loss/cleanup output, unchanged App Sandbox and
-Hypervisor entitlement floor, stable pre-access rejection anchors, exact
-delivery owner, and nonterminal status:
+Snapshot paging feasibility and its standalone protocol slice are guarded
+separately from runtime integration. The inventory test pins the upstream
+contract, public macOS environment, signed prototype output, unchanged
+entitlement floor, stable pre-access rejection anchors, exact delivery owner,
+protocol source/document anchors, and nonterminal status. The pager package
+then covers canonical framing, every split/coalesced boundary, adversarial
+input, negotiation, exact out-of-order matching, cancellation, shutdown,
+timeout/EOF, redaction, and two inherited-stream child-process sessions:
 
 ```sh
+cargo test -p bangbang-pager --all-targets --all-features --locked
 cargo test -p bangbang-firecracker-capability-audit --test checked_inventory snapshot_paging_feasibility_policy_is_stable --locked
 cargo test -p bangbang-runtime native_v1_load_policy_rejects_each_unsupported_dimension --locked
 cargo test -p bangbang returns_fault_for_snapshot_endpoint --locked
@@ -1127,8 +1131,8 @@ cargo test -p bangbang returns_fault_for_snapshot_endpoint --locked
 
 The final #1527 certification must run the complete signed wrapper without
 `--allow-unsupported` and exercise the production pager path before promotion.
-The retained prototypes and this ledger are not production implementation
-evidence.
+The retained prototypes, standalone protocol, and ledger are not production
+memory/fault/broker/restore implementation evidence.
 
 Run its two focused gates with:
 

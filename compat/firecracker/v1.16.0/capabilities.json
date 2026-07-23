@@ -9089,7 +9089,7 @@
     {
       "id": "corpus:snapshot-page-faults",
       "family": "snapshots",
-      "summary": "Public macOS APIs can reproduce the observable external demand-paging contract with task-local Mach exception mediation, HVF stage-two guest faults, one bounded coordinator, and an offset-only external protocol. Native-v1 Uffd remains rejected before resource access; https://github.com/seven332/bangbang/issues/1527 owns protocol, memory, fault, brokerage, removal/failure, consumer-gating, restore, and signed-certification delivery. This is not Linux UFFD descriptor or wire compatibility.",
+      "summary": "Public macOS APIs can reproduce the observable external demand-paging contract with task-local Mach exception mediation and HVF stage-two guest faults. The standalone bounded offset-only bangbang-pager-v1 codec, role state machines, and already-connected deadline transport are implemented and process-tested, but Native-v1 Uffd remains rejected before resource access; https://github.com/seven332/bangbang/issues/1527 still owns memory, fault, brokerage, removal/failure, consumer-gating, restore, and signed-certification delivery. This is not Linux UFFD descriptor or wire compatibility.",
       "source_refs": [
         "corpus:snapshot-page-faults"
       ],

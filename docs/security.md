@@ -2119,10 +2119,11 @@ into unbounded waits.
 
 The checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
-records positive public-macOS feasibility, not a shipped pager. Native-v1
-`Uffd` still rejects before path, socket, artifact, or backend access.
+records positive public-macOS feasibility and one implemented standalone
+protocol slice, not a shipped pager. Native-v1 `Uffd` still rejects before
+path, socket, artifact, or backend access.
 
-The accepted later boundary uses two in-worker protection planes: public Mach
+The accepted complete boundary uses two in-worker protection planes: public Mach
 task exceptions mediate host accesses to owned absent guest pages, and HVF
 stage-two permissions mediate guest accesses. Task and thread ports remain
 inside the worker because an exception receiver has whole-task authority, not
@@ -2130,15 +2131,22 @@ UFFD's registered-range authority. Unrelated exceptions must be forwarded and
 the prior task configuration conditionally restored.
 
 The external content owner receives neither task ports nor host virtual
-addresses. The launcher reduces the configured Unix path to one connected
-stream, and the worker exposes only versioned, bounded, offset-based
-`bangbang-pager-v1` requests. This adds no ambient network entitlement,
-dynamic Mach service, root requirement, private API, entitlement weakening, or
-host-wide setting.
+addresses. The implemented
+[`bangbang-pager-v1` contract](snapshot-pager-protocol.md) carries only random
+session IDs, opaque region/request/generation IDs, aligned offsets and bounded
+page data. It has no peer strings, paths, addresses, descriptors, or task
+ports; Debug and errors are value-redacted. Its transport accepts only an
+already-connected stream, uses one absolute deadline across partial I/O,
+suppresses `SIGPIPE`, and becomes terminal after malformed input, timeout, EOF,
+or transport failure. Later launcher work reduces the configured Unix path to
+that connected stream. This adds no ambient network entitlement, dynamic Mach
+service, root requirement, private API, entitlement weakening, or host-wide
+setting.
 
 Handler failure while a host instruction is suspended is a mandatory
-fail-closed supervision gate. Later implementation must bound I/O and take one
-documented terminal path; it may not fabricate zero or stale contents, fall
+fail-closed supervision gate. The protocol already bounds I/O and forbids
+automatic replay; later fault/supervision integration must take one documented
+terminal cleanup path. It may not fabricate zero or stale contents, fall
 through accidentally to `SIGBUS`, swallow a genuine crash, or wait
 indefinitely. External/shared mappings that bypass the task-local bridge remain
 pre-resource rejections until independently certified.

@@ -91,12 +91,13 @@ claims mechanically visible.
   ledger. It pins the exact 14 directly named records, promotes eight complete
   API/live outcomes, and retains six explicit #1490 optional-device encoding,
   public restore, clone/version, and portability handoffs.
-- [`snapshot-paging-contract.md`](snapshot-paging-contract.md) is the #1546
-  checked public-macOS UFFD-equivalent feasibility ledger. It pins the exact
-  page-fault corpus, upstream observable contract, public API and signed
-  prototype evidence, current pre-access rejection, security boundary, and
-  #1527 delivery gates without claiming Linux wire compatibility or runtime
-  support.
+- [`snapshot-paging-contract.md`](snapshot-paging-contract.md) is the
+  #1546/#1547 checked public-macOS UFFD-equivalent feasibility and standalone
+  protocol ledger. It pins the exact page-fault corpus, upstream observable
+  contract, signed prototype evidence, implemented bounded
+  `bangbang-pager-v1` wire/state/connected-transport slice, current pre-access
+  rejection, security boundary, and remaining #1527 gates without claiming
+  Linux wire compatibility or runtime support.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -564,12 +565,14 @@ reconciles those producers with the API and signed live evidence in the checked
 eight API/live rows and retains six precise Wave 6 #1490 outcomes, so the
 overlay at that checkpoint was 228/170/3/17.
 
-#1546 subsequently records the positively challenged public-macOS
-UFFD-equivalent feasibility decision in the checked
+#1546 records the positively challenged public-macOS UFFD-equivalent
+feasibility decision in the checked
 [`snapshot-paging-contract.md`](snapshot-paging-contract.md). It moves only
 `corpus:snapshot-page-faults` from unreviewed audit to
 `missing-platform-feasible` with #1527 as delivery owner; native-v1 `Uffd`
-remains rejected and no terminal evidence is added. The current overlay is
+remains rejected and no terminal evidence is added. #1547 then adds the
+standalone closed protocol crate and real inherited-stream process coverage
+without changing that aggregate disposition. The current overlay remains
 228/169/4/17.
 
 ## Commands
