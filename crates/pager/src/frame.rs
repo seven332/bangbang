@@ -914,17 +914,27 @@ impl PagerFrameDecoder {
         }
         self.buffer.extend_from_slice(bytes);
         let mut frames = Vec::new();
+        let mut consumed = 0_usize;
         loop {
-            if self.buffer.len() < HEADER_BYTES {
+            let remaining = self
+                .buffer
+                .get(consumed..)
+                .ok_or(PagerError::InvalidFrame)?;
+            if remaining.len() < HEADER_BYTES {
                 break;
             }
-            let (_, total) = declared_frame(&self.buffer)?;
-            if self.buffer.len() < total {
+            let (_, total) = declared_frame(remaining)?;
+            if remaining.len() < total {
                 break;
             }
-            let encoded = self.buffer.get(..total).ok_or(PagerError::InvalidFrame)?;
+            let encoded = remaining.get(..total).ok_or(PagerError::InvalidFrame)?;
             frames.push(decode_frame(encoded)?);
-            self.buffer.drain(..total);
+            consumed = consumed
+                .checked_add(total)
+                .ok_or(PagerError::LimitExceeded)?;
+        }
+        if consumed != 0 {
+            self.buffer.drain(..consumed);
         }
         Ok(frames)
     }
@@ -1320,6 +1330,14 @@ mod tests {
                 .expect("coalesced frames should decode"),
             vec![first, second]
         );
+
+        let small = encode_frame(&PagerFrame::new(session(), PagerMessage::Start))
+            .expect("small frame should encode");
+        let many = small.repeat(4096);
+        let frames = PagerFrameDecoder::new()
+            .push(&many)
+            .expect("many coalesced frames should decode");
+        assert_eq!(frames.len(), 4096);
     }
 
     #[test]
