@@ -556,17 +556,39 @@ and then reuse a fresh writer successfully. Run the focused module with
 Native-v2 structural state tests pin an independent exact 72-byte empty
 `2.0.0` fixture and keep the named native-v1 fixture byte-for-byte stable. A
 private catalog-aware test codec exercises multiple required features,
-semantic components, instances, and an ignorable nonsemantic extension while
-the empty production catalog rejects every required feature and semantic
-component. The mutation corpus covers every fixed header field, both count
-caps, exact/trailing/oversized lengths, all three offsets, CRC and every
-truncation, feature zero/order/duplicate/unknown cases, and component
+semantic components, instances, and an ignorable nonsemantic extension. The
+production `2.1.0` catalog admits only semantic memory kind 1 introduced in
+minor 1; the typed profile further requires instance 0. The mutation corpus
+covers every fixed header field, both count caps, exact/trailing/oversized
+lengths, all three offsets, CRC and every truncation, feature
+zero/order/duplicate/unknown cases, and component
 key/order/flag/reserved/empty/gap/overlap/wrap/trailing-range cases. It also
 checks patch/minor/major policy, introduction-minor catalogs, borrowed views,
 redacted diagnostics, allocation failure, native-v1/v2 family dispatch, and
-named Firecracker-family incompatibility without invoking a typed decoder or
+named Firecracker-family incompatibility without invoking an unsupported
 resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
+
+Native-v2 lazy-memory tests pin exact multi-extent binding and complete `2.1.0`
+state fixtures. They cover canonical 64-KiB metadata/data offsets and sparse
+gaps, every binding/header/topology/length mutation, typed state profiles,
+read-only/CLOEXEC/regular descriptor policy, final-symlink rejection,
+descriptor/path replacement, source truncation at both rechecks, retained-file
+and cursor independence, private COW isolation, clean dirty baselines, mixed
+private/anonymous/shared owners, source-preserving discard, pre-mmap validation,
+and partial mapping rollback. Writer coverage keeps output empty/position-zero,
+bounds all copying to 1-MiB chunks, exercises cancellation without returning a
+binding, and proves the exact final length. Run it with
+`cargo test -p bangbang-runtime snapshot_memory_v2 --locked`.
+
+The signed `hvf_lifecycle` lazy-memory case writes a 64-MiB image, drops the
+source allocation, loads the retained file mapping, and proves bounded resident
+and fault growth before guest entry. The guest demand-faults a distant page,
+writes it through COW, resumes after the dirty write fault, executes two HVC
+exits, and leaves the source bytes unchanged. It also proves a clean initial
+dirty epoch, the exact dirtied page, ordinary unmap/destroy, and post-VM-destroy
+owner cleanup. Run it only through `scripts/run-integration-tests.sh`; unsigned
+workspace tests must not execute real HVF.
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,

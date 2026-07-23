@@ -386,14 +386,18 @@ additional drives, serialized/restorable optional-device snapshot state,
 active SVE/SME/debug state, EL2 GIC CPU-interface state, and cross-host
 portability remain unsupported.
 
-Separately, the runtime library defines the allocation-free first-pass grammar
-for a future bangbang-native v2 arm64 state container. The initial `2.0.0`
-production catalog is structural only: its canonical state is empty, unknown
-explicitly nonsemantic extensions can be validated, and every required feature
-or semantic component rejects. No public create, load, describe, or version
+Separately, the runtime library implements the first bangbang-native v2 arm64
+state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
+readable; the current `2.1.0` catalog adds exactly one semantic memory component
+whose bounded GPA extents bind a canonical 64-KiB-aligned image. Library callers
+can write that image or load it from one retained read-only `File` as writable
+`MAP_PRIVATE` regions, so pages arrive on demand and writes remain private. The
+state and fixed 64-KiB metadata are CRC-protected, but guest bytes deliberately
+are not checksummed or authenticated and require an external artifact
+authentication/encryption policy. No public create, load, describe, or version
 path emits or accepts v2 yet, and recognizing a pinned Firecracker bitcode
-prefix reports incompatibility rather than claiming decode or translation.
-The exact wire and compatibility contract is documented in
+prefix reports incompatibility rather than claiming decode or translation. The
+exact wire, ownership, and compatibility contract is documented in
 [Snapshot Feasibility](docs/snapshot-feasibility.md#native-v2-structural-state-foundation).
 
 ## Process CLI

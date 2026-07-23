@@ -6143,7 +6143,8 @@ mod tests {
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::{MachineConfig, MachineConfigInput};
     use crate::memory::{
-        GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange, aarch64,
+        GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange,
+        GuestMemoryRegionBacking, aarch64,
     };
     use crate::memory_hotplug::{
         MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
@@ -6378,7 +6379,7 @@ mod tests {
 
         assert_eq!(resources.memory.backing(), GuestMemoryBacking::Shared);
         assert!(resources.memory.regions().iter().all(|region| {
-            region.backing() == GuestMemoryBacking::Shared
+            region.backing() == GuestMemoryRegionBacking::Shared
                 && region
                     .try_clone_shared_backing()
                     .expect("shared startup descriptor should clone")

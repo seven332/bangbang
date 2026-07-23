@@ -25,8 +25,8 @@ use bangbang_vhost_user::{
 };
 
 use crate::memory::{
-    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
-    GuestMemorySharedBacking, GuestMemorySharedBackingError,
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryError,
+    GuestMemoryRange, GuestMemorySharedBacking, GuestMemorySharedBackingError,
 };
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
@@ -5585,6 +5585,9 @@ impl VhostUserBlockMemoryRegion {
     fn preflight_guest_memory(
         memory: &GuestMemory,
     ) -> Result<(), PreparedVhostUserBlockMemoryError> {
+        if memory.backing() != GuestMemoryBacking::Shared {
+            return Err(PreparedVhostUserBlockMemoryError::AnonymousMemory);
+        }
         if memory.shared_export_regions().next().is_none() {
             return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);
         }
@@ -5603,6 +5606,9 @@ impl VhostUserBlockMemoryRegion {
     fn from_guest_memory(
         memory: &GuestMemory,
     ) -> Result<Vec<Self>, PreparedVhostUserBlockMemoryError> {
+        if memory.backing() != GuestMemoryBacking::Shared {
+            return Err(PreparedVhostUserBlockMemoryError::AnonymousMemory);
+        }
         let region_count = memory.shared_export_regions().count();
         if region_count == 0 {
             return Err(PreparedVhostUserBlockMemoryError::EmptyMemory);

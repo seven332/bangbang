@@ -1231,21 +1231,41 @@ is resource-specific:
   it is not authentication, and a party that can rewrite the file can recompute
   it. Future payload schemas must therefore stay memory-safe and fail closed
   even for checksum-valid attacker-controlled bytes.
-- Native-v2 structural state is currently a library-only, non-loadable format
-  foundation. Its first pass treats all bytes as hostile, caps the complete
-  file at 16 MiB, caps feature and component counts before table traversal,
-  uses checked conversions and arithmetic, requires canonical packed ranges
-  and exact EOF, and validates the whole-state CRC before publishing a borrowed
-  view. The pass performs no count-proportional allocation. The `2.0.0`
-  production catalogs contain no required feature or semantic component, so
-  unknown mandatory behavior fails closed; only explicitly marked
-  nonsemantic extensions can survive complete structural validation. Errors
-  and `Debug` omit identifiers, payloads, format magic, guest contents, and raw
-  state. CRC-64/Jones is corruption detection rather than authentication and
-  does not cover any future external guest-memory bytes. The Firecracker
-  prefix classifier proves only an incompatible family and never deserializes
-  or translates upstream bitcode. No public create, describe, load, or VM
-  action consumes v2 in this slice.
+- Native-v2 state is currently a library-only, incomplete VM-state format. Its
+  first pass treats all bytes as hostile, caps the complete file at 16 MiB,
+  caps feature and component counts before table traversal, uses checked
+  conversions and arithmetic, requires canonical packed ranges and exact EOF,
+  and validates the whole-state CRC before publishing a borrowed view. The pass
+  performs no count-proportional allocation. The immutable `2.0.0` catalogs are
+  empty; current `2.1.0` adds only semantic memory kind 1, instance 0. Unknown
+  mandatory behavior fails closed, while explicitly nonsemantic extensions can
+  survive complete structural validation. Errors and `Debug` omit identifiers,
+  payloads, format magic, guest contents, and raw state. The Firecracker prefix
+  classifier proves only an incompatible family and never deserializes or
+  translates upstream bitcode. No public create, describe, load, or VM action
+  consumes v2 in this slice.
+- Native-v2 lazy memory validates the state binding before opening or adopting
+  a source, then requires a read-only close-on-exec regular descriptor, exact
+  canonical length, stable descriptor identity/facts, an exact repeated header,
+  and zero fixed 64-KiB padding. Direct opens are anchored at the parent and
+  reject a final symlink; contained callers supply the exact `File`. Validation
+  reads only that fixed metadata area. All extents are checked for topology,
+  host-page compatibility, conversion, offset, and file bounds before the first
+  mapping. Every extent then retains the same descriptor through a writable
+  `MAP_PRIVATE`/no-reserve mapping; no path is reopened, no guest bytes are
+  eagerly copied, and all partial owners drop normally on failure. Descriptor
+  facts are rechecked after metadata and after mapping to reject substitution or
+  mutation during setup. The arbitrary external inode cannot be sealed on
+  macOS, so it must remain immutable for the entire mapping lifetime.
+- V2 guest writes and discard never write or punch the retained source. COW
+  writes enter the ordinary dirty epoch; discard replaces an aligned private
+  subrange with anonymous zero pages and marks it dirty. The binding and state
+  CRCs cover metadata only: guest bytes intentionally have no digest, trailer,
+  authentication, or encryption. An actor able to rewrite the artifacts can
+  recompute CRCs or alter lazy guest pages after validation. Deployment must
+  authenticate the complete state/memory pair and apply encryption when guest
+  memory confidentiality is required. Signed demand-fault/COW evidence is a
+  lifecycle proof, not an artifact trust mechanism.
 - Native guest-memory bindings and images are also untrusted. The binding caps
   metadata at 4,096 exact GPA ranges / 98,376 encoded bytes and memory data at
   the current 1,022-GiB arm64 policy, checks every conversion, alignment,

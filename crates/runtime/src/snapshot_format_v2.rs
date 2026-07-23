@@ -34,8 +34,12 @@ const COMPONENT_FLAG_SEMANTIC: u32 = 0;
 const COMPONENT_FLAG_NONSEMANTIC: u32 = 1;
 const REDACTED: &str = "<redacted>";
 
-/// Semantic version of the structural native-v2 foundation.
-pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 0, 0);
+/// Semantic version of the immutable structural native-v2 foundation.
+pub const NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION: SnapshotFormatVersion =
+    SnapshotFormatVersion::new(2, 0, 0);
+
+/// Semantic version emitted by the current native-v2 writer.
+pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 1, 0);
 
 /// Fixed native-v2 state header size.
 pub const NATIVE_V2_SNAPSHOT_HEADER_BYTES: usize = 64;
@@ -62,7 +66,10 @@ struct CatalogEntry {
 }
 
 const PRODUCTION_REQUIRED_FEATURES: &[CatalogEntry] = &[];
-const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[];
+const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[CatalogEntry {
+    id: NATIVE_V2_MEMORY_COMPONENT_KEY.kind,
+    introduced_minor: 1,
+}];
 
 const _: () = assert!(catalog_is_canonical(PRODUCTION_REQUIRED_FEATURES));
 const _: () = assert!(catalog_is_canonical(PRODUCTION_SEMANTIC_COMPONENTS));
@@ -110,6 +117,10 @@ impl SnapshotV2ComponentKey {
         self.instance
     }
 }
+
+/// Canonical identity of the singleton native-v2 guest-memory binding.
+pub const NATIVE_V2_MEMORY_COMPONENT_KEY: SnapshotV2ComponentKey =
+    SnapshotV2ComponentKey::new(1, 0);
 
 impl fmt::Debug for SnapshotV2ComponentKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

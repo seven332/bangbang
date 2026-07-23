@@ -3828,9 +3828,14 @@ Their eventual support level should follow the endpoint matrix:
   restored-guest acknowledgement/reconnect/override proof, clone/versioning,
   and portability remain #1490 work rather than live snapshot-compatibility
   claims
-- snapshot behavior beyond the implemented narrow native-v1 profile, including
-  optional-device state, Diff artifacts, overrides, Firecracker artifact
-  compatibility, and cross-host portability
+- snapshot behavior beyond the implemented narrow native-v1 profile. The
+  library-only native-v2 `2.1.0` foundation now includes a canonical 64-KiB
+  aligned memory binding, retained read-only File validation, and demand-paged
+  private COW/HVF mappings with dirty and cleanup proof, but no public v2
+  create/load/describe dispatch or complete machine/vCPU/device state. Remaining
+  work includes public transactional artifacts, optional-device state, Diff
+  artifacts, overrides, Firecracker artifact compatibility, authentication,
+  clone policy, and cross-host portability
 - balloon producers outside the implemented queue/discard/reporting activity
   and serialized/restored balloon state; live paired PFN accounting and
   capture-ready ownership are implemented, while absent guest statistics are

@@ -6,6 +6,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crc64::crc64;
 
+#[cfg(test)]
+use crate::memory::GuestMemoryRegionBacking;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError,
     GuestMemoryBacking, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64,
@@ -2038,7 +2040,7 @@ mod tests {
 
         assert_eq!(loaded.backing(), GuestMemoryBacking::Shared);
         assert!(loaded.regions().iter().all(|region| {
-            region.backing() == GuestMemoryBacking::Shared
+            region.backing() == GuestMemoryRegionBacking::Shared
                 && region
                     .try_clone_shared_backing()
                     .expect("loaded shared descriptor should clone")
