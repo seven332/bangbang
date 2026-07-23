@@ -544,17 +544,32 @@ mod tests {
 
     #[test]
     fn ancillary_descriptors_are_closed_and_rejected() {
-        let (left, right) = UnixStream::pair().expect("stream pair should open");
+        assert_ancillary_descriptors_closed(0);
+        assert_ancillary_descriptors_closed(HEADER_BYTES + 1);
+    }
+
+    fn assert_ancillary_descriptors_closed(prefix_len: usize) {
+        let (left, mut right) = UnixStream::pair().expect("stream pair should open");
         let mut receiver =
             PagerTransport::new(left, Duration::from_secs(1)).expect("transport should initialize");
         let encoded = encode_frame(&hello()).expect("frame should encode");
+        right
+            .write_all(
+                encoded
+                    .get(..prefix_len)
+                    .expect("plain frame prefix should exist"),
+            )
+            .expect("plain frame prefix should send");
         let (transferred, probe) = UnixStream::pair().expect("descriptor pair should open");
         suppress_socket_sigpipe(probe.as_raw_fd()).expect("probe should suppress SIGPIPE");
         let descriptors = [transferred.as_raw_fd(); 3];
+        let descriptor_bytes = encoded
+            .get(prefix_len..)
+            .expect("descriptor-bearing suffix should exist");
         assert_eq!(
-            send_with_descriptors(right.as_raw_fd(), &encoded, &descriptors)
+            send_with_descriptors(right.as_raw_fd(), descriptor_bytes, &descriptors)
                 .expect("descriptor-bearing frame should send"),
-            encoded.len()
+            descriptor_bytes.len()
         );
         drop(transferred);
         assert_eq!(receiver.receive(), Err(PagerError::InvalidFrame));
