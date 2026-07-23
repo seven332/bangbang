@@ -1072,9 +1072,13 @@ round-robin host-local-port allocation, `EVENT_IDX`, and process-local listener
 ownership with path/payload-redacted transport diagnostics. Signed Apple
 Silicon tests verify at least 1 MiB in each direction for both initiation paths
 plus two-stream isolation. Indirect descriptors are a supported bangbang
-extension. Native-v1 snapshot UDS override, event-queue `TRANSPORT_RESET`, and
-post-restore RX gating remain explicit exclusions; this does not claim general
-performance, Firecracker artifact, or snapshot parity.
+extension. The active event queue now owns validated rings and exposes explicit
+source-side `TRANSPORT_RESET` publication plus restored-origin queue signaling;
+the runtime-only acknowledgement gate preserves eligible RX work until the
+first guest event-queue kick while TX remains live. Public native-v1 invocation,
+durable vsock capture, UDS override, restored resource reconstruction, and
+end-to-end restored-guest proof remain #1515-#1518/#1490 work; this does not
+claim general performance, Firecracker artifact, or snapshot parity.
 
 Configure metrics output before boot:
 

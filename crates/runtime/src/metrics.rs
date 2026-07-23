@@ -28,7 +28,8 @@ use crate::serial::SerialOutputMetrics;
 use crate::vsock::{
     VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
     VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError,
-    VirtioVsockRxQueueDispatch, VirtioVsockTxQueueDispatch,
+    VirtioVsockRxQueueDispatch, VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError,
+    VirtioVsockTxQueueDispatch,
 };
 
 const fn incremental_delta(current: u64, previous: u64) -> u64 {
@@ -5100,6 +5101,22 @@ impl SharedVsockDeviceMetrics {
 
     pub fn record_config_failure(&self) {
         record_atomic_metric(&self.inner.cfg_fails, 1);
+    }
+
+    pub fn record_transport_reset_attempt(
+        &self,
+        attempt: &Result<VirtioVsockTransportResetAttempt, VirtioVsockTransportResetError>,
+    ) {
+        if matches!(
+            attempt,
+            Ok(VirtioVsockTransportResetAttempt::QueueEmpty) | Err(_)
+        ) {
+            self.record_event_queue_failure();
+        }
+    }
+
+    pub fn record_event_queue_signal_failure(&self) {
+        self.record_event_queue_failure();
     }
 
     pub fn record_notification_dispatch(&self, dispatch: &VirtioVsockDeviceNotificationDispatch) {

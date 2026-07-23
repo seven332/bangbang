@@ -24670,7 +24670,7 @@ mod tests {
     }
 
     #[test]
-    fn vsock_notification_signal_dispatch_preserves_event_noop_without_signal() {
+    fn vsock_notification_signal_dispatch_preserves_ungated_event_ack_without_signal() {
         let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_vsock();
         configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
         notify_boot_vsock_queue(
@@ -24683,7 +24683,7 @@ mod tests {
         let (lines, sink) = RecordingSink::successful();
 
         let result = signal_vsock_queue_interrupts(dispatches, sink.as_ref())
-            .expect("event no-op vsock dispatch should collect");
+            .expect("ungated event acknowledgement should collect");
 
         let device = &result.as_slice()[0];
         assert!(!device.dispatch().needs_queue_interrupt());
@@ -24694,7 +24694,7 @@ mod tests {
             .dispatch()
             .outcome()
             .dispatched()
-            .expect("event notification should be accepted as no-op dispatch");
+            .expect("ungated event acknowledgement should dispatch");
         assert_eq!(
             dispatch.drained_notifications(),
             [VIRTIO_VSOCK_EVENT_QUEUE_INDEX]

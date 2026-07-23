@@ -1985,12 +1985,17 @@ incomplete-host-handshake bound, round-robin host-local-port allocation,
 `EVENT_IDX`, ≥1-MiB bidirectional signed transfer for both initiation paths,
 two-stream isolation, and process-local Unix-listener ownership with
 path/payload-redacted transport diagnostics. Indirect descriptors are a
-supported bangbang extension. Repeated pre-boot `PUT /vsock` replaces stored
-configuration and post-start PUT is stably rejected; PATCH, DELETE, runtime
-hotplug, and broader CID routing are not supported. Native-v1 snapshot UDS
-override, event-queue `TRANSPORT_RESET`, and post-restore RX gating remain the
-precise #543 exclusions. The signed transfer is a compatibility/progress gate,
-not a general performance, Firecracker artifact, or snapshot-parity claim.
+supported bangbang extension. Focused runtime tests additionally validate the
+real event queue's reset payload and used-ring transaction, EVENT_IDX state,
+mandatory MMIO queue intent and PCI queue-2 delivery, typed empty/malformed
+failures and metrics, runtime-only restored-origin acknowledgement gate, TX
+progress, preserved RX work, and post-ack drain. Repeated pre-boot `PUT /vsock`
+replaces stored configuration and post-start PUT is stably rejected; PATCH,
+DELETE, runtime hotplug, and broader CID routing are not supported. Public
+native-v1 invocation, durable capture, UDS override, restored resource
+reconstruction, and the restored-guest proof remain #1515-#1518/#1490 work.
+The signed transfer is a compatibility/progress gate, not a general performance,
+Firecracker artifact, or snapshot-parity claim.
 
 The production-bundle socket-directory cases exercise the same guest protocol
 through contained host authority. Host initiation enters through the supplied
