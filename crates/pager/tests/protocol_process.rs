@@ -1,7 +1,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 use bangbang_pager::{
@@ -186,7 +186,35 @@ fn run_cancel_peer(
     Ok(())
 }
 
-fn spawn_peer(mode: &str) -> io::Result<(VmmSession, PagerTransport, Child)> {
+#[derive(Debug)]
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn wait_with_output(mut self) -> io::Result<Output> {
+        self.child
+            .take()
+            .ok_or_else(|| io::Error::other("pager child was already consumed"))?
+            .wait_with_output()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn spawn_peer(mode: &str) -> io::Result<(VmmSession, PagerTransport, ChildGuard)> {
     let limits = PagerLimits::new(
         MIN_PAGE_SIZE,
         1,
@@ -216,7 +244,7 @@ fn spawn_peer(mode: &str) -> io::Result<(VmmSession, PagerTransport, Child)> {
         .stderr(Stdio::piped())
         .spawn();
     let restore_result = set_close_on_exec(descriptor, true);
-    let spawned = spawn_result?;
+    let spawned = ChildGuard::new(spawn_result?);
     restore_result?;
     drop(child);
     let transport = PagerTransport::new(parent, Duration::from_secs(5))
@@ -237,7 +265,7 @@ fn establish(
     Ok(())
 }
 
-fn assert_child_success(child: Child) -> io::Result<()> {
+fn assert_child_success(child: ChildGuard) -> io::Result<()> {
     let output = child.wait_with_output()?;
     if output.status.success() {
         Ok(())

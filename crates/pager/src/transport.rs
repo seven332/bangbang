@@ -1,12 +1,19 @@
 use std::fmt;
 use std::io;
-use std::mem::size_of;
-use std::os::fd::{AsRawFd, RawFd};
+use std::mem::{MaybeUninit, size_of};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use crate::frame::declared_frame;
 use crate::{HEADER_BYTES, PagerError, PagerFrame, decode_frame, encode_frame};
+
+// XNU accepts at most 512 descriptors in one control message; Linux accepts
+// 253. One extra word covers the platform cmsghdr alignment.
+const MAX_ANCILLARY_DESCRIPTORS: usize = 512;
+const ANCILLARY_BUFFER_BYTES: usize =
+    size_of::<libc::cmsghdr>() + MAX_ANCILLARY_DESCRIPTORS * size_of::<RawFd>() + size_of::<u64>();
+const ANCILLARY_BUFFER_WORDS: usize = ANCILLARY_BUFFER_BYTES.div_ceil(size_of::<u64>());
 
 /// Absolute-deadline transport over one already connected Unix stream.
 pub struct PagerTransport {
@@ -181,13 +188,9 @@ fn receive_exact(
             };
         }
         let remaining = bytes.get_mut(received..).ok_or(PagerError::InvalidFrame)?;
-        // SAFETY: `remaining` is a live writable byte slice and `socket`
-        // remains owned by the caller for this synchronous receive.
-        let result =
-            unsafe { libc::recv(socket, remaining.as_mut_ptr().cast(), remaining.len(), 0) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            match error.kind() {
+        let (transferred, has_ancillary_data) = match receive_once(socket, remaining) {
+            Ok(attempt) => attempt,
+            Err(error) => match error.kind() {
                 io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => continue,
                 io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset => {
                     return if frame_started || received != 0 {
@@ -196,10 +199,13 @@ fn receive_exact(
                         Err(PagerError::Disconnected)
                     };
                 }
+                io::ErrorKind::InvalidData => return Err(PagerError::InvalidFrame),
                 kind => return Err(PagerError::Io(kind)),
-            }
+            },
+        };
+        if has_ancillary_data {
+            return Err(PagerError::InvalidFrame);
         }
-        let transferred = usize::try_from(result).map_err(|_| PagerError::InvalidFrame)?;
         if transferred == 0 {
             return if frame_started || received != 0 {
                 Err(PagerError::UnexpectedEof)
@@ -215,6 +221,139 @@ fn receive_exact(
             .ok_or(PagerError::InvalidFrame)?;
     }
     Ok(())
+}
+
+fn receive_once(socket: RawFd, bytes: &mut [u8]) -> io::Result<(usize, bool)> {
+    if bytes.is_empty() {
+        return Ok((0, false));
+    }
+    let mut iovec = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    let mut control = [0_u64; ANCILLARY_BUFFER_WORDS];
+    // SAFETY: An all-zero msghdr is a valid empty header. The live writable
+    // payload and aligned bounded control buffers are installed below.
+    let mut message: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
+    message.msg_iov = &raw mut iovec;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control
+        .len()
+        .checked_mul(size_of::<u64>())
+        .ok_or_else(invalid_data)?
+        .try_into()
+        .map_err(|_| invalid_data())?;
+    // SAFETY: The msghdr points only to the live writable payload slice for
+    // this synchronous receive. The aligned control buffer covers the larger
+    // supported-kernel descriptor limit, and received descriptors are closed
+    // below before this function returns.
+    let result = unsafe { libc::recvmsg(socket, &raw mut message, receive_flags()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let received =
+        usize::try_from(result).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    if received > bytes.len() {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    let has_ancillary_data = discard_ancillary_descriptors(&message, &control)?
+        || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0;
+    Ok((received, has_ancillary_data))
+}
+
+fn discard_ancillary_descriptors(message: &libc::msghdr, control: &[u64]) -> io::Result<bool> {
+    let available = usize::try_from(message.msg_controllen).map_err(|_| invalid_data())?;
+    let capacity = control
+        .len()
+        .checked_mul(size_of::<u64>())
+        .ok_or_else(invalid_data)?;
+    if available > capacity {
+        return Err(invalid_data());
+    }
+    if available == 0 {
+        return Ok(false);
+    }
+
+    // SAFETY: CMSG_LEN performs platform layout arithmetic for an empty
+    // payload and dereferences no pointer.
+    let header_bytes = usize::try_from(unsafe { libc::CMSG_LEN(0) }).map_err(|_| invalid_data())?;
+    if header_bytes < size_of::<libc::cmsghdr>() || available < header_bytes {
+        return Err(invalid_data());
+    }
+
+    let base = control.as_ptr().cast::<u8>();
+    let mut offset = 0_usize;
+    loop {
+        let remaining = available.checked_sub(offset).ok_or_else(invalid_data)?;
+        if remaining < size_of::<libc::cmsghdr>() {
+            break;
+        }
+        // SAFETY: `offset` is bounded by `available`, which is bounded by the
+        // aligned live control buffer. read_unaligned copies one cmsghdr.
+        let header = unsafe { base.add(offset).cast::<libc::cmsghdr>().read_unaligned() };
+        let declared_message_bytes =
+            usize::try_from(header.cmsg_len).map_err(|_| invalid_data())?;
+        if declared_message_bytes < header_bytes {
+            return Err(invalid_data());
+        }
+        let message_was_truncated = declared_message_bytes > remaining;
+        let message_bytes = declared_message_bytes.min(remaining);
+        let payload_bytes = message_bytes
+            .checked_sub(header_bytes)
+            .ok_or_else(invalid_data)?;
+        let mut malformed_rights = false;
+        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
+            if !payload_bytes.is_multiple_of(size_of::<RawFd>()) {
+                malformed_rights = true;
+            }
+            let descriptor_count = payload_bytes / size_of::<RawFd>();
+            for index in 0..descriptor_count {
+                let descriptor_offset = offset
+                    .checked_add(header_bytes)
+                    .and_then(|value| {
+                        index
+                            .checked_mul(size_of::<RawFd>())
+                            .and_then(|delta| value.checked_add(delta))
+                    })
+                    .ok_or_else(invalid_data)?;
+                // SAFETY: The validated SCM_RIGHTS payload contains one
+                // kernel-created RawFd at this checked in-buffer offset.
+                let descriptor =
+                    unsafe { base.add(descriptor_offset).cast::<RawFd>().read_unaligned() };
+                if descriptor < 0 {
+                    malformed_rights = true;
+                    continue;
+                }
+                // SAFETY: recvmsg transferred ownership of this new,
+                // nonnegative descriptor exactly once. Immediate drop closes
+                // it because this protocol grants no descriptor authority.
+                drop(unsafe { OwnedFd::from_raw_fd(descriptor) });
+            }
+        }
+        if message_was_truncated || malformed_rights {
+            return Err(invalid_data());
+        }
+
+        let payload = u32::try_from(payload_bytes).map_err(|_| invalid_data())?;
+        // SAFETY: CMSG_SPACE performs platform layout arithmetic for the
+        // already bounded payload and dereferences no pointer.
+        let padded =
+            usize::try_from(unsafe { libc::CMSG_SPACE(payload) }).map_err(|_| invalid_data())?;
+        if padded < message_bytes {
+            return Err(invalid_data());
+        }
+        let next = offset.checked_add(padded).ok_or_else(invalid_data)?;
+        if next > available || available - next < size_of::<libc::cmsghdr>() {
+            break;
+        }
+        offset = next;
+    }
+    Ok(true)
+}
+
+fn invalid_data() -> io::Error {
+    io::Error::from(io::ErrorKind::InvalidData)
 }
 
 fn wait_ready(
@@ -301,6 +440,16 @@ const fn send_flags() -> libc::c_int {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const fn send_flags() -> libc::c_int {
+    0
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const fn receive_flags() -> libc::c_int {
+    libc::MSG_CMSG_CLOEXEC
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const fn receive_flags() -> libc::c_int {
     0
 }
 
@@ -394,6 +543,44 @@ mod tests {
     }
 
     #[test]
+    fn ancillary_descriptors_are_closed_and_rejected() {
+        let (left, right) = UnixStream::pair().expect("stream pair should open");
+        let mut receiver =
+            PagerTransport::new(left, Duration::from_secs(1)).expect("transport should initialize");
+        let encoded = encode_frame(&hello()).expect("frame should encode");
+        let (transferred, probe) = UnixStream::pair().expect("descriptor pair should open");
+        suppress_socket_sigpipe(probe.as_raw_fd()).expect("probe should suppress SIGPIPE");
+        let descriptors = [transferred.as_raw_fd(); 3];
+        assert_eq!(
+            send_with_descriptors(right.as_raw_fd(), &encoded, &descriptors)
+                .expect("descriptor-bearing frame should send"),
+            encoded.len()
+        );
+        drop(transferred);
+        assert_eq!(receiver.receive(), Err(PagerError::InvalidFrame));
+        assert!(receiver.is_poisoned());
+
+        let byte = [0_u8];
+        // SAFETY: The borrowed probe descriptor and one-byte readable slice
+        // remain live for this synchronous, SIGPIPE-suppressed send.
+        let result = unsafe {
+            libc::send(
+                probe.as_raw_fd(),
+                byte.as_ptr().cast(),
+                byte.len(),
+                send_flags(),
+            )
+        };
+        assert_eq!(result, -1);
+        assert!(matches!(
+            io::Error::last_os_error().kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+        ));
+    }
+
+    #[test]
     fn debug_redacts_stream_identity() {
         let (left, _right) = UnixStream::pair().expect("stream pair should open");
         let transport =
@@ -401,5 +588,69 @@ mod tests {
         let debug = format!("{transport:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("fd:"));
+    }
+
+    fn send_with_descriptors(
+        socket: RawFd,
+        bytes: &[u8],
+        descriptors: &[RawFd],
+    ) -> io::Result<usize> {
+        if descriptors.is_empty() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let mut iovec = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut control = [0_usize; 8];
+        // SAFETY: An all-zero msghdr is valid before the live payload and
+        // aligned control buffers are installed below.
+        let mut message: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
+        message.msg_iov = &raw mut iovec;
+        message.msg_iovlen = 1;
+        let descriptor_bytes = descriptors
+            .len()
+            .checked_mul(size_of::<RawFd>())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let descriptor_bytes = u32::try_from(descriptor_bytes)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: CMSG_SPACE performs platform layout arithmetic on the
+        // bounded descriptor slice and dereferences no pointer.
+        let control_space = unsafe { libc::CMSG_SPACE(descriptor_bytes) };
+        let control_bytes = usize::try_from(control_space)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        if control_bytes > control.len().saturating_mul(size_of::<usize>()) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_bytes
+            .try_into()
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: The checked aligned control buffer has room for one
+        // cmsghdr and the complete descriptor slice. All pointers remain live
+        // for sendmsg.
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&raw const message);
+            if header.is_null() {
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            }
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(descriptor_bytes) as _;
+            std::ptr::copy_nonoverlapping(
+                descriptors.as_ptr().cast::<u8>(),
+                libc::CMSG_DATA(header),
+                usize::try_from(descriptor_bytes)
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+            );
+        }
+        // SAFETY: The msghdr references only live readable payload/control
+        // buffers and the descriptors remain borrowed by the caller.
+        let result = unsafe { libc::sendmsg(socket, &raw const message, send_flags()) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            usize::try_from(result).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+        }
     }
 }

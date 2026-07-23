@@ -159,7 +159,11 @@ condition. `ShutdownAck` closes both sides.
 `PagerTransport` sets the adopted stream nonblocking, suppresses `SIGPIPE`, and
 sends or receives one whole frame under one absolute operation deadline.
 Interrupts and partial transfers do not restart that deadline. Receive is
-header-first, so an oversized body is rejected before allocation.
+header-first, so an oversized body is rejected before allocation. Ancillary
+data, including SCM_RIGHTS descriptors attached to otherwise valid bytes, is
+accepted only into a bounded rejection buffer; every received descriptor is
+closed immediately, no descriptor authority enters the protocol, and the
+transport becomes terminal.
 
 A timeout, malformed frame, local I/O failure, broken connection, clean EOF
 between frames, or truncated EOF within a frame poisons that transport. No
