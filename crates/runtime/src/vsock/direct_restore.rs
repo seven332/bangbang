@@ -5,7 +5,7 @@ use std::ffi::CString;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _, Write as _};
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
@@ -46,6 +46,8 @@ pub enum DirectVsockRestoreError {
     UnrelatedEntry,
     ActiveSocket,
     Bind(io::ErrorKind),
+    Verification(io::ErrorKind),
+    Randomness,
     Metadata(io::ErrorKind),
     Permissions(io::ErrorKind),
     Publish(io::ErrorKind),
@@ -61,6 +63,8 @@ impl fmt::Display for DirectVsockRestoreError {
             Self::UnrelatedEntry => "direct vsock destination is not a socket",
             Self::ActiveSocket => "direct vsock destination is active or indeterminate",
             Self::Bind(_) => "failed to bind a provisional direct vsock socket",
+            Self::Verification(_) => "failed to verify a provisional direct vsock socket",
+            Self::Randomness => "failed to generate a direct vsock verification challenge",
             Self::Metadata(_) => "failed to inspect a provisional direct vsock socket",
             Self::Permissions(_) => "failed to restrict a provisional direct vsock socket",
             Self::Publish(_) => "failed to publish a direct vsock socket",
@@ -81,6 +85,8 @@ impl std::error::Error for DirectVsockRestoreError {
             | Self::UnrelatedEntry
             | Self::ActiveSocket
             | Self::Bind(_)
+            | Self::Verification(_)
+            | Self::Randomness
             | Self::Metadata(_)
             | Self::Permissions(_)
             | Self::Publish(_)
@@ -244,8 +250,11 @@ fn prepare_direct_vsock_restore_with(
         }
     };
     if let Err(error) = publication {
-        cleanup_owned_path(&temporary, new_identity).map_err(DirectVsockRestoreError::Cleanup)?;
-        cleanup_owned_path(&destination, new_identity).map_err(DirectVsockRestoreError::Cleanup)?;
+        let temporary_cleanup = cleanup_owned_path(&temporary, new_identity);
+        let destination_cleanup = cleanup_owned_path(&destination, new_identity);
+        if let Some(source) = temporary_cleanup.err().or(destination_cleanup.err()) {
+            return Err(DirectVsockRestoreError::Cleanup(source));
+        }
         return Err(error);
     }
 
@@ -296,10 +305,15 @@ fn bind_temporary_socket(
         };
         let identity = match required_socket_identity(&temporary) {
             Ok(identity) => identity,
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error);
+            Err(DirectVsockRestoreError::PathChanged) => {
+                return Err(DirectVsockRestoreError::PathChanged);
             }
+            Err(DirectVsockRestoreError::Metadata(kind)) => {
+                return Err(DirectVsockRestoreError::Cleanup(
+                    DirectVsockRestoreCleanupError::Inspect(kind),
+                ));
+            }
+            Err(error) => return Err(error),
         };
         if let Err(error) =
             fs::set_permissions(&temporary, fs::Permissions::from_mode(DIRECT_SOCKET_MODE))
@@ -307,13 +321,14 @@ fn bind_temporary_socket(
             cleanup_owned_path(&temporary, identity).map_err(DirectVsockRestoreError::Cleanup)?;
             return Err(DirectVsockRestoreError::Permissions(error.kind()));
         }
-        if required_socket_identity(&temporary)? != identity {
-            cleanup_owned_path(&temporary, identity).map_err(DirectVsockRestoreError::Cleanup)?;
-            return Err(DirectVsockRestoreError::PathChanged);
-        }
+        verify_owned_socket_path(&temporary, identity)?;
         if let Err(error) = listener.set_nonblocking(true) {
             cleanup_owned_path(&temporary, identity).map_err(DirectVsockRestoreError::Cleanup)?;
             return Err(DirectVsockRestoreError::Bind(error.kind()));
+        }
+        if let Err(error) = verify_listener_path(&listener, &temporary, identity) {
+            cleanup_owned_path(&temporary, identity).map_err(DirectVsockRestoreError::Cleanup)?;
+            return Err(error);
         }
         return Ok((listener, temporary, identity));
     }
@@ -332,6 +347,52 @@ fn required_socket_identity(path: &Path) -> Result<SocketIdentity, DirectVsockRe
     socket_identity(path)
         .map_err(|error| DirectVsockRestoreError::Metadata(error.kind()))?
         .ok_or(DirectVsockRestoreError::PathChanged)
+}
+
+fn verify_owned_socket_path(
+    path: &Path,
+    identity: SocketIdentity,
+) -> Result<(), DirectVsockRestoreError> {
+    match required_socket_identity(path) {
+        Ok(current) if current == identity => Ok(()),
+        Ok(_) => {
+            cleanup_owned_path(path, identity).map_err(DirectVsockRestoreError::Cleanup)?;
+            Err(DirectVsockRestoreError::PathChanged)
+        }
+        Err(error) => {
+            cleanup_owned_path(path, identity).map_err(DirectVsockRestoreError::Cleanup)?;
+            Err(error)
+        }
+    }
+}
+
+fn verify_listener_path(
+    listener: &UnixListener,
+    path: &Path,
+    identity: SocketIdentity,
+) -> Result<(), DirectVsockRestoreError> {
+    verify_owned_socket_path(path, identity)?;
+    let mut challenge = [0_u8; 32];
+    getrandom::fill(&mut challenge).map_err(|_| DirectVsockRestoreError::Randomness)?;
+    let mut client = nonblocking_unix_stream_connect(path)
+        .map_err(|error| DirectVsockRestoreError::Verification(error.kind()))?;
+    client
+        .write_all(&challenge)
+        .map_err(|error| DirectVsockRestoreError::Verification(error.kind()))?;
+    let (mut accepted, _) = listener
+        .accept()
+        .map_err(|error| DirectVsockRestoreError::Verification(error.kind()))?;
+    accepted
+        .set_nonblocking(true)
+        .map_err(|error| DirectVsockRestoreError::Verification(error.kind()))?;
+    let mut observed = [0_u8; 32];
+    accepted
+        .read_exact(&mut observed)
+        .map_err(|error| DirectVsockRestoreError::Verification(error.kind()))?;
+    if observed != challenge {
+        return Err(DirectVsockRestoreError::PathChanged);
+    }
+    verify_owned_socket_path(path, identity)
 }
 
 fn socket_identity(path: &Path) -> io::Result<Option<SocketIdentity>> {
@@ -453,9 +514,27 @@ fn publish_over_stale(
         rename_with_flags(temporary, destination, libc::RENAME_SWAP)
             .map_err(|error| DirectVsockRestoreError::Publish(error.kind()))?;
     }
-    cleanup_owned_path(temporary, new_identity).map_err(DirectVsockRestoreError::Cleanup)?;
-    cleanup_owned_path(destination, new_identity).map_err(DirectVsockRestoreError::Cleanup)?;
+    cleanup_failed_stale_exchange(temporary, destination, new_identity, stale_identity)
+        .map_err(DirectVsockRestoreError::Cleanup)?;
     Err(DirectVsockRestoreError::PathChanged)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_failed_stale_exchange(
+    temporary: &Path,
+    destination: &Path,
+    new_identity: SocketIdentity,
+    stale_identity: SocketIdentity,
+) -> Result<(), DirectVsockRestoreCleanupError> {
+    [
+        cleanup_owned_path(temporary, new_identity),
+        cleanup_owned_path(destination, new_identity),
+        cleanup_owned_path(temporary, stale_identity),
+        cleanup_owned_path(destination, stale_identity),
+    ]
+    .into_iter()
+    .find_map(Result::err)
+    .map_or(Ok(()), Err)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -590,6 +669,33 @@ mod tests {
                 .is_symlink()
         );
         fs::remove_file(&symlink_path).expect("test symlink should clean");
+    }
+
+    #[test]
+    fn listener_path_challenge_rejects_substitution_before_identity_capture() {
+        let path = test_path("challenge-substitution");
+        let original = UnixListener::bind(&path).expect("original listener should bind");
+        fs::remove_file(&path).expect("original path should unlink");
+        let replacement = UnixListener::bind(&path).expect("replacement listener should bind");
+        fs::set_permissions(&path, fs::Permissions::from_mode(DIRECT_SOCKET_MODE))
+            .expect("replacement permissions should set");
+        let replacement_identity =
+            required_socket_identity(&path).expect("replacement identity should inspect");
+        original
+            .set_nonblocking(true)
+            .expect("original listener should become nonblocking");
+
+        let error = verify_listener_path(&original, &path, replacement_identity)
+            .expect_err("path challenge must reject a substituted listener");
+        assert!(matches!(
+            error,
+            DirectVsockRestoreError::Verification(io::ErrorKind::WouldBlock)
+        ));
+        assert!(UnixStream::connect(&path).is_ok());
+
+        drop(original);
+        drop(replacement);
+        fs::remove_file(&path).expect("replacement should clean");
     }
 
     #[cfg(target_os = "macos")]
