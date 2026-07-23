@@ -1293,6 +1293,7 @@ mod tests {
     const ESR_EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
     const ESR_EC_SHIFT: u64 = 26;
     const ESR_ISS_WNR: u64 = 1 << 6;
+    const ESR_ISS_LEVEL_TWO_TRANSLATION: u64 = 0x06;
     const ESR_ISS_LEVEL_THREE_TRANSLATION: u64 = 0x07;
     const ESR_ISS_LEVEL_THREE_PERMISSION: u64 = 0x0f;
 
@@ -1391,6 +1392,10 @@ mod tests {
 
     fn tracked_write_fault(physical_address: u64) -> HvfExceptionExit {
         tracked_write_fault_with_dfsc(physical_address, ESR_ISS_LEVEL_THREE_TRANSLATION)
+    }
+
+    fn lazy_private_file_write_fault(physical_address: u64) -> HvfExceptionExit {
+        tracked_write_fault_with_dfsc(physical_address, ESR_ISS_LEVEL_TWO_TRANSLATION)
     }
 
     fn reprotected_write_fault(physical_address: u64) -> HvfExceptionExit {
@@ -1643,6 +1648,33 @@ mod tests {
             Err(HvfDirtyWriteFaultError::NoProgress)
         );
         tracker.unregister_owner();
+        tracker.stop().expect("tracker should stop");
+    }
+
+    #[test]
+    fn lazy_private_file_translation_fault_still_requires_exact_tracker_ownership() {
+        let mapper = Arc::new(RecordingMapper::default());
+        let tracker = start_tracker(
+            &[mapped_region(0x5000, 1, HvfMemoryPermissions::GUEST_RAM)],
+            mapper,
+        );
+
+        assert_eq!(
+            tracker
+                .handle_exception(0, lazy_private_file_write_fault(0x9000))
+                .expect("unowned lazy write fault should remain unhandled"),
+            None
+        );
+        let handled = tracker
+            .handle_exception(0, lazy_private_file_write_fault(0x5fff))
+            .expect("owned lazy write should succeed")
+            .expect("owned lazy write should be handled");
+        assert_eq!(handled.page(), GuestAddress::new(0x5000));
+        assert!(handled.first_write());
+        assert_eq!(
+            tracker.dirty_pages().expect("lazy write should mark"),
+            vec![GuestAddress::new(0x5000)]
+        );
         tracker.stop().expect("tracker should stop");
     }
 

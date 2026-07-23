@@ -36,13 +36,23 @@ const FIRECRACKER_AARCH64_PREFIX: [u8; 9] = [0x00, 0x00, 0x00, 0xaa, 0xaa, 0x84,
 const FIRECRACKER_X86_64_PREFIX: [u8; 9] = [0x00, 0x00, 0x00, 0x64, 0x86, 0x84, 0x19, 0x10, 0x07];
 
 #[test]
-fn empty_foundation_encoding_matches_immutable_fixture() {
-    let encoded = encode_snapshot_v2_state(&[], &[]).expect("empty foundation should encode");
+fn current_encoding_preserves_immutable_foundation_decode() {
+    let encoded = encode_snapshot_v2_state(&[], &[]).expect("empty current state should encode");
+    assert_ne!(encoded, EMPTY_V2_FIXTURE);
+    assert_eq!(
+        decode_snapshot_v2_state(&encoded)
+            .expect("current empty state should decode")
+            .metadata()
+            .version(),
+        NATIVE_V2_SNAPSHOT_VERSION
+    );
 
-    assert_eq!(encoded, EMPTY_V2_FIXTURE);
     let decoded = decode_snapshot_v2_state(&EMPTY_V2_FIXTURE)
         .expect("empty foundation fixture should decode");
-    assert_eq!(decoded.metadata().version(), NATIVE_V2_SNAPSHOT_VERSION);
+    assert_eq!(
+        decoded.metadata().version(),
+        NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION
+    );
     assert_eq!(
         decoded.metadata().architecture(),
         SnapshotArchitecture::Arm64
@@ -83,7 +93,7 @@ fn canonical_test_directory_round_trips_borrowed_components() {
 }
 
 #[test]
-fn production_catalog_accepts_nonsemantic_extensions_only() {
+fn production_catalog_accepts_memory_and_nonsemantic_extensions() {
     let nonsemantic = [SnapshotV2Component::new(
         SnapshotV2ComponentKey::new(77, 3),
         SnapshotV2ComponentDisposition::NonSemantic,
@@ -94,17 +104,31 @@ fn production_catalog_accepts_nonsemantic_extensions_only() {
     let decoded = decode_snapshot_v2_state(&encoded).expect("nonsemantic extension should decode");
     assert_eq!(decoded.components().collect::<Vec<_>>(), nonsemantic);
 
-    let semantic = [SnapshotV2Component::new(
-        SnapshotV2ComponentKey::new(1, 3),
+    let memory = [SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        b"semantic",
+    )];
+    let encoded_memory =
+        encode_snapshot_v2_state(&[], &memory).expect("memory component should encode");
+    assert_eq!(
+        decode_snapshot_v2_state(&encoded_memory)
+            .expect("memory component should decode")
+            .component(NATIVE_V2_MEMORY_COMPONENT_KEY),
+        Some(memory[0])
+    );
+
+    let unknown = [SnapshotV2Component::new(
+        SnapshotV2ComponentKey::new(2, 3),
         SnapshotV2ComponentDisposition::Semantic,
         b"semantic",
     )];
     assert!(matches!(
-        encode_snapshot_v2_state(&[], &semantic),
+        encode_snapshot_v2_state(&[], &unknown),
         Err(SnapshotV2EncodeError::UnknownSemanticComponent)
     ));
 
-    let encoded_semantic = encode_test_state(&[], &semantic);
+    let encoded_semantic = encode_test_state(&[], &unknown);
     assert_eq!(
         decode_snapshot_v2_state(&encoded_semantic),
         Err(SnapshotV2DecodeError::UnknownSemanticComponent)
@@ -123,7 +147,7 @@ fn family_dispatch_preserves_v1_recognizes_v2_and_rejects_firecracker() {
     let decoded_v2 =
         decode_native_snapshot_state(&EMPTY_V2_FIXTURE).expect("native-v2 fixture should dispatch");
     assert!(matches!(decoded_v2, NativeSnapshotState::V2(_)));
-    assert_eq!(decoded_v2.version(), NATIVE_V2_SNAPSHOT_VERSION);
+    assert_eq!(decoded_v2.version(), NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION);
 
     for prefix in [
         FIRECRACKER_AARCH64_PREFIX.as_slice(),
@@ -167,11 +191,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 1);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 2);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 1, 0),
+            found: SnapshotFormatVersion::new(2, 2, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );
@@ -596,7 +620,7 @@ fn catalog_introduction_minor_is_enforced() {
         encode_snapshot_v2_state_with_catalog_and_reserve(
             &[10],
             &[],
-            NATIVE_V2_SNAPSHOT_VERSION,
+            NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION,
             &catalog,
             &[],
             Vec::try_reserve_exact,
@@ -617,10 +641,10 @@ fn catalog_introduction_minor_is_enforced() {
     let decoded = decode_snapshot_v2_state_with_catalog(&encoded, version_one, &catalog, &[])
         .expect("minor-one feature should decode");
     assert_eq!(decoded.required_features().collect::<Vec<_>>(), vec![10]);
-    assert!(matches!(
+    assert_eq!(
         decode_snapshot_v2_state(&encoded),
-        Err(SnapshotV2DecodeError::UnsupportedVersion { .. })
-    ));
+        Err(SnapshotV2DecodeError::UnknownRequiredFeature)
+    );
 }
 
 fn test_components() -> [SnapshotV2Component<'static>; 3] {

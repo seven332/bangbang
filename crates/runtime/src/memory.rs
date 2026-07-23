@@ -180,6 +180,8 @@ pub enum GuestMemoryDiscardFailureKind {
     FreeAdvice,
     /// Zeroing and deallocating a descriptor-backed shared range failed.
     SharedReclaim,
+    /// Replacing a private-file range with anonymous zero pages failed.
+    PrivateFileReclaim,
 }
 
 /// Redacted failure counts from one guest-memory discard attempt.
@@ -192,6 +194,7 @@ pub struct GuestMemoryDiscardFailures {
     zero_advice: u64,
     free_advice: u64,
     shared_reclaim: u64,
+    private_file_reclaim: u64,
 }
 
 impl GuestMemoryDiscardFailures {
@@ -205,6 +208,7 @@ impl GuestMemoryDiscardFailures {
             GuestMemoryDiscardFailureKind::ZeroAdvice => self.zero_advice,
             GuestMemoryDiscardFailureKind::FreeAdvice => self.free_advice,
             GuestMemoryDiscardFailureKind::SharedReclaim => self.shared_reclaim,
+            GuestMemoryDiscardFailureKind::PrivateFileReclaim => self.private_file_reclaim,
         }
     }
 
@@ -217,6 +221,7 @@ impl GuestMemoryDiscardFailures {
             .saturating_add(self.zero_advice)
             .saturating_add(self.free_advice)
             .saturating_add(self.shared_reclaim)
+            .saturating_add(self.private_file_reclaim)
     }
 
     const fn with_failure(mut self, kind: GuestMemoryDiscardFailureKind) -> Self {
@@ -242,6 +247,9 @@ impl GuestMemoryDiscardFailures {
             GuestMemoryDiscardFailureKind::SharedReclaim => {
                 self.shared_reclaim = self.shared_reclaim.saturating_add(1);
             }
+            GuestMemoryDiscardFailureKind::PrivateFileReclaim => {
+                self.private_file_reclaim = self.private_file_reclaim.saturating_add(1);
+            }
         }
         self
     }
@@ -251,14 +259,15 @@ impl fmt::Display for GuestMemoryDiscardFailures {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "guest memory discard failures: range_validation={}, unsupported_target={}, invalid_host_page_size={}, host_address={}, zero_advice={}, free_advice={}, shared_reclaim={}",
+            "guest memory discard failures: range_validation={}, unsupported_target={}, invalid_host_page_size={}, host_address={}, zero_advice={}, free_advice={}, shared_reclaim={}, private_file_reclaim={}",
             self.range_validation,
             self.unsupported_target,
             self.invalid_host_page_size,
             self.host_address,
             self.zero_advice,
             self.free_advice,
-            self.shared_reclaim
+            self.shared_reclaim,
+            self.private_file_reclaim
         )
     }
 }
@@ -288,6 +297,7 @@ impl GuestMemoryDiscardOutcome {
                 zero_advice: 0,
                 free_advice: 0,
                 shared_reclaim: 0,
+                private_file_reclaim: 0,
             },
         }
     }
@@ -375,6 +385,17 @@ pub enum GuestMemoryBacking {
     Anonymous,
     /// Shared mappings backed by unlinked, owner-only file descriptors.
     Shared,
+}
+
+/// Describes the owner of one currently mapped guest-memory region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GuestMemoryRegionBacking {
+    /// A private anonymous mapping.
+    Anonymous,
+    /// A shared mapping backed by an exportable descriptor.
+    Shared,
+    /// A writable private mapping backed by a retained read-only snapshot file.
+    PrivateFile,
 }
 
 static NEXT_GUEST_MEMORY_MAPPING_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -590,6 +611,91 @@ impl GuestMemory {
         })
     }
 
+    /// Constructs guest memory from already validated private-file extents.
+    ///
+    /// The one descriptor owner is shared by every mapping without duplicating
+    /// the descriptor. Each mapped extent is independently revalidated at the
+    /// unsafe boundary so partial construction drops prior mappings normally.
+    pub(crate) fn from_private_file_ranges(
+        ranges: &[(GuestMemoryRange, u64)],
+        file: Arc<File>,
+        backing: GuestMemoryBacking,
+    ) -> Result<Self, GuestMemoryAllocationError> {
+        Self::from_private_file_ranges_with_mapper(
+            ranges,
+            file,
+            backing,
+            &mut GuestMemoryMapping::map_private_file,
+        )
+    }
+
+    fn from_private_file_ranges_with_mapper(
+        ranges: &[(GuestMemoryRange, u64)],
+        file: Arc<File>,
+        backing: GuestMemoryBacking,
+        mapper: &mut impl FnMut(
+            usize,
+            Arc<File>,
+            u64,
+        ) -> Result<GuestMemoryMapping, GuestMemoryAllocationError>,
+    ) -> Result<Self, GuestMemoryAllocationError> {
+        let page_size = host_page_size()?;
+        let mut layout_ranges = Vec::new();
+        layout_ranges
+            .try_reserve_exact(ranges.len())
+            .map_err(
+                |source| GuestMemoryAllocationError::RegionMetadataAllocationFailed { source },
+            )?;
+        layout_ranges.extend(ranges.iter().map(|(range, _)| *range));
+        let layout = GuestMemoryLayout::new(layout_ranges)?;
+        validate_allocation_ranges(&layout, page_size)?;
+
+        let file_length = file
+            .metadata()
+            .map_err(|source| GuestMemoryAllocationError::PrivateFileInspectFailed { source })?
+            .len();
+        let mut regions = Vec::new();
+        regions.try_reserve_exact(ranges.len()).map_err(|source| {
+            GuestMemoryAllocationError::RegionMetadataAllocationFailed { source }
+        })?;
+
+        // Validate every extent before the first mmap. The mapping constructor
+        // repeats the representation check at the unsafe boundary.
+        for (range, file_offset) in ranges.iter().copied() {
+            if !file_offset.is_multiple_of(page_size) {
+                return Err(GuestMemoryAllocationError::PrivateFileOffsetUnaligned);
+            }
+            let host_size = allocation_host_size(range)?;
+            libc::off_t::try_from(file_offset)
+                .map_err(|_| GuestMemoryAllocationError::PrivateFileOffsetTooLarge)?;
+            let host_size_u64 = u64::try_from(host_size)
+                .map_err(|_| GuestMemoryAllocationError::SizeTooLarge { range })?;
+            if file_offset
+                .checked_add(host_size_u64)
+                .is_none_or(|end| end > file_length)
+            {
+                return Err(GuestMemoryAllocationError::PrivateFileRangeBeyondEnd);
+            }
+        }
+
+        for (range, file_offset) in ranges.iter().copied() {
+            let host_size = allocation_host_size(range)?;
+            regions.push(GuestMemoryRegion {
+                range,
+                mapping: Arc::new(mapper(host_size, Arc::clone(&file), file_offset)?),
+                mapping_offset: 0,
+                host_size,
+            });
+        }
+
+        Ok(Self {
+            regions,
+            shared_reservations: Vec::new(),
+            dirty_tracker: None,
+            backing,
+        })
+    }
+
     /// Return the backing profile inherited by dynamically inserted regions.
     pub const fn backing(&self) -> GuestMemoryBacking {
         self.backing
@@ -764,12 +870,6 @@ impl GuestMemory {
         &mut self,
         range: GuestMemoryRange,
     ) -> Result<(), GuestMemoryAllocationError> {
-        if self.backing != GuestMemoryBacking::Shared {
-            return Err(
-                GuestMemoryAllocationError::SharedReservationRequiresSharedBacking { range },
-            );
-        }
-
         let page_size = host_page_size()?;
         let host_size = validate_allocation_range(range, page_size)?;
         for region in &self.regions {
@@ -845,7 +945,10 @@ impl GuestMemory {
         let mut active = self
             .regions
             .iter()
-            .filter(|region| self.shared_reservation_containing(region.range()).is_none())
+            .filter(|region| {
+                region.backing() == GuestMemoryRegionBacking::Shared
+                    && self.shared_reservation_containing(region.range()).is_none()
+            })
             .peekable();
         let mut reservations = self.shared_reservations.iter().peekable();
 
@@ -1249,8 +1352,8 @@ impl GuestMemoryRegion {
         self.host_size
     }
 
-    /// Return the backing profile for this region.
-    pub fn backing(&self) -> GuestMemoryBacking {
+    /// Return the actual backing owner for this region.
+    pub fn backing(&self) -> GuestMemoryRegionBacking {
         self.mapping.backing()
     }
 
@@ -1449,14 +1552,25 @@ pub enum GuestMemoryAllocationError {
     SharedBackingReservationMissing {
         size: usize,
     },
-    SharedReservationRequiresSharedBacking {
-        range: GuestMemoryRange,
-    },
     SharedMmapFailed {
         size: usize,
         source: io::Error,
     },
     SharedMmapReturnedNull {
+        size: usize,
+    },
+    PrivateFileInspectFailed {
+        source: io::Error,
+    },
+    PrivateFileMappingSizeInvalid,
+    PrivateFileOffsetUnaligned,
+    PrivateFileOffsetTooLarge,
+    PrivateFileRangeBeyondEnd,
+    PrivateFileMmapFailed {
+        size: usize,
+        source: io::Error,
+    },
+    PrivateFileMmapReturnedNull {
         size: usize,
     },
     MappingIdentityExhausted,
@@ -1552,10 +1666,6 @@ impl fmt::Display for GuestMemoryAllocationError {
                 f,
                 "shared guest-memory backing reservation is missing for {size} bytes"
             ),
-            Self::SharedReservationRequiresSharedBacking { range } => write!(
-                f,
-                "guest memory range {range} cannot be reserved without shared backing"
-            ),
             Self::SharedMmapFailed { size, source } => write!(
                 f,
                 "failed to map {size} bytes of descriptor-backed shared guest memory: {source}"
@@ -1563,6 +1673,30 @@ impl fmt::Display for GuestMemoryAllocationError {
             Self::SharedMmapReturnedNull { size } => write!(
                 f,
                 "descriptor-backed shared guest memory mapping of {size} bytes returned a null address"
+            ),
+            Self::PrivateFileInspectFailed { source } => write!(
+                f,
+                "failed to inspect private-file guest memory backing: {source}"
+            ),
+            Self::PrivateFileMappingSizeInvalid => {
+                f.write_str("private-file guest memory mapping size is invalid")
+            }
+            Self::PrivateFileOffsetUnaligned => {
+                f.write_str("private-file guest memory offset is not host-page aligned")
+            }
+            Self::PrivateFileOffsetTooLarge => {
+                f.write_str("private-file guest memory offset cannot be represented")
+            }
+            Self::PrivateFileRangeBeyondEnd => {
+                f.write_str("private-file guest memory range exceeds its backing file")
+            }
+            Self::PrivateFileMmapFailed { size, source } => write!(
+                f,
+                "failed to map {size} bytes of private-file guest memory: {source}"
+            ),
+            Self::PrivateFileMmapReturnedNull { size } => write!(
+                f,
+                "private-file guest memory mapping of {size} bytes returned a null address"
             ),
             Self::MappingIdentityExhausted => {
                 f.write_str("guest-memory mapping identity space is exhausted")
@@ -1582,7 +1716,9 @@ impl std::error::Error for GuestMemoryAllocationError {
             | Self::SharedBackingCreateFailed { source }
             | Self::SharedBackingUnlinkFailed { source }
             | Self::SharedBackingResizeFailed { source, .. }
-            | Self::SharedMmapFailed { source, .. } => Some(source),
+            | Self::SharedMmapFailed { source, .. }
+            | Self::PrivateFileInspectFailed { source }
+            | Self::PrivateFileMmapFailed { source, .. } => Some(source),
             Self::SharedNameGenerationFailed { .. } => None,
             Self::InvalidHostPageSize
             | Self::SizeTooLarge { .. }
@@ -1591,8 +1727,12 @@ impl std::error::Error for GuestMemoryAllocationError {
             | Self::SharedFileDescriptorLimitExceeded { .. }
             | Self::SharedBackingSizeTooLarge { .. }
             | Self::SharedBackingReservationMissing { .. }
-            | Self::SharedReservationRequiresSharedBacking { .. }
             | Self::SharedMmapReturnedNull { .. }
+            | Self::PrivateFileMappingSizeInvalid
+            | Self::PrivateFileOffsetUnaligned
+            | Self::PrivateFileOffsetTooLarge
+            | Self::PrivateFileRangeBeyondEnd
+            | Self::PrivateFileMmapReturnedNull { .. }
             | Self::MappingIdentityExhausted => None,
         }
     }
@@ -2377,6 +2517,20 @@ impl GuestMemoryDiscardAdviser for SystemGuestMemoryDiscardAdviser {
         address: NonNull<c_void>,
         size: usize,
     ) -> Result<(), GuestMemoryDiscardFailureKind> {
+        if mapping.is_private_file() {
+            #[cfg(target_os = "macos")]
+            {
+                return replace_private_file_with_anonymous(address, size)
+                    .map_err(|_| GuestMemoryDiscardFailureKind::PrivateFileReclaim);
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (offset, address, size);
+                return Err(GuestMemoryDiscardFailureKind::UnsupportedTarget);
+            }
+        }
+
         if let Some(file) = mapping.shared_file() {
             #[cfg(target_os = "macos")]
             {
@@ -2396,6 +2550,38 @@ impl GuestMemoryDiscardAdviser for SystemGuestMemoryDiscardAdviser {
         self.free(address, size)
             .map_err(|_| GuestMemoryDiscardFailureKind::FreeAdvice)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn replace_private_file_with_anonymous(address: NonNull<c_void>, size: usize) -> io::Result<()> {
+    // SAFETY: discard validation supplies an exact host-page-aligned subrange
+    // of a live private-file mapping. `MAP_FIXED` atomically replaces only
+    // that range with private anonymous zero pages; the mapping owner retains
+    // responsibility for the same address range and final `munmap`.
+    let replacement = unsafe {
+        libc::mmap(
+            address.as_ptr(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if replacement == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    if replacement != address.as_ptr() {
+        // SAFETY: `mmap` returned a successful unexpected mapping of this
+        // exact size. Release it before reporting the invariant violation.
+        unsafe {
+            let _ = libc::munmap(replacement, size);
+        }
+        return Err(io::Error::other(
+            "private-file discard replacement returned an unexpected address",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -2599,6 +2785,70 @@ impl GuestMemoryMapping {
         })
     }
 
+    fn map_private_file(
+        size: usize,
+        file: Arc<File>,
+        file_offset: u64,
+    ) -> Result<Self, GuestMemoryAllocationError> {
+        let page_size = host_page_size()?;
+        let size_u64 = u64::try_from(size)
+            .map_err(|_| GuestMemoryAllocationError::PrivateFileMappingSizeInvalid)?;
+        if size == 0 || !size_u64.is_multiple_of(page_size) {
+            return Err(GuestMemoryAllocationError::PrivateFileMappingSizeInvalid);
+        }
+        if !file_offset.is_multiple_of(page_size) {
+            return Err(GuestMemoryAllocationError::PrivateFileOffsetUnaligned);
+        }
+        let mmap_offset = libc::off_t::try_from(file_offset)
+            .map_err(|_| GuestMemoryAllocationError::PrivateFileOffsetTooLarge)?;
+        let file_length = file
+            .metadata()
+            .map_err(|source| GuestMemoryAllocationError::PrivateFileInspectFailed { source })?
+            .len();
+        if file_offset
+            .checked_add(size_u64)
+            .is_none_or(|end| end > file_length)
+        {
+            return Err(GuestMemoryAllocationError::PrivateFileRangeBeyondEnd);
+        }
+        let identity = next_guest_memory_mapping_identity()?;
+        // SAFETY: the caller validated the descriptor length and host-page
+        // alignment, and this boundary repeated both checks immediately above.
+        // The retained `Arc<File>` outlives this private mapping, and no Rust
+        // reference is created by `mmap`.
+        let address = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                file.as_fd().as_raw_fd(),
+                mmap_offset,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(GuestMemoryAllocationError::PrivateFileMmapFailed {
+                size,
+                source: io::Error::last_os_error(),
+            });
+        }
+        let Some(address) = NonNull::new(address) else {
+            // SAFETY: `mmap` reported success, so the returned address and
+            // size describe the mapping even if the address is null.
+            unsafe {
+                let _ = libc::munmap(address, size);
+            }
+            return Err(GuestMemoryAllocationError::PrivateFileMmapReturnedNull { size });
+        };
+
+        Ok(Self {
+            address,
+            size,
+            identity,
+            kind: GuestMemoryMappingKind::PrivateFile { file, file_offset },
+        })
+    }
+
     #[cfg(test)]
     fn test_mapping(size: usize, drop_count: Arc<AtomicUsize>) -> Self {
         Self {
@@ -2622,19 +2872,24 @@ impl GuestMemoryMapping {
         self.identity
     }
 
-    const fn backing(&self) -> GuestMemoryBacking {
+    const fn backing(&self) -> GuestMemoryRegionBacking {
         match &self.kind {
-            GuestMemoryMappingKind::Anonymous => GuestMemoryBacking::Anonymous,
-            GuestMemoryMappingKind::Shared { .. } => GuestMemoryBacking::Shared,
+            GuestMemoryMappingKind::Anonymous => GuestMemoryRegionBacking::Anonymous,
+            GuestMemoryMappingKind::Shared { .. } => GuestMemoryRegionBacking::Shared,
+            GuestMemoryMappingKind::PrivateFile { .. } => GuestMemoryRegionBacking::PrivateFile,
             #[cfg(test)]
-            GuestMemoryMappingKind::Test { .. } => GuestMemoryBacking::Anonymous,
+            GuestMemoryMappingKind::Test { .. } => GuestMemoryRegionBacking::Anonymous,
         }
+    }
+
+    const fn is_private_file(&self) -> bool {
+        matches!(&self.kind, GuestMemoryMappingKind::PrivateFile { .. })
     }
 
     fn shared_file(&self) -> Option<&File> {
         match &self.kind {
             GuestMemoryMappingKind::Shared { file } => Some(file),
-            GuestMemoryMappingKind::Anonymous => None,
+            GuestMemoryMappingKind::Anonymous | GuestMemoryMappingKind::PrivateFile { .. } => None,
             #[cfg(test)]
             GuestMemoryMappingKind::Test { .. } => None,
         }
@@ -2717,11 +2972,14 @@ impl fmt::Debug for GuestMemoryMapping {
     }
 }
 
-#[derive(Debug)]
 enum GuestMemoryMappingKind {
     Anonymous,
     Shared {
         file: File,
+    },
+    PrivateFile {
+        file: Arc<File>,
+        file_offset: u64,
     },
     #[cfg(test)]
     Test {
@@ -2729,10 +2987,27 @@ enum GuestMemoryMappingKind {
     },
 }
 
+impl fmt::Debug for GuestMemoryMappingKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Anonymous => formatter.write_str("Anonymous"),
+            Self::Shared { .. } => formatter.write_str("Shared(<redacted>)"),
+            Self::PrivateFile { file, file_offset } => {
+                let _ = (Arc::strong_count(file), file_offset);
+                formatter.write_str("PrivateFile(<redacted>)")
+            }
+            #[cfg(test)]
+            Self::Test { .. } => formatter.write_str("Test(<redacted>)"),
+        }
+    }
+}
+
 impl Drop for GuestMemoryMapping {
     fn drop(&mut self) {
         match &self.kind {
-            GuestMemoryMappingKind::Anonymous | GuestMemoryMappingKind::Shared { .. } => {
+            GuestMemoryMappingKind::Anonymous
+            | GuestMemoryMappingKind::Shared { .. }
+            | GuestMemoryMappingKind::PrivateFile { .. } => {
                 // SAFETY: the constructors store only successful mmap results,
                 // and each `GuestMemoryMapping` owns exactly one mapping.
                 unsafe {
@@ -2763,9 +3038,10 @@ mod tests {
         GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError,
         GuestMemoryBacking, GuestMemoryDiscardAdviser, GuestMemoryDiscardFailureKind,
         GuestMemoryError, GuestMemoryLayout, GuestMemoryMapper, GuestMemoryMapping,
-        GuestMemoryMappingKind, GuestMemoryRange, GuestMemoryRegion, GuestMemorySharedBackingError,
-        GuestMemorySharedReservationCaptureError, SharedMemoryResourceLimits, aarch64,
-        host_page_size, preflight_shared_memory_resource_values_with_limits,
+        GuestMemoryMappingKind, GuestMemoryRange, GuestMemoryRegion, GuestMemoryRegionBacking,
+        GuestMemorySharedBackingError, GuestMemorySharedReservationCaptureError,
+        SharedMemoryResourceLimits, aarch64, host_page_size,
+        preflight_shared_memory_resource_values_with_limits,
         preflight_shared_memory_resources_with_limits,
     };
 
@@ -4444,7 +4720,7 @@ mod tests {
             .expect("anonymous allocation should contain one region");
 
         assert_eq!(memory.backing(), GuestMemoryBacking::Anonymous);
-        assert_eq!(region.backing(), GuestMemoryBacking::Anonymous);
+        assert_eq!(region.backing(), GuestMemoryRegionBacking::Anonymous);
         assert!(
             !region
                 .validate_shared_backing()
@@ -4469,7 +4745,7 @@ mod tests {
             .regions()
             .first()
             .expect("shared allocation should contain one region");
-        assert_eq!(region.backing(), GuestMemoryBacking::Shared);
+        assert_eq!(region.backing(), GuestMemoryRegionBacking::Shared);
         let region_debug = format!("{region:?}");
         let host_address = format!("{:p}", region.host_address());
         let export = region
@@ -4585,7 +4861,7 @@ mod tests {
             .insert_region(second_range)
             .expect("shared dynamic region should allocate");
         assert!(memory.regions().iter().all(|region| {
-            region.backing() == GuestMemoryBacking::Shared
+            region.backing() == GuestMemoryRegionBacking::Shared
                 && region
                     .try_clone_shared_backing()
                     .expect("shared descriptor should clone")
@@ -4812,7 +5088,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_reservation_rejects_anonymous_and_overlapping_ranges() {
+    fn shared_reservation_accepts_any_profile_and_rejects_overlapping_ranges() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let boot_range = range(0, page_size);
         let reservation_range = range(page_size * 2, page_size * 2);
@@ -4821,13 +5097,11 @@ mod tests {
         let mut anonymous =
             GuestMemory::allocate(&layout).expect("anonymous memory should allocate");
 
-        assert!(matches!(
-            anonymous
-                .reserve_shared_region(reservation_range)
-                .expect_err("anonymous reservation should fail"),
-            GuestMemoryAllocationError::SharedReservationRequiresSharedBacking { range }
-                if range == reservation_range
-        ));
+        anonymous
+            .reserve_shared_region(reservation_range)
+            .expect("explicit reservation should be independent of the dynamic profile");
+        assert_eq!(anonymous.shared_export_regions().count(), 1);
+        assert_eq!(anonymous.backing(), GuestMemoryBacking::Anonymous);
 
         let mut shared = GuestMemory::allocate_with_backing(&layout, GuestMemoryBacking::Shared)
             .expect("shared memory should allocate");
@@ -5095,6 +5369,79 @@ mod tests {
         ));
         assert_eq!(mapper.maps, 2);
         assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn private_file_memory_preflights_all_extents_and_drops_partial_mapping_failure() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let file_size = usize::try_from(page_size * 3).expect("test file size should fit usize");
+        let file = Arc::new(
+            super::create_shared_memory_file(file_size)
+                .expect("test descriptor backing should create"),
+        );
+        let page_size_usize = usize::try_from(page_size).expect("test page size should fit usize");
+        assert!(matches!(
+            GuestMemoryMapping::map_private_file(page_size_usize - 1, Arc::clone(&file), page_size),
+            Err(GuestMemoryAllocationError::PrivateFileMappingSizeInvalid)
+        ));
+        assert!(matches!(
+            GuestMemoryMapping::map_private_file(page_size_usize, Arc::clone(&file), 1),
+            Err(GuestMemoryAllocationError::PrivateFileOffsetUnaligned)
+        ));
+        let valid = [
+            (range(0, page_size), page_size),
+            (range(page_size, page_size), page_size * 2),
+        ];
+        let mut preflight_calls = 0;
+        let unaligned = [valid[0], (valid[1].0, valid[1].1 + 1)];
+        let error = GuestMemory::from_private_file_ranges_with_mapper(
+            &unaligned,
+            Arc::clone(&file),
+            GuestMemoryBacking::Anonymous,
+            &mut |size, _file, _offset| {
+                preflight_calls += 1;
+                Ok(GuestMemoryMapping::test_mapping(
+                    size,
+                    Arc::new(AtomicUsize::new(0)),
+                ))
+            },
+        )
+        .expect_err("a later unaligned extent should fail before every mmap");
+        assert!(matches!(
+            error,
+            GuestMemoryAllocationError::PrivateFileOffsetUnaligned
+        ));
+        assert_eq!(preflight_calls, 0);
+
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut maps = 0;
+        let error = GuestMemory::from_private_file_ranges_with_mapper(
+            &valid,
+            Arc::clone(&file),
+            GuestMemoryBacking::Anonymous,
+            &mut |size, _file, _offset| {
+                maps += 1;
+                if maps == 2 {
+                    Err(GuestMemoryAllocationError::PrivateFileMmapFailed {
+                        size,
+                        source: io::Error::other("injected private-file mmap failure"),
+                    })
+                } else {
+                    Ok(GuestMemoryMapping::test_mapping(
+                        size,
+                        Arc::clone(&drop_count),
+                    ))
+                }
+            },
+        )
+        .expect_err("second private-file mmap should fail");
+        assert!(matches!(
+            error,
+            GuestMemoryAllocationError::PrivateFileMmapFailed { .. }
+        ));
+        assert_eq!(maps, 2);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+        assert_eq!(Arc::strong_count(&file), 1);
     }
 
     #[derive(Debug)]

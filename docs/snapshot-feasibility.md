@@ -5,11 +5,12 @@ Firecracker-shaped snapshot APIs on macOS with Hypervisor.framework. bangbang
 supports one narrow public native-v1 full-snapshot profile; broader Firecracker
 snapshot and migration compatibility remains out of scope.
 
-The runtime library also has an isolated bangbang-native v2 structural state
-foundation. Its initial `2.0.0` production catalog contains no required feature
-or semantic component, so it is not loadable VM state and is not emitted,
-described, or loaded by any public process path. The public lifecycle and CLI
-remain native-v1 until later Wave 6 work explicitly changes them.
+The runtime library also has an isolated bangbang-native v2 state and lazy
+guest-memory foundation. The immutable `2.0.0` profile contains no semantic
+component; the current `2.1.0` profile adds one state-bound, demand-paged
+File/COW memory image. It is still not complete loadable VM state and is not
+emitted, described, or loaded by any public process path. The public lifecycle
+and CLI remain native-v1 until later Wave 6 work explicitly changes them.
 
 ## Current Status
 
@@ -174,10 +175,9 @@ backend-specific composite payload.
 
 ## Native V2 Structural State Foundation
 
-Native v2 is a bangbang-owned, arm64-specific state container. It is designed
-for future typed component codecs without changing any native-v1 bytes or
-production path in this slice. All numeric fields are little-endian. The fixed
-header is 64 bytes:
+Native v2 is a bangbang-owned, arm64-specific state container designed for
+typed component codecs without changing any native-v1 bytes or production
+path. All numeric fields are little-endian. The fixed header is 64 bytes:
 
 | Offset | Width | Field | Native-v2 rule |
 | ---: | ---: | --- | --- |
@@ -221,11 +221,14 @@ minor. For an older or equal minor it requires every mandatory feature and
 semantic component kind to exist in the reader catalog at that minor.
 Explicitly nonsemantic components may remain unknown after their complete
 directory and payload ranges validate. Patch changes do not alter semantics.
-The initial production `2.0.0` catalogs are empty: the canonical emitted
-fixture is the 64-byte header plus its eight-byte CRC, nonsemantic extensions
-can be structurally represented, and every required feature or semantic
-component rejects. No future identifier or minor is reserved by this
-foundation.
+The immutable production `2.0.0` catalogs are empty: its canonical fixture is
+the 64-byte header plus its eight-byte CRC, nonsemantic extensions can be
+structurally represented, and every required feature or semantic component
+rejects. The current writer emits `2.1.0`; its catalog adds semantic component
+kind `1`, introduced in minor 1, and the typed memory profile requires its sole
+instance to be `0`. The required-feature catalog remains empty because the
+semantic component itself is the mandatory compatibility identity. No other
+identifier or future minor is reserved.
 
 Decoding first checks the fixed header, version, count caps, checked length and
 offset arithmetic, exact length, whole-state CRC, complete feature inventory,
@@ -246,6 +249,76 @@ from Firecracker v1.16.0 at pinned commit
 `d83d72b710361a10294480131377b1b00b163af8` to return a named incompatible-format
 result; this is not bitcode decoding, validity proof, translation, or
 Firecracker artifact compatibility.
+
+### Native V2 Lazy File Memory Profile
+
+The `(kind 1, instance 0)` semantic component payload is a fixed 64-byte
+binding header followed by one 24-byte entry per ordered guest extent:
+
+| Offset | Width | Field | Native-v2 memory rule |
+| ---: | ---: | --- | --- |
+| 0 | 8 | magic | bytes `BANGM2A\0` |
+| 8..14 | 6 | semantic version | exact `2.1.0` |
+| 14 | 2 | header bytes | exact `64` |
+| 16 | 4 | flags | must be zero |
+| 20 | 4 | guest granule | exact `4096` bytes |
+| 24 | 4 | file alignment | exact `65536` bytes |
+| 28 | 4 | extent count | `1..=4096` |
+| 32 | 16 | image ID | opaque OS-random state/image pair identity |
+| 48 | 8 | metadata CRC64 | CRC-64/Jones with this field zeroed over the header and complete extent table |
+| 56 | 8 | file length | exact final extent end; no trailer |
+
+Each extent contains little-endian `u64` GPA start, byte length, and absolute
+file offset. GPA values and lengths are nonzero and 4-KiB aligned, ranges are
+strictly increasing and nonoverlapping, total guest data is bounded by the
+existing 1,022-GiB arm64 policy, and every arithmetic operation is checked.
+The first extent starts at file offset 64 KiB. Every later extent starts at the
+64-KiB alignment of the preceding extent end, and the file ends exactly at the
+last extent end. The complete binding, including the topology and pair ID, is
+nested in the state container and protected by both metadata and outer-state
+CRCs.
+
+The memory image repeats the exact 64-byte binding header, requires zero bytes
+through offset 64 KiB, and stores guest bytes only in the bound extents.
+Inter-extent alignment gaps are sparse canonical zeroes outside guest memory.
+The bounded writer accepts only an empty, position-zero `Write + Seek` target,
+writes the header/padding, streams each guest extent in at most 1-MiB chunks,
+and verifies the exact final position and length. A cancellation-aware sibling
+checks the fixed preflight, header, padding, every extent/chunk, and final-length
+stages and never returns a binding after cancellation.
+
+The loader extracts and validates the typed state component before path or
+descriptor access. Its direct adapter opens the final component once with
+read-only, close-on-exec, nonblocking, and no-follow flags; its contained
+adapter adopts one already-opened `File`. Both require a read-only close-on-exec
+regular descriptor, exact length, stable device/inode/mode/timestamps/flags,
+an exact state-bound header, and zero fixed padding. Only the 64-KiB metadata
+area is read before mapping. Every GPA, length, file offset, host-page
+alignment, integer conversion, and file bound is preflighted before the first
+`mmap`, then each extent becomes `PROT_READ|PROT_WRITE`, `MAP_PRIVATE`,
+no-reserve guest memory retaining the same descriptor owner. The descriptor is
+rechecked after metadata validation and after mapping; any change drops all
+partial mappings. A successful load never consults the path again.
+
+Private-file regions participate in ordinary byte access, HVF mapping, and the
+existing dirty epoch. Initial demand faults are clean; explicit VMM/device or
+guest writes become dirty COW pages and never write the source. Discard replaces
+an exact aligned private subrange with anonymous zero pages instead of punching
+or mutating the file. Anonymous dynamic regions and explicit shared reservations
+can coexist, but shared export exposes only actual shared mappings; vhost-user's
+whole-memory Shared requirement is unchanged. Every region retains and releases
+its own owner, including partial construction, dynamic removal, ordinary drop,
+and post-VM-destroy cleanup.
+
+This format deliberately has no guest-byte CRC, authenticated digest, trailer,
+or encryption. The metadata CRCs detect accidental binding corruption only.
+A deployment must authenticate and, when confidentiality is required, encrypt
+the complete state and memory artifacts outside this codec. After validation,
+the retained inode must remain immutable for the mapping lifetime; macOS offers
+no seal for an arbitrary external regular file, so concurrent external mutation
+or truncation violates the loader contract. Public native-v2 create/load,
+transactional pair publication, machine/vCPU/device state, Diff/merge, UFFD,
+and clone/portability policy remain follow-on work.
 
 ## Native V1 Guest-Memory Image and Binding
 

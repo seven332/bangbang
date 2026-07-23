@@ -4712,6 +4712,213 @@ fn maps_shared_guest_memory_and_exposes_guest_writes_through_its_descriptor() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn maps_native_v2_file_memory_on_demand_with_cow_dirty_and_cleanup() {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt;
+    use std::sync::{Arc, Mutex};
+
+    use bangbang_hvf::{
+        HvfArm64BootRegisters, HvfBackend, HvfMemoryPermissions, HvfVcpuRunStepOutcome,
+    };
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, aarch64};
+    use bangbang_runtime::mmio::MmioDispatcher;
+    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
+    use bangbang_runtime::snapshot_memory_v2::{
+        encode_snapshot_v2_state_with_memory, load_snapshot_v2_memory_file,
+        write_snapshot_v2_memory_image,
+    };
+
+    const IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+    const TARGET_OFFSET: u64 = IMAGE_BYTES - 64 * 1024;
+    const TEST_VALUE: u32 = 0x5aa5_c33c;
+    const INITIAL_TARGET: [u8; 4] = [0x13, 0x37, 0x42, 0x99];
+    const LDR_W2_X0: u32 = 0xb940_0002;
+    const HVC_ZERO: u32 = 0xd400_0002;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let layout = aarch64::dram_layout(IMAGE_BYTES).expect("large v2 layout should be valid");
+    let mut source_memory = GuestMemory::allocate(&layout).expect("source memory should allocate");
+    let guest_entry = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let guest_target = guest_entry
+        .checked_add(TARGET_OFFSET)
+        .expect("distant target should fit");
+    let mut guest_code = arm64_store_u32_and_hvc_program(guest_target.raw_value(), TEST_VALUE);
+    guest_code.truncate(guest_code.len() - std::mem::size_of::<u32>());
+    guest_code.extend_from_slice(&LDR_W2_X0.to_le_bytes());
+    guest_code.extend_from_slice(&HVC_ZERO.to_le_bytes());
+    guest_code.extend_from_slice(&HVC_ZERO.to_le_bytes());
+    source_memory
+        .write_slice(&guest_code, guest_entry)
+        .expect("v2 guest code should write");
+    source_memory
+        .write_slice(&INITIAL_TARGET, guest_target)
+        .expect("v2 distant source value should write");
+
+    let image_file = TempFile::new_len("native-v2-lazy-memory", 0)
+        .expect("empty v2 memory artifact should create");
+    let mut writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image_file.path())
+        .expect("v2 memory artifact should open for writing");
+    let binding = write_snapshot_v2_memory_image(&source_memory, &mut writer)
+        .expect("v2 memory artifact should write");
+    drop(writer);
+    drop(source_memory);
+
+    let state_bytes =
+        encode_snapshot_v2_state_with_memory(&binding).expect("v2 memory state should encode");
+    let state = decode_snapshot_v2_state(&state_bytes).expect("v2 memory state should decode");
+    let source_file =
+        std::fs::File::open(image_file.path()).expect("v2 source should open read-only");
+    let data_offset = binding.extents()[0].file_offset();
+    let target_file_offset = data_offset + TARGET_OFFSET;
+    let mut source_code_before = vec![0_u8; guest_code.len()];
+    source_file
+        .read_exact_at(&mut source_code_before, data_offset)
+        .expect("source code should read before mapping");
+    let mut source_target_before = [0_u8; 4];
+    source_file
+        .read_exact_at(&mut source_target_before, target_file_offset)
+        .expect("source target should read before mapping");
+    assert_eq!(source_code_before, guest_code);
+    assert_eq!(source_target_before, INITIAL_TARGET);
+
+    let before_load = process_memory_usage().expect("pre-load process usage should query");
+    let memory =
+        load_snapshot_v2_memory_file(&state, source_file).expect("v2 memory should map lazily");
+    let after_load = process_memory_usage().expect("post-load process usage should query");
+    let load_growth = after_load.saturating_growth_from(before_load);
+    assert!(
+        load_growth.virtual_size >= IMAGE_BYTES / 2,
+        "lazy mapping should reserve most of the image virtually: {load_growth:?}"
+    );
+    assert!(
+        load_growth.resident_size < IMAGE_BYTES / 2,
+        "metadata validation must not make half the image resident: {load_growth:?}"
+    );
+    assert!(
+        load_growth.faults < IMAGE_BYTES / host_page_size().expect("page size should query") / 2,
+        "metadata validation must not fault half the image: {load_growth:?}"
+    );
+
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("v2 VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("v2 file memory should map into HVF");
+    let tracker = backend
+        .start_dirty_write_tracking()
+        .expect("v2 memory should establish a clean dirty baseline");
+    assert!(
+        tracker
+            .dirty_pages()
+            .expect("initial v2 dirty pages should query")
+            .is_empty()
+    );
+    let before_guest = process_memory_usage().expect("pre-guest process usage should query");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("v2 memory vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: guest_entry,
+                fdt_address: guest_target,
+            })
+            .expect("v2 memory guest registers should configure");
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        assert_eq!(
+            runner
+                .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                .expect("v2 guest first write should be handled"),
+            HvfVcpuRunStepOutcome::DirtyWrite {
+                page: guest_target,
+                first_write: true,
+            }
+        );
+        assert!(matches!(
+            runner
+                .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                .expect("v2 guest should retry through first HVC"),
+            HvfVcpuRunStepOutcome::Hvc { exit, .. } if exit.immediate() == 0
+        ));
+        assert_eq!(
+            runner
+                .capture_arm64_general_register_state()
+                .expect("v2 guest registers should capture")
+                .general_purpose_register(2),
+            Some(u64::from(TEST_VALUE))
+        );
+        assert!(matches!(
+            runner
+                .run_once_and_handle_mmio(dispatcher)
+                .expect("v2 guest should continue through second HVC"),
+            HvfVcpuRunStepOutcome::Hvc { exit, .. } if exit.immediate() == 0
+        ));
+        runner
+            .shutdown()
+            .expect("v2 memory vCPU runner should shut down");
+    }
+    let after_guest = process_memory_usage().expect("post-guest process usage should query");
+    assert!(
+        after_guest.faults > before_guest.faults || after_guest.pageins > before_guest.pageins,
+        "first guest access should add a demand fault or page-in: before={before_guest:?}, after={after_guest:?}"
+    );
+    assert_eq!(
+        tracker
+            .dirty_pages()
+            .expect("v2 memory dirty pages should query"),
+        vec![guest_target]
+    );
+    tracker
+        .stop()
+        .expect("v2 dirty tracker should restore write access");
+    backend
+        .stop_dirty_write_tracking()
+        .expect("v2 tracker retention should clear");
+
+    let source_file =
+        std::fs::File::open(image_file.path()).expect("v2 source should reopen for verification");
+    let mut source_code_after = vec![0_u8; guest_code.len()];
+    source_file
+        .read_exact_at(&mut source_code_after, data_offset)
+        .expect("source code should read after execution");
+    let mut source_target_after = [0_u8; 4];
+    source_file
+        .read_exact_at(&mut source_target_after, target_file_offset)
+        .expect("source target should read after execution");
+    assert_eq!(source_code_after, source_code_before);
+    assert_eq!(source_target_after, source_target_before);
+
+    backend
+        .unmap_guest_memory()
+        .expect("v2 memory should unmap ordinarily");
+    backend.destroy_vm().expect("v2 VM should destroy");
+
+    let fallback_memory = load_snapshot_v2_memory_file(
+        &state,
+        std::fs::File::open(image_file.path())
+            .expect("v2 source should reopen for fallback cleanup"),
+    )
+    .expect("second v2 memory should map lazily");
+    let mut fallback_backend = HvfBackend::new();
+    fallback_backend
+        .create_vm()
+        .expect("fallback v2 VM should create");
+    fallback_backend
+        .map_guest_memory(fallback_memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("fallback v2 memory should map");
+    fallback_backend
+        .destroy_vm()
+        .expect("VM destroy should release v2 memory after backend unmap");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn prepares_internal_hvf_arm64_boot_session() {
     use bangbang_hvf::{ARM64_LINUX_BOOT_CPSR, HvfArm64BootSessionConfig, HvfBackend};
     use bangbang_runtime::VmmAction;
@@ -8988,6 +9195,8 @@ fn host_page_size() -> Result<u64, std::num::TryFromIntError> {
 struct ProcessMemoryUsage {
     virtual_size: u64,
     resident_size: u64,
+    faults: u64,
+    pageins: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -8996,6 +9205,8 @@ impl ProcessMemoryUsage {
         Self {
             virtual_size: self.virtual_size.saturating_sub(baseline.virtual_size),
             resident_size: self.resident_size.saturating_sub(baseline.resident_size),
+            faults: self.faults.saturating_sub(baseline.faults),
+            pageins: self.pageins.saturating_sub(baseline.pageins),
         }
     }
 }
@@ -9029,6 +9240,8 @@ fn process_memory_usage() -> std::io::Result<ProcessMemoryUsage> {
         Ok(ProcessMemoryUsage {
             virtual_size: task_info.pti_virtual_size,
             resident_size: task_info.pti_resident_size,
+            faults: u64::try_from(task_info.pti_faults).unwrap_or(0),
+            pageins: u64::try_from(task_info.pti_pageins).unwrap_or(0),
         })
     } else if returned_size == 0 {
         Err(std::io::Error::last_os_error())

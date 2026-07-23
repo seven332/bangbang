@@ -38,10 +38,12 @@ const ESR_ISS_S1PTW: u64 = 1 << 7;
 const ESR_ISS_WNR: u64 = 1 << 6;
 const ESR_ISS_DFSC_MASK: u64 = 0x3f;
 // Signed Apple Silicon evidence shows that the initial pre-owner protection
-// exits as a level-three translation fault, while re-protecting a page after
-// one writable epoch exits as a level-three permission fault. This empirical
-// HVF contract must remain exact and is never sufficient without tracker-owned
-// range and protection-state checks.
+// exits as a level-three translation fault, a write-first fault on an untouched
+// lazy private-file page exits as a level-two translation fault, and
+// re-protecting a page after one writable epoch exits as a level-three
+// permission fault. This empirical HVF contract must remain exact and is never
+// sufficient without tracker-owned range and protection-state checks.
+const ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION: u64 = 0x06;
 const ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION: u64 = 0x07;
 const ESR_ISS_DFSC_LEVEL_THREE_PERMISSION: u64 = 0x0f;
 
@@ -64,7 +66,9 @@ impl HvfExceptionExit {
             && self.syndrome & (ESR_ISS_CM | ESR_ISS_S1PTW) == 0
             && matches!(
                 dfsc,
-                ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION | ESR_ISS_DFSC_LEVEL_THREE_PERMISSION
+                ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION
+                    | ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION
+                    | ESR_ISS_DFSC_LEVEL_THREE_PERMISSION
             )
     }
 
@@ -675,13 +679,13 @@ mod tests {
     use super::{
         ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_HVC, ESR_EC_SHIFT, ESR_EC_SYS64, ESR_ISS_CM,
         ESR_ISS_DFSC_LEVEL_THREE_PERMISSION, ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION,
-        ESR_ISS_DFSC_MASK, ESR_ISS_ISV, ESR_ISS_S1PTW, ESR_ISS_SAS_SHIFT, ESR_ISS_SF,
-        ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_SYS64_CRM_SHIFT, ESR_ISS_SYS64_CRN_SHIFT,
-        ESR_ISS_SYS64_DIRECTION, ESR_ISS_SYS64_OP0_SHIFT, ESR_ISS_SYS64_OP1_SHIFT,
-        ESR_ISS_SYS64_OP2_SHIFT, ESR_ISS_SYS64_RT_SHIFT, ESR_ISS_WNR, HvfExceptionExit,
-        HvfHvcDecodeError, HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection,
-        HvfMmioRegister, HvfMmioRegisterWidth, HvfMmioResolveError, HvfResolvedVcpuExit,
-        HvfSys64DecodeError, HvfSys64Direction, HvfSys64Register, HvfVcpuExit,
+        ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION, ESR_ISS_DFSC_MASK, ESR_ISS_ISV, ESR_ISS_S1PTW,
+        ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_SYS64_CRM_SHIFT,
+        ESR_ISS_SYS64_CRN_SHIFT, ESR_ISS_SYS64_DIRECTION, ESR_ISS_SYS64_OP0_SHIFT,
+        ESR_ISS_SYS64_OP1_SHIFT, ESR_ISS_SYS64_OP2_SHIFT, ESR_ISS_SYS64_RT_SHIFT, ESR_ISS_WNR,
+        HvfExceptionExit, HvfHvcDecodeError, HvfMmioAccessSize, HvfMmioDecodeError,
+        HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth, HvfMmioResolveError,
+        HvfResolvedVcpuExit, HvfSys64DecodeError, HvfSys64Direction, HvfSys64Register, HvfVcpuExit,
         HvfVcpuExitResolveError,
     };
     use bangbang_runtime::{
@@ -769,8 +773,9 @@ mod tests {
     }
 
     #[test]
-    fn classifies_signed_observed_initial_and_reprotected_write_faults() {
+    fn classifies_signed_observed_anonymous_lazy_and_reprotected_write_faults() {
         for dfsc in [
+            ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION,
             ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION,
             ESR_ISS_DFSC_LEVEL_THREE_PERMISSION,
         ] {
@@ -798,7 +803,6 @@ mod tests {
             candidate | ESR_ISS_S1PTW,
             (candidate & !ESR_ISS_DFSC_MASK) | 0x04,
             (candidate & !ESR_ISS_DFSC_MASK) | 0x05,
-            (candidate & !ESR_ISS_DFSC_MASK) | 0x06,
             (candidate & !ESR_ISS_DFSC_MASK) | 0x0c,
             (candidate & !ESR_ISS_DFSC_MASK) | 0x0e,
             same_el_data_abort,
