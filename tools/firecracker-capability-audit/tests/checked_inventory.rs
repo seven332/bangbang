@@ -264,8 +264,220 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 220);
-    assert_eq!(count(Disposition::AuditRequired), 178);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 228);
+    assert_eq!(count(Disposition::AuditRequired), 170);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
+}
+
+#[test]
+fn vsock_closure_policy_is_stable() {
+    const TERMINAL: [&str; 8] = [
+        "api-operation:PUT /vsock",
+        "api-path:/vsock",
+        "api-property:FullVmConfiguration.vsock",
+        "api-property:Vsock.guest_cid",
+        "api-property:Vsock.uds_path",
+        "api-property:Vsock.vsock_id",
+        "api-schema:Vsock",
+        "semantic.vsock:live-routing-credit-events-and-cleanup",
+    ];
+    const RETAINED: [&str; 6] = [
+        "api-property:SnapshotLoadParams.vsock_override",
+        "api-property:VsockOverride.uds_path",
+        "api-schema:VsockOverride",
+        "corpus:vsock",
+        "semantic.snapshot:network-vsock-overrides-portability-and-clones",
+        "semantic.vsock:snapshot-override-reset-and-rx-gating",
+    ];
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+    let contract = std::fs::read_to_string(
+        repository_root.join("compat/firecracker/v1.16.0/vsock-contract.md"),
+    )
+    .expect("checked vsock contract must be readable");
+
+    assert_eq!(
+        inventory.capabilities.len(),
+        418,
+        "the checked v1.16.0 overlay identity count drifted"
+    );
+    let expected_ids = TERMINAL
+        .into_iter()
+        .chain(RETAINED)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected_ids.len(), 14, "vsock ledger must stay exact");
+
+    for id in TERMINAL {
+        let capability = by_id.get(id).expect("terminal vsock record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "terminal vsock disposition drifted: {id}"
+        );
+        assert!(
+            !capability.implementation.is_empty() && !capability.validation.is_empty(),
+            "terminal vsock evidence is incomplete: {id}"
+        );
+        assert!(
+            !capability.summary.contains("Audit ")
+                && !capability.summary.contains("Continue auditing")
+                && !capability.summary.contains("current live subset")
+                && !capability.summary.contains("#1518"),
+            "terminal vsock summary still names future certification: {id}"
+        );
+    }
+
+    const WAVE_6_URL: &str = "https://github.com/seven332/bangbang/issues/1490";
+    for id in RETAINED {
+        let capability = by_id.get(id).expect("retained vsock record must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "retained vsock disposition drifted: {id}"
+        );
+        assert!(
+            capability.summary.contains(WAVE_6_URL),
+            "retained vsock summary must name the full Wave 6 owner URL: {id}"
+        );
+        for outcome in [
+            "encoding",
+            "placement",
+            "invocation",
+            "restored",
+            "acknowledgement",
+            "override",
+            "clone",
+            "version",
+            "portability",
+        ] {
+            assert!(
+                capability.summary.contains(outcome),
+                "retained vsock summary must name missing {outcome} outcome: {id}"
+            );
+        }
+        assert!(
+            capability.implementation.is_empty() && capability.validation.is_empty(),
+            "retained aggregate rows must not masquerade producer evidence as completion: {id}"
+        );
+    }
+
+    let rows = contract
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect::<Vec<_>>();
+    let contract_ids = rows
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix("| `")
+                .and_then(|line| line.split_once("` |"))
+                .map(|(id, _)| id)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(rows.len(), 14, "vsock contract row count drifted");
+    assert_eq!(
+        contract_ids, expected_ids,
+        "vsock contract identity set drifted"
+    );
+
+    for id in TERMINAL {
+        let row_prefix = format!("| `{id}` |");
+        let row = rows
+            .iter()
+            .copied()
+            .find(|row| row.starts_with(&row_prefix))
+            .unwrap_or_else(|| panic!("terminal vsock row must exist: {id}"));
+        assert_eq!(
+            contract.matches(&row_prefix).count(),
+            1,
+            "terminal vsock contract row must be unique: {id}"
+        );
+        assert!(row.contains("`implemented-and-verified`"));
+        assert!(row.ends_with("| `terminal` |"));
+        for evidence in ["FC-", "FOCUSED-", "SIGNED-"] {
+            assert!(
+                row.contains(evidence),
+                "terminal vsock row must contain {evidence} evidence: {id}"
+            );
+        }
+    }
+
+    for id in RETAINED {
+        let row_prefix = format!("| `{id}` |");
+        let row = rows
+            .iter()
+            .copied()
+            .find(|row| row.starts_with(&row_prefix))
+            .unwrap_or_else(|| panic!("retained vsock row must exist: {id}"));
+        assert_eq!(
+            contract.matches(&row_prefix).count(),
+            1,
+            "retained vsock contract row must be unique: {id}"
+        );
+        assert!(row.contains("`audit-required`"));
+        assert!(row.contains("`FC-SNAPSHOT`") || id == "corpus:vsock");
+        assert!(row.contains("FOCUSED-"));
+        assert!(
+            row.contains("SIGNED-CAPTURE")
+                && (row.contains("source only") || row.contains("source/live subset")),
+            "retained vsock signed evidence must stay source-only: {id}"
+        );
+        assert!(row.contains("`W6`"));
+        assert!(
+            row.contains(WAVE_6_URL),
+            "retained vsock row must name the full Wave 6 owner URL: {id}"
+        );
+    }
+
+    for required in [
+        "d83d72b710361a10294480131377b1b00b163af8",
+        "src/firecracker/swagger/firecracker.yaml",
+        "src/firecracker/src/api_server/request/vsock.rs",
+        "src/vmm/src/devices/virtio/vsock/persist.rs",
+        "tests/integration_tests/functional/test_vsock.py",
+        WAVE_6_URL,
+        "https://github.com/seven332/bangbang/issues/1491",
+        "parses_put_vsock_with_deprecated_vsock_id",
+        "snapshot_vsock_selectors_resolve_before_resource_access_and_redact_values",
+        "virtio_vsock_transport_reset_publishes_event_and_mmio_interrupt",
+        "virtio_vsock_restored_gate_keeps_tx_live_and_buffers_generated_rx",
+        "signed_executable_runs_async_block_over_mmio_with_live_patch",
+        "signed_executable_handles_guest_initiated_vsock_from_direct_rootfs",
+        "signed_executable_handles_guest_initiated_vsock_multistream_from_direct_rootfs",
+        "signed_executable_handles_host_initiated_vsock_to_direct_rootfs",
+        "signed_executable_handles_host_initiated_vsock_multistream_to_direct_rootfs",
+        "signed_executable_resets_live_vsock_before_unsupported_snapshot_over_mmio",
+        "signed_executable_resets_live_vsock_before_unsupported_snapshot_over_product_pci",
+        "capture_ready_vsock_resets_signed_mmio_and_pci_owners",
+        "normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers",
+        "normal_bundle_routes_host_vsock_through_supplied_granted_listener",
+    ] {
+        assert!(
+            contract.contains(required),
+            "vsock contract must pin {required}"
+        );
+    }
+
+    let count = |disposition| {
+        inventory
+            .capabilities
+            .iter()
+            .filter(|capability| capability.disposition == disposition)
+            .count()
+    };
+    assert_eq!(count(Disposition::ImplementedAndVerified), 228);
+    assert_eq!(count(Disposition::AuditRequired), 170);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -534,8 +746,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 220);
-    assert_eq!(count(Disposition::AuditRequired), 178);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 228);
+    assert_eq!(count(Disposition::AuditRequired), 170);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 

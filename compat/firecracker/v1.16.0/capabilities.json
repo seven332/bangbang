@@ -1378,11 +1378,50 @@
     {
       "id": "api-operation:PUT /vsock",
       "family": "api-contract",
-      "summary": "Audit the observable Firecracker v1.16 API operation PUT /vsock.",
+      "summary": "Accept and transactionally replace one strict Firecracker-shaped preboot vsock configuration, prepare direct or exact contained socket authority before commit, attach the selected MMIO or PCI live device at startup, and reject invalid or post-start requests without mutation.",
       "source_refs": [
         "api-operation:PUT /vsock"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "parse_vsock_config_request and strict PUT route"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "put_vsock prepares authority before configuration commit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "prepared MMIO or PCI virtio-vsock live device"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "PUT vsock parsing and rejection tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "configures_vsock_over_unix_socket"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct guest and host initiated vsock scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained guest and host initiated vsock scenarios"
+        }
+      ]
     },
     {
       "id": "api-path:/",
@@ -2155,11 +2194,40 @@
     {
       "id": "api-path:/vsock",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API path /vsock.",
+      "summary": "Expose the strict PUT-only /vsock route with bounded Firecracker-shaped JSON parsing, stable method and path faults, preboot-only state policy, and no unclaimed PATCH, DELETE, or runtime hotplug route.",
       "source_refs": [
         "api-path:/vsock"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "Endpoint::Vsock PUT-only request routing"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "PutVsock public process action conversion"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "rejects_unsupported_vsock_method_or_path"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed PUT /vsock startup and post-start rejection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained PUT /vsock startup"
+        }
+      ]
     },
     {
       "id": "api-property:ArmRegisterModifier.addr",
@@ -4519,11 +4587,45 @@
     {
       "id": "api-property:FullVmConfiguration.vsock",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property FullVmConfiguration.vsock.",
+      "summary": "Project the committed nullable vsock configuration through GET /vm/config with exact guest_cid and uds_path values, omit the deprecated input-only vsock_id, and preserve the last successful configuration across rejected replacement.",
       "source_refs": [
         "api-property:FullVmConfiguration.vsock"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "vsock_config_response_value"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "vsock_config_response_from_runtime"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "committed VmConfiguration vsock projection"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "response_body_contains_configured_vm_config and optional-field omission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed executable GET /vm/config vsock projection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "put_vsock_config_replaces_existing_config"
+        }
+      ]
     },
     {
       "id": "api-property:InstanceActionInfo.action_type",
@@ -6465,7 +6567,7 @@
     {
       "id": "api-property:SnapshotLoadParams.vsock_override",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property SnapshotLoadParams.vsock_override.",
+      "summary": "Bangbang parses and redacts vsock_override and resolves it before resource access. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns optional-device encoding and placement, public load invocation, restored acknowledgement and reconnect through the override, clone/version policy, and artifact/host portability.",
       "source_refs": [
         "api-property:SnapshotLoadParams.vsock_override"
       ],
@@ -6723,34 +6825,126 @@
     {
       "id": "api-property:Vsock.guest_cid",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Vsock.guest_cid.",
+      "summary": "Require an unsigned 32-bit guest CID of at least 3, publish it as the exact little-endian 64-bit virtio-vsock config value, and route both initiation directions only for that configured guest identity.",
       "source_refs": [
         "api-property:Vsock.guest_cid"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "configured guest CID preserved into the selected live owner"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "VsockConfig guest CID validation and VirtioVsockConfigSpace"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct guest and host initiated routing for CID 3"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "capture_ready_vsock_resets_signed_mmio_and_pci_owners"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "rejects_guest_cid_below_firecracker_minimum and config-space tests"
+        }
+      ]
     },
     {
       "id": "api-property:Vsock.uds_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Vsock.uds_path.",
+      "summary": "Validate one relative or absolute logical Unix-socket selector, keep it distinct from host authority and redacted from diagnostics, then bind or adopt the exact direct or contained listener and clean only the owned identity.",
       "source_refs": [
         "api-property:Vsock.uds_path"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/anchored_socket.rs",
+          "anchor": "exact contained listener publication and cleanup"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "direct or claimed vsock directory authority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "VsockBackendSelector and configured Unix backend"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct Unix listener routing and conditional cleanup"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed exact contained listener and launcher connector authority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "vsock_backend_selector_is_validated_and_redacted"
+        }
+      ]
     },
     {
       "id": "api-property:Vsock.vsock_id",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property Vsock.vsock_id.",
+      "summary": "Accept an optional ordinary string or null as deprecated input-only data, reject empty or control-character identifiers at the untrusted boundary, never use the value as device identity, and omit it from configuration readback.",
       "source_refs": [
         "api-property:Vsock.vsock_id"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "optional VsockConfigRequest vsock_id parsing and output omission"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "deprecated input validation without backend identity use"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "deprecated string and null parsing plus response omission tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed deprecated input-only vsock ID startup"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "optional deprecated ID and redacted invalid-ID tests"
+        }
+      ]
     },
     {
       "id": "api-property:VsockOverride.uds_path",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API property VsockOverride.uds_path.",
+      "summary": "Bangbang validates the override selector before direct or contained authority access and prepares exact destination resources without ambient fallback. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns optional-device encoding and placement, public artifact-load invocation, restored acknowledgement and reconnect through that override, clone/version policy, and artifact/host portability.",
       "source_refs": [
         "api-property:VsockOverride.uds_path"
       ],
@@ -8025,16 +8219,50 @@
     {
       "id": "api-schema:Vsock",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema Vsock.",
+      "summary": "Implement the complete strict preboot Vsock schema with required guest_cid and uds_path, optional deprecated input-only vsock_id, unknown-field and type rejection, exact configuration projection, and selected MMIO or PCI startup execution.",
       "source_refs": [
         "api-schema:Vsock"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "VsockConfigRequestBody parsing and VsockConfigResponse serialization"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "selected MMIO or PCI vsock startup owner"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "validated VsockConfig and live virtio-vsock device"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/api/src/http.rs",
+          "anchor": "complete Vsock request and response shape tests"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed MMIO and PCI Vsock configuration and live execution"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained Vsock schema execution"
+        }
+      ]
     },
     {
       "id": "api-schema:VsockOverride",
       "family": "api-contract",
-      "summary": "Audit the Firecracker v1.16 API schema VsockOverride.",
+      "summary": "Bangbang parses, validates, redacts, and resolves the one-field VsockOverride producer before resource access. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns optional-device encoding and placement, public load invocation, restored acknowledgement, reconnect and override proof, clone/version policy, and artifact/host portability.",
       "source_refs": [
         "api-schema:VsockOverride"
       ],
@@ -8915,7 +9143,7 @@
     {
       "id": "corpus:vsock",
       "family": "vsock",
-      "summary": "Audit all applicable capability claims owned by the pinned vsock source corpus.",
+      "summary": "The applicable API, live queues, routing, credit, reset, metrics, authority, cleanup, capture-ready state, and destination-resource producer are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns aggregate optional-device encoding and placement, public restore invocation, restored acknowledgement, reconnect and override proof, clone/version policy, and artifact/host portability.",
       "source_refs": [
         "corpus:vsock"
       ],
@@ -10401,7 +10629,7 @@
     {
       "id": "semantic.snapshot:network-vsock-overrides-portability-and-clones",
       "family": "snapshots",
-      "summary": "Audit network/vsock restore overrides, clone identity/time rules, artifact/host portability, versioning, and cross-process restore.",
+      "summary": "Network and vsock capture producers plus pre-access override/resource preparation exist, but Wave 6 https://github.com/seven332/bangbang/issues/1490 owns aggregate encoding and placement, public cross-process restore invocation, restored connectivity and acknowledgement, override behavior, clone identity/time rules, versioning, and artifact/host portability.",
       "source_refs": [
         "corpus:snapshot-network-clones",
         "corpus:snapshot-random-clones",
@@ -10573,16 +10801,55 @@
     {
       "id": "semantic.vsock:live-routing-credit-events-and-cleanup",
       "family": "vsock",
-      "summary": "Audit live vsock routing, credit flow, events, deadlines, errors, metrics, resource authority, and cleanup.",
+      "summary": "Implement bounded MMIO/PCI vsock queues and EVENT_IDX, both initiation directions, one shared 1023 active budget, round-robin local ports, wrapping credit, delivery-based deadlines, shutdown/reset and restored-origin event gating, complete metrics, exact direct/contained authority, failure atomicity, redaction, and cleanup.",
       "source_refs": [
         "corpus:vsock"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "exact direct and contained live owner integration"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/socket_broker.rs",
+          "anchor": "authenticated contained guest-initiated connector"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "bounded live routing credit events deadlines reset and cleanup"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed direct bidirectional multistream and reset scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "capture_ready_vsock_resets_signed_mmio_and_pci_owners"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed contained guest and host initiated scenarios"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/vsock.rs",
+          "anchor": "focused live packet queue connection credit event failure metrics and cleanup tests"
+        }
+      ]
     },
     {
       "id": "semantic.vsock:snapshot-override-reset-and-rx-gating",
       "family": "vsock",
-      "summary": "Audit vsock snapshot state, restore UDS override, TRANSPORT_RESET, post-restore RX gating, and port/state preservation.",
+      "summary": "Source-side TRANSPORT_RESET, capture-ready MMIO/PCI state, port cursor preservation, runtime-only RX acknowledgement gating, empty-work reconstruction, and direct/contained override resource preparation are implemented. Wave 6 https://github.com/seven332/bangbang/issues/1490 owns artifact encoding and placement, public restore invocation, restored guest acknowledgement, reconnect and override proof, clone/version policy, and artifact/host portability.",
       "source_refs": [
         "corpus:snapshot-support",
         "corpus:vsock"

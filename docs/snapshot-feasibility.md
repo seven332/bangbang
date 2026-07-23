@@ -79,6 +79,14 @@ path.
   the source, and a tracked source resets only after visible Full publication.
   Parser and invalid-lifecycle failures still do not record snapshot latency;
   admitted success, capability rejection, and execution failure do.
+- The checked
+  [vsock closure ledger](../compat/firecracker/v1.16.0/vsock-contract.md)
+  certifies all eight API/live records and records the complete source-side
+  reset/capture plus direct/contained destination-resource producer. Exactly six
+  rows remain with #1490 for optional-device encoding/placement, public load
+  invocation, restored acknowledgement/reconnect/override proof,
+  clone/versioning, and portability. The signed source resume is deliberately
+  not described as artifact restore.
 - `--snapshot-version` prints `v1.0.0`. `--describe-snapshot <PATH>` opens a
   bounded regular file with the same nonblocking, path-redacted startup-file
   policy, fully validates the native envelope and CRC, and prints its embedded

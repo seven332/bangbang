@@ -1730,9 +1730,11 @@ is resource-specific:
   and session-bound broker endpoint, rolls them back before activation, and has
   no ambient-path fallback. A single-use process transaction keeps cleanup
   ownership through runtime adoption. Public native-v1 records still omit
-  vsock encoding and placement and public load rejects overrides. Record
-  certification and restored-guest proof remain #1518/#1490 work; the live
-  subset and internal producer are not a public snapshot-containment claim.
+  vsock encoding and placement and public load rejects overrides. The checked
+  vsock ledger certifies the eight API/live records; the six aggregate
+  encoding, invocation, restored-guest, clone/version, and portability outcomes
+  remain #1490 work. The internal producer is not a public
+  snapshot-containment claim.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink. The `--metrics-path` startup CLI flag uses the same
   sink and host-path error redaction rules before the API socket is served.
@@ -2507,8 +2509,9 @@ The current scaffold does not implement:
   optional override selectors before resource access, uses owner-only
   stale-safe direct publication or exact transactional contained authority,
   and transfers cleanup ownership through one single-use runtime adoption.
-  Public native-v1 encoding/placement, record certification, and restored-guest
-  proof remain #1518/#1490 work.
+  The checked ledger certifies all eight API/live records. Public native-v1
+  encoding/placement and invocation, restored-guest acknowledgement/reconnect/
+  override proof, clone/versioning, and portability remain #1490 work.
 - log rotation, syslog, journald, tracing, remote telemetry, or process-global
   panic/fatal observability durability
 - a public serial streaming API, generalized serial artifact encoding/restore,

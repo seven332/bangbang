@@ -1098,8 +1098,10 @@ session-bound broker endpoint, rolls both back before activation, and never
 falls back to an ambient path. A single-use process transaction transfers the
 resource only when runtime reconstruction consumes it and retains cleanup
 ownership for the active device. Public native-v1 records still do not encode
-or place vsock, and public load continues to reject overrides. Record
-certification and end-to-end restored-guest proof remain #1518/#1490 work; this
+or place vsock, and public load continues to reject overrides. The checked
+[vsock closure ledger](compat/firecracker/v1.16.0/vsock-contract.md) certifies
+the eight complete API/live records; the exact six encoding, public invocation,
+restored-guest, clone/version, and portability outcomes remain #1490 work. This
 does not claim general performance, Firecracker artifact, or snapshot parity.
 
 Configure metrics output before boot:
@@ -1255,7 +1257,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 220 implemented-and-verified, 178 audit-required, three
+delivery overlay with 228 implemented-and-verified, 170 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1281,8 +1283,11 @@ joins those five family ledgers into an exact 85-record,
 [network and MMDS closure ledger](compat/firecracker/v1.16.0/network-mmds-contract.md)
 then maps an exact 35-record set to the composed direct, contained, capture,
 and non-success external gates: 31 are terminal and four remain audit-owned by
-#1378, #1490, or #1491. The repository-wide disposition counts are now
-220/178/3/17.
+#1378, #1490, or #1491. The
+[vsock closure ledger](compat/firecracker/v1.16.0/vsock-contract.md) maps its
+exact 14-record set to eight terminal API/live outcomes and six precise #1490
+artifact/restore/clone handoffs. The repository-wide disposition counts are now
+228/170/3/17.
 
 ## Build And Test
 

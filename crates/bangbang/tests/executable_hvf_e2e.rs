@@ -483,7 +483,9 @@ mod macos_arm64 {
         assert_no_content_response(&logger_response, "PUT /logger");
 
         let uds_path_json = json_string(path_text(&uds_path));
-        let vsock_body = format!(r#"{{"guest_cid":3,"uds_path":{uds_path_json}}}"#);
+        let vsock_body = format!(
+            r#"{{"vsock_id":"deprecated-input-only","guest_cid":3,"uds_path":{uds_path_json}}}"#
+        );
         let vsock_response = http_put_json(&socket_path, "/vsock", &vsock_body);
         assert_no_content_response(&vsock_response, "PUT /vsock");
         assert!(
@@ -1012,6 +1014,10 @@ mod macos_arm64 {
             &vm_config,
             &format!(r#""uds_path":{uds_path_json}"#),
             "GET /vm/config after InstanceStart",
+        );
+        assert!(
+            !vm_config.contains("vsock_id"),
+            "GET /vm/config must omit the deprecated input-only vsock_id"
         );
         assert!(
             !vm_config.contains(&format!(r#""uds_path":{replacement_vsock_path_json}"#)),
