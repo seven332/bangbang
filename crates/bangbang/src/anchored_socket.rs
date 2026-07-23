@@ -1309,7 +1309,9 @@ fn cleanup_published_claim_checked(
     claim: &SocketDirectoryClaim,
     record: &SocketOwnershipRecord,
 ) -> Result<(), AnchoredSocketError> {
-    let directory = claim.directory_anchor_fd()?;
+    let directory = claim
+        .directory_anchor_fd()
+        .map_err(|_| AnchoredSocketError::Cleanup)?;
     checked_cleanup(unlink_socket_if_owned(
         directory,
         claim.child(),
