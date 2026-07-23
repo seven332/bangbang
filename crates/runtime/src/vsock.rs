@@ -1,6 +1,6 @@
 //! Backend-neutral vsock configuration model.
 
-use std::collections::{BTreeSet, HashMap, HashSet, TryReserveError, VecDeque, hash_map::Entry};
+use std::collections::{HashMap, HashSet, TryReserveError, VecDeque, hash_map::Entry};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
@@ -63,11 +63,13 @@ pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_FEATURE_IN_ORDER: u32 = 35;
 pub const VSOCK_HOST_CONNECT_REQUEST_MAX_LEN: usize = 32;
-pub const VSOCK_HOST_CONNECTION_LIMIT: usize = VIRTIO_VSOCK_QUEUE_SIZE as usize;
+pub const VSOCK_CONNECTION_LIMIT: usize = 1023;
+pub const VSOCK_PENDING_HOST_CONNECTION_LIMIT: usize = VIRTIO_VSOCK_QUEUE_SIZE as usize;
 pub const VSOCK_HOST_LOCAL_PORT_BASE: u32 = 1_u32 << 30;
 pub const VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE: u32 = 1_u32 << 31;
 pub const VSOCK_HOST_LOCAL_PORT_CAPACITY: u32 =
     VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE - VSOCK_HOST_LOCAL_PORT_BASE;
+pub const VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED: u32 = VSOCK_HOST_LOCAL_PORT_BASE - 1;
 pub const VSOCK_HOST_RW_READ_LIMIT: usize = VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE as usize;
 
 const VIRTIO_VSOCK_RX_QUEUE_INDEX_U32: u32 = 0;
@@ -710,12 +712,79 @@ impl fmt::Display for VsockHostLocalPortError {
 
 impl std::error::Error for VsockHostLocalPortError {}
 
+/// Detached last-used host-local port for pinned round-robin allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsockHostLocalPortCursor {
+    last_used: u32,
+}
+
+impl VsockHostLocalPortCursor {
+    /// Returns the initial cursor immediately before the pinned allocation range.
+    pub const fn initial() -> Self {
+        Self {
+            last_used: VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED,
+        }
+    }
+
+    /// Validates one detached last-used value without allocating a port.
+    pub fn try_from_last_used(last_used: u32) -> Result<Self, VsockHostLocalPortCursorError> {
+        if last_used != VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED
+            && !(VSOCK_HOST_LOCAL_PORT_BASE..VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE)
+                .contains(&last_used)
+        {
+            return Err(VsockHostLocalPortCursorError::InvalidLastUsed {
+                last_used,
+                initial: VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED,
+                max_inclusive: VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE - 1,
+            });
+        }
+
+        Ok(Self { last_used })
+    }
+
+    /// Returns the detached last-used value.
+    pub const fn last_used(self) -> u32 {
+        self.last_used
+    }
+}
+
+impl Default for VsockHostLocalPortCursor {
+    fn default() -> Self {
+        Self::initial()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockHostLocalPortCursorError {
+    InvalidLastUsed {
+        last_used: u32,
+        initial: u32,
+        max_inclusive: u32,
+    },
+}
+
+impl fmt::Display for VsockHostLocalPortCursorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLastUsed {
+                last_used,
+                initial,
+                max_inclusive,
+            } => write!(
+                f,
+                "vsock host local port cursor {last_used} is outside initial-or-range [{initial}, {max_inclusive}]"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VsockHostLocalPortCursorError {}
+
 #[derive(Debug)]
 pub struct VsockHostLocalPortAllocator {
     capacity: u32,
-    next_offset: u32,
+    cursor: VsockHostLocalPortCursor,
     allocated_offsets: HashSet<u32>,
-    freed_offsets: BTreeSet<u32>,
 }
 
 impl VsockHostLocalPortAllocator {
@@ -723,29 +792,66 @@ impl VsockHostLocalPortAllocator {
         Self::with_capacity(VSOCK_HOST_LOCAL_PORT_CAPACITY)
     }
 
-    fn with_capacity(capacity: u32) -> Self {
-        let capacity = capacity.min(VSOCK_HOST_LOCAL_PORT_CAPACITY);
+    /// Reconstructs an allocator cursor with no active port ownership.
+    pub fn from_cursor(cursor: VsockHostLocalPortCursor) -> Self {
         Self {
-            capacity,
-            next_offset: 0,
+            capacity: VSOCK_HOST_LOCAL_PORT_CAPACITY,
+            cursor,
             allocated_offsets: HashSet::new(),
-            freed_offsets: BTreeSet::new(),
         }
     }
 
+    fn with_capacity(capacity: u32) -> Self {
+        Self {
+            capacity: capacity.min(VSOCK_HOST_LOCAL_PORT_CAPACITY),
+            cursor: VsockHostLocalPortCursor::initial(),
+            allocated_offsets: HashSet::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_capacity_and_cursor(capacity: u32, cursor: VsockHostLocalPortCursor) -> Self {
+        let capacity = capacity.min(VSOCK_HOST_LOCAL_PORT_CAPACITY);
+        assert!(
+            cursor.last_used() == VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED
+                || cursor.last_used() < VSOCK_HOST_LOCAL_PORT_BASE + capacity,
+            "test cursor should fit reduced capacity"
+        );
+
+        Self {
+            capacity,
+            cursor,
+            allocated_offsets: HashSet::new(),
+        }
+    }
+
+    /// Returns the detached last-used cursor without exposing active ownership.
+    pub const fn cursor(&self) -> VsockHostLocalPortCursor {
+        self.cursor
+    }
+
     pub fn allocate(&mut self) -> Result<VsockHostLocalPort, VsockHostLocalPortAllocatorError> {
-        if self.next_offset < self.capacity {
-            let offset = self.next_offset;
-            self.next_offset += 1;
-            self.allocated_offsets.insert(offset);
-            return Ok(VsockHostLocalPort::from_offset(offset));
+        if self.capacity == 0 {
+            return Err(VsockHostLocalPortAllocatorError::Exhausted);
         }
 
-        let Some(offset) = self.freed_offsets.pop_first() else {
-            return Err(VsockHostLocalPortAllocatorError::Exhausted);
+        let first_offset = if self.cursor.last_used() == VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED {
+            0
+        } else {
+            (self.cursor.last_used() - VSOCK_HOST_LOCAL_PORT_BASE + 1) % self.capacity
         };
-        self.allocated_offsets.insert(offset);
-        Ok(VsockHostLocalPort::from_offset(offset))
+        for scanned in 0..self.capacity {
+            let offset = (first_offset + scanned) % self.capacity;
+            if self.allocated_offsets.insert(offset) {
+                let port = VsockHostLocalPort::from_offset(offset);
+                self.cursor = VsockHostLocalPortCursor {
+                    last_used: port.raw(),
+                };
+                return Ok(port);
+            }
+        }
+
+        Err(VsockHostLocalPortAllocatorError::Exhausted)
     }
 
     pub fn free(&mut self, port: VsockHostLocalPort) -> bool {
@@ -753,12 +859,7 @@ impl VsockHostLocalPortAllocator {
         if offset >= self.capacity {
             return false;
         }
-        if self.allocated_offsets.remove(&offset) {
-            self.freed_offsets.insert(offset);
-            return true;
-        }
-
-        false
+        self.allocated_offsets.remove(&offset)
     }
 }
 
@@ -1981,6 +2082,11 @@ impl VsockHostConnectionTable {
         Self::with_local_port_allocator(VsockHostLocalPortAllocator::new())
     }
 
+    /// Reconstructs an empty table from one detached last-used port cursor.
+    pub fn from_local_port_cursor(cursor: VsockHostLocalPortCursor) -> Self {
+        Self::with_local_port_allocator(VsockHostLocalPortAllocator::from_cursor(cursor))
+    }
+
     fn with_local_port_allocator(local_ports: VsockHostLocalPortAllocator) -> Self {
         Self {
             local_ports,
@@ -1998,10 +2104,32 @@ impl VsockHostConnectionTable {
         accepted: VsockHostAcceptedConnection,
         request: VsockHostConnectRequest,
     ) -> Result<VsockHostConnectionKey, VsockHostConnectionTableError> {
+        self.insert_accepted_host_connection_with_active_limit(accepted, request, 0, usize::MAX)
+    }
+
+    fn insert_accepted_host_connection_with_active_limit(
+        &mut self,
+        accepted: VsockHostAcceptedConnection,
+        request: VsockHostConnectRequest,
+        other_active_connections: usize,
+        active_connection_limit: usize,
+    ) -> Result<VsockHostConnectionKey, VsockHostConnectionTableError> {
         let local_port = self
             .local_ports
             .allocate()
             .map_err(VsockHostConnectionTableError::LocalPort)?;
+        if self
+            .connections
+            .len()
+            .saturating_add(other_active_connections)
+            >= active_connection_limit
+        {
+            let freed = self.local_ports.free(local_port);
+            debug_assert!(freed);
+            return Err(VsockHostConnectionTableError::ActiveLimitExceeded {
+                limit: active_connection_limit,
+            });
+        }
         let key = VsockHostConnectionKey::new(local_port, request.guest_port());
         let connection = VsockHostConnection::from_accepted(accepted);
 
@@ -2554,6 +2682,11 @@ impl VsockHostConnectionTable {
 
     pub fn len(&self) -> usize {
         self.connections.len()
+    }
+
+    /// Returns the allocator cursor without exposing active port ownership.
+    pub const fn local_port_cursor(&self) -> VsockHostLocalPortCursor {
+        self.local_ports.cursor()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -3541,7 +3674,7 @@ pub struct VsockGuestConnectionTable {
 
 impl VsockGuestConnectionTable {
     pub fn new() -> Self {
-        Self::with_limit(VSOCK_HOST_CONNECTION_LIMIT)
+        Self::with_limit(VSOCK_CONNECTION_LIMIT)
     }
 
     fn with_limit(limit: usize) -> Self {
@@ -3572,7 +3705,34 @@ impl VsockGuestConnectionTable {
         stream: UnixStream,
         request_header: VirtioVsockPacketHeader,
     ) -> Result<(), VsockGuestConnectionTableError> {
+        self.insert_connected_guest_connection_with_active_limit(
+            key,
+            stream,
+            request_header,
+            0,
+            usize::MAX,
+        )
+    }
+
+    fn insert_connected_guest_connection_with_active_limit(
+        &mut self,
+        key: VsockGuestConnectionKey,
+        stream: UnixStream,
+        request_header: VirtioVsockPacketHeader,
+        other_active_connections: usize,
+        active_connection_limit: usize,
+    ) -> Result<(), VsockGuestConnectionTableError> {
         self.check_insert(key)?;
+        if self
+            .connections
+            .len()
+            .saturating_add(other_active_connections)
+            >= active_connection_limit
+        {
+            return Err(VsockGuestConnectionTableError::ActiveLimitExceeded {
+                limit: active_connection_limit,
+            });
+        }
 
         let replaced = self.connections.insert(
             key,
@@ -4057,6 +4217,7 @@ impl Default for VsockGuestConnectionTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VsockGuestConnectionTableError {
     LimitExceeded { limit: usize },
+    ActiveLimitExceeded { limit: usize },
     DuplicateKey { key: VsockGuestConnectionKey },
 }
 
@@ -4065,6 +4226,9 @@ impl fmt::Display for VsockGuestConnectionTableError {
         match self {
             Self::LimitExceeded { limit } => {
                 write!(f, "vsock guest connection limit {limit} reached")
+            }
+            Self::ActiveLimitExceeded { limit } => {
+                write!(f, "vsock active connection limit {limit} reached")
             }
             Self::DuplicateKey { key } => write!(
                 f,
@@ -4081,6 +4245,7 @@ impl std::error::Error for VsockGuestConnectionTableError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VsockHostConnectionTableError {
     LocalPort(VsockHostLocalPortAllocatorError),
+    ActiveLimitExceeded { limit: usize },
     DuplicateKey { key: VsockHostConnectionKey },
 }
 
@@ -4089,6 +4254,9 @@ impl fmt::Display for VsockHostConnectionTableError {
         match self {
             Self::LocalPort(source) => {
                 write!(f, "failed to allocate vsock host local port: {source}")
+            }
+            Self::ActiveLimitExceeded { limit } => {
+                write!(f, "vsock active connection limit {limit} reached")
             }
             Self::DuplicateKey { key } => write!(
                 f,
@@ -4104,7 +4272,7 @@ impl std::error::Error for VsockHostConnectionTableError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LocalPort(source) => Some(source),
-            Self::DuplicateKey { .. } => None,
+            Self::ActiveLimitExceeded { .. } | Self::DuplicateKey { .. } => None,
         }
     }
 }
@@ -6626,7 +6794,8 @@ pub struct VirtioVsockDevice {
     host_socket_owner: Option<VsockHostSocketOwner>,
     guest_connector: Option<Box<dyn VsockGuestConnector>>,
     pending_host_connections: VecDeque<VsockHostAcceptedConnection>,
-    host_connection_limit: usize,
+    active_connection_limit: usize,
+    pending_host_connection_limit: usize,
     host_connections: VsockHostConnectionTable,
     guest_connections: VsockGuestConnectionTable,
     pending_guest_reset_packets: VecDeque<VirtioVsockPacketHeader>,
@@ -6647,7 +6816,8 @@ impl VirtioVsockDevice {
             host_socket_owner: None,
             guest_connector: None,
             pending_host_connections: VecDeque::new(),
-            host_connection_limit: VSOCK_HOST_CONNECTION_LIMIT,
+            active_connection_limit: VSOCK_CONNECTION_LIMIT,
+            pending_host_connection_limit: VSOCK_PENDING_HOST_CONNECTION_LIMIT,
             host_connections: VsockHostConnectionTable::new(),
             guest_connections: VsockGuestConnectionTable::new(),
             pending_guest_reset_packets: VecDeque::new(),
@@ -6714,13 +6884,9 @@ impl VirtioVsockDevice {
             return Ok((read_fds, write_fds, None));
         }
 
-        let retained_host_connections = self
-            .host_connections
-            .len()
-            .saturating_add(self.pending_host_connections.len());
         let listener_fd_count = usize::from(
             self.host_socket_owner.is_some()
-                && retained_host_connections < self.host_connection_limit,
+                && self.pending_host_connections.len() < self.pending_host_connection_limit,
         );
         let read_capacity = listener_fd_count
             .saturating_add(self.pending_host_connections.len())
@@ -6787,8 +6953,14 @@ impl VirtioVsockDevice {
         accepted: VsockHostAcceptedConnection,
         request: VsockHostConnectRequest,
     ) -> Result<VsockHostConnectionKey, VsockHostConnectionTableError> {
+        let guest_connections = self.guest_connections.len();
         self.host_connections
-            .insert_accepted_host_connection(accepted, request)
+            .insert_accepted_host_connection_with_active_limit(
+                accepted,
+                request,
+                guest_connections,
+                self.active_connection_limit,
+            )
     }
 
     #[cfg(test)]
@@ -6819,6 +6991,18 @@ impl VirtioVsockDevice {
     #[cfg(test)]
     fn pending_guest_connection_count(&self) -> usize {
         self.guest_connections.len()
+    }
+
+    /// Returns the number of retained host- and guest-initiated connections.
+    pub fn active_connection_count(&self) -> usize {
+        self.host_connections
+            .len()
+            .saturating_add(self.guest_connections.len())
+    }
+
+    /// Returns the detached last-used host-local port cursor.
+    pub const fn host_local_port_cursor(&self) -> VsockHostLocalPortCursor {
+        self.host_connections.local_port_cursor()
     }
 
     #[cfg(test)]
@@ -6852,8 +7036,13 @@ impl VirtioVsockDevice {
     }
 
     #[cfg(test)]
-    fn set_host_connection_limit(&mut self, limit: usize) {
-        self.host_connection_limit = limit;
+    fn set_active_connection_limit(&mut self, limit: usize) {
+        self.active_connection_limit = limit;
+    }
+
+    #[cfg(test)]
+    fn set_pending_host_connection_limit(&mut self, limit: usize) {
+        self.pending_host_connection_limit = limit;
     }
 
     #[cfg(test)]
@@ -7238,19 +7427,18 @@ impl VirtioVsockDevice {
     fn poll_host_request_connections(&mut self) -> VirtioVsockHostRequestDispatch {
         let mut dispatch = VirtioVsockHostRequestDispatch::new();
 
-        let mut retained_connections = self
-            .host_connections
-            .len()
-            .saturating_add(self.pending_host_connections.len());
-        while retained_connections < self.host_connection_limit {
+        while self.pending_host_connections.len() < self.pending_host_connection_limit {
             let Some(host_socket_owner) = self.host_socket_owner.as_ref() else {
                 break;
             };
             match host_socket_owner.accept_host_connection() {
                 Ok(Some(accepted)) => {
+                    if self.active_connection_count() >= self.active_connection_limit {
+                        dispatch.dropped_connections += 1;
+                        break;
+                    }
                     self.pending_host_connections.push_back(accepted);
                     dispatch.accepted_connections += 1;
-                    retained_connections = retained_connections.saturating_add(1);
                 }
                 Ok(None) => break,
                 Err(_) => {
@@ -7268,14 +7456,15 @@ impl VirtioVsockDevice {
 
             match accepted.read_connect_request() {
                 Ok(Some(request)) => {
-                    if self.host_connections.len() >= self.host_connection_limit {
-                        dispatch.dropped_connections += 1;
-                        continue;
-                    }
+                    let guest_connections = self.guest_connections.len();
                     match self
                         .host_connections
-                        .insert_accepted_host_connection(accepted, request)
-                    {
+                        .insert_accepted_host_connection_with_active_limit(
+                            accepted,
+                            request,
+                            guest_connections,
+                            self.active_connection_limit,
+                        ) {
                         Ok(_) => {
                             dispatch.completed_requests += 1;
                         }
@@ -7362,8 +7551,13 @@ impl VirtioVsockDevice {
 
         match self
             .guest_connections
-            .insert_connected_guest_connection(key, stream, header)
-        {
+            .insert_connected_guest_connection_with_active_limit(
+                key,
+                stream,
+                header,
+                self.host_connections.len(),
+                self.active_connection_limit,
+            ) {
             Ok(()) => Some(VsockGuestConnectionRequestOutcome::Retained { key }),
             Err(source) => Some(VsockGuestConnectionRequestOutcome::Dropped {
                 key,
@@ -9259,8 +9453,9 @@ mod tests {
         VIRTIO_VSOCK_PACKET_HEADER_SIZE, VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
         VIRTIO_VSOCK_PACKET_TYPE_STREAM, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE,
         VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
-        VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VSOCK_HOST_LOCAL_PORT_BASE,
+        VSOCK_CONNECTION_LIMIT, VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VSOCK_HOST_LOCAL_PORT_BASE,
         VSOCK_HOST_LOCAL_PORT_CAPACITY, VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
+        VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED, VSOCK_PENDING_HOST_CONNECTION_LIMIT,
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
         VirtioVsockGuestCreditDispatch, VirtioVsockGuestRequestDispatch,
         VirtioVsockGuestResetDispatch, VirtioVsockGuestResponseDispatch,
@@ -9270,12 +9465,13 @@ mod tests {
         VirtioVsockRxPacketKind, VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError,
         VirtioVsockTxPacket, VirtioVsockTxPacketParseError, VirtioVsockTxQueue,
         VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
-        VsockGuestConnectionKey, VsockGuestConnector, VsockHostConnectHandshakeError,
-        VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostConnectionKey,
-        VsockHostConnectionTable, VsockHostConnectionTableError, VsockHostLocalPort,
-        VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortError,
-        VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
-        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        VsockGuestConnectionKey, VsockGuestConnectionTable, VsockGuestConnectionTableError,
+        VsockGuestConnector, VsockHostConnectHandshakeError, VsockHostConnectRequest,
+        VsockHostConnectRequestError, VsockHostConnectionKey, VsockHostConnectionTable,
+        VsockHostConnectionTableError, VsockHostLocalPort, VsockHostLocalPortAllocator,
+        VsockHostLocalPortAllocatorError, VsockHostLocalPortCursor, VsockHostLocalPortCursorError,
+        VsockHostLocalPortError, VsockHostSocketAcceptError, VsockHostSocketOwner,
+        VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
         is_transient_host_socket_accept_error, is_transient_host_socket_read_error,
         parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
     };
@@ -11446,6 +11642,46 @@ mod tests {
     }
 
     #[test]
+    fn host_local_port_cursor_accepts_initial_and_firecracker_range_boundaries() {
+        for last_used in [
+            VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED,
+            VSOCK_HOST_LOCAL_PORT_BASE,
+            VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE - 1,
+        ] {
+            let cursor = VsockHostLocalPortCursor::try_from_last_used(last_used)
+                .expect("valid last-used host local port should parse");
+
+            assert_eq!(cursor.last_used(), last_used);
+        }
+        assert_eq!(
+            VsockHostLocalPortCursor::default(),
+            VsockHostLocalPortCursor::initial()
+        );
+    }
+
+    #[test]
+    fn host_local_port_cursor_rejects_values_outside_initial_or_firecracker_range() {
+        for last_used in [
+            0,
+            VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED - 1,
+            VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
+            u32::MAX,
+        ] {
+            let err = VsockHostLocalPortCursor::try_from_last_used(last_used)
+                .expect_err("invalid last-used host local port should fail");
+
+            assert_eq!(
+                err,
+                VsockHostLocalPortCursorError::InvalidLastUsed {
+                    last_used,
+                    initial: VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED,
+                    max_inclusive: VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE - 1,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn host_local_port_allocator_allocates_first_and_sequential_ports() {
         let mut allocator = VsockHostLocalPortAllocator::new();
 
@@ -11456,6 +11692,53 @@ mod tests {
         assert_eq!(first.raw(), VSOCK_HOST_LOCAL_PORT_BASE);
         assert_eq!(second.raw(), VSOCK_HOST_LOCAL_PORT_BASE + 1);
         assert_eq!(third.raw(), VSOCK_HOST_LOCAL_PORT_BASE + 2);
+    }
+
+    #[test]
+    fn host_local_port_allocator_does_not_reuse_freed_port_before_wraparound() {
+        let mut allocator = VsockHostLocalPortAllocator::with_capacity(4);
+        let first = allocator.allocate().expect("first port should allocate");
+        let second = allocator.allocate().expect("second port should allocate");
+
+        assert!(allocator.free(first));
+        let third = allocator
+            .allocate()
+            .expect("allocation should continue after the cursor");
+
+        assert_eq!(second.raw(), VSOCK_HOST_LOCAL_PORT_BASE + 1);
+        assert_eq!(third.raw(), VSOCK_HOST_LOCAL_PORT_BASE + 2);
+        assert_ne!(third, first);
+    }
+
+    #[test]
+    fn host_local_port_allocator_reconstructs_detached_cursor_without_active_ports() {
+        let cursor = VsockHostLocalPortCursor::try_from_last_used(VSOCK_HOST_LOCAL_PORT_BASE + 17)
+            .expect("cursor should parse");
+        let mut allocator = VsockHostLocalPortAllocator::from_cursor(cursor);
+
+        assert_eq!(allocator.cursor(), cursor);
+        assert_eq!(
+            allocator
+                .allocate()
+                .expect("allocation should continue after restored cursor")
+                .raw(),
+            VSOCK_HOST_LOCAL_PORT_BASE + 18
+        );
+    }
+
+    #[test]
+    fn host_local_port_allocator_wraps_after_restored_cursor() {
+        let cursor = VsockHostLocalPortCursor::try_from_last_used(VSOCK_HOST_LOCAL_PORT_BASE + 2)
+            .expect("cursor should parse");
+        let mut allocator = VsockHostLocalPortAllocator::with_capacity_and_cursor(3, cursor);
+
+        assert_eq!(
+            allocator
+                .allocate()
+                .expect("allocation should wrap to range start")
+                .raw(),
+            VSOCK_HOST_LOCAL_PORT_BASE
+        );
     }
 
     #[test]
@@ -11587,6 +11870,15 @@ mod tests {
             VsockHostLocalPortAllocatorError::Exhausted
                 .source()
                 .is_none()
+        );
+        assert!(
+            VsockHostLocalPortCursorError::InvalidLastUsed {
+                last_used: 0,
+                initial: VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED,
+                max_inclusive: VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE - 1,
+            }
+            .source()
+            .is_none()
         );
     }
 
@@ -12607,6 +12899,51 @@ mod tests {
     }
 
     #[test]
+    fn vsock_host_connection_table_advances_cursor_before_active_limit_rejection() {
+        let mut table = VsockHostConnectionTable::with_local_port_capacity(2);
+        let (rejected, mut rejected_client, rejected_request) =
+            accepted_host_connection_with_request("table-active-full", 5000);
+
+        let err = table
+            .insert_accepted_host_connection_with_active_limit(rejected, rejected_request, 1, 1)
+            .expect_err("aggregate active limit should reject connection");
+
+        assert_eq!(
+            err,
+            VsockHostConnectionTableError::ActiveLimitExceeded { limit: 1 }
+        );
+        assert_eq!(
+            table.local_port_cursor().last_used(),
+            VSOCK_HOST_LOCAL_PORT_BASE
+        );
+        assert!(table.is_empty());
+        assert_stream_closed(
+            &mut rejected_client,
+            "active-limit rejection should drop supplied stream",
+        );
+
+        let (retained, _retained_client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-after-full", 5001);
+
+        assert_eq!(retained.local_port().raw(), VSOCK_HOST_LOCAL_PORT_BASE + 1);
+    }
+
+    #[test]
+    fn vsock_host_connection_table_reconstructs_empty_table_from_local_port_cursor() {
+        let cursor = VsockHostLocalPortCursor::try_from_last_used(VSOCK_HOST_LOCAL_PORT_BASE + 40)
+            .expect("cursor should parse");
+        let mut table = VsockHostConnectionTable::from_local_port_cursor(cursor);
+
+        assert!(table.is_empty());
+        assert_eq!(table.local_port_cursor(), cursor);
+
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-restored", 5000);
+
+        assert_eq!(key.local_port().raw(), VSOCK_HOST_LOCAL_PORT_BASE + 41);
+    }
+
+    #[test]
     fn vsock_host_connection_table_rejects_duplicate_allocated_key() {
         let mut table = VsockHostConnectionTable::new();
         let (key, _active_client) =
@@ -12684,9 +13021,39 @@ mod tests {
 
         assert!(local_port_err.source().is_some());
         assert!(
+            VsockHostConnectionTableError::ActiveLimitExceeded { limit: 1 }
+                .source()
+                .is_none()
+        );
+        assert!(
             VsockHostConnectionTableError::DuplicateKey { key }
                 .source()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn vsock_guest_connection_table_rejects_aggregate_active_limit() {
+        let mut table = VsockGuestConnectionTable::new();
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let (stream, mut peer) = UnixStream::pair().expect("test stream pair should build");
+        let request_header =
+            guest_request_tx_packet(42, key.host_port(), key.guest_port()).header();
+
+        let err = table
+            .insert_connected_guest_connection_with_active_limit(key, stream, request_header, 1, 1)
+            .expect_err("aggregate active limit should reject guest connection");
+
+        assert_eq!(
+            err,
+            VsockGuestConnectionTableError::ActiveLimitExceeded { limit: 1 }
+        );
+        assert_eq!(err.to_string(), "vsock active connection limit 1 reached");
+        assert!(err.source().is_none());
+        assert!(table.is_empty());
+        assert_stream_closed(
+            &mut peer,
+            "active-limit rejection should drop connected guest stream",
         );
     }
 
@@ -13020,6 +13387,22 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_device_uses_pinned_active_and_pending_connection_limits() {
+        let device = VirtioVsockDevice::with_guest_cid(42);
+
+        assert_eq!(device.active_connection_limit, VSOCK_CONNECTION_LIMIT);
+        assert_eq!(
+            device.pending_host_connection_limit,
+            VSOCK_PENDING_HOST_CONNECTION_LIMIT
+        );
+        assert_eq!(device.active_connection_count(), 0);
+        assert_eq!(
+            device.host_local_port_cursor().last_used(),
+            VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED
+        );
+    }
+
+    #[test]
     fn virtio_vsock_host_request_poll_drains_pending_listener_connections() {
         let (mut device, path) = host_socket_device(42, "poll-drain");
         let mut clients = Vec::new();
@@ -13106,7 +13489,7 @@ mod tests {
     #[test]
     fn virtio_vsock_host_request_poll_respects_pending_handshake_limit() {
         let (mut device, path) = host_socket_device(42, "poll-limit");
-        device.set_host_connection_limit(1);
+        device.set_pending_host_connection_limit(1);
         let mut first_client = UnixStream::connect(&path).expect("first client should connect");
         let _second_client = UnixStream::connect(&path).expect("second client should connect");
 
@@ -13146,7 +13529,8 @@ mod tests {
     #[test]
     fn virtio_vsock_host_request_poll_drops_completed_handshake_when_connection_limit_is_full() {
         let (mut device, path) = host_socket_device(42, "poll-full");
-        device.set_host_connection_limit(1);
+        device.set_active_connection_limit(1);
+        device.set_pending_host_connection_limit(1);
         let mut pending_client = UnixStream::connect(&path).expect("pending client should connect");
 
         let pending = device.poll_host_request_connections();
@@ -13172,10 +13556,152 @@ mod tests {
         assert_eq!(dropped.pending_connections(), 0);
         assert_eq!(device.pending_host_connection_count(), 0);
         assert_eq!(device.host_connections.len(), 1);
+        assert_eq!(device.active_connection_count(), 1);
+        assert_eq!(
+            device.host_local_port_cursor().last_used(),
+            VSOCK_HOST_LOCAL_PORT_BASE + 1
+        );
         assert_stream_closed(
             &mut pending_client,
             "completed pending stream should close when connection limit is full",
         );
+    }
+
+    #[test]
+    fn virtio_vsock_host_request_poll_accepts_and_drops_one_stream_at_active_limit() {
+        let (mut device, path) = host_socket_device(42, "poll-active-full");
+        device.set_active_connection_limit(1);
+        let (active, _active_client, request) =
+            accepted_host_connection_with_request("poll-active", 5000);
+        let active_key = device
+            .insert_accepted_host_connection(active, request)
+            .expect("active host connection should insert");
+        let mut first_client = UnixStream::connect(&path).expect("first client should connect");
+        let mut second_client = UnixStream::connect(&path).expect("second client should connect");
+
+        let first = device.poll_host_request_connections();
+
+        assert_eq!(first.accepted_connections(), 0);
+        assert_eq!(first.completed_requests(), 0);
+        assert_eq!(first.dropped_connections(), 1);
+        assert_eq!(first.pending_connections(), 0);
+        assert_eq!(device.active_connection_count(), 1);
+        assert_eq!(
+            device.host_local_port_cursor().last_used(),
+            active_key.local_port().raw()
+        );
+        let first_notification = super::VirtioVsockDeviceNotificationDispatch::new(
+            Vec::new(),
+            first,
+            super::VirtioVsockGuestTxControlDispatch::empty(),
+            None,
+            None,
+        );
+        assert_vsock_metrics_for_notification(
+            &first_notification,
+            VsockDeviceMetrics::default().with_conn_event_fails(1),
+        );
+
+        let second = device.poll_host_request_connections();
+
+        assert_eq!(second.accepted_connections(), 0);
+        assert_eq!(second.completed_requests(), 0);
+        assert_eq!(second.dropped_connections(), 1);
+        assert_eq!(second.pending_connections(), 0);
+        assert_stream_closed(
+            &mut first_client,
+            "first stream should be dropped at active limit",
+        );
+        assert_stream_closed(
+            &mut second_client,
+            "second stream should be dropped on the next poll",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_device_host_connection_saturates_guest_connection_budget() {
+        let (mut device, path) = host_socket_device(42, "host-fills-budget");
+        device.set_active_connection_limit(1);
+        let guest_listener = guest_connection_listener(&path, 52);
+        let (accepted, _host_client, request) =
+            accepted_host_connection_with_request("host-fills", 5000);
+        device
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should fill active budget");
+
+        let outcome =
+            device.connect_guest_connection_request_packet(&guest_request_tx_packet(42, 52, 4000));
+
+        assert!(matches!(
+            outcome,
+            Some(super::VsockGuestConnectionRequestOutcome::Dropped {
+                key,
+                source: super::VsockGuestConnectionRequestError::Table(
+                    VsockGuestConnectionTableError::ActiveLimitExceeded { limit: 1 }
+                ),
+            }) if key == VsockGuestConnectionKey::new(52, 4000)
+        ));
+        assert_eq!(device.active_connection_count(), 1);
+        assert!(!device.has_guest_connection(VsockGuestConnectionKey::new(52, 4000)));
+        let mut connected = guest_listener.accept();
+        assert_stream_closed(
+            &mut connected,
+            "aggregate rejection should close the connected guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_device_guest_connection_saturates_host_budget_until_release() {
+        let (mut device, path) = host_socket_device(42, "guest-fills-budget");
+        device.set_active_connection_limit(1);
+        let guest_listener = guest_connection_listener(&path, 52);
+        let guest_key = VsockGuestConnectionKey::new(52, 4000);
+
+        assert!(matches!(
+            device.connect_guest_connection_request_packet(&guest_request_tx_packet(42, 52, 4000)),
+            Some(super::VsockGuestConnectionRequestOutcome::Retained { key }) if key == guest_key
+        ));
+        let mut connected_guest = guest_listener.accept();
+        assert_eq!(device.active_connection_count(), 1);
+
+        let (rejected, mut rejected_client, rejected_request) =
+            accepted_host_connection_with_request("guest-fills", 5000);
+        let err = device
+            .insert_accepted_host_connection(rejected, rejected_request)
+            .expect_err("guest connection should fill aggregate active budget");
+
+        assert_eq!(
+            err,
+            VsockHostConnectionTableError::ActiveLimitExceeded { limit: 1 }
+        );
+        assert_eq!(
+            device.host_local_port_cursor().last_used(),
+            VSOCK_HOST_LOCAL_PORT_BASE
+        );
+        assert_eq!(device.active_connection_count(), 1);
+        assert_stream_closed(
+            &mut rejected_client,
+            "aggregate rejection should close supplied host stream",
+        );
+
+        assert!(device.guest_connections.remove(guest_key));
+        assert_eq!(device.active_connection_count(), 0);
+        assert_stream_closed(
+            &mut connected_guest,
+            "removing guest connection should close connected stream",
+        );
+
+        let (retained, _retained_client, retained_request) =
+            accepted_host_connection_with_request("guest-released", 5001);
+        let retained_key = device
+            .insert_accepted_host_connection(retained, retained_request)
+            .expect("released aggregate budget should accept host connection");
+
+        assert_eq!(
+            retained_key.local_port().raw(),
+            VSOCK_HOST_LOCAL_PORT_BASE + 1
+        );
+        assert_eq!(device.active_connection_count(), 1);
     }
 
     #[test]
@@ -14996,12 +15522,37 @@ mod tests {
     }
 
     #[test]
-    fn virtio_vsock_device_host_read_wakeup_fds_omit_listener_at_host_connection_limit() {
+    fn virtio_vsock_device_host_read_wakeup_keeps_listener_at_active_limit() {
+        let (mut device, _path) = host_socket_device(MIN_GUEST_CID, "wakeup-active-full");
+        activate_vsock_device(&mut device);
+        device.set_active_connection_limit(1);
+        let listener_fd = device
+            .host_socket_owner
+            .as_ref()
+            .expect("host socket should be attached")
+            .listener
+            .as_raw_fd();
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("wakeup-active", 5000);
+        device
+            .insert_accepted_host_connection(accepted, request)
+            .expect("active host connection should insert");
+
+        let fds = device
+            .host_read_wakeup_fds()
+            .expect("wakeup fd collection should succeed");
+
+        assert!(fds.contains(&listener_fd));
+        assert_eq!(device.active_connection_count(), 1);
+    }
+
+    #[test]
+    fn virtio_vsock_device_host_read_wakeup_fds_omit_listener_at_pending_handshake_limit() {
         let (accepted, _client) = accepted_host_connection("wakeup-limit");
         let accepted_fd = accepted.stream().as_raw_fd();
         let (mut device, _path) = host_socket_device(MIN_GUEST_CID, "wakeup-full");
         activate_vsock_device(&mut device);
-        device.set_host_connection_limit(1);
+        device.set_pending_host_connection_limit(1);
         let listener_fd = device
             .host_socket_owner
             .as_ref()
@@ -15322,10 +15873,20 @@ mod tests {
             .expect("host connection should insert");
 
         assert!(device.has_pending_host_request_packet(key));
+        assert_eq!(device.active_connection_count(), 1);
+        assert_eq!(
+            device.host_local_port_cursor().last_used(),
+            VSOCK_HOST_LOCAL_PORT_BASE
+        );
 
         VirtioMmioDeviceActivationHandler::reset(&mut device);
 
         assert!(!device.has_pending_host_request_packet(key));
+        assert_eq!(device.active_connection_count(), 0);
+        assert_eq!(
+            device.host_local_port_cursor().last_used(),
+            VSOCK_HOST_LOCAL_PORT_INITIAL_LAST_USED
+        );
         assert_stream_closed(&mut client, "reset should close retained host stream");
     }
 

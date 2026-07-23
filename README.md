@@ -1066,13 +1066,15 @@ Repeated valid pre-boot `PUT /vsock` requests replace the stored
 configuration; post-start PUT is rejected without mutation, and there is no
 PATCH, DELETE, runtime hotplug, or broader CID-routing contract. The live path
 uses dynamic 64-KiB credit windows with wrapping counters, two-second
-request/shutdown cleanup, up to 256 connections per direction, `EVENT_IDX`, and
-process-local listener ownership with path/payload-redacted transport
-diagnostics. Signed Apple Silicon tests verify at least 1 MiB in each direction
-for both initiation paths plus two-stream isolation. Indirect descriptors are a
-supported bangbang extension. Native-v1 snapshot UDS override, event-queue
-`TRANSPORT_RESET`, and post-restore RX gating remain explicit exclusions; this
-does not claim general performance, Firecracker artifact, or snapshot parity.
+request/shutdown cleanup, one 1023-connection active budget shared across both
+initiation directions, a separate 256-entry incomplete-host-handshake bound,
+round-robin host-local-port allocation, `EVENT_IDX`, and process-local listener
+ownership with path/payload-redacted transport diagnostics. Signed Apple
+Silicon tests verify at least 1 MiB in each direction for both initiation paths
+plus two-stream isolation. Indirect descriptors are a supported bangbang
+extension. Native-v1 snapshot UDS override, event-queue `TRANSPORT_RESET`, and
+post-restore RX gating remain explicit exclusions; this does not claim general
+performance, Firecracker artifact, or snapshot parity.
 
 Configure metrics output before boot:
 

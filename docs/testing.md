@@ -1979,9 +1979,11 @@ packets, callbacks, active protocol sessions, or source clock deadlines.
 
 For vsock specifically, this evidence validates the **implemented supported live MMIO-or-PCI startup/Unix-socket subset**:
 dynamic 64-KiB credit windows with wrapping
-counters, two-second request/shutdown cleanup, 256 retained connections per
-direction, `EVENT_IDX`, ≥1-MiB bidirectional signed transfer for both initiation
-paths, two-stream isolation, and process-local Unix-listener ownership with
+counters, two-second request/shutdown cleanup, one 1023-connection active
+budget shared across both initiation directions, a separate 256-entry
+incomplete-host-handshake bound, round-robin host-local-port allocation,
+`EVENT_IDX`, ≥1-MiB bidirectional signed transfer for both initiation paths,
+two-stream isolation, and process-local Unix-listener ownership with
 path/payload-redacted transport diagnostics. Indirect descriptors are a
 supported bangbang extension. Repeated pre-boot `PUT /vsock` replaces stored
 configuration and post-start PUT is stably rejected; PATCH, DELETE, runtime

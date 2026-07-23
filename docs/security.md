@@ -1693,7 +1693,10 @@ is resource-specific:
   shutdown and a two-second terminal cleanup deadline after queued payloads
   drain; terminal read/write failures queue a reset. Incomplete host requests
   use the same two-second bounded-cleanup policy. Host- and guest-initiated
-  tables each retain at most 256 connections.
+  tables share one 1023-connection active budget. Incomplete accepted host
+  handshakes are bounded separately to 256, and host-local ports advance from a
+  detached last-used cursor in Firecracker's round-robin range even when a
+  completed handshake loses the final active slot.
   Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
@@ -2461,8 +2464,10 @@ The current scaffold does not implement:
   `VSOCK_OP_CREDIT_UPDATE` headers on the existing RX path. Dynamic 64-KiB
   credit windows use wrapping counters and bounded reservations; clean host EOF
   queues shutdown after pending payloads, while terminal read/write failures
-  queue a reset. Request and shutdown cleanup are bounded to two seconds, and
-  each initiation direction retains at most 256 connections.
+  queue a reset. Request and shutdown cleanup are bounded to two seconds. Both
+  initiation directions share one 1023-connection active budget, incomplete
+  accepted host handshakes are bounded separately to 256, and host-local ports
+  use a detached round-robin last-used cursor.
   Startup preparation
   creates a nonblocking host Unix listener at `uds_path` and cleans it up only
   while the path still matches the created socket inode. `EVENT_IDX` is active
