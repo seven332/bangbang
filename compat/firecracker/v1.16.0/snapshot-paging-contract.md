@@ -5,9 +5,10 @@ Firecracker snapshot page-fault corpus and the completed #1547 standalone
 protocol, #1548 coordinated lazy-anonymous-memory, #1549 task-local host
 fault, #1550 HVF guest-fault, #1551 contained peer-broker, and #1552
 removal/peer-failure slices, plus #1553's complete consumer inventory and
-gates, and #1554's native-v1 direct/contained restore assembly. The exact
-capability remains nonterminal until #1555 final certification; this ledger
-does not claim Linux UFFD descriptor or wire compatibility.
+gates, #1554's native-v1 direct/contained restore assembly, and #1555's final
+signed cross-slice certification. The exact capability is now
+`implemented-and-verified`; this ledger does not claim Linux UFFD descriptor
+or wire compatibility.
 
 ## Pinned upstream contract
 
@@ -589,7 +590,65 @@ scripts/run-integration-tests.sh --test executable_hvf_e2e -- macos_arm64::signe
 scripts/run-integration-tests.sh --test production_bundle -- normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore --exact
 ```
 
-## Decision and remaining delivery boundary
+## Final signed certification
+
+#1555 binds the previously independent owners at signed process boundaries
+without expanding the supported profile.
+
+The test-only snapshot pager now publishes an explicit active-state report and
+exact region-relative `(offset, access)` observations. Both
+`signed_executable_creates_and_restores_native_v1_snapshot_across_processes`
+and
+`normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore`
+load a destination Paused, observe completed pager traffic while
+`SnapshotPagerTermination::Active`, and prove that three guest-only pages have
+not been touched. Because the vCPU has not resumed, those requests are direct
+host-side preparation evidence.
+
+Each snapshot guest remains in its restored identity polling loop on the first
+kernel page. After the destination identity changes, it branches to an
+untouched host-page-aligned continuation, reads a separate untouched RAM page,
+writes another untouched RAM page, and reaches `SYSTEM_OFF`. The final pager
+report contains protocol Read for the continuation and read page, Write for the
+write page, more requests than the paused report, and orderly Shutdown. The
+signed `hvf_lazy_guest_faults_populate_execute_read_and_write_before_retry`
+case binds continuation-page protocol Read to an execute-class stage-two
+fault; the pager wire deliberately remains the coarser Read/Write protocol.
+
+Signed
+`task_local_lazy_fault_bridge_removal_generations_refault_zero_before_and_during_population`
+removes one page before first population, then separately blocks an
+old-generation data response while removal commits. The first path requests
+zero only under the newer generation. The second discards the released stale
+data, retries under a later generation, commits zero, leaves no waiter, and
+restores the prior Mach handler. Combined with
+`hvf_lazy_guest_removal_revokes_stage_two_and_refaults_zero`, this is direct
+before/during/after removal and host/guest zero-refault evidence.
+
+The signed
+`production_bundle_has_exact_nested_signing_contract` test decodes the
+`codesign --entitlements - --xml` result as a plist. An empty launcher result
+is normalized to an empty dictionary; the nested worker dictionary must contain exactly
+`com.apple.security.app-sandbox = true` and
+`com.apple.security.hypervisor = true`. Existing tamper cases reject a false
+sandbox value, any ambient network/vmnet authority, an unexpected provisioning
+profile, or a missing hardened runtime. No dynamic Mach service, external task
+port, root, private API, or other entitlement is present.
+
+Existing signed pager-grant tests remain the direct corrupt-frame, EOF,
+timeout, cancellation, terminal, peer-death, worker-death, both death orders,
+repeat, descriptor closure, redaction, and session-root cleanup evidence.
+Signed lifecycle tests retain multi-vCPU coalescing, source failure,
+cancellation, conditional exception-port restoration, and fixed terminal
+behavior. File/COW regression remains in both snapshot restore tests, while
+dirty Uffd and bypassing shared/external consumers reject before configured
+resource access.
+
+The complete root validation matrix, including
+`scripts/run-integration-tests.sh` without `--allow-unsupported`, is the final
+repository-wide certification gate.
+
+## Decision and supported boundary
 
 Public macOS APIs can reproduce the observable external-demand-paging
 contract, but not Linux UFFD descriptor or wire compatibility. Linux transfers
@@ -625,7 +684,7 @@ or host-wide security or swap change.
 | Direct external Mach exception handler | Rejected because it exports whole-task authority, has unsafe death behavior, and cannot use the tested production App Sandbox discovery path. |
 | Permanent UFFD rejection | Replaced for the narrow supported macOS profile by #1554's bounded VMM-mediated peer path; unsupported profiles still reject before resources. |
 
-## Current runtime and promotion gates
+## Final runtime and checked disposition
 
 `crates/runtime/src/snapshot.rs::classify_v1_load_request` now admits both
 `File` and `Uffd`; higher-level
@@ -639,19 +698,18 @@ tests pin the split. `returns_fault_for_snapshot_endpoint` retains the
 dirty-`Uffd` public rejection and redaction path.
 
 Delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527)
-retains one certification gate after #1554:
+is complete only after [#1555](https://github.com/seven332/bangbang/issues/1555)
+merges and its independent current-default-branch gate passes. #1555 adds the
+cross-slice signed demand/removal/entitlement evidence and full validation
+described above. It promotes only `corpus:snapshot-page-faults`; the other
+checked outcomes and their independent delivery owners are unchanged.
 
-1. [#1555](https://github.com/seven332/bangbang/issues/1555) runs cross-slice
-   stress, complete entitlement inspection, the full validation matrix, and
-   promotes only direct evidence.
-
-Public `Uffd` success is now implemented, but there is no
-`implemented-and-verified` inventory result before #1555. Delivery-time
-`missing-platform-feasible` remains nonterminal and final capability validation
-continues to reject it.
+The resulting inventory is 229 `implemented-and-verified`, 169
+`audit-required`, three `missing-platform-feasible`, and 17
+`proven-platform-impossible`.
 
 ## Checked ledger
 
 | Capability identity | Disposition | Delivery owner | Evidence | Result |
 | --- | --- | --- | --- | --- |
-| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; protocol/coordinator/host/guest/removal/consumer tests; signed direct and App Sandbox fault/removal/failure/cleanup evidence; exact contained connected-stream brokerage; state-bound lazy restore assembly; signed direct restore and production-bundle restore without worker memory-file authority; final #1555 certification outstanding | `nonterminal` |
+| `corpus:snapshot-page-faults` | `implemented-and-verified` | — | Pinned upstream contract; public SDK/source audit; protocol/coordinator/host/guest/removal/consumer tests; signed direct and App Sandbox paused-host plus exact guest instruction/read/write demand; before/during/after removal generations and host/guest zero refault; multi-vCPU, cancellation, malformed/EOF/timeout/death/repeat/cleanup evidence; exact empty-launcher/two-key-worker entitlement dictionaries; state-bound direct/contained native-v1 restore without worker memory-file authority; full repository validation | `terminal` |

@@ -95,7 +95,8 @@ path.
   artifacts retain snapshot-specific rejection boundaries. The checked
   [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
   records the public macOS equivalent, its direct and contained restore
-  assembly, and the remaining final-certification gate under #1527.
+  assembly, and #1555's completed signed demand/removal/entitlement
+  certification.
   Full/File load can enable a clean destination dirty epoch, independently of
   the source, and a tracked source resets only after visible Full publication.
   Parser and invalid-lifecycle failures still do not record snapshot latency;
@@ -1340,7 +1341,12 @@ snapshot-memory file grant in the worker. Every preparation or construction
 failure unwinds owned resources; after the one-shot peer is adopted, such a
 failure cancels it and terminalizes the VMM process instead of advertising a
 retry that cannot reuse the stream. No File/COW or eager fallback is permitted.
-Final cross-slice signed certification remains nonterminal under #1527.
+#1555's final signed certification proves paused host demand, exact
+post-resume guest instruction/read/write pages, removal before/during/after
+population with zero refault, multi-vCPU/failure/death/repeat cleanup, and the
+exact production entitlement floor. The checked corpus is now terminal for
+this narrow profile; dirty/shared/external, Diff, optional-device,
+multi-vCPU-artifact, portability, and Linux UFFD wire profiles remain excluded.
 
 ### Implemented public native-v1 restore order
 

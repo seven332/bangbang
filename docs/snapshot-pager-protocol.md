@@ -15,8 +15,9 @@ guest memory, or own a Mach/HVF object. The native-v1 restore orchestrator owns
 those separate composition steps and uses this crate only after acquiring the
 stream. The production launcher performs the contained-boundary operation:
 it securely connects one configured local socket and atomically grants only
-that connected stream to the worker. Final aggregate certification remains
-under delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527).
+that connected stream to the worker. #1555 completes the signed aggregate
+certification under delivery parent
+[#1527](https://github.com/seven332/bangbang/issues/1527).
 
 ## Compatibility boundary
 
@@ -333,6 +334,9 @@ cleanup.
 The narrow native-v1 `Uffd` path now composes this protocol with
 private-anonymous memory, the host and guest bridges, and direct or contained
 stream acquisition on macOS Apple Silicon. Dirty tracking and bypassing
-consumer profiles remain pre-resource rejections. Final signed cross-slice
-certification is still deferred under #1527, so the checked capability remains
-`missing-platform-feasible`.
+consumer profiles remain pre-resource rejections. #1555's signed direct and
+App Sandbox restores prove paused host traffic followed by exact guest
+instruction/read/write pages and orderly shutdown; signed removal tests cover
+every generation phase, and production signing pins the exact entitlement
+dictionary. The checked capability is therefore `implemented-and-verified`
+without claiming Linux UFFD descriptor or wire compatibility.

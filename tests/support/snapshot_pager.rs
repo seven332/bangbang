@@ -1,10 +1,12 @@
 use std::os::unix::net::UnixListener;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use bangbang_pager::{
-    PagerFrameKind, PagerPeerState, PagerRegionId, PagerSessionId, PagerTransport, PeerSession,
+    PageAccess, PagerFrameKind, PagerPeerState, PagerRegionId, PagerSessionId, PagerTransport,
+    PeerSession,
 };
 use bangbang_runtime::memory::GuestAddress;
 use bangbang_runtime::snapshot_artifact::{
@@ -16,21 +18,31 @@ const PAGER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotPagerTermination {
+    Active,
     Shutdown,
     Cancelled,
     Terminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotPagerRequest {
+    pub region: PagerRegionId,
+    pub offset: u64,
+    pub access: PageAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPagerReport {
     pub page_data: u64,
     pub page_zero: u64,
     pub removals: u64,
+    pub requests: Vec<SnapshotPagerRequest>,
     pub termination: SnapshotPagerTermination,
 }
 
 pub struct SnapshotPagerServer {
-    worker: Option<JoinHandle<SnapshotPagerReport>>,
+    worker: Option<JoinHandle<()>>,
+    report: Arc<Mutex<SnapshotPagerReport>>,
 }
 
 impl SnapshotPagerServer {
@@ -39,15 +51,31 @@ impl SnapshotPagerServer {
         let artifacts =
             load_snapshot_artifacts(&paths).expect("pager-owned snapshot image should validate");
         let listener = UnixListener::bind(socket).expect("snapshot pager listener should bind");
+        let report = Arc::new(Mutex::new(SnapshotPagerReport {
+            page_data: 0,
+            page_zero: 0,
+            removals: 0,
+            requests: Vec::new(),
+            termination: SnapshotPagerTermination::Active,
+        }));
+        let worker_report = Arc::clone(&report);
         let worker = thread::spawn(move || {
             let (stream, _) = listener
                 .accept()
                 .expect("snapshot pager stream should accept");
-            serve_snapshot(artifacts, stream)
+            serve_snapshot(artifacts, stream, &worker_report);
         });
         Self {
             worker: Some(worker),
+            report,
         }
+    }
+
+    pub fn snapshot(&self) -> SnapshotPagerReport {
+        self.report
+            .lock()
+            .expect("snapshot pager report should not be poisoned")
+            .clone()
     }
 
     pub fn wait(mut self) -> SnapshotPagerReport {
@@ -55,14 +83,16 @@ impl SnapshotPagerServer {
             .take()
             .expect("snapshot pager worker should exist")
             .join()
-            .expect("snapshot pager worker should succeed")
+            .expect("snapshot pager worker should succeed");
+        self.snapshot()
     }
 }
 
 fn serve_snapshot(
     artifacts: LoadedSnapshotArtifacts,
     stream: std::os::unix::net::UnixStream,
-) -> SnapshotPagerReport {
+    report: &Mutex<SnapshotPagerReport>,
+) {
     let binding = artifacts.record().memory_binding();
     let expected_session = PagerSessionId::from_bytes(binding.pager_v1_session_bytes())
         .expect("snapshot pager session should validate");
@@ -130,12 +160,6 @@ fn serve_snapshot(
         .send(&peer.ready().expect("snapshot pager should become ready"))
         .expect("snapshot pager Ready should send");
 
-    let mut report = SnapshotPagerReport {
-        page_data: 0,
-        page_zero: 0,
-        removals: 0,
-        termination: SnapshotPagerTermination::Terminal,
-    };
     loop {
         let frame = peer
             .receive(
@@ -162,7 +186,23 @@ fn serve_snapshot(
                     .memory()
                     .read_slice(&mut page, GuestAddress::new(address.raw_value()))
                     .expect("pager-owned memory page should read");
-                if page.iter().all(|byte| *byte == 0) {
+                let is_zero = page.iter().all(|byte| *byte == 0);
+                {
+                    let mut report = report
+                        .lock()
+                        .expect("snapshot pager report should not be poisoned");
+                    if is_zero {
+                        report.page_zero += 1;
+                    } else {
+                        report.page_data += 1;
+                    }
+                    report.requests.push(SnapshotPagerRequest {
+                        region: request.region(),
+                        offset: request.offset(),
+                        access: request.access(),
+                    });
+                }
+                if is_zero {
                     transport
                         .send(
                             &peer
@@ -170,7 +210,6 @@ fn serve_snapshot(
                                 .expect("zero page response should build"),
                         )
                         .expect("zero page response should send");
-                    report.page_zero += 1;
                 } else {
                     transport
                         .send(
@@ -179,7 +218,6 @@ fn serve_snapshot(
                                 .expect("data page response should build"),
                         )
                         .expect("data page response should send");
-                    report.page_data += 1;
                 }
             }
             PagerFrameKind::Remove => {
@@ -193,7 +231,10 @@ fn serve_snapshot(
                             .expect("removal response should build"),
                     )
                     .expect("removal response should send");
-                report.removals += 1;
+                report
+                    .lock()
+                    .expect("snapshot pager report should not be poisoned")
+                    .removals += 1;
             }
             PagerFrameKind::Shutdown => {
                 transport
@@ -204,8 +245,11 @@ fn serve_snapshot(
                     )
                     .expect("shutdown acknowledgement should send");
                 assert_eq!(peer.state(), PagerPeerState::Closed);
-                report.termination = SnapshotPagerTermination::Shutdown;
-                return report;
+                report
+                    .lock()
+                    .expect("snapshot pager report should not be poisoned")
+                    .termination = SnapshotPagerTermination::Shutdown;
+                return;
             }
             PagerFrameKind::Cancel => {
                 transport
@@ -216,12 +260,18 @@ fn serve_snapshot(
                     )
                     .expect("cancellation acknowledgement should send");
                 assert_eq!(peer.state(), PagerPeerState::Closed);
-                report.termination = SnapshotPagerTermination::Cancelled;
-                return report;
+                report
+                    .lock()
+                    .expect("snapshot pager report should not be poisoned")
+                    .termination = SnapshotPagerTermination::Cancelled;
+                return;
             }
             PagerFrameKind::Terminal => {
-                report.termination = SnapshotPagerTermination::Terminal;
-                return report;
+                report
+                    .lock()
+                    .expect("snapshot pager report should not be poisoned")
+                    .termination = SnapshotPagerTermination::Terminal;
+                return;
             }
             _ => panic!("unexpected active snapshot pager frame"),
         }

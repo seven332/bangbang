@@ -409,9 +409,12 @@ one validated `bangbang-pager-v1` peer, exact state-bound session/layout/source
 offsets, and transactional owner construction. Direct mode must connect with a
 bounded deadline; contained mode must consume only the exact launcher-connected
 pager grant and must not gain snapshot-memory path/file authority. File/COW
-must not become an implicit fallback. `corpus:snapshot-page-faults` must remain
-nonterminal until signed guest/removal/failure/cleanup and final cross-slice
-certification completes.
+must not become an implicit fallback. `corpus:snapshot-page-faults` is terminal
+only because #1555 binds signed paused-host and exact restored-guest
+instruction/read/write demand, before/during/after removal, peer and process
+failure, repeat/cleanup, exact nested entitlement dictionaries, and the full
+repository matrix. Changes that weaken any of those gates must demote the row
+or add equivalent direct evidence; component-only inference is insufficient.
 
 Run
 `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`

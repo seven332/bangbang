@@ -1110,19 +1110,20 @@ precise #1490 artifact/restore/clone outcomes, so that checkpoint contained
 228/170/3/17 outcomes. The subsequent checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 moves one exact corpus record to #1527-owned
-`missing-platform-feasible`, making the current overlay 228/169/4/17 without
-promoting it before final certification.
+`missing-platform-feasible`, making that checkpoint 228/169/4/17 without
+premature promotion. #1555 subsequently adds direct signed host/guest demand,
+removal-generation, exact entitlement, and full-matrix evidence and promotes
+only that record. The current overlay is 229/169/3/17.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
 peer-failure propagation, checked consumer boundary, and native-v1 restore
-assembly are guarded separately from final aggregate promotion. The inventory
-test pins
+assembly remain guarded as one exact terminal aggregate. The inventory test pins
 the upstream contract, public macOS environment, signed prototype output,
 unchanged entitlement floor, stable pre-access profile rejection anchors,
-direct/contained successful restore evidence, exact delivery owner,
-protocol/coordinator/host/guest/restore source and documentation anchors, and
-nonterminal status. The pager package covers canonical framing,
+direct/contained successful restore evidence, exact implementation and
+validation paths, protocol/coordinator/host/guest/restore source and
+documentation anchors, and terminal status. The pager package covers canonical framing,
 every
 split/coalesced boundary, adversarial input, negotiation, exact out-of-order
 matching, concurrent mixed page/removal completion, first-terminal fan-out,
@@ -1206,8 +1207,10 @@ dispatch. The signed lifecycle test runs real execute-, read-, and write-first
 faults twice, verifies source-failure cleanup and no duplicate work after
 cancellation, blocks one source request until a second vCPU joins it, and
 proves an unowned instruction fault does not reach the lazy source. It also
-removes a committed real stage-two page and observes a newer-generation zero
-refault before guest progress. The
+removes a page before population, supersedes one blocked old-generation data
+response during population, and removes a committed real stage-two page after
+population. Those cases observe newer-generation host and guest zero refault,
+no stranded waiter, and restored exception ownership. The
 guest-boot target starts directly on a lazy instruction page:
 
 ```sh
@@ -1220,23 +1223,28 @@ Native-v1 restore tests keep `File` behavior as the eager regression path and
 cover `Uffd` profile ordering, state-derived pager-session identity, exact
 header-relative region offsets, invalid topology/limits/peer negotiation,
 transactional failure cleanup, and path/value redaction. The signed executable
-case runs an external peer that owns the committed memory image, restores a
-paused destination through direct `Uffd`, resumes it, and observes guest
-`SYSTEM_OFF` plus orderly pager shutdown. The production-bundle case repeats
-the restore through the launcher-connected grant while deliberately omitting
-the worker's snapshot-memory input grant:
+case runs an external peer that owns the committed memory image and restores a
+paused destination through direct `Uffd`. Before resume it proves host-side
+demand while three guest-only pages remain absent. After resume it observes
+exact continuation-instruction Read, guest-data Read, and guest-data Write
+pages, guest `SYSTEM_OFF`, and orderly pager shutdown. The production-bundle
+case repeats the same observations through the launcher-connected grant while
+deliberately omitting the worker's snapshot-memory input grant. Its signing
+test parses the entitlement plist and requires an empty launcher dictionary
+plus exactly Boolean-true App Sandbox and Hypervisor worker keys:
 
 ```sh
 cargo test -p bangbang native_v1_uffd --all-features --locked
 cargo test -p bangbang-hvf --lib --all-features --locked snapshot_restore
 scripts/run-integration-tests.sh --test executable_hvf_e2e -- macos_arm64::signed_executable_creates_and_restores_native_v1_snapshot_across_processes --exact
 scripts/run-integration-tests.sh --test production_bundle -- normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore --exact
+scripts/run-integration-tests.sh --test production_bundle -- production_bundle_has_exact_nested_signing_contract --exact
 ```
 
-The final #1527 certification must run the complete signed wrapper without
-`--allow-unsupported` and exercise the production pager path before promotion.
-The focused direct and contained successes are restore evidence, but they are
-not the final cross-slice stress/entitlement/full-matrix certification.
+#1555's final #1527 certification runs the complete signed wrapper without
+`--allow-unsupported` after the focused direct, contained, removal, and
+entitlement cases. Promotion is valid only when that complete matrix and the
+checked inventory validator pass on the same submitted head.
 
 Run its two focused gates with:
 
