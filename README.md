@@ -389,11 +389,13 @@ incomplete rollback prevents resume and tears the VM down safely. `Diff`
 artifacts and merging, clock adjustment, restore overrides, writable or
 additional drives, serialized/restorable optional-device snapshot state,
 active SVE/SME/debug state, EL2 GIC CPU-interface state, and cross-host
-portability remain unsupported. Native-v1 `Uffd` also remains rejected before
-resource access. The checked
+portability remain unsupported. Native-v1 `Uffd` is supported only on macOS
+Apple Silicon for the same narrow fixed-memory profile with dirty tracking
+disabled. Its `backend_path` names a `bangbang-pager-v1` Unix peer, not a Linux
+UFFD endpoint or memory image. The checked
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
-records that a public macOS observable equivalent is feasible under #1527; it
-is not Linux UFFD wire compatibility or native-v1 restore support. The standalone
+records the observable equivalent and its remaining final-certification gate
+under #1527; this is not Linux UFFD wire compatibility. The standalone
 [`bangbang-pager-v1` contract](docs/snapshot-pager-protocol.md) now implements
 the closed offset-only wire, role state machines, and already-connected
 deadline transport. In contained mode the launcher now reduces one strictly
@@ -450,8 +452,17 @@ terminal, and receive-worker loss nonblockingly preserve the first
 blocked-response supersession, real stage-two revocation, and zero refault;
 the contained probe now removes and refaults through the new client.
 
-Bypassing-consumer audit, native-v1 restore, and final certification remain
-deferred under #1527, and the native-v1 `Uffd` gate remains unchanged.
+Native-v1 restore now builds the private-anonymous coordinator, bound pager
+session, task-local Mach bridge, zero-permission HVF mappings, vCPU, devices,
+and runtime as one rollback-owned transaction. Direct mode performs a bounded
+connection to the configured Unix socket. Contained mode validates and
+one-time claims only the launcher-connected `snapshot-pager-stream`; it does
+not require a snapshot-memory file grant in the worker. State-bound image ID,
+checksum, length, GPA layout, region source offsets, negotiated limits, and
+root identity are validated before a VM owner is published. File restore
+remains the eager path, while dirty tracking and every consumer profile that
+can bypass the task-local bridge reject before path, socket, artifact, or
+backend access. Final cross-slice certification remains deferred under #1527.
 
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
@@ -794,7 +805,7 @@ Production consumers now adopt read-only startup config, startup metadata,
 kernel, initrd, snapshot describe/state/memory, and persisted snapshot-root
 grants plus repeatable read-only/read-write block and pmem backing grants,
 singleton write-only logger/metrics/serial sink grants, and repeatable snapshot
-output-directory grants.
+output-directory grants, plus the singleton connected snapshot-pager stream.
 In authenticated contained mode the exact
 case-sensitive private reference `bangbang-grant:<GrantId>` claims one matching
 ID/role/access entry; malformed, missing, mismatched, or consumed claims fail
@@ -845,12 +856,15 @@ and open-timing behavior.
 
 Snapshot file inputs use the same exact `bangbang-grant:<GrantId>` grammar with
 distinct read-only roles. Describe inspects a duplicate of its exact descriptor.
-Load preinspects state without consuming it, discovers any persisted root grant,
-then atomically takes all tagged state, memory, and read-only root backings and
-finishes from those opened identities. Input authority is one-time after that
-take. The persisted root identity includes file metadata such as `ctime`, so a
-later rename or metadata-changing replacement is correctly rejected even when
-it refers to the same inode.
+A `File` load preinspects state without consuming it, discovers any persisted
+root grant, then atomically takes all tagged state, memory, and read-only root
+backings and finishes from those opened identities. A native-v1 `Uffd` load
+preflights the exact pager grant before state access, prepares only the state
+and root inputs, then one-time claims the launcher-connected stream; the worker
+receives no snapshot-memory file grant. Input authority is one-time after its
+take or stream claim. The persisted root identity includes file metadata such
+as `ctime`, so a later rename or metadata-changing replacement is correctly
+rejected even when it refers to the same inode.
 
 Create outputs instead use
 `bangbang-grant:<GrantId>/<SnapshotOutputChild>`. The child is one 1–255 byte
@@ -1375,12 +1389,13 @@ exact 14-record set to eight terminal API/live outcomes and six precise #1490
 artifact/restore/clone handoffs. The
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 then moves its one exact corpus record to feasible-but-undelivered #1527
-ownership while preserving native-v1 rejection. Its standalone protocol
-and concurrent client, contained connected-peer grant, backend-neutral
-coordinated lazy-anonymous-memory slice, task-local public-Mach host-fault
-bridge, HVF guest read/write/execute fault bridge, ordered removal, and
-peer-failure propagation are implemented and tested without promoting the
-aggregate capability.
+ownership until final certification. Its standalone protocol and concurrent
+client, contained connected-peer grant, backend-neutral coordinated
+lazy-anonymous-memory slice, task-local public-Mach host-fault bridge, HVF
+guest read/write/execute fault bridge, ordered removal, peer-failure
+propagation, complete consumer gates, and native-v1 direct/contained restore
+assembly are implemented and tested without promoting the aggregate
+capability.
 The repository-wide disposition counts remain 228/169/4/17.
 
 ## Build And Test
@@ -1468,8 +1483,10 @@ entitlement change. Signed contained-pager cases prove exact anchored
 connection, descriptor/peer revalidation, page/zero/removal/shutdown,
 cancellation and peer terminal behavior, malformed/EOF/timeout failures, both
 process-death orders, repeated launch and cleanup, path redaction, signature
-inspection, and the unchanged entitlement floor without activating native-v1
-restore. Abrupt launcher-first and worker-first cases replace the
+inspection, and the unchanged entitlement floor. The normal production
+snapshot case additionally restores a real native-v1 guest through that
+connected pager without granting the worker the memory artifact. Abrupt
+launcher-first and worker-first cases replace the
 granted API pathname before death and prove both surviving cleanup owners
 preserve the replacement while clearing the matching private namespace record.
 Signed file-backed Async cases separately cover direct MMIO live path PATCH,

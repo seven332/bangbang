@@ -15,6 +15,9 @@ signal-hook = "0.3"
 [dev-dependencies]
 bangbang-pager = { path = "../pager" }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+bangbang-runtime = { path = "../runtime" }
+
 [[bin]]
 name = "bangbang-launcher"
 path = "src/main.rs"

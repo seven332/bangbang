@@ -11,12 +11,12 @@ its exact page/removal source boundary to this wire.
 
 The crate adopts an already connected Unix stream. It does not select or open a
 path, launch a process, transfer a descriptor, grant source authority, map
-guest memory, own a Mach/HVF object, or make native-v1 `Uffd` succeed. The
-production launcher now performs the separate contained-boundary operation:
+guest memory, or own a Mach/HVF object. The native-v1 restore orchestrator owns
+those separate composition steps and uses this crate only after acquiring the
+stream. The production launcher performs the contained-boundary operation:
 it securely connects one configured local socket and atomically grants only
-that connected stream to the worker. Native-v1 restore assembly and activation
-remain under delivery parent
-[#1527](https://github.com/seven332/bangbang/issues/1527).
+that connected stream to the worker. Final aggregate certification remains
+under delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527).
 
 ## Compatibility boundary
 
@@ -118,11 +118,14 @@ by construction.
 
 ## Handshake and region configuration
 
-The VMM chooses a fresh session and sends exactly one `Hello`. The peer returns
-one valid `HelloAck` selection. The VMM then sends exactly the negotiated
-number of unique Regions, followed by `Start`. The peer accepts `Start` only
-after that complete, valid region set and enters Active only when it emits
-`Ready`.
+The VMM chooses one nonzero 32-byte session identity and sends exactly one
+`Hello`. Standalone callers generate a fresh random identity. Native-v1 restore
+binds the peer to the state record's memory binding with
+`image_id[16] || checksum_le[8] || data_length_le[8]`; it does not invent a
+second unbound nonce. The peer returns one valid `HelloAck` selection. The VMM
+then sends exactly the negotiated number of unique Regions, followed by
+`Start`. The peer accepts `Start` only after that complete, valid region set
+and enters Active only when it emits `Ready`.
 
 Every later frame repeats the exact session identity. Cross-session frames,
 duplicate Regions, overlapping sources, early or repeated handshake frames,
@@ -143,8 +146,10 @@ from its outstanding set only after the full tuple and data length validate.
 Generation is an opaque nonzero coordinator value. The protocol compares it
 exactly and does not infer ordering between generations.
 
-There is no automatic request retry or replay. A later integration may begin a
-new restore only with a new random session and freshly assigned request IDs.
+There is no automatic request retry or replay. A later restore starts a new
+transport/session state machine and freshly assigned request IDs; restoring
+the same authenticated native-v1 image may repeat its state-bound session
+identity on that new connection.
 
 `PagerClient` owns the VMM-side live session. Outbound frame construction and
 sending are serialized so request-ID order matches wire order. One receive
@@ -203,8 +208,8 @@ retains the guard that such an operation must drain.
 This coordinator installs no Mach exception port, changes no HVF mapping or
 permission, reads no snapshot source, opens no peer, and changes no API
 behavior. `HvfLazyHostFaultBridge`, its guest handler, and `HvfLazyPager` now
-bind the internal fault/removal/failure path; bypassing consumers and
-native-v1 restore remain separately gated.
+bind the internal fault/removal/failure path. Native-v1 restore composes those
+owners only after the closed consumer-profile preflight succeeds.
 
 ## HVF integration and removal linearization
 
@@ -325,7 +330,9 @@ multi-vCPU coalescing, execute/read/write population, lazy entry boot, failure,
 cancellation, committed-page revocation, newer-generation zero refault, and
 cleanup.
 
-Still deferred are bypassing-consumer gating, native-v1 restore activation,
-and final signed end-to-end certification. Until those #1527 slices complete,
-native-v1 `Uffd` remains rejected before resource access and the checked
-capability remains `missing-platform-feasible`.
+The narrow native-v1 `Uffd` path now composes this protocol with
+private-anonymous memory, the host and guest bridges, and direct or contained
+stream acquisition on macOS Apple Silicon. Dirty tracking and bypassing
+consumer profiles remain pre-resource rejections. Final signed cross-slice
+certification is still deferred under #1527, so the checked capability remains
+`missing-platform-feasible`.

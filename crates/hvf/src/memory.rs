@@ -969,11 +969,22 @@ impl HvfGuestMemoryMapping {
         ))
     }
 
+    pub(crate) fn virtio_mem_executor_mut(
+        &mut self,
+        permissions: HvfMemoryPermissions,
+    ) -> HvfVirtioMemMutationExecutor<'_> {
+        HvfVirtioMemMutationExecutor::new(&mut self.state, permissions)
+    }
+
     pub(crate) fn memory_and_pmem_flush_executor_mut(
         &mut self,
     ) -> Result<(&mut GuestMemory, HvfPmemFlushExecutor<'_>), HvfGuestMemoryMappingError> {
         let (memory, state) = self.memory_and_state_mut()?;
         Ok((memory, HvfPmemFlushExecutor::new(state)))
+    }
+
+    pub(crate) fn pmem_flush_executor(&self) -> HvfPmemFlushExecutor<'_> {
+        HvfPmemFlushExecutor::new(&self.state)
     }
 
     pub(crate) fn start_dirty_write_tracking(

@@ -32,7 +32,7 @@ use bangbang_hvf::{
     HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootSnapshotV1StateCaptureError,
     HvfArm64BootStorageCaptureError, HvfArm64BootTimerDeviceConfig,
     HvfArm64BootVsockCaptureDisposition, HvfArm64BootVsockCaptureError,
-    HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState, HvfSnapshotV1Bundle,
+    HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState, HvfBackend, HvfSnapshotV1Bundle,
     HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
     HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfVcpuRunCoordinatorError,
     OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError, PreparedHvfArm64BootPciNetworkRemoval,
@@ -54,6 +54,7 @@ use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
 use bangbang_runtime::boot_timer::BootTimerMmioLayout;
 use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::{EntropyConfig, EntropyMmioLayout};
+use bangbang_runtime::lazy_memory::LazyGuestMemoryConsumerProfile;
 use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
@@ -99,7 +100,7 @@ use bangbang_runtime::serial::{
     SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use bangbang_runtime::snapshot::{
-    SnapshotCreateInput, SnapshotLoadInput, SnapshotV1ControllerCommit,
+    SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackendType, SnapshotV1ControllerCommit,
 };
 #[cfg(target_os = "macos")]
 use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
@@ -140,7 +141,7 @@ use bangbang_session::{GrantAccess, ResourceRole, SessionId, VmnetAuthority};
 use crate::anchored_socket::{AnchoredSocketGuard, bind as bind_anchored_socket};
 #[cfg(target_os = "macos")]
 use crate::contained_session::{
-    ClaimedSocketDirectory, ClaimedVhostUserSocket, DirectoryGrantAuthority,
+    ClaimedSocketDirectory, ClaimedVhostUserSocket, DirectoryGrantAuthority, PagerGrantAuthority,
     PreparedVhostUserSocketClaim, SnapshotStagingRecordTracker, SocketBrokerAuthority,
     VhostUserBrokerAuthority, socket_directory_reference,
 };
@@ -148,6 +149,7 @@ use crate::contained_session::{
     GrantAuthority, GrantClaimError, PreparedDriveBackingClaim, PreparedFileGrantClaim,
     grant_reference_id,
 };
+use crate::direct_snapshot_pager::{self, DirectSnapshotPagerConnectError};
 use crate::direct_vhost_user;
 use crate::host_network::virtio_vmnet::{
     MmdsNetworkStackBuildError, MmdsOnlyVirtioNetworkPacketIo,
@@ -199,6 +201,7 @@ const DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT: usize = 1024;
 const BOOT_RUN_LOOP_COMMAND_QUEUE_CAPACITY: usize = 32;
 const HVF_BOOT_RUN_LOOP_THREAD_NAME: &str = "bangbang-hvf-boot-loop";
 const DIRECT_VHOST_USER_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SNAPSHOT_PAGER_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InstanceStartDisposition {
@@ -552,6 +555,12 @@ pub(crate) enum NativeV1SnapshotLoadError {
     VsockResource(VsockRestoreError),
     Artifact(SnapshotArtifactLoadError),
     Prepare(PrepareHvfSnapshotV1LoadError),
+    PagerConnect(DirectSnapshotPagerConnectError),
+    PagerSession(DirectSnapshotPagerConnectError),
+    LazyPrepare(PrepareHvfSnapshotV1LoadError),
+    AfterPagerAdoption {
+        source: Box<NativeV1SnapshotLoadError>,
+    },
     ProcessPreparation(BackendError),
     ControllerCommitAllocation(TryReserveError),
     Restore(HvfSnapshotV1RestoreError),
@@ -566,6 +575,9 @@ impl NativeV1SnapshotLoadError {
         match self {
             Self::Restore(source) => source.disposition(),
             Self::ProcessTerminal => HvfSnapshotV1RestoreDisposition::Terminal,
+            Self::PagerSession(_) => HvfSnapshotV1RestoreDisposition::Terminal,
+            Self::LazyPrepare(_) => HvfSnapshotV1RestoreDisposition::Terminal,
+            Self::AfterPagerAdoption { .. } => HvfSnapshotV1RestoreDisposition::Terminal,
             #[cfg(target_os = "macos")]
             Self::VsockResource(source) => match source.disposition() {
                 VsockRestoreDisposition::Retryable => HvfSnapshotV1RestoreDisposition::Retryable,
@@ -578,6 +590,7 @@ impl NativeV1SnapshotLoadError {
             | Self::Resource(_)
             | Self::Artifact(_)
             | Self::Prepare(_)
+            | Self::PagerConnect(_)
             | Self::ProcessPreparation(_)
             | Self::ControllerCommitAllocation(_)
             | Self::WorkerStart { .. } => HvfSnapshotV1RestoreDisposition::Retryable,
@@ -597,6 +610,21 @@ impl fmt::Display for NativeV1SnapshotLoadError {
             }
             Self::Artifact(source) => write!(f, "native-v1 artifact load failed: {source}"),
             Self::Prepare(source) => write!(f, "native-v1 preparation failed: {source}"),
+            Self::PagerConnect(source) => {
+                write!(f, "native-v1 snapshot pager connection failed: {source}")
+            }
+            Self::PagerSession(source) => {
+                write!(f, "native-v1 snapshot pager session failed: {source}")
+            }
+            Self::LazyPrepare(source) => {
+                write!(f, "native-v1 lazy preparation failed: {source}")
+            }
+            Self::AfterPagerAdoption { source } => {
+                write!(
+                    f,
+                    "native-v1 load failed after snapshot pager adoption: {source}"
+                )
+            }
             Self::ProcessPreparation(source) => {
                 write!(f, "native-v1 process preparation failed: {source}")
             }
@@ -620,6 +648,10 @@ impl std::error::Error for NativeV1SnapshotLoadError {
             Self::VsockResource(source) => Some(source),
             Self::Artifact(source) => Some(source),
             Self::Prepare(source) => Some(source),
+            Self::PagerConnect(source) => Some(source),
+            Self::PagerSession(source) => Some(source),
+            Self::LazyPrepare(source) => Some(source),
+            Self::AfterPagerAdoption { source } => Some(source.as_ref()),
             Self::ProcessPreparation(source) => Some(source),
             Self::ControllerCommitAllocation(source) => Some(source),
             Self::Restore(source) => Some(source),
@@ -1775,6 +1807,8 @@ where
     #[cfg(target_os = "macos")]
     directory_grant_authority: Option<DirectoryGrantAuthority>,
     #[cfg(target_os = "macos")]
+    pager_grant_authority: Option<PagerGrantAuthority>,
+    #[cfg(target_os = "macos")]
     socket_broker_authority: Option<SocketBrokerAuthority>,
     #[cfg(target_os = "macos")]
     vhost_user_broker_authority: Option<VhostUserBrokerAuthority>,
@@ -1879,6 +1913,8 @@ where
             #[cfg(target_os = "macos")]
             directory_grant_authority: None,
             #[cfg(target_os = "macos")]
+            pager_grant_authority: None,
+            #[cfg(target_os = "macos")]
             socket_broker_authority: None,
             #[cfg(target_os = "macos")]
             vhost_user_broker_authority: None,
@@ -1919,6 +1955,15 @@ where
 
     pub(crate) const fn with_vmnet_authority(mut self, authority: ProcessVmnetAuthority) -> Self {
         self.vmnet_authority = authority;
+        self
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_pager_grant_authority(
+        mut self,
+        authority: Option<PagerGrantAuthority>,
+    ) -> Self {
+        self.pager_grant_authority = authority;
         self
     }
 
@@ -3564,6 +3609,56 @@ impl<S> ProcessVmm<S>
 where
     S: InstanceStartExecutor,
 {
+    fn preflight_native_v1_memory_backend(
+        &self,
+        input: &SnapshotLoadInput,
+    ) -> Result<(), NativeV1SnapshotLoadError> {
+        if input.mem_backend().backend_type() == SnapshotMemoryBackendType::File {
+            return Ok(());
+        }
+        if !HvfBackend::is_supported_target() {
+            return Err(NativeV1SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
+        let mut profile = LazyGuestMemoryConsumerProfile::in_process_fixed();
+        if input.track_dirty_pages() {
+            profile = profile.requiring_dirty_tracking();
+        }
+        profile.validate().map_err(|_| {
+            NativeV1SnapshotLoadError::Preflight(VmmActionError::SnapshotUnsupported)
+        })?;
+
+        #[cfg(target_os = "macos")]
+        {
+            let pager = input.mem_backend().backend_path();
+            if let Some(authority) = &self.pager_grant_authority {
+                if !authority.is_active() {
+                    return Err(NativeV1SnapshotLoadError::Resource(GrantClaimError));
+                }
+                authority
+                    .validates(pager)
+                    .map_err(NativeV1SnapshotLoadError::Resource)?;
+            } else {
+                if grant_reference_id(pager)
+                    .map_err(NativeV1SnapshotLoadError::Resource)?
+                    .is_some()
+                {
+                    return Err(NativeV1SnapshotLoadError::Resource(GrantClaimError));
+                }
+                direct_snapshot_pager::validate_path(pager)
+                    .map_err(NativeV1SnapshotLoadError::PagerConnect)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(NativeV1SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ))
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn prepare_snapshot_vsock_restore(
         &self,
@@ -3692,12 +3787,127 @@ where
         Ok(Some(prepared))
     }
 
+    #[cfg(target_os = "macos")]
+    fn prepare_lazy_snapshot_v1_load(
+        &self,
+        input: &SnapshotLoadInput,
+    ) -> Result<PreparedHvfSnapshotV1Load, NativeV1SnapshotLoadError> {
+        debug_assert_eq!(
+            input.mem_backend().backend_type(),
+            SnapshotMemoryBackendType::Uffd
+        );
+        let state_path = input.snapshot_path();
+        let mut state_claim = match &self.grant_authority {
+            Some(authority) => authority
+                .prepare_file_claim(
+                    Path::new(state_path),
+                    ResourceRole::SnapshotStateInput,
+                    GrantAccess::ReadOnly,
+                )
+                .map_err(NativeV1SnapshotLoadError::Resource)?,
+            None => {
+                if grant_reference_id(Path::new(state_path))
+                    .map_err(NativeV1SnapshotLoadError::Resource)?
+                    .is_some()
+                {
+                    return Err(NativeV1SnapshotLoadError::Resource(GrantClaimError));
+                }
+                None
+            }
+        };
+        let state_file = state_claim
+            .as_mut()
+            .map(PreparedFileGrantClaim::take_file)
+            .transpose()
+            .map_err(NativeV1SnapshotLoadError::Resource)?;
+        let state = match state_file {
+            Some(file) => prepare_snapshot_state_file(file),
+            None => prepare_snapshot_state_path(Path::new(state_path)),
+        }
+        .map_err(NativeV1SnapshotLoadError::Artifact)?;
+        let state = PreparedHvfSnapshotV1State::from_prepared_state(state)
+            .map_err(NativeV1SnapshotLoadError::Prepare)?
+            .prepare_lazy()
+            .map_err(NativeV1SnapshotLoadError::Prepare)?;
+
+        let mut root_claim = match &self.grant_authority {
+            Some(authority) => authority
+                .prepare_drive_backing_claim(state.root_backing_path(), GrantAccess::ReadOnly)
+                .map_err(NativeV1SnapshotLoadError::Resource)?,
+            None => {
+                if grant_reference_id(state.root_backing_path())
+                    .map_err(NativeV1SnapshotLoadError::Resource)?
+                    .is_some()
+                {
+                    return Err(NativeV1SnapshotLoadError::Resource(GrantClaimError));
+                }
+                None
+            }
+        };
+        let root = root_claim
+            .as_mut()
+            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
+            .transpose()
+            .map_err(NativeV1SnapshotLoadError::Resource)?;
+        let state = state
+            .prepare_root_backing(root)
+            .map_err(NativeV1SnapshotLoadError::Prepare)?;
+
+        let pager_path = input.mem_backend().backend_path();
+        let stream = match &self.pager_grant_authority {
+            Some(authority) => authority
+                .claim(pager_path)
+                .map_err(NativeV1SnapshotLoadError::Resource)?
+                .ok_or(NativeV1SnapshotLoadError::Resource(GrantClaimError))?
+                .into_stream(),
+            None => direct_snapshot_pager::connect(pager_path, SNAPSHOT_PAGER_OPERATION_TIMEOUT)
+                .map_err(NativeV1SnapshotLoadError::PagerConnect)?,
+        };
+        stream.set_nonblocking(false).map_err(|source| {
+            NativeV1SnapshotLoadError::PagerSession(DirectSnapshotPagerConnectError::Io(
+                source.kind(),
+            ))
+        })?;
+        let prepared = state
+            .finish(stream, SNAPSHOT_PAGER_OPERATION_TIMEOUT, Instant::now())
+            .map_err(NativeV1SnapshotLoadError::LazyPrepare)?;
+        if let Some(claim) = state_claim {
+            claim.commit();
+        }
+        if let Some(claim) = root_claim {
+            claim.commit();
+        }
+        Ok(prepared)
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn prepare_contained_snapshot_v1_load(
         &self,
         _input: &SnapshotLoadInput,
     ) -> Result<Option<PreparedHvfSnapshotV1Load>, NativeV1SnapshotLoadError> {
         Ok(None)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn prepare_lazy_snapshot_v1_load(
+        &self,
+        _input: &SnapshotLoadInput,
+    ) -> Result<PreparedHvfSnapshotV1Load, NativeV1SnapshotLoadError> {
+        Err(NativeV1SnapshotLoadError::Preflight(
+            VmmActionError::SnapshotUnsupported,
+        ))
+    }
+
+    fn record_native_v1_snapshot_load_result<T>(
+        &mut self,
+        result: Result<T, NativeV1SnapshotLoadError>,
+    ) -> Result<T, NativeV1SnapshotLoadError> {
+        if let Err(error) = &result
+            && error.disposition() == HvfSnapshotV1RestoreDisposition::Terminal
+        {
+            self.terminal_snapshot_load_failure = true;
+        }
+        result
     }
 
     /// Restores one admitted native-v1 pair and commits the session paused.
@@ -3708,9 +3918,18 @@ where
         if self.terminal_snapshot_load_failure {
             return Err(NativeV1SnapshotLoadError::ProcessTerminal);
         }
+        let result = self.restore_native_v1_snapshot_once(input);
+        self.record_native_v1_snapshot_load_result(result)
+    }
+
+    fn restore_native_v1_snapshot_once(
+        &mut self,
+        input: &SnapshotLoadInput,
+    ) -> Result<bool, NativeV1SnapshotLoadError> {
         self.controller
             .preflight_load_snapshot(input)
             .map_err(NativeV1SnapshotLoadError::Preflight)?;
+        self.preflight_native_v1_memory_backend(input)?;
 
         #[cfg(target_os = "macos")]
         if let Some(unintegrated) = self.prepare_snapshot_vsock_restore(None, input)? {
@@ -3722,7 +3941,11 @@ where
             return Err(NativeV1SnapshotLoadError::ProcessTerminal);
         }
 
-        let prepared = self.prepare_contained_snapshot_v1_load(input)?;
+        let memory_backend = input.mem_backend().backend_type();
+        let prepared = match memory_backend {
+            SnapshotMemoryBackendType::File => self.prepare_contained_snapshot_v1_load(input)?,
+            SnapshotMemoryBackendType::Uffd => Some(self.prepare_lazy_snapshot_v1_load(input)?),
+        };
         let result = match prepared {
             Some(prepared) => self.starter.load_prepared_snapshot_v1(
                 &self.controller,
@@ -3734,15 +3957,13 @@ where
                 .starter
                 .load_snapshot_v1(&self.controller, self.vmnet_authority, input),
         };
-        let restored = match result {
-            Ok(restored) => restored,
-            Err(error) => {
-                if error.disposition() == HvfSnapshotV1RestoreDisposition::Terminal {
-                    self.terminal_snapshot_load_failure = true;
-                }
-                return Err(error);
-            }
-        };
+        let result = result.map_err(|source| match memory_backend {
+            SnapshotMemoryBackendType::File => source,
+            SnapshotMemoryBackendType::Uffd => NativeV1SnapshotLoadError::AfterPagerAdoption {
+                source: Box::new(source),
+            },
+        });
+        let restored = result?;
         let (session, controller_commit) = restored.into_parts();
         self.started_session = Some(session);
         Ok(self.controller.commit_snapshot_v1_load(controller_commit))
@@ -4330,7 +4551,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         input: &SnapshotLoadInput,
         prepared: PreparedHvfSnapshotV1Load,
     ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
-        let restored_drive_config = prepared.runtime().drive_config.clone();
+        let restored_drive_config = prepared.drive_config().clone();
         let restored_machine = snapshot_destination_machine_config(
             prepared.state().machine(),
             input.track_dirty_pages(),
@@ -7302,6 +7523,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
 
     fn run_loop_control(&self) -> Self::Control;
 
+    fn commit_run_loop_start(&mut self) {}
+
+    fn abort_run_loop_start(&mut self) {}
+
     fn quiesce_snapshot_auxiliary_work(
         &self,
     ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError>;
@@ -7494,6 +7719,14 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
 
     fn run_loop_control(&self) -> Self::Control {
         OwnedHvfArm64BootSession::run_loop_control(self)
+    }
+
+    fn commit_run_loop_start(&mut self) {
+        self.commit_snapshot_v1_page_source();
+    }
+
+    fn abort_run_loop_start(&mut self) {
+        self.abort_snapshot_v1_page_source_commit();
     }
 
     fn quiesce_snapshot_auxiliary_work(
@@ -7780,6 +8013,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
     type SnapshotAuxiliaryQuiescenceGuard: Send + 'static;
 
     fn run_loop_control(&self) -> Self::Control;
+
+    fn commit_run_loop_start(&mut self) {}
+
+    fn abort_run_loop_start(&mut self) {}
 
     fn bind_run_loop_auxiliary_wakeup(
         &mut self,
@@ -8192,6 +8429,14 @@ where
 
     fn run_loop_control(&self) -> Self::Control {
         self.session.run_loop_control()
+    }
+
+    fn commit_run_loop_start(&mut self) {
+        self.session.commit_run_loop_start();
+    }
+
+    fn abort_run_loop_start(&mut self) {
+        self.session.abort_run_loop_start();
     }
 
     fn bind_run_loop_auxiliary_wakeup(
@@ -9674,11 +9919,14 @@ where
             let _ = worker.join();
             return Err(BootRunLoopStartError::new(source, session));
         }
+        session.commit_run_loop_start();
         if let Err(err) = session_sender.send(session) {
             let _ = worker.join();
+            let mut session = err.0;
+            session.abort_run_loop_start();
             return Err(BootRunLoopStartError::new(
                 BackendError::InvalidState("failed to hand off HVF boot run loop session"),
-                err.0,
+                session,
             ));
         }
 
@@ -14582,6 +14830,17 @@ mod tests {
         .with_resume_vm(resume_vm)
     }
 
+    fn snapshot_uffd_load_input(
+        pager: impl Into<PathBuf>,
+        track_dirty_pages: bool,
+    ) -> SnapshotLoadInput {
+        SnapshotLoadInput::new(
+            "/private/state",
+            SnapshotMemoryBackend::new(pager, SnapshotMemoryBackendType::Uffd),
+        )
+        .with_track_dirty_pages(track_dirty_pages)
+    }
+
     #[test]
     fn snapshot_destination_tracking_overrides_the_source_in_both_directions() {
         let untracked = MachineConfig::default();
@@ -14589,6 +14848,43 @@ mod tests {
 
         assert!(snapshot_destination_machine_config(untracked, true).track_dirty_pages());
         assert!(!snapshot_destination_machine_config(tracked, false).track_dirty_pages());
+    }
+
+    #[test]
+    fn native_v1_uffd_dirty_tracking_rejects_before_artifact_or_starter_access() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        assert!(matches!(
+            vmm.restore_native_v1_snapshot(&snapshot_uffd_load_input(
+                "/private/missing-pager.socket",
+                true,
+            )),
+            Err(NativeV1SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!vmm.has_started_session());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn native_v1_uffd_rejects_reserved_pager_reference_without_authority_before_state_open() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        assert!(matches!(
+            vmm.restore_native_v1_snapshot(&snapshot_uffd_load_input(
+                "bangbang-grant:pager",
+                false,
+            )),
+            Err(NativeV1SnapshotLoadError::Resource(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!vmm.has_started_session());
     }
 
     #[test]
@@ -14884,6 +15180,46 @@ mod tests {
             Err(NativeV1SnapshotLoadError::ProcessTerminal)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_v1_preparation_disposition_controls_process_latching() {
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
+
+        let retryable = vmm
+            .record_native_v1_snapshot_load_result::<()>(Err(
+                NativeV1SnapshotLoadError::PagerConnect(
+                    crate::direct_snapshot_pager::DirectSnapshotPagerConnectError::Refused,
+                ),
+            ))
+            .expect_err("a refused pre-session connection should remain retryable");
+        assert!(matches!(
+            retryable,
+            NativeV1SnapshotLoadError::PagerConnect(_)
+        ));
+        assert_eq!(
+            vmm.process_exit_status(),
+            super::ProcessSessionExitStatus::Running
+        );
+
+        let terminal = vmm
+            .record_native_v1_snapshot_load_result::<()>(Err(
+                NativeV1SnapshotLoadError::AfterPagerAdoption {
+                    source: Box::new(NativeV1SnapshotLoadError::PagerConnect(
+                        crate::direct_snapshot_pager::DirectSnapshotPagerConnectError::Refused,
+                    )),
+                },
+            ))
+            .expect_err("any failure after one-shot pager adoption should be terminal");
+        assert!(matches!(
+            terminal,
+            NativeV1SnapshotLoadError::AfterPagerAdoption { .. }
+        ));
+        assert_eq!(
+            vmm.process_exit_status(),
+            super::ProcessSessionExitStatus::Terminal
+        );
     }
 
     #[test]

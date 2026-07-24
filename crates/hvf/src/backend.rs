@@ -309,23 +309,46 @@ impl HvfBackend {
         permissions: HvfMemoryPermissions,
     ) -> Result<(&mut GuestMemory, HvfVirtioMemMutationExecutor<'_>), HvfGuestMemoryMappingError>
     {
-        self.guest_memory
-            .as_mut()
-            .ok_or(HvfGuestMemoryMappingError::InvalidState(
-                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
-            ))?
-            .memory_and_virtio_mem_executor_mut(permissions)
+        let mapping =
+            self.guest_memory
+                .as_mut()
+                .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                    GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+                ))?;
+        if let Some(consumer) = &mut self.lazy_guest_memory_consumer {
+            return Ok((
+                consumer.memory_mut(),
+                mapping.virtio_mem_executor_mut(permissions),
+            ));
+        }
+        mapping.memory_and_virtio_mem_executor_mut(permissions)
     }
 
     pub(crate) fn mapped_guest_memory_and_pmem_flush_executor_mut(
         &mut self,
     ) -> Result<(&mut GuestMemory, HvfPmemFlushExecutor<'_>), HvfGuestMemoryMappingError> {
-        self.guest_memory
-            .as_mut()
-            .ok_or(HvfGuestMemoryMappingError::InvalidState(
-                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
-            ))?
-            .memory_and_pmem_flush_executor_mut()
+        let mapping =
+            self.guest_memory
+                .as_mut()
+                .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                    GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+                ))?;
+        if let Some(consumer) = &mut self.lazy_guest_memory_consumer {
+            return Ok((consumer.memory_mut(), mapping.pmem_flush_executor()));
+        }
+        mapping.memory_and_pmem_flush_executor_mut()
+    }
+
+    pub(crate) fn cancel_lazy_page_source_on_drop(&mut self) {
+        if let Some(consumer) = &mut self.lazy_guest_memory_consumer {
+            consumer.cancel_source_on_drop();
+        }
+    }
+
+    pub(crate) fn shutdown_lazy_page_source_on_drop(&mut self) {
+        if let Some(consumer) = &mut self.lazy_guest_memory_consumer {
+            consumer.shutdown_source_on_drop();
+        }
     }
 
     /// Insert one owned guest memory region and map it into the active HVF VM.
@@ -2028,6 +2051,20 @@ mod tests {
             backend
                 .mapped_guest_memory()
                 .expect("internal lazy memory should be available")
+                .is_protected_lazy()
+        );
+        assert!(
+            backend
+                .mapped_guest_memory_and_pmem_flush_executor_mut()
+                .expect("pmem dispatch should borrow protected lazy memory")
+                .0
+                .is_protected_lazy()
+        );
+        assert!(
+            backend
+                .mapped_guest_memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM,)
+                .expect("virtio-mem dispatch should borrow protected lazy memory")
+                .0
                 .is_protected_lazy()
         );
         assert!(matches!(

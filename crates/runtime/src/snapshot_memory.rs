@@ -166,6 +166,24 @@ impl SnapshotMemoryBinding {
         self.checksum
     }
 
+    /// Returns the exact state-bound identity for one `bangbang-pager-v1`
+    /// session serving this memory image.
+    pub fn pager_v1_session_bytes(&self) -> [u8; 32] {
+        let mut bytes = [0_u8; 32];
+        let checksum = self.checksum.to_le_bytes();
+        let data_length = self.data_length.to_le_bytes();
+        for (destination, source) in bytes.iter_mut().zip(
+            self.image_id
+                .as_bytes()
+                .iter()
+                .chain(checksum.iter())
+                .chain(data_length.iter()),
+        ) {
+            *destination = *source;
+        }
+        bytes
+    }
+
     /// Returns the exact ordered GPA range bindings.
     pub fn ranges(&self) -> &[SnapshotMemoryRangeBinding] {
         &self.ranges
@@ -1826,6 +1844,19 @@ mod tests {
             u64::try_from(image.len()).expect("image size should fit u64")
         );
         assert_eq!(binding.integrity(), SnapshotIntegrity::Crc64Jones);
+        let pager_session = binding.pager_v1_session_bytes();
+        assert_eq!(
+            pager_session.get(..SNAPSHOT_MEMORY_IMAGE_ID_BYTES),
+            Some(TEST_IMAGE_ID.as_bytes().as_slice())
+        );
+        assert_eq!(
+            pager_session.get(16..24),
+            Some(binding.checksum().to_le_bytes().as_slice())
+        );
+        assert_eq!(
+            pager_session.get(24..),
+            Some(binding.data_length().to_le_bytes().as_slice())
+        );
         assert_eq!(binding.ranges().len(), 1);
         assert_eq!(binding.ranges()[0].range(), guest_range);
         assert_eq!(

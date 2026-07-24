@@ -313,13 +313,11 @@ mod platform {
         SnapshotArtifactKind, SnapshotArtifactOutput, SnapshotStagingOwnership,
         SnapshotStagingTracker, SnapshotStagingTrackingError,
     };
-    #[cfg(feature = "grant-integration-probe")]
     use bangbang_session::ConnectedUnixPeer;
     use bangbang_session::macos::block_control::{
         BlockControlError, BlockControlMessage, BlockControlOperation, BlockControlTarget,
         receive_block_control_message, send_block_control_message,
     };
-    #[cfg(feature = "grant-integration-probe")]
     use bangbang_session::macos::grant_registry::GrantedUnixStream;
     use bangbang_session::macos::grant_registry::{
         CommittedGrantBatch, ConnectedStreamGrantRegistry, DirectoryGrantRegistry,
@@ -424,14 +422,12 @@ mod platform {
     }
 
     /// One claimed pager stream and its redacted authenticated source metadata.
-    #[cfg(feature = "grant-integration-probe")]
     pub(crate) struct ClaimedPagerStream {
         stream: UnixStream,
         source_identity: ObjectIdentity,
         peer: ConnectedUnixPeer,
     }
 
-    #[cfg(feature = "grant-integration-probe")]
     impl std::fmt::Debug for ClaimedPagerStream {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -443,18 +439,24 @@ mod platform {
         }
     }
 
-    #[cfg(feature = "grant-integration-probe")]
     impl ClaimedPagerStream {
+        #[cfg(feature = "grant-integration-probe")]
         pub(crate) const fn source_identity(&self) -> ObjectIdentity {
             self.source_identity
         }
 
+        #[cfg(feature = "grant-integration-probe")]
         pub(crate) const fn peer(&self) -> ConnectedUnixPeer {
             self.peer
         }
 
         pub(crate) fn into_stream(self) -> UnixStream {
-            self.stream
+            let Self {
+                stream,
+                source_identity: _source_identity,
+                peer: _peer,
+            } = self;
+            stream
         }
     }
 
@@ -474,7 +476,6 @@ mod platform {
             }
         }
 
-        #[cfg(feature = "grant-integration-probe")]
         pub(crate) fn is_active(&self) -> bool {
             self.registry
                 .lock()
@@ -482,7 +483,17 @@ mod platform {
                 .unwrap_or(false)
         }
 
-        #[cfg(feature = "grant-integration-probe")]
+        pub(crate) fn validates(&self, reference: &Path) -> Result<(), GrantClaimError> {
+            let id = grant_reference_id(reference)?.ok_or(GrantClaimError)?;
+            let registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            let registry = registry.as_ref().ok_or(GrantClaimError)?;
+            if registry.validates_connected_stream(&id, ResourceRole::SnapshotPagerStream) {
+                Ok(())
+            } else {
+                Err(GrantClaimError)
+            }
+        }
+
         pub(crate) fn claim(
             &self,
             reference: &Path,
@@ -2418,7 +2429,6 @@ mod platform {
             self.started.then(|| self.grants.clone())
         }
 
-        #[cfg(feature = "grant-integration-probe")]
         pub(crate) fn pager_grant_authority(&self) -> Option<PagerGrantAuthority> {
             self.started.then(|| self.pager_grants.clone())
         }
@@ -4199,7 +4209,6 @@ mod platform {
     use std::path::Path;
 
     use bangbang_runtime::boot::BootSourceFiles;
-    #[cfg(feature = "grant-integration-probe")]
     use bangbang_session::{ConnectedUnixPeer, ObjectIdentity};
     use bangbang_session::{GrantAccess, ResourceRole};
 
@@ -4211,18 +4220,15 @@ mod platform {
     #[derive(Debug, Clone)]
     pub(crate) struct GrantAuthority;
 
-    #[cfg(feature = "grant-integration-probe")]
     #[derive(Debug, Clone)]
     pub(crate) struct PagerGrantAuthority;
 
-    #[cfg(feature = "grant-integration-probe")]
     pub(crate) struct ClaimedPagerStream {
         stream: UnixStream,
         source_identity: ObjectIdentity,
         peer: ConnectedUnixPeer,
     }
 
-    #[cfg(feature = "grant-integration-probe")]
     impl std::fmt::Debug for ClaimedPagerStream {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -4234,18 +4240,24 @@ mod platform {
         }
     }
 
-    #[cfg(feature = "grant-integration-probe")]
     impl ClaimedPagerStream {
+        #[cfg(feature = "grant-integration-probe")]
         pub(crate) const fn source_identity(&self) -> ObjectIdentity {
             self.source_identity
         }
 
+        #[cfg(feature = "grant-integration-probe")]
         pub(crate) const fn peer(&self) -> ConnectedUnixPeer {
             self.peer
         }
 
         pub(crate) fn into_stream(self) -> UnixStream {
-            self.stream
+            let Self {
+                stream,
+                source_identity: _source_identity,
+                peer: _peer,
+            } = self;
+            stream
         }
     }
 
@@ -4345,10 +4357,14 @@ mod platform {
         }
     }
 
-    #[cfg(feature = "grant-integration-probe")]
     impl PagerGrantAuthority {
         pub(crate) fn is_active(&self) -> bool {
             false
+        }
+
+        pub(crate) fn validates(&self, reference: &Path) -> Result<(), GrantClaimError> {
+            let _ = grant_reference_id(reference)?;
+            Err(GrantClaimError)
         }
 
         pub(crate) fn claim(
@@ -4412,7 +4428,6 @@ mod platform {
             None
         }
 
-        #[cfg(feature = "grant-integration-probe")]
         pub(crate) fn pager_grant_authority(&self) -> Option<PagerGrantAuthority> {
             None
         }
@@ -4452,7 +4467,8 @@ mod platform {
 
 pub(crate) use platform::{
     ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
-    PreparedDriveBackingClaim, PreparedFileGrantClaim, PreparedSocketDirectoryClaim,
+    PagerGrantAuthority, PreparedDriveBackingClaim, PreparedFileGrantClaim,
+    PreparedSocketDirectoryClaim,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use platform::{

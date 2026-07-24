@@ -109,7 +109,7 @@ use bangbang_runtime::startup::{
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
     Arm64BootVsockNotificationDispatches,
     Arm64BootVsockTransportResetError as RuntimeArm64BootVsockTransportResetError,
-    Arm64BootVsockWakeupFdsError, InstalledSnapshotV1Runtime, OpenedBlockDeviceLiveUpdate,
+    Arm64BootVsockWakeupFdsError, InstalledSnapshotV1RuntimeParts, OpenedBlockDeviceLiveUpdate,
     VmStartupResources, capture_balloon_state_for_device, capture_entropy_state_for_device_at,
     capture_memory_hotplug_state_for_device, capture_network_state_for_device_at,
     capture_ready_serial_state_for_device, capture_vsock_state_for_device,
@@ -176,7 +176,7 @@ use crate::snapshot_bundle::{
 };
 use crate::snapshot_restore::{
     HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreError, HvfSnapshotV1RestoreFailure,
-    HvfSnapshotV1RestoreStage, PreparedHvfSnapshotV1Load,
+    HvfSnapshotV1RestoreStage, PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1RuntimeMemory,
 };
 use crate::topology::{HvfVcpuTopologyError, prepare_ordered_mpidrs};
 use crate::vcpu::{
@@ -9575,12 +9575,22 @@ impl OwnedHvfArm64BootSession {
         })
     }
 
+    /// Marks a restored lazy source as published for orderly final shutdown.
+    pub fn commit_snapshot_v1_page_source(&mut self) {
+        self.backend.shutdown_lazy_page_source_on_drop();
+    }
+
+    /// Restores cancellation semantics when paused-worker publication fails.
+    pub fn abort_snapshot_v1_page_source_commit(&mut self) {
+        self.backend.cancel_lazy_page_source_on_drop();
+    }
+
     /// Construct and completely restore one never-run native-v1 destination.
     pub fn restore_snapshot_v1(
         prepared: PreparedHvfSnapshotV1Load,
         track_dirty_pages: bool,
     ) -> Result<RestoredHvfArm64BootSession, HvfSnapshotV1RestoreError> {
-        let (state, installed) = prepared.into_parts();
+        let (state, memory, installed) = prepared.into_parts();
         let (_machine, compatibility, vcpu_state, interrupt_state, _device_state) =
             state.into_parts();
         let expected_gic = compatibility.gic_metadata();
@@ -9597,8 +9607,7 @@ impl OwnedHvfArm64BootSession {
             interrupt_state,
         );
 
-        let InstalledSnapshotV1Runtime {
-            mut memory,
+        let InstalledSnapshotV1RuntimeParts {
             mmio_dispatcher,
             mut runtime_resources,
             drive_config,
@@ -9631,6 +9640,15 @@ impl OwnedHvfArm64BootSession {
         let mut runner: Option<HvfVcpuRunner<'static>> = None;
         let mut block_retry_wakeup_scheduler = None;
 
+        if track_dirty_pages && matches!(&memory, PreparedHvfSnapshotV1RuntimeMemory::Lazy(_)) {
+            return Err(failed_snapshot_v1_restore(
+                HvfSnapshotV1RestoreStage::EnableDirtyTracking,
+                HvfSnapshotV1RestoreFailure::DirtyTracking,
+                &mut block_retry_wakeup_scheduler,
+                &mut runner,
+                &mut backend,
+            ));
+        }
         if let Err(source) = <HvfBackend as VmBackend>::create_vm(&mut backend) {
             return Err(failed_snapshot_v1_restore(
                 HvfSnapshotV1RestoreStage::CreateVm,
@@ -9661,19 +9679,23 @@ impl OwnedHvfArm64BootSession {
                 &mut backend,
             ));
         }
-        if track_dirty_pages && memory.enable_dirty_tracking().is_err() {
-            return Err(failed_snapshot_v1_restore(
-                HvfSnapshotV1RestoreStage::EnableDirtyTracking,
-                HvfSnapshotV1RestoreFailure::DirtyTracking,
-                &mut block_retry_wakeup_scheduler,
-                &mut runner,
-                &mut backend,
-            ));
-        }
-        if backend
-            .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
-            .is_err()
-        {
+        let memory_mapping = match memory {
+            PreparedHvfSnapshotV1RuntimeMemory::Eager(mut memory) => {
+                if track_dirty_pages && memory.enable_dirty_tracking().is_err() {
+                    return Err(failed_snapshot_v1_restore(
+                        HvfSnapshotV1RestoreStage::EnableDirtyTracking,
+                        HvfSnapshotV1RestoreFailure::DirtyTracking,
+                        &mut block_retry_wakeup_scheduler,
+                        &mut runner,
+                        &mut backend,
+                    ));
+                }
+                backend.map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+            }
+            PreparedHvfSnapshotV1RuntimeMemory::Lazy(consumer) => backend
+                .map_lazy_guest_memory_with_consumer(consumer, HvfMemoryPermissions::GUEST_RAM),
+        };
+        if memory_mapping.is_err() {
             return Err(failed_snapshot_v1_restore(
                 HvfSnapshotV1RestoreStage::MapMemory,
                 HvfSnapshotV1RestoreFailure::MemoryMapping,

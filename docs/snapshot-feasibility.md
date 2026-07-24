@@ -13,11 +13,11 @@ emitted, described, or loaded by any public process path. The public lifecycle
 and CLI remain native-v1 until later Wave 6 work explicitly changes them.
 Separately, `LazyGuestMemory` is the backend-neutral private-anonymous
 coordinator for the external-paging roadmap; it is not the v2 File/COW loader
-and is not connected to a public restore path yet. `bangbang-hvf` now binds
-that coordinator to task-local public-Mach host faults through a trusted
-in-process content-source interface and to HVF stage-two guest
-read/write/execute faults. Pager transport and public restore remain separate
-later gates.
+and now backs the narrow public native-v1 `Uffd` restore path on macOS Apple
+Silicon. `bangbang-hvf` binds that coordinator to task-local public-Mach host
+faults, HVF stage-two guest read/write/execute faults, and one
+`bangbang-pager-v1` external content owner. This does not add Linux UFFD wire
+compatibility.
 
 ## Current Status
 
@@ -76,8 +76,11 @@ path.
 - Load is pre-boot-only and requires a pristine process except logger/metrics.
   Successful-action history catches explicit-default/no-op configuration, and
   a live view catches residual state such as MMDS left by a failed patch.
-  Only a `File` backend is supported; the deprecated sole `mem_file_path` alias
-  normalizes to `File` and records deprecation use.
+  `File` remains the eager backend, and the deprecated sole `mem_file_path`
+  alias normalizes to it and records deprecation use. On macOS Apple Silicon,
+  `Uffd` accepts the same fixed-memory native-v1 profile only with dirty
+  tracking disabled; its `backend_path` selects a `bangbang-pager-v1` Unix
+  peer rather than a memory file or Linux UFFD transport.
 - A valid committed kind-2 load performs full bounded validation before
   constructing a fresh VM, then restores the accepted native state and
   replaces/signals VMGenID. It always commits a real process session as
@@ -87,13 +90,12 @@ path.
   corrected request. Failures after an uncertain construction/cleanup boundary
   latch the process terminal. Create/load execution faults are typed and
   snapshot-specific while diagnostics remain path- and value-redacted.
-- `Diff`, native-v1 `Uffd` runtime success, realtime adjustment, overrides,
-  unsupported device profiles, and incompatible artifacts retain
-  snapshot-specific rejection boundaries. The checked
+- `Diff`, dirty-tracked or bypassing-consumer `Uffd` profiles, realtime
+  adjustment, overrides, unsupported device profiles, and incompatible
+  artifacts retain snapshot-specific rejection boundaries. The checked
   [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
-  separately records a feasible public macOS equivalent plus the internal
-  protocol, lazy-memory ownership, and task-local host fault slices under
-  #1527; none changes this runtime gate.
+  records the public macOS equivalent, its direct and contained restore
+  assembly, and the remaining final-certification gate under #1527.
   Full/File load can enable a clean destination dirty epoch, independently of
   the source, and a tracked source resets only after visible Full publication.
   Parser and invalid-lifecycle failures still do not record snapshot latency;
@@ -1246,8 +1248,9 @@ exact bitmap/protection metadata. After a Full pair is visibly committed inside
 snapshot-ready quiescence, restored pages are re-protected before the shared
 generation clears. Complete rollback retains the old epoch; incomplete rollback
 blocks resume and requires teardown. Machine/load tracking flags are enabled.
-`Diff` artifact serialization, merging/restore, UFFD, and broader snapshot
-compatibility remain outside native-v1.
+`Diff` artifact serialization and merging/restore, dirty-tracked or
+unsupported-profile external paging, and broader snapshot compatibility remain
+outside native-v1.
 
 ### Public UFFD-equivalent feasibility
 
@@ -1305,12 +1308,10 @@ and host addresses remain inside the process. Signed direct and App Sandbox
 tests cover reads, writes, atomics, raw pointers, forwarding, later-owner
 preservation, repeated cleanup, and terminal failure.
 
-This is still not a usable restore backend. The adapter accepts a trusted
-in-process content source but opens no peer or pager transport and exposes no
-native-v1 API success. The HVF guest adapter now maps lazy regions with no
-initial stage-two access, classifies owned data/instruction aborts, resolves all
-touched pages, synchronizes instruction contents, publishes serialized
-read/write/execute permission unions, and retries without advancing PC.
+The HVF guest adapter maps lazy regions with no initial stage-two access,
+classifies owned data/instruction aborts, resolves all touched pages,
+synchronizes instruction contents, publishes serialized read/write/execute
+permission unions, and retries without advancing PC.
 Multi-vCPU duplicates share coordinator work, while stale no-progress,
 resolver, and protection failures close the path. Signed lifecycle and guest
 boot cases cover execute/read/write population, failure, cancellation, and
@@ -1322,9 +1323,24 @@ connected-stream grant, and ordered peer removal/failure plus the checked
 consumer boundary are implemented. A one-shot protected view covers
 in-process slice/atomic/raw/device/full-snapshot access under the Mach bridge;
 shared/export, dirty, ordinary balloon discard, dynamic topology, and public
-memory-borrow paths reject before escape. Native-v1 `Uffd` remains rejected
-before resource access until #1527's restore gate; restore and final signed
-certification remain nonterminal.
+memory-borrow paths reject before escape.
+
+Native-v1 `Uffd` now accepts the same fixed-memory, one-vCPU native-v1 state
+profile on macOS Apple Silicon with dirty tracking disabled. Preflight checks
+the platform, machine/profile, protected consumer class, and exact contained
+pager grant before opening the snapshot state or connecting a direct socket.
+State validation then derives a 32-byte pager session from the 16-byte memory
+image ID, CRC-64/Jones value, and data length; validates the GPA layout and
+header-relative source offsets; opens or grant-adopts and validates the exact
+root backing; negotiates the peer; and only then publishes
+the private-anonymous memory, host/guest fault owners, HVF mappings, vCPU,
+devices, and runtime. Direct mode connects with a bounded deadline. Contained
+mode one-time claims the launcher-connected stream and deliberately consumes no
+snapshot-memory file grant in the worker. Every preparation or construction
+failure unwinds owned resources; after the one-shot peer is adopted, such a
+failure cancels it and terminalizes the VMM process instead of advertising a
+retry that cannot reuse the stream. No File/COW or eager fallback is permitted.
+Final cross-slice signed certification remains nonterminal under #1527.
 
 ### Implemented public native-v1 restore order
 

@@ -2,25 +2,43 @@
 
 use std::fmt;
 use std::fs::File;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
+use bangbang_pager::{
+    MAX_FRAME_BYTES, MAX_IN_FLIGHT, PagerLimits, PagerOperations, PagerRegionId, PagerSessionId,
+};
 use bangbang_runtime::BackendError;
-use bangbang_runtime::memory::GuestMemory;
+use bangbang_runtime::lazy_memory::{
+    LazyGuestMemory, LazyGuestMemoryError, LazyGuestMemoryLimits, LazyGuestMemoryRegion,
+    MAX_LAZY_MEMORY_WAITERS,
+};
+use bangbang_runtime::memory::{GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 use bangbang_runtime::rtc::RTC_MMIO_DEVICE_WINDOW_SIZE;
 use bangbang_runtime::snapshot_artifact::{
     LoadedSnapshotArtifacts, PreparedSnapshotState, SnapshotArtifactLoadError,
     load_prepared_snapshot_memory_file, load_prepared_snapshot_memory_path,
 };
+use bangbang_runtime::snapshot_memory::{
+    SNAPSHOT_MEMORY_IMAGE_HEADER_BYTES, SnapshotMemoryBinding,
+};
 use bangbang_runtime::startup::{
-    InstallSnapshotV1RuntimeError, InstalledSnapshotV1Runtime, PrepareSnapshotV1DeviceProfileError,
-    install_snapshot_v1_runtime, prepare_snapshot_v1_device_profile,
-    prepare_snapshot_v1_device_profile_with_root_backing,
+    InstallSnapshotV1RuntimeError, InstalledSnapshotV1Runtime, InstalledSnapshotV1RuntimeParts,
+    PrepareSnapshotV1DeviceProfileError, install_snapshot_v1_runtime,
+    install_snapshot_v1_runtime_with_memory_owner, prepare_snapshot_v1_device_profile,
+    prepare_snapshot_v1_device_profile_with_root_backing, prepare_snapshot_v1_root_backing_file,
 };
 
 use crate::backend::HvfBackend;
 use crate::coordinator::HvfVcpuRunCoordinatorError;
 use crate::gic::HvfGicError;
+use crate::lazy_host_fault::{
+    HvfLazyGuestMemoryConsumer, HvfLazyHostFaultBridge, HvfLazyHostFaultError,
+};
+use crate::lazy_pager::{HvfLazyPager, HvfLazyPagerError};
 use crate::runner::HvfVcpuRunnerError;
 use crate::snapshot_bundle::{HvfSnapshotV1Bundle, HvfSnapshotV1BundleError, HvfSnapshotV1State};
 use crate::startup::{HvfArm64BootTimeIdentityRestoreError, HvfArm64BootVmGenIdRestoreError};
@@ -30,7 +48,48 @@ const REDACTED: &str = "<redacted>";
 /// A complete native-v1 load value prepared without constructing an HVF VM.
 pub struct PreparedHvfSnapshotV1Load {
     state: HvfSnapshotV1State,
-    runtime: InstalledSnapshotV1Runtime,
+    runtime: PreparedHvfSnapshotV1Runtime,
+}
+
+enum PreparedHvfSnapshotV1Runtime {
+    Eager(InstalledSnapshotV1Runtime),
+    Lazy(InstalledSnapshotV1Runtime<HvfLazyGuestMemoryConsumer>),
+}
+
+/// Borrowed memory-owner-independent values from a prepared native-v1 runtime.
+pub struct PreparedHvfSnapshotV1RuntimeRef<'a> {
+    pub mmio_dispatcher: &'a bangbang_runtime::mmio::MmioDispatcher,
+    pub runtime_resources: &'a bangbang_runtime::startup::Arm64BootRuntimeResources,
+    pub drive_config: &'a bangbang_runtime::block::DriveConfig,
+    pub block_retry: &'a bangbang_runtime::snapshot_device::SnapshotV1BlockRetryState,
+    pub serial_output: &'a bangbang_runtime::serial::SharedSerialOutput,
+    pub serial_output_buffer: &'a bangbang_runtime::serial::SharedSerialOutputBuffer,
+}
+
+impl fmt::Debug for PreparedHvfSnapshotV1RuntimeRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedHvfSnapshotV1RuntimeRef(<redacted>)")
+    }
+}
+
+impl<'a, MemoryOwner> From<&'a InstalledSnapshotV1Runtime<MemoryOwner>>
+    for PreparedHvfSnapshotV1RuntimeRef<'a>
+{
+    fn from(runtime: &'a InstalledSnapshotV1Runtime<MemoryOwner>) -> Self {
+        Self {
+            mmio_dispatcher: &runtime.mmio_dispatcher,
+            runtime_resources: &runtime.runtime_resources,
+            drive_config: &runtime.drive_config,
+            block_retry: &runtime.block_retry,
+            serial_output: &runtime.serial_output,
+            serial_output_buffer: &runtime.serial_output_buffer,
+        }
+    }
+}
+
+pub(crate) enum PreparedHvfSnapshotV1RuntimeMemory {
+    Eager(GuestMemory),
+    Lazy(HvfLazyGuestMemoryConsumer),
 }
 
 /// Decoded native-v1 state retained before exact memory/root adoption.
@@ -57,6 +116,20 @@ impl PreparedHvfSnapshotV1State {
     /// Returns the persisted root-backing selector to the authority owner.
     pub fn root_backing_path(&self) -> &Path {
         self.state.device().root_block().path()
+    }
+
+    /// Validates and retains exact lazy topology before a peer is acquired.
+    pub fn prepare_lazy(
+        self,
+    ) -> Result<PreparedHvfSnapshotV1LazyState, PrepareHvfSnapshotV1LoadError> {
+        let topology =
+            PreparedHvfSnapshotV1LazyTopology::from_binding(self.record.memory_binding())?;
+        validate_platform_composition_ranges(&self.state, topology.layout.ranges().iter().copied())
+            .map_err(PrepareHvfSnapshotV1LoadError::Platform)?;
+        Ok(PreparedHvfSnapshotV1LazyState {
+            state: self.state,
+            topology,
+        })
     }
 
     /// Loads exact memory against the retained commit without re-decoding state.
@@ -88,6 +161,193 @@ impl PreparedHvfSnapshotV1State {
         Ok(PreparedHvfSnapshotV1Memory {
             state: self.state,
             memory,
+        })
+    }
+}
+
+/// State and topology validated before consuming one pager connection.
+pub struct PreparedHvfSnapshotV1LazyState {
+    state: HvfSnapshotV1State,
+    topology: PreparedHvfSnapshotV1LazyTopology,
+}
+
+impl PreparedHvfSnapshotV1LazyState {
+    /// Returns the persisted root-backing selector to the authority owner.
+    pub fn root_backing_path(&self) -> &Path {
+        self.state.device().root_block().path()
+    }
+
+    /// Validates and retains the exact root backing before peer acquisition.
+    pub fn prepare_root_backing(
+        self,
+        root_backing: Option<File>,
+    ) -> Result<PreparedHvfSnapshotV1LazyLoad, PrepareHvfSnapshotV1LoadError> {
+        let root_backing = prepare_snapshot_v1_root_backing_file(self.state.device(), root_backing)
+            .map_err(PrepareHvfSnapshotV1LoadError::Device)?;
+        Ok(PreparedHvfSnapshotV1LazyLoad {
+            state: self.state,
+            topology: self.topology,
+            root_backing,
+        })
+    }
+}
+
+/// State, topology, and root backing validated before consuming one pager.
+pub struct PreparedHvfSnapshotV1LazyLoad {
+    state: HvfSnapshotV1State,
+    topology: PreparedHvfSnapshotV1LazyTopology,
+    root_backing: File,
+}
+
+impl PreparedHvfSnapshotV1LazyLoad {
+    /// Completes demand-backed preparation over one already-connected peer.
+    pub fn finish(
+        self,
+        stream: UnixStream,
+        timeout: Duration,
+        now: Instant,
+    ) -> Result<PreparedHvfSnapshotV1Load, PrepareHvfSnapshotV1LoadError> {
+        let memory = Arc::new(
+            LazyGuestMemory::new(self.topology.limits, self.topology.regions)
+                .map_err(PrepareHvfSnapshotV1LoadError::LazyMemory)?,
+        );
+        let pager = Arc::new(
+            HvfLazyPager::connect_with_session(
+                Arc::clone(&memory),
+                stream,
+                timeout,
+                self.topology.session,
+            )
+            .map_err(PrepareHvfSnapshotV1LoadError::LazyPager)?,
+        );
+        let prepared = (|| {
+            let bridge = HvfLazyHostFaultBridge::install(
+                Arc::clone(&memory),
+                Arc::<HvfLazyPager>::clone(&pager),
+            )
+            .map_err(PrepareHvfSnapshotV1LoadError::LazyHostFault)?;
+            let mut consumer = bridge
+                .into_guest_memory_consumer()
+                .map_err(PrepareHvfSnapshotV1LoadError::LazyHostFault)?;
+            consumer.cancel_source_on_drop();
+            validate_platform_composition(&self.state, consumer.memory())
+                .map_err(PrepareHvfSnapshotV1LoadError::Platform)?;
+            let profile = prepare_snapshot_v1_device_profile_with_root_backing(
+                self.state.device(),
+                consumer.memory(),
+                now,
+                Some(self.root_backing),
+            )
+            .map_err(PrepareHvfSnapshotV1LoadError::Device)?;
+            let runtime = install_snapshot_v1_runtime_with_memory_owner(
+                profile,
+                self.state.machine(),
+                consumer,
+                self.topology.layout,
+                self.state.compatibility().rtc_mmio_layout(),
+            )
+            .map_err(PrepareHvfSnapshotV1LoadError::Install)?;
+            Ok(PreparedHvfSnapshotV1Load {
+                state: self.state,
+                runtime: PreparedHvfSnapshotV1Runtime::Lazy(runtime),
+            })
+        })();
+        if prepared.is_err() {
+            let _ = pager.cancel();
+        }
+        prepared
+    }
+}
+
+impl fmt::Debug for PreparedHvfSnapshotV1LazyState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedHvfSnapshotV1LazyState")
+            .field("profile", &"native-v1-lazy")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+impl fmt::Debug for PreparedHvfSnapshotV1LazyLoad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedHvfSnapshotV1LazyLoad")
+            .field("profile", &"native-v1-lazy")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+struct PreparedHvfSnapshotV1LazyTopology {
+    limits: LazyGuestMemoryLimits,
+    regions: Vec<LazyGuestMemoryRegion>,
+    layout: GuestMemoryLayout,
+    session: PagerSessionId,
+}
+
+impl PreparedHvfSnapshotV1LazyTopology {
+    fn from_binding(
+        binding: &SnapshotMemoryBinding,
+    ) -> Result<Self, PrepareHvfSnapshotV1LoadError> {
+        let page_size = u32::try_from(
+            crate::memory::host_page_size()
+                .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?,
+        )
+        .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+        let region_count = u16::try_from(binding.ranges().len())
+            .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+        let pager = PagerLimits::new(
+            page_size,
+            region_count,
+            MAX_IN_FLIGHT,
+            u32::try_from(MAX_FRAME_BYTES)
+                .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?,
+            PagerOperations::v1(),
+        )
+        .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+        let page_size_u64 = u64::from(page_size);
+        let total_pages = binding
+            .data_length()
+            .checked_div(page_size_u64)
+            .filter(|_| binding.data_length().is_multiple_of(page_size_u64))
+            .ok_or(PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+        let limits = LazyGuestMemoryLimits::new(pager, total_pages, MAX_LAZY_MEMORY_WAITERS)
+            .map_err(PrepareHvfSnapshotV1LoadError::LazyMemory)?;
+        let mut regions = Vec::new();
+        regions
+            .try_reserve_exact(binding.ranges().len())
+            .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(binding.ranges().len())
+            .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+        let header = u64::try_from(SNAPSHOT_MEMORY_IMAGE_HEADER_BYTES)
+            .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+        for (index, range) in binding.ranges().iter().copied().enumerate() {
+            let id = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .and_then(|id| PagerRegionId::new(id).ok())
+                .ok_or(PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+            let source_offset = range
+                .file_offset()
+                .checked_sub(header)
+                .ok_or(PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+            let guest = range.range();
+            regions.push(
+                LazyGuestMemoryRegion::new(id, guest, source_offset, page_size)
+                    .map_err(PrepareHvfSnapshotV1LoadError::LazyMemory)?,
+            );
+            ranges.push(guest);
+        }
+        let layout = GuestMemoryLayout::new(ranges)
+            .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+        let session = PagerSessionId::from_bytes(binding.pager_v1_session_bytes())
+            .map_err(|_| PrepareHvfSnapshotV1LoadError::LazyTopology)?;
+        Ok(Self {
+            limits,
+            regions,
+            layout,
+            session,
         })
     }
 }
@@ -132,7 +392,7 @@ impl PreparedHvfSnapshotV1Memory {
         .map_err(PrepareHvfSnapshotV1LoadError::Install)?;
         Ok(PreparedHvfSnapshotV1Load {
             state: self.state,
-            runtime,
+            runtime: PreparedHvfSnapshotV1Runtime::Eager(runtime),
         })
     }
 }
@@ -171,19 +431,45 @@ impl PreparedHvfSnapshotV1Load {
         )
         .map_err(PrepareHvfSnapshotV1LoadError::Install)?;
 
-        Ok(Self { state, runtime })
+        Ok(Self {
+            state,
+            runtime: PreparedHvfSnapshotV1Runtime::Eager(runtime),
+        })
     }
 
     pub const fn state(&self) -> &HvfSnapshotV1State {
         &self.state
     }
 
-    pub const fn runtime(&self) -> &InstalledSnapshotV1Runtime {
-        &self.runtime
+    pub fn runtime(&self) -> PreparedHvfSnapshotV1RuntimeRef<'_> {
+        match &self.runtime {
+            PreparedHvfSnapshotV1Runtime::Eager(runtime) => runtime.into(),
+            PreparedHvfSnapshotV1Runtime::Lazy(runtime) => runtime.into(),
+        }
     }
 
-    pub fn into_parts(self) -> (HvfSnapshotV1State, InstalledSnapshotV1Runtime) {
-        (self.state, self.runtime)
+    pub fn drive_config(&self) -> &bangbang_runtime::block::DriveConfig {
+        self.runtime().drive_config
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        HvfSnapshotV1State,
+        PreparedHvfSnapshotV1RuntimeMemory,
+        InstalledSnapshotV1RuntimeParts,
+    ) {
+        let (memory, runtime) = match self.runtime {
+            PreparedHvfSnapshotV1Runtime::Eager(runtime) => {
+                let (memory, runtime) = runtime.into_parts();
+                (PreparedHvfSnapshotV1RuntimeMemory::Eager(memory), runtime)
+            }
+            PreparedHvfSnapshotV1Runtime::Lazy(runtime) => {
+                let (memory, runtime) = runtime.into_parts();
+                (PreparedHvfSnapshotV1RuntimeMemory::Lazy(memory), runtime)
+            }
+        };
+        (self.state, memory, runtime)
     }
 }
 
@@ -213,6 +499,10 @@ pub enum PrepareHvfSnapshotV1LoadError {
     Platform(HvfSnapshotV1PlatformError),
     CacheQuery(BackendError),
     CacheMismatch,
+    LazyTopology,
+    LazyMemory(LazyGuestMemoryError),
+    LazyPager(HvfLazyPagerError),
+    LazyHostFault(HvfLazyHostFaultError),
     Device(PrepareSnapshotV1DeviceProfileError),
     Install(InstallSnapshotV1RuntimeError),
 }
@@ -228,6 +518,12 @@ impl fmt::Display for PrepareHvfSnapshotV1LoadError {
             Self::CacheMismatch => {
                 f.write_str("native-v1 destination cache manifest is incompatible")
             }
+            Self::LazyTopology => f.write_str("native-v1 lazy memory topology is incompatible"),
+            Self::LazyMemory(_) => f.write_str("native-v1 lazy memory construction failed"),
+            Self::LazyPager(_) => f.write_str("native-v1 bangbang-pager-v1 negotiation failed"),
+            Self::LazyHostFault(_) => {
+                f.write_str("native-v1 lazy host fault bridge preparation failed")
+            }
             Self::Device(source) => write!(f, "native-v1 device preparation failed: {source}"),
             Self::Install(source) => write!(f, "native-v1 runtime installation failed: {source}"),
         }
@@ -240,9 +536,12 @@ impl std::error::Error for PrepareHvfSnapshotV1LoadError {
             Self::Bundle(source) => Some(source),
             Self::Platform(source) => Some(source),
             Self::CacheQuery(source) => Some(source),
+            Self::LazyMemory(source) => Some(source),
+            Self::LazyPager(source) => Some(source),
+            Self::LazyHostFault(source) => Some(source),
             Self::Device(source) => Some(source),
             Self::Install(source) => Some(source),
-            Self::CacheMismatch => None,
+            Self::CacheMismatch | Self::LazyTopology => None,
         }
     }
 }
@@ -537,6 +836,16 @@ fn validate_platform_composition(
     state: &HvfSnapshotV1State,
     memory: &GuestMemory,
 ) -> Result<(), HvfSnapshotV1PlatformError> {
+    validate_platform_composition_ranges(
+        state,
+        memory.regions().iter().map(|region| region.range()),
+    )
+}
+
+fn validate_platform_composition_ranges(
+    state: &HvfSnapshotV1State,
+    memory_ranges: impl Iterator<Item = GuestMemoryRange> + Clone,
+) -> Result<(), HvfSnapshotV1PlatformError> {
     let compatibility = state.compatibility();
     let gic = compatibility.gic_metadata();
     let device = state.device();
@@ -610,11 +919,8 @@ fn validate_platform_composition(
         }
     }
     for device_range in platform {
-        if memory.regions().iter().any(|region| {
-            let guest = (
-                region.range().start().raw_value(),
-                region.range().end_exclusive().raw_value(),
-            );
+        if memory_ranges.clone().any(|range| {
+            let guest = (range.start().raw_value(), range.end_exclusive().raw_value());
             overlaps(device_range, guest)
         }) {
             return Err(HvfSnapshotV1PlatformError::MmioMemoryOverlap);
@@ -636,15 +942,19 @@ const fn overlaps(first: (u64, u64), second: (u64, u64)) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use bangbang_pager::PagerRegionId;
     use bangbang_runtime::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange, aarch64};
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::rtc::RtcMmioLayout;
+    use bangbang_runtime::snapshot_memory::write_snapshot_memory_image;
     use bangbang_runtime::vmclock::VmClockRestoreUpdateError;
 
     use super::{
         HvfSnapshotV1PlatformError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
         HvfSnapshotV1RestoreError, HvfSnapshotV1RestoreFailure, HvfSnapshotV1RestoreStage,
-        validate_platform_composition,
+        PreparedHvfSnapshotV1LazyTopology, validate_platform_composition,
     };
     use crate::snapshot_bundle::{
         HvfSnapshotV1CompatibilityState, HvfSnapshotV1State, tests::fixture,
@@ -682,6 +992,47 @@ mod tests {
             interrupts,
             device,
         )
+    }
+
+    #[test]
+    fn lazy_topology_uses_host_pages_and_zero_based_memory_source_offsets() {
+        let page_size =
+            crate::memory::host_page_size().expect("test host page size should validate");
+        let first = GuestMemoryRange::new(GuestAddress::new(aarch64::DRAM_MEM_START), page_size)
+            .expect("first range should validate");
+        let second = GuestMemoryRange::new(
+            GuestAddress::new(aarch64::DRAM_MEM_START + page_size * 2),
+            page_size,
+        )
+        .expect("second range should validate");
+        let layout = GuestMemoryLayout::new(vec![first, second])
+            .expect("fixture memory layout should validate");
+        let memory = bangbang_runtime::memory::GuestMemory::allocate(&layout)
+            .expect("fixture memory should allocate");
+        let mut image = Cursor::new(Vec::new());
+        let binding = write_snapshot_memory_image(&memory, &mut image)
+            .expect("fixture memory image should write");
+
+        let topology = PreparedHvfSnapshotV1LazyTopology::from_binding(&binding)
+            .expect("bound topology should prepare");
+        assert_eq!(u64::from(topology.limits.pager().page_size()), page_size);
+        assert_eq!(topology.limits.pager().region_count(), 2);
+        assert_eq!(topology.limits.max_pages(), 2);
+        assert_eq!(topology.layout.ranges(), [first, second]);
+        assert_eq!(
+            topology.regions[0].id(),
+            PagerRegionId::new(1).expect("region ID should validate")
+        );
+        assert_eq!(topology.regions[0].source_offset(), 0);
+        assert_eq!(
+            topology.regions[1].id(),
+            PagerRegionId::new(2).expect("region ID should validate")
+        );
+        assert_eq!(topology.regions[1].source_offset(), page_size);
+        assert_eq!(
+            topology.session.as_bytes(),
+            &binding.pager_v1_session_bytes()
+        );
     }
 
     #[test]

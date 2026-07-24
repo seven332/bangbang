@@ -305,6 +305,12 @@ impl ConnectedStreamGrantRegistry {
         self.entries.is_empty()
     }
 
+    /// Validates one exact connected local stream without adopting it.
+    #[must_use]
+    pub fn validates_connected_stream(&self, id: &GrantId, role: ResourceRole) -> bool {
+        matches_connected_stream(&self.entries, id, role)
+    }
+
     /// Adopts one exact connected local stream once.
     pub fn take_connected_stream(
         &mut self,
@@ -452,17 +458,24 @@ fn take_connected_stream(
     id: &GrantId,
     role: ResourceRole,
 ) -> Result<GrantedUnixStream, GrantRegistryError> {
-    let matches = matches!(
+    if !matches_connected_stream(entries, id, role) {
+        return Err(GrantRegistryError);
+    }
+    entries.remove(id).ok_or(GrantRegistryError)
+}
+
+fn matches_connected_stream(
+    entries: &HashMap<GrantId, GrantedUnixStream>,
+    id: &GrantId,
+    role: ResourceRole,
+) -> bool {
+    matches!(
         entries.get(id),
         Some(stream)
             if stream.role == role
                 && role == ResourceRole::SnapshotPagerStream
                 && stream.access == GrantAccess::ReadWrite
-    );
-    if !matches {
-        return Err(GrantRegistryError);
-    }
-    entries.remove(id).ok_or(GrantRegistryError)
+    )
 }
 
 fn take_file(
@@ -1846,6 +1859,9 @@ mod tests {
             format!("{streams:?}"),
             "ConnectedStreamGrantRegistry { entries: \"<redacted>\" }"
         );
+        assert!(streams.validates_connected_stream(&id, ResourceRole::SnapshotPagerStream));
+        assert!(!streams.validates_connected_stream(&id, ResourceRole::SnapshotStateInput));
+        assert_eq!(streams.len(), 1);
         let granted = streams
             .take_connected_stream(&id, ResourceRole::SnapshotPagerStream)
             .expect("matching stream should adopt");
@@ -1854,6 +1870,7 @@ mod tests {
         assert_eq!(granted.peer(), peer);
         assert_eq!(granted.status_flags(), status_flags);
         assert!(streams.is_empty());
+        assert!(!streams.validates_connected_stream(&id, ResourceRole::SnapshotPagerStream));
         assert!(
             streams
                 .take_connected_stream(&id, ResourceRole::SnapshotPagerStream)

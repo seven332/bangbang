@@ -212,6 +212,21 @@ pub trait HvfLazyPageSource: Send + Sync {
     fn remove(&self, _request: HvfLazyPageRemovalRequest) -> Result<(), HvfLazyPageSourceError> {
         Err(HvfLazyPageSourceError::failed())
     }
+
+    /// Cancels source work when an admitted memory owner fails construction.
+    ///
+    /// Sources without a session lifecycle need no explicit work.
+    fn cancel(&self) -> Result<(), HvfLazyPageSourceError> {
+        Ok(())
+    }
+
+    /// Performs drain-only orderly source shutdown after all memory consumers
+    /// and fault bridges have quiesced.
+    ///
+    /// Sources without a session lifecycle need no explicit work.
+    fn shutdown(&self) -> Result<(), HvfLazyPageSourceError> {
+        Ok(())
+    }
 }
 
 /// Whether one successful resolver call populated content or reused it.
@@ -506,6 +521,7 @@ pub struct HvfLazyGuestMemoryConsumer {
     memory: LazyGuestMemoryConsumer,
     resolver: HvfLazyPageResolver,
     _bridge: Mutex<HvfLazyHostFaultBridge>,
+    _source_teardown: HvfLazyPageSourceTeardown,
 }
 
 impl HvfLazyGuestMemoryConsumer {
@@ -521,6 +537,34 @@ impl HvfLazyGuestMemoryConsumer {
 
     pub(crate) const fn memory_mut(&mut self) -> &mut GuestMemory {
         self.memory.memory_mut()
+    }
+
+    pub(crate) fn cancel_source_on_drop(&mut self) {
+        self._source_teardown.kind = HvfLazyPageSourceTeardownKind::Cancel;
+    }
+
+    pub(crate) fn shutdown_source_on_drop(&mut self) {
+        self._source_teardown.kind = HvfLazyPageSourceTeardownKind::Shutdown;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HvfLazyPageSourceTeardownKind {
+    Shutdown,
+    Cancel,
+}
+
+struct HvfLazyPageSourceTeardown {
+    source: Arc<dyn HvfLazyPageSource>,
+    kind: HvfLazyPageSourceTeardownKind,
+}
+
+impl Drop for HvfLazyPageSourceTeardown {
+    fn drop(&mut self) {
+        let _ = match self.kind {
+            HvfLazyPageSourceTeardownKind::Shutdown => self.source.shutdown(),
+            HvfLazyPageSourceTeardownKind::Cancel => self.source.cancel(),
+        };
     }
 }
 
@@ -586,10 +630,15 @@ impl HvfLazyHostFaultBridge {
         let memory = unsafe { self.resolver.inner.memory.claim_protected_consumer() }
             .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
         let resolver = self.resolver();
+        let source = Arc::clone(&self.resolver.inner.source);
         Ok(HvfLazyGuestMemoryConsumer {
             memory,
             resolver,
             _bridge: Mutex::new(self),
+            _source_teardown: HvfLazyPageSourceTeardown {
+                source,
+                kind: HvfLazyPageSourceTeardownKind::Shutdown,
+            },
         })
     }
 
@@ -1593,6 +1642,11 @@ mod tests {
         reply: TestReply,
     }
 
+    struct ShutdownSource {
+        shutdown_calls: AtomicU64,
+        cancel_calls: AtomicU64,
+    }
+
     enum TestReply {
         Data(Vec<u8>),
         Zero,
@@ -1748,6 +1802,25 @@ mod tests {
                 TestReply::Failure => Err(HvfLazyPageSourceError::failed()),
                 TestReply::PeerFailure => Err(HvfLazyPageSourceError::peer_failure()),
             }
+        }
+    }
+
+    impl HvfLazyPageSource for ShutdownSource {
+        fn page(
+            &self,
+            _request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            Ok(HvfLazyPageContents::zero())
+        }
+
+        fn cancel(&self) -> Result<(), HvfLazyPageSourceError> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn shutdown(&self) -> Result<(), HvfLazyPageSourceError> {
+            self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -2537,6 +2610,62 @@ mod tests {
                 .iter()
                 .any(|request| request.access() == PageAccess::Read)
         );
+    }
+
+    #[test]
+    fn composite_consumer_shuts_down_its_page_source_once_after_bridge_release() {
+        let _test_lock = MACH_LAZY_TEST_LOCK
+            .lock()
+            .expect("Mach lazy test lock should not be poisoned");
+        let page_size =
+            u32::try_from(crate::memory::host_page_size().expect("host page size should resolve"))
+                .expect("host page size should fit u32");
+        let source = Arc::new(ShutdownSource {
+            shutdown_calls: AtomicU64::new(0),
+            cancel_calls: AtomicU64::new(0),
+        });
+        let bridge = HvfLazyHostFaultBridge::install(
+            memory(page_size, 1).expect("shutdown lazy memory should construct"),
+            Arc::<ShutdownSource>::clone(&source),
+        )
+        .expect("shutdown bridge should install");
+        let mut consumer = bridge
+            .into_guest_memory_consumer()
+            .expect("shutdown consumer should prepare");
+        consumer.cancel_source_on_drop();
+        consumer.shutdown_source_on_drop();
+        assert_eq!(source.shutdown_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(source.cancel_calls.load(Ordering::SeqCst), 0);
+        drop(consumer);
+        assert_eq!(source.shutdown_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(source.cancel_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn composite_consumer_cancels_its_page_source_when_preparation_fails() {
+        let _test_lock = MACH_LAZY_TEST_LOCK
+            .lock()
+            .expect("Mach lazy test lock should not be poisoned");
+        let page_size =
+            u32::try_from(crate::memory::host_page_size().expect("host page size should resolve"))
+                .expect("host page size should fit u32");
+        let source = Arc::new(ShutdownSource {
+            shutdown_calls: AtomicU64::new(0),
+            cancel_calls: AtomicU64::new(0),
+        });
+        let bridge = HvfLazyHostFaultBridge::install(
+            memory(page_size, 1).expect("cancelled lazy memory should construct"),
+            Arc::<ShutdownSource>::clone(&source),
+        )
+        .expect("cancelled bridge should install");
+        let mut consumer = bridge
+            .into_guest_memory_consumer()
+            .expect("cancelled consumer should prepare");
+        consumer.cancel_source_on_drop();
+        drop(consumer);
+
+        assert_eq!(source.shutdown_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(source.cancel_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
