@@ -2018,6 +2018,57 @@ fn assert_normalized_timer_restore_equivalent(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_native_v2_platform_recapture_equivalent(
+    source: &bangbang_hvf::HvfSnapshotV2PlatformState,
+    recaptured: &bangbang_hvf::HvfSnapshotV2PlatformState,
+) {
+    assert_eq!(recaptured.memory(), source.memory());
+    assert_eq!(recaptured.machine(), source.machine());
+    assert_eq!(recaptured.global(), source.global());
+    assert_eq!(recaptured.topology(), source.topology());
+    assert_eq!(recaptured.vcpus().len(), source.vcpus().len());
+    for (source_vcpu, recaptured_vcpu) in source.vcpus().iter().zip(recaptured.vcpus()) {
+        assert_eq!(recaptured_vcpu.index(), source_vcpu.index());
+        assert_eq!(recaptured_vcpu.mpidr(), source_vcpu.mpidr());
+        assert_eq!(recaptured_vcpu.mandatory(), source_vcpu.mandatory());
+        assert_eq!(
+            recaptured_vcpu.pending_interrupts(),
+            source_vcpu.pending_interrupts()
+        );
+        assert_eq!(recaptured_vcpu.gic_icc(), source_vcpu.gic_icc());
+        assert_eq!(
+            recaptured_vcpu.reviewed_optional(),
+            source_vcpu.reviewed_optional()
+        );
+        assert_normalized_timer_restore_equivalent(*source_vcpu.timer(), *recaptured_vcpu.timer());
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn arm64_adr(pc_offset: u64, target_offset: u64, register: u8) -> u32 {
+    let delta = i64::try_from(target_offset).expect("ADR target should fit")
+        - i64::try_from(pc_offset).expect("ADR PC should fit");
+    assert!(
+        (-(1_i64 << 20)..(1_i64 << 20)).contains(&delta),
+        "ADR target should fit its signed 21-bit immediate"
+    );
+    let immediate =
+        u32::try_from(delta.rem_euclid(1_i64 << 21)).expect("ADR immediate should fit 21 bits");
+    0x1000_0000
+        | ((immediate & 0b11) << 29)
+        | (((immediate >> 2) & 0x7_ffff) << 5)
+        | u32::from(register)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn arm64_instruction_bytes(instructions: &[u32]) -> Vec<u8> {
+    instructions
+        .iter()
+        .flat_map(|instruction| instruction.to_le_bytes())
+        .collect()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn assert_sme_pstate_capture_supported_or_unavailable(
     result: Result<bangbang_hvf::HvfArm64VcpuSmePstate, bangbang_hvf::HvfVcpuRunnerError>,
 ) -> Result<Option<bangbang_hvf::HvfArm64VcpuSmePstate>, bangbang_hvf::HvfVcpuRunnerError> {
@@ -9307,6 +9358,509 @@ fn prepares_owned_hvf_arm64_boot_session() {
     second_session
         .shutdown()
         .expect("second owned HVF arm64 boot session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progress() {
+    use std::fs::{File, OpenOptions};
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use bangbang_hvf::{
+        HvfArm64BootRunLoopOutcome, HvfArm64BootSessionConfig, HvfArm64BootSnapshotV2CaptureError,
+        HvfArm64BootSnapshotV2CaptureInput, HvfArm64StableVcpuDisposition, HvfSnapshotV2BootState,
+        HvfSnapshotV2NativePath, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
+        decode_hvf_snapshot_v2_platform_state, encode_hvf_snapshot_v2_platform_state,
+        restore_hvf_snapshot_v2_platform,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::{
+        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
+    };
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
+    use bangbang_runtime::snapshot_memory_v2::{
+        load_snapshot_v2_memory_file, write_snapshot_v2_memory_image,
+    };
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    const SECONDARY_ONE_OFFSET: u64 = 0x1000;
+    const SECONDARY_TWO_OFFSET: u64 = 0x2000;
+    const FLAGS_OFFSET: u64 = 0x4000;
+    const FLAGS_SIZE: usize = 0x40;
+    const CPU_ON_ONE_RESULT: usize = 0x00;
+    const PRIMARY_BEFORE_CAPTURE: usize = 0x08;
+    const PRE_SUSPEND: usize = 0x0c;
+    const POST_SUSPEND: usize = 0x10;
+    const SUSPEND_RESULT: usize = 0x18;
+    const SUSPEND_SENTINEL: usize = 0x20;
+    const PRIMARY_AFTER_RESTORE: usize = 0x28;
+    const CPU_ON_TWO_RESULT: usize = 0x30;
+    const CPU_TWO_PROGRESS: usize = 0x38;
+    const FINAL_CHECKPOINT: usize = 0x3c;
+    const SENTINEL: u64 = 0x5a5a;
+    const PSCI_VERSION: u64 = 0x8400_0000;
+    const PSCI_CPU_SUSPEND_64: u64 = 0xc400_0001;
+    const PSCI_CPU_ON_64: u64 = 0xc400_0003;
+
+    let primary_code = arm64_instruction_bytes(&[
+        arm64_adr(0, FLAGS_OFFSET, 19),             // adr x19, flags
+        0xd280_0060,                                // mov x0, #3
+        0xf2b8_8000,                                // movk x0, #0xc400, lsl #16 (CPU_ON64)
+        0xd280_0021,                                // mov x1, #1
+        arm64_adr(4 * 4, SECONDARY_ONE_OFFSET, 2),  // adr x2, secondary one
+        arm64_adr(5 * 4, FLAGS_OFFSET, 3),          // adr x3, flags
+        0xd400_0002,                                // hvc #0
+        0xf900_0260,                                // str x0, [x19]
+        0xb940_0e64,                                // ldr w4, [x19, #0xc]
+        0x34ff_ffe4,                                // cbz w4, previous instruction
+        0x5280_0024,                                // mov w4, #1
+        0xb900_0a64,                                // str w4, [x19, #8]
+        0xd280_0000,                                // mov x0, #0
+        0xf2b0_8000,                                // movk x0, #0x8400, lsl #16 (PSCI_VERSION)
+        0xd400_0002,                                // hvc #0 (source checkpoint)
+        0xb900_2a64,                                // str w4, [x19, #0x28]
+        0xb940_1265,                                // ldr w5, [x19, #0x10]
+        0x34ff_ffe5,                                // cbz w5, previous instruction
+        0xd280_0060,                                // mov x0, #3
+        0xf2b8_8000,                                // movk x0, #0xc400, lsl #16 (CPU_ON64)
+        0xd280_0041,                                // mov x1, #2
+        arm64_adr(21 * 4, SECONDARY_TWO_OFFSET, 2), // adr x2, secondary two
+        arm64_adr(22 * 4, FLAGS_OFFSET, 3),         // adr x3, flags
+        0xd400_0002,                                // hvc #0
+        0xf900_1a60,                                // str x0, [x19, #0x30]
+        0xb940_3a66,                                // ldr w6, [x19, #0x38]
+        0x34ff_ffe6,                                // cbz w6, previous instruction
+        0xb900_3e64,                                // str w4, [x19, #0x3c]
+        0xd280_0000,                                // mov x0, #0
+        0xf2b0_8000,                                // movk x0, #0x8400, lsl #16 (PSCI_VERSION)
+        0xd400_0002,                                // hvc #0 (final checkpoint)
+        0x1400_0000,                                // b .
+    ]);
+    let secondary_one_code = arm64_instruction_bytes(&[
+        0xaa00_03f3, // mov x19, x0
+        0xd28b_4b54, // mov x20, #0x5a5a
+        0xd53b_e044, // mrs x4, CNTVCT_EL0
+        0xd53b_e005, // mrs x5, CNTFRQ_EL0
+        0x8b05_0084, // add x4, x4, x5
+        0xd51b_e344, // msr CNTV_CVAL_EL0, x4
+        0xd280_0024, // mov x4, #1
+        0xd51b_e324, // msr CNTV_CTL_EL0, x4
+        0xd503_3fdf, // isb
+        0x5280_0026, // mov w6, #1
+        0xb900_0e66, // str w6, [x19, #0xc]
+        0xd280_0020, // mov x0, #1
+        0xf2b8_8000, // movk x0, #0xc400, lsl #16 (CPU_SUSPEND64)
+        0xd280_0001, // mov x1, #0
+        0xd280_0002, // mov x2, #0
+        0xd280_0003, // mov x3, #0
+        0xd400_0002, // hvc #0
+        0xf900_0e60, // str x0, [x19, #0x18]
+        0xf900_1274, // str x20, [x19, #0x20]
+        0xb900_1266, // str w6, [x19, #0x10]
+        0xd280_0040, // mov x0, #2
+        0xf2b0_8000, // movk x0, #0x8400, lsl #16 (CPU_OFF)
+        0xd400_0002, // hvc #0
+        0x1400_0000, // b .
+    ]);
+    let secondary_two_code = arm64_instruction_bytes(&[
+        0xaa00_03f3, // mov x19, x0
+        0x5280_0026, // mov w6, #1
+        0xb900_3a66, // str w6, [x19, #0x38]
+        0xd280_0040, // mov x0, #2
+        0xf2b0_8000, // movk x0, #0x8400, lsl #16 (CPU_OFF)
+        0xd400_0002, // hvc #0
+        0x1400_0000, // b .
+    ]);
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel =
+        TempFile::new("native-v2-platform-kernel", &image).expect("temp kernel should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("boot source should configure");
+    controller
+        .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(3, 16)))
+        .expect("three-vCPU machine should configure");
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
+    );
+    let mut source = OwnedHvfArm64BootSession::new(&controller, config)
+        .expect("native-v2 source should prepare");
+    let primary_entry = GuestAddress::new(
+        source
+            .capture_arm64_general_register_state()
+            .expect("primary entry should capture")
+            .pc(),
+    );
+    let secondary_one_entry = primary_entry
+        .checked_add(SECONDARY_ONE_OFFSET)
+        .expect("secondary-one entry should fit");
+    let secondary_two_entry = primary_entry
+        .checked_add(SECONDARY_TWO_OFFSET)
+        .expect("secondary-two entry should fit");
+    let flags = primary_entry
+        .checked_add(FLAGS_OFFSET)
+        .expect("shared flags should fit");
+    {
+        let memory = source
+            .guest_memory_mut()
+            .expect("source memory should be mutable before execution");
+        memory
+            .write_slice(&primary_code, primary_entry)
+            .expect("primary code should fit");
+        memory
+            .write_slice(&secondary_one_code, secondary_one_entry)
+            .expect("secondary-one code should fit");
+        memory
+            .write_slice(&secondary_two_code, secondary_two_entry)
+            .expect("secondary-two code should fit");
+        memory
+            .write_slice(&[0; FLAGS_SIZE], flags)
+            .expect("shared flags should fit");
+    }
+    let source_flags_host = {
+        let memory = source
+            .guest_memory()
+            .expect("source memory should remain mapped");
+        let region = memory
+            .regions()
+            .iter()
+            .find(|region| region.range().contains(flags))
+            .expect("source flags should belong to mapped DRAM");
+        let offset = flags
+            .raw_value()
+            .checked_sub(region.range().start().raw_value())
+            .and_then(|offset| usize::try_from(offset).ok())
+            .expect("source flag host offset should fit");
+        region.host_address().as_ptr().cast::<u8>() as usize + offset
+    };
+    let read_source_u32 = |offset: usize| {
+        // SAFETY: each aligned address remains inside the mapped shared flag
+        // area while `source` owns its guest memory; volatile reads observe
+        // stores from concurrently executing guest vCPUs.
+        unsafe { std::ptr::read_volatile((source_flags_host + offset) as *const u32) }
+    };
+    let read_source_u64 = |offset: usize| {
+        // SAFETY: the same owned mapping and alignment argument as above
+        // applies to each eight-byte field.
+        unsafe { std::ptr::read_volatile((source_flags_host + offset) as *const u64) }
+    };
+
+    let source_control = source.run_loop_control();
+    let source_stop = source_control.stop_token();
+    let one_step = NonZeroUsize::new(1).expect("one is nonzero");
+    let mut source_checkpoint = false;
+    let mut source_suspend = false;
+    for _ in 0..12 {
+        let mut observed = None;
+        let outcome = source
+            .run_loop_with_observer(&source_stop, one_step, |step| observed = Some(*step))
+            .expect("source step should succeed");
+        assert!(matches!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        ));
+        match observed.expect("one source step should be observed") {
+            HvfVcpuRunStepOutcome::CpuSuspend {
+                index: 1,
+                function_id: PSCI_CPU_SUSPEND_64,
+                ..
+            } => source_suspend = true,
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_VERSION,
+                return_value: 0x0001_0000,
+                ..
+            } => {
+                source_checkpoint = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(source_suspend, "secondary one should enter CPU_SUSPEND");
+    assert!(
+        source_checkpoint,
+        "primary should reach the source checkpoint"
+    );
+    assert_eq!(read_source_u64(CPU_ON_ONE_RESULT), 0);
+    assert_eq!(read_source_u32(PRIMARY_BEFORE_CAPTURE), 1);
+    assert_eq!(read_source_u32(PRE_SUSPEND), 1);
+    assert_eq!(read_source_u32(POST_SUSPEND), 0);
+    assert_eq!(read_source_u32(PRIMARY_AFTER_RESTORE), 0);
+    assert_eq!(read_source_u32(CPU_TWO_PROGRESS), 0);
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("source should complete a snapshot-v2 pause without redispatch");
+
+    let memory_artifact =
+        TempFile::new_len("native-v2-platform-memory", 0).expect("memory artifact should create");
+    let mut writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(memory_artifact.path())
+        .expect("memory artifact should open for writing");
+    let binding = write_snapshot_v2_memory_image(
+        source
+            .guest_memory()
+            .expect("paused source memory should remain available"),
+        &mut writer,
+    )
+    .expect("paused source memory should stream");
+    drop(writer);
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("kernel metadata path should validate"),
+        None,
+        None,
+    )
+    .expect("native-v2 boot metadata should validate");
+    let capture_input = HvfArm64BootSnapshotV2CaptureInput::new(binding, boot.clone());
+    let mismatched_layout = GuestMemoryLayout::new(vec![
+        GuestMemoryRange::new(
+            GuestAddress::new(0),
+            host_page_size().expect("mismatched binding page size should remain available"),
+        )
+        .expect("mismatched binding range should validate"),
+    ])
+    .expect("mismatched binding layout should validate");
+    let mismatched_memory =
+        GuestMemory::allocate(&mismatched_layout).expect("mismatched memory should allocate");
+    let mismatched_artifact = TempFile::new_len("native-v2-platform-mismatched-memory", 0)
+        .expect("mismatched memory artifact should create");
+    let mut mismatched_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mismatched_artifact.path())
+        .expect("mismatched memory artifact should open");
+    let mismatched_binding =
+        write_snapshot_v2_memory_image(&mismatched_memory, &mut mismatched_writer)
+            .expect("mismatched memory binding should encode");
+    let capture_error = source
+        .capture_snapshot_v2_platform(HvfArm64BootSnapshotV2CaptureInput::new(
+            mismatched_binding,
+            boot,
+        ))
+        .expect_err("mismatched binding should reject after paused owner capture");
+    assert!(matches!(
+        capture_error,
+        HvfArm64BootSnapshotV2CaptureError::MemoryBindingMismatch
+    ));
+    let first_capture = source
+        .capture_snapshot_v2_platform(capture_input.clone())
+        .expect("first paused platform capture should succeed");
+    let second_capture = source
+        .capture_snapshot_v2_platform(capture_input)
+        .expect("source capture should be non-consuming and reusable");
+    assert_native_v2_platform_recapture_equivalent(&first_capture, &second_capture);
+    assert!(matches!(
+        second_capture.topology().members()[0].disposition(),
+        HvfArm64StableVcpuDisposition::Runnable
+    ));
+    assert!(matches!(
+        second_capture.topology().members()[1].disposition(),
+        HvfArm64StableVcpuDisposition::Suspended(_)
+    ));
+    assert!(matches!(
+        second_capture.topology().members()[2].disposition(),
+        HvfArm64StableVcpuDisposition::Offline
+    ));
+    let virtual_timer_intid = second_capture.topology().virtual_timer_intid();
+
+    let encoded = encode_hvf_snapshot_v2_platform_state(&second_capture)
+        .expect("complete platform should encode");
+    let structural =
+        decode_snapshot_v2_state(&encoded).expect("native-v2 container should decode first");
+    let decoded = decode_hvf_snapshot_v2_platform_state(&structural)
+        .expect("typed platform should decode and cross-validate");
+    assert_native_v2_platform_recapture_equivalent(&second_capture, &decoded);
+    let restored_memory = load_snapshot_v2_memory_file(
+        &structural,
+        File::open(memory_artifact.path()).expect("memory artifact should open read-only"),
+    )
+    .expect("validated memory artifact should load");
+
+    source
+        .shutdown()
+        .expect("paused source should shut down cleanly");
+    drop(source);
+
+    let mut restored = restore_hvf_snapshot_v2_platform(decoded, restored_memory)
+        .expect("fresh native-v2 platform should restore");
+    assert_eq!(restored.vcpu_count(), 3);
+    assert_eq!(restored.vcpu_mpidrs(), [0, 1, 2]);
+    let immediate_recapture = restored
+        .capture_snapshot_v2_platform()
+        .expect("first published destination state should remain paused and recapturable");
+    assert_native_v2_platform_recapture_equivalent(&second_capture, &immediate_recapture);
+    let restored_flags_host = {
+        let memory = restored
+            .guest_memory()
+            .expect("restored memory should remain mapped");
+        let region = memory
+            .regions()
+            .iter()
+            .find(|region| region.range().contains(flags))
+            .expect("restored flags should belong to mapped DRAM");
+        let offset = flags
+            .raw_value()
+            .checked_sub(region.range().start().raw_value())
+            .and_then(|offset| usize::try_from(offset).ok())
+            .expect("restored flag host offset should fit");
+        region.host_address().as_ptr().cast::<u8>() as usize + offset
+    };
+    let read_restored_u32 = |offset: usize| {
+        // SAFETY: each aligned address remains inside the restored mapping for
+        // the platform lifetime; volatile reads observe guest progress.
+        unsafe { std::ptr::read_volatile((restored_flags_host + offset) as *const u32) }
+    };
+    let read_restored_u64 = |offset: usize| {
+        // SAFETY: the same owned mapping and alignment argument as above
+        // applies to each eight-byte field.
+        unsafe { std::ptr::read_volatile((restored_flags_host + offset) as *const u64) }
+    };
+    assert_eq!(read_restored_u32(PRIMARY_AFTER_RESTORE), 0);
+    assert_eq!(read_restored_u32(POST_SUSPEND), 0);
+    assert_eq!(read_restored_u32(CPU_TWO_PROGRESS), 0);
+
+    restored
+        .resume()
+        .expect("paused destination should resume once");
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let watchdog_done_for_thread = Arc::clone(&watchdog_done);
+    let watchdog_control = restored.control();
+    let watchdog = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !watchdog_done_for_thread.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if !watchdog_done_for_thread.load(Ordering::Acquire) {
+            let _ = watchdog_control.request_stop();
+        }
+    });
+
+    let mut suspend_completed = false;
+    let mut cpu_on_two_completed = false;
+    let mut cpu_one_offline = false;
+    let mut cpu_two_offline = false;
+    let mut final_checkpoint = false;
+    let mut direct_vtimer_exits = 0;
+    for _ in 0..32 {
+        let step = restored
+            .run_step(|entry| {
+                entry == secondary_one_entry.raw_value() || entry == secondary_two_entry.raw_value()
+            })
+            .expect("restored platform step should succeed");
+        match step {
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_CPU_SUSPEND_64,
+                return_value: 0,
+                ..
+            } => suspend_completed = true,
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_CPU_ON_64,
+                return_value: 0,
+                ..
+            } => cpu_on_two_completed = true,
+            HvfVcpuRunStepOutcome::CpuOff { index: 1, .. } => cpu_one_offline = true,
+            HvfVcpuRunStepOutcome::CpuOff { index: 2, .. } => cpu_two_offline = true,
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: PSCI_VERSION,
+                return_value: 0x0001_0000,
+                ..
+            } => final_checkpoint = true,
+            HvfVcpuRunStepOutcome::VtimerActivated => {
+                direct_vtimer_exits += 1;
+                restored
+                    .set_last_step_ppi_pending(virtual_timer_intid)
+                    .expect("direct virtual-timer exit should inject its restored PPI");
+            }
+            _ => {}
+        }
+        if suspend_completed
+            && cpu_on_two_completed
+            && cpu_one_offline
+            && cpu_two_offline
+            && final_checkpoint
+        {
+            break;
+        }
+    }
+    watchdog_done.store(true, Ordering::Release);
+    watchdog.join().expect("native-v2 watchdog should join");
+    assert!(suspend_completed, "restored CPU_SUSPEND should complete");
+    assert!(
+        cpu_on_two_completed,
+        "restored primary should start the initially offline vCPU"
+    );
+    assert!(cpu_one_offline, "woken secondary one should power off");
+    assert!(cpu_two_offline, "continued secondary two should power off");
+    assert!(
+        final_checkpoint,
+        "restored primary should reach its checkpoint"
+    );
+    assert_eq!(read_restored_u32(PRIMARY_AFTER_RESTORE), 1);
+    assert_eq!(read_restored_u32(POST_SUSPEND), 1);
+    assert_eq!(read_restored_u64(SUSPEND_RESULT), 0);
+    assert_eq!(read_restored_u64(SUSPEND_SENTINEL), SENTINEL);
+    assert_eq!(read_restored_u64(CPU_ON_TWO_RESULT), 0);
+    assert_eq!(read_restored_u32(CPU_TWO_PROGRESS), 1);
+    assert_eq!(read_restored_u32(FINAL_CHECKPOINT), 1);
+    assert!(
+        direct_vtimer_exits <= 1,
+        "the retained suspended timer should publish its PPI without duplicate direct exits"
+    );
+
+    restored
+        .control()
+        .request_pause()
+        .expect("idle continued topology should accept a final pause")
+        .wait()
+        .expect("final pause should complete");
+    let final_capture = restored
+        .capture_snapshot_v2_platform()
+        .expect("continued platform should remain capture-ready");
+    assert!(matches!(
+        final_capture.topology().members()[0].disposition(),
+        HvfArm64StableVcpuDisposition::Runnable
+    ));
+    assert!(matches!(
+        final_capture.topology().members()[1].disposition(),
+        HvfArm64StableVcpuDisposition::Offline
+    ));
+    assert!(matches!(
+        final_capture.topology().members()[2].disposition(),
+        HvfArm64StableVcpuDisposition::Offline
+    ));
+    let final_encoded = encode_hvf_snapshot_v2_platform_state(&final_capture)
+        .expect("continued platform should encode");
+    let final_structural =
+        decode_snapshot_v2_state(&final_encoded).expect("continued container should decode");
+    let final_decoded = decode_hvf_snapshot_v2_platform_state(&final_structural)
+        .expect("continued platform should cross-validate");
+    assert_eq!(final_decoded, final_capture);
+    restored
+        .shutdown()
+        .expect("restored native-v2 platform should shut down cleanly");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

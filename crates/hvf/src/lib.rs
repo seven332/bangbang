@@ -25,6 +25,7 @@ mod snapshot;
 mod snapshot_bundle;
 mod snapshot_restore;
 mod snapshot_v2;
+mod snapshot_v2_platform;
 mod startup;
 mod topology;
 mod vcpu;
@@ -101,14 +102,16 @@ pub use pvtime::{
 pub use runner::{
     HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1CaptureStage,
     HvfArm64SnapshotV1CompatibilityError, HvfArm64SnapshotV1Restore,
-    HvfArm64SnapshotV1RestoreStage, HvfVcpuMpidrAffinityStage, HvfVcpuRetainedVtimerWaitOutcome,
-    HvfVcpuRetainedVtimerWaitStage, HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner,
-    HvfVcpuRunnerError,
+    HvfArm64SnapshotV1RestoreStage, HvfArm64SnapshotV2VcpuCapture,
+    HvfArm64SnapshotV2VcpuCaptureStage, HvfArm64SnapshotV2VcpuRestore,
+    HvfArm64SnapshotV2VcpuRestoreStage, HvfVcpuMpidrAffinityStage,
+    HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRetainedVtimerWaitStage, HvfVcpuRunCancelHandle,
+    HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 pub use session_vcpu::{
-    HvfArm64BootVcpuError, HvfArm64BootVcpuSession, HvfArm64StablePausedTopologyCaptureError,
-    HvfArm64StablePausedTopologyCleanupFailure, HvfArm64StablePausedTopologyCleanupStage,
-    HvfArm64StablePausedTopologyImportError,
+    HvfArm64BootVcpuError, HvfArm64BootVcpuSession, HvfArm64SnapshotV2TopologyCaptureError,
+    HvfArm64StablePausedTopologyCaptureError, HvfArm64StablePausedTopologyCleanupFailure,
+    HvfArm64StablePausedTopologyCleanupStage, HvfArm64StablePausedTopologyImportError,
 };
 pub use sme::HvfArm64SmeConfiguration;
 pub use snapshot::{
@@ -138,6 +141,12 @@ pub use snapshot_v2::{
     HvfSnapshotV2NativePath, HvfSnapshotV2PlatformState, HvfSnapshotV2VcpuState,
     decode_hvf_snapshot_v2_platform_state, encode_hvf_snapshot_v2_platform_state,
 };
+pub use snapshot_v2_platform::{
+    HvfSnapshotV2PlatformCleanupFailure, HvfSnapshotV2PlatformCleanupStage,
+    HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformRestoreFailure,
+    HvfSnapshotV2PlatformRestoreStage, HvfSnapshotV2PlatformShutdownError,
+    RestoredHvfSnapshotV2Platform, restore_hvf_snapshot_v2_platform,
+};
 pub use startup::{
     HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonCaptureState,
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootBalloonTransportState,
@@ -163,16 +172,17 @@ pub use startup::{
     HvfArm64BootSerialCaptureError, HvfArm64BootSerialDeviceConfig, HvfArm64BootSession,
     HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootSessionShutdownError,
     HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
-    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootStorageCaptureError,
-    HvfArm64BootStorageCaptureErrorKind, HvfArm64BootStorageCaptureStage,
-    HvfArm64BootTimeIdentityRestoreError, HvfArm64BootTimerDeviceConfig,
-    HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
-    HvfArm64BootVsockCaptureDisposition, HvfArm64BootVsockCaptureError,
-    HvfArm64BootVsockCaptureErrorKind, HvfArm64BootVsockCaptureStage,
-    HvfArm64BootVsockCaptureState, HvfArm64BootVsockNotificationDispatch,
-    HvfArm64BootVsockNotificationDispatchError, HvfArm64BootVsockNotificationDispatches,
-    HvfArm64BootVsockTransportState, OwnedHvfArm64BootSession,
-    PreparedHvfArm64BootPciNetworkRemoval, RestoredHvfArm64BootSession,
+    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootSnapshotV2CaptureError,
+    HvfArm64BootSnapshotV2CaptureInput, HvfArm64BootSnapshotV2CaptureStage,
+    HvfArm64BootStorageCaptureError, HvfArm64BootStorageCaptureErrorKind,
+    HvfArm64BootStorageCaptureStage, HvfArm64BootTimeIdentityRestoreError,
+    HvfArm64BootTimerDeviceConfig, HvfArm64BootVmClockRestoreError,
+    HvfArm64BootVmGenIdRestoreError, HvfArm64BootVsockCaptureDisposition,
+    HvfArm64BootVsockCaptureError, HvfArm64BootVsockCaptureErrorKind,
+    HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState,
+    HvfArm64BootVsockNotificationDispatch, HvfArm64BootVsockNotificationDispatchError,
+    HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockTransportState,
+    OwnedHvfArm64BootSession, PreparedHvfArm64BootPciNetworkRemoval, RestoredHvfArm64BootSession,
 };
 pub use topology::{
     HvfVcpuTopology, HvfVcpuTopologyAllocation, HvfVcpuTopologyCreateStage, HvfVcpuTopologyError,

@@ -83,6 +83,7 @@ use bangbang_runtime::serial::{
     SharedSerialOutput, SharedSerialOutputBuffer,
 };
 use bangbang_runtime::snapshot_device::{SnapshotV1BlockRetryState, SnapshotV1DeviceState};
+use bangbang_runtime::snapshot_memory_v2::SnapshotV2MemoryBinding;
 use bangbang_runtime::startup::{
     Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
     Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatch,
@@ -143,6 +144,7 @@ use bangbang_runtime::vsock::{
     VirtioVsockPciCaptureState, VsockConfig, VsockHostWakeup, VsockMmioLayout,
 };
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
+use crc64::crc64;
 
 use crate::backend::HvfBackend;
 use crate::coordinator::{
@@ -170,7 +172,8 @@ use crate::runner::{
     HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 use crate::session_vcpu::{
-    HvfArm64BootVcpuError, HvfArm64BootVcpuSession, HvfArm64StablePausedTopologyCaptureError,
+    HvfArm64BootVcpuError, HvfArm64BootVcpuSession, HvfArm64SnapshotV2TopologyCaptureError,
+    HvfArm64StablePausedTopologyCaptureError,
 };
 use crate::snapshot::HvfArm64SnapshotTimerState;
 use crate::snapshot_bundle::{
@@ -180,6 +183,11 @@ use crate::snapshot_bundle::{
 use crate::snapshot_restore::{
     HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreError, HvfSnapshotV1RestoreFailure,
     HvfSnapshotV1RestoreStage, PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1RuntimeMemory,
+};
+use crate::snapshot_v2::{
+    HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2FdtState,
+    HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
+    HvfSnapshotV2VcpuState,
 };
 use crate::topology::{HvfVcpuTopologyError, prepare_ordered_mpidrs};
 use crate::vcpu::{
@@ -4887,6 +4895,167 @@ impl std::error::Error for HvfArm64BootSnapshotV1StateCaptureError {
     }
 }
 
+/// Already-authorized inputs composed with one live native-v2 platform capture.
+///
+/// The boot paths are inert metadata. Capture never resolves or opens them,
+/// and the memory binding must describe the guest memory already mapped by the
+/// source session.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64BootSnapshotV2CaptureInput {
+    memory: SnapshotV2MemoryBinding,
+    boot: HvfSnapshotV2BootState,
+}
+
+impl HvfArm64BootSnapshotV2CaptureInput {
+    /// Construct one capture input from an existing memory-image binding and
+    /// already-checked inert boot metadata.
+    pub const fn new(memory: SnapshotV2MemoryBinding, boot: HvfSnapshotV2BootState) -> Self {
+        Self { memory, boot }
+    }
+
+    fn into_parts(self) -> (SnapshotV2MemoryBinding, HvfSnapshotV2BootState) {
+        (self.memory, self.boot)
+    }
+}
+
+impl fmt::Debug for HvfArm64BootSnapshotV2CaptureInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64BootSnapshotV2CaptureInput")
+            .field("profile", &"native-v2")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Topology-wide native-v2 source-capture stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfArm64BootSnapshotV2CaptureStage {
+    /// Reobserve the complete stable paused topology around owner capture.
+    Topology,
+    /// Compare the supplied binding with the source guest-memory ranges.
+    MemoryBinding,
+    /// Retain source boot/FDT/RTC facts without reopening paths.
+    Machine,
+    /// Validate topology-wide processor and cache compatibility.
+    Compatibility,
+    /// Separate the singular VM-global GIC from per-vCPU state.
+    GlobalGic,
+    /// Construct one canonical per-vCPU component.
+    Vcpu { index: usize },
+    /// Cross-validate the complete native-v2 platform graph.
+    Platform,
+}
+
+impl fmt::Display for HvfArm64BootSnapshotV2CaptureStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Topology => f.write_str("stable topology"),
+            Self::MemoryBinding => f.write_str("memory binding"),
+            Self::Machine => f.write_str("machine metadata"),
+            Self::Compatibility => f.write_str("compatibility"),
+            Self::GlobalGic => f.write_str("global GIC"),
+            Self::Vcpu { index } => write!(f, "vCPU {index}"),
+            Self::Platform => f.write_str("platform graph"),
+        }
+    }
+}
+
+/// Failure while composing one live, completed-pause native-v2 platform.
+#[derive(Debug)]
+pub enum HvfArm64BootSnapshotV2CaptureError {
+    /// Stable lifecycle or one owner-thread capture failed.
+    Topology {
+        source: HvfArm64SnapshotV2TopologyCaptureError,
+    },
+    /// The source session no longer exposes its mapped guest memory.
+    GuestMemory { source: HvfGuestMemoryMappingError },
+    /// The supplied memory binding does not exactly name the mapped ranges.
+    MemoryBindingMismatch,
+    /// The source session has no retained boot/FDT origin.
+    MissingBootOrigin,
+    /// The source session has no mandatory PL031 RTC.
+    MissingRtc,
+    /// FDT capture could not allocate its bounded buffer.
+    FdtAllocation,
+    /// The retained FDT range could not be read from mapped guest memory.
+    FdtRead { source: GuestMemoryAccessError },
+    /// Mapped guest memory no longer contains the retained FDT identity.
+    FdtIdentityMismatch,
+    /// One member disagreed with the common processor/cache identity.
+    CompatibilityMismatch { index: usize },
+    /// Global GIC state was absent, duplicated, empty, or assigned incorrectly.
+    GlobalGicShape { index: usize },
+    /// A checked native-v2 component rejected the captured values.
+    Build {
+        stage: HvfArm64BootSnapshotV2CaptureStage,
+        source: HvfSnapshotV2BuildError,
+    },
+    /// Topology-wide component storage could not be reserved.
+    Allocation,
+}
+
+impl fmt::Display for HvfArm64BootSnapshotV2CaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Topology { source } => {
+                write!(f, "native-v2 stable topology capture failed: {source}")
+            }
+            Self::GuestMemory { source } => {
+                write!(f, "native-v2 source guest memory is unavailable: {source}")
+            }
+            Self::MemoryBindingMismatch => {
+                f.write_str("native-v2 memory binding disagrees with source guest memory")
+            }
+            Self::MissingBootOrigin => {
+                f.write_str("native-v2 source is missing retained boot/FDT metadata")
+            }
+            Self::MissingRtc => f.write_str("native-v2 source is missing the mandatory PL031 RTC"),
+            Self::FdtAllocation => f.write_str("native-v2 FDT capture allocation failed"),
+            Self::FdtRead { source } => {
+                write!(f, "native-v2 FDT capture failed: {source}")
+            }
+            Self::FdtIdentityMismatch => {
+                f.write_str("native-v2 FDT identity changed after reconstruction")
+            }
+            Self::CompatibilityMismatch { index } => {
+                write!(
+                    f,
+                    "native-v2 vCPU {index} compatibility changed after startup"
+                )
+            }
+            Self::GlobalGicShape { index } => {
+                write!(
+                    f,
+                    "native-v2 vCPU {index} returned invalid global GIC ownership"
+                )
+            }
+            Self::Build { stage, source } => {
+                write!(f, "native-v2 {stage} construction failed: {source}")
+            }
+            Self::Allocation => f.write_str("native-v2 platform capture allocation failed"),
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootSnapshotV2CaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Topology { source } => Some(source),
+            Self::GuestMemory { source } => Some(source),
+            Self::FdtRead { source } => Some(source),
+            Self::Build { source, .. } => Some(source),
+            Self::MemoryBindingMismatch
+            | Self::MissingBootOrigin
+            | Self::MissingRtc
+            | Self::FdtAllocation
+            | Self::FdtIdentityMismatch
+            | Self::CompatibilityMismatch { .. }
+            | Self::GlobalGicShape { .. }
+            | Self::Allocation => None,
+        }
+    }
+}
+
 impl fmt::Display for HvfArm64BootSnapshotV1DeviceCaptureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -6929,6 +7098,204 @@ fn build_snapshot_v1_state(
     Ok(state)
 }
 
+struct HvfArm64BootSnapshotV2CaptureOwner<'a, 'vm> {
+    runner: &'a mut HvfArm64BootVcpuSession<'vm>,
+    backend: &'a HvfBackend,
+    runtime_resources: &'a Arm64BootRuntimeResources,
+    cpu_template_application: Option<&'a crate::cpu_template::HvfArm64CpuTemplateApplicationState>,
+    cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
+    gic: HvfGicMetadata,
+}
+
+impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
+    fn capture(
+        self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        let (stable, captures) = self
+            .runner
+            .capture_arm64_snapshot_v2_topology()
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
+        let memory = self
+            .backend
+            .mapped_guest_memory()
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::GuestMemory { source })?;
+        let (memory_binding, boot) = input.into_parts();
+        if !memory_matches_snapshot_v2_binding(memory, &memory_binding) {
+            return Err(HvfArm64BootSnapshotV2CaptureError::MemoryBindingMismatch);
+        }
+
+        let boot_origin = self
+            .runtime_resources
+            .boot_origin
+            .as_ref()
+            .ok_or(HvfArm64BootSnapshotV2CaptureError::MissingBootOrigin)?;
+        let rtc = self
+            .runtime_resources
+            .rtc_device
+            .as_ref()
+            .ok_or(HvfArm64BootSnapshotV2CaptureError::MissingRtc)?;
+        let mut fdt_bytes = Vec::new();
+        fdt_bytes
+            .try_reserve_exact(boot_origin.fdt.size)
+            .map_err(|_| HvfArm64BootSnapshotV2CaptureError::FdtAllocation)?;
+        fdt_bytes.resize(boot_origin.fdt.size, 0);
+        memory
+            .read_slice(&mut fdt_bytes, boot_origin.fdt.address)
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::FdtRead { source })?;
+        let fdt = HvfSnapshotV2FdtState::try_new(
+            boot_origin.fdt.address,
+            boot_origin.fdt.size,
+            crc64(0, &fdt_bytes),
+        )
+        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
+            stage: HvfArm64BootSnapshotV2CaptureStage::Machine,
+            source,
+        })?;
+
+        let primary = captures
+            .first()
+            .ok_or(HvfArm64BootSnapshotV2CaptureError::CompatibilityMismatch { index: 0 })?;
+        let primary_member = stable
+            .members()
+            .first()
+            .ok_or(HvfArm64BootSnapshotV2CaptureError::CompatibilityMismatch { index: 0 })?;
+        let primary_identification = primary.identification();
+        let primary_optional_identification = primary.optional_identification();
+        if primary_identification.id_aa64mmfr2_el1() != self.cache_source.id_aa64mmfr2_el1() {
+            return Err(HvfArm64BootSnapshotV2CaptureError::CompatibilityMismatch { index: 0 });
+        }
+        if captures.len() != stable.members().len() {
+            return Err(HvfArm64BootSnapshotV2CaptureError::CompatibilityMismatch {
+                index: captures.len(),
+            });
+        }
+        for (capture, member) in captures.iter().zip(stable.members()) {
+            if capture.identification().mpidr_el1() != member.mpidr()
+                || !same_common_arm64_identification(
+                    capture.identification(),
+                    primary_identification,
+                )
+                || capture.optional_identification() != primary_optional_identification
+            {
+                return Err(HvfArm64BootSnapshotV2CaptureError::CompatibilityMismatch {
+                    index: member.index(),
+                });
+            }
+            if (member.index() == 0) != capture.gic_device().is_some() {
+                return Err(HvfArm64BootSnapshotV2CaptureError::GlobalGicShape {
+                    index: member.index(),
+                });
+            }
+        }
+
+        let mut vcpus = Vec::new();
+        vcpus
+            .try_reserve_exact(captures.len())
+            .map_err(|_| HvfArm64BootSnapshotV2CaptureError::Allocation)?;
+        let mut global_gic = None;
+        for (capture, member) in captures.into_iter().zip(stable.members()) {
+            let (
+                _identification,
+                _optional_identification,
+                mandatory,
+                timer,
+                pending_interrupts,
+                captured_global_gic,
+                gic_icc,
+                reviewed_optional,
+            ) = capture.into_parts();
+            if member.index() == 0 {
+                global_gic = captured_global_gic;
+            }
+            let index = u32::try_from(member.index()).map_err(|_| {
+                HvfArm64BootSnapshotV2CaptureError::CompatibilityMismatch {
+                    index: member.index(),
+                }
+            })?;
+            let vcpu = HvfSnapshotV2VcpuState::try_new(
+                index,
+                member.mpidr(),
+                mandatory,
+                timer,
+                pending_interrupts,
+                gic_icc,
+                reviewed_optional,
+            )
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
+                stage: HvfArm64BootSnapshotV2CaptureStage::Vcpu {
+                    index: member.index(),
+                },
+                source,
+            })?;
+            vcpus.push(vcpu);
+        }
+        let global_gic =
+            global_gic.ok_or(HvfArm64BootSnapshotV2CaptureError::GlobalGicShape { index: 0 })?;
+
+        let rtc_mmio_layout = RtcMmioLayout::new(rtc.region.range().start(), rtc.region.id());
+        let compatibility = HvfSnapshotV1CompatibilityState::new(
+            primary_identification,
+            primary_optional_identification,
+            self.cache_source.manifest(),
+            primary_member.mpidr(),
+            self.gic,
+            rtc_mmio_layout,
+        );
+        let machine = HvfSnapshotV2MachineState::try_new(
+            self.runtime_resources.machine_config,
+            boot,
+            fdt,
+            self.cpu_template_application.cloned(),
+        )
+        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
+            stage: HvfArm64BootSnapshotV2CaptureStage::Machine,
+            source,
+        })?;
+        let global =
+            HvfSnapshotV2GlobalState::try_new(compatibility, global_gic).map_err(|source| {
+                HvfArm64BootSnapshotV2CaptureError::Build {
+                    stage: HvfArm64BootSnapshotV2CaptureStage::GlobalGic,
+                    source,
+                }
+            })?;
+        HvfSnapshotV2PlatformState::try_new(memory_binding, machine, global, stable, vcpus).map_err(
+            |source| HvfArm64BootSnapshotV2CaptureError::Build {
+                stage: HvfArm64BootSnapshotV2CaptureStage::Platform,
+                source,
+            },
+        )
+    }
+}
+
+fn memory_matches_snapshot_v2_binding(
+    memory: &GuestMemory,
+    binding: &SnapshotV2MemoryBinding,
+) -> bool {
+    memory.regions().len() == binding.extents().len()
+        && memory
+            .regions()
+            .iter()
+            .zip(binding.extents())
+            .all(|(region, extent)| region.range() == extent.range())
+}
+
+fn same_common_arm64_identification(
+    left: HvfArm64VcpuIdentificationRegisterState,
+    right: HvfArm64VcpuIdentificationRegisterState,
+) -> bool {
+    left.midr_el1() == right.midr_el1()
+        && left.id_aa64pfr0_el1() == right.id_aa64pfr0_el1()
+        && left.id_aa64pfr1_el1() == right.id_aa64pfr1_el1()
+        && left.id_aa64dfr0_el1() == right.id_aa64dfr0_el1()
+        && left.id_aa64dfr1_el1() == right.id_aa64dfr1_el1()
+        && left.id_aa64isar0_el1() == right.id_aa64isar0_el1()
+        && left.id_aa64isar1_el1() == right.id_aa64isar1_el1()
+        && left.id_aa64mmfr0_el1() == right.id_aa64mmfr0_el1()
+        && left.id_aa64mmfr1_el1() == right.id_aa64mmfr1_el1()
+        && left.id_aa64mmfr2_el1() == right.id_aa64mmfr2_el1()
+}
+
 fn check_snapshot_v1_capture_cancelled(
     is_cancelled: &mut impl FnMut(HvfArm64BootSnapshotV1CaptureStage) -> bool,
     stage: HvfArm64BootSnapshotV1CaptureStage,
@@ -7953,6 +8320,32 @@ impl HvfArm64BootSession<'_> {
         &mut self,
     ) -> Result<HvfArm64StablePausedTopologyState, HvfArm64StablePausedTopologyCaptureError> {
         self.runner.capture_stable_paused_topology()
+    }
+
+    /// Capture the unpublished complete native-v2 platform graph after a
+    /// completed topology-wide pause.
+    ///
+    /// The supplied paths remain inert metadata and the supplied memory
+    /// binding must exactly describe this session's already-mapped memory.
+    pub fn capture_snapshot_v2_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture(input)
+    }
+
+    /// Complete a topology-wide pause without dispatching new guest work.
+    #[doc(hidden)]
+    pub fn pause_for_snapshot_v2_capture(&mut self) -> Result<(), HvfArm64BootVcpuError> {
+        self.runner.pause_for_arm64_snapshot_v2_capture()
     }
 
     /// Establish an empty-snapshot pause barrier for signed PVTime certification.
@@ -10393,6 +10786,32 @@ impl OwnedHvfArm64BootSession {
         &mut self,
     ) -> Result<HvfArm64StablePausedTopologyState, HvfArm64StablePausedTopologyCaptureError> {
         self.runner.capture_stable_paused_topology()
+    }
+
+    /// Capture the unpublished complete native-v2 platform graph after a
+    /// completed topology-wide pause.
+    ///
+    /// The supplied paths remain inert metadata and the supplied memory
+    /// binding must exactly describe this session's already-mapped memory.
+    pub fn capture_snapshot_v2_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: &self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture(input)
+    }
+
+    /// Complete a topology-wide pause without dispatching new guest work.
+    #[doc(hidden)]
+    pub fn pause_for_snapshot_v2_capture(&mut self) -> Result<(), HvfArm64BootVcpuError> {
+        self.runner.pause_for_arm64_snapshot_v2_capture()
     }
 
     /// Establish an empty-snapshot pause barrier for signed PVTime certification.

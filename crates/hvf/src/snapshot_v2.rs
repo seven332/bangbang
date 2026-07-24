@@ -347,6 +347,11 @@ impl HvfSnapshotV2GlobalState {
     pub const fn gic_device(&self) -> &HvfGicDeviceState {
         &self.gic_device
     }
+
+    /// Consume the component into compatibility facts and VM-global GIC state.
+    pub fn into_parts(self) -> (HvfSnapshotV1CompatibilityState, HvfGicDeviceState) {
+        (self.compatibility, self.gic_device)
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2GlobalState {
@@ -432,6 +437,29 @@ impl HvfSnapshotV2VcpuState {
     pub const fn reviewed_optional(&self) -> &HvfArm64ReviewedOptionalStateRestore {
         &self.reviewed_optional
     }
+
+    /// Consume the component into its canonical index, affinity, and state families.
+    pub fn into_parts(
+        self,
+    ) -> (
+        u32,
+        u64,
+        HvfSnapshotV1VcpuState,
+        HvfArm64SnapshotTimerState,
+        HvfArm64VcpuPendingInterruptState,
+        HvfArm64GicIccRegisterState,
+        HvfArm64ReviewedOptionalStateRestore,
+    ) {
+        (
+            self.index,
+            self.mpidr,
+            self.mandatory,
+            self.timer,
+            self.pending_interrupts,
+            self.gic_icc,
+            self.reviewed_optional,
+        )
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2VcpuState {
@@ -496,6 +524,25 @@ impl HvfSnapshotV2PlatformState {
     /// Return complete vCPUs in canonical instance order.
     pub fn vcpus(&self) -> &[HvfSnapshotV2VcpuState] {
         &self.vcpus
+    }
+
+    /// Consume the graph into its memory, machine, global, lifecycle, and vCPU components.
+    pub fn into_parts(
+        self,
+    ) -> (
+        SnapshotV2MemoryBinding,
+        HvfSnapshotV2MachineState,
+        HvfSnapshotV2GlobalState,
+        HvfArm64StablePausedTopologyState,
+        Vec<HvfSnapshotV2VcpuState>,
+    ) {
+        (
+            self.memory,
+            self.machine,
+            self.global,
+            self.topology,
+            self.vcpus,
+        )
     }
 }
 
