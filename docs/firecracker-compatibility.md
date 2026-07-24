@@ -3938,11 +3938,16 @@ Their eventual support level should follow the endpoint matrix:
   library-only native-v2 `2.2.0` profile retains readable `2.0.0`/`2.1.x`
   state and adds an exact typed 1–32-vCPU machine/global-GIC/topology/vCPU
   graph with CPU-application evidence and closed reviewed debug/SME state.
-  It remains data-only and composes with the canonical 64-KiB-aligned memory
-  binding, retained read-only File validation, and demand-paged private COW/HVF
-  mappings with dirty and cleanup proof. There is no public v2
-  create/load/describe dispatch, general device aggregate, or destination
-  resource/time/identity orchestration. Remaining work includes public
+  An unpublished focused boundary now captures a completed paused source,
+  composes that graph with the canonical 64-KiB-aligned memory binding, and
+  reconstructs a fresh complete never-run HVF topology from already-authorized
+  private-COW memory. It verifies CPU/cache/MPIDR/FDT/GIC compatibility,
+  restores global then canonical per-vCPU state, imports fresh offline/
+  runnable/timer-suspended lifecycle tokens, and publishes only Paused. Signed
+  three-vCPU proof resumes through timer PPI, secondary PSCI completion, and
+  initially offline continuation. There is no public v2 create/load/describe
+  dispatch, general device aggregate, production resource composition, or
+  time/PVTime/identity correction. Remaining work includes public
   transactional artifacts, optional-device state, Diff artifacts, overrides,
   Firecracker artifact compatibility, authentication, clone policy, and
   cross-host portability
@@ -3974,10 +3979,10 @@ Their eventual support level should follow the endpoint matrix:
   runtime device deletion, broader public guest-memory accounting,
   serialized/restorable optional-device snapshot state, and Firecracker's KVM
   slot mechanism
-- complete HVF vCPU state capture/restore beyond the current one-vCPU native-v1
-  aggregate, and generic snapshot-ready ownership for optional devices or
-  multi-vCPU artifacts beyond the topology-wide pause barrier, four-scheduler
-  transaction, and external-buffer exclusion
+- complete production snapshot ownership beyond the current one-vCPU
+  native-v1 aggregate and the focused unpublished native-v2 multi-vCPU
+  platform, including generic optional devices, the four-scheduler/public
+  transaction, time/identity correction, and external-buffer policy
 - runtime device attach/remove behavior beyond implemented in-place updates and
   stable unsupported paths
 

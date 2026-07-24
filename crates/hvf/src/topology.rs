@@ -10,8 +10,14 @@ use crate::cpu_template::{
     HvfArm64CpuTemplateApplicationState, HvfArm64CpuTemplateError, PreparedHvfArm64CpuTemplate,
 };
 use crate::dirty::HvfDirtyWriteTracker;
+use crate::gic::HvfGicDeviceState;
 use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
-use crate::runner::{HvfVcpuMpidrAffinityStage, HvfVcpuRunner, HvfVcpuRunnerError};
+use crate::runner::{
+    HvfArm64SnapshotV2VcpuRestore, HvfVcpuMpidrAffinityStage, HvfVcpuRunner, HvfVcpuRunnerError,
+};
+use crate::vcpu::{
+    HvfArm64VcpuIdentificationRegisterState, HvfArm64VcpuSveSmeIdentificationRegisterState,
+};
 
 const MAX_ORDERED_MPIDR: u64 = MAX_SUPPORTED_VCPUS as u64 - 1;
 
@@ -332,6 +338,17 @@ impl<'vm> HvfVcpuTopology<'vm> {
         )
     }
 
+    pub(crate) fn apply_retained_arm64_cpu_template_state(
+        &self,
+        state: &HvfArm64CpuTemplateApplicationState,
+    ) -> Result<(), HvfArm64CpuTemplateError> {
+        crate::cpu_template::apply_retained_arm64_cpu_template_state(
+            &self.runners,
+            &self.mpidrs,
+            state,
+        )
+    }
+
     /// Consume this ordered topology into a concurrent bounded-run coordinator.
     ///
     /// `online_indexes` is software power state only. Offline members retain
@@ -363,6 +380,58 @@ impl<'vm> HvfVcpuTopology<'vm> {
                 "stable import destination member index is invalid",
             ))?
             .ensure_stable_import_ready()
+    }
+
+    pub(crate) fn restore_arm64_snapshot_v2_global_gic(
+        &self,
+        state: &HvfGicDeviceState,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runners
+            .first()
+            .ok_or(HvfVcpuRunnerError::InvalidState(
+                "native-v2 destination topology has no primary owner",
+            ))?
+            .restore_gic_device_state(state)
+    }
+
+    pub(crate) fn capture_arm64_snapshot_v2_destination_compatibility(
+        &self,
+        index: usize,
+    ) -> Result<
+        (
+            HvfArm64VcpuIdentificationRegisterState,
+            Option<HvfArm64VcpuSveSmeIdentificationRegisterState>,
+        ),
+        HvfVcpuRunnerError,
+    > {
+        let runner = self
+            .runners
+            .get(index)
+            .ok_or(HvfVcpuRunnerError::InvalidState(
+                "native-v2 destination member index is invalid",
+            ))?;
+        let identification = runner.capture_arm64_identification_register_state()?;
+        let sve_present = ((identification.id_aa64pfr0_el1() >> 32) & 0xf) != 0xf;
+        let sme_present = ((identification.id_aa64pfr1_el1() >> 24) & 0xf) != 0xf;
+        let optional_identification = if sve_present || sme_present {
+            Some(runner.capture_arm64_sve_sme_identification_register_state()?)
+        } else {
+            None
+        };
+        Ok((identification, optional_identification))
+    }
+
+    pub(crate) fn restore_arm64_snapshot_v2_vcpu(
+        &self,
+        index: usize,
+        state: HvfArm64SnapshotV2VcpuRestore,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runners
+            .get(index)
+            .ok_or(HvfVcpuRunnerError::InvalidState(
+                "native-v2 destination member index is invalid",
+            ))?
+            .restore_arm64_snapshot_v2_vcpu_state(state)
     }
 
     #[cfg(test)]

@@ -11,9 +11,9 @@ use crate::paused_topology::{
 use crate::psci::{PsciCoordinatorRequest, PsciCoordinatorResponse};
 use crate::pvtime::{HvfArm64PvTimeAccountingConfig, HvfArm64PvTimeCaptureState};
 use crate::runner::{
-    HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken, HvfVcpuRetainedVtimerWaitOutcome,
-    HvfVcpuRunCompletion, HvfVcpuRunToken, HvfVcpuRunner, HvfVcpuRunnerError,
-    HvfVcpuStableCpuSuspendObservation, cancel_vcpu_run_batch_with,
+    HvfArm64SnapshotV2VcpuCapture, HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken,
+    HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunCompletion, HvfVcpuRunToken, HvfVcpuRunner,
+    HvfVcpuRunnerError, HvfVcpuStableCpuSuspendObservation, cancel_vcpu_run_batch_with,
 };
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError, shutdown_runner_topology};
 use crate::vcpu::{HvfArm64BootRegisters, HvfArm64SecondaryBootRegisters};
@@ -2187,6 +2187,32 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
             false,
             HvfVcpuRunner::ensure_no_stable_deferred_psci_call,
         )
+    }
+
+    pub(crate) fn capture_arm64_snapshot_v2_vcpu(
+        &self,
+        index: usize,
+        disposition: &HvfArm64StableVcpuDisposition,
+    ) -> Result<HvfArm64SnapshotV2VcpuCapture, HvfVcpuRunCoordinatorError> {
+        let expected_pending = match disposition {
+            HvfArm64StableVcpuDisposition::Suspended(expected) => {
+                let observation = self.capture_stable_cpu_suspend(index)?;
+                if observation.state() != expected {
+                    return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                        "stable CPU_SUSPEND changed before native-v2 capture",
+                    ));
+                }
+                Some(observation.token())
+            }
+            HvfArm64StableVcpuDisposition::Offline | HvfArm64StableVcpuDisposition::Runnable => {
+                self.ensure_no_stable_deferred_psci_call(index)?;
+                None
+            }
+        };
+        self.inner
+            .member_operation(index, "native-v2 vCPU capture", false, |runner| {
+                runner.capture_arm64_snapshot_v2_vcpu_state(expected_pending, index == 0)
+            })
     }
 
     pub(crate) fn restore_stable_cpu_suspend(

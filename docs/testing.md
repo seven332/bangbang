@@ -594,8 +594,13 @@ dependencies, SIMD aliases, and the 16 MiB composite budget. Locally valid
 machine-memory/FDT, timer, optional-identity, redistributor, and vCPU-count
 mismatches prove whole-graph validation. CPU-template unit tests separately
 prove the receipt appears only after topology-wide application and retains the
-logical/common/effective equation with redacted diagnostics. Run this surface
-with `cargo test -p bangbang-hvf --lib snapshot_v2 --all-features --locked`.
+logical/common/effective equation with redacted diagnostics. Reconstruction
+tests inject every preflight/VM/memory/GIC/topology/CPU/compatibility/global/
+per-vCPU/lifecycle/publication stage, assert the exact shared reverse cleanup
+sequence, and retain all cleanup failures. CPU replay tests require every
+destination baseline read before the first effective-target write and preserve
+read/apply failure positions. Run these surfaces with
+`cargo test -p bangbang-hvf --lib --all-features --locked`.
 
 The signed `hvf_lifecycle` lazy-memory case writes a 64-MiB image, drops the
 source allocation, loads the retained file mapping, and proves bounded resident
@@ -607,6 +612,22 @@ initial dirty epoch, the exact dirtied page, ordinary unmap/destroy, and
 post-VM-destroy owner cleanup. Run it only through
 `scripts/run-integration-tests.sh`; unsigned workspace tests must not execute
 real HVF.
+
+The same signed target contains the native-v2 platform completion gate. A
+three-vCPU bare guest reaches a paused runnable/suspended/offline graph, writes
+the canonical memory image, captures twice to prove non-consuming source
+ownership, structurally decodes before construction, loads already-authorized
+memory, destroys the source VM, and restores a fresh focused platform. Before
+resume it requires equivalent full recapture and unchanged guest progress.
+After resume it proves retained virtual-timer PPI publication and
+`CPU_SUSPEND64` completion, primary continuation, CPU_ON of the initially
+offline third owner, both secondary CPU_OFF transitions, a final valid
+recapture, and clean shutdown. Run the focused proof with:
+
+```sh
+scripts/run-integration-tests.sh --test hvf_lifecycle -- \
+  --exact native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progress
+```
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,

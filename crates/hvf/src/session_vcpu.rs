@@ -24,7 +24,10 @@ use crate::psci::{
     PsciCpuStableMemberObservation, PsciCpuSuspendResponse, PsciCpuSuspendToken,
 };
 use crate::pvtime::HvfArm64PvTimeCaptureState;
-use crate::runner::{HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunner, HvfVcpuRunnerError};
+use crate::runner::{
+    HvfArm64SnapshotV2VcpuCapture, HvfVcpuRetainedVtimerWaitOutcome, HvfVcpuRunner,
+    HvfVcpuRunnerError,
+};
 use crate::topology::HvfVcpuTopology;
 use crate::vcpu::HvfArm64SecondaryBootRegisters;
 
@@ -260,6 +263,48 @@ pub struct HvfArm64StablePausedTopologyImportError {
     cleanup: Vec<HvfArm64StablePausedTopologyCleanupFailure>,
 }
 
+/// Failure while capturing every native-v2 vCPU around one stable pause.
+#[derive(Debug)]
+pub enum HvfArm64SnapshotV2TopologyCaptureError {
+    Lifecycle {
+        stage: &'static str,
+        source: Box<HvfArm64StablePausedTopologyCaptureError>,
+    },
+    Member {
+        index: usize,
+        source: Box<HvfVcpuRunCoordinatorError>,
+    },
+    Allocation,
+    LifecycleChanged,
+}
+
+impl fmt::Display for HvfArm64SnapshotV2TopologyCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lifecycle { stage, source } => {
+                write!(f, "native-v2 topology {stage} failed: {source}")
+            }
+            Self::Member { index, source } => {
+                write!(f, "native-v2 vCPU {index} capture failed: {source}")
+            }
+            Self::Allocation => f.write_str("native-v2 topology capture allocation failed"),
+            Self::LifecycleChanged => {
+                f.write_str("native-v2 lifecycle changed during topology capture")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64SnapshotV2TopologyCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Lifecycle { source, .. } => Some(source.as_ref()),
+            Self::Member { source, .. } => Some(source.as_ref()),
+            Self::Allocation | Self::LifecycleChanged => None,
+        }
+    }
+}
+
 impl HvfArm64StablePausedTopologyImportError {
     fn new(stage: &'static str, index: Option<usize>) -> Self {
         Self {
@@ -451,6 +496,47 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         self.coordinator.pause_idle_for_arm64_pvtime_capture()
     }
 
+    pub(crate) fn pause_for_arm64_snapshot_v2_capture(
+        &mut self,
+    ) -> Result<(), HvfArm64BootVcpuError> {
+        if !self.pending_steps.is_empty() {
+            return Err(self.power_error("native-v2 pause pending-step validation", 0));
+        }
+        let waiter = self
+            .control()
+            .request_pause()
+            .map_err(|source| self.coordinator_error("native-v2 pause request", 0, source))?;
+        let mut invalid_index = None;
+        loop {
+            let event = self.coordinator.receive_event().map_err(|source| {
+                self.coordinator_error("native-v2 pause collection", 0, source)
+            })?;
+            let completed = matches!(event, HvfVcpuRunEvent::Barrier(_));
+            self.enqueue_event(event, &mut |_| false)?;
+            while let Some(step) = self.pending_steps.pop_front() {
+                match step? {
+                    IndexedBootStep {
+                        outcome: HvfVcpuRunStepOutcome::Canceled,
+                        ..
+                    } => {}
+                    IndexedBootStep { index, .. } => {
+                        invalid_index.get_or_insert(index);
+                    }
+                }
+            }
+            if completed {
+                break;
+            }
+        }
+        waiter
+            .wait()
+            .map_err(|source| self.coordinator_error("native-v2 pause completion", 0, source))?;
+        if let Some(index) = invalid_index {
+            return Err(self.power_error("native-v2 pause observed guest progress", index));
+        }
+        Ok(())
+    }
+
     /// Export one fully quiesced paused lifecycle graph.
     pub fn capture_stable_paused_topology(
         &mut self,
@@ -542,6 +628,48 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
                 )
             },
         )
+    }
+
+    pub(crate) fn capture_arm64_snapshot_v2_topology(
+        &mut self,
+    ) -> Result<
+        (
+            HvfArm64StablePausedTopologyState,
+            Vec<HvfArm64SnapshotV2VcpuCapture>,
+        ),
+        HvfArm64SnapshotV2TopologyCaptureError,
+    > {
+        let stable = self.capture_stable_paused_topology().map_err(|source| {
+            HvfArm64SnapshotV2TopologyCaptureError::Lifecycle {
+                stage: "initial lifecycle capture",
+                source: Box::new(source),
+            }
+        })?;
+        let mut captures = Vec::new();
+        captures
+            .try_reserve_exact(stable.members().len())
+            .map_err(|_| HvfArm64SnapshotV2TopologyCaptureError::Allocation)?;
+        for member in stable.members() {
+            let index = member.index();
+            let capture = self
+                .coordinator
+                .capture_arm64_snapshot_v2_vcpu(index, member.disposition())
+                .map_err(|source| HvfArm64SnapshotV2TopologyCaptureError::Member {
+                    index,
+                    source: Box::new(source),
+                })?;
+            captures.push(capture);
+        }
+        let after = self.capture_stable_paused_topology().map_err(|source| {
+            HvfArm64SnapshotV2TopologyCaptureError::Lifecycle {
+                stage: "final lifecycle capture",
+                source: Box::new(source),
+            }
+        })?;
+        if after != stable {
+            return Err(HvfArm64SnapshotV2TopologyCaptureError::LifecycleChanged);
+        }
+        Ok((stable, captures))
     }
 
     /// Consume never-run destination owners into one coordinator born paused.

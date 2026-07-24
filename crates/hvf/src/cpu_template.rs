@@ -1082,6 +1082,92 @@ pub(crate) fn apply_arm64_cpu_template_with_state(
     apply_custom_cpu_template_with_state(runners, mpidrs, template)
 }
 
+pub(crate) fn apply_retained_arm64_cpu_template_state(
+    runners: &[HvfVcpuRunner<'_>],
+    mpidrs: &[u64],
+    state: &HvfArm64CpuTemplateApplicationState,
+) -> Result<(), HvfArm64CpuTemplateError> {
+    apply_retained_arm64_cpu_template_state_with(runners, mpidrs, state)
+}
+
+fn apply_retained_arm64_cpu_template_state_with<M: CpuTemplateMember>(
+    members: &[M],
+    mpidrs: &[u64],
+    state: &HvfArm64CpuTemplateApplicationState,
+) -> Result<(), HvfArm64CpuTemplateError> {
+    if members.is_empty() || members.len() != mpidrs.len() {
+        return Err(HvfArm64CpuTemplateError::InvalidTopology {
+            member_count: members.len(),
+            mpidr_count: mpidrs.len(),
+        });
+    }
+    let registers = state
+        .entries
+        .iter()
+        .map(|entry| entry.register)
+        .collect::<Vec<_>>();
+    for (member_index, (member, &mpidr)) in members.iter().zip(mpidrs).enumerate() {
+        let baseline = member
+            .read_cpu_template_baseline(&registers)
+            .map_err(|source| HvfArm64CpuTemplateError::BaselineRead {
+                member_index,
+                mpidr,
+                completed_members: member_index,
+                source: Box::new(source),
+            })?;
+        if baseline.len() != state.entries.len() {
+            return Err(HvfArm64CpuTemplateError::BaselineLength {
+                member_index,
+                mpidr,
+                completed_members: member_index + 1,
+                expected: state.entries.len(),
+                actual: baseline.len(),
+            });
+        }
+        if let Some(completed_modifiers) = baseline
+            .iter()
+            .zip(&state.entries)
+            .position(|(actual, expected)| *actual != expected.common_baseline)
+        {
+            return Err(HvfArm64CpuTemplateError::BaselineMismatch {
+                member_index,
+                mpidr,
+                completed_members: member_index + 1,
+                completed_modifiers,
+            });
+        }
+    }
+
+    let targets = state
+        .entries
+        .iter()
+        .map(|entry| match (entry.register, entry.effective_value) {
+            (HvfArm64CpuTemplateRegister::U32(register), HvfArm64CpuTemplateValue::U32(value)) => {
+                Ok(HvfArm64CpuTemplateTarget::U32 { register, value })
+            }
+            (HvfArm64CpuTemplateRegister::U64(register), HvfArm64CpuTemplateValue::U64(value)) => {
+                Ok(HvfArm64CpuTemplateTarget::U64 { register, value })
+            }
+            (
+                HvfArm64CpuTemplateRegister::U128(register),
+                HvfArm64CpuTemplateValue::U128(value),
+            ) => Ok(HvfArm64CpuTemplateTarget::U128 { register, value }),
+            _ => Err(HvfArm64CpuTemplateError::InvalidRuntimeRegister),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (member_index, (member, &mpidr)) in members.iter().zip(mpidrs).enumerate() {
+        member
+            .apply_cpu_template_targets(&targets)
+            .map_err(|source| HvfArm64CpuTemplateError::Apply {
+                member_index,
+                mpidr,
+                completed_members: member_index,
+                source: Box::new(source),
+            })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn apply_custom_cpu_template_with<M: CpuTemplateMember>(
     members: &[M],
@@ -2672,6 +2758,238 @@ mod tests {
         let debug = format!("{application:?}");
         assert!(debug.contains(CPU_TEMPLATE_VALUE_REDACTED));
         assert!(!debug.contains("123456789abcdef0"));
+    }
+
+    #[test]
+    fn retained_application_replays_recorded_effective_targets_after_full_preflight() {
+        let template = canonical_template();
+        let baseline = [
+            0x1234_5678_9abc_def0,
+            0xfedc_ba98_7654_3210,
+            0x0123_4567_89ab_cdef,
+            0x0f0f_f0f0_55aa_aa55,
+        ];
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let source_members = [0, 1].map(|index| FakeMember {
+            index,
+            baseline: baseline
+                .into_iter()
+                .map(HvfArm64CpuTemplateValue::U64)
+                .collect(),
+            fail_read: false,
+            fail_apply: false,
+            events: Rc::clone(&events),
+        });
+        let application = apply_custom_cpu_template_with_state(&source_members, &[0, 1], &template)
+            .expect("source template should apply");
+        events.borrow_mut().clear();
+
+        let destination_members = [0, 1].map(|index| FakeMember {
+            index,
+            baseline: baseline
+                .into_iter()
+                .map(HvfArm64CpuTemplateValue::U64)
+                .collect(),
+            fail_read: false,
+            fail_apply: false,
+            events: Rc::clone(&events),
+        });
+        apply_retained_arm64_cpu_template_state_with(&destination_members, &[0, 1], &application)
+            .expect("matching retained application should replay");
+
+        let registers = application
+            .entries()
+            .iter()
+            .map(|entry| entry.register)
+            .collect::<Vec<_>>();
+        let targets = application
+            .entries()
+            .iter()
+            .map(|entry| match (entry.register, entry.effective_value) {
+                (
+                    HvfArm64CpuTemplateRegister::U32(register),
+                    HvfArm64CpuTemplateValue::U32(value),
+                ) => HvfArm64CpuTemplateTarget::U32 { register, value },
+                (
+                    HvfArm64CpuTemplateRegister::U64(register),
+                    HvfArm64CpuTemplateValue::U64(value),
+                ) => HvfArm64CpuTemplateTarget::U64 { register, value },
+                (
+                    HvfArm64CpuTemplateRegister::U128(register),
+                    HvfArm64CpuTemplateValue::U128(value),
+                ) => HvfArm64CpuTemplateTarget::U128 { register, value },
+                _ => panic!("validated retained entry should preserve its width"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                Event::Read {
+                    member: 0,
+                    registers: registers.clone(),
+                },
+                Event::Read {
+                    member: 1,
+                    registers,
+                },
+                Event::Apply {
+                    member: 0,
+                    targets: targets.clone(),
+                },
+                Event::Apply { member: 1, targets },
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_application_rejects_baseline_drift_before_every_write() {
+        let template = canonical_template();
+        let baseline = [
+            0x1234_5678_9abc_def0,
+            0xfedc_ba98_7654_3210,
+            0x0123_4567_89ab_cdef,
+            0x0f0f_f0f0_55aa_aa55,
+        ];
+        let source_events = Rc::new(RefCell::new(Vec::new()));
+        let source = [FakeMember {
+            index: 0,
+            baseline: baseline
+                .into_iter()
+                .map(HvfArm64CpuTemplateValue::U64)
+                .collect(),
+            fail_read: false,
+            fail_apply: false,
+            events: source_events,
+        }];
+        let application = apply_custom_cpu_template_with_state(&source, &[0], &template)
+            .expect("source template should apply");
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut drifted = baseline;
+        drifted[2] ^= 1;
+        let destination = [0, 1].map(|index| FakeMember {
+            index,
+            baseline: if index == 0 { baseline } else { drifted }
+                .into_iter()
+                .map(HvfArm64CpuTemplateValue::U64)
+                .collect(),
+            fail_read: false,
+            fail_apply: false,
+            events: Rc::clone(&events),
+        });
+        let error =
+            apply_retained_arm64_cpu_template_state_with(&destination, &[0, 1], &application)
+                .expect_err("destination drift should reject retained replay");
+        assert!(matches!(
+            error,
+            HvfArm64CpuTemplateError::BaselineMismatch {
+                member_index: 1,
+                completed_members: 2,
+                completed_modifiers: 2,
+                ..
+            }
+        ));
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .all(|event| matches!(event, Event::Read { .. }))
+        );
+    }
+
+    #[test]
+    fn retained_application_preserves_read_and_apply_failure_positions() {
+        let template = canonical_template();
+        let baseline = [
+            0x1234_5678_9abc_def0,
+            0xfedc_ba98_7654_3210,
+            0x0123_4567_89ab_cdef,
+            0x0f0f_f0f0_55aa_aa55,
+        ];
+        let source_events = Rc::new(RefCell::new(Vec::new()));
+        let source = [FakeMember {
+            index: 0,
+            baseline: baseline
+                .into_iter()
+                .map(HvfArm64CpuTemplateValue::U64)
+                .collect(),
+            fail_read: false,
+            fail_apply: false,
+            events: source_events,
+        }];
+        let application = apply_custom_cpu_template_with_state(&source, &[0], &template)
+            .expect("source template should apply");
+
+        let read_events = Rc::new(RefCell::new(Vec::new()));
+        let read_failure = [0, 1].map(|index| FakeMember {
+            index,
+            baseline: baseline
+                .into_iter()
+                .map(HvfArm64CpuTemplateValue::U64)
+                .collect(),
+            fail_read: index == 1,
+            fail_apply: false,
+            events: Rc::clone(&read_events),
+        });
+        let error = apply_retained_arm64_cpu_template_state_with(
+            &read_failure,
+            &[0x10, 0x11],
+            &application,
+        )
+        .expect_err("injected destination read should fail");
+        assert!(matches!(
+            error,
+            HvfArm64CpuTemplateError::BaselineRead {
+                member_index: 1,
+                mpidr: 0x11,
+                completed_members: 1,
+                ..
+            }
+        ));
+        assert_eq!(read_events.borrow().len(), 2);
+
+        let apply_events = Rc::new(RefCell::new(Vec::new()));
+        let apply_failure = [0, 1].map(|index| FakeMember {
+            index,
+            baseline: baseline
+                .into_iter()
+                .map(HvfArm64CpuTemplateValue::U64)
+                .collect(),
+            fail_read: false,
+            fail_apply: index == 1,
+            events: Rc::clone(&apply_events),
+        });
+        let error = apply_retained_arm64_cpu_template_state_with(
+            &apply_failure,
+            &[0x10, 0x11],
+            &application,
+        )
+        .expect_err("injected destination apply should fail");
+        assert!(matches!(
+            error,
+            HvfArm64CpuTemplateError::Apply {
+                member_index: 1,
+                mpidr: 0x11,
+                completed_members: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            apply_events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, Event::Read { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            apply_events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, Event::Apply { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]

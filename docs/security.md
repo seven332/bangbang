@@ -1232,7 +1232,7 @@ is resource-specific:
   it. Future payload schemas must therefore stay memory-safe and fail closed
   even for checksum-valid attacker-controlled bytes.
 - Native-v2 state is currently a library-only data format with no public
-  lifecycle or destination-resource construction. Its
+  lifecycle. Its
   first pass treats all bytes as hostile, caps the complete file at 16 MiB,
   caps feature and component counts before table traversal, uses checked
   conversions and arithmetic, requires canonical packed ranges and exact EOF,
@@ -1250,8 +1250,17 @@ is resource-specific:
   and `Debug` omit identifiers, paths, arguments, CPU/register values,
   checksums used as identities, GIC bytes, format magic, guest contents, and raw
   state. The Firecracker prefix classifier proves only an incompatible family
-  and never deserializes or translates upstream bitcode. No public create,
-  describe, load, or VM action consumes v2 in this slice.
+  and never deserializes or translates upstream bitcode. The unpublished
+  #1569 reconstruction boundary accepts only this owned cross-validated graph
+  plus an already-authorized `GuestMemory`; it never opens an inert kernel,
+  initrd, or memory path. Exact memory ranges, mapped FDT checksum, and
+  destination cache identity are checked before VM creation. The guard owns VM,
+  memory, GIC, all never-run vCPU owners, CPU replay, global GIC, per-vCPU
+  state, and fresh lifecycle import until it can publish one paused focused
+  owner. Partial failure attempts reverse topology/backend cleanup and retains
+  value-free primary and cleanup evidence. No control or runnable owner escapes
+  earlier. Devices, host endpoints, time/PVTime/identity correction, public
+  create/describe/load, and VM actions remain outside this boundary.
 - Native-v2 lazy memory validates the state binding before opening or adopting
   a source, then requires a read-only close-on-exec regular descriptor, exact
   canonical length, stable descriptor identity/facts, an exact repeated header,
