@@ -14288,6 +14288,7 @@ fn run_boot_session_loop_with_observer_inner(
             | HvfVcpuRunStepOutcome::CpuOff { .. }
             | HvfVcpuRunStepOutcome::CpuSuspend { .. }
             | HvfVcpuRunStepOutcome::Sys64 { .. }
+            | HvfVcpuRunStepOutcome::LazyPage { .. }
             | HvfVcpuRunStepOutcome::DirtyWrite { .. } => {
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });

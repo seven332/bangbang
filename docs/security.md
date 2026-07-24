@@ -2124,12 +2124,12 @@ and internal anonymous-memory ownership slices, not a shipped pager.
 Native-v1 `Uffd` still rejects before path, socket, artifact, or backend
 access.
 
-The accepted complete boundary uses two in-worker protection planes: public Mach
-task exceptions mediate host accesses to owned absent guest pages, and HVF
-stage-two permissions mediate guest accesses. The first plane is now
-implemented in `bangbang-hvf`; the guest plane remains a separate delivery
-gate. Task and thread ports stay inside the worker because an exception
-receiver has whole-task authority, not UFFD's registered-range authority.
+The accepted complete boundary uses two in-worker protection planes: public
+Mach task exceptions mediate host accesses to owned absent guest pages, and HVF
+stage-two permissions mediate guest accesses. Both internal planes are now
+implemented in `bangbang-hvf`. Task and thread ports stay inside the worker
+because an exception receiver has whole-task authority, not UFFD's
+registered-range authority.
 
 The external content owner receives neither task ports nor host virtual
 addresses. The implemented
@@ -2169,6 +2169,36 @@ zero bytes are written through the alias while the original remains hidden; a
 sequentially consistent fence precedes least host permission and exact
 coordinator commit. A read-populated page stays read-only until a real write
 fault upgrades it.
+
+The guest bridge maps the retained private-anonymous regions into HVF at their
+declared maximum permissions and removes all stage-two access before
+publication. Only signed-observed ARM64 data- and instruction-abort forms can
+reach the resolver. The classifier validates the access width/direction,
+faulting IPA, instruction VA/PC relationship, and owned range; HVC and trapped
+system registers retain precedence, and unowned or malformed exceptions fall
+through to the existing dirty/MMIO policy. A fault that spans pages resolves
+every page before publishing any guest permission.
+
+Guest permission publication is serialized per mapping. Read, write, and
+execute faults add only `READ`, `READ|WRITE`, or `EXECUTE` respectively, and
+concurrent vCPUs take the union instead of overwriting a peer's upgrade.
+Instruction pages receive the platform cache synchronization before execute
+permission. The runner reports the handled page and retries the same
+instruction without advancing PC. One stale peer exit may be admitted after a
+concurrent publication; a repeated no-progress exit is terminal instead of a
+busy loop. Source, coordinator, stage-two protection, or synchronization
+failure poisons the guest handler and the shared resolver. No absent or
+partially initialized page is published; if a later page in one cross-page
+permission transaction fails, an earlier fully initialized page may remain
+accessible until VM teardown.
+
+Lazy guest mappings cannot coexist with the current dirty-write protection
+overlay, and the backend refuses raw vCPU ownership that could bypass runner
+dispatch. Mapping setup is transactional: an initial protection failure unmaps
+everything it can and retains any failed owner for explicit cleanup. Shutdown
+cancellation does not start new page work after a canceled HVF exit; work
+already synchronously admitted before cancellation follows the ordinary
+bounded resolver contract.
 
 Every unowned address and unsupported exception form forwards to the captured
 legacy or Mach default/state/state-identity behavior, including returned thread

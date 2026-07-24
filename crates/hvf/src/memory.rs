@@ -74,7 +74,13 @@ impl HvfMemoryPermissions {
         }
     }
 
-    const fn is_empty(self) -> bool {
+    pub(crate) const fn union(self, permissions: Self) -> Self {
+        Self {
+            bits: self.bits | permissions.bits,
+        }
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
         self.bits == 0
     }
 }
@@ -154,6 +160,11 @@ pub enum HvfGuestMemoryMappingError {
         source: TryReserveError,
     },
     MapFailed {
+        range: GuestMemoryRange,
+        source: BackendError,
+        cleanup_failures: Vec<HvfGuestMemoryUnmapFailure>,
+    },
+    ProtectFailed {
         range: GuestMemoryRange,
         source: BackendError,
         cleanup_failures: Vec<HvfGuestMemoryUnmapFailure>,
@@ -335,6 +346,21 @@ impl fmt::Display for HvfGuestMemoryMappingError {
                     )
                 }
             }
+            Self::ProtectFailed {
+                range,
+                source,
+                cleanup_failures,
+            } => {
+                if cleanup_failures.is_empty() {
+                    write!(f, "failed to protect guest memory range {range}: {source}")
+                } else {
+                    write!(
+                        f,
+                        "failed to protect guest memory range {range}: {source}; also failed to unmap {} mapped region(s)",
+                        cleanup_failures.len()
+                    )
+                }
+            }
             Self::UnmapFailed { failures } => {
                 write!(
                     f,
@@ -360,6 +386,7 @@ impl std::error::Error for HvfGuestMemoryMappingError {
         match self {
             Self::Backend(source)
             | Self::MapFailed { source, .. }
+            | Self::ProtectFailed { source, .. }
             | Self::DynamicRegionMapFailed { source, .. } => Some(source),
             Self::DynamicRegionAllocationFailed { source, .. } => Some(source),
             Self::DynamicRegionRemovalFailed { source, .. } => Some(source),
@@ -676,6 +703,31 @@ impl HvfGuestMemoryMapping {
         };
 
         match mapping.map_all(permissions) {
+            Ok(()) => Ok(mapping),
+            Err(error) => Err(Box::new(FailedGuestMemoryMapping { mapping, error })),
+        }
+    }
+
+    pub(crate) fn map_lazy_with_mapper(
+        regions: &[GuestMemoryRegion],
+        permissions: HvfMemoryPermissions,
+        mapper: Arc<dyn HvfMemoryMapper>,
+    ) -> Result<Self, Box<FailedGuestMemoryMapping>> {
+        let mut mapping = Self {
+            memory: None,
+            state: HvfGuestMemoryMappingState {
+                host_memory: Vec::new(),
+                host_memory_should_flush: false,
+                host_memory_flushed: false,
+                mapped_regions: Vec::new(),
+                dynamic_regions: Vec::new(),
+                mapper,
+                dirty_write_tracker: None,
+                protection_poisoned: false,
+            },
+        };
+
+        match mapping.map_lazy_all(regions, permissions) {
             Ok(()) => Ok(mapping),
             Err(error) => Err(Box::new(FailedGuestMemoryMapping { mapping, error })),
         }
@@ -1001,6 +1053,15 @@ impl HvfGuestMemoryMapping {
                 "guest memory owner is missing",
             ))?;
         self.state.map_all(memory, permissions)
+    }
+
+    fn map_lazy_all(
+        &mut self,
+        regions: &[GuestMemoryRegion],
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.state.map_regions(regions, permissions)?;
+        self.state.protect_all_none()
     }
 }
 
@@ -1506,6 +1567,45 @@ impl HvfGuestMemoryMappingState {
         }
 
         self.host_memory_should_flush = true;
+        Ok(())
+    }
+
+    fn map_regions(
+        &mut self,
+        regions: &[GuestMemoryRegion],
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let page_size = host_page_size()?;
+        let requests = validated_region_map_requests(regions, permissions, page_size)?;
+        self.mapped_regions
+            .try_reserve_exact(requests.len())
+            .map_err(
+                |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
+            )?;
+
+        for request in requests {
+            self.map_validated_request(request, permissions)?;
+        }
+        Ok(())
+    }
+
+    fn protect_all_none(&mut self) -> Result<(), HvfGuestMemoryMappingError> {
+        let no_permissions = HvfMemoryPermissions::new(false, false, false);
+        for index in 0..self.mapped_regions.len() {
+            let mapped = self.mapped_regions.get(index).copied().ok_or(
+                HvfGuestMemoryMappingError::InvalidState(
+                    "mapped guest memory region disappeared during protection",
+                ),
+            )?;
+            if let Err(source) = self.mapper.protect_region(mapped.range, no_permissions) {
+                let cleanup_failures = self.unmap_mapped_regions();
+                return Err(HvfGuestMemoryMappingError::ProtectFailed {
+                    range: mapped.range,
+                    source,
+                    cleanup_failures,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -2061,20 +2161,28 @@ fn validated_map_requests(
     permissions: HvfMemoryPermissions,
     page_size: u64,
 ) -> Result<Vec<HvfMemoryMapRequest>, HvfGuestMemoryMappingError> {
+    validated_region_map_requests(memory.regions(), permissions, page_size)
+}
+
+fn validated_region_map_requests(
+    regions: &[GuestMemoryRegion],
+    permissions: HvfMemoryPermissions,
+    page_size: u64,
+) -> Result<Vec<HvfMemoryMapRequest>, HvfGuestMemoryMappingError> {
     if permissions.is_empty() {
         return Err(HvfGuestMemoryMappingError::EmptyPermissions);
     }
 
-    if memory.regions().is_empty() {
+    if regions.is_empty() {
         return Err(HvfGuestMemoryMappingError::EmptyGuestMemory);
     }
 
     let mut requests = Vec::new();
     requests
-        .try_reserve_exact(memory.regions().len())
+        .try_reserve_exact(regions.len())
         .map_err(|source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source })?;
 
-    for region in memory.regions() {
+    for region in regions {
         requests.push(validated_region_map_request(region, page_size)?);
     }
 
@@ -4729,6 +4837,97 @@ mod tests {
         fail_map_on: Option<usize>,
         fail_unmap: bool,
         fail_protect_on: Vec<usize>,
+    }
+
+    #[test]
+    fn lazy_mapping_zero_protects_every_region_before_publication() {
+        let page_size = page_size();
+        let ranges = vec![range(0, page_size), range(page_size * 2, page_size * 2)];
+        let memory = memory_for_ranges(ranges.clone());
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_lazy_with_mapper(
+            memory.regions(),
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("lazy regions should map and zero-protect");
+
+        assert_eq!(mapper.map_count(), 2);
+        assert!(
+            mapper
+                .maps()
+                .iter()
+                .all(|(_, permissions)| *permissions == HvfMemoryPermissions::GUEST_RAM)
+        );
+        assert_eq!(
+            mapper.protects(),
+            ranges
+                .iter()
+                .copied()
+                .map(|range| (range, HvfMemoryPermissions::new(false, false, false)))
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            mapping.memory(),
+            Err(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory owner is missing"
+            ))
+        ));
+
+        mapping
+            .unmap_all()
+            .expect("lazy mapping should unmap cleanly");
+        assert_eq!(mapper.unmap_count(), 2);
+    }
+
+    #[test]
+    fn lazy_protection_failure_cleans_or_retains_every_mapping() {
+        let page_size = page_size();
+        let ranges = vec![range(0, page_size), range(page_size * 2, page_size)];
+        let memory = memory_for_ranges(ranges);
+        let mapper = Arc::new(RecordingMapper::default());
+        mapper.set_fail_protect_on(vec![2]);
+        let failed = HvfGuestMemoryMapping::map_lazy_with_mapper(
+            memory.regions(),
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect_err("second zero-protection should fail");
+
+        assert!(matches!(
+            failed.error,
+            HvfGuestMemoryMappingError::ProtectFailed {
+                cleanup_failures,
+                ..
+            } if cleanup_failures.is_empty()
+        ));
+        assert!(!failed.mapping.has_mapped_regions());
+        assert_eq!(mapper.unmap_count(), 2);
+
+        let mapper = Arc::new(RecordingMapper::default());
+        mapper.set_fail_protect_on(vec![2]);
+        mapper.set_fail_unmap(true);
+        let mut failed = HvfGuestMemoryMapping::map_lazy_with_mapper(
+            memory.regions(),
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect_err("failed cleanup should retain lazy mappings");
+        assert!(matches!(
+            failed.error,
+            HvfGuestMemoryMappingError::ProtectFailed {
+                cleanup_failures,
+                ..
+            } if cleanup_failures.len() == 2
+        ));
+        assert!(failed.mapping.has_mapped_regions());
+
+        mapper.set_fail_unmap(false);
+        failed
+            .mapping
+            .unmap_all()
+            .expect("retained lazy mapping cleanup should retry");
+        assert!(!failed.mapping.has_mapped_regions());
     }
 
     fn assert_send_sync<T: Send + Sync>() {}

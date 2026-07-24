@@ -89,6 +89,9 @@ fn snapshot_paging_feasibility_policy_is_stable() {
             && capability
                 .summary
                 .contains("Native-v1 Uffd remains rejected")
+            && capability
+                .summary
+                .contains("HVF guest read/write/execute fault bridge")
             && capability.summary.contains("not Linux UFFD"),
         "snapshot paging summary must retain owner, runtime, and compatibility limits"
     );
@@ -135,6 +138,11 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "task_swap_exception_ports",
         "fixed status 70",
         "lazy_host_fault_integration::",
+        "Implemented HVF guest fault bridge",
+        "crates/hvf/src/lazy_guest_fault.rs",
+        "HvfBackend::map_lazy_guest_memory",
+        "hvf_lazy_guest_",
+        "lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page",
         "BBPAGER\\0",
         "cargo test -p bangbang-pager",
         "classify_v1_load_request",
@@ -264,6 +272,25 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         );
     }
 
+    let guest_bridge =
+        std::fs::read_to_string(repository_root.join("crates/hvf/src/lazy_guest_fault.rs"))
+            .expect("checked guest-fault bridge source must be readable");
+    for required in [
+        "pub(crate) struct HvfLazyGuestFaultHandler",
+        "pub enum HvfLazyGuestResolutionFailure",
+        "pub struct HvfHandledLazyGuestFault",
+        "resolves_every_cross_page_byte_before_publishing_any_permission",
+        "publishes_read_write_and_execute_as_serialized_permission_unions",
+        "peer_stale_exit_is_admitted_once_then_reports_no_progress",
+        "resolver_and_protection_failures_poison_without_later_publication",
+        "debug_and_resolution_errors_do_not_expose_guest_addresses",
+    ] {
+        assert!(
+            guest_bridge.contains(required),
+            "guest-fault bridge must retain {required}"
+        );
+    }
+
     let signed_lifecycle =
         std::fs::read_to_string(repository_root.join("crates/hvf/tests/hvf_lifecycle.rs"))
             .expect("signed HVF lifecycle source must be readable");
@@ -271,6 +298,11 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "task_local_lazy_fault_bridge_populates_real_host_accesses_and_repeats",
         "task_local_lazy_fault_bridge_forwards_and_preserves_a_later_owner",
         "task_local_lazy_fault_bridge_uses_fixed_terminal_exit_on_owned_failure",
+        "hvf_lazy_guest_faults_populate_execute_read_and_write_before_retry",
+        "hvf_lazy_guest_two_vcpus_coalesce_one_signed_page_request",
+        "hvf_lazy_guest_unowned_instruction_fault_keeps_existing_error_path",
+        "hvf_lazy_guest_source_failure_keeps_stage_two_closed_and_cleans_up",
+        "hvf_lazy_guest_run_cancellation_does_not_repeat_page_work",
         "bangbang_mach_test_handler_reinstall",
     ] {
         assert!(
@@ -278,6 +310,14 @@ fn snapshot_paging_feasibility_policy_is_stable() {
             "signed host-fault evidence must retain {required}"
         );
     }
+
+    let signed_guest_boot =
+        std::fs::read_to_string(repository_root.join("crates/hvf/tests/guest_boot.rs"))
+            .expect("signed guest-boot source must be readable");
+    assert!(
+        signed_guest_boot.contains("boots_guest_entry_from_a_lazy_instruction_page"),
+        "signed guest-boot evidence must retain lazy instruction entry"
+    );
 
     let protocol = std::fs::read_to_string(repository_root.join("docs/snapshot-pager-protocol.md"))
         .expect("checked pager protocol document must be readable");

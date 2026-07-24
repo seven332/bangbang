@@ -387,6 +387,18 @@ do not claim public Mach provides compare-and-swap restoration or that a task
 handler precedes thread-specific handlers. Owned callback failure must retain
 the fixed supervised exit, while unrelated faults must never be swallowed.
 
+Review the HVF guest adapter as the second protection owner. Lazy mappings must
+start with no stage-two access and become active only after complete
+transactional protection. Admit only evidenced data/instruction abort forms,
+validate IPA plus instruction VA/PC state, and keep HVC/SYS64 precedence.
+Resolve every touched page before any permission; serialize per-page
+read/write/execute unions so concurrent vCPUs cannot downgrade one another;
+synchronize instruction bytes before execute permission; retry without
+advancing PC. One peer-stale exit may count as progress, but repeated
+no-progress, resolver, cache, or protection failure must poison the path.
+Dirty-write tracking and raw vCPU dispatch must remain mutually exclusive with
+lazy guest paging until a reviewed composition exists.
+
 Keep Mach task/thread ports, aliases, and host virtual addresses inside the
 VMM, reject unmodified Linux UFFD wire traffic, and require pre-resource
 rejection for bypass profiles. Native-v1 `Uffd` must remain rejected until the

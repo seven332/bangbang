@@ -11,6 +11,171 @@
 static GUEST_BOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod lazy_guest_boot_integration {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use bangbang_hvf::{
+        HvfArm64BootRegisters, HvfBackend, HvfLazyGuestAccess, HvfLazyHostFaultBridge,
+        HvfLazyPageContents, HvfLazyPageRequest, HvfLazyPageSource, HvfLazyPageSourceError,
+        HvfMemoryPermissions, HvfVcpuRunStepOutcome,
+    };
+    use bangbang_pager::{
+        MAX_FRAME_BYTES, PageAccess, PagerLimits, PagerOperations, PagerRegionId,
+    };
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::lazy_memory::{
+        LazyGuestMemory, LazyGuestMemoryLimits, LazyGuestMemoryRegion, LazyPageState,
+    };
+    use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
+    use bangbang_runtime::mmio::MmioDispatcher;
+
+    use super::GUEST_BOOT_TEST_LOCK;
+
+    const GUEST_BASE: u64 = 0x10_0000;
+    const SOURCE_BASE: u64 = 0x20_0000;
+
+    fn host_page_size() -> u64 {
+        // SAFETY: sysconf has no pointer arguments and `_SC_PAGESIZE` is a
+        // supported immutable process query.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page_size > 0, "host page size should be available");
+        u64::try_from(page_size).expect("host page size should fit u64")
+    }
+
+    struct BootPageSource {
+        page: Vec<u8>,
+        requests: Mutex<Vec<HvfLazyPageRequest>>,
+        request_count: AtomicUsize,
+    }
+
+    impl HvfLazyPageSource for BootPageSource {
+        fn page(
+            &self,
+            request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+            self.requests
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            Ok(HvfLazyPageContents::data(self.page.clone()))
+        }
+    }
+
+    fn memory(page_size: u32) -> Arc<LazyGuestMemory> {
+        let pager = PagerLimits::new(
+            page_size,
+            1,
+            2,
+            u32::try_from(MAX_FRAME_BYTES).expect("maximum frame size should fit u32"),
+            PagerOperations::v1(),
+        )
+        .expect("guest boot pager limits should validate");
+        let limits = LazyGuestMemoryLimits::new(pager, 1, 4)
+            .expect("guest boot lazy-memory limits should validate");
+        let range = GuestMemoryRange::new(GuestAddress::new(GUEST_BASE), u64::from(page_size))
+            .expect("guest boot lazy range should validate");
+        let region = LazyGuestMemoryRegion::new(
+            PagerRegionId::new(1).expect("guest boot pager region should validate"),
+            range,
+            SOURCE_BASE,
+            page_size,
+        )
+        .expect("guest boot lazy region should validate");
+        Arc::new(
+            LazyGuestMemory::new(limits, vec![region])
+                .expect("guest boot lazy memory should construct"),
+        )
+    }
+
+    #[test]
+    fn boots_guest_entry_from_a_lazy_instruction_page() {
+        let _test_lock = GUEST_BOOT_TEST_LOCK
+            .lock()
+            .expect("guest boot test lock should not be poisoned");
+        let page_size = u32::try_from(host_page_size()).expect("host page size should fit u32");
+        let memory = memory(page_size);
+        let mut page = vec![0_u8; usize::try_from(page_size).expect("page size should fit usize")];
+        for (index, instruction) in [0xd280_0000_u32, 0xd400_0002].iter().enumerate() {
+            let start = index * std::mem::size_of::<u32>();
+            page[start..start + std::mem::size_of::<u32>()]
+                .copy_from_slice(&instruction.to_le_bytes());
+        }
+        let source = Arc::new(BootPageSource {
+            page,
+            requests: Mutex::new(Vec::new()),
+            request_count: AtomicUsize::new(0),
+        });
+        let bridge = HvfLazyHostFaultBridge::install(
+            Arc::clone(&memory),
+            Arc::<BootPageSource>::clone(&source),
+        )
+        .expect("guest boot lazy host bridge should install");
+        let mut backend = HvfBackend::new();
+        backend.create_vm().expect("guest boot VM should create");
+        backend
+            .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+            .expect("guest boot lazy memory should map");
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("guest boot lazy-aware runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: GuestAddress::new(GUEST_BASE),
+                fdt_address: GuestAddress::new(GUEST_BASE),
+            })
+            .expect("guest boot registers should configure");
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+
+        assert!(matches!(
+            runner
+                .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                .expect("guest entry instruction fault should resolve"),
+            HvfVcpuRunStepOutcome::LazyPage { fault }
+                if fault.fault().access() == HvfLazyGuestAccess::Execute
+                    && fault.populated_pages() == 1
+                    && fault.permission_changes() == 1
+        ));
+        assert!(matches!(
+            runner
+                .run_once_and_handle_mmio(dispatcher)
+                .expect("populated guest entry should execute"),
+            HvfVcpuRunStepOutcome::Hvc { function_id: 0, .. }
+        ));
+        assert_eq!(source.request_count.load(Ordering::Relaxed), 1);
+        let requests = source
+            .requests
+            .lock()
+            .expect("guest boot source request log should lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].offset(), 0);
+        assert_eq!(requests[0].source_offset(), SOURCE_BASE);
+        assert_eq!(requests[0].access(), PageAccess::Read);
+        drop(requests);
+        assert_eq!(
+            memory
+                .page_state(
+                    PagerRegionId::new(1).expect("guest boot pager region should validate"),
+                    0,
+                )
+                .expect("guest boot page state should resolve"),
+            LazyPageState::Present
+        );
+
+        runner.shutdown().expect("guest boot runner should stop");
+        std::mem::drop(runner);
+        backend
+            .unmap_guest_memory()
+            .expect("guest boot lazy mapping should unmap");
+        backend.destroy_vm().expect("guest boot VM should destroy");
+        bridge
+            .shutdown()
+            .expect("guest boot lazy host bridge should shut down");
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BOOT_MARKER: &[u8] = b"BANGBANG_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VIRTIO_PCI_RNG_BOUND_MARKER: &[u8] = b"BANGBANG_VIRTIO_PCI_RNG_BOUND";
@@ -3163,6 +3328,7 @@ struct GuestBootRunDiagnostics {
     completed_steps: usize,
     resumable_outcomes: usize,
     dirty_write_steps: usize,
+    lazy_page_steps: usize,
     hvc_steps: usize,
     cpu_off_steps: usize,
     cpu_suspend_steps: usize,
@@ -3193,6 +3359,9 @@ impl GuestBootRunDiagnostics {
             }
             bangbang_hvf::HvfVcpuRunStepOutcome::DirtyWrite { .. } => {
                 self.dirty_write_steps += 1;
+            }
+            bangbang_hvf::HvfVcpuRunStepOutcome::LazyPage { .. } => {
+                self.lazy_page_steps += 1;
             }
             bangbang_hvf::HvfVcpuRunStepOutcome::Hvc { .. } => {
                 self.hvc_steps += 1;

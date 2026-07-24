@@ -90,19 +90,25 @@ mod lazy_host_fault_integration {
     use std::ffi::c_void;
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
     use bangbang_hvf::{
-        HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfLazyHostFaultBridge, HvfLazyPageContents,
-        HvfLazyPageRequest, HvfLazyPageSource, HvfLazyPageSourceError,
+        HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfArm64BootRegisters, HvfBackend,
+        HvfLazyGuestAccess, HvfLazyGuestFaultError, HvfLazyGuestResolutionFailure,
+        HvfLazyHostFaultBridge, HvfLazyPageContents, HvfLazyPageRequest, HvfLazyPageSource,
+        HvfLazyPageSourceError, HvfMemoryPermissions, HvfVcpuRunEvent, HvfVcpuRunMemberOutcome,
+        HvfVcpuRunStepOutcome, HvfVcpuRunnerError,
     };
     use bangbang_pager::{
         MAX_FRAME_BYTES, PageAccess, PagerLimits, PagerOperations, PagerRegionId,
     };
+    use bangbang_runtime::VmBackend;
     use bangbang_runtime::lazy_memory::{
         LazyGuestMemory, LazyGuestMemoryLimits, LazyGuestMemoryRegion, LazyPageState,
     };
     use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
+    use bangbang_runtime::mmio::MmioDispatcher;
 
     use super::{HVF_LIFECYCLE_TEST_LOCK, host_page_size};
 
@@ -120,6 +126,13 @@ mod lazy_host_fault_integration {
     struct SignedLazySource {
         requests: Mutex<Vec<HvfLazyPageRequest>>,
         reply: SignedSourceReply,
+    }
+
+    struct BlockingSignedLazySource {
+        requests: Mutex<Vec<HvfLazyPageRequest>>,
+        page: Vec<u8>,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
     }
 
     impl SignedLazySource {
@@ -162,7 +175,32 @@ mod lazy_host_fault_integration {
         }
     }
 
+    impl HvfLazyPageSource for BlockingSignedLazySource {
+        fn page(
+            &self,
+            request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            self.requests
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            self.entered
+                .send(())
+                .map_err(|_| HvfLazyPageSourceError::failed())?;
+            self.release
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .recv()
+                .map_err(|_| HvfLazyPageSourceError::failed())?;
+            Ok(HvfLazyPageContents::data(self.page.clone()))
+        }
+    }
+
     fn lazy_memory(page_count: u64) -> Arc<LazyGuestMemory> {
+        lazy_memory_at(GUEST_BASE, page_count)
+    }
+
+    fn lazy_memory_at(guest_base: u64, page_count: u64) -> Arc<LazyGuestMemory> {
         let page_size = u32::try_from(host_page_size().expect("host page size should be valid"))
             .expect("host page size should fit u32");
         let pager = PagerLimits::new(
@@ -178,7 +216,7 @@ mod lazy_host_fault_integration {
         let region_size = u64::from(page_size)
             .checked_mul(page_count)
             .expect("signed lazy region size should fit");
-        let range = GuestMemoryRange::new(GuestAddress::new(GUEST_BASE), region_size)
+        let range = GuestMemoryRange::new(GuestAddress::new(guest_base), region_size)
             .expect("signed guest range should validate");
         let region = LazyGuestMemoryRegion::new(
             PagerRegionId::new(1).expect("signed region id should validate"),
@@ -440,6 +478,430 @@ mod lazy_host_fault_integration {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hvf_lazy_guest_faults_populate_execute_read_and_write_before_retry() {
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let page_size = usize::try_from(host_page_size().expect("host page size should be valid"))
+            .expect("host page size should fit usize");
+        let page_size_u64 = u64::try_from(page_size).expect("host page size should fit u64");
+        let guest_base = 0x10_0000_u64;
+        let page_addend = u32::try_from(page_size / 0x1000)
+            .expect("host page increment should fit AArch64 ADD immediate");
+        assert!(page_addend > 0 && page_addend <= 0xfff);
+        let add_one_page = 0x9140_0000_u32 | (page_addend << 10);
+
+        for _ in 0..2 {
+            let memory = lazy_memory_at(guest_base, 3);
+            let pointer = memory.mapping_regions()[0]
+                .host_address()
+                .as_ptr()
+                .cast::<u8>();
+            let instructions = [
+                0xd280_0000_u32,
+                0xf2a0_0200,
+                add_one_page,
+                0xb940_0001,
+                add_one_page,
+                0xb900_0001,
+                0xd280_0000,
+                0xd400_0002,
+            ];
+            let mut page = vec![0_u8; page_size];
+            for (index, instruction) in instructions.iter().enumerate() {
+                let start = index * std::mem::size_of::<u32>();
+                page[start..start + std::mem::size_of::<u32>()]
+                    .copy_from_slice(&instruction.to_le_bytes());
+            }
+            let source = Arc::new(SignedLazySource::data(page));
+            let bridge = HvfLazyHostFaultBridge::install(
+                Arc::clone(&memory),
+                Arc::<SignedLazySource>::clone(&source),
+            )
+            .expect("signed lazy host bridge should install");
+
+            let mut backend = HvfBackend::new();
+            backend.create_vm().expect("HVF VM should be created");
+            backend
+                .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+                .expect("lazy guest memory should map with zero stage-two permission");
+            let runner = backend
+                .start_vcpu_runner()
+                .expect("lazy-aware vCPU runner should start");
+            runner
+                .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                    kernel_entry: GuestAddress::new(guest_base),
+                    fdt_address: GuestAddress::new(guest_base + page_size_u64),
+                })
+                .expect("lazy guest boot registers should configure");
+            let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+
+            for expected_access in [
+                HvfLazyGuestAccess::Execute,
+                HvfLazyGuestAccess::Read,
+                HvfLazyGuestAccess::Write,
+            ] {
+                let outcome = runner
+                    .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                    .expect("lazy guest exit should resolve");
+                let HvfVcpuRunStepOutcome::LazyPage { fault } = outcome else {
+                    panic!("first execute/read/write access should return a lazy-page outcome");
+                };
+                assert_eq!(fault.fault().access(), expected_access);
+                assert_eq!(fault.populated_pages(), 1);
+                assert_eq!(fault.permission_changes(), 1);
+                assert!(!fault.stale_exit());
+            }
+
+            assert!(matches!(
+                runner
+                    .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                    .expect("populated guest should reach HVC"),
+                HvfVcpuRunStepOutcome::Hvc { function_id: 0, .. }
+            ));
+            // SAFETY: write-first resolution committed this complete retained
+            // page and opened host read/write before stage-two READ|WRITE.
+            let written =
+                unsafe { std::ptr::read_volatile(pointer.add(page_size * 2).cast::<u32>()) };
+            assert_eq!(written, instructions[0]);
+
+            let requests = source
+                .requests
+                .lock()
+                .expect("signed request log should not be poisoned");
+            assert_eq!(requests.len(), 3);
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| (request.offset(), request.access()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (0, PageAccess::Read),
+                    (page_size_u64, PageAccess::Read),
+                    (page_size_u64 * 2, PageAccess::Write),
+                ]
+            );
+            drop(requests);
+
+            runner.shutdown().expect("lazy vCPU runner should stop");
+            std::mem::drop(runner);
+            backend
+                .unmap_guest_memory()
+                .expect("lazy guest mapping should unmap");
+            backend.destroy_vm().expect("HVF VM should be destroyed");
+            assert!(
+                bridge
+                    .shutdown()
+                    .expect("lazy host bridge should shut down")
+                    .prior_handler_restored()
+            );
+        }
+    }
+
+    #[test]
+    fn hvf_lazy_guest_two_vcpus_coalesce_one_signed_page_request() {
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let page_size = usize::try_from(host_page_size().expect("host page size should be valid"))
+            .expect("host page size should fit usize");
+        let guest_base = 0x10_0000_u64;
+        let memory = lazy_memory_at(guest_base, 1);
+        let mut page = vec![0_u8; page_size];
+        page[..std::mem::size_of::<u32>()].copy_from_slice(&0xd400_0002_u32.to_le_bytes());
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let source = Arc::new(BlockingSignedLazySource {
+            requests: Mutex::new(Vec::new()),
+            page,
+            entered: entered_sender,
+            release: Mutex::new(release_receiver),
+        });
+        let bridge = HvfLazyHostFaultBridge::install(
+            Arc::clone(&memory),
+            Arc::<BlockingSignedLazySource>::clone(&source),
+        )
+        .expect("signed lazy host bridge should install");
+        let mut backend = HvfBackend::new();
+        backend.create_vm().expect("HVF VM should be created");
+        backend
+            .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+            .expect("lazy guest memory should map");
+        backend
+            .create_gic()
+            .expect("GIC should precede a lazy two-vCPU topology");
+        let topology = backend
+            .start_vcpu_topology(2)
+            .expect("host should support a lazy two-vCPU topology");
+        let mut coordinator = topology
+            .into_run_coordinator(Arc::new(Mutex::new(MmioDispatcher::new())), &[0, 1])
+            .expect("lazy two-vCPU coordinator should start");
+        for index in 0..2 {
+            coordinator
+                .configure_arm64_boot_registers(
+                    index,
+                    HvfArm64BootRegisters {
+                        kernel_entry: GuestAddress::new(guest_base),
+                        fdt_address: GuestAddress::new(guest_base),
+                    },
+                )
+                .expect("lazy topology boot registers should configure");
+        }
+        assert_eq!(coordinator.dispatch_online(), Ok(2));
+        entered_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one vCPU should enter the page source");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while memory
+            .waiter_count()
+            .expect("lazy waiter count should resolve")
+            != 1
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the peer vCPU did not join the in-flight page request"
+            );
+            std::thread::yield_now();
+        }
+        release_sender
+            .send(())
+            .expect("the signed page source should be released");
+
+        let mut populated_pages = 0_usize;
+        let mut permission_changes = 0_usize;
+        let mut stale_exits = 0_usize;
+        let mut members = Vec::new();
+        for _ in 0..2 {
+            let event = coordinator
+                .receive_event()
+                .expect("each lazy topology member should complete");
+            let HvfVcpuRunEvent::Member(result) = event else {
+                panic!("lazy peer faults should be nonterminal member events: {event:?}");
+            };
+            members.push(result.index());
+            let Ok(HvfVcpuRunMemberOutcome::Handled(HvfVcpuRunStepOutcome::LazyPage { fault })) =
+                result.result()
+            else {
+                panic!("lazy peer should report a handled page fault: {result:?}");
+            };
+            assert_eq!(fault.fault().access(), HvfLazyGuestAccess::Execute);
+            populated_pages += fault.populated_pages();
+            permission_changes += fault.permission_changes();
+            stale_exits += usize::from(fault.stale_exit());
+        }
+        members.sort_unstable();
+        assert_eq!(members, [0, 1]);
+        assert_eq!(populated_pages, 1);
+        assert_eq!(permission_changes, 1);
+        assert_eq!(stale_exits, 1);
+        assert_eq!(
+            source
+                .requests
+                .lock()
+                .expect("signed request log should lock")
+                .len(),
+            1
+        );
+
+        coordinator
+            .shutdown()
+            .expect("lazy topology should shut down");
+        std::mem::drop(coordinator);
+        backend
+            .unmap_guest_memory()
+            .expect("lazy topology mapping should unmap");
+        backend.destroy_vm().expect("HVF VM should be destroyed");
+        bridge
+            .shutdown()
+            .expect("lazy topology bridge should shut down");
+    }
+
+    #[test]
+    fn hvf_lazy_guest_unowned_instruction_fault_keeps_existing_error_path() {
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let guest_base = 0x10_0000_u64;
+        let unowned_entry = guest_base + 0x20_0000;
+        let memory = lazy_memory_at(guest_base, 1);
+        let source = Arc::new(SignedLazySource::zero());
+        let bridge = HvfLazyHostFaultBridge::install(
+            Arc::clone(&memory),
+            Arc::<SignedLazySource>::clone(&source),
+        )
+        .expect("signed lazy host bridge should install");
+        let mut backend = HvfBackend::new();
+        backend.create_vm().expect("HVF VM should be created");
+        backend
+            .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+            .expect("lazy guest memory should map");
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("lazy-aware vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: GuestAddress::new(unowned_entry),
+                fdt_address: GuestAddress::new(guest_base),
+            })
+            .expect("unowned guest entry should configure");
+
+        let error = runner
+            .run_once_and_handle_mmio(Arc::new(Mutex::new(MmioDispatcher::new())))
+            .expect_err("unowned instruction fault should retain the existing error path");
+        assert!(
+            !matches!(error, HvfVcpuRunnerError::LazyGuestFault(_)),
+            "an unowned instruction exit must not reach the lazy handler"
+        );
+        assert!(
+            source
+                .requests
+                .lock()
+                .expect("signed request log should lock")
+                .is_empty()
+        );
+
+        runner.shutdown().expect("unowned-fault runner should stop");
+        std::mem::drop(runner);
+        backend
+            .unmap_guest_memory()
+            .expect("unowned-fault mapping should unmap");
+        backend.destroy_vm().expect("HVF VM should be destroyed");
+        bridge
+            .shutdown()
+            .expect("unowned-fault bridge should shut down");
+    }
+
+    #[test]
+    fn hvf_lazy_guest_source_failure_keeps_stage_two_closed_and_cleans_up() {
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let memory = lazy_memory_at(0x10_0000, 1);
+        let source = Arc::new(SignedLazySource::failure());
+        let bridge = HvfLazyHostFaultBridge::install(
+            Arc::clone(&memory),
+            Arc::<SignedLazySource>::clone(&source),
+        )
+        .expect("signed lazy host bridge should install");
+        let mut backend = HvfBackend::new();
+        backend.create_vm().expect("HVF VM should be created");
+        backend
+            .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+            .expect("lazy guest memory should map");
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("lazy-aware vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: GuestAddress::new(0x10_0000),
+                fdt_address: GuestAddress::new(0x10_0000),
+            })
+            .expect("lazy guest boot registers should configure");
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(Arc::new(Mutex::new(MmioDispatcher::new()))),
+            Err(HvfVcpuRunnerError::LazyGuestFault(
+                HvfLazyGuestFaultError::Resolution {
+                    failure: HvfLazyGuestResolutionFailure::Source,
+                }
+            ))
+        );
+        assert_eq!(
+            memory
+                .terminal_reason()
+                .expect("terminal reason should resolve"),
+            Some(bangbang_runtime::lazy_memory::LazyGuestMemoryTerminalReason::TransitionFailure)
+        );
+        assert_eq!(
+            source
+                .requests
+                .lock()
+                .expect("source request log should lock")
+                .len(),
+            1
+        );
+
+        runner.shutdown().expect("failed lazy runner should stop");
+        std::mem::drop(runner);
+        backend
+            .unmap_guest_memory()
+            .expect("failed lazy guest mapping should unmap");
+        backend.destroy_vm().expect("HVF VM should be destroyed");
+        bridge
+            .shutdown()
+            .expect("failed lazy bridge should still shut down");
+    }
+
+    #[test]
+    fn hvf_lazy_guest_run_cancellation_does_not_repeat_page_work() {
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let page_size = usize::try_from(host_page_size().expect("host page size should be valid"))
+            .expect("host page size should fit usize");
+        let memory = lazy_memory_at(0x10_0000, 1);
+        let mut page = vec![0_u8; page_size];
+        page[..std::mem::size_of::<u32>()].copy_from_slice(&0x1400_0000_u32.to_le_bytes());
+        let source = Arc::new(SignedLazySource::data(page));
+        let bridge = HvfLazyHostFaultBridge::install(
+            Arc::clone(&memory),
+            Arc::<SignedLazySource>::clone(&source),
+        )
+        .expect("signed lazy host bridge should install");
+        let mut backend = HvfBackend::new();
+        backend.create_vm().expect("HVF VM should be created");
+        backend
+            .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+            .expect("lazy guest memory should map");
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("lazy-aware vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: GuestAddress::new(0x10_0000),
+                fdt_address: GuestAddress::new(0x10_0000),
+            })
+            .expect("lazy guest boot registers should configure");
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        assert!(matches!(
+            runner
+                .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                .expect("instruction-first fault should resolve"),
+            HvfVcpuRunStepOutcome::LazyPage { fault }
+                if fault.fault().access() == HvfLazyGuestAccess::Execute
+        ));
+
+        let cancel = runner.run_cancel_handle();
+        std::thread::scope(|scope| {
+            let run = scope.spawn(|| runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cancel.cancel().expect("lazy guest run should cancel");
+            assert_eq!(
+                run.join().expect("lazy guest run thread should join"),
+                Ok(HvfVcpuRunStepOutcome::Canceled)
+            );
+        });
+        assert_eq!(
+            source
+                .requests
+                .lock()
+                .expect("source request log should lock")
+                .len(),
+            1
+        );
+
+        runner.shutdown().expect("canceled lazy runner should stop");
+        std::mem::drop(runner);
+        backend
+            .unmap_guest_memory()
+            .expect("canceled lazy guest mapping should unmap");
+        backend.destroy_vm().expect("HVF VM should be destroyed");
+        bridge
+            .shutdown()
+            .expect("canceled lazy bridge should shut down");
     }
 
     #[test]

@@ -16,13 +16,18 @@ use bangbang_pager::{PageAccess, PagerGeneration, PagerRegionId};
 use bangbang_runtime::lazy_memory::{
     LazyGuestMemory, LazyGuestMemoryError, LazyGuestMemoryTerminalReason, LazyPageFault,
 };
-use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
+use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange, GuestMemoryRegion};
 
 use crate::mach_lazy::{
     MACH_ACCESS_READ, MACH_ACCESS_WRITE, MACH_FAULT_FORWARD, MACH_FAULT_HANDLED,
     MACH_FAULT_TERMINAL, MachExceptionOwner, MachLazyContents, MachLazyError, MachLazyMapping,
     is_supported_target,
 };
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe extern "C" {
+    fn sys_icache_invalidate(start: *mut c_void, length: usize);
+}
 
 /// Fixed exit status used when an owned host fault cannot be resolved safely.
 pub const HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE: i32 = crate::mach_lazy::MACH_TERMINAL_EXIT_CODE;
@@ -268,7 +273,7 @@ impl Error for HvfLazyHostFaultError {
     }
 }
 
-/// Cloneable resolver shared by the task bridge and later guest protection.
+/// Cloneable resolver shared by the task bridge and HVF guest protection.
 #[derive(Clone)]
 pub struct HvfLazyPageResolver {
     inner: Arc<ResolverInner>,
@@ -278,8 +283,8 @@ impl HvfLazyPageResolver {
     /// Resolves one owned guest address through the shared content path.
     ///
     /// The task exception bridge uses the same method after translating an
-    /// owned host fault. A later HVF guest-fault adapter may clone this handle
-    /// and call it before publishing stage-two permissions.
+    /// owned host fault. The HVF guest-fault adapter clones this handle and
+    /// calls it before publishing stage-two permissions.
     pub fn resolve_guest_address(
         &self,
         address: GuestAddress,
@@ -291,6 +296,25 @@ impl HvfLazyPageResolver {
             },
         )?;
         self.inner.resolve(region_index, address, access)
+    }
+
+    pub(crate) fn mapping_regions(&self) -> &[GuestMemoryRegion] {
+        self.inner.memory.mapping_regions()
+    }
+
+    pub(crate) fn page_size(&self) -> u32 {
+        self.inner.memory.page_size()
+    }
+
+    pub(crate) fn fail_closed(&self) {
+        self.inner.fail_closed();
+    }
+
+    pub(crate) fn synchronize_instruction_page(
+        &self,
+        address: GuestAddress,
+    ) -> Result<(), HvfLazyHostFaultError> {
+        self.inner.synchronize_instruction_page(address)
     }
 }
 
@@ -362,7 +386,7 @@ impl HvfLazyHostFaultBridge {
         })
     }
 
-    /// Returns a shared resolver for the later guest-fault protection plane.
+    /// Returns a shared resolver for the HVF guest-fault protection plane.
     pub fn resolver(&self) -> HvfLazyPageResolver {
         self.resolver.clone()
     }
@@ -810,6 +834,48 @@ impl ResolverInner {
         })
     }
 
+    fn synchronize_instruction_page(
+        &self,
+        address: GuestAddress,
+    ) -> Result<(), HvfLazyHostFaultError> {
+        let _action = self.begin_action()?;
+        let region_index =
+            self.region_for_guest(address)
+                .ok_or(HvfLazyHostFaultError::InvalidConfiguration {
+                    stage: HvfLazyHostFaultStage::Validate,
+                })?;
+        let region =
+            self.regions
+                .get(region_index)
+                .ok_or(HvfLazyHostFaultError::InvalidConfiguration {
+                    stage: HvfLazyHostFaultStage::Validate,
+                })?;
+        let page_offset = self.page_offset(region.guest, address)?;
+        let host_address = region.host_start.checked_add(page_offset).ok_or(
+            HvfLazyHostFaultError::InvalidConfiguration {
+                stage: HvfLazyHostFaultStage::Validate,
+            },
+        )?;
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            // SAFETY: resolver construction retained this complete mapping,
+            // page_offset identifies one aligned coordinator page inside it,
+            // and page resolution completed before the guest adapter calls
+            // this method. The public libSystem routine only synchronizes
+            // instruction visibility for the supplied live byte range.
+            unsafe {
+                sys_icache_invalidate(host_address as *mut c_void, self.page_size);
+            }
+            Ok(())
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = host_address;
+            Err(HvfLazyHostFaultError::UnsupportedTarget)
+        }
+    }
+
     fn fail_closed(&self) {
         let _ = self
             .memory
@@ -867,8 +933,15 @@ mod tests {
     use bangbang_pager::{
         MAX_FRAME_BYTES, PagerGeneration, PagerLimits, PagerOperations, PagerRegionId,
     };
+    use bangbang_runtime::BackendError;
     use bangbang_runtime::lazy_memory::{
         LazyGuestMemoryLimits, LazyGuestMemoryRegion, LazyPageState,
+    };
+
+    use crate::exit::{HvfExceptionExit, HvfLazyGuestAccess};
+    use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
+    use crate::memory::{
+        HvfMappedGuestMemoryRegion, HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions,
     };
 
     use super::*;
@@ -888,6 +961,64 @@ mod tests {
         Data(Vec<u8>),
         Zero,
         Failure,
+    }
+
+    #[derive(Debug, Default)]
+    struct ConcurrentProtectionMapper {
+        protects: Mutex<Vec<(GuestMemoryRange, HvfMemoryPermissions)>>,
+    }
+
+    impl HvfMemoryMapper for ConcurrentProtectionMapper {
+        fn map_region(
+            &self,
+            _request: HvfMemoryMapRequest,
+            _permissions: HvfMemoryPermissions,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn unmap_region(
+            &self,
+            _mapped_region: HvfMappedGuestMemoryRegion,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn protect_region(
+            &self,
+            range: GuestMemoryRange,
+            permissions: HvfMemoryPermissions,
+        ) -> Result<(), BackendError> {
+            self.protects
+                .lock()
+                .map_err(|_| BackendError::InvalidState("test protection log is poisoned"))?
+                .push((range, permissions));
+            Ok(())
+        }
+    }
+
+    struct BlockingZeroSource {
+        requests: AtomicU64,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl HvfLazyPageSource for BlockingZeroSource {
+        fn page(
+            &self,
+            _request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.entered
+                .send(())
+                .map_err(|_| HvfLazyPageSourceError::failed())?;
+            self.release
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .recv()
+                .map_err(|_| HvfLazyPageSourceError::failed())?;
+            Ok(HvfLazyPageContents::zero())
+        }
     }
 
     impl HvfLazyPageSource for TestSource {
@@ -1132,6 +1263,101 @@ mod tests {
                 .len(),
             1
         );
+        bridge.shutdown().expect("test bridge should shut down");
+    }
+
+    #[test]
+    fn concurrent_guest_handlers_coalesce_source_and_publish_one_permission_union() {
+        let _test_lock = MACH_TEST_LOCK
+            .lock()
+            .expect("Mach lazy test lock should not be poisoned");
+        let page_size =
+            u32::try_from(crate::memory::host_page_size().expect("host page size should resolve"))
+                .expect("host page size should fit u32");
+        let memory = memory(page_size, 1).expect("test lazy memory should construct");
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let source = Arc::new(BlockingZeroSource {
+            requests: AtomicU64::new(0),
+            entered: entered_sender,
+            release: Mutex::new(release_receiver),
+        });
+        let bridge = HvfLazyHostFaultBridge::install(
+            Arc::clone(&memory),
+            Arc::<BlockingZeroSource>::clone(&source),
+        )
+        .expect("test bridge should install");
+        let mapper = Arc::new(ConcurrentProtectionMapper::default());
+        let handler = HvfLazyGuestFaultHandler::prepare(
+            bridge.resolver(),
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("guest handler should prepare");
+        handler.activate().expect("guest handler should activate");
+        let exit = HvfExceptionExit {
+            syndrome: 0x9381_0007,
+            virtual_address: GUEST_BASE,
+            physical_address: GUEST_BASE,
+        };
+        let candidate = handler
+            .classify(exit)
+            .expect("fault classification should succeed")
+            .expect("owned read should classify");
+
+        let first_handler = Arc::clone(&handler);
+        let first = thread::spawn(move || first_handler.handle(0, candidate, 0x1000));
+        entered_receiver
+            .recv()
+            .expect("first member should enter the source");
+        let second_handler = Arc::clone(&handler);
+        let second = thread::spawn(move || second_handler.handle(1, candidate, 0x2000));
+
+        for _ in 0..1_000 {
+            if memory.waiter_count().expect("waiter count should resolve") == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            memory.waiter_count().expect("waiter count should resolve"),
+            1
+        );
+        release_sender
+            .send(())
+            .expect("source release should be sent");
+        release_sender
+            .send(())
+            .expect("defensive duplicate release should be sent");
+
+        let first = first
+            .join()
+            .expect("first member should join")
+            .expect("first member should resolve")
+            .expect("first member should be handled");
+        let second = second
+            .join()
+            .expect("second member should join")
+            .expect("second member should resolve")
+            .expect("second member should be handled");
+        assert_eq!(first.fault().access(), HvfLazyGuestAccess::Read);
+        assert_eq!(second.fault().access(), HvfLazyGuestAccess::Read);
+        assert_eq!(first.permission_changes() + second.permission_changes(), 1);
+        assert_eq!(
+            usize::from(first.stale_exit()) + usize::from(second.stale_exit()),
+            1
+        );
+        assert_eq!(source.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *mapper.protects.lock().expect("protection log should lock"),
+            vec![(
+                GuestMemoryRange::new(GuestAddress::new(GUEST_BASE), u64::from(page_size))
+                    .expect("test page range should be valid"),
+                HvfMemoryPermissions::READ,
+            )]
+        );
+
+        drop(handler);
         bridge.shutdown().expect("test bridge should shut down");
     }
 

@@ -1114,12 +1114,13 @@ moves one exact corpus record to #1527-owned
 changing native-v1 rejection.
 
 Snapshot paging feasibility, its standalone protocol, internal
-lazy-anonymous-memory coordinator, and task-local host fault bridge are guarded
-separately from public runtime integration. The inventory test pins the
-upstream contract, public macOS environment, signed prototype output, unchanged
-entitlement floor, stable pre-access rejection anchors, exact delivery owner,
-protocol/coordinator/host-bridge source and documentation anchors, and
-nonterminal status. The pager package covers canonical framing, every
+lazy-anonymous-memory coordinator, and internal host/guest fault bridges are
+guarded separately from public runtime integration. The inventory test pins
+the upstream contract, public macOS environment, signed prototype output,
+unchanged entitlement floor, stable pre-access rejection anchors, exact
+delivery owner, protocol/coordinator/host/guest source and documentation
+anchors, and nonterminal status. The pager package covers canonical framing,
+every
 split/coalesced boundary, adversarial input, negotiation, exact out-of-order
 matching, cancellation, shutdown, timeout/EOF, redaction, and two
 inherited-stream child-process sessions.
@@ -1160,10 +1161,27 @@ scripts/run-integration-tests.sh --test hvf_lifecycle -- lazy_host_fault_integra
 scripts/run-integration-tests.sh --test app_sandbox -- lazy_host_fault_integration::
 ```
 
+HVF guest-fault unit tests cover the signed-observed data/instruction syndrome
+classifier, complete cross-page resolution before permission, serialized
+read/write/execute permission unions, duplicate-vCPU coalescing, one stale
+admission followed by no-progress failure, transactional setup cleanup,
+source/protection terminalization, redaction, dirty/raw exclusion, and canceled
+dispatch. The signed lifecycle test runs real execute-, read-, and write-first
+faults twice, verifies source-failure cleanup and no duplicate work after
+cancellation, blocks one source request until a second vCPU joins it, and
+proves an unowned instruction fault does not reach the lazy source. The
+guest-boot target starts directly on a lazy instruction page:
+
+```sh
+cargo test -p bangbang-hvf --lib --all-features --locked lazy_guest
+scripts/run-integration-tests.sh --test hvf_lifecycle -- hvf_lazy_guest_
+scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page
+```
+
 The final #1527 certification must run the complete signed wrapper without
 `--allow-unsupported` and exercise the production pager path before promotion.
-The retained prototypes, standalone protocol, internal coordinator, host-only
-bridge, and ledger are not complete broker/guest/removal/restore implementation
+The retained prototypes, standalone protocol, internal coordinator, host/guest
+bridges, and ledger are not complete broker/removal/restore implementation
 evidence.
 
 Run its two focused gates with:
