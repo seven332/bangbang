@@ -14,10 +14,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 use bangbang_pager::{PageAccess, PagerGeneration, PagerRegion, PagerRegionId};
 use bangbang_runtime::lazy_memory::{
-    LazyGuestMemory, LazyGuestMemoryError, LazyGuestMemoryTerminalReason, LazyPageFault,
-    LazyPageState,
+    LazyGuestMemory, LazyGuestMemoryConsumer, LazyGuestMemoryError, LazyGuestMemoryTerminalReason,
+    LazyPageFault, LazyPageState,
 };
-use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange, GuestMemoryRegion};
+use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange, GuestMemoryRegion};
 
 use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
 use crate::mach_lazy::{
@@ -33,6 +33,9 @@ unsafe extern "C" {
 
 /// Fixed exit status used when an owned host fault cannot be resolved safely.
 pub const HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE: i32 = crate::mach_lazy::MACH_TERMINAL_EXIT_CODE;
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) static MACH_LAZY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Offset-only page request presented to an in-process content source.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -493,6 +496,40 @@ pub struct HvfLazyHostFaultBridge {
     callback_context: Option<Box<CallbackContext>>,
 }
 
+/// Composite owner for ordinary in-process consumers of protected lazy guest
+/// memory.
+///
+/// Field order is intentional: the ordinary-access view and leases derived
+/// from it must be gone before the bridge restores or releases host-fault
+/// ownership.
+pub struct HvfLazyGuestMemoryConsumer {
+    memory: LazyGuestMemoryConsumer,
+    resolver: HvfLazyPageResolver,
+    _bridge: Mutex<HvfLazyHostFaultBridge>,
+}
+
+impl HvfLazyGuestMemoryConsumer {
+    /// Returns a resolver handle for HVF guest-fault handling or coordinated
+    /// lazy page removal.
+    pub fn resolver(&self) -> HvfLazyPageResolver {
+        self.resolver.clone()
+    }
+
+    pub(crate) const fn memory(&self) -> &GuestMemory {
+        self.memory.memory()
+    }
+
+    pub(crate) const fn memory_mut(&mut self) -> &mut GuestMemory {
+        self.memory.memory_mut()
+    }
+}
+
+impl fmt::Debug for HvfLazyGuestMemoryConsumer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HvfLazyGuestMemoryConsumer(<redacted>)")
+    }
+}
+
 impl HvfLazyHostFaultBridge {
     /// Transactionally constructs aliases, installs the exception owner, and
     /// protects every original lazy mapping.
@@ -536,6 +573,24 @@ impl HvfLazyHostFaultBridge {
     /// Returns a shared resolver for the HVF guest-fault protection plane.
     pub fn resolver(&self) -> HvfLazyPageResolver {
         self.resolver.clone()
+    }
+
+    /// Consumes an installed bridge and claims the only ordinary-access view
+    /// that may be retained by an HVF backend.
+    pub fn into_guest_memory_consumer(
+        self,
+    ) -> Result<HvfLazyGuestMemoryConsumer, HvfLazyHostFaultError> {
+        // SAFETY: successful bridge installation protected these exact
+        // mappings. The composite declares the consumer before the bridge so
+        // Rust drops that view before bridge teardown.
+        let memory = unsafe { self.resolver.inner.memory.claim_protected_consumer() }
+            .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
+        let resolver = self.resolver();
+        Ok(HvfLazyGuestMemoryConsumer {
+            memory,
+            resolver,
+            _bridge: Mutex::new(self),
+        })
     }
 
     /// Removes one exact lazy range through both host and guest permission
@@ -1532,7 +1587,6 @@ mod tests {
     const GUEST_BASE: u64 = 0x8000_0000;
     const SOURCE_BASE: u64 = 0x10_0000;
     const TEST_VALUE: u32 = 0x3141_5926;
-    static MACH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestSource {
         requests: Mutex<Vec<HvfLazyPageRequest>>,
@@ -1737,7 +1791,7 @@ mod tests {
 
     #[test]
     fn resolves_real_task_local_accesses_in_subprocess() {
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         if std::env::var_os(CHILD_ENV).is_none() {
@@ -1865,7 +1919,7 @@ mod tests {
 
     #[test]
     fn rejects_sub_host_page_granularity_before_exception_install() {
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let host_page_size =
@@ -1886,7 +1940,7 @@ mod tests {
 
     #[test]
     fn shared_resolver_publishes_zero_without_faulting_itself() {
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let page_size =
@@ -1927,7 +1981,7 @@ mod tests {
 
     #[test]
     fn removal_revokes_guest_permissions_and_refaults_zero_under_a_new_generation() {
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let page_size =
@@ -2040,7 +2094,7 @@ mod tests {
 
     #[test]
     fn removal_supersedes_blocked_population_and_retries_the_stale_response() {
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let page_size =
@@ -2108,7 +2162,7 @@ mod tests {
 
     #[test]
     fn concurrent_guest_handlers_coalesce_source_and_publish_one_permission_union() {
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let page_size =
@@ -2203,7 +2257,7 @@ mod tests {
 
     #[test]
     fn wrong_length_and_source_failure_terminalize_before_permission() {
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let page_size =
@@ -2245,7 +2299,7 @@ mod tests {
 
     #[test]
     fn peer_source_failure_wins_before_population_guard_cleanup() {
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let page_size =
@@ -2277,7 +2331,7 @@ mod tests {
 
     #[test]
     fn owner_busy_install_rolls_back_candidate_aliases_without_protection() {
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let page_size =
@@ -2359,7 +2413,7 @@ mod tests {
             }
         }
 
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let page_size =
@@ -2426,6 +2480,66 @@ mod tests {
     }
 
     #[test]
+    fn composite_consumer_resolves_ordinary_access_and_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HvfLazyGuestMemoryConsumer>();
+
+        let _test_lock = MACH_LAZY_TEST_LOCK
+            .lock()
+            .expect("Mach lazy test lock should not be poisoned");
+        let page_size =
+            u32::try_from(crate::memory::host_page_size().expect("host page size should resolve"))
+                .expect("host page size should fit u32");
+        let source = Arc::new(TestSource {
+            requests: Mutex::new(Vec::new()),
+            reply: TestReply::Zero,
+        });
+        let bridge = HvfLazyHostFaultBridge::install(
+            memory(page_size, 1).expect("consumer lazy memory should construct"),
+            Arc::<TestSource>::clone(&source),
+        )
+        .expect("consumer bridge should install");
+        let mut consumer = bridge
+            .into_guest_memory_consumer()
+            .expect("consumer view should be claimed once");
+
+        assert_eq!(
+            format!("{consumer:?}"),
+            "HvfLazyGuestMemoryConsumer(<redacted>)"
+        );
+        assert!(consumer.memory().is_protected_lazy());
+        let address = GuestAddress::new(GUEST_BASE);
+        let mut first = [0xff_u8; 8];
+        consumer
+            .memory()
+            .read_slice(&mut first, address)
+            .expect("ordinary read should resolve the absent page");
+        assert_eq!(first, [0; 8]);
+        consumer
+            .memory_mut()
+            .write_slice(&0x1122_3344_5566_7788_u64.to_le_bytes(), address)
+            .expect("ordinary write should upgrade resolved permissions");
+        let word = consumer
+            .memory()
+            .atomic_u64(address)
+            .expect("ordinary aligned atomic should resolve");
+        assert_eq!(word.load_le(), 0x1122_3344_5566_7788);
+        word.store_le(0x8877_6655_4433_2211)
+            .expect("ordinary atomic store should succeed");
+        drop(word);
+        drop(consumer);
+
+        assert!(
+            source
+                .requests
+                .lock()
+                .expect("source requests should not be poisoned")
+                .iter()
+                .any(|request| request.access() == PageAccess::Read)
+        );
+    }
+
+    #[test]
     fn public_diagnostics_redact_fault_authority_and_contents() {
         let request = HvfLazyPageRequest {
             region: PagerRegionId::new(77).expect("test region id should validate"),
@@ -2454,7 +2568,7 @@ mod tests {
             "HvfLazyHostFaultError::Source(<redacted>)"
         );
 
-        let _test_lock = MACH_TEST_LOCK
+        let _test_lock = MACH_LAZY_TEST_LOCK
             .lock()
             .expect("Mach lazy test lock should not be poisoned");
         let page_size =

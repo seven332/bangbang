@@ -112,10 +112,13 @@ mod lazy_guest_boot_integration {
             Arc::<BootPageSource>::clone(&source),
         )
         .expect("guest boot lazy host bridge should install");
+        let consumer = bridge
+            .into_guest_memory_consumer()
+            .expect("guest boot lazy consumer should claim once");
         let mut backend = HvfBackend::new();
         backend.create_vm().expect("guest boot VM should create");
         backend
-            .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+            .map_lazy_guest_memory_with_consumer(consumer, HvfMemoryPermissions::GUEST_RAM)
             .expect("guest boot lazy memory should map");
         let runner = backend
             .start_vcpu_runner()
@@ -169,9 +172,6 @@ mod lazy_guest_boot_integration {
             .unmap_guest_memory()
             .expect("guest boot lazy mapping should unmap");
         backend.destroy_vm().expect("guest boot VM should destroy");
-        bridge
-            .shutdown()
-            .expect("guest boot lazy host bridge should shut down");
     }
 }
 

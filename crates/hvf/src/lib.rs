@@ -62,10 +62,10 @@ pub use lazy_guest_fault::{
     HvfHandledLazyGuestFault, HvfLazyGuestFaultError, HvfLazyGuestResolutionFailure,
 };
 pub use lazy_host_fault::{
-    HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfLazyHostFaultBridge, HvfLazyHostFaultError,
-    HvfLazyHostFaultShutdown, HvfLazyHostFaultStage, HvfLazyPageContents, HvfLazyPageRemoval,
-    HvfLazyPageRemovalRequest, HvfLazyPageRequest, HvfLazyPageResolution, HvfLazyPageResolver,
-    HvfLazyPageSource, HvfLazyPageSourceError,
+    HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfLazyGuestMemoryConsumer, HvfLazyHostFaultBridge,
+    HvfLazyHostFaultError, HvfLazyHostFaultShutdown, HvfLazyHostFaultStage, HvfLazyPageContents,
+    HvfLazyPageRemoval, HvfLazyPageRemovalRequest, HvfLazyPageRequest, HvfLazyPageResolution,
+    HvfLazyPageResolver, HvfLazyPageSource, HvfLazyPageSourceError,
 };
 pub use lazy_pager::{HvfLazyPager, HvfLazyPagerError};
 pub use memory::{

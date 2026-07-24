@@ -4,7 +4,8 @@ This ledger records the #1527 public-macOS feasibility decision for the pinned
 Firecracker snapshot page-fault corpus and the completed #1547 standalone
 protocol, #1548 coordinated lazy-anonymous-memory, #1549 task-local host
 fault, #1550 HVF guest-fault, #1551 contained peer-broker, and #1552
-removal/peer-failure slices. It is not an aggregate runtime
+removal/peer-failure slices, plus #1553's complete consumer inventory and
+gates. It is not an aggregate runtime
 implementation claim: bangbang still rejects native-v1 `Uffd` before artifact
 or backend access.
 
@@ -412,9 +413,103 @@ scripts/run-integration-tests.sh --test production_bundle -- pager_grant
 ```
 
 The same connected stream can now be adopted by `HvfLazyPager`; public restore
-assembly, every-consumer certification, and native-v1 activation remain
-deferred. The reference peer is support tooling, not a daemon or Linux UFFD
-compatibility.
+assembly and native-v1 activation remain deferred. The consumer boundary is
+completed below. The reference peer is support tooling, not a daemon or Linux
+UFFD compatibility.
+
+## Implemented protected lazy consumer boundary
+
+`GuestMemory` now distinguishes eager ownership from a protected-lazy
+consumer view. `LazyGuestMemory::claim_protected_consumer` is a documented
+`#[doc(hidden)]` unsafe boundary that fallibly clones only region metadata and
+the existing mmap `Arc`s after the exact Mach bridge is active. An atomic
+one-shot claim prevents a second view, the wrapper is not cloneable, and the
+safe `LazyGuestMemory` API still exposes no ordinary memory.
+
+The protected view permits the existing bounded `read_slice`, `write_slice`,
+and aligned `GuestMemoryAtomicU64` paths because their real load/store
+instructions remain in the worker task and therefore fault through the Mach
+bridge. Before mutation it rejects dirty tracking, region insertion/removal,
+shared reservation, descriptor export, and ordinary discard. The only
+supported removal remains `HvfLazyPageResolver::remove_pages`, which owns both
+protection planes and exact pager acknowledgement.
+
+`HvfLazyGuestMemoryConsumer` owns the view before a mutex-serialized
+`HvfLazyHostFaultBridge`. This preserves the backend's existing `Send + Sync`
+contract without declaring the unique Mach exception owner itself `Sync`.
+`HvfBackend::map_lazy_guest_memory_with_consumer` consumes that composite,
+stores it whenever any lazy HVF mapping survives, and retains it across
+activation, binding, partial-map rollback, and failed-unmap paths. Successful
+teardown stops joined vCPU/PVTime users, unmaps stage two, drops the protected
+view, restores the Mach bridge, and only then releases coordinator/source
+ownership. If both stage-two unmap and VM destruction fail, the backend
+deliberately retains the mapping, guest-fault handler, and whole composite
+rather than release host backing that HVF may still reference.
+
+Crate-internal boot, virtqueue, device, and full-snapshot readers obtain the
+protected view through the backend. Public `HvfArm64BootSession` and
+`OwnedHvfArm64BootSession` guest-memory borrows reject lazy mode, so safe
+callers cannot retain a raw pointer or atomic lease past bridge teardown. Full
+native-v1 save uses the narrowly named unsafe
+`native_snapshot_guest_memory` borrow only under the existing snapshot
+quiescence transaction and performs bounded reads; dirty/diff save remains an
+incompatible profile.
+
+`LazyGuestMemoryConsumerProfile` is the closed backend-neutral preflight
+classifier for dirty tracking, shared memory, external-process access,
+ordinary balloon reclaim, and dynamic memory topology. It has a stable
+priority and typed `LazyGuestMemoryConsumerRejection`. #1554 will invoke it
+while assembling the supported `Uffd` restore; the current blanket public
+`Uffd` rejection remains earlier than every path, socket, grant, artifact, or
+backend access in this slice.
+
+### Checked guest-memory consumer inventory
+
+| Consumer identity | Concrete paths | Lazy behavior | Enforcement | Disposition |
+| --- | --- | --- | --- | --- |
+| consumer:guest-memory-slices | `GuestMemory::read_slice` / `write_slice` | Real worker loads and stores fault through Mach | Protected view plus signed App Sandbox data/zero/write probe | bridged |
+| consumer:guest-memory-atomic | `GuestMemoryAtomicU64`, ARM64 PVTime publisher | Aligned load/store faults through Mach; lease must not outlive joined runner owners | Non-cloneable composite lifetime plus PVTime shutdown-before-unmap order | bridged |
+| consumer:guest-memory-raw-pointer | region host addresses, mapping internals | Raw read/write instructions fault through Mach | No public protected-memory borrow; signed volatile-pointer probe | bridged |
+| consumer:hvf-stage-two | HVF mapping and vCPU read/write/execute | Guest faults do not observe host protection | Zero initial stage-two access plus lazy-aware runner/resolver | resolver-only |
+| consumer:virtqueue-core | descriptor, available, used, and indirect ring helpers | Uses bounded guest-memory reads/writes in the worker | Protected view; signed `VirtqueueAvailableRing::used_event` probe | bridged |
+| consumer:transport-mmio-pci | MMIO/PCI queue dispatch and notification paths | Queue metadata remains in-process | Internal backend borrow; public borrow closed | bridged |
+| consumer:boot-fdt | kernel, initrd, command line, FDT, and boot metadata writes | Startup writes fault and populate on demand | Internal protected view before vCPU start | bridged |
+| consumer:block-sync-async | Sync/Async file block request headers, data, status, and retry completion | Worker/async executor copies use guest-memory helpers | Protected view; vCPU/device owners join before teardown | bridged |
+| consumer:network-vmnet-mmds | virtio-net TX/RX, vmnet copy, MMDS frame/TCP stack | All guest bytes are copied in the contained worker | Protected view; no guest descriptor exported to vmnet | bridged |
+| consumer:vsock | TX/RX/event queues and connection packet buffers | In-process queue and packet copies | Protected view; source work quiesces before snapshot/teardown | bridged |
+| consumer:entropy | request queue and random-byte writes | In-process queue reads/writes | Protected view and retained retry-owner quiescence | bridged |
+| consumer:balloon-control | stats, reporting, and PFN descriptor queues | Queue metadata is in-process | Protected view for control reads/writes | bridged |
+| consumer:balloon-reclaim | inflate, hinting, reporting ordinary discard | `madvise` would bypass pager removal generations | Protected view returns `UnsupportedTarget`; profile requires pager-aware removal | preflight-rejected |
+| consumer:memory-hotplug-control | virtio-mem request/response queue | Queue bytes are ordinary in-process accesses | Protected view for control traffic only | bridged |
+| consumer:memory-hotplug-topology | shared aperture and dynamic insert/remove | Changes mapping inventory outside the fixed lazy coordinator | Profile and protected topology mutations reject | preflight-rejected |
+| consumer:pmem | virtio-pmem queue metadata plus separately mapped backing | Queue metadata is covered; optional backing ownership is outside native-v1 lazy profile | Internal view for queue; existing native-v1 optional-device preflight | gated |
+| consumer:vhost-user | cloned shared descriptors, userspace bases, socket/grant/backend protocol | Another process would bypass the task-local Mach owner | Anonymous/protected memory preflight before descriptor clone, socket, or grant | preflight-rejected |
+| consumer:vmgenid-vmclock-pvtime | VMGenID/VMClock writes and retained PVTime atomics | Worker writes and runner atomics fault through Mach | Protected view; retained atomics destroyed with joined runner owners | bridged |
+| consumer:snapshot-restore-population | connected pager data/zero and removal responses | Writes only through the bridge's private alias while primary pages are hidden | Coordinator generation plus exact response validation | resolver-only |
+| consumer:snapshot-full-save | native-v1 full memory image streaming | Bounded reads populate missing pages normally | Snapshot-quiesced unsafe internal borrow; signed image writer probe | bridged |
+| consumer:snapshot-dirty-diff | dirty bitmap and differential memory composition | Conflicts with lazy WRITE permission ownership | Dirty profile and `enable_dirty_tracking` reject | preflight-rejected |
+| consumer:public-memory-borrow | public boot-session `guest_memory` / `guest_memory_mut` | Could retain pointers or atomics beyond bridge lifetime | Public-access backend methods reject lazy; only narrow unsafe snapshot borrow remains | preflight-rejected |
+| consumer:teardown | vCPU/PVTime/device stop, HVF unmap, view, Mach owner, coordinator/pager | Incorrect order could leave an unmediated retained lease | Composite field order plus retained partial/failing cleanup owner | ordered-owner |
+| consumer:eager-file-regression | eager anonymous/shared and native-v1 File/COW memory | No lazy tag or bridge behavior | Existing constructors select eager profile; full workspace/File tests unchanged | unchanged |
+
+Focused runtime tests prove the one-shot claim, stable profile priority, normal
+slice/atomic operation, every state-changing rejection, empty descriptor
+export, and vhost-user preflight. HVF tests prove the composite is `Send +
+Sync`, public borrows are closed, and failed unmap or partial-map rollback
+retains the bridge until cleanup. Signed lifecycle and guest-boot cases consume
+the composite for real HVF execution and repeat teardown. The
+test-bundle-only `pager-consumer` production probe runs slice, volatile raw
+pointer, aligned atomic, virtqueue metadata, full snapshot image, mutation
+rejection, pager removal, and zero refault through a real connected peer under
+unchanged App Sandbox entitlements:
+
+```sh
+cargo test -p bangbang-runtime lazy_memory --all-features --locked
+cargo test -p bangbang-hvf --lib --all-features --locked lazy_composite
+scripts/run-integration-tests.sh --test hvf_lifecycle -- hvf_lazy_guest_faults_populate_execute_read_and_write_before_retry
+scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page
+scripts/run-integration-tests.sh --test production_bundle -- signed_pager_consumer_chain_runs_inside_app_sandbox
+```
 
 ## Decision and remaining delivery boundary
 
@@ -463,11 +558,10 @@ VM construction. The focused
 case additionally proves private UFFD paths remain redacted.
 
 Delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527)
-retains three integration/certification gates after #1552:
+retains two integration/certification gates after #1553:
 
-1. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
-2. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
-3. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
+1. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
+2. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
 
 There is no public `Uffd` success before #1554 and no
 `implemented-and-verified` inventory result before #1555. Delivery-time

@@ -4846,7 +4846,11 @@ impl<P> ProcessHvfBootSession<OwnedHvfArm64BootSession, P> {
     }
 
     fn guest_memory(&self) -> Result<&GuestMemory, BackendError> {
-        self.session.guest_memory().map_err(|source| {
+        // SAFETY: this private adapter is called only inside the native-v1
+        // snapshot transaction after VM/device quiescence. The snapshot
+        // writer performs bounded reads and does not retain host addresses or
+        // atomic leases.
+        unsafe { self.session.native_snapshot_guest_memory() }.map_err(|source| {
             BackendError::Hypervisor(format!("failed to borrow HVF guest memory: {source}"))
         })
     }

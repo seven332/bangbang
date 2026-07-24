@@ -8,6 +8,7 @@ use std::collections::TryReserveError;
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use bangbang_pager::{
@@ -25,6 +26,123 @@ pub const MAX_LAZY_MEMORY_WAITERS: u16 = 4_096;
 
 /// Maximum number of 4-KiB coordinator pages representable by arm64 DRAM.
 pub const MAX_LAZY_MEMORY_PAGES: u64 = aarch64::DRAM_MEM_MAX_SIZE / (MIN_PAGE_SIZE as u64);
+
+/// Backend-neutral guest-memory behaviors that cannot share a protected lazy
+/// mapping in the current process model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LazyGuestMemoryConsumerRequirement {
+    DirtyTracking,
+    SharedMemory,
+    ExternalProcessMemory,
+    BalloonReclaim,
+    DynamicMemory,
+}
+
+impl fmt::Display for LazyGuestMemoryConsumerRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DirtyTracking => "dirty-page tracking",
+            Self::SharedMemory => "descriptor-backed shared guest memory",
+            Self::ExternalProcessMemory => "external-process guest-memory access",
+            Self::BalloonReclaim => "ordinary balloon guest-memory reclaim",
+            Self::DynamicMemory => "dynamic guest-memory topology",
+        })
+    }
+}
+
+/// Closed inventory of the guest-memory behaviors needed by one VM
+/// configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LazyGuestMemoryConsumerProfile {
+    dirty_tracking: bool,
+    shared_memory: bool,
+    external_process_memory: bool,
+    balloon_reclaim: bool,
+    dynamic_memory: bool,
+}
+
+impl LazyGuestMemoryConsumerProfile {
+    /// Constructs the ordinary in-process, fixed-memory consumer profile.
+    pub const fn in_process_fixed() -> Self {
+        Self {
+            dirty_tracking: false,
+            shared_memory: false,
+            external_process_memory: false,
+            balloon_reclaim: false,
+            dynamic_memory: false,
+        }
+    }
+
+    pub const fn requiring_dirty_tracking(mut self) -> Self {
+        self.dirty_tracking = true;
+        self
+    }
+
+    pub const fn requiring_shared_memory(mut self) -> Self {
+        self.shared_memory = true;
+        self
+    }
+
+    pub const fn requiring_external_process_memory(mut self) -> Self {
+        self.external_process_memory = true;
+        self
+    }
+
+    pub const fn requiring_balloon_reclaim(mut self) -> Self {
+        self.balloon_reclaim = true;
+        self
+    }
+
+    pub const fn requiring_dynamic_memory(mut self) -> Self {
+        self.dynamic_memory = true;
+        self
+    }
+
+    /// Rejects the first incompatible behavior in stable priority order.
+    pub const fn validate(self) -> Result<(), LazyGuestMemoryConsumerRejection> {
+        let requirement = if self.dirty_tracking {
+            Some(LazyGuestMemoryConsumerRequirement::DirtyTracking)
+        } else if self.shared_memory {
+            Some(LazyGuestMemoryConsumerRequirement::SharedMemory)
+        } else if self.external_process_memory {
+            Some(LazyGuestMemoryConsumerRequirement::ExternalProcessMemory)
+        } else if self.balloon_reclaim {
+            Some(LazyGuestMemoryConsumerRequirement::BalloonReclaim)
+        } else if self.dynamic_memory {
+            Some(LazyGuestMemoryConsumerRequirement::DynamicMemory)
+        } else {
+            None
+        };
+        match requirement {
+            Some(requirement) => Err(LazyGuestMemoryConsumerRejection { requirement }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Stable rejection returned before a lazy restore acquires resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LazyGuestMemoryConsumerRejection {
+    requirement: LazyGuestMemoryConsumerRequirement,
+}
+
+impl LazyGuestMemoryConsumerRejection {
+    pub const fn requirement(self) -> LazyGuestMemoryConsumerRequirement {
+        self.requirement
+    }
+}
+
+impl fmt::Display for LazyGuestMemoryConsumerRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "lazy guest memory does not support {}",
+            self.requirement
+        )
+    }
+}
+
+impl std::error::Error for LazyGuestMemoryConsumerRejection {}
 
 /// Local resource bounds layered on the negotiated pager limits.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -489,6 +607,34 @@ pub struct LazyGuestMemory {
     inner: Arc<LazyGuestMemoryInner>,
 }
 
+/// One non-cloneable ordinary-access view whose lifetime is bounded by a
+/// platform fault bridge.
+///
+/// Only platform adapters may construct this type. It intentionally permits
+/// byte and aligned-atomic access while the underlying [`GuestMemory`] rejects
+/// dirty tracking, region changes, descriptor export, and ordinary discard.
+pub struct LazyGuestMemoryConsumer {
+    memory: GuestMemory,
+}
+
+impl LazyGuestMemoryConsumer {
+    #[doc(hidden)]
+    pub const fn memory(&self) -> &GuestMemory {
+        &self.memory
+    }
+
+    #[doc(hidden)]
+    pub const fn memory_mut(&mut self) -> &mut GuestMemory {
+        &mut self.memory
+    }
+}
+
+impl fmt::Debug for LazyGuestMemoryConsumer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LazyGuestMemoryConsumer(<redacted>)")
+    }
+}
+
 impl LazyGuestMemory {
     /// Validates all metadata and transactionally constructs absent mappings.
     pub fn new(
@@ -576,6 +722,7 @@ impl LazyGuestMemory {
                 limits,
                 regions: records,
                 memory,
+                consumer_claimed: AtomicBool::new(false),
                 state: Mutex::new(CoordinatorState {
                     phase: CoordinatorPhase::Active,
                     pages,
@@ -593,6 +740,32 @@ impl LazyGuestMemory {
     /// Returns mapping metadata for later in-process backend adapters.
     pub fn mapping_regions(&self) -> &[GuestMemoryRegion] {
         self.inner.memory.regions()
+    }
+
+    /// Claims the sole ordinary-access view after a platform fault bridge has
+    /// protected every primary mapping.
+    ///
+    /// # Safety
+    ///
+    /// The caller must already own an active fault bridge for these exact
+    /// mappings, must retain that bridge until after the returned view and all
+    /// access leases derived from it are dropped, and must serialize bridge
+    /// teardown against every consumer thread. A successful claim is
+    /// irreversible for this lazy-memory owner.
+    #[doc(hidden)]
+    pub unsafe fn claim_protected_consumer(
+        &self,
+    ) -> Result<LazyGuestMemoryConsumer, LazyGuestMemoryError> {
+        let memory = self
+            .inner
+            .memory
+            .try_protected_lazy_view()
+            .map_err(|source| LazyGuestMemoryError::MetadataAllocationFailed { source })?;
+        self.inner
+            .consumer_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| LazyGuestMemoryError::ConsumerAlreadyClaimed)?;
+        Ok(LazyGuestMemoryConsumer { memory })
     }
 
     /// Returns the exact coordinator page size selected by the pager limits.
@@ -749,6 +922,7 @@ struct LazyGuestMemoryInner {
     limits: LazyGuestMemoryLimits,
     regions: Vec<LazyRegionRecord>,
     memory: GuestMemory,
+    consumer_claimed: AtomicBool,
     state: Mutex<CoordinatorState>,
     changed: Condvar,
 }
@@ -1979,6 +2153,8 @@ pub enum LazyGuestMemoryError {
     StaleGeneration,
     /// The requested transition is not legal in the current state.
     InvalidLifecycle,
+    /// The sole protected ordinary-access view was already claimed.
+    ConsumerAlreadyClaimed,
     /// Supplied contents do not exactly fill the target.
     ContentLength,
     /// Contents were already installed through this guard.
@@ -2011,6 +2187,7 @@ impl fmt::Debug for LazyGuestMemoryError {
             Self::WaiterLimitExceeded => "LazyGuestMemoryError::WaiterLimitExceeded",
             Self::StaleGeneration => "LazyGuestMemoryError::StaleGeneration",
             Self::InvalidLifecycle => "LazyGuestMemoryError::InvalidLifecycle",
+            Self::ConsumerAlreadyClaimed => "LazyGuestMemoryError::ConsumerAlreadyClaimed",
             Self::ContentLength => "LazyGuestMemoryError::ContentLength",
             Self::ContentAlreadyInstalled => "LazyGuestMemoryError::ContentAlreadyInstalled",
             Self::ContentMissing => "LazyGuestMemoryError::ContentMissing",
@@ -2033,6 +2210,7 @@ impl fmt::Display for LazyGuestMemoryError {
             Self::WaiterLimitExceeded => "lazy guest-memory waiter limit exceeded",
             Self::StaleGeneration => "stale lazy guest-memory generation",
             Self::InvalidLifecycle => "invalid lazy guest-memory lifecycle transition",
+            Self::ConsumerAlreadyClaimed => "lazy guest-memory consumer view was already claimed",
             Self::ContentLength => "invalid lazy guest-memory content length",
             Self::ContentAlreadyInstalled => "lazy guest-memory content is already installed",
             Self::ContentMissing => "lazy guest-memory content was not installed",
@@ -2055,6 +2233,7 @@ impl std::error::Error for LazyGuestMemoryError {
             | Self::WaiterLimitExceeded
             | Self::StaleGeneration
             | Self::InvalidLifecycle
+            | Self::ConsumerAlreadyClaimed
             | Self::ContentLength
             | Self::ContentAlreadyInstalled
             | Self::ContentMissing
@@ -2266,6 +2445,171 @@ mod tests {
             0
         );
         assert_eq!(read_page(&memory, 0), vec![0; PAGE_SIZE as usize]);
+    }
+
+    #[test]
+    fn protected_consumer_is_one_shot_and_gates_mutating_memory_operations() {
+        let memory = owner(1, 1, 1);
+        // SAFETY: this unit test does not trigger concurrent access or actual
+        // faults; it exercises only the protected view's ownership metadata
+        // and operations that reject before touching a mapping.
+        let mut consumer = unsafe { memory.claim_protected_consumer() }
+            .expect("first protected consumer claim should succeed");
+
+        assert!(consumer.memory().is_protected_lazy());
+        assert_eq!(
+            consumer.memory().backing(),
+            crate::memory::GuestMemoryBacking::Anonymous
+        );
+        assert_eq!(consumer.memory().shared_export_regions().count(), 0);
+        assert!(matches!(
+            crate::block::PreparedBlockDevice::preflight_vhost_user_memory(consumer.memory()),
+            Err(crate::block::PreparedVhostUserBlockMemoryError::AnonymousMemory)
+        ));
+
+        consumer
+            .memory_mut()
+            .write_slice(
+                &0x0102_0304_0506_0708_u64.to_le_bytes(),
+                GuestAddress::new(GUEST_BASE),
+            )
+            .expect("ordinary protected write should succeed");
+        let atomic = consumer
+            .memory()
+            .atomic_u64(GuestAddress::new(GUEST_BASE))
+            .expect("aligned protected atomic should construct");
+        assert_eq!(atomic.load_le(), 0x0102_0304_0506_0708);
+        atomic
+            .store_le(0x8877_6655_4433_2211)
+            .expect("protected atomic store should succeed");
+        let mut contents = [0_u8; 8];
+        consumer
+            .memory()
+            .read_slice(&mut contents, GuestAddress::new(GUEST_BASE))
+            .expect("ordinary protected read should succeed");
+        assert_eq!(u64::from_le_bytes(contents), 0x8877_6655_4433_2211);
+        drop(atomic);
+
+        assert!(matches!(
+            consumer.memory_mut().enable_dirty_tracking(),
+            Err(crate::memory_dirty::GuestMemoryDirtyTrackerError::ProtectedLazyMemory)
+        ));
+        assert!(matches!(
+            consumer.memory_mut().insert_region(guest_range(
+                GUEST_BASE + u64::from(PAGE_SIZE),
+                u64::from(PAGE_SIZE),
+            )),
+            Err(GuestMemoryAllocationError::ProtectedLazyMutation)
+        ));
+        assert!(matches!(
+            consumer.memory_mut().reserve_shared_region(guest_range(
+                GUEST_BASE + u64::from(PAGE_SIZE),
+                u64::from(PAGE_SIZE),
+            )),
+            Err(GuestMemoryAllocationError::ProtectedLazyMutation)
+        ));
+        assert_eq!(
+            consumer
+                .memory_mut()
+                .remove_region(guest_range(GUEST_BASE, u64::from(PAGE_SIZE))),
+            Err(crate::memory::GuestMemoryRegionRemovalError::ProtectedLazyMutation)
+        );
+        let discard = consumer
+            .memory()
+            .discard_range(guest_range(GUEST_BASE, u64::from(PAGE_SIZE)));
+        assert_eq!(discard.failed_bytes(), u64::from(PAGE_SIZE));
+        assert_eq!(
+            discard
+                .failures()
+                .count(crate::memory::GuestMemoryDiscardFailureKind::UnsupportedTarget),
+            1
+        );
+
+        // SAFETY: as above, the second claim is expected to reject before
+        // returning another usable view.
+        let duplicate = unsafe { memory.claim_protected_consumer() };
+        assert!(matches!(
+            duplicate,
+            Err(LazyGuestMemoryError::ConsumerAlreadyClaimed)
+        ));
+    }
+
+    #[test]
+    fn consumer_profile_classifies_each_incompatible_behavior() {
+        assert_eq!(
+            LazyGuestMemoryConsumerProfile::in_process_fixed().validate(),
+            Ok(())
+        );
+        for (profile, requirement) in [
+            (
+                LazyGuestMemoryConsumerProfile::in_process_fixed().requiring_dirty_tracking(),
+                LazyGuestMemoryConsumerRequirement::DirtyTracking,
+            ),
+            (
+                LazyGuestMemoryConsumerProfile::in_process_fixed().requiring_shared_memory(),
+                LazyGuestMemoryConsumerRequirement::SharedMemory,
+            ),
+            (
+                LazyGuestMemoryConsumerProfile::in_process_fixed()
+                    .requiring_external_process_memory(),
+                LazyGuestMemoryConsumerRequirement::ExternalProcessMemory,
+            ),
+            (
+                LazyGuestMemoryConsumerProfile::in_process_fixed().requiring_balloon_reclaim(),
+                LazyGuestMemoryConsumerRequirement::BalloonReclaim,
+            ),
+            (
+                LazyGuestMemoryConsumerProfile::in_process_fixed().requiring_dynamic_memory(),
+                LazyGuestMemoryConsumerRequirement::DynamicMemory,
+            ),
+        ] {
+            let rejection = profile
+                .validate()
+                .expect_err("incompatible profile should reject");
+            assert_eq!(rejection.requirement(), requirement);
+            assert!(rejection.to_string().contains(&requirement.to_string()));
+        }
+
+        for (profile, requirement) in [
+            (
+                LazyGuestMemoryConsumerProfile::in_process_fixed()
+                    .requiring_dirty_tracking()
+                    .requiring_shared_memory()
+                    .requiring_external_process_memory()
+                    .requiring_balloon_reclaim()
+                    .requiring_dynamic_memory(),
+                LazyGuestMemoryConsumerRequirement::DirtyTracking,
+            ),
+            (
+                LazyGuestMemoryConsumerProfile::in_process_fixed()
+                    .requiring_shared_memory()
+                    .requiring_external_process_memory()
+                    .requiring_balloon_reclaim()
+                    .requiring_dynamic_memory(),
+                LazyGuestMemoryConsumerRequirement::SharedMemory,
+            ),
+            (
+                LazyGuestMemoryConsumerProfile::in_process_fixed()
+                    .requiring_external_process_memory()
+                    .requiring_balloon_reclaim()
+                    .requiring_dynamic_memory(),
+                LazyGuestMemoryConsumerRequirement::ExternalProcessMemory,
+            ),
+            (
+                LazyGuestMemoryConsumerProfile::in_process_fixed()
+                    .requiring_balloon_reclaim()
+                    .requiring_dynamic_memory(),
+                LazyGuestMemoryConsumerRequirement::BalloonReclaim,
+            ),
+        ] {
+            assert_eq!(
+                profile
+                    .validate()
+                    .expect_err("combined incompatible profile should reject")
+                    .requirement(),
+                requirement
+            );
+        }
     }
 
     #[test]

@@ -485,6 +485,13 @@ pub struct GuestMemory {
     shared_reservations: Vec<GuestMemoryRegion>,
     dirty_tracker: Option<Arc<GuestMemoryDirtyTracker>>,
     backing: GuestMemoryBacking,
+    access_profile: GuestMemoryAccessProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuestMemoryAccessProfile {
+    Eager,
+    ProtectedLazy,
 }
 
 /// Retained, aligned 64-bit word inside owned guest memory.
@@ -608,6 +615,7 @@ impl GuestMemory {
             shared_reservations: Vec::new(),
             dirty_tracker: None,
             backing,
+            access_profile: GuestMemoryAccessProfile::Eager,
         })
     }
 
@@ -693,12 +701,44 @@ impl GuestMemory {
             shared_reservations: Vec::new(),
             dirty_tracker: None,
             backing,
+            access_profile: GuestMemoryAccessProfile::Eager,
         })
     }
 
     /// Return the backing profile inherited by dynamically inserted regions.
     pub const fn backing(&self) -> GuestMemoryBacking {
         self.backing
+    }
+
+    /// Return whether this is the non-cloneable consumer view retained by a
+    /// platform lazy-fault bridge.
+    #[doc(hidden)]
+    pub const fn is_protected_lazy(&self) -> bool {
+        matches!(self.access_profile, GuestMemoryAccessProfile::ProtectedLazy)
+    }
+
+    pub(crate) fn try_protected_lazy_view(&self) -> Result<Self, TryReserveError> {
+        debug_assert_eq!(self.backing, GuestMemoryBacking::Anonymous);
+        debug_assert!(self.shared_reservations.is_empty());
+        debug_assert!(self.dirty_tracker.is_none());
+        debug_assert_eq!(self.access_profile, GuestMemoryAccessProfile::Eager);
+
+        let mut regions = Vec::new();
+        regions.try_reserve_exact(self.regions.len())?;
+        regions.extend(self.regions.iter().map(|region| GuestMemoryRegion {
+            range: region.range,
+            mapping: Arc::clone(&region.mapping),
+            mapping_offset: region.mapping_offset,
+            host_size: region.host_size,
+        }));
+
+        Ok(Self {
+            regions,
+            shared_reservations: Vec::new(),
+            dirty_tracker: None,
+            backing: GuestMemoryBacking::Anonymous,
+            access_profile: GuestMemoryAccessProfile::ProtectedLazy,
+        })
     }
 
     /// Install one shared dirty-page generation over every current region.
@@ -709,6 +749,9 @@ impl GuestMemory {
     pub fn enable_dirty_tracking(
         &mut self,
     ) -> Result<Arc<GuestMemoryDirtyTracker>, GuestMemoryDirtyTrackerError> {
+        if self.is_protected_lazy() {
+            return Err(GuestMemoryDirtyTrackerError::ProtectedLazyMemory);
+        }
         if let Some(tracker) = self.dirty_tracker.as_ref() {
             return Ok(Arc::clone(tracker));
         }
@@ -759,6 +802,9 @@ impl GuestMemory {
         &mut self,
         range: GuestMemoryRange,
     ) -> Result<(), GuestMemoryAllocationError> {
+        if self.is_protected_lazy() {
+            return Err(GuestMemoryAllocationError::ProtectedLazyMutation);
+        }
         let page_size = host_page_size()?;
         let insert_index = self.validate_insert_region(range, page_size)?;
         if let Some(reservation) = self.shared_reservation_containing(range) {
@@ -870,6 +916,9 @@ impl GuestMemory {
         &mut self,
         range: GuestMemoryRange,
     ) -> Result<(), GuestMemoryAllocationError> {
+        if self.is_protected_lazy() {
+            return Err(GuestMemoryAllocationError::ProtectedLazyMutation);
+        }
         let page_size = host_page_size()?;
         let host_size = validate_allocation_range(range, page_size)?;
         for region in &self.regions {
@@ -942,15 +991,21 @@ impl GuestMemory {
     }
 
     pub(crate) fn shared_export_regions(&self) -> impl Iterator<Item = &GuestMemoryRegion> {
+        let export_allowed = !self.is_protected_lazy();
         let mut active = self
             .regions
             .iter()
-            .filter(|region| {
-                region.backing() == GuestMemoryRegionBacking::Shared
+            .filter(move |region| {
+                export_allowed
+                    && region.backing() == GuestMemoryRegionBacking::Shared
                     && self.shared_reservation_containing(region.range()).is_none()
             })
             .peekable();
-        let mut reservations = self.shared_reservations.iter().peekable();
+        let mut reservations = self
+            .shared_reservations
+            .iter()
+            .filter(move |_| export_allowed)
+            .peekable();
 
         std::iter::from_fn(move || {
             let take_active = match (active.peek(), reservations.peek()) {
@@ -978,6 +1033,9 @@ impl GuestMemory {
         &mut self,
         range: GuestMemoryRange,
     ) -> Result<(), GuestMemoryRegionRemovalError> {
+        if self.is_protected_lazy() {
+            return Err(GuestMemoryRegionRemovalError::ProtectedLazyMutation);
+        }
         let Some(index) = self
             .regions
             .iter()
@@ -1022,6 +1080,9 @@ impl GuestMemory {
         adviser: &mut impl GuestMemoryDiscardAdviser,
     ) -> GuestMemoryDiscardOutcome {
         let mut outcome = GuestMemoryDiscardOutcome::new(range.size());
+        if self.is_protected_lazy() {
+            return outcome.fail_all(GuestMemoryDiscardFailureKind::UnsupportedTarget);
+        }
         if self.validate_mapped_range(range).is_err() {
             return outcome.fail_all(GuestMemoryDiscardFailureKind::RangeValidation);
         }
@@ -1506,6 +1567,7 @@ impl std::error::Error for GuestMemorySharedBackingError {
 #[derive(Debug)]
 pub enum GuestMemoryAllocationError {
     InvalidLayout(GuestMemoryError),
+    ProtectedLazyMutation,
     InvalidHostPageSize,
     SizeTooLarge {
         range: GuestMemoryRange,
@@ -1596,6 +1658,9 @@ impl fmt::Display for GuestMemoryAllocationError {
         match self {
             Self::InvalidLayout(source) => {
                 write!(f, "invalid guest memory layout for allocation: {source}")
+            }
+            Self::ProtectedLazyMutation => {
+                f.write_str("protected lazy guest memory has immutable region topology")
             }
             Self::InvalidHostPageSize => f.write_str("host page size is unavailable or invalid"),
             Self::SizeTooLarge { range } => {
@@ -1720,7 +1785,8 @@ impl std::error::Error for GuestMemoryAllocationError {
             | Self::PrivateFileInspectFailed { source }
             | Self::PrivateFileMmapFailed { source, .. } => Some(source),
             Self::SharedNameGenerationFailed { .. } => None,
-            Self::InvalidHostPageSize
+            Self::ProtectedLazyMutation
+            | Self::InvalidHostPageSize
             | Self::SizeTooLarge { .. }
             | Self::AnonymousMmapReturnedNull { .. }
             | Self::SharedFileSizeLimitExceeded { .. }
@@ -1746,6 +1812,8 @@ impl From<GuestMemoryError> for GuestMemoryAllocationError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestMemoryRegionRemovalError {
+    /// Protected lazy memory is immutable outside its page coordinator.
+    ProtectedLazyMutation,
     /// No owned region exactly matches the requested guest range.
     MissingRange { range: GuestMemoryRange },
 }
@@ -1753,6 +1821,9 @@ pub enum GuestMemoryRegionRemovalError {
 impl fmt::Display for GuestMemoryRegionRemovalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProtectedLazyMutation => {
+                f.write_str("protected lazy guest memory has immutable region topology")
+            }
             Self::MissingRange { range } => {
                 write!(f, "guest memory region {range} is not mapped")
             }
@@ -3514,6 +3585,7 @@ mod tests {
             shared_reservations: Vec::new(),
             dirty_tracker: None,
             backing: super::GuestMemoryBacking::Anonymous,
+            access_profile: super::GuestMemoryAccessProfile::Eager,
         };
         let mut adviser = TestDiscardAdviser::new(PAGE_SIZE);
 

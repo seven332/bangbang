@@ -1114,9 +1114,9 @@ moves one exact corpus record to #1527-owned
 changing native-v1 rejection.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
-lazy-anonymous-memory coordinator, host/guest fault bridges, removal, and
-peer-failure propagation are guarded separately from public runtime
-integration. The inventory test pins
+lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
+peer-failure propagation, and checked consumer boundary are guarded separately
+from public runtime integration. The inventory test pins
 the upstream contract, public macOS environment, signed prototype output,
 unchanged entitlement floor, stable pre-access rejection anchors, exact
 delivery owner, protocol/coordinator/host/guest source and documentation
@@ -1137,6 +1137,11 @@ non-socket targets, and source replacement. The bounded reference peer covers
 page data, zero, removal, cancellation, terminal, operation limits, and orderly
 shutdown without claiming Linux UFFD compatibility. The signed contained
 complete probe uses `PagerClient` and verifies remove followed by zero refault.
+The `pager-consumer` probe additionally constructs the real lazy owner and
+Mach bridge inside the signed App Sandbox worker, then covers ordinary slice
+access, volatile raw access, aligned atomic publication, virtqueue metadata,
+full snapshot streaming, mutation/export rejection, acknowledged removal, and
+zero refault against the connected reference peer.
 
 The runtime lazy-memory tests use barriers, channels/condition wakeups, and
 bounded yield polling rather than sleeps. They cover absent private-anonymous
@@ -1154,6 +1159,18 @@ cargo test -p bangbang-runtime lazy_memory --all-features --locked
 cargo test -p bangbang-firecracker-capability-audit --test checked_inventory snapshot_paging_feasibility_policy_is_stable --locked
 cargo test -p bangbang-runtime native_v1_load_policy_rejects_each_unsupported_dimension --locked
 cargo test -p bangbang returns_fault_for_snapshot_endpoint --locked
+```
+
+Protected-consumer tests additionally pin the one-shot claim, closed profile
+priority, eager-vs-lazy tag, every topology/dirty/discard/export rejection,
+vhost-user shared-memory preflight, public session-borrow closure, and
+composite retention across partial map and failed unmap. The signed guest
+tests consume the composite, so repeat teardown proves the protected view is
+dropped before Mach restoration:
+
+```sh
+cargo test -p bangbang-hvf --lib --all-features --locked lazy_composite
+scripts/run-integration-tests.sh --test production_bundle -- signed_pager_consumer_chain_runs_inside_app_sandbox
 ```
 
 HVF host-fault unit tests use the real public Mach server for ordinary accesses
@@ -1197,7 +1214,8 @@ scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_in
 The final #1527 certification must run the complete signed wrapper without
 `--allow-unsupported` and exercise the production pager path before promotion.
 The retained prototypes and implemented internal pager/removal path are not
-complete consumer-audit/restore/final-certification evidence.
+restore/final-certification evidence; consumer-audit evidence is now checked
+and signed independently.
 
 Run its two focused gates with:
 

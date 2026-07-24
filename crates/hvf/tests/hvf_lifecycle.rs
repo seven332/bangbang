@@ -566,11 +566,14 @@ mod lazy_host_fault_integration {
                 Arc::<SignedLazySource>::clone(&source),
             )
             .expect("signed lazy host bridge should install");
+            let consumer = bridge
+                .into_guest_memory_consumer()
+                .expect("signed lazy consumer should claim once");
 
             let mut backend = HvfBackend::new();
             backend.create_vm().expect("HVF VM should be created");
             backend
-                .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+                .map_lazy_guest_memory_with_consumer(consumer, HvfMemoryPermissions::GUEST_RAM)
                 .expect("lazy guest memory should map with zero stage-two permission");
             let runner = backend
                 .start_vcpu_runner()
@@ -636,12 +639,6 @@ mod lazy_host_fault_integration {
                 .unmap_guest_memory()
                 .expect("lazy guest mapping should unmap");
             backend.destroy_vm().expect("HVF VM should be destroyed");
-            assert!(
-                bridge
-                    .shutdown()
-                    .expect("lazy host bridge should shut down")
-                    .prior_handler_restored()
-            );
         }
     }
 
@@ -692,10 +689,14 @@ mod lazy_host_fault_integration {
             Arc::<SignedRemovalSource>::clone(&source),
         )
         .expect("signed lazy host bridge should install");
+        let resolver = bridge.resolver();
+        let consumer = bridge
+            .into_guest_memory_consumer()
+            .expect("signed removal consumer should claim once");
         let mut backend = HvfBackend::new();
         backend.create_vm().expect("HVF VM should be created");
         backend
-            .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+            .map_lazy_guest_memory_with_consumer(consumer, HvfMemoryPermissions::GUEST_RAM)
             .expect("lazy guest memory should map with zero stage-two permission");
         let runner = backend
             .start_vcpu_runner()
@@ -729,7 +730,7 @@ mod lazy_host_fault_integration {
         assert_eq!(initial, TEST_VALUE);
 
         let region = PagerRegionId::new(1).expect("signed region id should validate");
-        let removed = bridge
+        let removed = resolver
             .remove_pages(region, page_size_u64, page_size_u64)
             .expect("signed removal should revoke both permission planes");
         assert_eq!(
@@ -778,9 +779,6 @@ mod lazy_host_fault_integration {
             .unmap_guest_memory()
             .expect("lazy guest mapping should unmap");
         backend.destroy_vm().expect("HVF VM should be destroyed");
-        bridge
-            .shutdown()
-            .expect("lazy host bridge should shut down");
     }
 
     #[test]

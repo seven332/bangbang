@@ -8300,7 +8300,7 @@ impl HvfArm64BootSession<'_> {
     /// This is startup preparation plumbing; it does not enter a continuous
     /// guest run loop or prove guest boot.
     pub fn guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
-        self.backend.mapped_guest_memory()
+        self.backend.mapped_guest_memory_for_public_access()
     }
 
     /// Mutably borrow the guest memory mapped for this prepared boot session.
@@ -8308,7 +8308,21 @@ impl HvfArm64BootSession<'_> {
     /// The HVF backend remains the mapping owner, so shutdown and drop still
     /// unmap the memory through the backend.
     pub fn guest_memory_mut(&mut self) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
-        self.backend.mapped_guest_memory_mut()
+        self.backend.mapped_guest_memory_for_public_access_mut()
+    }
+
+    /// Borrows protected memory for one quiesced native snapshot read.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold snapshot quiescence for every VM and device
+    /// consumer, must use only bounded reads during the borrow, and must not
+    /// retain an atomic lease or host address derived from the result.
+    #[doc(hidden)]
+    pub unsafe fn native_snapshot_guest_memory(
+        &self,
+    ) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
+        self.backend.mapped_guest_memory()
     }
 
     /// Advance one complete dirty generation under snapshot-ready quiescence.
@@ -10684,7 +10698,7 @@ impl OwnedHvfArm64BootSession {
     /// This is startup preparation plumbing; it does not enter a continuous
     /// guest run loop or prove guest boot.
     pub fn guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
-        self.backend.mapped_guest_memory()
+        self.backend.mapped_guest_memory_for_public_access()
     }
 
     /// Mutably borrow the guest memory mapped for this prepared boot session.
@@ -10692,7 +10706,21 @@ impl OwnedHvfArm64BootSession {
     /// The HVF backend remains the mapping owner, so shutdown and drop still
     /// unmap the memory through the backend.
     pub fn guest_memory_mut(&mut self) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
-        self.backend.mapped_guest_memory_mut()
+        self.backend.mapped_guest_memory_for_public_access_mut()
+    }
+
+    /// Borrows protected memory for one quiesced native snapshot read.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold snapshot quiescence for every VM and device
+    /// consumer, must use only bounded reads during the borrow, and must not
+    /// retain an atomic lease or host address derived from the result.
+    #[doc(hidden)]
+    pub unsafe fn native_snapshot_guest_memory(
+        &self,
+    ) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
+        self.backend.mapped_guest_memory()
     }
 
     /// Advance one complete dirty generation under snapshot-ready quiescence.

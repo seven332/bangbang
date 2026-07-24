@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
@@ -10,14 +10,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bangbang_hvf::{HvfBackend, HvfMemoryPermissions};
+use bangbang_hvf::{HvfBackend, HvfLazyHostFaultBridge, HvfLazyPager, HvfMemoryPermissions};
 use bangbang_pager::{
     CancelReason, MAX_FRAME_BYTES, MIN_PAGE_SIZE, PageAccess, PagerClient, PagerClientPage,
     PagerError, PagerGeneration, PagerLimits, PagerOperations, PagerRegion, PagerRegionId,
     PagerSessionId, PagerTransport, PagerVmmState, REFERENCE_PAGE_BYTE, TerminalCode, VmmSession,
 };
 use bangbang_runtime::VmBackend;
+use bangbang_runtime::block::PreparedBlockDevice;
+use bangbang_runtime::lazy_memory::{
+    LazyGuestMemory, LazyGuestMemoryLimits, LazyGuestMemoryRegion,
+};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryBacking, aarch64};
+use bangbang_runtime::snapshot_memory::write_snapshot_memory_image;
+use bangbang_runtime::virtio_queue::VirtqueueAvailableRing;
 use bangbang_session::{GrantAccess, GrantId, GrantObjectKind, ResourceRole};
 
 use crate::contained_session::{ContainedSession, ContainedSessionError};
@@ -225,6 +231,9 @@ fn verify_pager_in_containment(
             )
             .map_err(|_| ContainedSessionError);
     }
+    if probe == PagerProbeCase::Consumer {
+        return run_lazy_consumer_pager(stream);
+    }
     let client = Arc::new(
         PagerClient::connect(
             pager_vmm().map_err(|_| ContainedSessionError)?,
@@ -238,7 +247,7 @@ fn verify_pager_in_containment(
         PagerProbeCase::Cancel => client
             .cancel(CancelReason::Requested)
             .map_err(|_| ContainedSessionError),
-        PagerProbeCase::Terminal => Err(ContainedSessionError),
+        PagerProbeCase::Terminal | PagerProbeCase::Consumer => Err(ContainedSessionError),
         PagerProbeCase::Wait => {
             let waiting_client = Arc::clone(&client);
             let waiter = std::thread::spawn(move || {
@@ -272,6 +281,166 @@ fn verify_pager_in_containment(
                 .map(|_| ())
         }
     }
+}
+
+fn run_lazy_consumer_pager(
+    stream: std::os::unix::net::UnixStream,
+) -> Result<(), ContainedSessionError> {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = u32::try_from(page_size).map_err(|_| ContainedSessionError)?;
+    let pager_limits = PagerLimits::new(
+        page_size,
+        1,
+        4,
+        u32::try_from(MAX_FRAME_BYTES).map_err(|_| ContainedSessionError)?,
+        PagerOperations::v1(),
+    )
+    .map_err(|_| ContainedSessionError)?;
+    let limits =
+        LazyGuestMemoryLimits::new(pager_limits, 2, 4).map_err(|_| ContainedSessionError)?;
+    let length = u64::from(page_size)
+        .checked_mul(2)
+        .ok_or(ContainedSessionError)?;
+    let guest_range = bangbang_runtime::memory::GuestMemoryRange::new(
+        GuestAddress::new(aarch64::DRAM_MEM_START),
+        length,
+    )
+    .map_err(|_| ContainedSessionError)?;
+    let region = LazyGuestMemoryRegion::new(
+        PagerRegionId::new(1).map_err(|_| ContainedSessionError)?,
+        guest_range,
+        0,
+        page_size,
+    )
+    .map_err(|_| ContainedSessionError)?;
+    let memory =
+        Arc::new(LazyGuestMemory::new(limits, vec![region]).map_err(|_| ContainedSessionError)?);
+    let raw = memory
+        .mapping_regions()
+        .first()
+        .ok_or(ContainedSessionError)?
+        .host_address()
+        .as_ptr()
+        .cast::<u8>();
+    let pager = Arc::new(
+        HvfLazyPager::connect(Arc::clone(&memory), stream, PAGER_TIMEOUT)
+            .map_err(|_| ContainedSessionError)?,
+    );
+    let bridge =
+        HvfLazyHostFaultBridge::install(Arc::clone(&memory), Arc::<HvfLazyPager>::clone(&pager))
+            .map_err(|_| ContainedSessionError)?;
+    // SAFETY: the bridge above protects these exact mappings and remains live
+    // until after this non-cloneable view, every local atomic lease, and all
+    // synchronous consumer operations have been dropped.
+    let mut consumer =
+        unsafe { memory.claim_protected_consumer() }.map_err(|_| ContainedSessionError)?;
+    let guest_base = GuestAddress::new(aarch64::DRAM_MEM_START);
+
+    let mut first = [0_u8; 8];
+    consumer
+        .memory()
+        .read_slice(&mut first, guest_base)
+        .map_err(|_| ContainedSessionError)?;
+    if first != [REFERENCE_PAGE_BYTE; 8] {
+        return Err(ContainedSessionError);
+    }
+    // SAFETY: the bounded read above resolved and exposed the complete first
+    // page while the protected view and bridge remain live.
+    if unsafe { std::ptr::read_volatile(raw) } != REFERENCE_PAGE_BYTE {
+        return Err(ContainedSessionError);
+    }
+
+    let second = guest_base
+        .checked_add(u64::from(page_size))
+        .ok_or(ContainedSessionError)?;
+    consumer
+        .memory_mut()
+        .write_slice(&[0x5a; 8], second)
+        .map_err(|_| ContainedSessionError)?;
+    let mut second_bytes = [0_u8; 8];
+    consumer
+        .memory()
+        .read_slice(&mut second_bytes, second)
+        .map_err(|_| ContainedSessionError)?;
+    if second_bytes != [0x5a; 8] {
+        return Err(ContainedSessionError);
+    }
+
+    let atomic = consumer
+        .memory()
+        .atomic_u64(guest_base)
+        .map_err(|_| ContainedSessionError)?;
+    atomic
+        .store_le(0x8877_6655_4433_2211)
+        .map_err(|_| ContainedSessionError)?;
+    if atomic.load_le() != 0x8877_6655_4433_2211 {
+        return Err(ContainedSessionError);
+    }
+    drop(atomic);
+
+    let descriptor_table = guest_base.checked_add(0x100).ok_or(ContainedSessionError)?;
+    let available_ring = guest_base.checked_add(0x200).ok_or(ContainedSessionError)?;
+    let queue = VirtqueueAvailableRing::new(descriptor_table, available_ring, 8)
+        .map_err(|_| ContainedSessionError)?;
+    let used_event = available_ring
+        .checked_add(20)
+        .ok_or(ContainedSessionError)?;
+    consumer
+        .memory_mut()
+        .write_slice(&0x1234_u16.to_le_bytes(), used_event)
+        .map_err(|_| ContainedSessionError)?;
+    if queue
+        .used_event(consumer.memory())
+        .map_err(|_| ContainedSessionError)?
+        != 0x1234
+    {
+        return Err(ContainedSessionError);
+    }
+
+    let mut snapshot = Cursor::new(Vec::new());
+    let binding = write_snapshot_memory_image(consumer.memory(), &mut snapshot)
+        .map_err(|_| ContainedSessionError)?;
+    if binding.data_length() != length || snapshot.get_ref().is_empty() {
+        return Err(ContainedSessionError);
+    }
+    if PreparedBlockDevice::preflight_vhost_user_memory(consumer.memory()).is_ok()
+        || consumer.memory_mut().enable_dirty_tracking().is_ok()
+        || consumer
+            .memory_mut()
+            .insert_region(
+                bangbang_runtime::memory::GuestMemoryRange::new(
+                    GuestAddress::new(aarch64::DRAM_MEM_START + length),
+                    u64::from(page_size),
+                )
+                .map_err(|_| ContainedSessionError)?,
+            )
+            .is_ok()
+        || consumer.memory().discard_range(guest_range).is_complete()
+    {
+        return Err(ContainedSessionError);
+    }
+
+    let resolver = bridge.resolver();
+    resolver
+        .remove_pages(
+            PagerRegionId::new(1).map_err(|_| ContainedSessionError)?,
+            0,
+            u64::from(page_size),
+        )
+        .map_err(|_| ContainedSessionError)?;
+    let mut removed = [0xff_u8; 8];
+    consumer
+        .memory()
+        .read_slice(&mut removed, guest_base)
+        .map_err(|_| ContainedSessionError)?;
+    if removed != [0; 8] {
+        return Err(ContainedSessionError);
+    }
+
+    drop(consumer);
+    bridge.shutdown().map_err(|_| ContainedSessionError)?;
+    pager.shutdown().map_err(|_| ContainedSessionError)
 }
 
 fn pager_vmm() -> Result<VmmSession, PagerError> {
@@ -539,6 +708,7 @@ fn trigger_file_size_enforcement(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PagerProbeCase {
     Complete,
+    Consumer,
     Cancel,
     Terminal,
     Wait,
@@ -554,6 +724,7 @@ impl PagerProbeCase {
         }
         Ok(match value.to_str() {
             Some("pager-complete") => Some(Self::Complete),
+            Some("pager-consumer") => Some(Self::Consumer),
             Some("pager-cancel") => Some(Self::Cancel),
             Some("pager-terminal") => Some(Self::Terminal),
             Some("pager-wait") => Some(Self::Wait),
