@@ -9089,7 +9089,7 @@
     {
       "id": "corpus:snapshot-page-faults",
       "family": "snapshots",
-      "summary": "Public macOS APIs can reproduce the observable external demand-paging contract with task-local Mach exception mediation and HVF stage-two guest faults. The bounded offset-only bangbang-pager-v1 codec, role state machines, concurrent already-connected deadline client, contained connected-peer grant, distinct coordinated private-anonymous lazy-memory owner, task-local public-Mach host-fault bridge, HVF guest read/write/execute fault bridge, ordered host/guest removal, and first-terminal peer-failure propagation are implemented and tested. Evidence includes signed production App Sandbox host population, forwarding, conditional restoration, repeated cleanup, and fixed fail-closed exit plus signed guest execute/read/write population, lazy entry boot, real stage-two revocation and zero refault, two-vCPU coalescing, unowned-exit preservation, source failure, cancellation, contained remove/refault, and cleanup. Native-v1 Uffd remains rejected before resource access; https://github.com/seven332/bangbang/issues/1527 still owns consumer gating, restore, and final signed certification. This is not Linux UFFD descriptor or wire compatibility.",
+      "summary": "Public macOS APIs reproduce the observable external demand-paging contract with a bounded offset-only bangbang-pager-v1 peer, coordinated private-anonymous memory, task-local Mach host faults, HVF stage-two guest faults, ordered removal, first-terminal peer failure, and closed consumer gates. Native-v1 Uffd now restores the narrow fixed-memory profile on macOS Apple Silicon with dirty tracking disabled: platform/profile/grant preflight precedes resource access, state-authenticated image metadata binds the pager session and layout, direct mode connects with a deadline, contained mode claims only the launcher-connected stream without worker memory-file authority, and the complete owner graph is transactional. Signed direct and production-bundle guests restore, resume, reach SYSTEM_OFF, and shut the pager down orderly. https://github.com/seven332/bangbang/issues/1527 still owns final cross-slice certification, so this record remains feasible-but-nonterminal. This is not Linux UFFD descriptor or wire compatibility.",
       "source_refs": [
         "corpus:snapshot-page-faults"
       ],
@@ -10592,7 +10592,7 @@
     {
       "id": "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
       "family": "snapshots",
-      "summary": "Full/File snapshot load can now activate a complete destination dirty epoch and Full commit resets an active source epoch; Diff serialization/merge/restore and UFFD-equivalent backends remain for Wave 6.",
+      "summary": "Full/File snapshot load can activate a complete destination dirty epoch and Full commit resets an active source epoch. The narrow macOS Apple-Silicon native-v1 Uffd pager path is implemented only with dirty tracking disabled; Diff serialization/merge/restore, broader external-paging profiles, and final aggregate certification remain for Wave 6.",
       "source_refs": [
         "corpus:snapshot-page-faults",
         "corpus:snapshot-support"

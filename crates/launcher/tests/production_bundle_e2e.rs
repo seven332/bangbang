@@ -7,6 +7,9 @@
 
 #[path = "../../../tests/support/macos_virtual_block.rs"]
 mod macos_virtual_block;
+#[cfg(target_os = "macos")]
+#[path = "../../../tests/support/snapshot_pager.rs"]
+mod snapshot_pager;
 #[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
 
@@ -41,6 +44,8 @@ use bangbang_session::{
     encode_frame,
 };
 use macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize};
+#[cfg(target_os = "macos")]
+use snapshot_pager::{SnapshotPagerServer, SnapshotPagerTermination};
 use vhost_user_block::{
     VhostUserBlockBackend, VhostUserBlockBackendOptions, VhostUserBlockBackendReport,
 };
@@ -1421,6 +1426,15 @@ fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
     assert_snapshot_output_redacted(&mismatch_output, &mismatch.sensitive_strings());
     assert_eq!(session_entries(), baseline_sessions);
 
+    #[cfg(target_os = "macos")]
+    let pager_fixture = PagerGrantFixture::new("snapshot-restore");
+    #[cfg(target_os = "macos")]
+    let pager =
+        SnapshotPagerServer::start(&pager_fixture.socket, &artifacts.state, &artifacts.memory);
+    #[cfg(target_os = "macos")]
+    let paused_fixture =
+        SnapshotInputGrantFixture::new_with_pager("paused", artifacts, &pager_fixture.socket);
+    #[cfg(not(target_os = "macos"))]
     let paused_fixture = SnapshotInputGrantFixture::new("paused", artifacts);
     let mut paused = spawn_ready_snapshot_grant_api_launcher(
         &bundle,
@@ -1430,7 +1444,11 @@ fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
         false,
     );
     let next_artifacts = paused_fixture.replace_source_pathnames();
-    let paused_load = http_put(&paused.socket, "/snapshot/load", &snapshot_load_body(false));
+    #[cfg(target_os = "macos")]
+    let paused_load_body = snapshot_uffd_load_body(false);
+    #[cfg(not(target_os = "macos"))]
+    let paused_load_body = snapshot_load_body(false);
+    let paused_load = http_put(&paused.socket, "/snapshot/load", &paused_load_body);
     assert_http_status(&paused_load, 204, "load granted snapshot paused");
     let paused_state = http_get(&paused.socket, "/");
     assert_http_status(&paused_state, 200, "read granted paused snapshot state");
@@ -1444,6 +1462,15 @@ fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
         paused.wait("granted snapshot explicit resume").success(),
         "explicitly resumed granted snapshot should reach SYSTEM_OFF"
     );
+    #[cfg(target_os = "macos")]
+    {
+        let pager_report = pager.wait();
+        assert_eq!(pager_report.termination, SnapshotPagerTermination::Shutdown);
+        assert!(
+            pager_report.page_data + pager_report.page_zero > 0,
+            "contained demand-backed restore should request bound pages"
+        );
+    }
     assert_eq!(session_entries(), baseline_sessions);
 
     let resumed_fixture = SnapshotInputGrantFixture::new("automatic", next_artifacts);
@@ -6552,10 +6579,24 @@ struct SnapshotInputGrantFixture {
     manifest: PathBuf,
     sources: SnapshotArtifactSet,
     opened: SnapshotArtifactSet,
+    pager: Option<PathBuf>,
 }
 
 impl SnapshotInputGrantFixture {
     fn new(case: &str, sources: SnapshotArtifactSet) -> Self {
+        Self::new_with_optional_pager(case, sources, None)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn new_with_pager(case: &str, sources: SnapshotArtifactSet, pager: &Path) -> Self {
+        Self::new_with_optional_pager(case, sources, Some(pager))
+    }
+
+    fn new_with_optional_pager(
+        case: &str,
+        sources: SnapshotArtifactSet,
+        pager: Option<&Path>,
+    ) -> Self {
         let root = TestDir::new(&format!("snapshot-input-{case}"));
         let manifest = fs::canonicalize(root.path())
             .expect("snapshot input root should canonicalize")
@@ -6565,28 +6606,40 @@ impl SnapshotInputGrantFixture {
             memory: replacement_opened_path(&sources.memory, case),
             root: sources.root.clone(),
         };
-        let manifest_json = serde_json::json!({
-            "version": 1,
-            "grants": [
-                {
-                    "id": SNAPSHOT_STATE_INPUT_ID,
-                    "role": "snapshot-state-input",
-                    "access": "read-only",
-                    "source": path_text(&sources.state),
-                },
-                {
+        let mut grants = vec![
+            serde_json::json!({
+                "id": SNAPSHOT_STATE_INPUT_ID,
+                "role": "snapshot-state-input",
+                "access": "read-only",
+                "source": path_text(&sources.state),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_ROOT_ID,
+                "role": "drive-backing",
+                "access": "read-only",
+                "source": path_text(&sources.root),
+            }),
+        ];
+        match pager {
+            Some(pager) => grants.push(serde_json::json!({
+                "id": PAGER_GRANT_ID,
+                "role": "snapshot-pager-stream",
+                "access": "read-write",
+                "source": path_text(pager),
+            })),
+            None => grants.insert(
+                1,
+                serde_json::json!({
                     "id": SNAPSHOT_MEMORY_INPUT_ID,
                     "role": "snapshot-memory-input",
                     "access": "read-only",
                     "source": path_text(&sources.memory),
-                },
-                {
-                    "id": SNAPSHOT_ROOT_ID,
-                    "role": "drive-backing",
-                    "access": "read-only",
-                    "source": path_text(&sources.root),
-                },
-            ],
+                }),
+            ),
+        }
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": grants,
         });
         fs::write(
             &manifest,
@@ -6598,6 +6651,7 @@ impl SnapshotInputGrantFixture {
             manifest,
             sources,
             opened,
+            pager: pager.map(Path::to_path_buf),
         }
     }
 
@@ -6616,7 +6670,7 @@ impl SnapshotInputGrantFixture {
     }
 
     fn sensitive_strings(&self) -> Vec<String> {
-        [
+        let mut sensitive = [
             path_text(&self.manifest),
             path_text(&self.sources.state),
             path_text(&self.sources.memory),
@@ -6633,7 +6687,15 @@ impl SnapshotInputGrantFixture {
         ]
         .into_iter()
         .map(str::to_owned)
-        .collect()
+        .collect::<Vec<_>>();
+        if let Some(pager) = &self.pager {
+            sensitive.extend([
+                path_text(pager).to_owned(),
+                PAGER_GRANT_ID.to_owned(),
+                PAGER_GRANT_REF.to_owned(),
+            ]);
+        }
+        sensitive
     }
 }
 
@@ -9101,6 +9163,20 @@ fn snapshot_load_body(resume_vm: bool) -> String {
         "resume_vm": resume_vm,
     }))
     .expect("snapshot load body should serialize")
+}
+
+#[cfg(target_os = "macos")]
+fn snapshot_uffd_load_body(resume_vm: bool) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "snapshot_path": SNAPSHOT_STATE_INPUT_REF,
+        "mem_backend": {
+            "backend_path": PAGER_GRANT_REF,
+            "backend_type": "Uffd",
+        },
+        "track_dirty_pages": false,
+        "resume_vm": resume_vm,
+    }))
+    .expect("snapshot Uffd load body should serialize")
 }
 
 fn assert_no_snapshot_staging(directory: &Path) {

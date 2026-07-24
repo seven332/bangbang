@@ -9,6 +9,8 @@
 
 #[path = "../../../tests/support/macos_virtual_block.rs"]
 mod macos_virtual_block;
+#[path = "../../../tests/support/snapshot_pager.rs"]
+mod snapshot_pager;
 mod support;
 #[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
@@ -26,6 +28,7 @@ mod macos_arm64 {
     use crate::macos_virtual_block::{
         MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize,
     };
+    use crate::snapshot_pager::{SnapshotPagerServer, SnapshotPagerTermination};
     use crate::support::{
         BangbangProcess, CompletedProcess, TestDir, assert_bad_request_response,
         assert_clean_shutdown, assert_no_content_response, assert_ok_response,
@@ -11126,7 +11129,7 @@ mod macos_arm64 {
             "PUT",
             "/snapshot/load",
             &format!(
-                r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"Uffd"}}}}"#,
+                r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"Uffd"}},"track_dirty_pages":true}}"#,
                 json_string(path_text(&unsupported_state)),
                 json_string(path_text(&unsupported_memory))
             ),
@@ -11163,7 +11166,9 @@ mod macos_arm64 {
         assert!(!missing_load.contains(path_text(&missing_state)));
         assert!(!missing_load.contains(path_text(&missing_memory)));
 
-        let load_paused_body = snapshot_load_body(&state_path, &memory_path, false);
+        let pager_path = test_dir.path().join("snapshot-pager.socket");
+        let pager = SnapshotPagerServer::start(&pager_path, &state_path, &memory_path);
+        let load_paused_body = snapshot_uffd_load_body(&state_path, &pager_path, false);
         let load_paused = http_json_with_io_timeout(
             &paused_socket,
             "PUT",
@@ -11183,7 +11188,7 @@ mod macos_arm64 {
         assert_ok_response(&paused_machine, "GET tracked paused destination machine");
         assert_response_contains(
             &paused_machine,
-            r#""track_dirty_pages":true"#,
+            r#""track_dirty_pages":false"#,
             "GET tracked paused destination machine",
         );
         let resume = http_json(&paused_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
@@ -11196,6 +11201,12 @@ mod macos_arm64 {
             paused_output,
             &paused_socket,
             "explicitly resumed snapshot destination",
+        );
+        let pager_report = pager.wait();
+        assert_eq!(pager_report.termination, SnapshotPagerTermination::Shutdown);
+        assert!(
+            pager_report.page_data + pager_report.page_zero > 0,
+            "demand-backed restore should request at least one bound page"
         );
 
         let resumed = BangbangProcess::start(
@@ -11262,6 +11273,14 @@ mod macos_arm64 {
             r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"File"}},"track_dirty_pages":true,"resume_vm":{resume_vm}}}"#,
             json_string(path_text(state_path)),
             json_string(path_text(memory_path))
+        )
+    }
+
+    fn snapshot_uffd_load_body(state_path: &Path, pager_path: &Path, resume_vm: bool) -> String {
+        format!(
+            r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"Uffd"}},"track_dirty_pages":false,"resume_vm":{resume_vm}}}"#,
+            json_string(path_text(state_path)),
+            json_string(path_text(pager_path))
         )
     }
 

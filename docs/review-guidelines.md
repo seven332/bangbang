@@ -360,9 +360,11 @@ review feasibility and implementation as separate claims. File/COW, eager
 population, or parser recognition must never be relabeled as UFFD-equivalent.
 Review standalone protocol changes against the normative
 [`bangbang-pager-v1` document](snapshot-pager-protocol.md): keep the closed
-header/kind set, pre-allocation bounds, random session binding, monotonic
-request IDs, exact response tuples, terminal cancellation, drained shutdown,
-absolute deadlines, poison-on-stream-failure, and value-redacted diagnostics.
+header/kind set, pre-allocation bounds, nonzero session binding (fresh random
+for standalone callers and exact image-ID/checksum/length binding for
+native-v1), monotonic request IDs, exact response tuples, terminal
+cancellation, drained shutdown, absolute deadlines, poison-on-stream-failure,
+and value-redacted diagnostics.
 Review `LazyGuestMemory` changes as a distinct ownership boundary: ordinary
 initialized-memory APIs must remain unavailable; page metadata must stay
 compact; operations and waiters must remain independently bounded; duplicate
@@ -401,9 +403,15 @@ lazy guest paging until a reviewed composition exists.
 
 Keep Mach task/thread ports, aliases, and host virtual addresses inside the
 VMM, reject unmodified Linux UFFD wire traffic, and require pre-resource
-rejection for bypass profiles. Native-v1 `Uffd` must remain rejected until the
-restore gate, and `corpus:snapshot-page-faults` must remain nonterminal until
-signed guest/removal/failure/cleanup certification completes.
+rejection for bypass profiles. Native-v1 `Uffd` may succeed only for the
+reviewed macOS Apple-Silicon fixed-memory profile with dirty tracking disabled,
+one validated `bangbang-pager-v1` peer, exact state-bound session/layout/source
+offsets, and transactional owner construction. Direct mode must connect with a
+bounded deadline; contained mode must consume only the exact launcher-connected
+pager grant and must not gain snapshot-memory path/file authority. File/COW
+must not become an implicit fallback. `corpus:snapshot-page-faults` must remain
+nonterminal until signed guest/removal/failure/cleanup and final cross-slice
+certification completes.
 
 Run
 `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`

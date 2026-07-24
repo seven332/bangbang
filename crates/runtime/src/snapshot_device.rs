@@ -1556,6 +1556,7 @@ mod tests {
     use crate::startup::{
         PrepareSnapshotV1DeviceProfileError, install_snapshot_v1_runtime,
         prepare_snapshot_v1_device_profile, prepare_snapshot_v1_device_profile_with_root_backing,
+        prepare_snapshot_v1_root_backing_file,
     };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -2157,6 +2158,8 @@ mod tests {
         let vmgenid_base = vmclock_base - 16;
         state.vmgenid = platform(vmgenid_base, 16, 34);
         state.vmclock = platform(vmclock_base, 4096, 35);
+        let supplied = prepare_snapshot_v1_root_backing_file(&state, Some(supplied))
+            .expect("exact supplied backing should validate before memory preparation");
         let layout = GuestMemoryLayout::new(vec![
             GuestMemoryRange::new(
                 GuestAddress::new(aarch64::SYSTEM_MEM_START),

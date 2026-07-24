@@ -14,6 +14,7 @@ use std::time::Instant;
 mod anchored_socket;
 mod api_server;
 mod contained_session;
+mod direct_snapshot_pager;
 mod direct_vhost_user;
 #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
 mod grant_integration_probe;
@@ -36,6 +37,8 @@ use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{RequestError, parse_request_with_limit};
 use bangbang_hvf::HvfBackend;
+#[cfg(target_os = "macos")]
+use contained_session::PagerGrantAuthority;
 use contained_session::{ContainedSession, GrantAuthority};
 use periodic_metrics::{
     PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
@@ -183,6 +186,10 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
                 .as_ref()
                 .and_then(ContainedSession::directory_grant_authority);
             #[cfg(target_os = "macos")]
+            let pager_grant_authority: Option<PagerGrantAuthority> = contained
+                .as_ref()
+                .and_then(ContainedSession::pager_grant_authority);
+            #[cfg(target_os = "macos")]
             let socket_broker_authority = contained
                 .as_ref()
                 .and_then(ContainedSession::socket_broker_authority);
@@ -242,12 +249,14 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             .with_grant_authority(grant_authority.clone())
             .with_vmnet_authority(vmnet_authority);
             #[cfg(target_os = "macos")]
-            let mut vmm = vmm.with_socket_grant_authority(
-                directory_grant_authority.clone(),
-                socket_broker_authority,
-                vhost_user_broker_authority,
-                socket_namespace,
-            );
+            let mut vmm = vmm
+                .with_pager_grant_authority(pager_grant_authority)
+                .with_socket_grant_authority(
+                    directory_grant_authority.clone(),
+                    socket_broker_authority,
+                    vhost_user_broker_authority,
+                    socket_namespace,
+                );
             #[cfg(not(target_os = "macos"))]
             let mut vmm = vmm;
             apply_startup_metrics_config(&mut vmm, metrics_config)?;

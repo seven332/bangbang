@@ -144,14 +144,37 @@ impl HvfExceptionExit {
 
         match exception_class(self.syndrome) {
             ESR_EC_DATA_ABORT_LOWER_EL => {
-                let access = self.decode_mmio_access().ok()?;
+                if self.syndrome & (ESR_ISS_CM | ESR_ISS_S1PTW) != 0 {
+                    return None;
+                }
+                let (range, access) = if self.syndrome & ESR_ISS_ISV != 0 {
+                    let access = self.decode_mmio_access().ok()?;
+                    (
+                        access.range(),
+                        match access.direction() {
+                            HvfMmioDirection::Read => HvfLazyGuestAccess::Read,
+                            HvfMmioDirection::Write => HvfLazyGuestAccess::Write,
+                        },
+                    )
+                } else {
+                    // Signed Apple Silicon restore evidence includes a
+                    // level-three lazy translation abort with ISV clear.
+                    // The handler still proves ownership against the exact
+                    // protected RAM range; one byte is sufficient to select
+                    // its coordinator page, and WnR remains the access class.
+                    let range =
+                        GuestMemoryRange::new(GuestAddress::new(self.physical_address), 1).ok()?;
+                    let access = if self.syndrome & ESR_ISS_WNR == 0 {
+                        HvfLazyGuestAccess::Read
+                    } else {
+                        HvfLazyGuestAccess::Write
+                    };
+                    (range, access)
+                };
                 Some(HvfLazyGuestFaultCandidate {
-                    range: access.range(),
+                    range,
                     virtual_address: GuestAddress::new(self.virtual_address),
-                    access: match access.direction() {
-                        HvfMmioDirection::Read => HvfLazyGuestAccess::Read,
-                        HvfMmioDirection::Write => HvfLazyGuestAccess::Write,
-                    },
+                    access,
                 })
             }
             ESR_EC_INSTRUCTION_ABORT_LOWER_EL => {
@@ -969,6 +992,18 @@ mod tests {
         .expect("aligned data-fault PC should validate");
         assert_eq!(write.range(), range(0x2000, 4));
         assert_eq!(write.access(), HvfLazyGuestAccess::Write);
+
+        let read_without_isv = HvfExceptionExit {
+            syndrome: 0x9200_0007,
+            virtual_address: 0x4000,
+            physical_address: 0x2000,
+        }
+        .decode_lazy_guest_fault_candidate()
+        .expect("signed ISV-free read fault should classify")
+        .validate_pc(0x1000)
+        .expect("aligned ISV-free data-fault PC should validate");
+        assert_eq!(read_without_isv.range(), range(0x2000, 1));
+        assert_eq!(read_without_isv.access(), HvfLazyGuestAccess::Read);
 
         let instruction = HvfExceptionExit {
             syndrome: 0x8200_0006,

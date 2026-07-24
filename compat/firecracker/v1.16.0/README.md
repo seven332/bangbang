@@ -92,15 +92,13 @@ claims mechanically visible.
   API/live outcomes, and retains six explicit #1490 optional-device encoding,
   public restore, clone/version, and portability handoffs.
 - [`snapshot-paging-contract.md`](snapshot-paging-contract.md) is the
-  #1546/#1547/#1548/#1549/#1550 checked public-macOS UFFD-equivalent
-  feasibility, standalone protocol, coordinated lazy-anonymous-memory, and
-  internal host/guest fault ledger. It pins the exact page-fault corpus,
-  upstream observable contract, signed prototype evidence, implemented bounded
-  `bangbang-pager-v1` wire/state/connected-transport slice, distinct runtime
-  anonymous mapping owner/page lifecycle, public-Mach host bridge, HVF
-  read/write/execute guest bridge, current pre-access rejection, security
-  boundary, and remaining #1527 gates without claiming Linux wire
-  compatibility or runtime support.
+  #1546-#1554 checked public-macOS UFFD-equivalent feasibility and delivery
+  ledger. It pins the exact page-fault corpus, upstream observable contract,
+  bounded `bangbang-pager-v1` protocol, distinct lazy-anonymous owner,
+  public-Mach host bridge, HVF read/write/execute guest bridge, contained
+  connected-stream authority, consumer gates, and narrow direct/contained
+  native-v1 restore. The aggregate remains nonterminal for #1555 final
+  certification and does not claim Linux wire compatibility.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -573,7 +571,8 @@ feasibility decision in the checked
 [`snapshot-paging-contract.md`](snapshot-paging-contract.md). It moves only
 `corpus:snapshot-page-faults` from unreviewed audit to
 `missing-platform-feasible` with #1527 as delivery owner; native-v1 `Uffd`
-remains rejected and no terminal evidence is added. #1547 then adds the
+was still rejected at that checkpoint and no terminal evidence was added.
+#1547 then adds the
 standalone closed protocol crate and real inherited-stream process coverage
 without changing that aggregate disposition. #1548 adds the distinct bounded
 private-anonymous owner, compact page coordinator, duplicate-content
@@ -591,8 +590,13 @@ peer-failure propagation. #1553 adds the checked complete consumer table, a
 one-shot protected ordinary-memory view, mutation/export/profile gates, an HVF
 composite retained through partial cleanup, closed public memory borrows, and a
 signed App Sandbox slice/raw/atomic/virtqueue/full-snapshot/removal chain.
-Public restore and final certification remain open, so the current overlay
-remains 228/169/4/17.
+#1554 activates the narrow native-v1 `Uffd` path on macOS Apple Silicon with
+dirty tracking disabled. It adds state-bound pager sessions, exact
+layout/source-offset validation, bounded direct connection, one-time contained
+stream claim without a worker memory-file grant, rollback-owned host/guest
+lazy assembly, and signed direct plus production-bundle restore-to-shutdown
+evidence. Final certification remains open, so the current overlay remains
+228/169/4/17.
 
 ## Commands
 

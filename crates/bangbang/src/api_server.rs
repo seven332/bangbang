@@ -7241,7 +7241,7 @@ mod tests {
                 request_with_body(
                     "PUT",
                     "/snapshot/load",
-                    r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"}}"#,
+                    r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"},"track_dirty_pages":true}"#,
                 ),
                 "Snapshot and restore are not supported.",
             ),

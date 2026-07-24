@@ -1111,16 +1111,18 @@ precise #1490 artifact/restore/clone outcomes, so that checkpoint contained
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 moves one exact corpus record to #1527-owned
 `missing-platform-feasible`, making the current overlay 228/169/4/17 without
-changing native-v1 rejection.
+promoting it before final certification.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
-peer-failure propagation, and checked consumer boundary are guarded separately
-from public runtime integration. The inventory test pins
+peer-failure propagation, checked consumer boundary, and native-v1 restore
+assembly are guarded separately from final aggregate promotion. The inventory
+test pins
 the upstream contract, public macOS environment, signed prototype output,
-unchanged entitlement floor, stable pre-access rejection anchors, exact
-delivery owner, protocol/coordinator/host/guest source and documentation
-anchors, and nonterminal status. The pager package covers canonical framing,
+unchanged entitlement floor, stable pre-access profile rejection anchors,
+direct/contained successful restore evidence, exact delivery owner,
+protocol/coordinator/host/guest/restore source and documentation anchors, and
+nonterminal status. The pager package covers canonical framing,
 every
 split/coalesced boundary, adversarial input, negotiation, exact out-of-order
 matching, concurrent mixed page/removal completion, first-terminal fan-out,
@@ -1164,9 +1166,11 @@ cargo test -p bangbang returns_fault_for_snapshot_endpoint --locked
 Protected-consumer tests additionally pin the one-shot claim, closed profile
 priority, eager-vs-lazy tag, every topology/dirty/discard/export rejection,
 vhost-user shared-memory preflight, public session-borrow closure, and
-composite retention across partial map and failed unmap. The signed guest
-tests consume the composite, so repeat teardown proves the protected view is
-dropped before Mach restoration:
+composite retention across partial map and failed unmap. Combined pmem and
+virtio-mem dispatch borrows also prove that lazy mode takes guest bytes from
+the protected consumer while retaining the mapping-owned executors. The signed
+guest tests consume the composite, so repeat teardown proves the protected view
+is dropped before Mach restoration:
 
 ```sh
 cargo test -p bangbang-hvf --lib --all-features --locked lazy_composite
@@ -1193,7 +1197,8 @@ scripts/run-integration-tests.sh --test app_sandbox -- lazy_host_fault_integrati
 ```
 
 HVF guest-fault unit tests cover the signed-observed data/instruction syndrome
-classifier, complete cross-page resolution before permission, serialized
+classifier, including the Apple-Silicon data-abort form without instruction
+syndrome metadata, complete cross-page resolution before permission, serialized
 read/write/execute permission unions, duplicate-vCPU coalescing, one stale
 admission followed by no-progress failure, transactional setup cleanup,
 source/protection terminalization, redaction, dirty/raw exclusion, and canceled
@@ -1211,11 +1216,27 @@ scripts/run-integration-tests.sh --test hvf_lifecycle -- hvf_lazy_guest_
 scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page
 ```
 
+Native-v1 restore tests keep `File` behavior as the eager regression path and
+cover `Uffd` profile ordering, state-derived pager-session identity, exact
+header-relative region offsets, invalid topology/limits/peer negotiation,
+transactional failure cleanup, and path/value redaction. The signed executable
+case runs an external peer that owns the committed memory image, restores a
+paused destination through direct `Uffd`, resumes it, and observes guest
+`SYSTEM_OFF` plus orderly pager shutdown. The production-bundle case repeats
+the restore through the launcher-connected grant while deliberately omitting
+the worker's snapshot-memory input grant:
+
+```sh
+cargo test -p bangbang native_v1_uffd --all-features --locked
+cargo test -p bangbang-hvf --lib --all-features --locked snapshot_restore
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- macos_arm64::signed_executable_creates_and_restores_native_v1_snapshot_across_processes --exact
+scripts/run-integration-tests.sh --test production_bundle -- normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore --exact
+```
+
 The final #1527 certification must run the complete signed wrapper without
 `--allow-unsupported` and exercise the production pager path before promotion.
-The retained prototypes and implemented internal pager/removal path are not
-restore/final-certification evidence; consumer-audit evidence is now checked
-and signed independently.
+The focused direct and contained successes are restore evidence, but they are
+not the final cross-slice stress/entitlement/full-matrix certification.
 
 Run its two focused gates with:
 

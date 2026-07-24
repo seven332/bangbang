@@ -4672,6 +4672,12 @@ impl BlockFileBacking {
         }
     }
 
+    pub(crate) fn into_snapshot_read_only_file(self) -> File {
+        debug_assert!(self.is_read_only);
+        debug_assert_eq!(self.kind, BlockFileBackingKind::REGULAR_FILE);
+        self.file
+    }
+
     pub(crate) const fn uses_supplied_file(&self) -> bool {
         matches!(self.origin, BlockFileBackingOrigin::SuppliedFile)
     }

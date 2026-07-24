@@ -86,12 +86,10 @@ fn snapshot_paging_feasibility_policy_is_stable() {
     );
     assert!(
         capability.summary.contains(DELIVERY_ISSUE)
+            && capability.summary.contains("Native-v1 Uffd now restores")
             && capability
                 .summary
-                .contains("Native-v1 Uffd remains rejected")
-            && capability
-                .summary
-                .contains("HVF guest read/write/execute fault bridge")
+                .contains("without worker memory-file authority")
             && capability.summary.contains("not Linux UFFD"),
         "snapshot paging summary must retain owner, runtime, and compatibility limits"
     );
@@ -163,6 +161,14 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "pager-consumer",
         "signed_pager_consumer_chain_runs_inside_app_sandbox",
         "scripts/run-integration-tests.sh --test production_bundle -- pager_grant",
+        "Implemented native-v1 pager restore",
+        "ProcessVmm::preflight_native_v1_memory_backend",
+        "PreparedHvfSnapshotV1State::prepare_lazy",
+        "image_id[16] || crc64_jones_le[8] || data_length_le[8]",
+        "file_offset - 48",
+        "native_v1_uffd_dirty_tracking_rejects_before_artifact_or_starter_access",
+        "native_v1_uffd_rejects_reserved_pager_reference_without_authority_before_state_open",
+        "normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore",
         "BBPAGER\\0",
         "cargo test -p bangbang-pager",
         "classify_v1_load_request",

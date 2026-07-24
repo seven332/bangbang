@@ -5,9 +5,9 @@ Firecracker snapshot page-fault corpus and the completed #1547 standalone
 protocol, #1548 coordinated lazy-anonymous-memory, #1549 task-local host
 fault, #1550 HVF guest-fault, #1551 contained peer-broker, and #1552
 removal/peer-failure slices, plus #1553's complete consumer inventory and
-gates. It is not an aggregate runtime
-implementation claim: bangbang still rejects native-v1 `Uffd` before artifact
-or backend access.
+gates, and #1554's native-v1 direct/contained restore assembly. The exact
+capability remains nonterminal until #1555 final certification; this ledger
+does not claim Linux UFFD descriptor or wire compatibility.
 
 ## Pinned upstream contract
 
@@ -234,8 +234,8 @@ cargo test -p bangbang-runtime lazy_memory --all-features --locked
 This slice installs no Mach exception port, HVF mapping/protection, socket,
 source authority, peer state machine, native-v1 restore route, or public API
 success. The coordinator alone does not enforce logical absence; the host and
-guest adapters below bind its two internal protection planes, while bypassing
-consumers remain gated on a later audit slice.
+guest adapters below bind its two internal protection planes. Later sections
+record the completed consumer gates and public restore composition.
 
 ## Implemented task-local host fault bridge
 
@@ -317,8 +317,9 @@ scripts/run-integration-tests.sh --test app_sandbox -- lazy_host_fault_integrati
 the same `LazyGuestMemory`. It rejects a peer-selected in-flight reduction
 before the first page operation because the coordinator has already
 preconstructed that exact combined operation bound; the protocol's independent
-maximum-frame reduction remains supported. This slice still does not certify every memory
-consumer, make native-v1 `Uffd` succeed, or promote the aggregate capability.
+maximum-frame reduction remains supported. The #1549 slice alone did not
+certify every memory consumer or make native-v1 `Uffd` succeed; #1553 and #1554
+close those narrower gates without promoting the aggregate capability.
 
 ## Implemented HVF guest fault bridge
 
@@ -376,8 +377,9 @@ scripts/run-integration-tests.sh --test hvf_lifecycle -- hvf_lazy_guest_
 scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page
 ```
 
-The source may now be the pager-backed adapter. Bypassing memory consumers,
-native-v1 restore activation, and aggregate promotion remain deferred.
+The source may now be the pager-backed adapter. #1553 later closes bypassing
+memory consumers and #1554 activates the supported native-v1 composition;
+aggregate promotion remains deferred.
 
 ## Implemented contained pager peer broker
 
@@ -412,10 +414,9 @@ launcher/worker signatures and entitlement floor:
 scripts/run-integration-tests.sh --test production_bundle -- pager_grant
 ```
 
-The same connected stream can now be adopted by `HvfLazyPager`; public restore
-assembly and native-v1 activation remain deferred. The consumer boundary is
-completed below. The reference peer is support tooling, not a daemon or Linux
-UFFD compatibility.
+The same connected stream is adopted by `HvfLazyPager`; #1554's public restore
+assembly consumes this exact authority after the consumer boundary below. The
+reference peer is support tooling, not a daemon or Linux UFFD compatibility.
 
 ## Implemented protected lazy consumer boundary
 
@@ -458,10 +459,9 @@ incompatible profile.
 `LazyGuestMemoryConsumerProfile` is the closed backend-neutral preflight
 classifier for dirty tracking, shared memory, external-process access,
 ordinary balloon reclaim, and dynamic memory topology. It has a stable
-priority and typed `LazyGuestMemoryConsumerRejection`. #1554 will invoke it
-while assembling the supported `Uffd` restore; the current blanket public
-`Uffd` rejection remains earlier than every path, socket, grant, artifact, or
-backend access in this slice.
+priority and typed `LazyGuestMemoryConsumerRejection`. #1554 invokes it before
+any path, socket, grant claim, artifact, or backend access while assembling the
+supported `Uffd` restore.
 
 ### Checked guest-memory consumer inventory
 
@@ -511,6 +511,84 @@ scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_in
 scripts/run-integration-tests.sh --test production_bundle -- signed_pager_consumer_chain_runs_inside_app_sandbox
 ```
 
+## Implemented native-v1 pager restore
+
+#1554 removes the blanket native-v1 `Uffd` classifier rejection and keeps the
+Firecracker-shaped `backend_type`/`backend_path` API. On macOS Apple Silicon,
+the accepted path is the existing narrow fixed-memory native-v1 profile with
+dirty tracking disabled. Here `Uffd` means one `bangbang-pager-v1` peer; an
+unmodified Linux UFFD descriptor, JSON/SCM_RIGHTS handshake, or event stream is
+not accepted.
+
+`ProcessVmm::preflight_native_v1_memory_backend` runs after pristine-machine
+policy and before configured path, socket, snapshot artifact, or backend
+access. It validates the platform and
+`LazyGuestMemoryConsumerProfile::in_process_fixed`; dirty, shared/export,
+external-process, ordinary discard, and dynamic-topology profiles fail there.
+Contained mode additionally requires an active exact
+`SnapshotPagerStream` grant and validates it without consuming the one-time
+stream. Direct mode rejects reserved grant syntax and validates only the Unix
+path shape at this stage.
+
+`PreparedHvfSnapshotV1State::prepare_lazy` decodes the state-only artifact and
+validates the complete memory binding and platform ranges without opening the
+snapshot memory file. Each binding range becomes a pager region with its exact
+GPA and `file_offset - 48` data-source offset. Region count, host page size,
+total pages, combined operations, frame size, waiter count, ordering, overlap,
+alignment, and overflow are checked before the peer is acquired. The persisted
+root selector is also resolved or grant-adopted, then validated for exact
+identity, capacity, device ID, and read-only regular-file shape before peer
+acquisition. The peer session is state-bound as:
+
+```text
+image_id[16] || crc64_jones_le[8] || data_length_le[8]
+```
+
+Direct mode connects to `backend_path` under the bounded snapshot-pager
+deadline. Contained mode one-time claims the launcher-connected stream and
+deliberately needs no `SnapshotMemoryInput` file grant in the worker. Both
+paths complete the exact `Hello`/regions/`Start`/`Ready` negotiation before an
+HVF VM owner exists.
+
+Preparation then owns `LazyGuestMemory`, `HvfLazyPager`, the task-local
+`HvfLazyHostFaultBridge`, its one-shot `HvfLazyGuestMemoryConsumer`, validated
+root/device state, and the installed runtime in dependency order. Any failure
+cancels the pager and drops those owners in reverse order. Once the one-shot
+peer is adopted, every later preparation, restore, or worker-publication
+failure is terminal for that VMM process; only failures before adoption remain
+retryable. The restore
+transaction creates and validates the VM/GIC, maps every lazy region with zero
+initial stage-two access while retaining the composite, starts the vCPU owner,
+restores architecture/GIC/time/identity state, and publishes the paused process
+session only after every stage succeeds. Failure uses the existing typed
+precommit/postcommit cleanup disposition. There is no eager read, memory-file
+mapping, or `File`/COW fallback.
+
+In-process device notifications borrow bytes from the protected consumer while
+pmem/virtio-mem executors remain mapping-owned; this closes the combined-borrow
+path that eager mappings previously supplied. Real Apple Silicon data
+translation aborts may arrive without instruction-syndrome metadata. The lazy
+classifier now rejects external-abort, invalid-address, cache-maintenance, and
+stage-one-walk forms first, then uses WnR plus an exact one-byte IPA ownership
+probe for that form; the protected-range handler still makes the final
+authority decision.
+
+Focused tests cover state-derived session bytes, lazy topology, profile/grant
+ordering, direct connector redaction, combined protected-memory borrows,
+ISV-clear data aborts, eager `File` regression, peer shutdown, and preparation/
+restore cleanup. Signed direct execution restores a paused destination from an
+externally owned memory image, resumes it, reaches guest `SYSTEM_OFF`, and
+observes orderly pager shutdown. The normal production bundle repeats that
+path through the exact launcher grant while omitting worker memory-file
+authority:
+
+```sh
+cargo test -p bangbang native_v1_uffd --all-features --locked
+cargo test -p bangbang-hvf --lib --all-features --locked snapshot_restore
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- macos_arm64::signed_executable_creates_and_restores_native_v1_snapshot_across_processes --exact
+scripts/run-integration-tests.sh --test production_bundle -- normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore --exact
+```
+
 ## Decision and remaining delivery boundary
 
 Public macOS APIs can reproduce the observable external-demand-paging
@@ -545,25 +623,29 @@ or host-wide security or swap change.
 | Public custom Mach memory-object pager | Rejected by the public SDK/runtime evidence; hidden or privileged pager interfaces are outside support. |
 | HVF faults plus explicit host-access hooks | Insufficient as a complete boundary because raw pointers and external/shared mappings can bypass a permanently fallible call-site audit. |
 | Direct external Mach exception handler | Rejected because it exports whole-task authority, has unsafe death behavior, and cannot use the tested production App Sandbox discovery path. |
-| Permanent UFFD rejection | No longer the best platform conclusion after the signed combined public prototype, but remains the correct runtime behavior until delivery completes. |
+| Permanent UFFD rejection | Replaced for the narrow supported macOS profile by #1554's bounded VMM-mediated peer path; unsupported profiles still reject before resources. |
 
 ## Current runtime and promotion gates
 
-`crates/runtime/src/snapshot.rs::classify_v1_load_request` still rejects every
-non-File native-v1 backend with `LoadMemoryBackend` before artifact access or
-VM construction. The focused
-`native_v1_load_policy_rejects_each_unsupported_dimension` and
-`returns_fault_for_snapshot_endpoint` tests preserve that result; the signed
-`signed_executable_creates_and_restores_native_v1_snapshot_across_processes`
-case additionally proves private UFFD paths remain redacted.
+`crates/runtime/src/snapshot.rs::classify_v1_load_request` now admits both
+`File` and `Uffd`; higher-level
+`ProcessVmm::preflight_native_v1_memory_backend` enforces the macOS target,
+closed lazy-consumer profile, dirty exclusion, and exact direct/contained pager
+authority before artifact access or VM construction. The focused
+`native_v1_load_policy_rejects_each_unsupported_dimension`,
+`native_v1_uffd_dirty_tracking_rejects_before_artifact_or_starter_access`, and
+`native_v1_uffd_rejects_reserved_pager_reference_without_authority_before_state_open`
+tests pin the split. `returns_fault_for_snapshot_endpoint` retains the
+dirty-`Uffd` public rejection and redaction path.
 
 Delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527)
-retains two integration/certification gates after #1553:
+retains one certification gate after #1554:
 
-1. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
-2. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
+1. [#1555](https://github.com/seven332/bangbang/issues/1555) runs cross-slice
+   stress, complete entitlement inspection, the full validation matrix, and
+   promotes only direct evidence.
 
-There is no public `Uffd` success before #1554 and no
+Public `Uffd` success is now implemented, but there is no
 `implemented-and-verified` inventory result before #1555. Delivery-time
 `missing-platform-feasible` remains nonterminal and final capability validation
 continues to reject it.
@@ -572,4 +654,4 @@ continues to reject it.
 
 | Capability identity | Disposition | Delivery owner | Evidence | Result |
 | --- | --- | --- | --- | --- |
-| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented concurrent pager client/protocol/process/reference-peer tests, nonblocking coordinator terminal/concurrency tests, host/guest transition-gate removal and zero-refault tests, signed real-HVF revocation/refault, pager-backed source failure fan-out, and typed contained connected-stream remove/refault plus broker lifecycle tests; unchanged pre-access rejection | `nonterminal` |
+| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; protocol/coordinator/host/guest/removal/consumer tests; signed direct and App Sandbox fault/removal/failure/cleanup evidence; exact contained connected-stream brokerage; state-bound lazy restore assembly; signed direct restore and production-bundle restore without worker memory-file authority; final #1555 certification outstanding | `nonterminal` |

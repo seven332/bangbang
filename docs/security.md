@@ -2119,10 +2119,10 @@ into unbounded waits.
 
 The checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
-records positive public-macOS feasibility plus implemented standalone protocol
-and client, internal anonymous-memory ownership and fault/removal slices, plus
-a contained connected-peer grant, not an activated restore backend. Native-v1
-`Uffd` still rejects before path, socket, artifact, or backend access.
+records positive public-macOS feasibility, the standalone protocol and client,
+internal anonymous-memory ownership and fault/removal slices, the contained
+connected-peer grant, and the activated narrow native-v1 restore path. The
+aggregate inventory record remains nonterminal until final certification.
 
 The accepted complete boundary uses two in-worker protection planes: public
 Mach task exceptions mediate host accesses to owned absent guest pages, and HVF
@@ -2134,8 +2134,13 @@ registered-range authority.
 The external content owner receives neither task ports nor host virtual
 addresses. The implemented
 [`bangbang-pager-v1` contract](snapshot-pager-protocol.md) carries only random
-session IDs, opaque region/request/generation IDs, aligned offsets and bounded
-page data. It has no peer strings, paths, addresses, descriptors, or task
+or state-bound session IDs, opaque region/request/generation IDs, aligned
+offsets and bounded page data. Native-v1 derives its 32-byte session from the
+state-bound 16-byte memory image ID, checksum, and data length, so a conforming
+peer can reject the wrong artifact before `Ready`. As with Firecracker's
+external handler, that peer remains trusted for the page bytes it returns; the
+session is binding, not content authentication. The wire has no peer strings,
+paths, addresses, descriptors, or task
 ports; Debug and errors are value-redacted. Its transport accepts only an
 already-connected stream, uses one absolute deadline across partial I/O,
 suppresses `SIGPIPE`, and becomes terminal after malformed input, timeout, EOF,
@@ -2155,6 +2160,18 @@ grant ID before adoption. Unclaimed authority closes on reader loss or
 contained-session teardown. This adds no path/directory/listener authority,
 ambient network entitlement, dynamic Mach service, root requirement, private
 API, entitlement weakening, or host-wide setting.
+
+For native-v1 `Uffd`, platform, fixed-memory machine profile, dirty/shared/
+external/discard/topology consumer policy, and contained grant identity are
+checked before a configured path, socket, snapshot artifact, or VM backend is
+accessed. Direct mode then makes one bounded path connection. Contained mode
+one-time claims only the preconnected stream and never receives the snapshot
+memory file. State decoding validates the memory binding, exact GPA topology,
+header-relative peer offsets, root backing, and negotiated peer limits before
+the first VM owner is published. No failure falls back to eager `File` or COW.
+After the one-shot peer is claimed or connected, any later preparation,
+restore, or paused-worker publication failure sends cancellation and makes the
+VMM process terminal; pre-adoption failures alone remain retryable.
 
 The runtime's `LazyGuestMemory` is a separate owner rather than an alternate
 mode on ordinary initialized `GuestMemory`. It allocates only private anonymous
@@ -2185,11 +2202,15 @@ fault upgrades it.
 The guest bridge maps the retained private-anonymous regions into HVF at their
 declared maximum permissions and removes all stage-two access before
 publication. Only signed-observed ARM64 data- and instruction-abort forms can
-reach the resolver. The classifier validates the access width/direction,
-faulting IPA, instruction VA/PC relationship, and owned range; HVC and trapped
-system registers retain precedence, and unowned or malformed exceptions fall
-through to the existing dirty/MMIO policy. A fault that spans pages resolves
-every page before publishing any guest permission.
+reach the resolver. When ARM supplies instruction-syndrome metadata, the
+classifier validates exact access width and direction. A real Apple Silicon
+translation abort may clear that metadata; after rejecting external-abort,
+invalid-address, cache-maintenance, and stage-one-walk forms, the classifier
+uses WnR plus a one-byte IPA ownership proof and lets the exact protected-range
+handler establish authority. Instruction faults retain the VA/PC and aligned
+IPA checks. HVC and trapped system registers keep precedence, and unowned or
+malformed exceptions fall through to the existing dirty/MMIO policy. A fault
+that spans pages resolves every page before publishing any guest permission.
 
 Guest permission publication is serialized per mapping. Read, write, and
 execute faults add only `READ`, `READ|WRITE`, or `EXECUTE` respectively, and
@@ -2261,9 +2282,12 @@ timeout/EOF, peer death, worker death, cancellation, terminal, and orderly
 shutdown at the process boundary. `HvfLazyPager` now maps those outcomes onto
 the live coordinator as the first stable nonblocking `PeerFailure`, releasing
 pending host and guest faults without waiting on a retained transition guard.
-They still cannot trigger native-v1 restore.
-External/shared mappings that bypass the task-local bridge remain pre-resource
-rejections until independently certified.
+The native-v1 restore owner retains the pager, resolver, host bridge, protected
+memory view, guest-fault handler, mappings, vCPU, and devices in dependency
+order; normal teardown sends orderly pager shutdown only after live users have
+joined, while every partial-construction failure cancels and unwinds in reverse
+order. External/shared mappings and other consumers that bypass the task-local
+bridge remain pre-resource rejections.
 
 ## Guest Data Exposure
 

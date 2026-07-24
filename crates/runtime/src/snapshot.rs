@@ -444,7 +444,6 @@ impl fmt::Debug for SnapshotLoadInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotV1Rejection {
     CreateSnapshotType,
-    LoadMemoryBackend,
     LoadClockRealtime,
     LoadNetworkOverrides,
     LoadVsockOverride,
@@ -560,9 +559,6 @@ pub(crate) fn classify_v1_load(
 pub(crate) fn classify_v1_load_request(
     input: &SnapshotLoadInput,
 ) -> Result<(), SnapshotV1Rejection> {
-    if input.mem_backend.backend_type != SnapshotMemoryBackendType::File {
-        return Err(SnapshotV1Rejection::LoadMemoryBackend);
-    }
     if input.clock_realtime {
         return Err(SnapshotV1Rejection::LoadClockRealtime);
     }
@@ -882,7 +878,7 @@ mod tests {
                 true,
                 clean_load_profile(),
             ),
-            Err(SnapshotV1Rejection::LoadMemoryBackend)
+            Ok(())
         );
         assert_eq!(
             classify_v1_load(

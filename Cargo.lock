@@ -150,6 +150,7 @@ name = "bangbang-launcher"
 version = "0.1.0"
 dependencies = [
  "bangbang-pager",
+ "bangbang-runtime",
  "bangbang-session",
  "libc",
  "plist",

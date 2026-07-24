@@ -1019,6 +1019,48 @@ pub fn prepare_snapshot_v1_device_profile(
     prepare_snapshot_v1_device_profile_with_root_backing(state, memory, now, None)
 }
 
+/// Opens and validates the exact native-v1 root backing before later device
+/// preparation.
+///
+/// Lazy restore uses this boundary before acquiring its one-shot content peer.
+/// The returned descriptor is the same validated owner later adopted by device
+/// preparation, so no persisted path is reopened.
+pub fn prepare_snapshot_v1_root_backing_file(
+    state: &SnapshotV1DeviceState,
+    root_backing: Option<File>,
+) -> Result<File, PrepareSnapshotV1DeviceProfileError> {
+    let root = state.root_block();
+    snapshot_v1_drive_config(root)?;
+    validate_mmio_metadata(
+        root.mmio(),
+        crate::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+    )
+    .map_err(|_| PrepareSnapshotV1DeviceProfileError::InvalidBlockMetadata)?;
+    if matches!(
+        state.block_retry(),
+        SnapshotV1BlockRetryState::After { remaining_nanos: 0 }
+    ) {
+        return Err(PrepareSnapshotV1DeviceProfileError::InvalidRetry);
+    }
+
+    let (backing, backing_identity) = match root_backing {
+        Some(file) => BlockFileBacking::from_snapshot_read_only_file(file),
+        None => BlockFileBacking::open_snapshot_read_only(root.path()),
+    }
+    .map_err(|_| PrepareSnapshotV1DeviceProfileError::BlockBacking)?;
+    if backing_identity != root.backing_identity() {
+        return Err(PrepareSnapshotV1DeviceProfileError::BlockBackingMismatch);
+    }
+    let config_space = VirtioBlockConfigSpace::from_backing(&backing, root.cache_type());
+    if config_space.capacity_sectors() != root.capacity_sectors() {
+        return Err(PrepareSnapshotV1DeviceProfileError::BlockCapacityMismatch);
+    }
+    if !backing.snapshot_device_id_is_compatible(root.drive_id(), root.device_id()) {
+        return Err(PrepareSnapshotV1DeviceProfileError::BlockDeviceIdMismatch);
+    }
+    Ok(backing.into_snapshot_read_only_file())
+}
+
 /// Prepares the native-v1 device profile with an optional exact root backing.
 ///
 /// When supplied, the already-opened backing is adopted without resolving the
@@ -1148,8 +1190,8 @@ pub fn prepare_snapshot_v1_device_profile_with_root_backing(
 }
 
 /// Baseline runtime owners installed from a validated native-v1 device value.
-pub struct InstalledSnapshotV1Runtime {
-    pub memory: GuestMemory,
+pub struct InstalledSnapshotV1Runtime<MemoryOwner = GuestMemory> {
+    pub memory: MemoryOwner,
     pub mmio_dispatcher: MmioDispatcher,
     pub runtime_resources: Arm64BootRuntimeResources,
     pub drive_config: DriveConfig,
@@ -1158,12 +1200,48 @@ pub struct InstalledSnapshotV1Runtime {
     pub serial_output_buffer: SharedSerialOutputBuffer,
 }
 
-impl fmt::Debug for InstalledSnapshotV1Runtime {
+impl<MemoryOwner> fmt::Debug for InstalledSnapshotV1Runtime<MemoryOwner> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InstalledSnapshotV1Runtime")
             .field("profile", &"native-v1")
             .field("resources", &"<redacted>")
             .finish()
+    }
+}
+
+/// Memory-owner-independent native-v1 runtime values.
+pub struct InstalledSnapshotV1RuntimeParts {
+    pub mmio_dispatcher: MmioDispatcher,
+    pub runtime_resources: Arm64BootRuntimeResources,
+    pub drive_config: DriveConfig,
+    pub block_retry: SnapshotV1BlockRetryState,
+    pub serial_output: SharedSerialOutput,
+    pub serial_output_buffer: SharedSerialOutputBuffer,
+}
+
+impl fmt::Debug for InstalledSnapshotV1RuntimeParts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InstalledSnapshotV1RuntimeParts")
+            .field("profile", &"native-v1")
+            .field("resources", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<MemoryOwner> InstalledSnapshotV1Runtime<MemoryOwner> {
+    /// Separates the memory owner from the already installed common runtime.
+    pub fn into_parts(self) -> (MemoryOwner, InstalledSnapshotV1RuntimeParts) {
+        (
+            self.memory,
+            InstalledSnapshotV1RuntimeParts {
+                mmio_dispatcher: self.mmio_dispatcher,
+                runtime_resources: self.runtime_resources,
+                drive_config: self.drive_config,
+                block_retry: self.block_retry,
+                serial_output: self.serial_output,
+                serial_output_buffer: self.serial_output_buffer,
+            },
+        )
     }
 }
 
@@ -1212,6 +1290,31 @@ pub fn install_snapshot_v1_runtime(
     ranges.extend(memory.regions().iter().map(|region| region.range()));
     let layout =
         GuestMemoryLayout::new(ranges).map_err(|_| InstallSnapshotV1RuntimeError::InvalidLayout)?;
+
+    install_snapshot_v1_runtime_with_memory_owner(
+        profile,
+        machine_config,
+        memory,
+        layout,
+        rtc_mmio_layout,
+    )
+}
+
+/// Installs native-v1 runtime values around an already validated memory owner.
+///
+/// The supplied layout must describe the exact protected memory view retained
+/// by `memory`. Keeping that relationship explicit lets a platform backend
+/// retain a composite owner without exposing or duplicating its guest memory.
+pub fn install_snapshot_v1_runtime_with_memory_owner<MemoryOwner>(
+    profile: PreparedSnapshotV1DeviceProfile,
+    machine_config: MachineConfig,
+    memory: MemoryOwner,
+    layout: GuestMemoryLayout,
+    rtc_mmio_layout: RtcMmioLayout,
+) -> Result<InstalledSnapshotV1Runtime<MemoryOwner>, InstallSnapshotV1RuntimeError> {
+    if layout.ranges().is_empty() {
+        return Err(InstallSnapshotV1RuntimeError::InvalidLayout);
+    }
 
     let PreparedSnapshotV1DeviceProfileParts {
         drive_config,

@@ -174,8 +174,9 @@ remain out of diagnostics.
 The closed roles cover read-only startup config/metadata, kernel/initrd and
 snapshot inputs; repeatable read-only/read-write drive and pmem backing;
 write-only logger/metrics/serial sinks; create-children API/vsock/snapshot
-output directories; and repeatable connect-only vhost-user socket directories.
-Regular-file authority is descriptor-only. Block-special drive authority uses
+output directories; repeatable connect-only vhost-user socket directories; and
+one read-write already-connected snapshot-pager stream. Regular-file authority
+is descriptor-only. Block-special drive authority uses
 one BBG2 record binding the descriptor, exact access/status, rdev, logical block
 size, block count, and checked capacity. Each mutable
 directory combines an anchor descriptor with a bounded freshly minted ordinary
@@ -309,13 +310,21 @@ ownership; no hard revocation is claimed.
 
 Snapshot describe/state/memory inputs use the same exact file-reference grammar
 with distinct singleton read-only roles. Early description duplicates and
-inspects only the granted regular file. Load duplicates state only for bounded
-decode, discovers any persisted grant-tagged root selector, then atomically
-takes every tagged state, memory, and read-only `DriveBacking` input. The
-prepared state, anonymous memory, and supplied root file complete restore
-without reopening a submitted or persisted tag. Direct and mixed ordinary
-members retain pathname adapters. Snapshot input grants are one-time after the
-atomic take; wrong, missing, duplicate, or mismatched authority consumes none.
+inspects only the granted regular file. A `File` load duplicates state for
+bounded decode, discovers any persisted grant-tagged root selector, then
+atomically takes every tagged state, memory, and read-only `DriveBacking`
+input. The prepared state, eager anonymous memory, and supplied root file
+complete restore without reopening a submitted or persisted tag.
+
+A native-v1 `Uffd` load instead validates the exact singleton
+`snapshot-pager-stream` reference before state access, prepares only state and
+the read-only root backing, then one-time claims the already-connected stream.
+The worker receives no snapshot-memory input file. The launcher has already
+performed the no-follow, current-user, deadline-bounded socket connection and
+the worker has revalidated the stream/source/peer identity and role. Direct
+mode keeps ordinary state and root path adapters plus a bounded pager-socket
+connector. Wrong, missing, duplicate, inactive, or mismatched pager authority
+fails without ambient path fallback.
 
 Snapshot outputs use `bangbang-grant:<GrantId>/<SnapshotOutputChild>`, where
 the child is one 1–255 byte UTF-8 component with no NUL or `/` and is not `.` or

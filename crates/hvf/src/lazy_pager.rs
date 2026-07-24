@@ -94,6 +94,19 @@ impl HvfLazyPager {
             let _ = memory.signal_terminal(LazyGuestMemoryTerminalReason::TransitionFailure);
             HvfLazyPagerError::Pager { source }
         })?;
+        Self::connect_with_session(memory, stream, timeout, session)
+    }
+
+    /// Negotiates one session bound to a caller-validated nonzero identity.
+    ///
+    /// Native snapshot restore uses this to bind the peer to the memory-image
+    /// identity already authenticated by the state artifact.
+    pub fn connect_with_session(
+        memory: Arc<LazyGuestMemory>,
+        stream: UnixStream,
+        timeout: Duration,
+        session: PagerSessionId,
+    ) -> Result<Self, HvfLazyPagerError> {
         let regions = memory.pager_regions().map_err(|source| {
             let _ = memory.signal_terminal(LazyGuestMemoryTerminalReason::TransitionFailure);
             HvfLazyPagerError::Coordinator { source }
@@ -184,6 +197,22 @@ impl HvfLazyPageSource for HvfLazyPager {
                 request.length(),
             )
             .or_else(|source| self.peer_failure(source))
+    }
+
+    fn cancel(&self) -> Result<(), HvfLazyPageSourceError> {
+        HvfLazyPager::cancel(self).map_err(|_| HvfLazyPageSourceError::peer_failure())
+    }
+
+    fn shutdown(&self) -> Result<(), HvfLazyPageSourceError> {
+        match HvfLazyPager::shutdown(self) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let _ = self
+                    .memory
+                    .signal_terminal(LazyGuestMemoryTerminalReason::PeerFailure);
+                Err(HvfLazyPageSourceError::peer_failure())
+            }
+        }
     }
 }
 

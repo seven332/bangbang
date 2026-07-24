@@ -34,6 +34,10 @@ impl fmt::Display for DirectVhostUserConnectError {
 
 impl std::error::Error for DirectVhostUserConnectError {}
 
+pub(crate) fn validate_path(path: &Path) -> Result<(), DirectVhostUserConnectError> {
+    unix_socket_address(path).map(|_| ())
+}
+
 pub(crate) fn connect(
     path: &Path,
     timeout: Duration,
