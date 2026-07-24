@@ -804,7 +804,7 @@ Those eight promotions moved the global counts at that checkpoint to
 228/170/3/17. #1491 retains repository-wide performance/observability work,
 not a directly owned live vsock row.
 
-After #1550, the checked
+After #1551, the checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 moves only `corpus:snapshot-page-faults` from `audit-required` to
 `missing-platform-feasible` with #1527 as its delivery owner. This records
@@ -826,11 +826,21 @@ and retries without advancing PC. Focused and signed tests cover multi-vCPU
 coalescing, stale/no-progress handling, execute/read/write population, guest
 entry, source failure, cancellation, and cleanup.
 
+The production launcher now also walks and anchors one configured pager socket,
+performs a bounded current-user connection outside App Sandbox, and transfers
+only a typed connected stream with minimum identity metadata through the atomic
+startup grant. The worker independently revalidates and claims that stream
+once. A bounded support-only reference peer and signed production-bundle cases
+cover complete protocol exchange, cancellation/terminal behavior, malformed
+traffic, EOF/timeout, both process-death orders, repeat launch, cleanup,
+redaction, signatures, and unchanged entitlements.
+
 This is still not public runtime support: both bridges accept only a trusted
-in-process source, native-v1 `Uffd` rejects before resource access, the
-protocol is not Linux UFFD wire-compatible, and
-broker/removal/consumer/restore integration remains open. The current global
-counts remain 228/169/4/17.
+in-process source, the granted stream is not wired to the coordinator,
+native-v1 `Uffd` rejects before resource access, the protocol is not Linux UFFD
+wire-compatible, and removal/failure propagation, consumer audit, restore, and
+final certification remain open. The current global counts remain
+228/169/4/17.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,

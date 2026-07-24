@@ -3,7 +3,8 @@
 This ledger records the #1527 public-macOS feasibility decision for the pinned
 Firecracker snapshot page-fault corpus and the completed #1547 standalone
 protocol, #1548 coordinated lazy-anonymous-memory, and #1549 task-local host
-fault, and #1550 HVF guest-fault slices. It is not an aggregate runtime
+fault, #1550 HVF guest-fault, and #1551 contained peer-broker slices. It is not
+an aggregate runtime
 implementation claim: bangbang still rejects native-v1 `Uffd` before artifact
 or backend access.
 
@@ -351,6 +352,42 @@ This slice still uses a trusted in-process source. It does not broker a pager
 peer, integrate peer-driven removal/failure, certify bypassing memory
 consumers, activate native-v1 restore, or promote the aggregate capability.
 
+## Implemented contained pager peer broker
+
+The production launcher now accepts one singleton read-write
+`snapshot-pager-stream` startup grant. It walks every source parent with
+no-follow directory anchors, rejects aliases and non-sockets, performs one
+nonblocking relative connect under a one-second absolute deadline, requires a
+current-user peer, and compares the single-link socket vnode before and after
+connection. It records only the connected descriptor identity, source vnode
+identity, normalized status flags, and redacted peer UID/GID/PID.
+
+The existing atomic launcher/worker grant channel carries that connected stream
+as a closed record kind. The worker stages streams separately from files and
+directories and independently revalidates `FD_CLOEXEC`, read-write nonblocking
+status, `SOCK_STREAM`, `SO_ERROR`, AF_UNIX connection, descriptor identity, and
+exact peer credentials before Commit. A one-time `PagerGrantAuthority` claims
+only the exact `bangbang-grant:<GrantId>` role; reader loss and contained
+teardown revoke unclaimed streams. No path, directory, listener, network
+entitlement, task/thread port, host address, or peer diagnostic enters the
+worker.
+
+`bangbang-pager` additionally supplies a bounded support-only reference peer
+over an already-connected stream. Signed production-bundle tests exercise
+data, zero, removal, drained shutdown, cancellation, peer terminal, refused
+connection, wrong descriptors and protocol, EOF, timeout, peer and worker
+death, repeat launch, cleanup and redaction while inspecting the unchanged
+launcher/worker signatures and entitlement floor:
+
+```sh
+scripts/run-integration-tests.sh --test production_bundle -- pager_grant
+```
+
+This slice does not connect the stream to `LazyGuestMemory` or either HVF
+bridge, propagate live peer removal/failure into the coordinator, certify every
+memory consumer, or activate native-v1 restore. The reference peer is support
+tooling, not a daemon or Linux UFFD compatibility.
+
 ## Decision and remaining delivery boundary
 
 Public macOS APIs can reproduce the observable external-demand-paging
@@ -398,13 +435,12 @@ VM construction. The focused
 case additionally proves private UFFD paths remain redacted.
 
 Delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527)
-retains five integration/certification gates after the #1550 guest bridge:
+retains four integration/certification gates after the #1551 contained broker:
 
-1. [#1551](https://github.com/seven332/bangbang/issues/1551) brokers the contained peer.
-2. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
-3. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
-4. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
-5. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
+1. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
+2. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
+3. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
+4. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
 
 There is no public `Uffd` success before #1554 and no
 `implemented-and-verified` inventory result before #1555. Delivery-time
@@ -415,4 +451,4 @@ continues to reject it.
 
 | Capability identity | Disposition | Delivery owner | Evidence | Result |
 | --- | --- | --- | --- | --- |
-| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol/process tests, `crates/runtime/src/lazy_memory.rs` coordinator/concurrency tests, `crates/hvf/src/lazy_host_fault.rs` focused plus signed/App Sandbox host-fault tests, and `crates/hvf/src/lazy_guest_fault.rs` focused plus signed execute/read/write/failure/cancellation/guest-boot tests; unchanged pre-access rejection | `nonterminal` |
+| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol/process/reference-peer tests, `crates/runtime/src/lazy_memory.rs` coordinator/concurrency tests, `crates/hvf/src/lazy_host_fault.rs` focused plus signed/App Sandbox host-fault tests, `crates/hvf/src/lazy_guest_fault.rs` focused plus signed execute/read/write/failure/cancellation/guest-boot tests, and typed contained connected-stream grant plus signed production-bundle broker lifecycle tests; unchanged pre-access rejection | `nonterminal` |

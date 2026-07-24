@@ -2,6 +2,7 @@ pub(crate) mod block_control;
 pub(crate) mod block_device;
 pub(crate) mod code_sign;
 pub(crate) mod daemon;
+pub(crate) mod local_socket;
 pub(crate) mod publish;
 pub(crate) mod socket_broker;
 pub(crate) mod spawn;

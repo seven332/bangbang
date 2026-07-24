@@ -1,8 +1,8 @@
 # `bangbang-pager-v1` Protocol
 
 This document is the normative wire, lifecycle, and failure contract shared by
-the bangbang VMM snapshot coordinator and its future external page-content
-peer. The wire implementation is the standalone `bangbang-pager` crate; the
+the bangbang VMM snapshot coordinator and its external page-content peer. The
+wire implementation is the standalone `bangbang-pager` crate; the
 backend-neutral anonymous-memory coordinator is
 `bangbang_runtime::lazy_memory`. The separate
 `bangbang_hvf::HvfLazyHostFaultBridge` now implements task-local host fault
@@ -10,8 +10,11 @@ mediation against that coordinator, but it is not yet connected to this wire.
 
 The crate adopts an already connected Unix stream. It does not select or open a
 path, launch a process, transfer a descriptor, grant source authority, map
-guest memory, own a Mach/HVF object, or make native-v1 `Uffd` succeed. Those
-remaining integration steps stay under delivery parent
+guest memory, own a Mach/HVF object, or make native-v1 `Uffd` succeed. The
+production launcher now performs the separate contained-boundary operation:
+it securely connects one configured local socket and atomically grants only
+that connected stream to the worker. Coordinator wiring and restore activation
+remain under delivery parent
 [#1527](https://github.com/seven332/bangbang/issues/1527).
 
 ## Compatibility boundary
@@ -240,7 +243,19 @@ The crate currently implements and tests:
 - request/generation/range validation and out-of-order exact matching;
 - terminal cancellation and drained shutdown;
 - already-connected absolute-deadline Unix transport; and
-- real child-process exchanges over an inherited connected stream.
+- real child-process exchanges over an inherited connected stream; and
+- a bounded support-only reference peer for page data, zero, removal,
+  cancellation, terminal, and orderly-shutdown scenarios.
+
+The contained launcher/worker boundary additionally implements and signs a
+singleton `snapshot-pager-stream` startup grant. The launcher walks the source
+without symlinks, performs one bounded anchored connect, verifies the
+current-user peer and socket vnode, and sends only the connected descriptor
+plus minimum redacted identity metadata. The worker independently revalidates
+descriptor type, status, identity, connection, peer credentials, role, and
+one-time grant ID before adopting it. Reader loss or contained-session teardown
+revokes any unclaimed stream. Neither side grants the worker a socket path,
+directory, listener, network entitlement, task port, or host address.
 
 The runtime additionally implements and deterministically tests bounded
 private-anonymous region ownership, duplicate-fault coalescing, exact
@@ -262,8 +277,8 @@ multi-vCPU coalescing, execute/read/write population, lazy entry boot, failure,
 cancellation, and cleanup. This remains a trusted in-process source boundary;
 it does not drive `PagerTransport`.
 
-Still deferred are transport/coordinator wiring, socket brokerage, source
-grants, peer-driven removal/failure integration, consumer gating, native-v1
-restore activation, and final signed end-to-end certification. Until those
-#1527 slices complete, native-v1 `Uffd` remains rejected before resource access
-and the checked capability remains `missing-platform-feasible`.
+Still deferred are transport/coordinator wiring, peer-driven removal/failure
+integration, consumer gating, native-v1 restore activation, and final signed
+end-to-end certification. Until those #1527 slices complete, native-v1 `Uffd`
+remains rejected before resource access and the checked capability remains
+`missing-platform-feasible`.

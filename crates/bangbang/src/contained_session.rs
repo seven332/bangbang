@@ -313,13 +313,17 @@ mod platform {
         SnapshotArtifactKind, SnapshotArtifactOutput, SnapshotStagingOwnership,
         SnapshotStagingTracker, SnapshotStagingTrackingError,
     };
+    #[cfg(feature = "grant-integration-probe")]
+    use bangbang_session::ConnectedUnixPeer;
     use bangbang_session::macos::block_control::{
         BlockControlError, BlockControlMessage, BlockControlOperation, BlockControlTarget,
         receive_block_control_message, send_block_control_message,
     };
+    #[cfg(feature = "grant-integration-probe")]
+    use bangbang_session::macos::grant_registry::GrantedUnixStream;
     use bangbang_session::macos::grant_registry::{
-        CommittedGrantBatch, DirectoryGrantRegistry, FileGrantRegistry, GrantRegistry,
-        GrantedDirectory, GrantedFile, StagedGrantBatch,
+        CommittedGrantBatch, ConnectedStreamGrantRegistry, DirectoryGrantRegistry,
+        FileGrantRegistry, GrantRegistry, GrantedDirectory, GrantedFile, StagedGrantBatch,
     };
     use bangbang_session::macos::grant_transport::receive_grant;
     use bangbang_session::macos::runtime::{
@@ -411,6 +415,103 @@ mod platform {
     pub(crate) struct GrantAuthority {
         registry: Arc<Mutex<Option<FileGrantRegistry>>>,
         block_control: Option<BlockControlBrokerAuthority>,
+    }
+
+    /// Shared one-time authority for the launcher-connected snapshot pager.
+    #[derive(Clone)]
+    pub(crate) struct PagerGrantAuthority {
+        registry: Arc<Mutex<Option<ConnectedStreamGrantRegistry>>>,
+    }
+
+    /// One claimed pager stream and its redacted authenticated source metadata.
+    #[cfg(feature = "grant-integration-probe")]
+    pub(crate) struct ClaimedPagerStream {
+        stream: UnixStream,
+        source_identity: ObjectIdentity,
+        peer: ConnectedUnixPeer,
+    }
+
+    #[cfg(feature = "grant-integration-probe")]
+    impl std::fmt::Debug for ClaimedPagerStream {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ClaimedPagerStream")
+                .field("stream", &"<owned>")
+                .field("source_identity", &"<redacted>")
+                .field("peer", &"<redacted>")
+                .finish()
+        }
+    }
+
+    #[cfg(feature = "grant-integration-probe")]
+    impl ClaimedPagerStream {
+        pub(crate) const fn source_identity(&self) -> ObjectIdentity {
+            self.source_identity
+        }
+
+        pub(crate) const fn peer(&self) -> ConnectedUnixPeer {
+            self.peer
+        }
+
+        pub(crate) fn into_stream(self) -> UnixStream {
+            self.stream
+        }
+    }
+
+    impl std::fmt::Debug for PagerGrantAuthority {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PagerGrantAuthority")
+                .field("registry", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl PagerGrantAuthority {
+        fn new(registry: ConnectedStreamGrantRegistry) -> Self {
+            Self {
+                registry: Arc::new(Mutex::new(Some(registry))),
+            }
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        pub(crate) fn is_active(&self) -> bool {
+            self.registry
+                .lock()
+                .map(|registry| registry.is_some())
+                .unwrap_or(false)
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        pub(crate) fn claim(
+            &self,
+            reference: &Path,
+        ) -> Result<Option<ClaimedPagerStream>, GrantClaimError> {
+            let Some(id) = grant_reference_id(reference)? else {
+                return Ok(None);
+            };
+            let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            let granted: GrantedUnixStream = registry
+                .as_mut()
+                .ok_or(GrantClaimError)?
+                .take_connected_stream(&id, ResourceRole::SnapshotPagerStream)
+                .map_err(|_| GrantClaimError)?;
+            let source_identity = granted.source_identity();
+            let peer = granted.peer();
+            Ok(Some(ClaimedPagerStream {
+                stream: granted.into_stream(),
+                source_identity,
+                peer,
+            }))
+        }
+
+        fn invalidate(&self) {
+            let mut registry = match self.registry.lock() {
+                Ok(registry) => registry,
+                Err(error) => error.into_inner(),
+            };
+            registry.take();
+        }
     }
 
     /// One exact file grant reserved for a failure-atomic runtime transaction.
@@ -2071,6 +2172,7 @@ mod platform {
         wakeup_writer: Option<UnixStream>,
         reader: Option<JoinHandle<()>>,
         grants: GrantAuthority,
+        pager_grants: PagerGrantAuthority,
         directory_grants: DirectoryGrantAuthority,
         socket_broker: SocketBrokerAuthority,
         vhost_user_broker: VhostUserBrokerAuthority,
@@ -2236,6 +2338,7 @@ mod platform {
                 BlockControlBrokerAuthority::new(block_control_socket, session, parent)?;
             let file_grants =
                 GrantAuthority::new_with_block_control(grants.take_file_registry(), block_control);
+            let pager_grants = PagerGrantAuthority::new(grants.take_stream_registry());
             let directory_grants = DirectoryGrantAuthority::new(grants.take_directory_registry());
             let socket_broker = SocketBrokerAuthority::new(broker_socket, session, parent);
             let vhost_user_broker =
@@ -2257,6 +2360,7 @@ mod platform {
                     Arc::clone(&control),
                     ReaderRevocationAuthorities {
                         grants: file_grants.clone(),
+                        pager_grants: pager_grants.clone(),
                         vhost_user_broker: vhost_user_broker.clone(),
                     },
                     reader_wakeup,
@@ -2276,6 +2380,7 @@ mod platform {
                 wakeup_writer: Some(wakeup_writer),
                 reader,
                 grants: file_grants,
+                pager_grants,
                 directory_grants,
                 socket_broker,
                 vhost_user_broker,
@@ -2311,6 +2416,11 @@ mod platform {
 
         pub(crate) fn grant_authority(&self) -> Option<GrantAuthority> {
             self.started.then(|| self.grants.clone())
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        pub(crate) fn pager_grant_authority(&self) -> Option<PagerGrantAuthority> {
+            self.started.then(|| self.pager_grants.clone())
         }
 
         pub(crate) fn vmnet_session_authority(
@@ -2439,6 +2549,7 @@ mod platform {
             self.closed = true;
             self.control.closing.store(true, Ordering::Release);
             self.grants.invalidate();
+            self.pager_grants.invalidate();
             self.directory_grants.invalidate();
             self.socket_broker.invalidate();
             self.vhost_user_broker.invalidate();
@@ -2674,6 +2785,7 @@ mod platform {
 
     struct ReaderRevocationAuthorities {
         grants: GrantAuthority,
+        pager_grants: PagerGrantAuthority,
         vhost_user_broker: VhostUserBrokerAuthority,
     }
 
@@ -2692,6 +2804,7 @@ mod platform {
                 let state = reader_loop(&mut stream, &mut decoder, &lifecycle);
                 if !control.closing.load(Ordering::Acquire) {
                     authorities.grants.invalidate();
+                    authorities.pager_grants.invalidate();
                     authorities.vhost_user_broker.invalidate();
                     if state == ControlState::Disconnected {
                         cleanup_namespace(&namespace);
@@ -4086,6 +4199,8 @@ mod platform {
     use std::path::Path;
 
     use bangbang_runtime::boot::BootSourceFiles;
+    #[cfg(feature = "grant-integration-probe")]
+    use bangbang_session::{ConnectedUnixPeer, ObjectIdentity};
     use bangbang_session::{GrantAccess, ResourceRole};
 
     use super::{
@@ -4095,6 +4210,44 @@ mod platform {
 
     #[derive(Debug, Clone)]
     pub(crate) struct GrantAuthority;
+
+    #[cfg(feature = "grant-integration-probe")]
+    #[derive(Debug, Clone)]
+    pub(crate) struct PagerGrantAuthority;
+
+    #[cfg(feature = "grant-integration-probe")]
+    pub(crate) struct ClaimedPagerStream {
+        stream: UnixStream,
+        source_identity: ObjectIdentity,
+        peer: ConnectedUnixPeer,
+    }
+
+    #[cfg(feature = "grant-integration-probe")]
+    impl std::fmt::Debug for ClaimedPagerStream {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ClaimedPagerStream")
+                .field("stream", &"<owned>")
+                .field("source_identity", &"<redacted>")
+                .field("peer", &"<redacted>")
+                .finish()
+        }
+    }
+
+    #[cfg(feature = "grant-integration-probe")]
+    impl ClaimedPagerStream {
+        pub(crate) const fn source_identity(&self) -> ObjectIdentity {
+            self.source_identity
+        }
+
+        pub(crate) const fn peer(&self) -> ConnectedUnixPeer {
+            self.peer
+        }
+
+        pub(crate) fn into_stream(self) -> UnixStream {
+            self.stream
+        }
+    }
 
     #[derive(Debug)]
     pub(crate) struct PreparedFileGrantClaim;
@@ -4192,6 +4345,23 @@ mod platform {
         }
     }
 
+    #[cfg(feature = "grant-integration-probe")]
+    impl PagerGrantAuthority {
+        pub(crate) fn is_active(&self) -> bool {
+            false
+        }
+
+        pub(crate) fn claim(
+            &self,
+            reference: &Path,
+        ) -> Result<Option<ClaimedPagerStream>, GrantClaimError> {
+            match grant_reference_id(reference)? {
+                Some(_) => Err(GrantClaimError),
+                None => Ok(None),
+            }
+        }
+    }
+
     impl DirectoryGrantAuthority {
         pub(crate) fn claim_socket_directory(
             &self,
@@ -4239,6 +4409,11 @@ mod platform {
         }
 
         pub(crate) fn grant_authority(&self) -> Option<GrantAuthority> {
+            None
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        pub(crate) fn pager_grant_authority(&self) -> Option<PagerGrantAuthority> {
             None
         }
 

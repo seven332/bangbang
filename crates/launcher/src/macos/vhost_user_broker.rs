@@ -5,6 +5,7 @@ use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use bangbang_session::macos::vhost_user_broker::{
@@ -19,6 +20,9 @@ use crate::grant_manifest::{PreparedGrantBatch, SocketDirectoryAnchor};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const CONNECT_INTERRUPTED_RETRY_LIMIT: usize = 8;
+// Darwin has no descriptor-relative Unix-socket connect. Serialize the brief
+// cwd switch shared by pager startup and the vhost-user supervisor.
+static CWD_CONNECT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Session-bound serial connector for worker vhost-user requests.
 pub(crate) struct LauncherVhostUserBroker {
@@ -143,7 +147,10 @@ struct CwdGuard {
 }
 
 impl CwdGuard {
-    fn enter(anchor: SocketDirectoryAnchor) -> Result<Self, LauncherError> {
+    fn enter(
+        anchor_descriptor: RawFd,
+        anchor_identity: ObjectIdentity,
+    ) -> Result<Self, LauncherError> {
         // SAFETY: The fixed relative directory path is NUL-terminated; success
         // returns a fresh close-on-exec directory descriptor.
         let saved = unsafe {
@@ -164,9 +171,9 @@ impl CwdGuard {
             identity,
         };
         // SAFETY: The retained manifest descriptor is a live directory anchor.
-        if unsafe { libc::fchdir(anchor.descriptor()) } != 0
+        if unsafe { libc::fchdir(anchor_descriptor) } != 0
             || current_directory_identity().map_err(|_| LauncherError::VhostUserBroker)?
-                != anchor.identity()
+                != anchor_identity
         {
             return Err(LauncherError::VhostUserBroker);
         }
@@ -197,7 +204,7 @@ impl Drop for CwdGuard {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScopedConnectError {
+pub(crate) enum ScopedConnectError {
     Failure(io::ErrorKind),
     Rejected,
     Invalid,
@@ -207,20 +214,43 @@ fn connect_scoped(
     anchor: SocketDirectoryAnchor,
     child: &bangbang_session::SocketChild,
 ) -> Result<UnixStream, ScopedConnectError> {
-    let mut guard = CwdGuard::enter(anchor).map_err(|_| ScopedConnectError::Invalid)?;
-    let result = connect_relative_child(child);
+    let name = CString::new(child.as_bytes()).map_err(|_| ScopedConnectError::Invalid)?;
+    connect_anchored_exact(
+        anchor.descriptor(),
+        anchor.identity(),
+        &name,
+        CONNECT_TIMEOUT,
+    )
+    .map(|(stream, _)| stream)
+}
+
+pub(crate) fn connect_anchored_exact(
+    anchor_descriptor: RawFd,
+    anchor_identity: ObjectIdentity,
+    name: &CStr,
+    timeout: Duration,
+) -> Result<(UnixStream, ObjectIdentity), ScopedConnectError> {
+    if timeout.is_zero() || name.to_bytes().is_empty() || name.to_bytes().contains(&b'/') {
+        return Err(ScopedConnectError::Invalid);
+    }
+    let _cwd_connect = CWD_CONNECT_LOCK
+        .lock()
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let mut guard = CwdGuard::enter(anchor_descriptor, anchor_identity)
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let result = connect_relative_child(name, timeout);
     guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
     result
 }
 
 fn connect_relative_child(
-    child: &bangbang_session::SocketChild,
-) -> Result<UnixStream, ScopedConnectError> {
-    let name = CString::new(child.as_bytes()).map_err(|_| ScopedConnectError::Invalid)?;
-    let before = relative_connect_target_identity(&name)?;
-    let (address, address_length) = relative_unix_socket_address(&name)?;
+    name: &CStr,
+    timeout: Duration,
+) -> Result<(UnixStream, ObjectIdentity), ScopedConnectError> {
+    let before = relative_connect_target_identity(name)?;
+    let (address, address_length) = relative_unix_socket_address(name)?;
     let deadline = Instant::now()
-        .checked_add(CONNECT_TIMEOUT)
+        .checked_add(timeout)
         .ok_or(ScopedConnectError::Failure(io::ErrorKind::TimedOut))?;
 
     // SAFETY: A successful descriptor is immediately wrapped for unique ownership.
@@ -265,12 +295,12 @@ fn connect_relative_child(
         return Err(ScopedConnectError::Failure(error.kind()));
     }
 
-    let after = relative_connect_target_identity(&name)?;
+    let after = relative_connect_target_identity(name)?;
     if after != before {
         return Err(ScopedConnectError::Rejected);
     }
-    validate_connected_peer(descriptor.as_raw_fd(), &name)?;
-    Ok(UnixStream::from(descriptor))
+    validate_connected_peer(descriptor.as_raw_fd(), name)?;
+    Ok((UnixStream::from(descriptor), before))
 }
 
 fn current_directory_identity() -> Result<ObjectIdentity, ScopedConnectError> {

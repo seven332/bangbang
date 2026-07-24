@@ -12,8 +12,8 @@ pub use codec::{
     VmnetAuthority, VmnetAuthorityError, WorkerPolicy, encode_frame,
 };
 pub use grant::{
-    BatchId, BlockDeviceGrant, GRANT_HEADER_BYTES, GrantAccess, GrantFrame, GrantId,
-    GrantObjectKind, GrantRecord, MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES,
+    BatchId, BlockDeviceGrant, ConnectedUnixPeer, GRANT_HEADER_BYTES, GrantAccess, GrantFrame,
+    GrantId, GrantObjectKind, GrantRecord, MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES,
     MAX_GRANT_DATAGRAM_BYTES, MAX_GRANT_ID_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS,
     MAX_SNAPSHOT_OUTPUT_CHILD_BYTES, MAX_SOCKET_CHILD_BYTES, ObjectIdentity, ResourceRole,
     SnapshotOutputChild, SocketChild, decode_grant_frame, encode_grant_frame,

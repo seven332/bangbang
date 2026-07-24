@@ -1125,6 +1125,14 @@ split/coalesced boundary, adversarial input, negotiation, exact out-of-order
 matching, cancellation, shutdown, timeout/EOF, redaction, and two
 inherited-stream child-process sessions.
 
+Contained pager brokerage is tested as a separate startup-authority boundary.
+Session and launcher tests cover the closed connected-stream record, malformed
+peer/source identity, CLOEXEC/status/type/identity/credential revalidation,
+one-time claim and cleanup, no-follow anchored connection, missing and
+non-socket targets, and source replacement. The bounded reference peer covers
+page data, zero, removal, cancellation, terminal, operation limits, and orderly
+shutdown without claiming Linux UFFD compatibility.
+
 The runtime lazy-memory tests use barriers, channels/condition wakeups, and
 bounded yield polling rather than sleeps. They cover absent private-anonymous
 construction, invalid layouts and bounds, exact data/zero publication, every
@@ -1342,6 +1350,12 @@ may skip execution. On supported Apple Silicon it proves:
   redaction; signal cancellation during an incomplete batch; one absolute grant
   deadline; both grant-bearing crash orders; and concurrent sessions whose
   distinct grant authority cannot be interchanged;
+- one exact `snapshot-pager-stream` grant connecting outside the App Sandbox,
+  independent worker descriptor/peer/protocol validation, complete
+  page/zero/removal/shutdown, cancellation and terminal sessions, refused
+  connection, wrong descriptor/protocol, EOF, timeout, peer and worker death,
+  repeat launch, cleanup/redaction, signature inspection, and unchanged
+  entitlements;
 - rejection of the internal grant probe by the normal production worker with no
   resource mutation, proving the exerciser is absent from the shipped build;
 - unlinked shared guest-memory allocation, two-way descriptor coherence, and
@@ -1436,7 +1450,8 @@ limits, oversized input, EOF rejection, replay, sequence gaps, cross-session and
 wrong-role/state input, reserved identity use, monotonic API/early-command/
 cancellation/grant state, and payload/identity-redacted formatting. Grant codec
 tests cover every closed record, limit and descriptor declaration, including
-the 255-byte redacted snapshot child grammar. Socket
+connected-stream source/peer identity and the 255-byte redacted snapshot child
+grammar. Socket
 broker codec tests cover every closed kind, exact fixed frame/reserved fields,
 session/sequence/child/port/status encoding, descriptor declarations,
 truncation, malformed ancillary data, and value-redacted formatting. The

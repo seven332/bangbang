@@ -7,11 +7,13 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bangbang_session::macos::bookmark::create_implicit_bookmark;
+use bangbang_session::macos::peer_identity;
 use bangbang_session::{
-    BatchId, BlockDeviceGrant, GRANT_HEADER_BYTES, GrantAccess, GrantFrame, GrantId,
-    GrantObjectKind, GrantRecord, MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES,
+    BatchId, BlockDeviceGrant, ConnectedUnixPeer, GRANT_HEADER_BYTES, GrantAccess, GrantFrame,
+    GrantId, GrantObjectKind, GrantRecord, MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES,
     MAX_GRANT_DATAGRAM_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS, ObjectIdentity, ResourceRole,
     SessionId,
 };
@@ -24,6 +26,7 @@ const ENVELOPE_DELIMITER: &str = "--";
 const MANIFEST_VERSION: u16 = 1;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_SOURCE_PATH_BYTES: usize = 4096;
+const PAGER_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Parsed launcher-only input and byte-preserved worker arguments.
 pub(crate) struct LaunchInput {
@@ -203,6 +206,7 @@ fn parse_role(value: &str) -> Result<ResourceRole, LauncherError> {
         "snapshot-memory-input" => Ok(ResourceRole::SnapshotMemoryInput),
         "snapshot-output-directory" => Ok(ResourceRole::SnapshotOutputDirectory),
         "vhost-user-socket-directory" => Ok(ResourceRole::VhostUserSocketDirectory),
+        "snapshot-pager-stream" => Ok(ResourceRole::SnapshotPagerStream),
         _ => Err(LauncherError::InvalidGrantInput),
     }
 }
@@ -384,7 +388,11 @@ impl PreparedGrantBatch {
         let mut records = Vec::new();
         let mut bookmark_bytes = 0_u32;
         for grant in grants {
-            let prepared = open_resource(&grant)?;
+            let prepared = if grant.role == ResourceRole::SnapshotPagerStream {
+                connect_resource(&grant)?
+            } else {
+                open_resource(&grant)?
+            };
             if !identities.insert(prepared.identity) {
                 return Err(LauncherError::GrantPreparation);
             }
@@ -433,6 +441,21 @@ impl PreparedGrantBatch {
                         descriptor: None,
                     });
                 }
+            } else if grant.role == ResourceRole::SnapshotPagerStream {
+                records.push(PreparedRecord {
+                    record: GrantRecord::ConnectedStream {
+                        id: grant.id,
+                        role: grant.role,
+                        access: grant.access,
+                        identity: prepared.identity,
+                        source_identity: prepared
+                            .source_identity
+                            .ok_or(LauncherError::GrantPreparation)?,
+                        status_flags: prepared.status_flags,
+                        peer: prepared.peer.ok_or(LauncherError::GrantPreparation)?,
+                    },
+                    descriptor: Some(prepared.descriptor),
+                });
             } else {
                 records.push(PreparedRecord {
                     record: GrantRecord::Descriptor {
@@ -646,8 +669,10 @@ struct PreparedResource {
     descriptor: OwnedFd,
     kind: GrantObjectKind,
     identity: ObjectIdentity,
+    source_identity: Option<ObjectIdentity>,
     status_flags: u32,
     block_device: Option<BlockDeviceGrant>,
+    peer: Option<ConnectedUnixPeer>,
 }
 
 fn open_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherError> {
@@ -741,8 +766,96 @@ fn open_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherErro
             device: normalized_device(stat.st_dev),
             inode: stat.st_ino,
         },
+        source_identity: None,
         status_flags,
         block_device,
+        peer: None,
+    })
+}
+
+fn connect_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherError> {
+    if grant.role != ResourceRole::SnapshotPagerStream || grant.access != GrantAccess::ReadWrite {
+        return Err(LauncherError::GrantPreparation);
+    }
+    let mut components = resource_path_components(&grant.source)?;
+    let name = components.pop().ok_or(LauncherError::GrantPreparation)?;
+    let mut anchor = open_root_directory()?;
+    for component in components {
+        // SAFETY: `anchor` remains live, `component` is one NUL-terminated
+        // no-traversal component, and success returns a fresh descriptor.
+        let opened = unsafe {
+            libc::openat(
+                anchor.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if opened < 0 {
+            return Err(LauncherError::GrantPreparation);
+        }
+        // SAFETY: `opened` is the fresh descriptor returned by openat.
+        anchor = unsafe { OwnedFd::from_raw_fd(opened) };
+    }
+    let anchor_stat = descriptor_stat(anchor.as_raw_fd())?;
+    if anchor_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(LauncherError::GrantPreparation);
+    }
+    let connected = crate::macos::local_socket::connect_anchored(
+        anchor.as_raw_fd(),
+        ObjectIdentity {
+            device: normalized_device(anchor_stat.st_dev),
+            inode: anchor_stat.st_ino,
+        },
+        &name,
+        PAGER_CONNECT_TIMEOUT,
+    )
+    .map_err(|_| LauncherError::GrantPreparation)?;
+    let source_identity = connected.source_identity();
+    let stream = connected.into_stream();
+    let peer = peer_identity(stream.as_raw_fd()).map_err(|_| LauncherError::GrantPreparation)?;
+    // SAFETY: Effective identity calls have no pointer or ownership contract.
+    let expected_uid = unsafe { libc::geteuid() };
+    // SAFETY: Effective identity calls have no pointer or ownership contract.
+    let expected_gid = unsafe { libc::getegid() };
+    if peer.uid != expected_uid || peer.gid != expected_gid {
+        return Err(LauncherError::GrantPreparation);
+    }
+    let process_id = u32::try_from(peer.pid).map_err(|_| LauncherError::GrantPreparation)?;
+    let peer = ConnectedUnixPeer::new(peer.uid, peer.gid, process_id)
+        .ok_or(LauncherError::GrantPreparation)?;
+    let descriptor: OwnedFd = stream.into();
+    let stat = descriptor_stat(descriptor.as_raw_fd())?;
+    // SAFETY: F_GETFD and F_GETFL inspect the live connected stream.
+    let descriptor_flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+    // SAFETY: F_GETFL inspects the same live stream.
+    let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+        || stat.st_ino == 0
+        || descriptor_flags < 0
+        || descriptor_flags & libc::FD_CLOEXEC == 0
+        || flags < 0
+        || flags & libc::O_ACCMODE != libc::O_RDWR
+        || flags & libc::O_NONBLOCK == 0
+    {
+        return Err(LauncherError::GrantPreparation);
+    }
+    let status_flags = u32::try_from(flags & (libc::O_ACCMODE | libc::O_NONBLOCK))
+        .map_err(|_| LauncherError::GrantPreparation)?;
+    Ok(PreparedResource {
+        descriptor,
+        kind: GrantObjectKind::ConnectedUnixStream,
+        identity: ObjectIdentity {
+            device: normalized_device(stat.st_dev),
+            inode: stat.st_ino,
+        },
+        source_identity: Some(source_identity),
+        status_flags,
+        block_device: None,
+        peer: Some(peer),
     })
 }
 
@@ -835,9 +948,11 @@ fn fragment_capacity(id: &GrantId) -> Result<usize, LauncherError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -1281,6 +1396,123 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn pager_stream_preparation_connects_exactly_and_records_redacted_identity() {
+        let root = TestDir::new();
+        let socket = root.path().join("pager.sock");
+        let listener = UnixListener::bind(&socket).expect("pager listener should bind");
+        let batch = PreparedGrantBatch::prepare(vec![manifest_grant(
+            "pager",
+            ResourceRole::SnapshotPagerStream,
+            GrantAccess::ReadWrite,
+            socket.clone(),
+        )])
+        .expect("pager stream grant should prepare");
+        let (mut accepted, _) = listener.accept().expect("pager stream should connect");
+        assert_eq!(batch.grant_count(), 1);
+        let prepared = batch
+            .records
+            .iter()
+            .find(|record| matches!(record.record, GrantRecord::ConnectedStream { .. }))
+            .expect("connected stream record should exist");
+        let GrantRecord::ConnectedStream {
+            role,
+            access,
+            identity,
+            source_identity,
+            status_flags,
+            peer,
+            ..
+        } = &prepared.record
+        else {
+            panic!("record should be connected stream");
+        };
+        assert_eq!(*role, ResourceRole::SnapshotPagerStream);
+        assert_eq!(*access, GrantAccess::ReadWrite);
+        assert_ne!(identity.inode, 0);
+        assert_ne!(source_identity.inode, 0);
+        assert_eq!(
+            *status_flags,
+            u32::try_from(libc::O_RDWR | libc::O_NONBLOCK).expect("flags should fit")
+        );
+        // SAFETY: Effective identity calls have no pointer or ownership contract.
+        assert_eq!(peer.user_id(), unsafe { libc::geteuid() });
+        // SAFETY: Effective identity calls have no pointer or ownership contract.
+        assert_eq!(peer.group_id(), unsafe { libc::getegid() });
+        assert_eq!(peer.process_id(), std::process::id());
+        let descriptor = prepared
+            .descriptor
+            .as_ref()
+            .expect("connected stream descriptor should remain owned");
+        // SAFETY: F_GETFD inspects the live retained descriptor.
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        fs::remove_file(&socket).expect("original socket name should unlink");
+        let _replacement =
+            UnixListener::bind(&socket).expect("replacement socket name should bind");
+        let marker = [0x5a_u8];
+        // SAFETY: The retained descriptor remains connected to `accepted`, and
+        // the one-byte marker is readable for the complete synchronous write.
+        let written =
+            unsafe { libc::write(descriptor.as_raw_fd(), marker.as_ptr().cast(), marker.len()) };
+        assert_eq!(written, 1);
+        let mut observed = [0_u8; 1];
+        accepted
+            .read_exact(&mut observed)
+            .expect("prepared stream should survive pathname replacement");
+        assert_eq!(observed, marker);
+        let debug = format!("{batch:?} {prepared:?}");
+        assert!(!debug.contains(path_text_for_test(&socket)));
+        assert!(!debug.contains("pager"));
+    }
+
+    #[test]
+    fn pager_stream_preparation_rejects_missing_refused_regular_and_symlink_targets() {
+        let root = TestDir::new();
+        let missing = root.path().join("missing.sock");
+        let regular = root.path().join("regular.sock");
+        fs::write(&regular, b"not a socket").expect("regular fixture should write");
+        for (id, path) in [("missing", missing), ("regular", regular.clone())] {
+            assert!(
+                connect_resource(&manifest_grant(
+                    id,
+                    ResourceRole::SnapshotPagerStream,
+                    GrantAccess::ReadWrite,
+                    path,
+                ))
+                .is_err()
+            );
+        }
+        let refused = root.path().join("refused.sock");
+        drop(UnixListener::bind(&refused).expect("refused listener should bind then close"));
+        assert!(
+            connect_resource(&manifest_grant(
+                "refused",
+                ResourceRole::SnapshotPagerStream,
+                GrantAccess::ReadWrite,
+                refused,
+            ))
+            .is_err()
+        );
+        let target = root.path().join("target.sock");
+        let _listener = UnixListener::bind(&target).expect("target listener should bind");
+        let link = root.path().join("link.sock");
+        symlink(&target, &link).expect("socket symlink should create");
+        assert!(
+            connect_resource(&manifest_grant(
+                "link",
+                ResourceRole::SnapshotPagerStream,
+                GrantAccess::ReadWrite,
+                link,
+            ))
+            .is_err()
+        );
+    }
+
+    fn path_text_for_test(path: &Path) -> &str {
+        path.to_str().expect("test path should be UTF-8")
     }
 
     #[test]
