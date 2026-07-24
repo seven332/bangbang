@@ -339,6 +339,44 @@ checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md);
 File/COW remains a distinct backend.
 
+### Stable Paused vCPU Topology State
+
+#1567 adds a wire-format-neutral lifecycle graph for a completed arm64
+topology-wide pause. Its checked public value contains exactly `1..=32`
+canonical index/MPIDR members, one validated EL1 virtual-timer PPI, and a
+closed disposition for each vCPU: offline, runnable after explicit resume, or
+suspended in PSCI `CPU_SUSPEND32/64`. The suspended form preserves X1-X3 and
+the post-trap PC, rejects a misaligned PC, and redacts all architectural values
+from `Debug`.
+
+Capture is available on the public boot-vCPU session only while its coordinator
+has completed the Paused barrier and no per-vCPU step or terminal result is
+pending. It reconciles the topology snapshot with the PSCI power coordinator,
+all pending CPU_ON/OFF/SUSPEND transactions, session-owned deferred work,
+runner-owned suspend identity and request, timer PPI, HVC form, and X0-X3/PC.
+Offline and ordinary runnable members are also probed for absence of an
+unreported deferred PSCI call. A second coordinator observation must match
+before the immutable graph is published.
+
+Import validates PPI, member count, topology order, MPIDRs, and the never-run
+readiness of every destination owner before the first mutation. It constructs a
+fresh PSCI power model and a coordinator born Paused, installs each suspended
+continuation through its destination owner, and assigns fresh destination-only
+power and runner transaction identities.
+Nothing can dispatch until explicit resume, whose first run generation is 1.
+If any installation or publication step fails, the transaction aborts all
+installed runner calls in reverse order, clears coordinator dispatch state,
+records every cleanup failure without replacing the primary error, and shuts
+down the consumed unpublished topology. A successful immediate recapture is
+equivalent to the source stable graph but contains none of its process-local
+tokens.
+
+This state is not encoded by either snapshot family yet. Native-v1 bytes and
+its one-vCPU profile remain unchanged; native-v2 component tags, composition
+with the complete reviewed vCPU register aggregate, public create/load
+reconstruction, and resumed-guest end-to-end evidence remain later #1528
+delivery slices.
+
 ## Native V1 Guest-Memory Image and Binding
 
 The internal memory image is bangbang-owned and uses a fixed 48-byte
@@ -1623,6 +1661,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 
 | Slice | Scope | Minimum validation |
 | --- | --- | --- |
+| Stable paused arm64 topology capture/import (wire-format-neutral foundation implemented) | #1567 adds a checked `1..=32` topology graph with canonical index/MPIDR identity, virtual-timer PPI, offline/runnable dispositions, and redacted CPU_SUSPEND32/64 X1-X3/post-trap-PC continuations. Capture requires a completed topology pause and cross-validates coordinator, PSCI, session, runner, HVC, and owner registers before publication. Import prevalidates before mutation, allocates fresh destination tokens, constructs the coordinator born Paused, installs suspended members in order, and dispatches nothing until explicit resume generation 1. Failure aborts installed calls in reverse order, clears dispatch state, retains cleanup evidence, and consumes the unpublished topology. Native-v1/native-v2 bytes and public snapshot reconstruction remain unchanged. | Empty/maximum/oversized/canonicality/PPI/primary-offline/PC-alignment boundaries; both suspend conventions and exact register checks; power/runner token inequality; paused admission and no pre-resume dispatch; offline/runnable/suspended import and equivalent recapture; reverse rollback, shutdown, redaction, and existing pause/resume/timer-wake lifecycle coverage. |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence and complete publication transaction (implemented for native-v1 baseline) | #1162 introduced acknowledged RAII quiescence for block and entropy; #1389 added the topology-wide SMP pause barrier and PMEM guard; #1390 includes network, acquires all four failure-atomically, drains tokens only after complete acknowledgement, preserves in-flight/deferred/deadline work, and holds the worker lease through commit plus the post-publication hook. Process API/MMDS/controller and periodic work are serialized by the synchronous owner borrow. | Deterministic scheduler, supervisor, cancellation/seal, publication-visibility, process/API serialization, and fresh-retry tests plus combined signed SMP pause and one-vCPU baseline publication evidence. |
 | Complete dirty epochs and public tracking (implemented) | #1395 supplies fail-closed HVF protection/fault retry. #1396 adds the shared `GuestMemory` bitmap, exact initial/reprotected DFSC `0x07`/`0x0f` ownership checks, every current bounded host/device writer, conservative discard, protected wholly-dirty dynamic RAM, destination load ordering, and post-visible-Full reset/rollback/poison semantics. Machine and load tracking flags are enabled without adding Diff artifacts. | Exact/repeated/concurrent host and CPU union, discard, dynamic mapping, load override/VMGenID, publication/cancellation/reset failures, and public transaction tests plus signed normal boot/load, two-vCPU current-device, and two-epoch exact-set evidence. |

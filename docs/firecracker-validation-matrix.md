@@ -591,9 +591,31 @@ prevents guest execution on that runner. Unit coverage exhausts static
 rejections, sparse reads, operation failures, ordering, admission, channels,
 panic, and execution poisoning; signed HVF coverage proves real same-owner
 debug and active-SME restore/recapture on supported Apple Silicon. Native-v1
-bytes and inactive-optional policy remain unchanged; stable topology/PSCI
-state, native-v2 encoding, multi-vCPU aggregate construction, and public
-lifecycle remain #1528 follow-up work.
+bytes and inactive-optional policy remain unchanged. The stable topology/PSCI
+lifecycle follows below; native-v2 encoding, complete multi-vCPU aggregate
+construction, and public snapshot reconstruction remain #1528 follow-up work.
+
+#1567 adds a public, wire-format-neutral stable paused-topology graph and
+capture/import transaction for the boot-vCPU session. The graph canonically
+binds `1..=32` members to topology index and MPIDR, retains the virtual-timer
+PPI, and distinguishes offline, runnable, and deferred PSCI
+`CPU_SUSPEND32/64` members. Suspended members preserve the closed call
+convention, X1-X3 arguments, and post-trap PC without exposing those values in
+diagnostics. Capture requires a completed Paused barrier and cross-checks the
+coordinator, PSCI power transactions, session records, runner-owned deferred
+call, and architectural registers before publishing. Import validates all
+topology and PPI facts plus the never-run readiness of every owner before
+mutation, prepares fresh destination-local PSCI and runner identities, installs
+suspended members in topology order, and publishes a coordinator born Paused
+with no dispatch or cancellation debt.
+Failures unwind installed calls in reverse order, retain every cleanup failure,
+and consume the unpublished topology; explicit resume begins generation 1.
+Unit coverage includes empty, maximum, oversized, malformed, offline,
+runnable, both suspend conventions, token inequality, no pre-resume dispatch,
+recapture equivalence, redaction, rollback, and shutdown behavior. Native-v1
+and native-v2 bytes remain unchanged; native-v2 topology encoding, the complete
+multi-vCPU state aggregate, and public snapshot reconstruction remain #1528
+follow-up work.
 
 ## Update Rule
 

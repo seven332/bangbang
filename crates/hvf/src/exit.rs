@@ -315,6 +315,17 @@ pub struct HvfHvcExit {
 }
 
 impl HvfHvcExit {
+    pub(crate) const fn restored_hvc0() -> Self {
+        Self {
+            exit: HvfExceptionExit {
+                syndrome: (ESR_EC_HVC as u64) << ESR_EC_SHIFT,
+                virtual_address: 0,
+                physical_address: 0,
+            },
+            immediate: 0,
+        }
+    }
+
     pub const fn exception_exit(self) -> HvfExceptionExit {
         self.exit
     }

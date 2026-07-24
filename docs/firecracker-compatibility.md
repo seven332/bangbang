@@ -3327,7 +3327,25 @@ runtime-resolved macOS 15.2 boundary. Errors expose only
 family/stage/index/completed-write metadata; a failed nontransactional attempt
 permanently prevents guest execution on that runner. This wire-format-neutral
 foundation does not change native-v1 bytes or its inactive-optional rejection
-policy, and native-v2 encoding plus multi-vCPU orchestration remain separate.
+policy.
+A separate stable paused-topology lifecycle value canonically binds every
+member to topology index and MPIDR, records the virtual-timer PPI, and
+distinguishes offline, runnable, and deferred PSCI `CPU_SUSPEND32/64` members.
+The suspended form retains the call convention, X1-X3 arguments, and post-trap
+PC while redacting architectural values from diagnostics. Public boot-vCPU
+session capture succeeds only after a completed pause barrier and cross-checks
+coordinator membership, PSCI power/transaction state, session bookkeeping, the
+runner-owned deferred call, and owner-thread registers before publication.
+Import validates the complete graph and the never-run readiness of every
+destination owner before mutation, allocates fresh destination power and runner
+identities, creates the coordinator directly in Paused state, and requires
+explicit resume before generation 1 can dispatch.
+Post-mutation failure aborts installed suspend calls in reverse topology order,
+clears coordinator dispatch metadata, records every cleanup failure, and
+consumes the unpublished topology. This is an in-memory, wire-format-neutral
+foundation: native-v1 and native-v2 bytes are unchanged, while native-v2
+encoding, the complete multi-vCPU aggregate, and public snapshot reconstruction
+remain separate.
 The separate system-context capture uses macOS 15.2 SDK register ids through the
 same owner-thread getter and preserves raw backend errors. Its paired restore
 writes `SCXTNUM_EL0` then `SCXTNUM_EL1` through the same owner and reports the
