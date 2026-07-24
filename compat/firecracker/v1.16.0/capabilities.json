@@ -9089,12 +9089,70 @@
     {
       "id": "corpus:snapshot-page-faults",
       "family": "snapshots",
-      "summary": "Public macOS APIs reproduce the observable external demand-paging contract with a bounded offset-only bangbang-pager-v1 peer, coordinated private-anonymous memory, task-local Mach host faults, HVF stage-two guest faults, ordered removal, first-terminal peer failure, and closed consumer gates. Native-v1 Uffd now restores the narrow fixed-memory profile on macOS Apple Silicon with dirty tracking disabled: platform/profile/grant preflight precedes resource access, state-authenticated image metadata binds the pager session and layout, direct mode connects with a deadline, contained mode claims only the launcher-connected stream without worker memory-file authority, and the complete owner graph is transactional. Signed direct and production-bundle guests restore, resume, reach SYSTEM_OFF, and shut the pager down orderly. https://github.com/seven332/bangbang/issues/1527 still owns final cross-slice certification, so this record remains feasible-but-nonterminal. This is not Linux UFFD descriptor or wire compatibility.",
+      "summary": "Public macOS APIs implement and verify the observable external demand-paging contract with a bounded offset-only bangbang-pager-v1 peer, coordinated private-anonymous memory, task-local Mach host faults, HVF stage-two guest faults, ordered generation-aware removal, first-terminal peer failure, and closed consumer gates. Native-v1 Uffd restores the narrow fixed-memory profile on macOS Apple Silicon with dirty tracking disabled: platform/profile/grant preflight precedes resource access, state-authenticated image metadata binds the pager session and layout, direct mode connects with a deadline, contained mode claims only the launcher-connected stream without worker memory-file authority, and the complete owner graph is transactional. Signed direct and production App Sandbox restores prove paused host demand followed by exact guest instruction/read/write-first pages, SYSTEM_OFF, and orderly shutdown; signed lifecycle and production cases cover multi-vCPU coalescing, removal before/during/after population, zero refault, peer failures, cancellation, death orders, repeat, exact entitlements, and cleanup. Unsupported shared/external/dirty profiles still reject before access. This is not Linux UFFD descriptor or wire compatibility.",
       "source_refs": [
         "corpus:snapshot-page-faults"
       ],
-      "disposition": "missing-platform-feasible",
-      "delivery_issue": "https://github.com/seven332/bangbang/issues/1527"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "native-v1 direct and contained Uffd preflight, preparation, restore, and transactional publication"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/lazy_guest_fault.rs",
+          "anchor": "HVF stage-two execute, read, write, permission, and stale-exit mediation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/lazy_host_fault.rs",
+          "anchor": "task-local Mach host-fault bridge and complete-before-visible population"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/grant_manifest.rs",
+          "anchor": "contained connected pager-stream authority without worker memory-file access"
+        },
+        {
+          "kind": "local",
+          "path": "crates/pager/src/lib.rs",
+          "anchor": "bounded bangbang-pager-v1 protocol, client, source adapter, and lifecycle"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lazy_memory.rs",
+          "anchor": "private-anonymous coordinated memory, removal generations, and protected consumer profile"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/snapshot-paging-contract.md",
+          "anchor": "checked pinned-source, platform, protocol, consumer, signed-evidence, and exclusion ledger"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed native-v1 direct restore with paused host demand and exact guest instruction, read, and write pages"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "signed instruction-first lazy guest entry"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "signed host and guest access classes, multi-vCPU coalescing, removal generations, zero refault, cancellation, failure, and teardown"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production App Sandbox restore, exact entitlement dictionaries, peer failure, death-order, repeat, and cleanup evidence"
+        }
+      ]
     },
     {
       "id": "corpus:snapshot-random-clones",

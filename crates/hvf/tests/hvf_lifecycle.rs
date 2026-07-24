@@ -97,8 +97,8 @@ mod lazy_host_fault_integration {
         HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfArm64BootRegisters, HvfBackend,
         HvfLazyGuestAccess, HvfLazyGuestFaultError, HvfLazyGuestResolutionFailure,
         HvfLazyHostFaultBridge, HvfLazyPageContents, HvfLazyPageRemovalRequest, HvfLazyPageRequest,
-        HvfLazyPageSource, HvfLazyPageSourceError, HvfMemoryPermissions, HvfVcpuRunEvent,
-        HvfVcpuRunMemberOutcome, HvfVcpuRunStepOutcome, HvfVcpuRunnerError,
+        HvfLazyPageResolution, HvfLazyPageSource, HvfLazyPageSourceError, HvfMemoryPermissions,
+        HvfVcpuRunEvent, HvfVcpuRunMemberOutcome, HvfVcpuRunStepOutcome, HvfVcpuRunnerError,
     };
     use bangbang_pager::{
         MAX_FRAME_BYTES, PageAccess, PagerLimits, PagerOperations, PagerRegionId,
@@ -133,6 +133,15 @@ mod lazy_host_fault_integration {
         page: Vec<u8>,
         entered: mpsc::Sender<()>,
         release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    struct SignedRemovalRaceSource {
+        page: Vec<u8>,
+        removed: AtomicBool,
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<Option<mpsc::Receiver<()>>>,
+        requests: Mutex<Vec<HvfLazyPageRequest>>,
+        removals: Mutex<Vec<HvfLazyPageRemovalRequest>>,
     }
 
     struct SignedRemovalSource {
@@ -202,6 +211,58 @@ mod lazy_host_fault_integration {
                 .recv()
                 .map_err(|_| HvfLazyPageSourceError::failed())?;
             Ok(HvfLazyPageContents::data(self.page.clone()))
+        }
+    }
+
+    impl HvfLazyPageSource for SignedRemovalRaceSource {
+        fn page(
+            &self,
+            request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            self.requests
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            let removed_at_entry = self.removed.load(Ordering::Acquire);
+            let entered = self
+                .entered
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .take();
+            if let Some(entered) = entered {
+                entered
+                    .send(())
+                    .map_err(|_| HvfLazyPageSourceError::failed())?;
+                self.release
+                    .lock()
+                    .map_err(|_| HvfLazyPageSourceError::failed())?
+                    .take()
+                    .ok_or_else(HvfLazyPageSourceError::failed)?
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| HvfLazyPageSourceError::failed())?;
+            }
+            if removed_at_entry {
+                Ok(HvfLazyPageContents::zero())
+            } else {
+                Ok(HvfLazyPageContents::data(self.page.clone()))
+            }
+        }
+
+        fn remove(&self, request: HvfLazyPageRemovalRequest) -> Result<(), HvfLazyPageSourceError> {
+            let expected_length =
+                u64::try_from(self.page.len()).map_err(|_| HvfLazyPageSourceError::failed())?;
+            if request.region().get() != 1
+                || request.offset() != 0
+                || request.length() != expected_length
+            {
+                return Err(HvfLazyPageSourceError::failed());
+            }
+            self.removals
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            self.removed.store(true, Ordering::Release);
+            Ok(())
         }
     }
 
@@ -521,6 +582,143 @@ mod lazy_host_fault_integration {
                     written
                 );
             }
+        }
+    }
+
+    #[test]
+    fn task_local_lazy_fault_bridge_removal_generations_refault_zero_before_and_during_population()
+    {
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let page_size = usize::try_from(host_page_size().expect("host page size should be valid"))
+            .expect("host page size should fit usize");
+        let page_size_u64 = u64::try_from(page_size).expect("host page size should fit u64");
+        let region = PagerRegionId::new(1).expect("signed region id should validate");
+        let mut page = vec![0_u8; page_size];
+        page[..std::mem::size_of::<u64>()].copy_from_slice(&TEST_VALUE.to_ne_bytes());
+
+        {
+            let source = Arc::new(SignedRemovalRaceSource {
+                page: page.clone(),
+                removed: AtomicBool::new(false),
+                entered: Mutex::new(None),
+                release: Mutex::new(None),
+                requests: Mutex::new(Vec::new()),
+                removals: Mutex::new(Vec::new()),
+            });
+            let memory = lazy_memory(1);
+            let pointer = memory.mapping_regions()[0]
+                .host_address()
+                .as_ptr()
+                .cast::<u64>();
+            let bridge = HvfLazyHostFaultBridge::install(
+                Arc::clone(&memory),
+                Arc::<SignedRemovalRaceSource>::clone(&source),
+            )
+            .expect("signed pre-population removal bridge should install");
+
+            let removed = bridge
+                .remove_pages(region, 0, page_size_u64)
+                .expect("signed removal before population should commit");
+            assert_eq!(
+                bridge
+                    .resolver()
+                    .resolve_guest_address(GuestAddress::new(GUEST_BASE), PageAccess::Read)
+                    .expect("signed post-removal population should resolve"),
+                HvfLazyPageResolution::Populated
+            );
+            // SAFETY: the post-removal generation committed a zero page and
+            // reopened this retained mapping for host reads.
+            assert_eq!(unsafe { std::ptr::read_volatile(pointer) }, 0);
+            let requests = source.requests.lock().expect("request log should lock");
+            let removals = source.removals.lock().expect("removal log should lock");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(removals.len(), 1);
+            assert!(removed.generation().get() < requests[0].generation().get());
+            drop(requests);
+            drop(removals);
+            assert_eq!(
+                memory
+                    .waiter_count()
+                    .expect("signed pre-population waiter count should resolve"),
+                0
+            );
+            assert!(
+                bridge
+                    .shutdown()
+                    .expect("signed pre-population bridge should shut down")
+                    .prior_handler_restored()
+            );
+        }
+
+        {
+            let (entered_sender, entered_receiver) = mpsc::channel();
+            let (release_sender, release_receiver) = mpsc::channel();
+            let source = Arc::new(SignedRemovalRaceSource {
+                page,
+                removed: AtomicBool::new(false),
+                entered: Mutex::new(Some(entered_sender)),
+                release: Mutex::new(Some(release_receiver)),
+                requests: Mutex::new(Vec::new()),
+                removals: Mutex::new(Vec::new()),
+            });
+            let memory = lazy_memory(1);
+            let pointer = memory.mapping_regions()[0]
+                .host_address()
+                .as_ptr()
+                .cast::<u64>();
+            let bridge = HvfLazyHostFaultBridge::install(
+                Arc::clone(&memory),
+                Arc::<SignedRemovalRaceSource>::clone(&source),
+            )
+            .expect("signed in-flight removal bridge should install");
+            let resolver = bridge.resolver();
+            let population = std::thread::spawn(move || {
+                resolver.resolve_guest_address(GuestAddress::new(GUEST_BASE), PageAccess::Read)
+            });
+            entered_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("signed population should block in the old generation");
+
+            let removed = bridge
+                .remove_pages(region, 0, page_size_u64)
+                .expect("signed removal should supersede the in-flight generation");
+            release_sender
+                .send(())
+                .expect("signed stale page response should be released");
+            assert_eq!(
+                population
+                    .join()
+                    .expect("signed population thread should join")
+                    .expect("signed population should retry under the new generation"),
+                HvfLazyPageResolution::Populated
+            );
+            // SAFETY: the stale data response was discarded and the retried
+            // generation committed zero before reopening this mapping.
+            assert_eq!(unsafe { std::ptr::read_volatile(pointer) }, 0);
+            let requests = source.requests.lock().expect("request log should lock");
+            let removals = source.removals.lock().expect("removal log should lock");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(removals.len(), 1);
+            assert!(
+                requests[0].generation().get() < removed.generation().get()
+                    && removed.generation().get() < requests[1].generation().get()
+            );
+            drop(requests);
+            drop(removals);
+            assert_eq!(
+                memory
+                    .waiter_count()
+                    .expect("signed in-flight waiter count should resolve"),
+                0
+            );
+            assert!(
+                bridge
+                    .shutdown()
+                    .expect("signed in-flight removal bridge should shut down")
+                    .prior_handler_restored()
+            );
         }
     }
 

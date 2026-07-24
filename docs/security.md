@@ -2121,8 +2121,9 @@ The checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 records positive public-macOS feasibility, the standalone protocol and client,
 internal anonymous-memory ownership and fault/removal slices, the contained
-connected-peer grant, and the activated narrow native-v1 restore path. The
-aggregate inventory record remains nonterminal until final certification.
+connected-peer grant, the activated narrow native-v1 restore path, and #1555's
+signed cross-slice certification. The aggregate inventory record is now
+terminal for only that documented narrow profile.
 
 The accepted complete boundary uses two in-worker protection planes: public
 Mach task exceptions mediate host accesses to owned absent guest pages, and HVF
@@ -2160,6 +2161,13 @@ grant ID before adoption. Unclaimed authority closes on reader loss or
 contained-session teardown. This adds no path/directory/listener authority,
 ambient network entitlement, dynamic Mach service, root requirement, private
 API, entitlement weakening, or host-wide setting.
+
+The final production signing gate parses the effective entitlement plist
+rather than relying on substring checks. The outer launcher must have an empty
+entitlement dictionary. The nested worker must have exactly two Boolean-true
+entries: App Sandbox and Hypervisor. Existing tamper cases reject false
+sandbox, extra network/vmnet authority, provisioning profiles, and missing
+hardened runtime before worker execution.
 
 For native-v1 `Uffd`, platform, fixed-memory machine profile, dirty/shared/
 external/discard/topology consumer policy, and contained grant identity are
@@ -2288,6 +2296,16 @@ order; normal teardown sends orderly pager shutdown only after live users have
 joined, while every partial-construction failure cancels and unwinds in reverse
 order. External/shared mappings and other consumers that bypass the task-local
 bridge remain pre-resource rejections.
+
+Final signed direct and contained restore tests snapshot pager observations
+while the destination is Paused, proving host preparation demand before any
+vCPU resumes and no access to three guest-only pages. After resume, the guest
+branches into a previously untouched instruction page, reads a distinct
+untouched page, writes another, reaches `SYSTEM_OFF`, and shuts the peer down
+orderly. Signed removal tests cover before population, stale data superseded
+during population, and after-population stage-two revocation, with newer
+generation zero refault, no stranded waiter, and conditional exception-port
+restoration.
 
 ## Guest Data Exposure
 

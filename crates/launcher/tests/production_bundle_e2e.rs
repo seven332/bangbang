@@ -35,7 +35,7 @@ use bangbang_launcher::{
     OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 use bangbang_pager::{
-    PagerError, PagerFrameKind, PagerTransport, PeerSession, ReferencePeer,
+    PageAccess, PagerError, PagerFrameKind, PagerTransport, PeerSession, ReferencePeer,
     ReferencePeerTermination,
 };
 use bangbang_session::{
@@ -45,7 +45,7 @@ use bangbang_session::{
 };
 use macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize};
 #[cfg(target_os = "macos")]
-use snapshot_pager::{SnapshotPagerServer, SnapshotPagerTermination};
+use snapshot_pager::{SnapshotPagerReport, SnapshotPagerServer, SnapshotPagerTermination};
 use vhost_user_block::{
     VhostUserBlockBackend, VhostUserBlockBackendOptions, VhostUserBlockBackendReport,
 };
@@ -186,6 +186,14 @@ const SNAPSHOT_REPEAT_STATE_CHILD: &str = "state-repeat-1368.snap";
 const SNAPSHOT_REPEAT_MEMORY_CHILD: &str = "memory-repeat-1368.snap";
 const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
 const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
+const SNAPSHOT_GUEST_MEMORY_BASE: u64 = 0x8000_0000;
+const SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET: usize = 0x4000;
+const SNAPSHOT_GUEST_CODE_OFFSET: u64 = 0x20_4000;
+const SNAPSHOT_GUEST_READ_OFFSET: u64 = 0x1_0000;
+const SNAPSHOT_GUEST_WRITE_OFFSET: u64 = 0x2_0000;
+const SNAPSHOT_GUEST_CODE_ADDRESS: u64 = SNAPSHOT_GUEST_MEMORY_BASE + SNAPSHOT_GUEST_CODE_OFFSET;
+const SNAPSHOT_GUEST_READ_ADDRESS: u64 = SNAPSHOT_GUEST_MEMORY_BASE + SNAPSHOT_GUEST_READ_OFFSET;
+const SNAPSHOT_GUEST_WRITE_ADDRESS: u64 = SNAPSHOT_GUEST_MEMORY_BASE + SNAPSHOT_GUEST_WRITE_OFFSET;
 const SNAPSHOT_GUEST_UART_ADDRESS: u64 = 0x4000_2000;
 const SNAPSHOT_GUEST_VMGENID_ADDRESS: u64 = 0x801f_eff0;
 const GRANTED_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
@@ -528,16 +536,7 @@ fn production_bundle_has_exact_nested_signing_contract() {
     assert!(outer_display.contains("runtime"));
     assert!(worker_display.contains("runtime"));
 
-    let outer_entitlements = codesign_entitlements(&bundle);
-    let worker_entitlements = codesign_entitlements(&worker);
-    assert!(
-        !outer_entitlements.contains("com.apple.security.app-sandbox")
-            && !outer_entitlements.contains("com.apple.security.hypervisor"),
-        "launcher must not inherit worker entitlements: {outer_entitlements}"
-    );
-    assert_eq!(worker_entitlements.matches("<key>").count(), 2);
-    assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
-    assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+    assert_exact_networkless_bundle_entitlements(&bundle);
     assert!(
         !worker.join("Contents/embedded.provisionprofile").exists(),
         "networkless production worker must not embed a provisioning profile"
@@ -1453,6 +1452,31 @@ fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
     let paused_state = http_get(&paused.socket, "/");
     assert_http_status(&paused_state, 200, "read granted paused snapshot state");
     assert!(paused_state.contains(r#""state":"Paused""#));
+    #[cfg(target_os = "macos")]
+    let host_demand = {
+        let report = pager.snapshot();
+        assert_eq!(
+            report.termination,
+            SnapshotPagerTermination::Active,
+            "contained paused restore should retain an active external pager"
+        );
+        assert!(
+            report.page_data + report.page_zero > 0,
+            "contained paused restore preparation should demand host pages"
+        );
+        for offset in [
+            SNAPSHOT_GUEST_CODE_OFFSET,
+            SNAPSHOT_GUEST_READ_OFFSET,
+            SNAPSHOT_GUEST_WRITE_OFFSET,
+        ] {
+            assert!(
+                !snapshot_pager_observed(&report, offset, PageAccess::Read)
+                    && !snapshot_pager_observed(&report, offset, PageAccess::Write),
+                "contained paused host preparation must not pre-access guest-only offset {offset:#x}: {report:?}"
+            );
+        }
+        report
+    };
     assert_http_status(
         &http_request(&paused.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
         204,
@@ -1467,9 +1491,32 @@ fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
         let pager_report = pager.wait();
         assert_eq!(pager_report.termination, SnapshotPagerTermination::Shutdown);
         assert!(
-            pager_report.page_data + pager_report.page_zero > 0,
-            "contained demand-backed restore should request bound pages"
+            pager_report.page_data + pager_report.page_zero
+                > host_demand.page_data + host_demand.page_zero,
+            "contained restored guest should add demand beyond paused host preparation"
         );
+        for (offset, access, context) in [
+            (
+                SNAPSHOT_GUEST_CODE_OFFSET,
+                PageAccess::Read,
+                "instruction-first code page",
+            ),
+            (
+                SNAPSHOT_GUEST_READ_OFFSET,
+                PageAccess::Read,
+                "read-first guest page",
+            ),
+            (
+                SNAPSHOT_GUEST_WRITE_OFFSET,
+                PageAccess::Write,
+                "write-first guest page",
+            ),
+        ] {
+            assert!(
+                snapshot_pager_observed(&pager_report, offset, access),
+                "contained restored guest should demand {context} at {offset:#x}: {pager_report:?}"
+            );
+        }
     }
     assert_eq!(session_entries(), baseline_sessions);
 
@@ -4342,13 +4389,7 @@ fn normal_bundle_replaces_contained_macos_block_special_media_over_mmio() {
     let worker_display = codesign_display(&worker_bundle(&bundle));
     assert!(outer_display.contains(&format!("Identifier={LAUNCHER_BUNDLE_IDENTIFIER}")));
     assert!(worker_display.contains(&format!("Identifier={WORKER_BUNDLE_IDENTIFIER}")));
-    let launcher_entitlements = codesign_entitlements(&bundle);
-    let worker_entitlements = codesign_entitlements(&worker_bundle(&bundle));
-    assert!(!launcher_entitlements.contains("com.apple.security.app-sandbox"));
-    assert!(!launcher_entitlements.contains("com.apple.security.hypervisor"));
-    assert_eq!(worker_entitlements.matches("<key>").count(), 2);
-    assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
-    assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+    assert_exact_networkless_bundle_entitlements(&bundle);
 
     let fixture = BlockSpecialGrantFixture::new("mmio-replacement");
     write_virtual_block_marker_at(&fixture.first_media, 0, BLOCK_LIFECYCLE_HOST_ONE_MARKER);
@@ -4869,13 +4910,7 @@ fn normal_bundle_hotplugs_async_runtime_block_from_exact_unused_grants() {
 #[test]
 fn normal_bundle_hotplugs_contained_macos_block_special_media_over_pci() {
     let bundle = production_bundle();
-    let launcher_entitlements = codesign_entitlements(&bundle);
-    let worker_entitlements = codesign_entitlements(&worker_bundle(&bundle));
-    assert!(!launcher_entitlements.contains("com.apple.security.app-sandbox"));
-    assert!(!launcher_entitlements.contains("com.apple.security.hypervisor"));
-    assert_eq!(worker_entitlements.matches("<key>").count(), 2);
-    assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
-    assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+    assert_exact_networkless_bundle_entitlements(&bundle);
 
     let fixture = BlockSpecialGrantFixture::new("pci-hotplug");
     write_virtual_block_marker_at(&fixture.first_media, 0, BLOCK_HOTPLUG_HOST_ONE_MARKER);
@@ -5747,13 +5782,7 @@ fn signed_grants_authorize_only_typed_read_write_and_directory_operations() {
 #[test]
 fn signed_pager_grant_completes_and_repeats_under_unchanged_entitlements() {
     let bundle = grant_test_bundle();
-    let launcher_entitlements = codesign_entitlements(&bundle);
-    let worker_entitlements = codesign_entitlements(&worker_bundle(&bundle));
-    assert!(!launcher_entitlements.contains("com.apple.security.app-sandbox"));
-    assert!(!launcher_entitlements.contains("com.apple.security.hypervisor"));
-    assert_eq!(worker_entitlements.matches("<key>").count(), 2);
-    assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
-    assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+    assert_exact_networkless_bundle_entitlements(&bundle);
 
     let fixture = PagerGrantFixture::new("complete-repeat");
     for cycle in 0..2 {
@@ -5876,13 +5905,7 @@ fn signed_pager_grant_closes_streams_across_both_process_death_orders() {
 #[test]
 fn signed_contained_block_device_uses_launcher_control_broker() {
     let bundle = grant_test_bundle();
-    let launcher_entitlements = codesign_entitlements(&bundle);
-    let worker_entitlements = codesign_entitlements(&worker_bundle(&bundle));
-    assert!(!launcher_entitlements.contains("com.apple.security.app-sandbox"));
-    assert!(!launcher_entitlements.contains("com.apple.security.hypervisor"));
-    assert_eq!(worker_entitlements.matches("<key>").count(), 2);
-    assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
-    assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+    assert_exact_networkless_bundle_entitlements(&bundle);
     let mut media = MacosVirtualBlock::create(MacosVirtualBlockAccess::ReadWrite)
         .expect("temporary block media should attach read-write");
     let logical_block_size = usize::try_from(
@@ -10466,6 +10489,44 @@ fn codesign_entitlements(path: &Path) -> String {
     String::from_utf8(output.stdout).expect("entitlements should be UTF-8")
 }
 
+fn codesign_entitlement_dictionary(path: &Path) -> plist::Dictionary {
+    let xml = codesign_entitlements(path);
+    if xml.is_empty() {
+        return plist::Dictionary::new();
+    }
+    let value =
+        plist::Value::from_reader_xml(xml.as_bytes()).expect("entitlements should be a plist");
+    value
+        .as_dictionary()
+        .expect("entitlements plist should contain a dictionary")
+        .clone()
+}
+
+fn assert_exact_networkless_bundle_entitlements(bundle: &Path) {
+    let launcher = codesign_entitlement_dictionary(bundle);
+    assert!(
+        launcher.is_empty(),
+        "networkless launcher entitlement dictionary must be empty: {launcher:?}"
+    );
+
+    let worker = codesign_entitlement_dictionary(&worker_bundle(bundle));
+    assert_eq!(
+        worker.len(),
+        2,
+        "networkless worker must retain exactly two entitlements: {worker:?}"
+    );
+    for key in [
+        "com.apple.security.app-sandbox",
+        "com.apple.security.hypervisor",
+    ] {
+        assert_eq!(
+            worker.get(key),
+            Some(&plist::Value::Boolean(true)),
+            "networkless worker entitlement {key} must be exactly Boolean true: {worker:?}"
+        );
+    }
+}
+
 fn assert_output_success(output: &Output, context: &str) {
     assert!(
         output.status.success(),
@@ -10518,6 +10579,13 @@ fn path_text(path: &Path) -> &str {
     path.to_str().expect("test path should be UTF-8")
 }
 
+#[cfg(target_os = "macos")]
+fn snapshot_pager_observed(report: &SnapshotPagerReport, offset: u64, access: PageAccess) -> bool {
+    report.requests.iter().any(|request| {
+        request.region.get() == 1 && request.offset == offset && request.access == access
+    })
+}
+
 fn snapshot_continuity_guest_image() -> Vec<u8> {
     let instructions = [
         aarch64_movz_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0), 0),
@@ -10532,6 +10600,17 @@ fn snapshot_continuity_guest_image() -> Vec<u8> {
         0x5400_0061,
         aarch64_cmp_x(6, 3),
         0x54ff_ff80,
+        aarch64_movz_x(21, low_u16(SNAPSHOT_GUEST_CODE_ADDRESS, 0), 0),
+        aarch64_movk_x(21, low_u16(SNAPSHOT_GUEST_CODE_ADDRESS, 16), 16),
+        aarch64_br(21),
+    ];
+    let continuation = [
+        aarch64_movz_x(18, low_u16(SNAPSHOT_GUEST_READ_ADDRESS, 0), 0),
+        aarch64_movk_x(18, low_u16(SNAPSHOT_GUEST_READ_ADDRESS, 16), 16),
+        aarch64_ldr_x(19, 18, 0),
+        aarch64_movz_x(20, low_u16(SNAPSHOT_GUEST_WRITE_ADDRESS, 0), 0),
+        aarch64_movk_x(20, low_u16(SNAPSHOT_GUEST_WRITE_ADDRESS, 16), 16),
+        aarch64_str_x(19, 20, 0),
         aarch64_movz_x(7, u16::from(b'C'), 0),
         aarch64_strb_w(7, 4),
         aarch64_movz_x(0, 0x0008, 0),
@@ -10545,6 +10624,8 @@ fn snapshot_continuity_guest_image() -> Vec<u8> {
     write_snapshot_test_u64(&mut image, 8, 0);
     write_snapshot_test_u32(&mut image, 56, SNAPSHOT_GUEST_IMAGE_MAGIC);
     image.extend(instructions.into_iter().flat_map(u32::to_le_bytes));
+    image.resize(SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET, 0);
+    image.extend(continuation.into_iter().flat_map(u32::to_le_bytes));
     let image_size = u64::try_from(image.len()).expect("snapshot guest image length should fit");
     write_snapshot_test_u64(&mut image, 16, image_size);
     image
@@ -10564,6 +10645,20 @@ fn aarch64_ldp_x(first: u32, second: u32, base: u32) -> u32 {
 
 fn aarch64_cmp_x(left: u32, right: u32) -> u32 {
     0xeb00_001f | (right << 16) | (left << 5)
+}
+
+fn aarch64_ldr_x(destination: u32, base: u32, byte_offset: u32) -> u32 {
+    assert!(byte_offset.is_multiple_of(8) && byte_offset / 8 <= 0xfff);
+    0xf940_0000 | ((byte_offset / 8) << 10) | (base << 5) | destination
+}
+
+fn aarch64_str_x(source: u32, base: u32, byte_offset: u32) -> u32 {
+    assert!(byte_offset.is_multiple_of(8) && byte_offset / 8 <= 0xfff);
+    0xf900_0000 | ((byte_offset / 8) << 10) | (base << 5) | source
+}
+
+fn aarch64_br(register: u32) -> u32 {
+    0xd61f_0000 | (register << 5)
 }
 
 fn aarch64_strb_w(source: u32, base: u32) -> u32 {

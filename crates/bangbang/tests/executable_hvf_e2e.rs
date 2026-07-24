@@ -28,7 +28,9 @@ mod macos_arm64 {
     use crate::macos_virtual_block::{
         MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize,
     };
-    use crate::snapshot_pager::{SnapshotPagerServer, SnapshotPagerTermination};
+    use crate::snapshot_pager::{
+        SnapshotPagerReport, SnapshotPagerServer, SnapshotPagerTermination,
+    };
     use crate::support::{
         BangbangProcess, CompletedProcess, TestDir, assert_bad_request_response,
         assert_clean_shutdown, assert_no_content_response, assert_ok_response,
@@ -38,6 +40,7 @@ mod macos_arm64 {
     use crate::vhost_user_block::{
         VhostUserBlockBackend, VhostUserBlockBackendOptions, VhostUserBlockBackendReport,
     };
+    use bangbang_pager::PageAccess;
 
     const BANGBANG_GUEST_KERNEL_PATH_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
     const BANGBANG_GUEST_INITRD_PATH_ENV: &str = "BANGBANG_GUEST_INITRD_PATH";
@@ -308,6 +311,16 @@ mod macos_arm64 {
     const PCI_ALL_VIRTIO_GUEST_TIMEOUT: Duration = Duration::from_secs(90);
     const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
     const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
+    const SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET: usize = 0x4000;
+    const SNAPSHOT_GUEST_CODE_OFFSET: u64 = 0x20_4000;
+    const SNAPSHOT_GUEST_READ_OFFSET: u64 = 0x1_0000;
+    const SNAPSHOT_GUEST_WRITE_OFFSET: u64 = 0x2_0000;
+    const SNAPSHOT_GUEST_CODE_ADDRESS: u64 =
+        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_CODE_OFFSET;
+    const SNAPSHOT_GUEST_READ_ADDRESS: u64 =
+        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_READ_OFFSET;
+    const SNAPSHOT_GUEST_WRITE_ADDRESS: u64 =
+        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_WRITE_OFFSET;
     const SNAPSHOT_GUEST_RTC_ADDRESS: u64 = 0x4000_1000;
     const SNAPSHOT_GUEST_UART_ADDRESS: u64 = 0x4000_2000;
     const SNAPSHOT_GUEST_VMCLOCK_ADDRESS: u64 = bangbang_runtime::memory::aarch64::SYSTEM_MEM_START
@@ -11191,6 +11204,27 @@ mod macos_arm64 {
             r#""track_dirty_pages":false"#,
             "GET tracked paused destination machine",
         );
+        let host_demand = pager.snapshot();
+        assert_eq!(
+            host_demand.termination,
+            SnapshotPagerTermination::Active,
+            "paused restore should retain an active external pager"
+        );
+        assert!(
+            host_demand.page_data + host_demand.page_zero > 0,
+            "paused restore preparation should demand at least one host page"
+        );
+        for offset in [
+            SNAPSHOT_GUEST_CODE_OFFSET,
+            SNAPSHOT_GUEST_READ_OFFSET,
+            SNAPSHOT_GUEST_WRITE_OFFSET,
+        ] {
+            assert!(
+                !snapshot_pager_observed(&host_demand, offset, PageAccess::Read)
+                    && !snapshot_pager_observed(&host_demand, offset, PageAccess::Write),
+                "paused host preparation must not pre-access guest-only offset {offset:#x}: {host_demand:?}"
+            );
+        }
         let resume = http_json(&paused_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
         assert_no_content_response(&resume, "PATCH paused destination /vm Resumed");
         let paused_output = paused.wait_for_exit_with_timeout(
@@ -11205,9 +11239,32 @@ mod macos_arm64 {
         let pager_report = pager.wait();
         assert_eq!(pager_report.termination, SnapshotPagerTermination::Shutdown);
         assert!(
-            pager_report.page_data + pager_report.page_zero > 0,
-            "demand-backed restore should request at least one bound page"
+            pager_report.page_data + pager_report.page_zero
+                > host_demand.page_data + host_demand.page_zero,
+            "resumed guest should add demand beyond paused host preparation"
         );
+        for (offset, access, context) in [
+            (
+                SNAPSHOT_GUEST_CODE_OFFSET,
+                PageAccess::Read,
+                "instruction-first code page",
+            ),
+            (
+                SNAPSHOT_GUEST_READ_OFFSET,
+                PageAccess::Read,
+                "read-first guest page",
+            ),
+            (
+                SNAPSHOT_GUEST_WRITE_OFFSET,
+                PageAccess::Write,
+                "write-first guest page",
+            ),
+        ] {
+            assert!(
+                snapshot_pager_observed(&pager_report, offset, access),
+                "restored guest should demand {context} at {offset:#x}: {pager_report:?}"
+            );
+        }
 
         let resumed = BangbangProcess::start(
             &resumed_socket,
@@ -11262,10 +11319,27 @@ mod macos_arm64 {
             read_test_u32(&image, 64 + (20 * 4)),
             aarch64_tbnz_w(11, 0, -6)
         );
-        assert_eq!(read_test_u32(&image, 64 + (39 * 4)), 0xd400_0002);
-        assert_eq!(read_test_u32(&image, 64 + (40 * 4)), 0x1400_0000);
+        assert_eq!(read_test_u32(&image, 64 + (37 * 4)), aarch64_br(21));
+        assert_eq!(
+            read_test_u32(&image, SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET + (2 * 4)),
+            aarch64_ldr_x(19, 18, 0)
+        );
+        assert_eq!(
+            read_test_u32(&image, SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET + (5 * 4)),
+            aarch64_str_x(19, 20, 0)
+        );
+        assert_eq!(
+            read_test_u32(&image, SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET + (10 * 4)),
+            0xd400_0002
+        );
+        assert_eq!(
+            read_test_u32(&image, SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET + (11 * 4)),
+            0x1400_0000
+        );
         assert_eq!(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0x801f_eff0);
         assert_eq!(SNAPSHOT_GUEST_VMCLOCK_ADDRESS, 0x801f_f000);
+        assert!(SNAPSHOT_GUEST_READ_OFFSET.is_multiple_of(0x4000));
+        assert!(SNAPSHOT_GUEST_WRITE_OFFSET.is_multiple_of(0x4000));
     }
 
     fn snapshot_load_body(state_path: &Path, memory_path: &Path, resume_vm: bool) -> String {
@@ -11282,6 +11356,16 @@ mod macos_arm64 {
             json_string(path_text(state_path)),
             json_string(path_text(pager_path))
         )
+    }
+
+    fn snapshot_pager_observed(
+        report: &SnapshotPagerReport,
+        offset: u64,
+        access: PageAccess,
+    ) -> bool {
+        report.requests.iter().any(|request| {
+            request.region.get() == 1 && request.offset == offset && request.access == access
+        })
     }
 
     fn flush_memory_hotplug_metrics(
@@ -11495,6 +11579,17 @@ mod macos_arm64 {
             aarch64_ldr_w(17, 15, 0),
             aarch64_cmp_w(17, 16),
             aarch64_b_cond(-20, 3), // b.lo poll
+            aarch64_movz_x(21, low_u16(SNAPSHOT_GUEST_CODE_ADDRESS, 0), 0),
+            aarch64_movk_x(21, low_u16(SNAPSHOT_GUEST_CODE_ADDRESS, 16), 16),
+            aarch64_br(21),
+        ];
+        let continuation = [
+            aarch64_movz_x(18, low_u16(SNAPSHOT_GUEST_READ_ADDRESS, 0), 0),
+            aarch64_movk_x(18, low_u16(SNAPSHOT_GUEST_READ_ADDRESS, 16), 16),
+            aarch64_ldr_x(19, 18, 0),
+            aarch64_movz_x(20, low_u16(SNAPSHOT_GUEST_WRITE_ADDRESS, 0), 0),
+            aarch64_movk_x(20, low_u16(SNAPSHOT_GUEST_WRITE_ADDRESS, 16), 16),
+            aarch64_str_x(19, 20, 0),
             aarch64_movz_x(7, u16::from(b'C'), 0),
             aarch64_strb_w(7, 4),
             aarch64_movz_x(0, 0x0008, 0),
@@ -11509,6 +11604,8 @@ mod macos_arm64 {
         write_test_u64(&mut image, 8, 0); // text_offset
         write_test_u32(&mut image, 56, SNAPSHOT_GUEST_IMAGE_MAGIC);
         image.extend(instructions.into_iter().flat_map(u32::to_le_bytes));
+        image.resize(SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET, 0);
+        image.extend(continuation.into_iter().flat_map(u32::to_le_bytes));
         let image_size = u64::try_from(image.len()).expect("guest image length should fit u64");
         write_test_u64(&mut image, 16, image_size);
         image
@@ -11543,6 +11640,12 @@ mod macos_arm64 {
         0xb940_0000 | ((byte_offset / 4) << 10) | (base << 5) | destination
     }
 
+    fn aarch64_str_x(source: u32, base: u32, byte_offset: u32) -> u32 {
+        assert!(source <= 30 && base <= 30);
+        assert!(byte_offset.is_multiple_of(8) && byte_offset / 8 <= 0xfff);
+        0xf900_0000 | ((byte_offset / 8) << 10) | (base << 5) | source
+    }
+
     fn aarch64_cmp_x(left: u32, right: u32) -> u32 {
         assert!(left <= 30 && right <= 30);
         0xeb00_001f | (right << 16) | (left << 5)
@@ -11565,6 +11668,11 @@ mod macos_arm64 {
         assert!((-8192..8192).contains(&instruction_offset));
         let immediate = instruction_offset.cast_unsigned() & 0x3fff;
         0x3700_0000 | (bit << 19) | (immediate << 5) | register
+    }
+
+    fn aarch64_br(register: u32) -> u32 {
+        assert!(register <= 30);
+        0xd61f_0000 | (register << 5)
     }
 
     fn aarch64_strb_w(source: u32, base: u32) -> u32 {

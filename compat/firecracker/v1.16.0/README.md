@@ -92,13 +92,15 @@ claims mechanically visible.
   API/live outcomes, and retains six explicit #1490 optional-device encoding,
   public restore, clone/version, and portability handoffs.
 - [`snapshot-paging-contract.md`](snapshot-paging-contract.md) is the
-  #1546-#1554 checked public-macOS UFFD-equivalent feasibility and delivery
+  #1546-#1555 checked public-macOS UFFD-equivalent feasibility, delivery, and
+  certification
   ledger. It pins the exact page-fault corpus, upstream observable contract,
   bounded `bangbang-pager-v1` protocol, distinct lazy-anonymous owner,
   public-Mach host bridge, HVF read/write/execute guest bridge, contained
   connected-stream authority, consumer gates, and narrow direct/contained
-  native-v1 restore. The aggregate remains nonterminal for #1555 final
-  certification and does not claim Linux wire compatibility.
+  native-v1 restore, exact signed host/guest demand, removal generations,
+  failure/cleanup composition, and production entitlement floor. The exact
+  corpus is terminal and does not claim Linux wire compatibility.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -595,8 +597,13 @@ dirty tracking disabled. It adds state-bound pager sessions, exact
 layout/source-offset validation, bounded direct connection, one-time contained
 stream claim without a worker memory-file grant, rollback-owned host/guest
 lazy assembly, and signed direct plus production-bundle restore-to-shutdown
-evidence. Final certification remains open, so the current overlay remains
-228/169/4/17.
+evidence. At that checkpoint final certification remained open and the overlay
+was 228/169/4/17. #1555 adds live paused-host and exact
+restored-guest instruction/read/write observations, signed
+before/during/after removal and zero refault, multi-vCPU/failure/death/repeat
+cleanup, exact empty-launcher/two-key-worker entitlement dictionaries, and the
+full repository matrix. It promotes only `corpus:snapshot-page-faults`, so the
+current overlay is 229/169/3/17.
 
 ## Commands
 

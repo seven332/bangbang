@@ -394,8 +394,8 @@ Apple Silicon for the same narrow fixed-memory profile with dirty tracking
 disabled. Its `backend_path` names a `bangbang-pager-v1` Unix peer, not a Linux
 UFFD endpoint or memory image. The checked
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
-records the observable equivalent and its remaining final-certification gate
-under #1527; this is not Linux UFFD wire compatibility. The standalone
+records the observable equivalent and completed #1555 signed certification;
+this is not Linux UFFD wire compatibility. The standalone
 [`bangbang-pager-v1` contract](docs/snapshot-pager-protocol.md) now implements
 the closed offset-only wire, role state machines, and already-connected
 deadline transport. In contained mode the launcher now reduces one strictly
@@ -462,7 +462,9 @@ checksum, length, GPA layout, region source offsets, negotiated limits, and
 root identity are validated before a VM owner is published. File restore
 remains the eager path, while dirty tracking and every consumer profile that
 can bypass the task-local bridge reject before path, socket, artifact, or
-backend access. Final cross-slice certification remains deferred under #1527.
+backend access. #1555's signed final certification proves paused host demand,
+exact resumed-guest instruction/read/write pages, all removal generations,
+failure/death/repeat cleanup, and the exact production entitlement floor.
 
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
@@ -1357,7 +1359,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 228 implemented-and-verified, 169 audit-required, four
+delivery overlay with 229 implemented-and-verified, 169 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1388,15 +1390,15 @@ and non-success external gates: 31 are terminal and four remain audit-owned by
 exact 14-record set to eight terminal API/live outcomes and six precise #1490
 artifact/restore/clone handoffs. The
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
-then moves its one exact corpus record to feasible-but-undelivered #1527
-ownership until final certification. Its standalone protocol and concurrent
-client, contained connected-peer grant, backend-neutral coordinated
-lazy-anonymous-memory slice, task-local public-Mach host-fault bridge, HVF
-guest read/write/execute fault bridge, ordered removal, peer-failure
-propagation, complete consumer gates, and native-v1 direct/contained restore
-assembly are implemented and tested without promoting the aggregate
-capability.
-The repository-wide disposition counts remain 228/169/4/17.
+now promotes its one exact corpus record after #1555's signed final
+certification. Its standalone protocol and concurrent client, contained
+connected-peer grant, backend-neutral coordinated lazy-anonymous-memory slice,
+task-local public-Mach host-fault bridge, HVF guest read/write/execute fault
+bridge, ordered before/during/after removal, peer-failure propagation,
+complete consumer gates, native-v1 direct/contained restore, paused-host plus
+exact restored-guest demand, exact nested entitlement dictionaries, and
+cleanup are implemented and verified.
+The repository-wide disposition counts are 229/169/3/17.
 
 ## Build And Test
 

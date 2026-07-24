@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, SOURCE_MANIFEST_PATH,
+    AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, Reference, SOURCE_MANIFEST_PATH,
     read_capability_inventory, read_source_manifest, source_manifest_json, validate,
 };
 
@@ -45,10 +45,19 @@ fn checked_source_manifest_is_canonical_and_deterministic() {
     );
 }
 
+fn local_reference_paths(references: &[Reference]) -> Option<BTreeSet<&str>> {
+    references
+        .iter()
+        .map(|reference| match reference {
+            Reference::Local { path, .. } => Some(path.as_str()),
+            Reference::Github { .. } | Reference::Authoritative { .. } => None,
+        })
+        .collect()
+}
+
 #[test]
-fn snapshot_paging_feasibility_policy_is_stable() {
+fn snapshot_paging_terminal_policy_is_stable() {
     const CAPABILITY_ID: &str = "corpus:snapshot-page-faults";
-    const DELIVERY_ISSUE: &str = "https://github.com/seven332/bangbang/issues/1527";
 
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -70,28 +79,48 @@ fn snapshot_paging_feasibility_policy_is_stable() {
     );
     assert_eq!(
         capability.disposition,
-        Disposition::MissingPlatformFeasible,
-        "snapshot paging must remain feasible but nonterminal until certification"
+        Disposition::ImplementedAndVerified,
+        "snapshot paging must remain terminal after signed certification"
+    );
+    assert!(
+        capability.delivery_issue.is_none() && capability.exclusion.is_none(),
+        "terminal snapshot paging must not retain a delivery owner or exclusion"
     );
     assert_eq!(
-        capability.delivery_issue.as_deref(),
-        Some(DELIVERY_ISSUE),
-        "snapshot paging must retain its challenged delivery owner"
+        local_reference_paths(&capability.implementation),
+        Some(BTreeSet::from([
+            "crates/bangbang/src/vmm.rs",
+            "crates/hvf/src/lazy_guest_fault.rs",
+            "crates/hvf/src/lazy_host_fault.rs",
+            "crates/launcher/src/grant_manifest.rs",
+            "crates/pager/src/lib.rs",
+            "crates/runtime/src/lazy_memory.rs",
+        ])),
+        "snapshot implementation evidence must stay exact"
+    );
+    assert_eq!(
+        local_reference_paths(&capability.validation),
+        Some(BTreeSet::from([
+            "compat/firecracker/v1.16.0/snapshot-paging-contract.md",
+            "crates/bangbang/tests/executable_hvf_e2e.rs",
+            "crates/hvf/tests/guest_boot.rs",
+            "crates/hvf/tests/hvf_lifecycle.rs",
+            "crates/launcher/tests/production_bundle_e2e.rs",
+        ])),
+        "snapshot validation evidence must stay exact"
     );
     assert!(
-        capability.implementation.is_empty()
-            && capability.validation.is_empty()
-            && capability.exclusion.is_none(),
-        "feasibility evidence must not masquerade as terminal capability evidence"
-    );
-    assert!(
-        capability.summary.contains(DELIVERY_ISSUE)
-            && capability.summary.contains("Native-v1 Uffd now restores")
+        capability.summary.contains("Native-v1 Uffd restores")
             && capability
                 .summary
                 .contains("without worker memory-file authority")
+            && capability.summary.contains("instruction/read/write-first")
+            && capability
+                .summary
+                .contains("before/during/after population")
+            && capability.summary.contains("exact entitlements")
             && capability.summary.contains("not Linux UFFD"),
-        "snapshot paging summary must retain owner, runtime, and compatibility limits"
+        "snapshot paging summary must retain runtime, signed evidence, and compatibility limits"
     );
 
     let contract = std::fs::read_to_string(
@@ -105,10 +134,10 @@ fn snapshot_paging_feasibility_policy_is_stable() {
     assert_eq!(rows.len(), 1, "snapshot paging ledger must have one row");
     assert!(
         rows[0].starts_with(&format!("| `{CAPABILITY_ID}` |"))
-            && rows[0].contains("`missing-platform-feasible`")
-            && rows[0].contains(DELIVERY_ISSUE)
-            && rows[0].ends_with("| `nonterminal` |"),
-        "snapshot paging ledger row must pin identity, status, owner, and result"
+            && rows[0].contains("`implemented-and-verified`")
+            && rows[0].contains("| — |")
+            && rows[0].ends_with("| `terminal` |"),
+        "snapshot paging ledger row must pin identity, terminal status, and result"
     );
 
     for required in [
@@ -176,6 +205,10 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "returns_fault_for_snapshot_endpoint",
         "signed_executable_creates_and_restores_native_v1_snapshot_across_processes",
         "https://github.com/seven332/bangbang/issues/1555",
+        "SnapshotPagerTermination::Active",
+        "task_local_lazy_fault_bridge_removal_generations_refault_zero_before_and_during_population",
+        "production_bundle_has_exact_nested_signing_contract",
+        "229 `implemented-and-verified`",
     ] {
         assert!(
             contract.contains(required),
@@ -513,9 +546,9 @@ fn snapshot_paging_feasibility_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 228);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 229);
     assert_eq!(count(Disposition::AuditRequired), 169);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 4);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
 
@@ -738,9 +771,9 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 228);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 229);
     assert_eq!(count(Disposition::AuditRequired), 169);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 4);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
 
@@ -950,9 +983,9 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 228);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 229);
     assert_eq!(count(Disposition::AuditRequired), 169);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 4);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
 
@@ -1220,9 +1253,9 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 228);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 229);
     assert_eq!(count(Disposition::AuditRequired), 169);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 4);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
     for id in IMPLEMENTED_ORIGINAL {
