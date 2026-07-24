@@ -577,6 +577,24 @@ and writes, unknown calls, and nonzero HVC immediates. A signed one-vCPU bare
 guest stores 36 feature-query results plus both version and architecture
 discovery results before terminating through SYSTEM_OFF without fixed sleeps.
 
+#1566 adds the wire-format-neutral reviewed optional arm64 restore foundation
+needed by native-v2. Five public macOS 15.2 SME setters are dynamically
+resolved without raising the deployment target. One one-attempt, never-run
+owner command validates exact DFR0 counts, SME version/identification/maximum
+SVL, conditional inventory and widths, fresh disabled controls/PSTATE,
+destination-local sparse defaults, and every Q/Z alias before mutation. It
+disables breakpoint/watchpoint controls before comparator publication, applies
+SME system registers before PSTATE and Z/P/ZA/ZT0, then restores authoritative
+Q0-Q31, FPCR, and FPSR last. Every read/write failure reports redacted
+family/stage/index/completed-write context, and any failed attempt permanently
+prevents guest execution on that runner. Unit coverage exhausts static
+rejections, sparse reads, operation failures, ordering, admission, channels,
+panic, and execution poisoning; signed HVF coverage proves real same-owner
+debug and active-SME restore/recapture on supported Apple Silicon. Native-v1
+bytes and inactive-optional policy remain unchanged; stable topology/PSCI
+state, native-v2 encoding, multi-vCPU aggregate construction, and public
+lifecycle remain #1528 follow-up work.
+
 ## Update Rule
 
 When a PR changes Firecracker-facing behavior, update this matrix if it changes

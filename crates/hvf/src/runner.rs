@@ -30,6 +30,10 @@ use crate::lazy_guest_fault::{
     HvfHandledLazyGuestFault, HvfLazyGuestFaultError, HvfLazyGuestFaultHandler,
 };
 use crate::mmio::HvfMmioDispatchError;
+use crate::optional_state::{
+    HvfArm64ReviewedOptionalStateAccess, HvfArm64ReviewedOptionalStateRestore,
+    HvfArm64ReviewedOptionalStateRestoreError, restore_arm64_reviewed_optional_state_with,
+};
 use crate::psci::{
     PsciCall, PsciCallAction, PsciCoordinatedDispatch, PsciCoordinatorRequest,
     PsciCoordinatorResponse, call_uses_arg0, coordinated_call_argument_count,
@@ -130,6 +134,12 @@ const CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has core register operation in flight";
 const CPU_TEMPLATE_AFTER_RUN_MESSAGE: &str =
     "vCPU runner CPU-template registers cannot change after execution starts";
+const REVIEWED_OPTIONAL_STATE_AFTER_RUN_MESSAGE: &str =
+    "vCPU runner reviewed optional state cannot be restored after execution starts";
+const REVIEWED_OPTIONAL_STATE_ALREADY_ATTEMPTED_MESSAGE: &str =
+    "vCPU runner reviewed optional state restore was already attempted";
+const REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE: &str =
+    "vCPU runner reviewed optional state restore failed and runner must be discarded";
 const TIMER_OPERATION_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has timer operation in flight";
 const INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has interrupt operation in flight";
@@ -196,6 +206,7 @@ pub enum HvfVcpuRunnerError {
     SmeZRegisterCapture(HvfArm64VcpuSmeZRegisterCaptureError),
     SmeZaRegisterCapture(HvfArm64VcpuSmeZaRegisterCaptureError),
     SmeZt0RegisterCapture(HvfArm64VcpuSmeZt0RegisterCaptureError),
+    ReviewedOptionalStateRestore(HvfArm64ReviewedOptionalStateRestoreError),
     SnapshotTimerPolicy(HvfArm64SnapshotTimerPolicyError),
     SnapshotTimerRestore(HvfArm64SnapshotTimerRestoreError),
     SnapshotOptionalState(HvfArm64SnapshotOptionalStateRejection),
@@ -698,6 +709,7 @@ impl fmt::Display for HvfVcpuRunnerError {
             Self::SmeZRegisterCapture(err) => write!(f, "{err}"),
             Self::SmeZaRegisterCapture(err) => write!(f, "{err}"),
             Self::SmeZt0RegisterCapture(err) => write!(f, "{err}"),
+            Self::ReviewedOptionalStateRestore(err) => write!(f, "{err}"),
             Self::SnapshotTimerPolicy(err) => write!(f, "{err}"),
             Self::SnapshotTimerRestore(err) => write!(f, "{err}"),
             Self::SnapshotOptionalState(err) => write!(f, "{err}"),
@@ -779,6 +791,7 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::SmeZRegisterCapture(err) => Some(err),
             Self::SmeZaRegisterCapture(err) => Some(err),
             Self::SmeZt0RegisterCapture(err) => Some(err),
+            Self::ReviewedOptionalStateRestore(err) => Some(err),
             Self::SnapshotTimerPolicy(err) => Some(err),
             Self::SnapshotTimerRestore(err) => Some(err),
             Self::SnapshotOptionalState(err) => Some(err),
@@ -879,6 +892,12 @@ impl From<HvfArm64VcpuSmeZaRegisterCaptureError> for HvfVcpuRunnerError {
 impl From<HvfArm64VcpuSmeZt0RegisterCaptureError> for HvfVcpuRunnerError {
     fn from(err: HvfArm64VcpuSmeZt0RegisterCaptureError) -> Self {
         Self::SmeZt0RegisterCapture(err)
+    }
+}
+
+impl From<HvfArm64ReviewedOptionalStateRestoreError> for HvfVcpuRunnerError {
+    fn from(err: HvfArm64ReviewedOptionalStateRestoreError) -> Self {
+        Self::ReviewedOptionalStateRestore(err)
     }
 }
 
@@ -1111,6 +1130,8 @@ struct RunnerHandleState {
     boot_register_setup_failed: bool,
     boot_registers_configured: bool,
     run_started: bool,
+    reviewed_optional_restore_attempted: bool,
+    reviewed_optional_restore_failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1366,6 +1387,11 @@ enum RunnerCommand {
         admission: InFlightCoreRegisterOperation,
         response_sender:
             mpsc::Sender<Result<HvfArm64VcpuSmeSystemRegisterState, HvfVcpuRunnerError>>,
+    },
+    RestoreArm64ReviewedOptionalState {
+        admission: InFlightCoreRegisterOperation,
+        state: Box<HvfArm64ReviewedOptionalStateRestore>,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     CaptureArm64SystemContextRegisterState {
         admission: InFlightCoreRegisterOperation,
@@ -1785,6 +1811,15 @@ trait RunnerVcpu {
             "vCPU does not support SME PSTATE reads",
         ))
     }
+    fn set_sme_pstate(
+        &mut self,
+        _streaming_sve_mode_enabled: bool,
+        _za_storage_enabled: bool,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support SME PSTATE writes",
+        ))
+    }
     fn capture_arm64_sme_pstate(&mut self) -> Result<HvfArm64VcpuSmePstate, BackendError> {
         capture_arm64_vcpu_sme_pstate_with(|| self.get_sme_pstate())
     }
@@ -1800,6 +1835,11 @@ trait RunnerVcpu {
     ) -> Result<(), BackendError> {
         Err(BackendError::InvalidState(
             "vCPU does not support SME P-register reads",
+        ))
+    }
+    fn set_sme_p_register(&mut self, _register: u32, _value: &[u8]) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support SME P-register writes",
         ))
     }
     fn capture_arm64_sme_p_register_state(
@@ -1821,6 +1861,11 @@ trait RunnerVcpu {
             "vCPU does not support SME Z-register reads",
         ))
     }
+    fn set_sme_z_register(&mut self, _register: u32, _value: &[u8]) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support SME Z-register writes",
+        ))
+    }
     fn capture_arm64_sme_z_register_state(
         &mut self,
     ) -> Result<HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuSmeZRegisterCaptureError> {
@@ -1834,6 +1879,11 @@ trait RunnerVcpu {
     fn get_sme_za_register(&mut self, _value: &mut [u8]) -> Result<(), BackendError> {
         Err(BackendError::InvalidState(
             "vCPU does not support SME ZA-register reads",
+        ))
+    }
+    fn set_sme_za_register(&mut self, _value: &[u8]) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support SME ZA-register writes",
         ))
     }
     fn capture_arm64_sme_za_register_state(
@@ -1851,6 +1901,11 @@ trait RunnerVcpu {
             "vCPU does not support SME ZT0-register reads",
         ))
     }
+    fn set_sme_zt0_register(&mut self, _value: [u8; 64]) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support SME ZT0-register writes",
+        ))
+    }
     fn capture_arm64_sme_zt0_register_state(
         &mut self,
     ) -> Result<HvfArm64VcpuSmeZt0RegisterState, HvfArm64VcpuSmeZt0RegisterCaptureError> {
@@ -1866,6 +1921,15 @@ trait RunnerVcpu {
         capture_arm64_vcpu_sme_system_register_state_with(|register| {
             self.read_system_register(register)
         })
+    }
+    fn restore_arm64_reviewed_optional_state(
+        &mut self,
+        state: &HvfArm64ReviewedOptionalStateRestore,
+    ) -> Result<(), HvfArm64ReviewedOptionalStateRestoreError>
+    where
+        Self: Sized,
+    {
+        restore_arm64_reviewed_optional_state_with(self, state)
     }
     fn capture_arm64_system_context_register_state(
         &mut self,
@@ -2528,6 +2592,84 @@ trait RunnerVcpu {
     fn destroy(&mut self) -> Result<(), BackendError>;
 }
 
+impl<T: RunnerVcpu + ?Sized> HvfArm64ReviewedOptionalStateAccess for T {
+    fn read_system_register(&mut self, register: HvfSystemRegister) -> Result<u64, BackendError> {
+        RunnerVcpu::read_system_register(self, register)
+    }
+
+    fn write_system_register(
+        &mut self,
+        register: HvfSystemRegister,
+        value: u64,
+    ) -> Result<(), BackendError> {
+        RunnerVcpu::write_system_register(self, register, value)
+    }
+
+    fn get_sme_pstate(&mut self) -> Result<(bool, bool), BackendError> {
+        RunnerVcpu::get_sme_pstate(self)
+    }
+
+    fn set_sme_pstate(
+        &mut self,
+        streaming_sve_mode_enabled: bool,
+        za_storage_enabled: bool,
+    ) -> Result<(), BackendError> {
+        RunnerVcpu::set_sme_pstate(self, streaming_sve_mode_enabled, za_storage_enabled)
+    }
+
+    fn get_sme_maximum_svl_bytes(&mut self) -> Result<usize, BackendError> {
+        RunnerVcpu::get_sme_maximum_svl_bytes(self)
+    }
+
+    fn get_sme_z_register(&mut self, register: u32, value: &mut [u8]) -> Result<(), BackendError> {
+        RunnerVcpu::get_sme_z_register(self, register, value)
+    }
+
+    fn set_sme_z_register(&mut self, register: u32, value: &[u8]) -> Result<(), BackendError> {
+        RunnerVcpu::set_sme_z_register(self, register, value)
+    }
+
+    fn get_sme_p_register(&mut self, register: u32, value: &mut [u8]) -> Result<(), BackendError> {
+        RunnerVcpu::get_sme_p_register(self, register, value)
+    }
+
+    fn set_sme_p_register(&mut self, register: u32, value: &[u8]) -> Result<(), BackendError> {
+        RunnerVcpu::set_sme_p_register(self, register, value)
+    }
+
+    fn get_sme_za_register(&mut self, value: &mut [u8]) -> Result<(), BackendError> {
+        RunnerVcpu::get_sme_za_register(self, value)
+    }
+
+    fn set_sme_za_register(&mut self, value: &[u8]) -> Result<(), BackendError> {
+        RunnerVcpu::set_sme_za_register(self, value)
+    }
+
+    fn get_sme_zt0_register(&mut self) -> Result<[u8; 64], BackendError> {
+        RunnerVcpu::get_sme_zt0_register(self)
+    }
+
+    fn set_sme_zt0_register(&mut self, value: [u8; 64]) -> Result<(), BackendError> {
+        RunnerVcpu::set_sme_zt0_register(self, value)
+    }
+
+    fn write_simd_fp_register(
+        &mut self,
+        register: HvfSimdFpRegister,
+        value: [u8; 16],
+    ) -> Result<(), BackendError> {
+        RunnerVcpu::write_simd_fp_register(self, register, value)
+    }
+
+    fn write_scalar_register(
+        &mut self,
+        register: HvfRegister,
+        value: u64,
+    ) -> Result<(), BackendError> {
+        RunnerVcpu::write_register(self, register, value)
+    }
+}
+
 impl<T: RunnerVcpu + ?Sized> HvfArm64CpuTemplateAccess for T {
     fn read_general_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
         self.read_register(register)
@@ -2734,6 +2876,15 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner.get_sme_pstate()
     }
 
+    fn set_sme_pstate(
+        &mut self,
+        streaming_sve_mode_enabled: bool,
+        za_storage_enabled: bool,
+    ) -> Result<(), BackendError> {
+        self.owner
+            .set_sme_pstate(streaming_sve_mode_enabled, za_storage_enabled)
+    }
+
     fn get_sme_maximum_svl_bytes(&mut self) -> Result<usize, BackendError> {
         self.owner.get_sme_maximum_svl_bytes()
     }
@@ -2742,16 +2893,32 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner.get_sme_p_register(register, value)
     }
 
+    fn set_sme_p_register(&mut self, register: u32, value: &[u8]) -> Result<(), BackendError> {
+        self.owner.set_sme_p_register(register, value)
+    }
+
     fn get_sme_z_register(&mut self, register: u32, value: &mut [u8]) -> Result<(), BackendError> {
         self.owner.get_sme_z_register(register, value)
+    }
+
+    fn set_sme_z_register(&mut self, register: u32, value: &[u8]) -> Result<(), BackendError> {
+        self.owner.set_sme_z_register(register, value)
     }
 
     fn get_sme_za_register(&mut self, value: &mut [u8]) -> Result<(), BackendError> {
         self.owner.get_sme_za_register(value)
     }
 
+    fn set_sme_za_register(&mut self, value: &[u8]) -> Result<(), BackendError> {
+        self.owner.set_sme_za_register(value)
+    }
+
     fn get_sme_zt0_register(&mut self) -> Result<[u8; 64], BackendError> {
         self.owner.get_sme_zt0_register()
+    }
+
+    fn set_sme_zt0_register(&mut self, value: [u8; 64]) -> Result<(), BackendError> {
+        self.owner.set_sme_zt0_register(value)
     }
 
     fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
@@ -3812,6 +3979,26 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
+    /// Restore reviewed optional arm64 state under one fresh never-run owner admission.
+    ///
+    /// This is a low-level owner operation, not a complete snapshot lifecycle:
+    /// callers remain responsible for constructing a compatible aggregate.
+    /// Admission is consumed before enqueue and cannot be retried, because a
+    /// failed nontransactional restore may have changed destination defaults.
+    /// A failed attempt permanently makes this runner ineligible for guest
+    /// execution so the caller can only shut it down and discard the vCPU.
+    pub fn restore_arm64_reviewed_optional_state(
+        &self,
+        state: HvfArm64ReviewedOptionalStateRestore,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.start_arm64_reviewed_optional_state_restore(state, response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
     /// Capture raw system-context registers on the vCPU-owning runner thread.
     ///
     /// This macOS 15.2+ subset contains `SCXTNUM_EL0` and `SCXTNUM_EL1`.
@@ -4380,6 +4567,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 boot_register_setup_failed: false,
                 boot_registers_configured: false,
                 run_started: false,
+                reviewed_optional_restore_attempted: false,
+                reviewed_optional_restore_failed: false,
             })),
             dirty_write_tracker: None,
             dirty_write_member_index: 0,
@@ -4561,6 +4750,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
             ));
         }
+        if state.reviewed_optional_restore_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE,
+            ));
+        }
 
         state.in_flight_runs = 1;
         if self
@@ -4632,6 +4826,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.boot_register_setup_failed {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
+            ));
+        }
+        if state.reviewed_optional_restore_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE,
             ));
         }
 
@@ -4713,6 +4912,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.boot_register_setup_failed {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
+            ));
+        }
+        if state.reviewed_optional_restore_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE,
             ));
         }
 
@@ -5293,7 +5497,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
         ) -> RunnerCommand,
         response_sender: mpsc::Sender<Result<T, HvfVcpuRunnerError>>,
     ) -> Result<(), HvfVcpuRunnerError> {
-        let admission = self.reserve_core_register_operation_with(true)?;
+        let admission =
+            self.reserve_core_register_operation_with(true, CPU_TEMPLATE_AFTER_RUN_MESSAGE)?;
         self.command_sender
             .send(command(admission, response_sender))
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
@@ -5758,6 +5963,35 @@ impl<'vm> HvfVcpuRunner<'vm> {
         )
     }
 
+    fn start_arm64_reviewed_optional_state_restore(
+        &self,
+        state: HvfArm64ReviewedOptionalStateRestore,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let admission = self.reserve_core_register_operation_with(
+            true,
+            REVIEWED_OPTIONAL_STATE_AFTER_RUN_MESSAGE,
+        )?;
+        {
+            let mut handle_state = self.lock_state()?;
+            if handle_state.reviewed_optional_restore_attempted {
+                drop(handle_state);
+                drop(admission);
+                return Err(HvfVcpuRunnerError::InvalidState(
+                    REVIEWED_OPTIONAL_STATE_ALREADY_ATTEMPTED_MESSAGE,
+                ));
+            }
+            handle_state.reviewed_optional_restore_attempted = true;
+        }
+        self.command_sender
+            .send(RunnerCommand::RestoreArm64ReviewedOptionalState {
+                admission,
+                state: Box::new(state),
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))
+    }
+
     fn start_arm64_system_context_register_capture(
         &self,
         response_sender: mpsc::Sender<
@@ -5930,12 +6164,13 @@ impl<'vm> HvfVcpuRunner<'vm> {
     fn reserve_core_register_operation(
         &self,
     ) -> Result<InFlightCoreRegisterOperation, HvfVcpuRunnerError> {
-        self.reserve_core_register_operation_with(false)
+        self.reserve_core_register_operation_with(false, CPU_TEMPLATE_AFTER_RUN_MESSAGE)
     }
 
     fn reserve_core_register_operation_with(
         &self,
         require_unrun: bool,
+        after_run_message: &'static str,
     ) -> Result<InFlightCoreRegisterOperation, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
@@ -5948,9 +6183,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
         ensure_no_pending_psci_call(&state)?;
         if require_unrun && state.run_started {
-            return Err(HvfVcpuRunnerError::InvalidState(
-                CPU_TEMPLATE_AFTER_RUN_MESSAGE,
-            ));
+            return Err(HvfVcpuRunnerError::InvalidState(after_run_message));
         }
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
@@ -6959,6 +7192,16 @@ impl InFlightCoreRegisterOperation {
             state.core_register_operation_in_flight = false;
         }
     }
+
+    fn finish_reviewed_optional_restore(&mut self, failed: bool) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        if let Ok(mut state) = state.lock() {
+            state.reviewed_optional_restore_failed = failed;
+            state.core_register_operation_in_flight = false;
+        }
+    }
 }
 
 impl Drop for InFlightCoreRegisterOperation {
@@ -7631,6 +7874,19 @@ fn run_runner_thread<C, V>(
                 // Restore admission before response send so receiver failure
                 // is not part of the capture lifetime.
                 admission.release();
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::RestoreArm64ReviewedOptionalState {
+                mut admission,
+                state,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .restore_arm64_reviewed_optional_state(&state)
+                    .map_err(HvfVcpuRunnerError::ReviewedOptionalStateRestore);
+                // Every destination read and write has finished or the first
+                // staged failure has made this one-attempt owner disposable.
+                admission.finish_reviewed_optional_restore(result.is_err());
                 let _ = response_sender.send(result);
             }
             RunnerCommand::CaptureArm64SystemContextRegisterState {
@@ -8773,6 +9029,10 @@ pub(crate) mod tests {
         HvfMappedGuestMemoryRegion, HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions,
     };
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
+    use crate::optional_state::{
+        HvfArm64DebugRegisterRestoreState, HvfArm64OptionalStateValue,
+        HvfArm64ReviewedOptionalStateRestore,
+    };
     use crate::psci::{
         PsciAffinityInfoResponse, PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOnBegin,
         PsciCpuOnResponse, PsciCpuPowerCoordinator, PsciCpuPowerState, PsciCpuSuspendResponse,
@@ -37633,6 +37893,7 @@ pub(crate) mod tests {
         fail_next_write: bool,
         mismatch_next_readback: bool,
         last_write: Option<CpuTemplateRunnerRegister>,
+        panic_on_system_read: bool,
         block_next_read: bool,
         read_entered_sender: Option<mpsc::Sender<()>>,
         read_release_receiver: Option<mpsc::Receiver<()>>,
@@ -37788,6 +38049,10 @@ pub(crate) mod tests {
             &mut self,
             register: HvfSystemRegister,
         ) -> Result<u64, BackendError> {
+            assert!(
+                !self.panic_on_system_read,
+                "injected reviewed optional-state owner panic"
+            );
             let typed_register = CpuTemplateRunnerRegister::System(register);
             self.begin_read(typed_register)?;
             let value = self
@@ -37871,6 +38136,7 @@ pub(crate) mod tests {
             fail_next_write: false,
             mismatch_next_readback: false,
             last_write: None,
+            panic_on_system_read: false,
             block_next_read: false,
             read_entered_sender: None,
             read_release_receiver: None,
@@ -38081,5 +38347,224 @@ pub(crate) mod tests {
             ))
         );
         runner.shutdown().expect("runner should shut down");
+    }
+
+    fn reviewed_optional_debug_state(value: u64) -> HvfArm64DebugRegisterRestoreState {
+        let mut values = [HvfArm64OptionalStateValue::DestinationDefault; 16];
+        let mut controls = [HvfArm64OptionalStateValue::DestinationDefault; 16];
+        values[0] = HvfArm64OptionalStateValue::Explicit(value);
+        controls[0] = HvfArm64OptionalStateValue::Explicit(1);
+        HvfArm64DebugRegisterRestoreState::try_new(1, values, controls)
+            .expect("one reviewed debug slot should be valid")
+    }
+
+    fn reviewed_optional_test_request() -> HvfArm64ReviewedOptionalStateRestore {
+        HvfArm64ReviewedOptionalStateRestore::try_new(
+            0,
+            None,
+            reviewed_optional_debug_state(0x1111),
+            reviewed_optional_debug_state(0x2222),
+            None,
+            HvfArm64VcpuSimdFpState::new([[0x5a; 16]; 32], 0x1234, 0x5678),
+        )
+        .expect("reviewed optional-state request should be valid")
+    }
+
+    fn reviewed_optional_test_vcpu(
+        events_sender: mpsc::Sender<CpuTemplateRunnerEvent>,
+        destination_dfr0: u64,
+    ) -> CpuTemplateRunnerTestVcpu {
+        let mut vcpu = cpu_template_test_vcpu(events_sender);
+        vcpu.general_values = vec![(HvfRegister::FPCR, 0), (HvfRegister::FPSR, 0)];
+        vcpu.simd_fp_values = (0..32)
+            .map(|index| {
+                (
+                    HvfSimdFpRegister::q(index).expect("reviewed Q register should exist"),
+                    [0; 16],
+                )
+            })
+            .collect();
+        vcpu.system_values = vec![
+            (HvfSystemRegister::ID_AA64DFR0_EL1, destination_dfr0),
+            (HvfSystemRegister::ID_AA64PFR1_EL1, 0xf << 24),
+            (
+                HvfSystemRegister::debug_breakpoint_value(0)
+                    .expect("reviewed breakpoint value should exist"),
+                0,
+            ),
+            (
+                HvfSystemRegister::debug_breakpoint_control(0)
+                    .expect("reviewed breakpoint control should exist"),
+                0,
+            ),
+            (
+                HvfSystemRegister::debug_watchpoint_value(0)
+                    .expect("reviewed watchpoint value should exist"),
+                0,
+            ),
+            (
+                HvfSystemRegister::debug_watchpoint_control(0)
+                    .expect("reviewed watchpoint control should exist"),
+                0,
+            ),
+        ];
+        vcpu
+    }
+
+    #[test]
+    fn reviewed_optional_restore_consumes_its_only_attempt_after_success() {
+        let (events_sender, _events_receiver) = mpsc::channel();
+        let runner = start_cpu_template_test_runner(reviewed_optional_test_vcpu(events_sender, 0));
+        let request = reviewed_optional_test_request();
+
+        assert_eq!(
+            runner.restore_arm64_reviewed_optional_state(request.clone()),
+            Ok(())
+        );
+        assert_eq!(
+            runner.restore_arm64_reviewed_optional_state(request),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::REVIEWED_OPTIONAL_STATE_ALREADY_ATTEMPTED_MESSAGE,
+            ))
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn reviewed_optional_restore_consumes_its_only_attempt_after_preflight_failure() {
+        let (events_sender, _events_receiver) = mpsc::channel();
+        let runner = start_cpu_template_test_runner(reviewed_optional_test_vcpu(events_sender, 1));
+        let request = reviewed_optional_test_request();
+
+        assert!(matches!(
+            runner.restore_arm64_reviewed_optional_state(request.clone()),
+            Err(HvfVcpuRunnerError::ReviewedOptionalStateRestore(_))
+        ));
+        assert_eq!(
+            runner.restore_arm64_reviewed_optional_state(request),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::REVIEWED_OPTIONAL_STATE_ALREADY_ATTEMPTED_MESSAGE,
+            ))
+        );
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE,
+            ))
+        );
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn reviewed_optional_restore_rejects_after_run_without_consuming_attempt() {
+        let (events_sender, _events_receiver) = mpsc::channel();
+        let runner = start_cpu_template_test_runner(reviewed_optional_test_vcpu(events_sender, 0));
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        assert_eq!(
+            runner.restore_arm64_reviewed_optional_state(reviewed_optional_test_request()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::REVIEWED_OPTIONAL_STATE_AFTER_RUN_MESSAGE,
+            ))
+        );
+        assert!(
+            !runner
+                .lock_state()
+                .expect("runner state should remain available")
+                .reviewed_optional_restore_attempted
+        );
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn reviewed_optional_restore_conflict_is_retryable_and_does_not_consume_attempt() {
+        let (events_sender, _events_receiver) = mpsc::channel();
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let mut vcpu = reviewed_optional_test_vcpu(events_sender, 0);
+        vcpu.block_next_read = true;
+        vcpu.read_entered_sender = Some(entered_sender);
+        vcpu.read_release_receiver = Some(release_receiver);
+        let runner = start_cpu_template_test_runner(vcpu);
+        let register = cpu_template_register(HvfSystemRegister::ID_AA64PFR1_EL1);
+
+        thread::scope(|scope| {
+            let read = scope.spawn(|| runner.read_arm64_cpu_template_baseline(&[register]));
+            entered_receiver
+                .recv()
+                .expect("baseline read should enter the owner thread");
+            assert_eq!(
+                runner.restore_arm64_reviewed_optional_state(reviewed_optional_test_request()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
+                ))
+            );
+            assert!(
+                !runner
+                    .lock_state()
+                    .expect("runner state should remain available")
+                    .reviewed_optional_restore_attempted
+            );
+            release_sender
+                .send(())
+                .expect("blocked baseline read should release");
+            assert_eq!(
+                read.join().expect("baseline caller should not panic"),
+                Ok(vec![HvfArm64CpuTemplateValue::U64(0xf << 24)])
+            );
+        });
+
+        assert_eq!(
+            runner.restore_arm64_reviewed_optional_state(reviewed_optional_test_request()),
+            Ok(())
+        );
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn reviewed_optional_restore_attempt_survives_owner_panic() {
+        let (events_sender, _events_receiver) = mpsc::channel();
+        let mut vcpu = reviewed_optional_test_vcpu(events_sender, 0);
+        vcpu.panic_on_system_read = true;
+        let runner = start_cpu_template_test_runner(vcpu);
+        let request = reviewed_optional_test_request();
+
+        assert!(matches!(
+            runner.restore_arm64_reviewed_optional_state(request.clone()),
+            Err(HvfVcpuRunnerError::ChannelClosed(_))
+        ));
+        assert_eq!(
+            runner.restore_arm64_reviewed_optional_state(request),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::REVIEWED_OPTIONAL_STATE_ALREADY_ATTEMPTED_MESSAGE,
+            ))
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn reviewed_optional_restore_attempt_survives_command_channel_failure() {
+        let (events_sender, _events_receiver) = mpsc::channel();
+        let mut vcpu = reviewed_optional_test_vcpu(events_sender, 0);
+        vcpu.panic_on_system_read = true;
+        let runner = start_cpu_template_test_runner(vcpu);
+        let register = cpu_template_register(HvfSystemRegister::ID_AA64PFR1_EL1);
+
+        assert!(matches!(
+            runner.read_arm64_cpu_template_baseline(&[register]),
+            Err(HvfVcpuRunnerError::ChannelClosed(_))
+        ));
+        assert!(matches!(
+            runner.restore_arm64_reviewed_optional_state(reviewed_optional_test_request()),
+            Err(HvfVcpuRunnerError::ChannelClosed(_))
+        ));
+        assert_eq!(
+            runner.restore_arm64_reviewed_optional_state(reviewed_optional_test_request()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::REVIEWED_OPTIONAL_STATE_ALREADY_ATTEMPTED_MESSAGE,
+            ))
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
 }

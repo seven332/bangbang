@@ -954,8 +954,9 @@ impl HvfArm64VcpuSveSmeIdentificationRegisterState {
 /// supported. They are mutable guest execution controls, not SVE/SME
 /// identification metadata or the conditionally present Z, P, ZA, and ZT0
 /// register contents. In streaming mode, baseline Q registers alias the low
-/// 128 bits of Z registers. This getter-only value defines no transition,
-/// persistence, snapshot-schema, or restore-ordering policy.
+/// 128 bits of Z registers. The value can describe the target of the reviewed
+/// optional-state restore policy, but by itself defines no transition,
+/// persistence, snapshot schema, or restore ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfArm64VcpuSmePstate {
     streaming_sve_mode_enabled: bool,
@@ -963,7 +964,8 @@ pub struct HvfArm64VcpuSmePstate {
 }
 
 impl HvfArm64VcpuSmePstate {
-    pub(crate) const fn new(streaming_sve_mode_enabled: bool, za_storage_enabled: bool) -> Self {
+    /// Construct the target streaming-SVE and ZA-storage flags.
+    pub const fn new(streaming_sve_mode_enabled: bool, za_storage_enabled: bool) -> Self {
         Self {
             streaming_sve_mode_enabled,
             za_storage_enabled,
@@ -2145,6 +2147,18 @@ impl HvfVcpuOwner {
         crate::ffi::get_sme_state(self.handle()?.vcpu)
     }
 
+    pub(crate) fn set_sme_pstate(
+        &mut self,
+        streaming_sve_mode_enabled: bool,
+        za_storage_enabled: bool,
+    ) -> Result<(), BackendError> {
+        crate::ffi::set_sme_state(
+            self.handle()?.vcpu,
+            streaming_sve_mode_enabled,
+            za_storage_enabled,
+        )
+    }
+
     pub(crate) fn get_sme_maximum_svl_bytes(&self) -> Result<usize, BackendError> {
         self.handle()?;
         crate::ffi::get_sme_config_max_svl_bytes()
@@ -2158,6 +2172,14 @@ impl HvfVcpuOwner {
         crate::ffi::get_sme_p_reg(self.handle()?.vcpu, register, value)
     }
 
+    pub(crate) fn set_sme_p_register(
+        &mut self,
+        register: u32,
+        value: &[u8],
+    ) -> Result<(), BackendError> {
+        crate::ffi::set_sme_p_reg(self.handle()?.vcpu, register, value)
+    }
+
     pub(crate) fn get_sme_z_register(
         &self,
         register: u32,
@@ -2166,12 +2188,28 @@ impl HvfVcpuOwner {
         crate::ffi::get_sme_z_reg(self.handle()?.vcpu, register, value)
     }
 
+    pub(crate) fn set_sme_z_register(
+        &mut self,
+        register: u32,
+        value: &[u8],
+    ) -> Result<(), BackendError> {
+        crate::ffi::set_sme_z_reg(self.handle()?.vcpu, register, value)
+    }
+
     pub(crate) fn get_sme_za_register(&self, value: &mut [u8]) -> Result<(), BackendError> {
         crate::ffi::get_sme_za_reg(self.handle()?.vcpu, value)
     }
 
+    pub(crate) fn set_sme_za_register(&mut self, value: &[u8]) -> Result<(), BackendError> {
+        crate::ffi::set_sme_za_reg(self.handle()?.vcpu, value)
+    }
+
     pub(crate) fn get_sme_zt0_register(&self) -> Result<[u8; 64], BackendError> {
         crate::ffi::get_sme_zt0_reg(self.handle()?.vcpu)
+    }
+
+    pub(crate) fn set_sme_zt0_register(&mut self, value: [u8; 64]) -> Result<(), BackendError> {
+        crate::ffi::set_sme_zt0_reg(self.handle()?.vcpu, value)
     }
 
     pub(crate) fn configure_arm64_boot_registers(

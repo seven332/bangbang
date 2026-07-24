@@ -14,6 +14,7 @@ mod lazy_pager;
 mod mach_lazy;
 mod memory;
 mod mmio;
+mod optional_state;
 mod psci;
 mod pvtime;
 mod runner;
@@ -73,6 +74,13 @@ pub use memory::{
     HvfVirtioMemMappingCaptureError, HvfVirtioMemMappingCaptureState,
 };
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
+pub use optional_state::{
+    HvfArm64DebugRegisterRestoreState, HvfArm64OptionalStateValue,
+    HvfArm64ReviewedOptionalStateBuildError, HvfArm64ReviewedOptionalStateRestore,
+    HvfArm64ReviewedOptionalStateRestoreError, HvfArm64ReviewedOptionalStateRestoreFamily,
+    HvfArm64ReviewedOptionalStateRestoreRejection, HvfArm64ReviewedOptionalStateRestoreStage,
+    HvfArm64SmeRestoreState, HvfArm64SmeRestoreStateInput,
+};
 pub use pvtime::{
     HvfArm64PvTimeAccountingError, HvfArm64PvTimeAccountingStage, HvfArm64PvTimeCaptureState,
     HvfArm64PvTimeContentionProbe, HvfArm64PvTimeMeasurementError, HvfArm64PvTimeVcpuCaptureState,
