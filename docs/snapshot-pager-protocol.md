@@ -6,14 +6,15 @@ wire implementation is the standalone `bangbang-pager` crate; the
 backend-neutral anonymous-memory coordinator is
 `bangbang_runtime::lazy_memory`. The separate
 `bangbang_hvf::HvfLazyHostFaultBridge` now implements task-local host fault
-mediation against that coordinator, but it is not yet connected to this wire.
+mediation against that coordinator, and `bangbang_hvf::HvfLazyPager` connects
+its exact page/removal source boundary to this wire.
 
 The crate adopts an already connected Unix stream. It does not select or open a
 path, launch a process, transfer a descriptor, grant source authority, map
 guest memory, own a Mach/HVF object, or make native-v1 `Uffd` succeed. The
 production launcher now performs the separate contained-boundary operation:
 it securely connects one configured local socket and atomically grants only
-that connected stream to the worker. Coordinator wiring and restore activation
+that connected stream to the worker. Native-v1 restore assembly and activation
 remain under delivery parent
 [#1527](https://github.com/seven332/bangbang/issues/1527).
 
@@ -145,6 +146,14 @@ exactly and does not infer ordering between generations.
 There is no automatic request retry or replay. A later integration may begin a
 new restore only with a new random session and freshly assigned request IDs.
 
+`PagerClient` owns the VMM-side live session. Outbound frame construction and
+sending are serialized so request-ID order matches wire order. One receive
+worker dispatches exact out-of-order page and removal responses through a
+bounded pending map capped by the negotiated combined limit. Each caller owns
+one bounded completion; the first protocol, transport, timeout, explicit peer
+terminal, or worker failure releases all pending callers exactly once and
+rejects later work with the stable terminal result. No request is replayed.
+
 ## Runtime anonymous-memory coordinator
 
 `crates/runtime/src/lazy_memory.rs` implements the in-process ownership half of
@@ -193,9 +202,46 @@ retains the guard that such an operation must drain.
 
 This coordinator installs no Mach exception port, changes no HVF mapping or
 permission, reads no snapshot source, opens no peer, and changes no API
-behavior. Its logical absence is not a delivered fault path until the later
-host/HVF, peer, consumer, and native-v1 restore slices bind those integration
-points.
+behavior. `HvfLazyHostFaultBridge`, its guest handler, and `HvfLazyPager` now
+bind the internal fault/removal/failure path; bypassing consumers and
+native-v1 restore remain separately gated.
+
+## HVF integration and removal linearization
+
+`HvfLazyPager` builds the handshake from the coordinator's exact limits and
+regions, translates validated page data/zero responses, and acknowledges
+removal only after `PagerClient` validates the exact `Removed` tuple. Any
+protocol, transport, timeout, EOF, explicit peer terminal, or receive-worker
+failure closes coordinator admission nonblockingly with the first stable
+`PeerFailure` reason before pending transition guards unwind.
+The generic protocol permits the peer to reduce `max_in_flight`, but this
+adapter requires the coordinator's preconstructed combined in-flight limit to
+be selected unchanged. An incompatible reduction fails construction before
+any page operation; reducing only the maximum frame size remains valid.
+
+The host resolver has a writer-preferring platform-transition gate independent
+of source retrieval. Page bytes may be fetched while no gate is held. Final
+generation revalidation, alias initialization, host permission publication,
+coordinator commit, instruction synchronization, and the complete HVF
+stage-two permission union retain a shared lease. Removal takes the exclusive
+lease and performs this exact sequence:
+
+1. acquire the coordinator removal generation, retiring any overlapping
+   loading generation;
+2. revoke the exact guest stage-two range and cached permission union;
+3. hide the exact host primary range;
+4. zero every byte through the private alias and fence while both public
+   planes remain hidden;
+5. send the exact `Remove` and wait for validated `Removed`;
+6. commit the coordinator range to `Absent`; and
+7. release the exclusive lease so a later host or guest access obtains a
+   strictly newer generation.
+
+A retired response that reaches publication as `StaleGeneration` is consumed,
+released, and retried through the coordinator. It cannot reopen host or guest
+permission and is not itself terminal. Failure after revocation leaves both
+planes closed: peer failures retain `PeerFailure`; local coordinator,
+protection, or invariant failures retain `TransitionFailure`.
 
 ## Cancellation, terminal failure, and shutdown
 
@@ -241,8 +287,10 @@ The crate currently implements and tests:
 - exact canonical encode/decode and bounded incremental decoding;
 - VMM and peer role-specific state machines;
 - request/generation/range validation and out-of-order exact matching;
+- a bounded concurrent VMM client with mixed page/removal dispatch and
+  first-terminal fan-out;
 - terminal cancellation and drained shutdown;
-- already-connected absolute-deadline Unix transport; and
+- already-connected absolute-deadline Unix transport;
 - real child-process exchanges over an inherited connected stream; and
 - a bounded support-only reference peer for page data, zero, removal,
   cancellation, terminal, and orderly-shutdown scenarios.
@@ -265,20 +313,19 @@ wakeup, poison recovery, resource limits, and repeated cleanup.
 The HVF crate additionally implements and signs the task-local public-Mach
 host adapter: it keeps ports and addresses in-process, publishes complete pages
 through a private alias and this coordinator, forwards unrelated exceptions,
-restores conditionally, and fails closed with fixed worker exit status 70. Its
-current `HvfLazyPageSource` is a trusted in-process boundary; it does not adopt
-or drive a `PagerTransport`.
+restores conditionally, and fails closed with fixed worker exit status 70.
+`HvfLazyPager` is the pager-backed implementation of its trusted source
+boundary.
 
 The HVF crate also binds the same resolver to zero-permission guest mappings.
 Its runner classifies owned data/instruction aborts, resolves every touched
 page, synchronizes executable contents, publishes serialized least-permission
 unions, and retries without PC advance. Focused and signed coverage includes
 multi-vCPU coalescing, execute/read/write population, lazy entry boot, failure,
-cancellation, and cleanup. This remains a trusted in-process source boundary;
-it does not drive `PagerTransport`.
+cancellation, committed-page revocation, newer-generation zero refault, and
+cleanup.
 
-Still deferred are transport/coordinator wiring, peer-driven removal/failure
-integration, consumer gating, native-v1 restore activation, and final signed
-end-to-end certification. Until those #1527 slices complete, native-v1 `Uffd`
-remains rejected before resource access and the checked capability remains
-`missing-platform-feasible`.
+Still deferred are bypassing-consumer gating, native-v1 restore activation,
+and final signed end-to-end certification. Until those #1527 slices complete,
+native-v1 `Uffd` remains rejected before resource access and the checked
+capability remains `missing-platform-feasible`.

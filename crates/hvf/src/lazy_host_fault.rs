@@ -10,14 +10,16 @@ use std::ffi::c_void;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
-use bangbang_pager::{PageAccess, PagerGeneration, PagerRegionId};
+use bangbang_pager::{PageAccess, PagerGeneration, PagerRegion, PagerRegionId};
 use bangbang_runtime::lazy_memory::{
     LazyGuestMemory, LazyGuestMemoryError, LazyGuestMemoryTerminalReason, LazyPageFault,
+    LazyPageState,
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange, GuestMemoryRegion};
 
+use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
 use crate::mach_lazy::{
     MACH_ACCESS_READ, MACH_ACCESS_WRITE, MACH_FAULT_FORWARD, MACH_FAULT_HANDLED,
     MACH_FAULT_TERMINAL, MachExceptionOwner, MachLazyContents, MachLazyError, MachLazyMapping,
@@ -108,13 +110,32 @@ impl fmt::Debug for HvfLazyPageContents {
 }
 
 /// Redacted failure returned by one page-content source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HvfLazyPageSourceError;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfLazyPageSourceError {
+    peer_failure: bool,
+}
 
 impl HvfLazyPageSourceError {
     /// Constructs one intentionally detail-free source failure.
     pub const fn failed() -> Self {
-        Self
+        Self {
+            peer_failure: false,
+        }
+    }
+
+    /// Constructs one intentionally detail-free external peer failure.
+    pub const fn peer_failure() -> Self {
+        Self { peer_failure: true }
+    }
+
+    pub(crate) const fn is_peer_failure(self) -> bool {
+        self.peer_failure
+    }
+}
+
+impl fmt::Debug for HvfLazyPageSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HvfLazyPageSourceError(<redacted>)")
     }
 }
 
@@ -126,17 +147,68 @@ impl fmt::Display for HvfLazyPageSourceError {
 
 impl Error for HvfLazyPageSourceError {}
 
+/// Exact offset-only removal presented to an in-process content source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfLazyPageRemovalRequest {
+    region: PagerRegionId,
+    generation: PagerGeneration,
+    offset: u64,
+    source_offset: u64,
+    length: u64,
+}
+
+impl HvfLazyPageRemovalRequest {
+    /// Returns the opaque pager region identity.
+    pub const fn region(self) -> PagerRegionId {
+        self.region
+    }
+
+    /// Returns the exact nonzero removal generation.
+    pub const fn generation(self) -> PagerGeneration {
+        self.generation
+    }
+
+    /// Returns the region-relative removal offset.
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the peer-owned source offset.
+    pub const fn source_offset(self) -> u64 {
+        self.source_offset
+    }
+
+    /// Returns the exact aligned removal length.
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+}
+
+impl fmt::Debug for HvfLazyPageRemovalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HvfLazyPageRemovalRequest(<redacted>)")
+    }
+}
+
 /// Trusted in-process adapter that obtains exact lazy-page contents.
 ///
 /// Implementations must remain bounded and must not access a mapping owned by
-/// the same bridge while serving a request. Pager socket ownership and timeout
-/// policy are added by later delivery slices.
+/// the same bridge while serving a request. [`crate::HvfLazyPager`] supplies
+/// the bounded connected-peer implementation.
 pub trait HvfLazyPageSource: Send + Sync {
     /// Returns exact data or zero contents for one offset-only request.
     fn page(
         &self,
         request: HvfLazyPageRequest,
     ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError>;
+
+    /// Acknowledges one exact range after recording its removed source state.
+    ///
+    /// The default deliberately fails closed so a source cannot silently
+    /// claim removal support.
+    fn remove(&self, _request: HvfLazyPageRemovalRequest) -> Result<(), HvfLazyPageSourceError> {
+        Err(HvfLazyPageSourceError::failed())
+    }
 }
 
 /// Whether one successful resolver call populated content or reused it.
@@ -146,6 +218,50 @@ pub enum HvfLazyPageResolution {
     Populated,
     /// Contents were already committed; only host permission was ensured.
     Present,
+}
+
+/// Successful completion of one exact lazy-page removal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfLazyPageRemoval {
+    generation: PagerGeneration,
+}
+
+impl HvfLazyPageRemoval {
+    /// Returns the exact generation acknowledged by the pager peer.
+    pub const fn generation(self) -> PagerGeneration {
+        self.generation
+    }
+}
+
+impl fmt::Debug for HvfLazyPageRemoval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HvfLazyPageRemoval(<redacted>)")
+    }
+}
+
+pub(crate) struct HvfLazyPageResolutionLease {
+    resolutions: Vec<HvfLazyPageResolution>,
+    _transition: Option<ResolverTransitionRead>,
+}
+
+impl HvfLazyPageResolutionLease {
+    pub(crate) fn resolutions(&self) -> &[HvfLazyPageResolution] {
+        &self.resolutions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn untracked(resolutions: Vec<HvfLazyPageResolution>) -> Self {
+        Self {
+            resolutions,
+            _transition: None,
+        }
+    }
+}
+
+impl fmt::Debug for HvfLazyPageResolutionLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HvfLazyPageResolutionLease(<redacted>)")
+    }
 }
 
 /// Stable stage for a host-fault bridge failure.
@@ -290,12 +406,35 @@ impl HvfLazyPageResolver {
         address: GuestAddress,
         access: PageAccess,
     ) -> Result<HvfLazyPageResolution, HvfLazyHostFaultError> {
-        let region_index = self.inner.region_for_guest(address).ok_or(
-            HvfLazyHostFaultError::InvalidConfiguration {
+        let lease = self
+            .inner
+            .resolve_pages(std::slice::from_ref(&address), access)?;
+        lease
+            .resolutions()
+            .first()
+            .copied()
+            .ok_or(HvfLazyHostFaultError::InvalidConfiguration {
                 stage: HvfLazyHostFaultStage::Validate,
-            },
-        )?;
-        self.inner.resolve(region_index, address, access)
+            })
+    }
+
+    /// Removes one aligned, nonempty range and waits for its exact peer
+    /// acknowledgement before making the range faultable again.
+    pub fn remove_pages(
+        &self,
+        region: PagerRegionId,
+        offset: u64,
+        length: u64,
+    ) -> Result<HvfLazyPageRemoval, HvfLazyHostFaultError> {
+        self.inner.remove(region, offset, length)
+    }
+
+    pub(crate) fn resolve_guest_pages_leased(
+        &self,
+        addresses: &[GuestAddress],
+        access: PageAccess,
+    ) -> Result<HvfLazyPageResolutionLease, HvfLazyHostFaultError> {
+        self.inner.resolve_pages(addresses, access)
     }
 
     pub(crate) fn mapping_regions(&self) -> &[GuestMemoryRegion] {
@@ -310,11 +449,19 @@ impl HvfLazyPageResolver {
         self.inner.fail_closed();
     }
 
+    pub(crate) fn bind_guest_fault_handler(
+        &self,
+        handler: &Arc<HvfLazyGuestFaultHandler>,
+    ) -> Result<(), HvfLazyHostFaultError> {
+        self.inner.bind_guest_fault_handler(handler)
+    }
+
     pub(crate) fn synchronize_instruction_page(
         &self,
         address: GuestAddress,
+        lease: &HvfLazyPageResolutionLease,
     ) -> Result<(), HvfLazyHostFaultError> {
-        self.inner.synchronize_instruction_page(address)
+        self.inner.synchronize_instruction_page(address, lease)
     }
 }
 
@@ -389,6 +536,17 @@ impl HvfLazyHostFaultBridge {
     /// Returns a shared resolver for the HVF guest-fault protection plane.
     pub fn resolver(&self) -> HvfLazyPageResolver {
         self.resolver.clone()
+    }
+
+    /// Removes one exact lazy range through both host and guest permission
+    /// planes and the connected content source.
+    pub fn remove_pages(
+        &self,
+        region: PagerRegionId,
+        offset: u64,
+        length: u64,
+    ) -> Result<HvfLazyPageRemoval, HvfLazyHostFaultError> {
+        self.resolver.remove_pages(region, offset, length)
     }
 
     /// Quiesces work, restores host mappings and the prior task owner, and
@@ -477,6 +635,7 @@ enum HostFaultOutcome {
 #[derive(Clone, Copy)]
 struct ResolverRegion {
     guest: GuestMemoryRange,
+    source: PagerRegion,
     host_start: usize,
     host_end: usize,
 }
@@ -491,6 +650,9 @@ struct ResolverInner {
     page_size: usize,
     lifecycle: Mutex<ResolverLifecycle>,
     changed: Condvar,
+    transition: Mutex<ResolverTransitionState>,
+    transition_changed: Condvar,
+    guest_handler: Mutex<Option<Weak<HvfLazyGuestFaultHandler>>>,
 }
 
 impl ResolverInner {
@@ -512,8 +674,12 @@ impl ResolverInner {
             }
         })?;
         let mapping_regions = memory.mapping_regions();
+        let pager_regions = memory
+            .pager_regions()
+            .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
         if mapping_regions.is_empty()
             || mapping_regions.len() != memory.region_count()
+            || pager_regions.len() != mapping_regions.len()
             || page_size < host_page_size
             || !page_size.is_multiple_of(host_page_size)
         {
@@ -526,7 +692,7 @@ impl ResolverInner {
         regions
             .try_reserve_exact(mapping_regions.len())
             .map_err(|source| HvfLazyHostFaultError::MetadataAllocationFailed { source })?;
-        for mapping_region in mapping_regions {
+        for (mapping_region, source) in mapping_regions.iter().zip(pager_regions) {
             let host_start = mapping_region.host_address().as_ptr() as usize;
             let host_end = host_start.checked_add(mapping_region.host_size()).ok_or(
                 HvfLazyHostFaultError::InvalidConfiguration {
@@ -536,6 +702,12 @@ impl ResolverInner {
             if host_start == 0
                 || mapping_region.host_size() == 0
                 || mapping_region.host_size() % page_size != 0
+                || source.length()
+                    != u64::try_from(mapping_region.host_size()).map_err(|_| {
+                        HvfLazyHostFaultError::InvalidConfiguration {
+                            stage: HvfLazyHostFaultStage::Validate,
+                        }
+                    })?
                 || regions.iter().any(|existing: &ResolverRegion| {
                     host_start < existing.host_end && existing.host_start < host_end
                 })
@@ -546,6 +718,7 @@ impl ResolverInner {
             }
             regions.push(ResolverRegion {
                 guest: mapping_region.range(),
+                source,
                 host_start,
                 host_end,
             });
@@ -570,6 +743,13 @@ impl ResolverInner {
                 actions: 0,
             }),
             changed: Condvar::new(),
+            transition: Mutex::new(ResolverTransitionState {
+                readers: 0,
+                writer: false,
+                writers_waiting: 0,
+            }),
+            transition_changed: Condvar::new(),
+            guest_handler: Mutex::new(None),
         })
     }
 
@@ -587,7 +767,7 @@ impl ResolverInner {
         Ok(())
     }
 
-    fn close(&self) -> Result<(), HvfLazyHostFaultError> {
+    fn close(self: &Arc<Self>) -> Result<(), HvfLazyHostFaultError> {
         let mut lifecycle = self.lock_lifecycle()?;
         match lifecycle.phase {
             ResolverPhase::Active => lifecycle.phase = ResolverPhase::Closing,
@@ -603,6 +783,9 @@ impl ResolverInner {
                 .map_err(|_| HvfLazyHostFaultError::InvalidLifecycle)?;
         }
         lifecycle.phase = ResolverPhase::Closed;
+        drop(lifecycle);
+        let transition = self.begin_transition_write()?;
+        drop(transition);
         Ok(())
     }
 
@@ -643,6 +826,122 @@ impl ResolverInner {
         }
     }
 
+    fn lock_transition(
+        &self,
+    ) -> Result<MutexGuard<'_, ResolverTransitionState>, HvfLazyHostFaultError> {
+        self.transition
+            .lock()
+            .map_err(|_| HvfLazyHostFaultError::InvalidLifecycle)
+    }
+
+    fn begin_transition_read(
+        self: &Arc<Self>,
+    ) -> Result<ResolverTransitionRead, HvfLazyHostFaultError> {
+        let mut transition = self.lock_transition()?;
+        while transition.writer || transition.writers_waiting != 0 {
+            transition = self
+                .transition_changed
+                .wait(transition)
+                .map_err(|_| HvfLazyHostFaultError::InvalidLifecycle)?;
+        }
+        transition.readers = transition
+            .readers
+            .checked_add(1)
+            .ok_or(HvfLazyHostFaultError::InvalidLifecycle)?;
+        drop(transition);
+        Ok(ResolverTransitionRead {
+            resolver: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    fn begin_transition_write(
+        self: &Arc<Self>,
+    ) -> Result<ResolverTransitionWrite, HvfLazyHostFaultError> {
+        let mut transition = self.lock_transition()?;
+        transition.writers_waiting = transition
+            .writers_waiting
+            .checked_add(1)
+            .ok_or(HvfLazyHostFaultError::InvalidLifecycle)?;
+        while transition.writer || transition.readers != 0 {
+            transition = match self.transition_changed.wait(transition) {
+                Ok(transition) => transition,
+                Err(poisoned) => {
+                    let mut recovered = poisoned.into_inner();
+                    recovered.writers_waiting = recovered.writers_waiting.saturating_sub(1);
+                    self.transition_changed.notify_all();
+                    return Err(HvfLazyHostFaultError::InvalidLifecycle);
+                }
+            };
+        }
+        transition.writers_waiting -= 1;
+        transition.writer = true;
+        drop(transition);
+        Ok(ResolverTransitionWrite {
+            resolver: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    fn finish_transition_read(&self) {
+        let Ok(mut transition) = self.transition.lock() else {
+            self.fail_closed();
+            return;
+        };
+        let Some(readers) = transition.readers.checked_sub(1) else {
+            drop(transition);
+            self.fail_closed();
+            return;
+        };
+        transition.readers = readers;
+        if readers == 0 {
+            self.transition_changed.notify_all();
+        }
+    }
+
+    fn finish_transition_write(&self) {
+        let Ok(mut transition) = self.transition.lock() else {
+            self.fail_closed();
+            return;
+        };
+        if !transition.writer {
+            drop(transition);
+            self.fail_closed();
+            return;
+        }
+        transition.writer = false;
+        self.transition_changed.notify_all();
+    }
+
+    fn bind_guest_fault_handler(
+        &self,
+        handler: &Arc<HvfLazyGuestFaultHandler>,
+    ) -> Result<(), HvfLazyHostFaultError> {
+        let mut current = self
+            .guest_handler
+            .lock()
+            .map_err(|_| HvfLazyHostFaultError::InvalidLifecycle)?;
+        if current.as_ref().and_then(Weak::upgrade).is_some() {
+            return Err(HvfLazyHostFaultError::InvalidLifecycle);
+        }
+        *current = Some(Arc::downgrade(handler));
+        Ok(())
+    }
+
+    fn guest_fault_handler(
+        &self,
+    ) -> Result<Option<Arc<HvfLazyGuestFaultHandler>>, HvfLazyHostFaultError> {
+        let mut current = self
+            .guest_handler
+            .lock()
+            .map_err(|_| HvfLazyHostFaultError::InvalidLifecycle)?;
+        let handler = current.as_ref().and_then(Weak::upgrade);
+        if handler.is_none() {
+            *current = None;
+        }
+        Ok(handler)
+    }
+
     fn region_for_guest(&self, address: GuestAddress) -> Option<usize> {
         self.regions
             .iter()
@@ -660,8 +959,8 @@ impl ResolverInner {
         })
     }
 
-    fn resolve_host_address(&self, address: u64, access: u32) -> HostFaultOutcome {
-        let Some((region_index, guest_address)) = self.translate_host(address) else {
+    fn resolve_host_address(self: &Arc<Self>, address: u64, access: u32) -> HostFaultOutcome {
+        let Some((_, guest_address)) = self.translate_host(address) else {
             return HostFaultOutcome::Forward;
         };
         let access = match access {
@@ -669,28 +968,102 @@ impl ResolverInner {
             MACH_ACCESS_WRITE => PageAccess::Write,
             _ => return HostFaultOutcome::Forward,
         };
-        match self.resolve(region_index, guest_address, access) {
+        match self.resolve_pages(std::slice::from_ref(&guest_address), access) {
             Ok(_) => HostFaultOutcome::Handled,
             Err(_) => HostFaultOutcome::Terminal,
         }
     }
 
-    fn resolve(
-        &self,
-        region_index: usize,
-        address: GuestAddress,
+    fn resolve_pages(
+        self: &Arc<Self>,
+        addresses: &[GuestAddress],
         access: PageAccess,
-    ) -> Result<HvfLazyPageResolution, HvfLazyHostFaultError> {
+    ) -> Result<HvfLazyPageResolutionLease, HvfLazyHostFaultError> {
         let _action = self.begin_action()?;
-        let result = self.resolve_inner(region_index, address, access);
-        if result.is_err() {
-            self.fail_closed();
+        let result = self.resolve_pages_inner(addresses, access);
+        if let Err(error) = &result {
+            self.fail_closed_for_error(error);
         }
         result
     }
 
-    fn resolve_inner(
-        &self,
+    fn resolve_pages_inner(
+        self: &Arc<Self>,
+        addresses: &[GuestAddress],
+        access: PageAccess,
+    ) -> Result<HvfLazyPageResolutionLease, HvfLazyHostFaultError> {
+        if addresses.is_empty() {
+            return Err(HvfLazyHostFaultError::InvalidConfiguration {
+                stage: HvfLazyHostFaultStage::Validate,
+            });
+        }
+
+        loop {
+            let mut resolutions = Vec::new();
+            resolutions
+                .try_reserve_exact(addresses.len())
+                .map_err(|source| HvfLazyHostFaultError::MetadataAllocationFailed { source })?;
+            for address in addresses {
+                let region_index = self.region_for_guest(*address).ok_or(
+                    HvfLazyHostFaultError::InvalidConfiguration {
+                        stage: HvfLazyHostFaultStage::Validate,
+                    },
+                )?;
+                resolutions.push(self.resolve_one(region_index, *address, access)?);
+            }
+
+            let transition = self.begin_transition_read()?;
+            let mut retry = false;
+            for address in addresses {
+                let region_index = self.region_for_guest(*address).ok_or(
+                    HvfLazyHostFaultError::InvalidConfiguration {
+                        stage: HvfLazyHostFaultStage::Validate,
+                    },
+                )?;
+                let region = self.regions.get(region_index).ok_or(
+                    HvfLazyHostFaultError::InvalidConfiguration {
+                        stage: HvfLazyHostFaultStage::Validate,
+                    },
+                )?;
+                let page_offset = self.page_offset(region.guest, *address)?;
+                let source_offset = u64::try_from(page_offset).map_err(|_| {
+                    HvfLazyHostFaultError::InvalidConfiguration {
+                        stage: HvfLazyHostFaultStage::Validate,
+                    }
+                })?;
+                if self
+                    .memory
+                    .page_state(region.source.id(), source_offset)
+                    .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?
+                    != LazyPageState::Present
+                {
+                    retry = true;
+                    break;
+                }
+                self.mapping
+                    .allow(
+                        region_index,
+                        page_offset,
+                        self.page_size,
+                        access == PageAccess::Write,
+                    )
+                    .map_err(|_| HvfLazyHostFaultError::Platform {
+                        stage: HvfLazyHostFaultStage::Protection,
+                    })?;
+            }
+            if retry {
+                drop(transition);
+                continue;
+            }
+            return Ok(HvfLazyPageResolutionLease {
+                resolutions,
+                _transition: Some(transition),
+            });
+        }
+    }
+
+    fn resolve_one(
+        self: &Arc<Self>,
         region_index: usize,
         address: GuestAddress,
         access: PageAccess,
@@ -706,109 +1079,266 @@ impl ResolverInner {
                 stage: HvfLazyHostFaultStage::Validate,
             });
         }
-        match self
-            .memory
-            .fault_address(address, access)
-            .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?
-        {
-            LazyPageFault::Present => {
-                let page_offset = self.page_offset(region.guest, address)?;
-                self.mapping
-                    .allow(
+        loop {
+            let fault = match self.memory.fault_address(address, access) {
+                Ok(fault) => fault,
+                Err(LazyGuestMemoryError::StaleGeneration) => continue,
+                Err(source) => return Err(HvfLazyHostFaultError::Coordinator { source }),
+            };
+            match fault {
+                LazyPageFault::Present => {
+                    let transition = self.begin_transition_read()?;
+                    let page_offset = self.page_offset(region.guest, address)?;
+                    let source_offset = u64::try_from(page_offset).map_err(|_| {
+                        HvfLazyHostFaultError::InvalidConfiguration {
+                            stage: HvfLazyHostFaultStage::Validate,
+                        }
+                    })?;
+                    if self
+                        .memory
+                        .page_state(region.source.id(), source_offset)
+                        .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?
+                        != LazyPageState::Present
+                    {
+                        drop(transition);
+                        continue;
+                    }
+                    self.mapping
+                        .allow(
+                            region_index,
+                            page_offset,
+                            self.page_size,
+                            access == PageAccess::Write,
+                        )
+                        .map_err(|_| HvfLazyHostFaultError::Platform {
+                            stage: HvfLazyHostFaultStage::Protection,
+                        })?;
+                    return Ok(HvfLazyPageResolution::Present);
+                }
+                LazyPageFault::Populate(population) => {
+                    let request = HvfLazyPageRequest {
+                        region: population.region(),
+                        generation: population.generation(),
+                        access: population.access(),
+                        offset: population.offset(),
+                        source_offset: population.source_offset(),
+                        length: population.length(),
+                    };
+                    let guest_range = population.guest_range();
+                    let contents = match self.source.page(request) {
+                        Ok(contents) => contents,
+                        Err(source) => {
+                            self.signal_source_failure(source);
+                            return Err(HvfLazyHostFaultError::Source { source });
+                        }
+                    };
+                    let expected_length = usize::try_from(request.length()).map_err(|_| {
+                        HvfLazyHostFaultError::InvalidConfiguration {
+                            stage: HvfLazyHostFaultStage::Validate,
+                        }
+                    })?;
+                    if matches!(&contents, HvfLazyPageContents::Data(data) if data.len() != expected_length)
+                    {
+                        return Err(HvfLazyHostFaultError::ContentLength);
+                    }
+
+                    let transition = self.begin_transition_read()?;
+                    let page_offset = usize::try_from(
+                        guest_range
+                            .start()
+                            .raw_value()
+                            .checked_sub(region.guest.start().raw_value())
+                            .ok_or(HvfLazyHostFaultError::InvalidConfiguration {
+                                stage: HvfLazyHostFaultStage::Validate,
+                            })?,
+                    )
+                    .map_err(|_| {
+                        HvfLazyHostFaultError::InvalidConfiguration {
+                            stage: HvfLazyHostFaultStage::Validate,
+                        }
+                    })?;
+                    let mut publication = match population.begin_publication() {
+                        Ok(publication) => publication,
+                        Err(LazyGuestMemoryError::StaleGeneration) => {
+                            drop(transition);
+                            continue;
+                        }
+                        Err(source) => {
+                            return Err(HvfLazyHostFaultError::Coordinator { source });
+                        }
+                    };
+                    let mut target = publication
+                        .target()
+                        .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
+                    if target.range() != guest_range || target.len() != expected_length {
+                        return Err(HvfLazyHostFaultError::InvalidConfiguration {
+                            stage: HvfLazyHostFaultStage::Coordinator,
+                        });
+                    }
+                    let native_contents = match &contents {
+                        HvfLazyPageContents::Data(data) => MachLazyContents::Data(data),
+                        HvfLazyPageContents::Zero => MachLazyContents::Zero {
+                            length: expected_length,
+                        },
+                    };
+                    if let Err(error) = self.mapping.publish(
                         region_index,
                         page_offset,
-                        self.page_size,
+                        native_contents,
                         access == PageAccess::Write,
-                    )
-                    .map_err(|_| HvfLazyHostFaultError::Platform {
-                        stage: HvfLazyHostFaultStage::Protection,
-                    })?;
-                Ok(HvfLazyPageResolution::Present)
+                    ) {
+                        let _ = self
+                            .mapping
+                            .hide(region_index, page_offset, expected_length);
+                        return Err(platform_error(error, HvfLazyHostFaultStage::Protection));
+                    }
+                    // SAFETY: MachLazyMapping construction created a non-copying
+                    // alias of this exact retained mapping. `publish` validated
+                    // the page range, initialized every byte through that alias,
+                    // issued a sequentially consistent fence, and opened the
+                    // matching original permission before returning success.
+                    if let Err(source) = unsafe { target.assume_initialized_by_platform() } {
+                        let _ = self
+                            .mapping
+                            .hide(region_index, page_offset, expected_length);
+                        return Err(HvfLazyHostFaultError::Coordinator { source });
+                    }
+                    if let Err(source) = publication.commit() {
+                        let _ = self
+                            .mapping
+                            .hide(region_index, page_offset, expected_length);
+                        return Err(HvfLazyHostFaultError::Coordinator { source });
+                    }
+                    return Ok(HvfLazyPageResolution::Populated);
+                }
             }
-            LazyPageFault::Populate(population) => {
-                let request = HvfLazyPageRequest {
-                    region: population.region(),
-                    generation: population.generation(),
-                    access: population.access(),
-                    offset: population.offset(),
-                    source_offset: population.source_offset(),
-                    length: population.length(),
-                };
-                let guest_range = population.guest_range();
-                let contents = self
-                    .source
-                    .page(request)
-                    .map_err(|source| HvfLazyHostFaultError::Source { source })?;
-                let expected_length = usize::try_from(request.length()).map_err(|_| {
+        }
+    }
+
+    fn remove(
+        self: &Arc<Self>,
+        region: PagerRegionId,
+        offset: u64,
+        length: u64,
+    ) -> Result<HvfLazyPageRemoval, HvfLazyHostFaultError> {
+        let _action = self.begin_action()?;
+        let result = self.remove_inner(region, offset, length);
+        if let Err(error) = &result {
+            self.fail_closed_for_error(error);
+        }
+        result
+    }
+
+    fn remove_inner(
+        self: &Arc<Self>,
+        region: PagerRegionId,
+        offset: u64,
+        length: u64,
+    ) -> Result<HvfLazyPageRemoval, HvfLazyHostFaultError> {
+        let _transition = self.begin_transition_write()?;
+        let mut removal = self
+            .memory
+            .begin_removal(region, offset, length)
+            .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
+        let generation = removal.generation();
+        let request = HvfLazyPageRemovalRequest {
+            region: removal.region(),
+            generation,
+            offset: removal.offset(),
+            source_offset: removal.source_offset(),
+            length: removal.length(),
+        };
+        let guest_range = {
+            let target = removal
+                .target()
+                .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
+            if target.len()
+                != usize::try_from(length).map_err(|_| {
                     HvfLazyHostFaultError::InvalidConfiguration {
                         stage: HvfLazyHostFaultStage::Validate,
                     }
-                })?;
-                if matches!(&contents, HvfLazyPageContents::Data(data) if data.len() != expected_length)
-                {
-                    return Err(HvfLazyHostFaultError::ContentLength);
-                }
-
-                let page_offset = usize::try_from(
-                    guest_range
-                        .start()
-                        .raw_value()
-                        .checked_sub(region.guest.start().raw_value())
-                        .ok_or(HvfLazyHostFaultError::InvalidConfiguration {
-                            stage: HvfLazyHostFaultStage::Validate,
-                        })?,
-                )
-                .map_err(|_| HvfLazyHostFaultError::InvalidConfiguration {
+                })?
+            {
+                return Err(HvfLazyHostFaultError::InvalidConfiguration {
+                    stage: HvfLazyHostFaultStage::Coordinator,
+                });
+            }
+            target.range()
+        };
+        let region_index = self.region_for_guest(guest_range.start()).ok_or(
+            HvfLazyHostFaultError::InvalidConfiguration {
+                stage: HvfLazyHostFaultStage::Validate,
+            },
+        )?;
+        let resolver_region =
+            self.regions
+                .get(region_index)
+                .ok_or(HvfLazyHostFaultError::InvalidConfiguration {
                     stage: HvfLazyHostFaultStage::Validate,
                 })?;
-                let mut publication = population
-                    .begin_publication()
+        if guest_range.end_exclusive().raw_value()
+            > resolver_region.guest.end_exclusive().raw_value()
+        {
+            return Err(HvfLazyHostFaultError::InvalidConfiguration {
+                stage: HvfLazyHostFaultStage::Validate,
+            });
+        }
+        let page_offset = usize::try_from(
+            guest_range
+                .start()
+                .raw_value()
+                .checked_sub(resolver_region.guest.start().raw_value())
+                .ok_or(HvfLazyHostFaultError::InvalidConfiguration {
+                    stage: HvfLazyHostFaultStage::Validate,
+                })?,
+        )
+        .map_err(|_| HvfLazyHostFaultError::InvalidConfiguration {
+            stage: HvfLazyHostFaultStage::Validate,
+        })?;
+        let removal_length =
+            usize::try_from(length).map_err(|_| HvfLazyHostFaultError::InvalidConfiguration {
+                stage: HvfLazyHostFaultStage::Validate,
+            })?;
+
+        if let Some(handler) = self.guest_fault_handler()? {
+            handler
+                .revoke(guest_range)
+                .map_err(|_| HvfLazyHostFaultError::Platform {
+                    stage: HvfLazyHostFaultStage::Protection,
+                })?;
+        }
+        self.mapping
+            .hide(region_index, page_offset, removal_length)
+            .map_err(|source| platform_error(source, HvfLazyHostFaultStage::Protection))?;
+        self.mapping
+            .zero_hidden(region_index, page_offset, removal_length)
+            .map_err(|source| platform_error(source, HvfLazyHostFaultStage::Protection))?;
+        {
+            let mut target = removal
+                .target()
+                .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
+            if target.range() != guest_range || target.len() != removal_length {
+                return Err(HvfLazyHostFaultError::InvalidConfiguration {
+                    stage: HvfLazyHostFaultStage::Coordinator,
+                });
+            }
+            // SAFETY: `zero_hidden` writes and fences the same retained memory
+            // object and exact target range through the private alias while
+            // both host and guest public permissions remain revoked.
+            unsafe {
+                target
+                    .assume_initialized_by_platform()
                     .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
-                let mut target = publication
-                    .target()
-                    .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
-                if target.range() != guest_range || target.len() != expected_length {
-                    return Err(HvfLazyHostFaultError::InvalidConfiguration {
-                        stage: HvfLazyHostFaultStage::Coordinator,
-                    });
-                }
-                let native_contents = match &contents {
-                    HvfLazyPageContents::Data(data) => MachLazyContents::Data(data),
-                    HvfLazyPageContents::Zero => MachLazyContents::Zero {
-                        length: expected_length,
-                    },
-                };
-                if let Err(error) = self.mapping.publish(
-                    region_index,
-                    page_offset,
-                    native_contents,
-                    access == PageAccess::Write,
-                ) {
-                    let _ = self
-                        .mapping
-                        .hide(region_index, page_offset, expected_length);
-                    return Err(platform_error(error, HvfLazyHostFaultStage::Protection));
-                }
-                // SAFETY: MachLazyMapping construction created a non-copying
-                // alias of this exact retained mapping. `publish` validated
-                // the page range, initialized every byte through that alias,
-                // issued a sequentially consistent fence, and opened the
-                // matching original permission before returning success.
-                if let Err(source) = unsafe { target.assume_initialized_by_platform() } {
-                    let _ = self
-                        .mapping
-                        .hide(region_index, page_offset, expected_length);
-                    return Err(HvfLazyHostFaultError::Coordinator { source });
-                }
-                if let Err(source) = publication.commit() {
-                    let _ = self
-                        .mapping
-                        .hide(region_index, page_offset, expected_length);
-                    return Err(HvfLazyHostFaultError::Coordinator { source });
-                }
-                Ok(HvfLazyPageResolution::Populated)
             }
         }
+        if let Err(source) = self.source.remove(request) {
+            self.signal_source_failure(source);
+            return Err(HvfLazyHostFaultError::Source { source });
+        }
+        removal
+            .commit_acknowledged()
+            .map_err(|source| HvfLazyHostFaultError::Coordinator { source })?;
+        Ok(HvfLazyPageRemoval { generation })
     }
 
     fn page_offset(
@@ -837,8 +1367,8 @@ impl ResolverInner {
     fn synchronize_instruction_page(
         &self,
         address: GuestAddress,
+        _lease: &HvfLazyPageResolutionLease,
     ) -> Result<(), HvfLazyHostFaultError> {
-        let _action = self.begin_action()?;
         let region_index =
             self.region_for_guest(address)
                 .ok_or(HvfLazyHostFaultError::InvalidConfiguration {
@@ -876,10 +1406,28 @@ impl ResolverInner {
         }
     }
 
+    fn fail_closed_for_error(&self, error: &HvfLazyHostFaultError) {
+        let reason = match error {
+            HvfLazyHostFaultError::Source { source } if source.is_peer_failure() => {
+                LazyGuestMemoryTerminalReason::PeerFailure
+            }
+            _ => LazyGuestMemoryTerminalReason::TransitionFailure,
+        };
+        let _ = self.memory.signal_terminal(reason);
+    }
+
+    fn signal_source_failure(&self, source: HvfLazyPageSourceError) {
+        if source.is_peer_failure() {
+            let _ = self
+                .memory
+                .signal_terminal(LazyGuestMemoryTerminalReason::PeerFailure);
+        }
+    }
+
     fn fail_closed(&self) {
         let _ = self
             .memory
-            .terminate(LazyGuestMemoryTerminalReason::TransitionFailure);
+            .signal_terminal(LazyGuestMemoryTerminalReason::TransitionFailure);
     }
 }
 
@@ -903,9 +1451,43 @@ impl Drop for ResolverAction<'_> {
     }
 }
 
+struct ResolverTransitionRead {
+    resolver: Arc<ResolverInner>,
+    active: bool,
+}
+
+impl Drop for ResolverTransitionRead {
+    fn drop(&mut self) {
+        if self.active {
+            self.resolver.finish_transition_read();
+            self.active = false;
+        }
+    }
+}
+
+struct ResolverTransitionWrite {
+    resolver: Arc<ResolverInner>,
+    active: bool,
+}
+
+impl Drop for ResolverTransitionWrite {
+    fn drop(&mut self) {
+        if self.active {
+            self.resolver.finish_transition_write();
+            self.active = false;
+        }
+    }
+}
+
 struct ResolverLifecycle {
     phase: ResolverPhase,
     actions: usize,
+}
+
+struct ResolverTransitionState {
+    readers: usize,
+    writer: bool,
+    writers_waiting: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -925,7 +1507,7 @@ mod tests {
     use std::mem::size_of;
     use std::process::Command;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, TryRecvError};
     use std::thread;
     use std::time::Duration;
@@ -961,6 +1543,7 @@ mod tests {
         Data(Vec<u8>),
         Zero,
         Failure,
+        PeerFailure,
     }
 
     #[derive(Debug, Default)]
@@ -1003,6 +1586,81 @@ mod tests {
         release: Mutex<mpsc::Receiver<()>>,
     }
 
+    struct RemovalSource {
+        page: Vec<u8>,
+        removed: AtomicBool,
+        requests: Mutex<Vec<HvfLazyPageRequest>>,
+        removals: Mutex<Vec<HvfLazyPageRemovalRequest>>,
+    }
+
+    impl HvfLazyPageSource for RemovalSource {
+        fn page(
+            &self,
+            request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            self.requests
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            if self.removed.load(Ordering::Acquire) {
+                Ok(HvfLazyPageContents::zero())
+            } else {
+                Ok(HvfLazyPageContents::data(self.page.clone()))
+            }
+        }
+
+        fn remove(&self, request: HvfLazyPageRemovalRequest) -> Result<(), HvfLazyPageSourceError> {
+            self.removals
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            self.removed.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    struct SupersededSource {
+        page: Vec<u8>,
+        calls: AtomicU64,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        requests: Mutex<Vec<HvfLazyPageRequest>>,
+        removals: Mutex<Vec<HvfLazyPageRemovalRequest>>,
+    }
+
+    impl HvfLazyPageSource for SupersededSource {
+        fn page(
+            &self,
+            request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            self.requests
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.entered
+                    .send(())
+                    .map_err(|_| HvfLazyPageSourceError::failed())?;
+                self.release
+                    .lock()
+                    .map_err(|_| HvfLazyPageSourceError::failed())?
+                    .recv()
+                    .map_err(|_| HvfLazyPageSourceError::failed())?;
+                Ok(HvfLazyPageContents::data(self.page.clone()))
+            } else {
+                Ok(HvfLazyPageContents::zero())
+            }
+        }
+
+        fn remove(&self, request: HvfLazyPageRemovalRequest) -> Result<(), HvfLazyPageSourceError> {
+            self.removals
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            Ok(())
+        }
+    }
+
     impl HvfLazyPageSource for BlockingZeroSource {
         fn page(
             &self,
@@ -1034,6 +1692,7 @@ mod tests {
                 TestReply::Data(page) => Ok(HvfLazyPageContents::data(page.clone())),
                 TestReply::Zero => Ok(HvfLazyPageContents::zero()),
                 TestReply::Failure => Err(HvfLazyPageSourceError::failed()),
+                TestReply::PeerFailure => Err(HvfLazyPageSourceError::peer_failure()),
             }
         }
     }
@@ -1267,6 +1926,187 @@ mod tests {
     }
 
     #[test]
+    fn removal_revokes_guest_permissions_and_refaults_zero_under_a_new_generation() {
+        let _test_lock = MACH_TEST_LOCK
+            .lock()
+            .expect("Mach lazy test lock should not be poisoned");
+        let page_size =
+            u32::try_from(crate::memory::host_page_size().expect("host page size should resolve"))
+                .expect("host page size should fit u32");
+        let page_bytes = usize::try_from(page_size).expect("page size should fit usize");
+        let memory = memory(page_size, 1).expect("test lazy memory should construct");
+        let pointer = memory.mapping_regions()[0]
+            .host_address()
+            .as_ptr()
+            .cast::<u32>();
+        let mut page = vec![0_u8; page_bytes];
+        page[..size_of::<u32>()].copy_from_slice(&TEST_VALUE.to_ne_bytes());
+        let source = Arc::new(RemovalSource {
+            page,
+            removed: AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
+            removals: Mutex::new(Vec::new()),
+        });
+        let bridge = HvfLazyHostFaultBridge::install(
+            Arc::clone(&memory),
+            Arc::<RemovalSource>::clone(&source),
+        )
+        .expect("test bridge should install");
+        let resolver = bridge.resolver();
+        let mapper = Arc::new(ConcurrentProtectionMapper::default());
+        let handler = HvfLazyGuestFaultHandler::prepare(
+            resolver.clone(),
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("guest handler should prepare");
+        handler.activate().expect("guest handler should activate");
+        resolver
+            .bind_guest_fault_handler(&handler)
+            .expect("guest handler should bind");
+        let exit = HvfExceptionExit {
+            syndrome: 0x9381_0047,
+            virtual_address: GUEST_BASE,
+            physical_address: GUEST_BASE,
+        };
+        let candidate = handler
+            .classify(exit)
+            .expect("fault classification should succeed")
+            .expect("owned write should classify");
+        handler
+            .handle(0, candidate, 0x1000)
+            .expect("initial guest fault should resolve")
+            .expect("initial guest fault should be handled");
+        // SAFETY: the guest resolver published this exact retained page.
+        assert_eq!(unsafe { std::ptr::read_volatile(pointer) }, TEST_VALUE);
+
+        let region = PagerRegionId::new(1).expect("test region id should validate");
+        let removed = bridge
+            .remove_pages(region, 0, u64::from(page_size))
+            .expect("page removal should complete");
+        assert_eq!(
+            memory
+                .page_state(region, 0)
+                .expect("page state should resolve"),
+            LazyPageState::Absent
+        );
+
+        let candidate = handler
+            .classify(exit)
+            .expect("refault classification should succeed")
+            .expect("removed write should classify");
+        let handled = handler
+            .handle(0, candidate, 0x1000)
+            .expect("removed guest page should refault")
+            .expect("removed guest page should be handled");
+        assert_eq!(handled.populated_pages(), 1);
+        assert_eq!(handled.permission_changes(), 1);
+        // SAFETY: the refault committed a zero page and reopened host reads.
+        assert_eq!(unsafe { std::ptr::read_volatile(pointer) }, 0);
+
+        let requests = source.requests.lock().expect("request log should lock");
+        let removals = source.removals.lock().expect("removal log should lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(removals.len(), 1);
+        assert!(
+            requests[0].generation().get() < removed.generation().get()
+                && removed.generation().get() < requests[1].generation().get()
+        );
+        assert_eq!(
+            *mapper.protects.lock().expect("protection log should lock"),
+            vec![
+                (
+                    GuestMemoryRange::new(GuestAddress::new(GUEST_BASE), u64::from(page_size),)
+                        .expect("test page range should validate"),
+                    HvfMemoryPermissions::READ.union(HvfMemoryPermissions::WRITE),
+                ),
+                (
+                    GuestMemoryRange::new(GuestAddress::new(GUEST_BASE), u64::from(page_size),)
+                        .expect("test page range should validate"),
+                    HvfMemoryPermissions::new(false, false, false),
+                ),
+                (
+                    GuestMemoryRange::new(GuestAddress::new(GUEST_BASE), u64::from(page_size),)
+                        .expect("test page range should validate"),
+                    HvfMemoryPermissions::READ.union(HvfMemoryPermissions::WRITE),
+                ),
+            ]
+        );
+        drop(requests);
+        drop(removals);
+        drop(handler);
+        bridge.shutdown().expect("test bridge should shut down");
+    }
+
+    #[test]
+    fn removal_supersedes_blocked_population_and_retries_the_stale_response() {
+        let _test_lock = MACH_TEST_LOCK
+            .lock()
+            .expect("Mach lazy test lock should not be poisoned");
+        let page_size =
+            u32::try_from(crate::memory::host_page_size().expect("host page size should resolve"))
+                .expect("host page size should fit u32");
+        let page_bytes = usize::try_from(page_size).expect("page size should fit usize");
+        let memory = memory(page_size, 1).expect("test lazy memory should construct");
+        let pointer = memory.mapping_regions()[0]
+            .host_address()
+            .as_ptr()
+            .cast::<u32>();
+        let mut page = vec![0_u8; page_bytes];
+        page[..size_of::<u32>()].copy_from_slice(&TEST_VALUE.to_ne_bytes());
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let source = Arc::new(SupersededSource {
+            page,
+            calls: AtomicU64::new(0),
+            entered: entered_sender,
+            release: Mutex::new(release_receiver),
+            requests: Mutex::new(Vec::new()),
+            removals: Mutex::new(Vec::new()),
+        });
+        let bridge = HvfLazyHostFaultBridge::install(
+            Arc::clone(&memory),
+            Arc::<SupersededSource>::clone(&source),
+        )
+        .expect("test bridge should install");
+        let resolver = bridge.resolver();
+        let population = thread::spawn(move || {
+            resolver.resolve_guest_address(GuestAddress::new(GUEST_BASE), PageAccess::Read)
+        });
+        entered_receiver
+            .recv()
+            .expect("population should enter the source");
+
+        let region = PagerRegionId::new(1).expect("test region id should validate");
+        let removed = bridge
+            .remove_pages(region, 0, u64::from(page_size))
+            .expect("removal should supersede loading");
+        release_sender
+            .send(())
+            .expect("stale source response should be released");
+        assert_eq!(
+            population
+                .join()
+                .expect("population thread should join")
+                .expect("population should retry"),
+            HvfLazyPageResolution::Populated
+        );
+        // SAFETY: the retried generation committed zero and opened host reads.
+        assert_eq!(unsafe { std::ptr::read_volatile(pointer) }, 0);
+        let requests = source.requests.lock().expect("request log should lock");
+        let removals = source.removals.lock().expect("removal log should lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(removals.len(), 1);
+        assert!(
+            requests[0].generation().get() < removed.generation().get()
+                && removed.generation().get() < requests[1].generation().get()
+        );
+        drop(requests);
+        drop(removals);
+        bridge.shutdown().expect("test bridge should shut down");
+    }
+
+    #[test]
     fn concurrent_guest_handlers_coalesce_source_and_publish_one_permission_union() {
         let _test_lock = MACH_TEST_LOCK
             .lock()
@@ -1401,6 +2241,38 @@ mod tests {
                 .shutdown()
                 .expect("terminal bridge should still restore ownership");
         }
+    }
+
+    #[test]
+    fn peer_source_failure_wins_before_population_guard_cleanup() {
+        let _test_lock = MACH_TEST_LOCK
+            .lock()
+            .expect("Mach lazy test lock should not be poisoned");
+        let page_size =
+            u32::try_from(crate::memory::host_page_size().expect("host page size should resolve"))
+                .expect("host page size should fit u32");
+        let memory = memory(page_size, 1).expect("test lazy memory should construct");
+        let source = Arc::new(TestSource {
+            requests: Mutex::new(Vec::new()),
+            reply: TestReply::PeerFailure,
+        });
+        let bridge = HvfLazyHostFaultBridge::install(Arc::clone(&memory), source)
+            .expect("test bridge should install");
+        assert!(
+            bridge
+                .resolver()
+                .resolve_guest_address(GuestAddress::new(GUEST_BASE), PageAccess::Read)
+                .is_err()
+        );
+        assert_eq!(
+            memory
+                .terminal_reason()
+                .expect("terminal reason should resolve"),
+            Some(LazyGuestMemoryTerminalReason::PeerFailure)
+        );
+        bridge
+            .shutdown()
+            .expect("terminal bridge should still restore ownership");
     }
 
     #[test]

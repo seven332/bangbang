@@ -171,9 +171,9 @@ crates/runtime    Backend-neutral VM model, eager/lazy memory ownership, MMIO,
 crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
 crates/launcher   Production app bundle, nested-worker validation, and supervision
-crates/pager      Closed bangbang-pager-v1 codec, state machines, and
-                  already-connected deadline-bounded Unix transport plus a
-                  bounded support-only reference peer
+crates/pager      Closed bangbang-pager-v1 codec, state machines, concurrent
+                  VMM client, and already-connected deadline-bounded Unix
+                  transport plus a bounded support-only reference peer
 crates/session    Private launcher-worker protocol and runtime namespace ownership
 crates/vhost-user Strict vhost-user frontend protocol, SCM_RIGHTS framing,
                   and portable pipe queue notifiers used by direct block startup
@@ -436,11 +436,22 @@ the mapping instead of spinning or exposing a partial page. Raw vCPU ownership
 and dirty-write tracking remain explicitly incompatible with this internal
 mode.
 
-These internal bridges still accept only a trusted in-process page source; the
-contained pager grant is not yet connected to their coordinator. Peer-driven
-removal/failure propagation, bypassing-consumer audit, native-v1 restore, and
-final certification remain deferred under #1527, and the native-v1 `Uffd`
-gate remains unchanged.
+The pager client now adopts an already-connected stream, performs the complete
+VMM handshake, and dispatches bounded mixed page/removal work out of order.
+`HvfLazyPager` binds that client to the same coordinator. Page source I/O runs
+outside a writer-preferring transition gate; host publication, instruction
+synchronization, and the complete guest permission union retain a shared
+lease. Removal takes the exclusive lease, retires an old loading generation,
+revokes guest permission, hides host permission, zeroes through the private
+alias, waits for exact peer acknowledgement, commits `Absent`, and admits only
+a newer refault. Peer timeout, EOF, malformed/mismatched traffic, explicit
+terminal, and receive-worker loss nonblockingly preserve the first
+`PeerFailure` and release every pending fault. Focused and signed tests cover
+blocked-response supersession, real stage-two revocation, and zero refault;
+the contained probe now removes and refaults through the new client.
+
+Bypassing-consumer audit, native-v1 restore, and final certification remain
+deferred under #1527, and the native-v1 `Uffd` gate remains unchanged.
 
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
@@ -1365,9 +1376,11 @@ artifact/restore/clone handoffs. The
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 then moves its one exact corpus record to feasible-but-undelivered #1527
 ownership while preserving native-v1 rejection. Its standalone protocol
-slice, backend-neutral coordinated lazy-anonymous-memory slice, task-local
-public-Mach host-fault bridge, and HVF guest read/write/execute fault bridge
-are implemented and tested without promoting the aggregate capability.
+and concurrent client, contained connected-peer grant, backend-neutral
+coordinated lazy-anonymous-memory slice, task-local public-Mach host-fault
+bridge, HVF guest read/write/execute fault bridge, ordered removal, and
+peer-failure propagation are implemented and tested without promoting the
+aggregate capability.
 The repository-wide disposition counts remain 228/169/4/17.
 
 ## Build And Test

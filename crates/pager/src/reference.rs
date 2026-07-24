@@ -8,7 +8,8 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use crate::{
-    PagerError, PagerFrameKind, PagerPeerState, PagerTransport, PeerSession, TerminalCode,
+    PagerError, PagerFrameKind, PagerPeerState, PagerRegionId, PagerRemoveRequest, PagerTransport,
+    PeerSession, TerminalCode,
 };
 
 /// Deterministic nonzero payload byte returned for even-numbered source pages.
@@ -64,6 +65,13 @@ impl ReferencePeerReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReferencePeer {
     max_operations: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RemovedRange {
+    region: PagerRegionId,
+    start: u64,
+    end: u64,
 }
 
 impl ReferencePeer {
@@ -123,6 +131,7 @@ impl ReferencePeer {
         let mut page_zero = 0_u32;
         let mut removals = 0_u32;
         let mut operations = 0_u32;
+        let mut removed_ranges = Vec::<RemovedRange>::new();
         loop {
             let frame = peer.receive(transport.receive()?)?;
             match frame.kind() {
@@ -130,7 +139,13 @@ impl ReferencePeer {
                     operations = bounded_increment(operations, self.max_operations)?;
                     let request = frame.page_request().ok_or(PagerError::InvalidFrame)?;
                     let page = request.offset() / u64::from(request.length());
-                    if page.is_multiple_of(2) {
+                    if removed_ranges
+                        .iter()
+                        .any(|removed| page_overlaps_removal(request, *removed))
+                    {
+                        transport.send(&peer.page_zero(request.request())?)?;
+                        page_zero = page_zero.checked_add(1).ok_or(PagerError::LimitExceeded)?;
+                    } else if page.is_multiple_of(2) {
                         let length = usize::try_from(request.length())
                             .map_err(|_| PagerError::InvalidConfiguration)?;
                         transport.send(
@@ -146,6 +161,7 @@ impl ReferencePeer {
                 PagerFrameKind::Remove => {
                     operations = bounded_increment(operations, self.max_operations)?;
                     let removal = frame.remove_request().ok_or(PagerError::InvalidFrame)?;
+                    record_removed_range(&mut removed_ranges, removal)?;
                     transport.send(&peer.removed(removal.request())?)?;
                     removals = removals.checked_add(1).ok_or(PagerError::LimitExceeded)?;
                 }
@@ -182,6 +198,49 @@ impl ReferencePeer {
             }
         }
     }
+}
+
+fn record_removed_range(
+    ranges: &mut Vec<RemovedRange>,
+    removal: PagerRemoveRequest,
+) -> Result<(), PagerError> {
+    let mut start = removal.offset();
+    let mut end = start
+        .checked_add(removal.length())
+        .ok_or(PagerError::InvalidPeerState)?;
+    let mut index = 0;
+    while index < ranges.len() {
+        let existing = ranges
+            .get(index)
+            .copied()
+            .ok_or(PagerError::InvalidLifecycle)?;
+        if existing.region == removal.region() && start <= existing.end && existing.start <= end {
+            start = start.min(existing.start);
+            end = end.max(existing.end);
+            ranges.swap_remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    ranges
+        .try_reserve(1)
+        .map_err(|_| PagerError::LimitExceeded)?;
+    ranges.push(RemovedRange {
+        region: removal.region(),
+        start,
+        end,
+    });
+    Ok(())
+}
+
+fn page_overlaps_removal(page: crate::PagerPageRequest, removal: RemovedRange) -> bool {
+    if page.region() != removal.region {
+        return false;
+    }
+    let Some(page_end) = page.offset().checked_add(u64::from(page.length())) else {
+        return false;
+    };
+    page.offset() < removal.end && removal.start < page_end
 }
 
 fn bounded_increment(current: u32, maximum: u32) -> Result<u32, PagerError> {
@@ -221,7 +280,7 @@ mod tests {
                 PagerRegion::new(
                     PagerRegionId::new(1).expect("region should validate"),
                     0,
-                    u64::from(MIN_PAGE_SIZE) * 2,
+                    u64::from(MIN_PAGE_SIZE) * 3,
                     MIN_PAGE_SIZE,
                 )
                 .expect("region should validate"),
@@ -314,5 +373,106 @@ mod tests {
         );
         assert_eq!(ReferencePeer::new(0), Err(PagerError::InvalidConfiguration));
         assert_eq!(bounded_increment(1, 1), Err(PagerError::LimitExceeded));
+    }
+
+    #[test]
+    fn support_peer_returns_zero_after_removal_without_changing_adjacent_data() {
+        let (vmm_stream, peer_stream) = UnixStream::pair().expect("stream pair should open");
+        let peer = thread::spawn(move || {
+            ReferencePeer::new(4)
+                .expect("bound should validate")
+                .serve(peer_stream, Duration::from_secs(1))
+        });
+        let mut transport =
+            PagerTransport::new(vmm_stream, Duration::from_secs(1)).expect("transport should open");
+        let mut vmm = vmm();
+        establish(&mut vmm, &mut transport).expect("session should establish");
+        let region = PagerRegionId::new(1).expect("region should validate");
+
+        transport
+            .send(
+                &vmm.request_page(
+                    region,
+                    PagerGeneration::new(1).expect("generation should validate"),
+                    0,
+                    PageAccess::Read,
+                )
+                .expect("initial request should build"),
+            )
+            .expect("initial request should send");
+        assert!(
+            vmm.receive(transport.receive().expect("initial response should arrive"))
+                .expect("initial response should validate")
+                .page_data()
+                .is_some()
+        );
+
+        transport
+            .send(
+                &vmm.remove(
+                    region,
+                    PagerGeneration::new(2).expect("generation should validate"),
+                    0,
+                    u64::from(MIN_PAGE_SIZE),
+                )
+                .expect("removal should build"),
+            )
+            .expect("removal should send");
+        vmm.receive(transport.receive().expect("removal response should arrive"))
+            .expect("removal response should validate");
+
+        transport
+            .send(
+                &vmm.request_page(
+                    region,
+                    PagerGeneration::new(3).expect("generation should validate"),
+                    0,
+                    PageAccess::Read,
+                )
+                .expect("refault should build"),
+            )
+            .expect("refault should send");
+        assert_eq!(
+            vmm.receive(transport.receive().expect("refault response should arrive"))
+                .expect("refault response should validate")
+                .kind(),
+            PagerFrameKind::PageZero
+        );
+
+        transport
+            .send(
+                &vmm.request_page(
+                    region,
+                    PagerGeneration::new(4).expect("generation should validate"),
+                    u64::from(MIN_PAGE_SIZE) * 2,
+                    PageAccess::Read,
+                )
+                .expect("adjacent request should build"),
+            )
+            .expect("adjacent request should send");
+        assert_eq!(
+            vmm.receive(
+                transport
+                    .receive()
+                    .expect("adjacent response should arrive")
+            )
+            .expect("adjacent response should validate")
+            .kind(),
+            PagerFrameKind::PageData
+        );
+
+        transport
+            .send(&vmm.shutdown().expect("shutdown should build"))
+            .expect("shutdown should send");
+        vmm.receive(transport.receive().expect("shutdown ack should arrive"))
+            .expect("shutdown ack should validate");
+        let report = peer
+            .join()
+            .expect("peer should join")
+            .expect("peer should succeed");
+        assert_eq!(report.page_data(), 2);
+        assert_eq!(report.page_zero(), 1);
+        assert_eq!(report.removals(), 1);
+        assert_eq!(report.termination(), ReferencePeerTermination::Shutdown);
     }
 }

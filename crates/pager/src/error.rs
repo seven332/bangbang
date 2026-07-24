@@ -22,6 +22,10 @@ pub enum PagerError {
     Timeout,
     /// The peer disconnected between complete frames.
     Disconnected,
+    /// Requested session-wide cancellation released this operation.
+    Cancelled,
+    /// The peer sent one valid explicit terminal frame.
+    PeerTerminal,
     /// A local socket operation failed.
     Io(io::ErrorKind),
     /// An earlier stream failure made subsequent framing unknowable.
@@ -40,6 +44,8 @@ impl fmt::Debug for PagerError {
             Self::UnexpectedEof => "PagerError::UnexpectedEof",
             Self::Timeout => "PagerError::Timeout",
             Self::Disconnected => "PagerError::Disconnected",
+            Self::Cancelled => "PagerError::Cancelled",
+            Self::PeerTerminal => "PagerError::PeerTerminal",
             Self::Io(_) => "PagerError::Io(<redacted>)",
             Self::Poisoned => "PagerError::Poisoned",
         })
@@ -58,6 +64,8 @@ impl fmt::Display for PagerError {
             Self::UnexpectedEof => "snapshot pager peer truncated a frame",
             Self::Timeout => "snapshot pager operation timed out",
             Self::Disconnected => "snapshot pager peer disconnected",
+            Self::Cancelled => "snapshot pager operation was cancelled",
+            Self::PeerTerminal => "snapshot pager peer terminated the session",
             Self::Io(_) => "snapshot pager transport operation failed",
             Self::Poisoned => "snapshot pager transport is terminal",
         })

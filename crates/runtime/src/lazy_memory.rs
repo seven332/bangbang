@@ -605,6 +605,26 @@ impl LazyGuestMemory {
         self.inner.regions.len()
     }
 
+    /// Returns the exact offered pager limits bound to this owner.
+    pub fn pager_limits(&self) -> PagerLimits {
+        self.inner.limits.pager
+    }
+
+    /// Copies the exact ordered pager region records bound to this owner.
+    pub fn pager_regions(&self) -> Result<Vec<PagerRegion>, LazyGuestMemoryError> {
+        let mut regions = Vec::new();
+        regions
+            .try_reserve_exact(self.inner.regions.len())
+            .map_err(|source| LazyGuestMemoryError::MetadataAllocationFailed { source })?;
+        regions.extend(
+            self.inner
+                .regions
+                .iter()
+                .map(|record| record.source.pager_region()),
+        );
+        Ok(regions)
+    }
+
     /// Acquires the page containing one guest address.
     pub fn fault_address(
         &self,
@@ -678,6 +698,19 @@ impl LazyGuestMemory {
         reason: LazyGuestMemoryTerminalReason,
     ) -> Result<(), LazyGuestMemoryError> {
         self.inner.terminate(reason)
+    }
+
+    /// Closes admission without waiting for already-linearized actions.
+    ///
+    /// This is safe to call from an I/O failure observer or while another
+    /// thread retains a publication/removal guard. The first terminal reason
+    /// remains stable; synchronized owners may call [`Self::terminate`] later
+    /// to wait for action cleanup.
+    pub fn signal_terminal(
+        &self,
+        reason: LazyGuestMemoryTerminalReason,
+    ) -> Result<(), LazyGuestMemoryError> {
+        self.inner.signal_terminal(reason)
     }
 }
 
@@ -1614,6 +1647,16 @@ impl LazyGuestMemoryInner {
             state = self.wait_state(state)?;
         }
         self.finalize_if_drained_locked(&mut state);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn signal_terminal(
+        &self,
+        reason: LazyGuestMemoryTerminalReason,
+    ) -> Result<(), LazyGuestMemoryError> {
+        let mut state = self.lock_state()?;
+        self.begin_closing_locked(&mut state, reason);
         self.changed.notify_all();
         Ok(())
     }
@@ -3120,6 +3163,82 @@ mod tests {
             .join()
             .expect("removal terminator should join")
             .expect("termination should finish after removal");
+    }
+
+    #[test]
+    fn nonblocking_terminal_signal_preserves_first_reason_during_removal() {
+        let memory = owner(1, 1, 1);
+        assert_eq!(memory.pager_limits(), pager_limits(1, 1, PAGE_SIZE));
+        assert_eq!(
+            memory
+                .pager_regions()
+                .expect("pager regions should copy")
+                .into_iter()
+                .map(|region| region.id())
+                .collect::<Vec<_>>(),
+            vec![region_id(1)]
+        );
+
+        let mut removal = memory
+            .begin_removal(region_id(1), 0, u64::from(PAGE_SIZE))
+            .expect("removal should begin");
+        removal
+            .target()
+            .expect("removal target should be available")
+            .zero()
+            .expect("removal target should zero");
+
+        memory
+            .signal_terminal(LazyGuestMemoryTerminalReason::PeerFailure)
+            .expect("terminal signal must not wait for the held removal");
+        memory
+            .signal_terminal(LazyGuestMemoryTerminalReason::Requested)
+            .expect("later terminal signal should remain idempotent");
+        assert_eq!(
+            memory
+                .terminal_reason()
+                .expect("terminal reason should resolve"),
+            Some(LazyGuestMemoryTerminalReason::PeerFailure)
+        );
+        assert!(matches!(
+            removal.commit_acknowledged(),
+            Err(LazyGuestMemoryError::Terminal {
+                reason: LazyGuestMemoryTerminalReason::PeerFailure
+            })
+        ));
+        assert_eq!(
+            memory
+                .operation_count()
+                .expect("terminal operation count should resolve"),
+            0
+        );
+    }
+
+    #[test]
+    fn nonblocking_terminal_signal_wakes_duplicate_population_waiters() {
+        let memory = Arc::new(owner(1, 1, 1));
+        let population = fault(&memory, 0, PageAccess::Read);
+        let waiter_memory = Arc::clone(&memory);
+        let waiter =
+            thread::spawn(move || waiter_memory.fault_page(region_id(1), 0, PageAccess::Write));
+        wait_for_waiters(&memory, 1);
+
+        memory
+            .signal_terminal(LazyGuestMemoryTerminalReason::PeerFailure)
+            .expect("peer failure should signal");
+        assert!(matches!(
+            waiter.join().expect("waiter should join"),
+            Err(LazyGuestMemoryError::Terminal {
+                reason: LazyGuestMemoryTerminalReason::PeerFailure
+            })
+        ));
+        drop(population);
+        assert_eq!(
+            memory
+                .operation_count()
+                .expect("terminal operation count should resolve"),
+            0
+        );
     }
 
     #[test]

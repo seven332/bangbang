@@ -10,6 +10,7 @@ mod ffi;
 mod gic;
 mod lazy_guest_fault;
 mod lazy_host_fault;
+mod lazy_pager;
 mod mach_lazy;
 mod memory;
 mod mmio;
@@ -62,9 +63,11 @@ pub use lazy_guest_fault::{
 };
 pub use lazy_host_fault::{
     HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfLazyHostFaultBridge, HvfLazyHostFaultError,
-    HvfLazyHostFaultShutdown, HvfLazyHostFaultStage, HvfLazyPageContents, HvfLazyPageRequest,
-    HvfLazyPageResolution, HvfLazyPageResolver, HvfLazyPageSource, HvfLazyPageSourceError,
+    HvfLazyHostFaultShutdown, HvfLazyHostFaultStage, HvfLazyPageContents, HvfLazyPageRemoval,
+    HvfLazyPageRemovalRequest, HvfLazyPageRequest, HvfLazyPageResolution, HvfLazyPageResolver,
+    HvfLazyPageSource, HvfLazyPageSourceError,
 };
+pub use lazy_pager::{HvfLazyPager, HvfLazyPagerError};
 pub use memory::{
     HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions,
     HvfVirtioMemMappingCaptureError, HvfVirtioMemMappingCaptureState,
