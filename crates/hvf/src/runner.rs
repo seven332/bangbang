@@ -138,6 +138,8 @@ const REVIEWED_OPTIONAL_STATE_AFTER_RUN_MESSAGE: &str =
     "vCPU runner reviewed optional state cannot be restored after execution starts";
 const REVIEWED_OPTIONAL_STATE_ALREADY_ATTEMPTED_MESSAGE: &str =
     "vCPU runner reviewed optional state restore was already attempted";
+const REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE: &str =
+    "vCPU runner reviewed optional state restore failed and runner must be discarded";
 const TIMER_OPERATION_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has timer operation in flight";
 const INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has interrupt operation in flight";
@@ -1129,6 +1131,7 @@ struct RunnerHandleState {
     boot_registers_configured: bool,
     run_started: bool,
     reviewed_optional_restore_attempted: bool,
+    reviewed_optional_restore_failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3979,10 +3982,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
     /// Restore reviewed optional arm64 state under one fresh never-run owner admission.
     ///
     /// This is a low-level owner operation, not a complete snapshot lifecycle:
-    /// callers remain responsible for constructing a compatible aggregate and
-    /// discarding the vCPU after failure. Admission is consumed before enqueue
-    /// and cannot be retried, because a failed nontransactional restore may
-    /// have changed destination defaults.
+    /// callers remain responsible for constructing a compatible aggregate.
+    /// Admission is consumed before enqueue and cannot be retried, because a
+    /// failed nontransactional restore may have changed destination defaults.
+    /// A failed attempt permanently makes this runner ineligible for guest
+    /// execution so the caller can only shut it down and discard the vCPU.
     pub fn restore_arm64_reviewed_optional_state(
         &self,
         state: HvfArm64ReviewedOptionalStateRestore,
@@ -4564,6 +4568,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 boot_registers_configured: false,
                 run_started: false,
                 reviewed_optional_restore_attempted: false,
+                reviewed_optional_restore_failed: false,
             })),
             dirty_write_tracker: None,
             dirty_write_member_index: 0,
@@ -4745,6 +4750,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
             ));
         }
+        if state.reviewed_optional_restore_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE,
+            ));
+        }
 
         state.in_flight_runs = 1;
         if self
@@ -4816,6 +4826,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.boot_register_setup_failed {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
+            ));
+        }
+        if state.reviewed_optional_restore_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE,
             ));
         }
 
@@ -4897,6 +4912,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.boot_register_setup_failed {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
+            ));
+        }
+        if state.reviewed_optional_restore_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE,
             ));
         }
 
@@ -7172,6 +7192,16 @@ impl InFlightCoreRegisterOperation {
             state.core_register_operation_in_flight = false;
         }
     }
+
+    fn finish_reviewed_optional_restore(&mut self, failed: bool) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        if let Ok(mut state) = state.lock() {
+            state.reviewed_optional_restore_failed = failed;
+            state.core_register_operation_in_flight = false;
+        }
+    }
 }
 
 impl Drop for InFlightCoreRegisterOperation {
@@ -7856,7 +7886,7 @@ fn run_runner_thread<C, V>(
                     .map_err(HvfVcpuRunnerError::ReviewedOptionalStateRestore);
                 // Every destination read and write has finished or the first
                 // staged failure has made this one-attempt owner disposable.
-                admission.release();
+                admission.finish_reviewed_optional_restore(result.is_err());
                 let _ = response_sender.send(result);
             }
             RunnerCommand::CaptureArm64SystemContextRegisterState {
@@ -38397,6 +38427,7 @@ pub(crate) mod tests {
                 super::REVIEWED_OPTIONAL_STATE_ALREADY_ATTEMPTED_MESSAGE,
             ))
         );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
         runner.shutdown().expect("runner should shut down");
     }
 
@@ -38414,6 +38445,12 @@ pub(crate) mod tests {
             runner.restore_arm64_reviewed_optional_state(request),
             Err(HvfVcpuRunnerError::InvalidState(
                 super::REVIEWED_OPTIONAL_STATE_ALREADY_ATTEMPTED_MESSAGE,
+            ))
+        );
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE,
             ))
         );
         runner.shutdown().expect("runner should shut down");

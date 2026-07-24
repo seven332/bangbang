@@ -398,6 +398,20 @@ impl HvfArm64SmeRestoreState {
 }
 
 /// Checked, detached optional arm64 state consumed by one never-run owner.
+///
+/// `DestinationDefault` fields are not assumed to be zero. The owner first
+/// verifies exact destination debug/SME feature evidence, requires every fresh
+/// debug control and SME PSTATE flag to be disabled, and reads only the
+/// requested destination defaults. It then disables all breakpoint controls,
+/// writes breakpoint values and final controls, repeats that order for
+/// watchpoints, writes SME system registers, changes SME PSTATE, validates
+/// transition-exposed defaults, writes Z/P/ZA/ZT0 contents, and finally writes
+/// authoritative Q0-Q31, FPCR, and FPSR state. The final SIMD/FP pass preserves
+/// validated Q/Z aliases and repairs FPSR side effects from an SME transition.
+///
+/// The operation is nontransactional and one-attempt. It defines neither a
+/// snapshot wire format nor native-v1 policy; a failure makes the destination
+/// runner ineligible for guest execution.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HvfArm64ReviewedOptionalStateRestore {
     expected_id_aa64dfr0_el1: u64,

@@ -3271,14 +3271,15 @@ The SME PSTATE getter is resolved at runtime so a pre-macOS-15.2 process returns
 a structured unsupported error instead of failing to load. An available symbol
 preserves HVF's raw `HV_UNSUPPORTED` result on SME-incapable hardware. The two
 flags are separate from feature metadata and from the conditionally present
-Z/P/ZA/ZT0 contents; no setter, transition, or restore ordering is defined.
+Z/P/ZA/ZT0 contents; that standalone capture defines no setter, transition, or
+restore ordering.
 The separate Z-register capture preflights that `PSTATE.SM` is enabled before
 querying the configuration-wide maximum SVL or allocating memory. It then reads
 Z0 through Z31 into exact maximum-width chunks and publishes only the complete
 value. The maximum is an allocation width, not the effective `SMCR_EL1.LEN`;
 baseline Q registers alias only each Z register's low 128 bits while streaming
-mode is active. P predicates, ZA, and ZT0 are captured separately. Setters and
-transitions, byte-layout interpretation,
+mode is active. P predicates, ZA, and ZT0 are captured separately. The
+standalone Z value defines no setters or transitions, byte-layout interpretation,
 feature/destination validation, encrypted persistence, schema, restore
 ordering, orchestration, and multi-vCPU association remain deferred.
 The separate P-register capture likewise preflights `PSTATE.SM`, then requires
@@ -3286,7 +3287,8 @@ the configuration-wide maximum SVL to be non-zero and divisible by eight. It
 reads P0 through P15 into exact `maximum / 8`-byte chunks and publishes only the
 complete value. The maximum remains an allocation basis rather than the
 effective `SMCR_EL1.LEN`; Z registers, ZA, and ZT0 are captured separately.
-Setters and transitions, byte-layout and inactive-lane interpretation,
+The standalone P value defines no setters or transitions, byte-layout and
+inactive-lane interpretation,
 feature/destination validation, encrypted persistence, schema, restore
 ordering, orchestration, and multi-vCPU association remain deferred.
 The separate ZA-register capture preflights `PSTATE.ZA` but does not require
@@ -3295,7 +3297,8 @@ checked-squares that byte count, fallibly allocates the exact result, and calls
 the runtime-resolved getter once. The raw complete value is published only on
 success and redacts bytes and dimensions from `Debug`. The maximum is an
 allocation dimension, not an effective-SVL or row/tile interpretation. ZT0 is
-captured separately. Setters and transitions, layout interpretation,
+captured separately. The standalone ZA value defines no setters or transitions,
+layout interpretation,
 feature/destination validation,
 encrypted persistence, schema, restore ordering, orchestration, and multi-vCPU
 association remain deferred.
@@ -3303,7 +3306,8 @@ The separate SME2 ZT0-register capture preflights `PSTATE.ZA` without requiring
 streaming mode, then calls its runtime-resolved getter once through a private
 64-byte, 16-byte-aligned SDK-compatible output value. It does not query maximum
 SVL. The detached fixed-size value is published only on success and redacts all
-bytes from `Debug`. Setters and transitions, SME2 feature/destination policy,
+bytes from `Debug`. The standalone ZT0 value defines no setters or transitions,
+SME2 feature/destination policy,
 lane interpretation, encrypted persistence, schema, restore ordering,
 orchestration, and multi-vCPU association remain deferred.
 The separate SME system-register capture uses the macOS 15.2 SDK register ids
@@ -3311,6 +3315,19 @@ through the existing owner-thread getter and preserves each raw backend error.
 It performs no writes and defines no writable-bit or feature validation,
 maximum-SVL policy, persistence, schema, or restore ordering with PSTATE and
 the conditionally present Z/P/ZA/ZT0 contents.
+A separate reviewed optional-state operation composes those raw values with
+every implemented breakpoint/watchpoint pair and authoritative SIMD/FP state.
+One permanent never-run owner validates exact debug counts, SME version and
+identification, maximum SVL, conditional inventories, fresh disabled
+controls/PSTATE, destination-local sparse defaults, and Q/Z aliases before the
+first write. It disables debug controls before comparator values, writes SME
+system registers before PSTATE and conditional Z/P/ZA/ZT0 contents, and writes
+Q0-Q31, FPCR, and FPSR last. The public-SDK SME setter symbols retain the
+runtime-resolved macOS 15.2 boundary. Errors expose only
+family/stage/index/completed-write metadata; a failed nontransactional attempt
+permanently prevents guest execution on that runner. This wire-format-neutral
+foundation does not change native-v1 bytes or its inactive-optional rejection
+policy, and native-v2 encoding plus multi-vCPU orchestration remain separate.
 The separate system-context capture uses macOS 15.2 SDK register ids through the
 same owner-thread getter and preserves raw backend errors. Its paired restore
 writes `SCXTNUM_EL0` then `SCXTNUM_EL1` through the same owner and reports the
@@ -3452,11 +3469,13 @@ ENABLE/IMASK. Its never-run owner command reconstructs the destination offset
 and CVAL after complete read/clock preflight, then applies a ten-write safe
 order with typed value-free partial progress. Snapshot downtime is frozen;
 after restore, both domains advance by the same host-counter interval. Retry
-uses a fresh sample, and a partially updated destination must never run. The baseline and optional SVE/SME identification,
-SME PSTATE, SME Z-register, SME P-register, SME ZA-register, SME system-register,
-breakpoint, watchpoint, and physical-timer
-subsets are raw, getter-only observations and likewise have no restore
-validation, snapshot schema, or Firecracker on-disk compatibility.
+uses a fresh sample, and a partially updated destination must never run. The
+baseline and optional SVE/SME identification, SME PSTATE, SME Z-register, SME
+P-register, SME ZA-register, SME system-register, breakpoint, watchpoint, and
+physical-timer capture values remain raw observations and individually define
+no restore validation, snapshot schema, or Firecracker on-disk compatibility.
+The reviewed optional-state aggregate described above is the sole checked
+breakpoint/watchpoint/SME/SIMD composition and remains wire-format-neutral.
 The core system-register, EL1 exception, execution-control, cache-selection,
 debug-control, debug-trap policy, thread-context, and translation subsets plus system-context,
 baseline SIMD/FP, and pointer-authentication keys have paired ordered,

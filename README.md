@@ -295,6 +295,19 @@ levels plus ordered nontransactional restore of their complete typed value,
 opaque GIC device state plus runner-owned pre-first-run reapply, and raw EL1
 GIC ICC CPU-interface registers plus ordered pre-first-run restore of their nine
 mutable values with derived RPR validation.
+A separate reviewed optional-state operation now restores every implemented
+breakpoint/watchpoint pair and compatible macOS 15.2+ SME PSTATE, system,
+streaming Z/P, ZA, and SME2 ZT0 value under one permanent never-run owner
+admission. It validates exact destination counts, identification, maximum SVL,
+conditional inventory, fresh disabled controls/PSTATE, and Q/Z aliases before
+writing; disables debug controls before comparator publication; applies SME
+system/PSTATE/contents in that order; and restores authoritative Q0-Q31,
+FPCR, and FPSR last. Sparse fields retain only owner-local defaults that were
+read or transition-validated in the same command. The operation is
+nontransactional and one-attempt: a failure permanently prevents that runner
+from executing and requires discarding the vCPU. This is an internal
+wire-format-neutral foundation; native-v1 bytes and its inactive-optional
+policy remain unchanged.
 A native-v1 optional-state classifier fails closed for active SVE/SME and
 enabled hardware breakpoint/watchpoint state. Prepared boot sessions can also
 replace the 16-byte VMGenID buffer and retained metadata before first run, then
