@@ -159,6 +159,7 @@ use crate::memory::{
     HvfGuestMemoryMappingError, HvfMemoryPermissions, HvfPmemFlushExecutor,
     HvfVirtioMemMappingCaptureError, HvfVirtioMemMappingCaptureState,
 };
+use crate::paused_topology::HvfArm64StablePausedTopologyState;
 use crate::psci::PsciCpuPowerCoordinator;
 use crate::pvtime::{
     HvfArm64PvTimeAccountingConfig, HvfArm64PvTimeCaptureState, HvfArm64PvTimeContentionProbe,
@@ -168,7 +169,9 @@ use crate::runner::{
     HvfArm64SnapshotV1Capture, HvfArm64SnapshotV1Restore, HvfVcpuRunCancelHandle,
     HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
-use crate::session_vcpu::{HvfArm64BootVcpuError, HvfArm64BootVcpuSession};
+use crate::session_vcpu::{
+    HvfArm64BootVcpuError, HvfArm64BootVcpuSession, HvfArm64StablePausedTopologyCaptureError,
+};
 use crate::snapshot::HvfArm64SnapshotTimerState;
 use crate::snapshot_bundle::{
     HvfSnapshotV1CompatibilityState, HvfSnapshotV1EncodeError, HvfSnapshotV1State,
@@ -7932,6 +7935,16 @@ impl HvfArm64BootSession<'_> {
         self.runner.capture_arm64_pvtime()
     }
 
+    /// Export the stable vCPU lifecycle graph after a completed pause barrier.
+    ///
+    /// This in-memory value excludes register, memory, device, and persistent
+    /// snapshot state.
+    pub fn capture_stable_paused_vcpu_topology(
+        &mut self,
+    ) -> Result<HvfArm64StablePausedTopologyState, HvfArm64StablePausedTopologyCaptureError> {
+        self.runner.capture_stable_paused_topology()
+    }
+
     /// Establish an empty-snapshot pause barrier for signed PVTime certification.
     #[doc(hidden)]
     pub fn pause_idle_for_arm64_pvtime_capture(&self) -> Result<(), HvfVcpuRunCoordinatorError> {
@@ -10350,6 +10363,16 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Result<HvfArm64PvTimeCaptureState, HvfVcpuRunCoordinatorError> {
         self.runner.capture_arm64_pvtime()
+    }
+
+    /// Export the stable vCPU lifecycle graph after a completed pause barrier.
+    ///
+    /// This in-memory value excludes register, memory, device, and persistent
+    /// snapshot state.
+    pub fn capture_stable_paused_vcpu_topology(
+        &mut self,
+    ) -> Result<HvfArm64StablePausedTopologyState, HvfArm64StablePausedTopologyCaptureError> {
+        self.runner.capture_stable_paused_topology()
     }
 
     /// Establish an empty-snapshot pause barrier for signed PVTime certification.

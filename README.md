@@ -308,6 +308,20 @@ nontransactional and one-attempt: a failure permanently prevents that runner
 from executing and requires discarding the vCPU. This is an internal
 wire-format-neutral foundation; native-v1 bytes and its inactive-optional
 policy remain unchanged.
+The public boot-vCPU session can also capture and import one stable in-memory
+topology graph at a completed pause barrier. The graph preserves canonical
+index/MPIDR ordering, the virtual-timer PPI, offline and runnable members, and
+deferred PSCI `CPU_SUSPEND32/64` continuations with their X1-X3 arguments and
+post-trap PC. Capture cross-checks the coordinator, PSCI power model, session
+bookkeeping, runner-owned deferred call, and architectural registers before
+publication. Import validates the complete source and proves every destination
+owner is never-run before mutation, allocates fresh destination-local power and
+runner transaction identities, constructs the destination already Paused, and
+rolls back installed suspend calls in reverse order before consuming a failed
+destination. Explicit resume starts generation 1. This is still a
+wire-format-neutral lifecycle foundation:
+native-v1 and native-v2 bytes are unchanged, and no public multi-vCPU snapshot
+create/load path is claimed.
 A native-v1 optional-state classifier fails closed for active SVE/SME and
 enabled hardware breakpoint/watchpoint state. Prepared boot sessions can also
 replace the 16-byte VMGenID buffer and retained metadata before first run, then

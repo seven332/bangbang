@@ -347,6 +347,18 @@ impl<'vm> HvfVcpuTopology<'vm> {
         )
     }
 
+    pub(crate) fn ensure_stable_import_ready(
+        &self,
+        index: usize,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runners
+            .get(index)
+            .ok_or(HvfVcpuRunnerError::InvalidState(
+                "stable import destination member index is invalid",
+            ))?
+            .ensure_stable_import_ready()
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_parts(runners: Vec<HvfVcpuRunner<'vm>>, mpidrs: Vec<u64>) -> Self {
         Self { runners, mpidrs }

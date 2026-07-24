@@ -5,12 +5,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use bangbang_runtime::mmio::MmioDispatcher;
 
+use crate::paused_topology::{
+    HvfArm64StableCpuSuspendState, HvfArm64StablePausedTopologyState, HvfArm64StableVcpuDisposition,
+};
 use crate::psci::{PsciCoordinatorRequest, PsciCoordinatorResponse};
 use crate::pvtime::{HvfArm64PvTimeAccountingConfig, HvfArm64PvTimeCaptureState};
 use crate::runner::{
     HvfVcpuCoordinatedRunStepOutcome, HvfVcpuPsciCallToken, HvfVcpuRetainedVtimerWaitOutcome,
     HvfVcpuRunCompletion, HvfVcpuRunToken, HvfVcpuRunner, HvfVcpuRunnerError,
-    cancel_vcpu_run_batch_with,
+    HvfVcpuStableCpuSuspendObservation, cancel_vcpu_run_batch_with,
 };
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError, shutdown_runner_topology};
 use crate::vcpu::{HvfArm64BootRegisters, HvfArm64SecondaryBootRegisters};
@@ -91,6 +94,18 @@ pub struct HvfVcpuCoordinatorWork {
 }
 
 impl HvfVcpuCoordinatorWork {
+    pub(crate) const fn restored_cpu_suspend(
+        function_id: u64,
+        runner_token: HvfVcpuPsciCallToken,
+    ) -> Self {
+        Self {
+            exit: HvfHvcExit::restored_hvc0(),
+            function_id,
+            runner_token,
+            request: PsciCoordinatorRequest::CpuSuspend,
+        }
+    }
+
     pub(crate) const fn into_parts(
         self,
     ) -> (
@@ -476,6 +491,41 @@ enum MemberDispatch {
         psci_token: HvfVcpuPsciCallToken,
         timer_intid: u32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HvfVcpuStableMemberDispatch {
+    Runnable,
+    Suspended {
+        psci_token: HvfVcpuPsciCallToken,
+        timer_intid: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HvfVcpuStablePausedMemberObservation {
+    index: usize,
+    mpidr: u64,
+    online: bool,
+    dispatch: HvfVcpuStableMemberDispatch,
+}
+
+impl HvfVcpuStablePausedMemberObservation {
+    pub(crate) const fn index(self) -> usize {
+        self.index
+    }
+
+    pub(crate) const fn mpidr(self) -> u64 {
+        self.mpidr
+    }
+
+    pub(crate) const fn online(self) -> bool {
+        self.online
+    }
+
+    pub(crate) const fn dispatch(self) -> HvfVcpuStableMemberDispatch {
+        self.dispatch
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -995,6 +1045,61 @@ where
         })
     }
 
+    fn new_paused_for_stable_import(
+        members: Vec<M>,
+        mpidrs: &[u64],
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+        stable: &HvfArm64StablePausedTopologyState,
+        batch_cancel: BatchCancel,
+    ) -> Result<Self, HvfVcpuRunCoordinatorError> {
+        if members.len() != mpidrs.len() || members.len() != stable.members().len() {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "stable paused topology metadata length does not match members",
+            ));
+        }
+        for (index, (mpidr, stable_member)) in mpidrs.iter().zip(stable.members()).enumerate() {
+            if stable_member.index() != index || stable_member.mpidr() != *mpidr {
+                return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                    "stable paused topology identity does not match destination members",
+                ));
+            }
+        }
+
+        let members =
+            NonEmptyMembers::new(members).ok_or(HvfVcpuRunCoordinatorError::InvalidState(
+                "vCPU run coordinator requires at least one topology member",
+            ))?;
+        let member_states = stable
+            .members()
+            .iter()
+            .map(|member| MemberState {
+                online: !matches!(member.disposition(), HvfArm64StableVcpuDisposition::Offline),
+                // Deferred runner calls are installed after this unpublished
+                // coordinator owns shutdown authority.
+                dispatch: MemberDispatch::Runnable,
+                active: None,
+                next_generation: 1,
+                cancellation_debt: None,
+            })
+            .collect::<Vec<_>>();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        Ok(Self {
+            members,
+            dispatcher,
+            completion_sender,
+            completion_receiver,
+            shared: Arc::new(CoordinatorShared {
+                state: Mutex::new(CoordinatorState {
+                    phase: CoordinatorPhase::Paused,
+                    members: member_states,
+                    pending_events: VecDeque::new(),
+                }),
+                mpidrs: Arc::from(mpidrs.to_vec()),
+                batch_cancel,
+            }),
+        })
+    }
+
     fn control(&self) -> HvfVcpuRunControl {
         HvfVcpuRunControl {
             shared: Arc::clone(&self.shared),
@@ -1345,6 +1450,141 @@ where
             ));
         }
         state.phase = CoordinatorPhase::Running;
+        Ok(())
+    }
+
+    fn capture_stable_paused_members(
+        &mut self,
+    ) -> Result<Vec<HvfVcpuStablePausedMemberObservation>, HvfVcpuRunCoordinatorError> {
+        let mut state = self.shared.lock_state()?;
+        if !matches!(state.phase, CoordinatorPhase::Paused) {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                PAUSED_PHASE_REQUIRED_MESSAGE,
+            ));
+        }
+        let consumes_idle_pause = state.pending_events.len() == 1
+            && matches!(
+                state.pending_events.front(),
+                Some(HvfVcpuRunEvent::Barrier(HvfVcpuRunBarrierReport {
+                    reason: HvfVcpuRunControlReason::Pause,
+                    acknowledgements,
+                })) if acknowledgements.is_empty()
+            );
+        if !state.pending_events.is_empty() && !consumes_idle_pause {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "stable paused topology capture has a pending coordinator event",
+            ));
+        }
+        for member in &state.members {
+            if member.active.is_some() || member.cancellation_debt.is_some() {
+                return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                    "stable paused topology capture requires idle debt-free members",
+                ));
+            }
+            if !member.online && member.dispatch != MemberDispatch::Runnable {
+                return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                    "stable paused topology has an offline suspended member",
+                ));
+            }
+        }
+
+        let observations = state
+            .members
+            .iter()
+            .enumerate()
+            .zip(self.shared.mpidrs.iter().copied())
+            .map(|((index, member), mpidr)| {
+                let dispatch = match member.dispatch {
+                    MemberDispatch::Runnable => HvfVcpuStableMemberDispatch::Runnable,
+                    MemberDispatch::Suspended {
+                        psci_token,
+                        timer_intid,
+                    } => HvfVcpuStableMemberDispatch::Suspended {
+                        psci_token,
+                        timer_intid,
+                    },
+                };
+                HvfVcpuStablePausedMemberObservation {
+                    index,
+                    mpidr,
+                    online: member.online,
+                    dispatch,
+                }
+            })
+            .collect();
+        if consumes_idle_pause {
+            let _ = state.pending_events.pop_front();
+        }
+        drop(state);
+        Ok(observations)
+    }
+
+    fn install_imported_cpu_suspend_dispatch(
+        &mut self,
+        index: usize,
+        psci_token: HvfVcpuPsciCallToken,
+        timer_intid: u32,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        let mut state = self.shared.lock_state()?;
+        if !matches!(state.phase, CoordinatorPhase::Paused) || !state.pending_events.is_empty() {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                PAUSED_PHASE_REQUIRED_MESSAGE,
+            ));
+        }
+        let member_count = state.members.len();
+        let member =
+            state
+                .members
+                .get_mut(index)
+                .ok_or(HvfVcpuRunCoordinatorError::InvalidMember {
+                    index,
+                    member_count,
+                })?;
+        if !member.online
+            || member.active.is_some()
+            || member.cancellation_debt.is_some()
+            || member.dispatch != MemberDispatch::Runnable
+        {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "stable CPU_SUSPEND import requires one idle runnable online member",
+            ));
+        }
+        member.dispatch = MemberDispatch::Suspended {
+            psci_token,
+            timer_intid,
+        };
+        Ok(())
+    }
+
+    fn clear_imported_cpu_suspend_dispatch(
+        &mut self,
+        index: usize,
+        psci_token: HvfVcpuPsciCallToken,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        let mut state = self.shared.lock_state()?;
+        let member_count = state.members.len();
+        let member =
+            state
+                .members
+                .get_mut(index)
+                .ok_or(HvfVcpuRunCoordinatorError::InvalidMember {
+                    index,
+                    member_count,
+                })?;
+        if member.active.is_some()
+            || !matches!(
+                member.dispatch,
+                MemberDispatch::Suspended {
+                    psci_token: active_token,
+                    ..
+                } if active_token == psci_token
+            )
+        {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "stable CPU_SUSPEND rollback token does not match member dispatch",
+            ));
+        }
+        member.dispatch = MemberDispatch::Runnable;
         Ok(())
     }
 
@@ -1761,6 +2001,76 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         Self::from_parts(vec![runner], vec![mpidr], dispatcher, online_indexes)
     }
 
+    pub(crate) fn from_stable_paused_topology(
+        topology: HvfVcpuTopology<'vm>,
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+        stable: &HvfArm64StablePausedTopologyState,
+    ) -> Result<Self, HvfVcpuRunCoordinatorError> {
+        let validation = if topology.len() != stable.members().len() {
+            Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "stable paused topology count does not match destination owners",
+            ))
+        } else if topology
+            .mpidrs()
+            .iter()
+            .zip(stable.members())
+            .enumerate()
+            .any(|(index, (mpidr, member))| member.index() != index || member.mpidr() != *mpidr)
+        {
+            Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "stable paused topology MPIDRs do not match destination owners",
+            ))
+        } else {
+            Ok(())
+        };
+        if let Err(primary) = validation {
+            return match topology.shutdown() {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(HvfVcpuRunCoordinatorError::ConstructionCleanup {
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                }),
+            };
+        }
+
+        let (runners, mpidrs) = topology.into_parts();
+        let primary_mpidr =
+            mpidrs
+                .first()
+                .copied()
+                .ok_or(HvfVcpuRunCoordinatorError::InvalidState(
+                    "stable paused topology requires primary metadata",
+                ))?;
+        let handles = Arc::new(
+            runners
+                .iter()
+                .map(HvfVcpuRunner::run_cancel_handle)
+                .collect::<Vec<_>>(),
+        );
+        let batch_cancel: BatchCancel = Arc::new(move |indexes| {
+            let mut selected = Vec::with_capacity(indexes.len());
+            for index in indexes.iter().copied() {
+                let handle = handles
+                    .get(index)
+                    .ok_or(HvfVcpuRunnerError::InvalidState(BATCH_CANCEL_INDEX_MESSAGE))?;
+                selected.push(handle.clone());
+            }
+            cancel_vcpu_run_batch_with(&selected, crate::ffi::exit_vcpus)
+        });
+        let inner = RunCoordinator::new_paused_for_stable_import(
+            runners,
+            &mpidrs,
+            dispatcher,
+            stable,
+            batch_cancel,
+        )?;
+        Ok(Self {
+            inner,
+            primary_mpidr,
+            shutdown_complete: false,
+        })
+    }
+
     fn from_parts(
         runners: Vec<HvfVcpuRunner<'vm>>,
         mpidrs: Vec<u64>,
@@ -1847,6 +2157,76 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
 
     pub(crate) fn primary_runner(&self) -> &HvfVcpuRunner<'vm> {
         self.inner.primary_member()
+    }
+
+    pub(crate) fn capture_stable_paused_members(
+        &mut self,
+    ) -> Result<Vec<HvfVcpuStablePausedMemberObservation>, HvfVcpuRunCoordinatorError> {
+        self.inner.capture_stable_paused_members()
+    }
+
+    pub(crate) fn capture_stable_cpu_suspend(
+        &self,
+        index: usize,
+    ) -> Result<HvfVcpuStableCpuSuspendObservation, HvfVcpuRunCoordinatorError> {
+        self.inner.member_operation(
+            index,
+            "stable CPU_SUSPEND capture",
+            false,
+            HvfVcpuRunner::capture_stable_cpu_suspend,
+        )
+    }
+
+    pub(crate) fn ensure_no_stable_deferred_psci_call(
+        &self,
+        index: usize,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        self.inner.member_operation(
+            index,
+            "stable deferred PSCI absence check",
+            false,
+            HvfVcpuRunner::ensure_no_stable_deferred_psci_call,
+        )
+    }
+
+    pub(crate) fn restore_stable_cpu_suspend(
+        &self,
+        index: usize,
+        state: &HvfArm64StableCpuSuspendState,
+    ) -> Result<HvfVcpuPsciCallToken, HvfVcpuRunCoordinatorError> {
+        self.inner
+            .member_operation(index, "stable CPU_SUSPEND restore", false, |runner| {
+                runner.restore_stable_cpu_suspend(state)
+            })
+    }
+
+    pub(crate) fn abort_stable_cpu_suspend(
+        &self,
+        index: usize,
+        token: HvfVcpuPsciCallToken,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        self.inner
+            .member_operation(index, "stable CPU_SUSPEND rollback", false, |runner| {
+                runner.abort_stable_cpu_suspend(token)
+            })
+    }
+
+    pub(crate) fn install_imported_cpu_suspend_dispatch(
+        &mut self,
+        index: usize,
+        token: HvfVcpuPsciCallToken,
+        timer_intid: u32,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        self.inner
+            .install_imported_cpu_suspend_dispatch(index, token, timer_intid)
+    }
+
+    pub(crate) fn clear_imported_cpu_suspend_dispatch(
+        &mut self,
+        index: usize,
+        token: HvfVcpuPsciCallToken,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        self.inner.clear_imported_cpu_suspend_dispatch(index, token)
     }
 
     /// Wait for the next member, barrier, or fully drained terminal event.
@@ -2073,6 +2453,16 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
         }
     }
 
+    pub(crate) fn shutdown_after_failed_stable_import(
+        &mut self,
+    ) -> Result<(), HvfVcpuRunCoordinatorError> {
+        let result = self.shutdown();
+        // A consuming import never republishes failed owners. Preserve the
+        // first reverse shutdown evidence and prevent Drop from retrying it.
+        self.shutdown_complete = true;
+        result
+    }
+
     fn drain_waiter(
         &mut self,
         waiter: &HvfVcpuRunBarrierWaiter,
@@ -2125,11 +2515,17 @@ mod tests {
     use bangbang_runtime::mmio::MmioDispatcher;
 
     use super::{
-        BatchCancel, CoordinatorMember, HvfVcpuRunControlReason, HvfVcpuRunCoordinator,
-        HvfVcpuRunCoordinatorError, HvfVcpuRunEvent, RunCoordinator,
+        BatchCancel, CoordinatorMember, HvfVcpuRunBarrierReport, HvfVcpuRunControlReason,
+        HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError, HvfVcpuRunEvent,
+        HvfVcpuStableMemberDispatch, RunCoordinator,
     };
     use crate::HvfVcpuRunStepOutcome;
     use crate::exit::{HvfExceptionExit, HvfHvcExit};
+    use crate::paused_topology::{
+        HvfArm64CpuSuspendConvention, HvfArm64StableCpuSuspendState,
+        HvfArm64StablePausedTopologyMember, HvfArm64StablePausedTopologyState,
+        HvfArm64StableVcpuDisposition,
+    };
     use crate::psci::{PsciCoordinatorRequest, PsciCoordinatorResponse};
     use crate::pvtime::HvfArm64PvTimeAccountingConfig;
     use crate::runner::tests::start_destroy_order_recording_runner;
@@ -2444,6 +2840,154 @@ mod tests {
             online_indexes,
             batch_cancel,
         )
+    }
+
+    #[test]
+    fn stable_import_coordinator_is_born_paused_and_resumes_at_generation_one() {
+        let members = fake_members(3);
+        let stable_suspend = HvfArm64StableCpuSuspendState::new(
+            HvfArm64CpuSuspendConvention::Call32,
+            [1, 2, 3],
+            0x8000,
+        )
+        .expect("stable suspend should build");
+        let stable = HvfArm64StablePausedTopologyState::new(
+            27,
+            vec![
+                HvfArm64StablePausedTopologyMember::new(
+                    0,
+                    0,
+                    HvfArm64StableVcpuDisposition::Runnable,
+                ),
+                HvfArm64StablePausedTopologyMember::new(
+                    1,
+                    1,
+                    HvfArm64StableVcpuDisposition::Offline,
+                ),
+                HvfArm64StablePausedTopologyMember::new(
+                    2,
+                    2,
+                    HvfArm64StableVcpuDisposition::Suspended(stable_suspend),
+                ),
+            ],
+        )
+        .expect("stable topology should build");
+        let mut coordinator = RunCoordinator::new_paused_for_stable_import(
+            members.clone(),
+            &[0, 1, 2],
+            Arc::new(Mutex::new(MmioDispatcher::new())),
+            &stable,
+            BatchHarness::default().callback(),
+        )
+        .expect("paused coordinator should build");
+        let psci_token = HvfVcpuPsciCallToken::new(9, 1);
+        coordinator
+            .install_imported_cpu_suspend_dispatch(2, psci_token, 27)
+            .expect("suspended dispatch should install");
+
+        assert!(matches!(
+            coordinator.dispatch_online(),
+            Err(HvfVcpuRunCoordinatorError::InvalidState(
+                super::RUNNING_PHASE_REQUIRED_MESSAGE
+            ))
+        ));
+        let observations = coordinator
+            .capture_stable_paused_members()
+            .expect("paused observations should capture");
+        assert!(!observations[1].online());
+        assert_eq!(
+            observations[2].dispatch(),
+            HvfVcpuStableMemberDispatch::Suspended {
+                psci_token,
+                timer_intid: 27
+            }
+        );
+
+        coordinator
+            .resume()
+            .expect("explicit resume should succeed");
+        assert_eq!(
+            coordinator
+                .dispatch_online()
+                .expect("online members should dispatch"),
+            2
+        );
+        assert_eq!(members[0].pending_tokens()[0].generation(), 1);
+        assert!(members[1].pending_tokens().is_empty());
+        assert_eq!(members[2].pending_tokens()[0].generation(), 1);
+        assert_eq!(members[2].retained_wait(1), (psci_token, 27));
+    }
+
+    #[test]
+    fn stable_capture_consumes_only_the_idle_pause_notification() {
+        let members = fake_members(1);
+        let mut coordinator = coordinator(&members, &[0], BatchHarness::default().callback())
+            .expect("coordinator should build");
+        coordinator
+            .control()
+            .request_pause()
+            .expect("idle pause should start")
+            .wait()
+            .expect("idle pause should complete");
+
+        assert_eq!(
+            coordinator
+                .capture_stable_paused_members()
+                .expect("exact idle pause notification should finalize")
+                .len(),
+            1
+        );
+        assert_eq!(
+            coordinator
+                .capture_stable_paused_members()
+                .expect("capture should remain stable after finalization")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn stable_capture_rejects_active_debt_and_unrelated_pending_events() {
+        let stable = HvfArm64StablePausedTopologyState::new(
+            27,
+            vec![HvfArm64StablePausedTopologyMember::new(
+                0,
+                0,
+                HvfArm64StableVcpuDisposition::Runnable,
+            )],
+        )
+        .expect("stable topology should build");
+        let mut coordinator = RunCoordinator::new_paused_for_stable_import(
+            fake_members(1),
+            &[0],
+            Arc::new(Mutex::new(MmioDispatcher::new())),
+            &stable,
+            BatchHarness::default().callback(),
+        )
+        .expect("paused coordinator should build");
+
+        {
+            let mut state = coordinator.shared.lock_state().expect("state should lock");
+            state.members[0].active = Some(HvfVcpuRunToken::new(0, 1));
+        }
+        assert!(coordinator.capture_stable_paused_members().is_err());
+        {
+            let mut state = coordinator.shared.lock_state().expect("state should lock");
+            state.members[0].active = None;
+            state.members[0].cancellation_debt = Some(1);
+        }
+        assert!(coordinator.capture_stable_paused_members().is_err());
+        {
+            let mut state = coordinator.shared.lock_state().expect("state should lock");
+            state.members[0].cancellation_debt = None;
+            state
+                .pending_events
+                .push_back(HvfVcpuRunEvent::Barrier(HvfVcpuRunBarrierReport {
+                    reason: HvfVcpuRunControlReason::Wakeup,
+                    acknowledgements: Vec::new(),
+                }));
+        }
+        assert!(coordinator.capture_stable_paused_members().is_err());
     }
 
     fn handled(outcome: HvfVcpuRunStepOutcome) -> FakeRunResult {

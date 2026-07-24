@@ -1,6 +1,6 @@
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
@@ -34,6 +34,7 @@ use crate::optional_state::{
     HvfArm64ReviewedOptionalStateAccess, HvfArm64ReviewedOptionalStateRestore,
     HvfArm64ReviewedOptionalStateRestoreError, restore_arm64_reviewed_optional_state_with,
 };
+use crate::paused_topology::{HvfArm64CpuSuspendConvention, HvfArm64StableCpuSuspendState};
 use crate::psci::{
     PsciCall, PsciCallAction, PsciCoordinatedDispatch, PsciCoordinatorRequest,
     PsciCoordinatorResponse, call_uses_arg0, coordinated_call_argument_count,
@@ -162,10 +163,25 @@ const PSCI_CALL_REQUEST_MISMATCH_MESSAGE: &str =
     "deferred PSCI request does not match the completion operation";
 const PSCI_COMPLETION_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has PSCI completion in flight";
 const PSCI_CALL_TOKEN_EXHAUSTED_MESSAGE: &str = "deferred PSCI call token space is exhausted";
+const PSCI_CALL_OWNER_EXHAUSTED_MESSAGE: &str =
+    "deferred PSCI call owner identity space is exhausted";
+const STABLE_CPU_SUSPEND_REQUEST_MISMATCH_MESSAGE: &str =
+    "deferred PSCI call is not a restorable CPU_SUSPEND";
+const STABLE_CPU_SUSPEND_REGISTER_MISMATCH_MESSAGE: &str =
+    "restored CPU_SUSPEND architectural state does not match";
 const RETAINED_VTIMER_WAIT_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has a retained virtual-timer wait in flight";
 const RETAINED_VTIMER_WAIT_TOKEN_EXHAUSTED_MESSAGE: &str =
     "retained virtual-timer wait token space is exhausted";
+static NEXT_PSCI_CALL_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_psci_call_owner_id() -> Result<u64, HvfVcpuRunnerError> {
+    NEXT_PSCI_CALL_OWNER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .map_err(|_| HvfVcpuRunnerError::InvalidState(PSCI_CALL_OWNER_EXHAUSTED_MESSAGE))
+}
 const RETAINED_VTIMER_WAIT_SIGNAL_POISONED_MESSAGE: &str =
     "retained virtual-timer wait signal lock is poisoned";
 const RETAINED_VTIMER_WAIT_IDENTITY_MISMATCH_MESSAGE: &str =
@@ -608,14 +624,43 @@ pub enum HvfVcpuRunStepOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct HvfVcpuPsciCallToken {
+    owner: u64,
     vcpu: crate::ffi::HvVcpu,
     sequence: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct HvfVcpuStableCpuSuspendObservation {
+    token: HvfVcpuPsciCallToken,
+    state: HvfArm64StableCpuSuspendState,
+}
+
+impl HvfVcpuStableCpuSuspendObservation {
+    pub(crate) const fn token(&self) -> HvfVcpuPsciCallToken {
+        self.token
+    }
+
+    pub(crate) const fn state(&self) -> &HvfArm64StableCpuSuspendState {
+        &self.state
+    }
+}
+
+impl fmt::Debug for HvfVcpuStableCpuSuspendObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfVcpuStableCpuSuspendObservation")
+            .field("state", &"<redacted>")
+            .finish()
+    }
 }
 
 #[cfg(test)]
 impl HvfVcpuPsciCallToken {
     pub(crate) const fn new(vcpu: crate::ffi::HvVcpu, sequence: u64) -> Self {
-        Self { vcpu, sequence }
+        Self {
+            owner: vcpu,
+            vcpu,
+            sequence,
+        }
     }
 }
 
@@ -1143,14 +1188,16 @@ struct RunnerThreadPendingPsciCall {
 
 #[derive(Debug)]
 struct RunnerThreadPsciState {
+    owner: u64,
     vcpu: crate::ffi::HvVcpu,
     next_token: u64,
     pending: Option<RunnerThreadPendingPsciCall>,
 }
 
 impl RunnerThreadPsciState {
-    const fn new(vcpu: crate::ffi::HvVcpu) -> Self {
+    const fn new(owner: u64, vcpu: crate::ffi::HvVcpu) -> Self {
         Self {
+            owner,
             vcpu,
             next_token: 1,
             pending: None,
@@ -1171,6 +1218,7 @@ impl RunnerThreadPsciState {
                 PSCI_CALL_TOKEN_EXHAUSTED_MESSAGE,
             ))?;
         let token = HvfVcpuPsciCallToken {
+            owner: self.owner,
             vcpu: self.vcpu,
             sequence: self.next_token,
         };
@@ -1232,6 +1280,28 @@ enum RunnerCommand {
     },
     CommitPsciCpuOff {
         token: HvfVcpuPsciCallToken,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
+    CaptureStableCpuSuspend {
+        admission: InFlightCoreRegisterOperation,
+        expected_token: HvfVcpuPsciCallToken,
+        response_sender:
+            mpsc::Sender<Result<HvfVcpuStableCpuSuspendObservation, HvfVcpuRunnerError>>,
+    },
+    RestoreStableCpuSuspend {
+        admission: InFlightCoreRegisterOperation,
+        handle_state: RunnerState,
+        state: HvfArm64StableCpuSuspendState,
+        response_sender: mpsc::Sender<Result<HvfVcpuPsciCallToken, HvfVcpuRunnerError>>,
+    },
+    AbortStableCpuSuspend {
+        admission: InFlightCoreRegisterOperation,
+        handle_state: RunnerState,
+        token: HvfVcpuPsciCallToken,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
+    ProbeNoDeferredPsciCall {
+        admission: InFlightCoreRegisterOperation,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     DispatchMmioAccess {
@@ -3340,6 +3410,117 @@ impl<'vm> HvfVcpuRunner<'vm> {
         Ok(self.lock_state()?.retained_vtimer_wait.is_some())
     }
 
+    pub(crate) fn capture_stable_cpu_suspend(
+        &self,
+    ) -> Result<HvfVcpuStableCpuSuspendObservation, HvfVcpuRunnerError> {
+        let (admission, expected_token) =
+            self.reserve_stable_cpu_suspend_operation(false, |state| {
+                match state.pending_psci_call {
+                    Some(token) => Ok(token),
+                    None => Err(HvfVcpuRunnerError::InvalidState(
+                        PSCI_CALL_NOT_PENDING_MESSAGE,
+                    )),
+                }
+            })?;
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.command_sender
+            .send(RunnerCommand::CaptureStableCpuSuspend {
+                admission,
+                expected_token,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    pub(crate) fn restore_stable_cpu_suspend(
+        &self,
+        state: &HvfArm64StableCpuSuspendState,
+    ) -> Result<HvfVcpuPsciCallToken, HvfVcpuRunnerError> {
+        let (admission, ()) = self.reserve_stable_cpu_suspend_operation(true, |runner_state| {
+            ensure_no_pending_psci_call(runner_state)
+        })?;
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.command_sender
+            .send(RunnerCommand::RestoreStableCpuSuspend {
+                admission,
+                handle_state: Arc::clone(&self.state),
+                state: state.clone(),
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    pub(crate) fn abort_stable_cpu_suspend(
+        &self,
+        token: HvfVcpuPsciCallToken,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (admission, ()) =
+            self.reserve_stable_cpu_suspend_operation(false, |state| {
+                match state.pending_psci_call {
+                    None => Err(HvfVcpuRunnerError::InvalidState(
+                        PSCI_CALL_NOT_PENDING_MESSAGE,
+                    )),
+                    Some(pending) if pending != token => Err(HvfVcpuRunnerError::InvalidState(
+                        PSCI_CALL_TOKEN_MISMATCH_MESSAGE,
+                    )),
+                    Some(_) => Ok(()),
+                }
+            })?;
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.command_sender
+            .send(RunnerCommand::AbortStableCpuSuspend {
+                admission,
+                handle_state: Arc::clone(&self.state),
+                token,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    pub(crate) fn ensure_no_stable_deferred_psci_call(&self) -> Result<(), HvfVcpuRunnerError> {
+        let admission = self.reserve_core_register_operation()?;
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.command_sender
+            .send(RunnerCommand::ProbeNoDeferredPsciCall {
+                admission,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    pub(crate) fn ensure_stable_import_ready(&self) -> Result<(), HvfVcpuRunnerError> {
+        let (admission, ()) = self.reserve_stable_cpu_suspend_operation(true, |state| {
+            ensure_no_pending_psci_call(state)
+        })?;
+        let (response_sender, response_receiver) = mpsc::channel();
+        self.command_sender
+            .send(RunnerCommand::ProbeNoDeferredPsciCall {
+                admission,
+                response_sender,
+            })
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(COMMAND_CHANNEL_CLOSED_MESSAGE))?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
     #[cfg(test)]
     pub(crate) fn run_once_and_handle_mmio_coordinated(
         &self,
@@ -5168,6 +5349,90 @@ impl<'vm> HvfVcpuRunner<'vm> {
             ));
         }
         Ok(state)
+    }
+
+    fn reserve_stable_cpu_suspend_operation<T>(
+        &self,
+        require_never_run: bool,
+        validate_pending: impl FnOnce(&RunnerHandleState) -> Result<T, HvfVcpuRunnerError>,
+    ) -> Result<(InFlightCoreRegisterOperation, T), HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if !state.mpidr_configured {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MPIDR_NOT_CONFIGURED_MESSAGE,
+            ));
+        }
+        if require_never_run && state.run_started {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUN_ALREADY_STARTED_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.retained_vtimer_wait.is_some() {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RETAINED_VTIMER_WAIT_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.core_register_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                CORE_REGISTER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.timer_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                TIMER_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.interrupt_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                INTERRUPT_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.psci_completion_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                PSCI_COMPLETION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_FAILED_MESSAGE,
+            ));
+        }
+        if state.reviewed_optional_restore_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                REVIEWED_OPTIONAL_STATE_RESTORE_FAILED_MESSAGE,
+            ));
+        }
+        let validated = validate_pending(&state)?;
+
+        state.core_register_operation_in_flight = true;
+        drop(state);
+        Ok((InFlightCoreRegisterOperation::new(&self.state), validated))
     }
 
     fn start_mmio_dispatch(
@@ -7323,11 +7588,19 @@ fn run_runner_thread<C, V>(
         }
     };
 
+    let psci_owner = match allocate_psci_call_owner_id() {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = startup_sender.send(Err(error));
+            return;
+        }
+    };
+
     if startup_sender.send(Ok(vcpu_id)).is_err() {
         return;
     }
 
-    let mut psci_state = RunnerThreadPsciState::new(vcpu_id);
+    let mut psci_state = RunnerThreadPsciState::new(psci_owner, vcpu_id);
     let mut pvtime = HvfArm64PvTimeAccounting::disabled();
 
     while let Ok(command) = command_receiver.recv() {
@@ -7474,6 +7747,60 @@ fn run_runner_thread<C, V>(
                 if sent && result.is_ok() {
                     psci_state.pending = None;
                 }
+            }
+            RunnerCommand::CaptureStableCpuSuspend {
+                mut admission,
+                expected_token,
+                response_sender,
+            } => {
+                let result = capture_stable_cpu_suspend_on_runner_thread(
+                    &mut vcpu,
+                    &psci_state,
+                    expected_token,
+                );
+                admission.release();
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::RestoreStableCpuSuspend {
+                mut admission,
+                handle_state,
+                state,
+                response_sender,
+            } => {
+                let result = restore_stable_cpu_suspend_on_runner_thread(
+                    &mut vcpu,
+                    &mut psci_state,
+                    &handle_state,
+                    &state,
+                );
+                admission.release();
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::AbortStableCpuSuspend {
+                mut admission,
+                handle_state,
+                token,
+                response_sender,
+            } => {
+                let result = abort_stable_cpu_suspend_on_runner_thread(
+                    &mut psci_state,
+                    &handle_state,
+                    token,
+                );
+                admission.release();
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::ProbeNoDeferredPsciCall {
+                mut admission,
+                response_sender,
+            } => {
+                let result = if psci_state.pending.is_none() {
+                    Ok(())
+                } else {
+                    Err(HvfVcpuRunnerError::InvalidState(PSCI_CALL_PENDING_MESSAGE))
+                };
+                admission.release();
+                let _ = response_sender.send(result);
             }
             RunnerCommand::DispatchMmioAccess {
                 access,
@@ -8826,6 +9153,139 @@ fn handle_coordinated_hvc_on_runner_thread(
     }
 }
 
+fn capture_stable_cpu_suspend_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    psci_state: &RunnerThreadPsciState,
+    expected_token: HvfVcpuPsciCallToken,
+) -> Result<HvfVcpuStableCpuSuspendObservation, HvfVcpuRunnerError> {
+    let Some(pending) = psci_state.pending.as_ref() else {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_NOT_PENDING_MESSAGE,
+        ));
+    };
+    if pending.token != expected_token {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_TOKEN_MISMATCH_MESSAGE,
+        ));
+    }
+    if pending.request != PsciCoordinatorRequest::CpuSuspend || pending.written_response.is_some() {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            STABLE_CPU_SUSPEND_REQUEST_MISMATCH_MESSAGE,
+        ));
+    }
+
+    let function_id = vcpu
+        .read_register(HvfRegister::X0)
+        .map_err(HvfVcpuRunnerError::Backend)?;
+    let convention = HvfArm64CpuSuspendConvention::from_function_id(function_id).ok_or(
+        HvfVcpuRunnerError::InvalidState(STABLE_CPU_SUSPEND_REQUEST_MISMATCH_MESSAGE),
+    )?;
+    let mut arguments = [0; 3];
+    for (argument, register) in
+        arguments
+            .iter_mut()
+            .zip([HvfRegister::X1, HvfRegister::X2, HvfRegister::X3])
+    {
+        *argument = vcpu
+            .read_register(register)
+            .map_err(HvfVcpuRunnerError::Backend)?;
+    }
+    let return_pc = vcpu
+        .read_register(HvfRegister::PC)
+        .map_err(HvfVcpuRunnerError::Backend)?;
+    let state =
+        HvfArm64StableCpuSuspendState::new(convention, arguments, return_pc).map_err(|_| {
+            HvfVcpuRunnerError::InvalidState(STABLE_CPU_SUSPEND_REGISTER_MISMATCH_MESSAGE)
+        })?;
+
+    Ok(HvfVcpuStableCpuSuspendObservation {
+        token: expected_token,
+        state,
+    })
+}
+
+fn restore_stable_cpu_suspend_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    psci_state: &mut RunnerThreadPsciState,
+    handle_state: &RunnerState,
+    stable_state: &HvfArm64StableCpuSuspendState,
+) -> Result<HvfVcpuPsciCallToken, HvfVcpuRunnerError> {
+    let function_id = vcpu
+        .read_register(HvfRegister::X0)
+        .map_err(HvfVcpuRunnerError::Backend)?;
+    let mut arguments = [0; 3];
+    for (argument, register) in
+        arguments
+            .iter_mut()
+            .zip([HvfRegister::X1, HvfRegister::X2, HvfRegister::X3])
+    {
+        *argument = vcpu
+            .read_register(register)
+            .map_err(HvfVcpuRunnerError::Backend)?;
+    }
+    let return_pc = vcpu
+        .read_register(HvfRegister::PC)
+        .map_err(HvfVcpuRunnerError::Backend)?;
+    if function_id != stable_state.convention().function_id()
+        || arguments != stable_state.arguments()
+        || return_pc != stable_state.return_pc()
+    {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            STABLE_CPU_SUSPEND_REGISTER_MISMATCH_MESSAGE,
+        ));
+    }
+
+    let mut state = lock_runner_state(handle_state)?;
+    ensure_no_pending_psci_call(&state)?;
+    let token = psci_state.begin(PsciCoordinatorRequest::CpuSuspend)?;
+    state.pending_psci_call = Some(token);
+    drop(state);
+
+    Ok(token)
+}
+
+fn abort_stable_cpu_suspend_on_runner_thread(
+    psci_state: &mut RunnerThreadPsciState,
+    handle_state: &RunnerState,
+    token: HvfVcpuPsciCallToken,
+) -> Result<(), HvfVcpuRunnerError> {
+    let Some(pending) = psci_state.pending.as_ref() else {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_NOT_PENDING_MESSAGE,
+        ));
+    };
+    if pending.token != token {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            PSCI_CALL_TOKEN_MISMATCH_MESSAGE,
+        ));
+    }
+    if pending.request != PsciCoordinatorRequest::CpuSuspend || pending.written_response.is_some() {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            STABLE_CPU_SUSPEND_REQUEST_MISMATCH_MESSAGE,
+        ));
+    }
+
+    let mut state = lock_runner_state(handle_state)?;
+    match state.pending_psci_call {
+        None => {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                PSCI_CALL_NOT_PENDING_MESSAGE,
+            ));
+        }
+        Some(pending) if pending != token => {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                PSCI_CALL_TOKEN_MISMATCH_MESSAGE,
+            ));
+        }
+        Some(_) => {}
+    }
+    state.pending_psci_call = None;
+    psci_state.pending = None;
+    drop(state);
+
+    Ok(())
+}
+
 fn complete_psci_call_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     psci_state: &mut RunnerThreadPsciState,
@@ -9033,6 +9493,7 @@ pub(crate) mod tests {
         HvfArm64DebugRegisterRestoreState, HvfArm64OptionalStateValue,
         HvfArm64ReviewedOptionalStateRestore,
     };
+    use crate::paused_topology::{HvfArm64CpuSuspendConvention, HvfArm64StableCpuSuspendState};
     use crate::psci::{
         PsciAffinityInfoResponse, PsciCoordinatorRequest, PsciCoordinatorResponse, PsciCpuOnBegin,
         PsciCpuOnResponse, PsciCpuPowerCoordinator, PsciCpuPowerState, PsciCpuSuspendResponse,
@@ -10821,6 +11282,7 @@ pub(crate) mod tests {
     struct CoordinatedPsciRecordingVcpu {
         run_once_result: Result<HvfVcpuExit, BackendError>,
         registers: [u64; 4],
+        pc: u64,
         register_read_sender: mpsc::Sender<HvfRegister>,
         register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
         fail_next_x0_write: bool,
@@ -10829,6 +11291,7 @@ pub(crate) mod tests {
         vtimer_counter_samples: VecDeque<Result<u64, BackendError>>,
         vtimer_sample_sender: Option<mpsc::Sender<()>>,
         ppi_sender: Option<mpsc::Sender<(u32, bool)>>,
+        destroy_observation: Option<(usize, bool, mpsc::Sender<usize>)>,
     }
 
     struct SecondaryConfigureRecordingVcpu {
@@ -17673,6 +18136,7 @@ pub(crate) mod tests {
                 HvfRegister::X1 => Ok(self.registers[1]),
                 HvfRegister::X2 => Ok(self.registers[2]),
                 HvfRegister::X3 => Ok(self.registers[3]),
+                HvfRegister::PC => Ok(self.pc),
                 _ => Err(BackendError::InvalidState("unexpected fake register read")),
             }
         }
@@ -17737,7 +18201,19 @@ pub(crate) mod tests {
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
-            Ok(())
+            let Some((index, fail_destroy, sender)) = &self.destroy_observation else {
+                return Ok(());
+            };
+            sender
+                .send(*index)
+                .map_err(|_| BackendError::InvalidState("fake destroy receiver closed"))?;
+            if *fail_destroy {
+                Err(BackendError::InvalidState(
+                    "fake coordinated PSCI destroy failed",
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -19366,12 +19842,35 @@ pub(crate) mod tests {
         mpsc::Receiver<HvfRegister>,
         mpsc::Receiver<(HvfRegister, u64)>,
     ) {
+        start_coordinated_psci_run_step_recording_runner_with_destroy(
+            function_id,
+            arguments,
+            hvc_immediate,
+            fail_next_x0_write,
+            None,
+        )
+    }
+
+    pub(crate) type CoordinatedPsciDestroyObservation = (usize, bool, mpsc::Sender<usize>);
+
+    pub(crate) fn start_coordinated_psci_run_step_recording_runner_with_destroy(
+        function_id: u64,
+        arguments: [u64; 3],
+        hvc_immediate: u16,
+        fail_next_x0_write: bool,
+        destroy_observation: Option<CoordinatedPsciDestroyObservation>,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<HvfRegister>,
+        mpsc::Receiver<(HvfRegister, u64)>,
+    ) {
         let (register_read_sender, register_read_receiver) = mpsc::channel();
         let (register_write_sender, register_write_receiver) = mpsc::channel();
         let started = spawn_runner_thread(move || {
             Ok(CoordinatedPsciRecordingVcpu {
                 run_once_result: Ok(hvc_exception_exit(hvc_immediate)),
                 registers: [function_id, arguments[0], arguments[1], arguments[2]],
+                pc: 0x8000,
                 register_read_sender,
                 register_write_sender,
                 fail_next_x0_write,
@@ -19380,6 +19879,7 @@ pub(crate) mod tests {
                 vtimer_counter_samples: VecDeque::from([Ok(100)]),
                 vtimer_sample_sender: None,
                 ppi_sender: None,
+                destroy_observation,
             })
         })
         .expect("fake coordinated PSCI runner should start");
@@ -19416,6 +19916,7 @@ pub(crate) mod tests {
             Ok(CoordinatedPsciRecordingVcpu {
                 run_once_result: Ok(hvc_exception_exit(0)),
                 registers: [function_id, arguments[0], arguments[1], arguments[2]],
+                pc: 0x8000,
                 register_read_sender,
                 register_write_sender,
                 fail_next_x0_write: false,
@@ -19424,6 +19925,7 @@ pub(crate) mod tests {
                 vtimer_counter_samples,
                 vtimer_sample_sender: Some(vtimer_sample_sender),
                 ppi_sender: Some(ppi_sender),
+                destroy_observation: None,
             })
         })
         .expect("fake CPU_SUSPEND runner should start");
@@ -34790,6 +35292,175 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stable_cpu_suspend_capture_closes_owner_and_architectural_identity() {
+        for (function_id, convention) in [
+            (PSCI_CPU_SUSPEND, HvfArm64CpuSuspendConvention::Call32),
+            (PSCI_CPU_SUSPEND_64, HvfArm64CpuSuspendConvention::Call64),
+        ] {
+            let arguments = [0x11, 0x22, 0x33];
+            let (runner, register_reads, register_writes) =
+                start_coordinated_psci_run_step_recording_runner(function_id, arguments, 0, false);
+            let HvfVcpuCoordinatedRunStepOutcome::Psci {
+                token,
+                request: PsciCoordinatorRequest::CpuSuspend,
+                ..
+            } = runner
+                .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+                .expect("CPU_SUSPEND should defer")
+            else {
+                panic!("CPU_SUSPEND should return coordinator work");
+            };
+
+            let observation = runner
+                .capture_stable_cpu_suspend()
+                .expect("quiescent deferred CPU_SUSPEND should capture");
+            assert_eq!(observation.token(), token);
+            assert_eq!(observation.state().convention(), convention);
+            assert_eq!(observation.state().arguments(), arguments);
+            assert_eq!(observation.state().return_pc(), 0x8000);
+            assert!(format!("{observation:?}").contains("<redacted>"));
+            assert_eq!(
+                register_reads.try_iter().collect::<Vec<_>>(),
+                vec![
+                    HvfRegister::X0,
+                    HvfRegister::X1,
+                    HvfRegister::X2,
+                    HvfRegister::X3,
+                    HvfRegister::X0,
+                    HvfRegister::X1,
+                    HvfRegister::X2,
+                    HvfRegister::X3,
+                    HvfRegister::PC,
+                ]
+            );
+            assert_eq!(register_writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+            runner
+                .abort_stable_cpu_suspend(token)
+                .expect("exact deferred call should abort");
+            runner
+                .ensure_no_stable_deferred_psci_call()
+                .expect("abort should clear both owner records");
+            runner.shutdown().expect("runner should shut down");
+        }
+    }
+
+    #[test]
+    fn stable_cpu_suspend_restore_allocates_a_fresh_destination_owner_token() {
+        let arguments = [7, 8, 9];
+        let (source, _, _) = start_coordinated_psci_run_step_recording_runner(
+            PSCI_CPU_SUSPEND_64,
+            arguments,
+            0,
+            false,
+        );
+        let HvfVcpuCoordinatedRunStepOutcome::Psci {
+            token: source_token,
+            request: PsciCoordinatorRequest::CpuSuspend,
+            ..
+        } = source
+            .run_once_and_handle_mmio_coordinated(shared_dispatcher())
+            .expect("source CPU_SUSPEND should defer")
+        else {
+            panic!("source CPU_SUSPEND should return coordinator work");
+        };
+        let stable = source
+            .capture_stable_cpu_suspend()
+            .expect("source suspension should capture")
+            .state()
+            .clone();
+
+        let (destination, _, _) = start_coordinated_psci_run_step_recording_runner(
+            PSCI_CPU_SUSPEND_64,
+            arguments,
+            0,
+            false,
+        );
+        let destination_token = destination
+            .restore_stable_cpu_suspend(&stable)
+            .expect("destination suspension should install");
+        assert_ne!(destination_token, source_token);
+
+        destination
+            .abort_stable_cpu_suspend(destination_token)
+            .expect("destination token should abort");
+        source
+            .abort_stable_cpu_suspend(source_token)
+            .expect("source token should abort");
+        destination
+            .shutdown()
+            .expect("destination should shut down");
+        source.shutdown().expect("source should shut down");
+    }
+
+    #[test]
+    fn stable_cpu_suspend_restore_validates_before_install_and_aborts_exactly() {
+        let arguments = [7, 8, 9];
+        let (runner, register_reads, register_writes) =
+            start_coordinated_psci_run_step_recording_runner(
+                PSCI_CPU_SUSPEND_64,
+                arguments,
+                0,
+                false,
+            );
+        let mismatch = HvfArm64StableCpuSuspendState::new(
+            HvfArm64CpuSuspendConvention::Call64,
+            [7, 8, 10],
+            0x8000,
+        )
+        .expect("test state should build");
+        assert_eq!(
+            runner.restore_stable_cpu_suspend(&mismatch),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::STABLE_CPU_SUSPEND_REGISTER_MISMATCH_MESSAGE
+            ))
+        );
+        runner
+            .ensure_no_stable_deferred_psci_call()
+            .expect("failed validation must not install owner state");
+
+        let stable = HvfArm64StableCpuSuspendState::new(
+            HvfArm64CpuSuspendConvention::Call64,
+            arguments,
+            0x8000,
+        )
+        .expect("test state should build");
+        let token = runner
+            .restore_stable_cpu_suspend(&stable)
+            .expect("matching never-run registers should install a fresh token");
+        assert_eq!(
+            runner
+                .capture_stable_cpu_suspend()
+                .expect("installed state should recapture")
+                .state(),
+            &stable
+        );
+        let stale = HvfVcpuPsciCallToken::new(7, token.sequence + 1);
+        assert_eq!(
+            runner.abort_stable_cpu_suspend(stale),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_TOKEN_MISMATCH_MESSAGE
+            ))
+        );
+        runner
+            .abort_stable_cpu_suspend(token)
+            .expect("exact installed token should abort");
+        assert_eq!(
+            runner.abort_stable_cpu_suspend(token),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::PSCI_CALL_NOT_PENDING_MESSAGE
+            ))
+        );
+        assert_eq!(register_writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(
+            register_reads
+                .try_iter()
+                .any(|read| read == HvfRegister::PC)
+        );
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
     fn coordinated_cpu_suspend_wait_rejects_stale_and_wrong_requests() {
         let (runner, _, register_writes) = start_coordinated_psci_run_step_recording_runner(
             PSCI_CPU_ON,
@@ -34806,6 +35477,7 @@ pub(crate) mod tests {
             panic!("CPU_ON should return coordinator work");
         };
         let stale = HvfVcpuPsciCallToken {
+            owner: psci_token.owner,
             vcpu: psci_token.vcpu,
             sequence: psci_token.sequence + 1,
         };
@@ -35706,6 +36378,7 @@ pub(crate) mod tests {
             panic!("CPU_ON should return coordinator work");
         };
         let stale = HvfVcpuPsciCallToken {
+            owner: token.owner,
             vcpu: token.vcpu,
             sequence: token.sequence + 1,
         };

@@ -15,6 +15,7 @@ mod mach_lazy;
 mod memory;
 mod mmio;
 mod optional_state;
+mod paused_topology;
 mod psci;
 mod pvtime;
 mod runner;
@@ -81,6 +82,11 @@ pub use optional_state::{
     HvfArm64ReviewedOptionalStateRestoreRejection, HvfArm64ReviewedOptionalStateRestoreStage,
     HvfArm64SmeRestoreState, HvfArm64SmeRestoreStateInput,
 };
+pub use paused_topology::{
+    HvfArm64CpuSuspendConvention, HvfArm64StableCpuSuspendState,
+    HvfArm64StablePausedTopologyBuildError, HvfArm64StablePausedTopologyMember,
+    HvfArm64StablePausedTopologyState, HvfArm64StableVcpuDisposition,
+};
 pub use pvtime::{
     HvfArm64PvTimeAccountingError, HvfArm64PvTimeAccountingStage, HvfArm64PvTimeCaptureState,
     HvfArm64PvTimeContentionProbe, HvfArm64PvTimeMeasurementError, HvfArm64PvTimeVcpuCaptureState,
@@ -93,7 +99,11 @@ pub use runner::{
     HvfVcpuRetainedVtimerWaitStage, HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner,
     HvfVcpuRunnerError,
 };
-pub use session_vcpu::HvfArm64BootVcpuError;
+pub use session_vcpu::{
+    HvfArm64BootVcpuError, HvfArm64BootVcpuSession, HvfArm64StablePausedTopologyCaptureError,
+    HvfArm64StablePausedTopologyCleanupFailure, HvfArm64StablePausedTopologyCleanupStage,
+    HvfArm64StablePausedTopologyImportError,
+};
 pub use sme::HvfArm64SmeConfiguration;
 pub use snapshot::{
     HvfArm64SnapshotOptionalStateRejection, HvfArm64SnapshotTimerPolicyError,

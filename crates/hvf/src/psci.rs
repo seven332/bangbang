@@ -1,11 +1,15 @@
 //! PSCI-over-HVC decoding and secondary-vCPU power-state coordination.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::paused_topology::{
+    HvfArm64StablePausedTopologyState, HvfArm64StableVcpuDisposition, PSCI_CPU_SUSPEND_32,
+    PSCI_CPU_SUSPEND_64,
+};
 use crate::pvtime::{ARM_SMCCC_PV_TIME_FEATURES_64, HvfArm64PvTimeHvcPolicy, dispatch_pvtime_call};
 
 const PSCI_VERSION: u64 = 0x8400_0000;
-const PSCI_CPU_SUSPEND_32: u64 = 0x8400_0001;
 const PSCI_CPU_OFF: u64 = 0x8400_0002;
 const PSCI_CPU_ON_32: u64 = 0x8400_0003;
 const PSCI_AFFINITY_INFO_32: u64 = 0x8400_0004;
@@ -13,7 +17,6 @@ const PSCI_MIGRATE_INFO_TYPE: u64 = 0x8400_0006;
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 const PSCI_FEATURES: u64 = 0x8400_000a;
-const PSCI_CPU_SUSPEND_64: u64 = 0xc400_0001;
 const PSCI_CPU_ON_64: u64 = 0xc400_0003;
 const PSCI_AFFINITY_INFO_64: u64 = 0xc400_0004;
 const ARM_SMCCC_VERSION: u64 = 0x8000_0000;
@@ -23,6 +26,15 @@ const ARM_SMCCC_VERSION_1_1: u64 = 0x0001_0001;
 const PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED: u64 = 2;
 const PSCI_MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
 const PSCI_MPIDR_32_RESERVED_MASK: u64 = 0xff00_0000;
+static NEXT_POWER_COORDINATOR_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_power_coordinator_id() -> Result<u64, PsciCpuPowerError> {
+    NEXT_POWER_COORDINATOR_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .map_err(|_| PsciCpuPowerError::TokenExhausted)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PsciCall {
@@ -499,7 +511,10 @@ impl PsciCpuSuspendResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct PsciCpuSuspendToken(u64);
+pub(crate) struct PsciCpuSuspendToken {
+    coordinator: u64,
+    sequence: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PsciCpuSuspendWork {
@@ -533,7 +548,10 @@ impl PsciCpuOffResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct PsciCpuOffToken(u64);
+pub(crate) struct PsciCpuOffToken {
+    coordinator: u64,
+    sequence: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PsciCpuOffWork {
@@ -594,7 +612,10 @@ impl PsciCpuOnResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct PsciCpuOnToken(u64);
+pub(crate) struct PsciCpuOnToken {
+    coordinator: u64,
+    sequence: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PsciCpuOnWork {
@@ -716,9 +737,46 @@ struct PsciCpuState {
     cpu_off_transaction: Option<PsciCpuOffWork>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PsciCpuStableMemberObservation {
+    index: usize,
+    mpidr: u64,
+    power: PsciCpuPowerState,
+    cpu_on_token: Option<PsciCpuOnToken>,
+    cpu_suspend_work: Option<PsciCpuSuspendWork>,
+    cpu_off_work: Option<PsciCpuOffWork>,
+}
+
+impl PsciCpuStableMemberObservation {
+    pub(crate) const fn index(self) -> usize {
+        self.index
+    }
+
+    pub(crate) const fn mpidr(self) -> u64 {
+        self.mpidr
+    }
+
+    pub(crate) const fn power(self) -> PsciCpuPowerState {
+        self.power
+    }
+
+    pub(crate) const fn cpu_on_token(self) -> Option<PsciCpuOnToken> {
+        self.cpu_on_token
+    }
+
+    pub(crate) const fn cpu_suspend_work(self) -> Option<PsciCpuSuspendWork> {
+        self.cpu_suspend_work
+    }
+
+    pub(crate) const fn cpu_off_work(self) -> Option<PsciCpuOffWork> {
+        self.cpu_off_work
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PsciCpuPowerCoordinator {
     cpus: Vec<PsciCpuState>,
+    identity: u64,
     next_token: u64,
 }
 
@@ -753,7 +811,89 @@ impl PsciCpuPowerCoordinator {
 
         Ok(Self {
             cpus,
+            identity: allocate_power_coordinator_id()?,
             next_token: 1,
+        })
+    }
+
+    pub(crate) fn from_stable_paused_topology(
+        stable: &HvfArm64StablePausedTopologyState,
+    ) -> Result<(Self, Vec<Option<PsciCpuSuspendWork>>), PsciCpuPowerError> {
+        let mut cpus = Vec::new();
+        cpus.try_reserve_exact(stable.members().len())
+            .map_err(|_| PsciCpuPowerError::InvalidTopology)?;
+        let mut suspended = Vec::new();
+        suspended
+            .try_reserve_exact(stable.members().len())
+            .map_err(|_| PsciCpuPowerError::InvalidTopology)?;
+        let mut next_token = 1_u64;
+        let identity = allocate_power_coordinator_id()?;
+
+        for member in stable.members() {
+            if member.index() != cpus.len() || member.mpidr() != member.index() as u64 {
+                return Err(PsciCpuPowerError::InvalidTopology);
+            }
+            let (power, cpu_suspend_transaction) = match member.disposition() {
+                HvfArm64StableVcpuDisposition::Offline => (PsciCpuPowerState::Off, None),
+                HvfArm64StableVcpuDisposition::Runnable => (PsciCpuPowerState::On, None),
+                HvfArm64StableVcpuDisposition::Suspended(_) => {
+                    let token = PsciCpuSuspendToken {
+                        coordinator: identity,
+                        sequence: next_token,
+                    };
+                    next_token = next_token
+                        .checked_add(1)
+                        .ok_or(PsciCpuPowerError::TokenExhausted)?;
+                    (
+                        PsciCpuPowerState::On,
+                        Some(PsciCpuSuspendWork {
+                            token,
+                            caller_index: member.index(),
+                        }),
+                    )
+                }
+            };
+            cpus.push(PsciCpuState {
+                mpidr: member.mpidr(),
+                power,
+                transaction: None,
+                cpu_suspend_transaction,
+                cpu_off_transaction: None,
+            });
+            suspended.push(cpu_suspend_transaction);
+        }
+        if cpus
+            .first()
+            .is_none_or(|cpu| cpu.power != PsciCpuPowerState::On)
+        {
+            return Err(PsciCpuPowerError::InvalidTopology);
+        }
+
+        Ok((
+            Self {
+                cpus,
+                identity,
+                next_token,
+            },
+            suspended,
+        ))
+    }
+
+    pub(crate) fn stable_member_observation(
+        &self,
+        index: usize,
+    ) -> Result<PsciCpuStableMemberObservation, PsciCpuPowerError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or(PsciCpuPowerError::InvalidCpuIndex { index })?;
+        Ok(PsciCpuStableMemberObservation {
+            index,
+            mpidr: cpu.mpidr,
+            power: cpu.power,
+            cpu_on_token: cpu.transaction.map(|transaction| transaction.work.token),
+            cpu_suspend_work: cpu.cpu_suspend_transaction,
+            cpu_off_work: cpu.cpu_off_transaction,
         })
     }
 
@@ -800,7 +940,10 @@ impl PsciCpuPowerCoordinator {
             PsciCpuPowerState::Off => {}
         }
 
-        let token = PsciCpuOnToken(self.next_token);
+        let token = PsciCpuOnToken {
+            coordinator: self.identity,
+            sequence: self.next_token,
+        };
         self.next_token = self
             .next_token
             .checked_add(1)
@@ -852,7 +995,10 @@ impl PsciCpuPowerCoordinator {
             return Ok(PsciCpuOffBegin::Complete(PsciCpuOffResponse::Denied));
         }
 
-        let token = PsciCpuOffToken(self.next_token);
+        let token = PsciCpuOffToken {
+            coordinator: self.identity,
+            sequence: self.next_token,
+        };
         self.next_token = self
             .next_token
             .checked_add(1)
@@ -890,7 +1036,10 @@ impl PsciCpuPowerCoordinator {
             });
         }
 
-        let token = PsciCpuSuspendToken(self.next_token);
+        let token = PsciCpuSuspendToken {
+            coordinator: self.identity,
+            sequence: self.next_token,
+        };
         self.next_token = self
             .next_token
             .checked_add(1)
@@ -1171,6 +1320,11 @@ mod tests {
         handle_call_with_pvtime, handle_coordinated_call, handle_coordinated_call_with_pvtime,
         not_supported_result,
     };
+    use crate::paused_topology::{
+        HvfArm64CpuSuspendConvention, HvfArm64StableCpuSuspendState,
+        HvfArm64StablePausedTopologyMember, HvfArm64StablePausedTopologyState,
+        HvfArm64StableVcpuDisposition,
+    };
     use crate::pvtime::{
         ARM_SMCCC_PV_TIME_FEATURES_32, ARM_SMCCC_PV_TIME_FEATURES_64, ARM_SMCCC_PV_TIME_ST_32,
         ARM_SMCCC_PV_TIME_ST_64, HvfArm64PvTimeHvcPolicy,
@@ -1206,6 +1360,65 @@ mod tests {
         coordinator
             .mark_target_entered(work.token())
             .expect("secondary should enter");
+    }
+
+    #[test]
+    fn stable_paused_preparation_builds_closed_power_state_with_fresh_tokens() {
+        let mut source =
+            PsciCpuPowerCoordinator::new(&[0, 1, 2]).expect("source power topology should build");
+        let source_suspend = source
+            .begin_cpu_suspend(0)
+            .expect("source primary should suspend");
+        let stable_suspend = HvfArm64StableCpuSuspendState::new(
+            HvfArm64CpuSuspendConvention::Call64,
+            [1, 2, 3],
+            0x8000,
+        )
+        .expect("stable continuation should build");
+        let stable = HvfArm64StablePausedTopologyState::new(
+            27,
+            vec![
+                HvfArm64StablePausedTopologyMember::new(
+                    0,
+                    0,
+                    HvfArm64StableVcpuDisposition::Suspended(stable_suspend),
+                ),
+                HvfArm64StablePausedTopologyMember::new(
+                    1,
+                    1,
+                    HvfArm64StableVcpuDisposition::Offline,
+                ),
+                HvfArm64StablePausedTopologyMember::new(
+                    2,
+                    2,
+                    HvfArm64StableVcpuDisposition::Runnable,
+                ),
+            ],
+        )
+        .expect("stable topology should build");
+
+        let (destination, suspended) =
+            PsciCpuPowerCoordinator::from_stable_paused_topology(&stable)
+                .expect("stable power topology should prepare");
+        let destination_suspend = suspended[0].expect("primary suspension should prepare");
+        assert_ne!(destination_suspend.token(), source_suspend.token());
+        assert_eq!(suspended[1], None);
+        assert_eq!(suspended[2], None);
+        for (index, expected_power, suspended_expected) in [
+            (0, PsciCpuPowerState::On, true),
+            (1, PsciCpuPowerState::Off, false),
+            (2, PsciCpuPowerState::On, false),
+        ] {
+            let observation = destination
+                .stable_member_observation(index)
+                .expect("member should be observable");
+            assert_eq!(observation.index(), index);
+            assert_eq!(observation.mpidr(), index as u64);
+            assert_eq!(observation.power(), expected_power);
+            assert_eq!(observation.cpu_suspend_work().is_some(), suspended_expected);
+            assert_eq!(observation.cpu_on_token(), None);
+            assert_eq!(observation.cpu_off_work(), None);
+        }
     }
 
     #[test]
@@ -1871,11 +2084,13 @@ mod tests {
             coordinator.begin_cpu_suspend(0),
             Err(PsciCpuPowerError::TokenExhausted)
         );
+        let unknown = PsciCpuSuspendToken {
+            coordinator: coordinator.identity,
+            sequence: u64::MAX,
+        };
         assert_eq!(
-            coordinator.validate_cpu_suspend(PsciCpuSuspendToken(u64::MAX), 0),
-            Err(PsciCpuPowerError::UnknownCpuSuspendTransaction {
-                token: PsciCpuSuspendToken(u64::MAX)
-            })
+            coordinator.validate_cpu_suspend(unknown, 0),
+            Err(PsciCpuPowerError::UnknownCpuSuspendTransaction { token: unknown })
         );
         assert_eq!(coordinator.power_state(0), Some(PsciCpuPowerState::On));
     }
@@ -1985,7 +2200,10 @@ mod tests {
     fn stale_and_duplicate_transitions_are_mutation_free() {
         let mut coordinator = coordinator();
         let work = pending_work(&mut coordinator);
-        let stale = super::PsciCpuOnToken(99);
+        let stale = super::PsciCpuOnToken {
+            coordinator: coordinator.identity,
+            sequence: 99,
+        };
         assert_eq!(
             coordinator.finish_target_setup(stale, true),
             Err(PsciCpuPowerError::UnknownTransaction { token: stale })
