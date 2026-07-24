@@ -72,7 +72,8 @@ fn canonical_binding_state_and_image_round_trip() {
     let memory = test_memory();
     let (image, binding) = write_test_image(&memory, TEST_ID);
     let encoded = binding.encode().expect("binding should encode");
-    assert_eq!(encoded, TWO_EXTENT_BINDING_FIXTURE);
+    assert_eq!(binding.version(), NATIVE_V2_SNAPSHOT_VERSION);
+    assert_ne!(encoded, TWO_EXTENT_BINDING_FIXTURE);
 
     assert_eq!(
         encoded.len(),
@@ -108,13 +109,39 @@ fn canonical_binding_state_and_image_round_trip() {
 
     let state_bytes =
         encode_snapshot_v2_state_with_memory(&binding).expect("typed state should encode");
-    assert_eq!(state_bytes, TWO_EXTENT_STATE_FIXTURE);
+    assert_ne!(state_bytes, TWO_EXTENT_STATE_FIXTURE);
     let state = decode_snapshot_v2_state(&state_bytes).expect("typed state should decode");
     assert_eq!(state.metadata().version(), NATIVE_V2_SNAPSHOT_VERSION);
     assert_eq!(
         decode_snapshot_v2_memory_binding(&state).expect("memory component should decode"),
         binding
     );
+
+    let legacy_state = decode_snapshot_v2_state(&TWO_EXTENT_STATE_FIXTURE)
+        .expect("minor-one state fixture should remain structurally compatible");
+    assert_eq!(
+        legacy_state.metadata().version(),
+        SnapshotFormatVersion::new(2, 1, 0)
+    );
+    let legacy_binding = decode_snapshot_v2_memory_binding(&legacy_state)
+        .expect("minor-one memory binding should remain compatible");
+    assert_eq!(
+        legacy_binding.version(),
+        SnapshotFormatVersion::new(2, 1, 0)
+    );
+    assert_eq!(
+        legacy_binding
+            .encode()
+            .expect("minor-one binding should preserve its exact version"),
+        TWO_EXTENT_BINDING_FIXTURE
+    );
+
+    let mut legacy_image = image;
+    legacy_image[..NATIVE_V2_MEMORY_HEADER_BYTES]
+        .copy_from_slice(&TWO_EXTENT_BINDING_FIXTURE[..NATIVE_V2_MEMORY_HEADER_BYTES]);
+    let legacy_image_file = TempFile::new("legacy-minor-one", &legacy_image);
+    load_snapshot_v2_memory_file(&legacy_state, legacy_image_file.open_read_only())
+        .expect("minor-one state and image headers should still pair");
 }
 
 #[test]
@@ -180,10 +207,18 @@ fn binding_mutations_reject_header_integrity_topology_and_trailing_bytes() {
     ));
 
     let mut invalid_version = encoded.clone();
-    replace_u16(&mut invalid_version, VERSION_MINOR_OFFSET, 2);
+    replace_u16(&mut invalid_version, VERSION_MINOR_OFFSET, 3);
     replace_binding_checksum(&mut invalid_version);
     assert!(matches!(
         decode_binding(&invalid_version),
+        Err(SnapshotV2MemoryBindingError::UnsupportedVersion)
+    ));
+
+    let mut foundation_version = encoded.clone();
+    replace_u16(&mut foundation_version, VERSION_MINOR_OFFSET, 0);
+    replace_binding_checksum(&mut foundation_version);
+    assert!(matches!(
+        decode_binding(&foundation_version),
         Err(SnapshotV2MemoryBindingError::UnsupportedVersion)
     ));
 

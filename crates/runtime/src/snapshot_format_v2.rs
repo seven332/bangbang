@@ -39,7 +39,7 @@ pub const NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION: SnapshotFormatVersion =
     SnapshotFormatVersion::new(2, 0, 0);
 
 /// Semantic version emitted by the current native-v2 writer.
-pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 1, 0);
+pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 2, 0);
 
 /// Fixed native-v2 state header size.
 pub const NATIVE_V2_SNAPSHOT_HEADER_BYTES: usize = 64;
@@ -66,10 +66,28 @@ struct CatalogEntry {
 }
 
 const PRODUCTION_REQUIRED_FEATURES: &[CatalogEntry] = &[];
-const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[CatalogEntry {
-    id: NATIVE_V2_MEMORY_COMPONENT_KEY.kind,
-    introduced_minor: 1,
-}];
+const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[
+    CatalogEntry {
+        id: NATIVE_V2_MEMORY_COMPONENT_KEY.kind,
+        introduced_minor: 1,
+    },
+    CatalogEntry {
+        id: NATIVE_V2_MACHINE_COMPONENT_KEY.kind,
+        introduced_minor: 2,
+    },
+    CatalogEntry {
+        id: NATIVE_V2_GLOBAL_COMPONENT_KEY.kind,
+        introduced_minor: 2,
+    },
+    CatalogEntry {
+        id: NATIVE_V2_TOPOLOGY_COMPONENT_KEY.kind,
+        introduced_minor: 2,
+    },
+    CatalogEntry {
+        id: NATIVE_V2_VCPU_COMPONENT_KIND,
+        introduced_minor: 2,
+    },
+];
 
 const _: () = assert!(catalog_is_canonical(PRODUCTION_REQUIRED_FEATURES));
 const _: () = assert!(catalog_is_canonical(PRODUCTION_SEMANTIC_COMPONENTS));
@@ -121,6 +139,26 @@ impl SnapshotV2ComponentKey {
 /// Canonical identity of the singleton native-v2 guest-memory binding.
 pub const NATIVE_V2_MEMORY_COMPONENT_KEY: SnapshotV2ComponentKey =
     SnapshotV2ComponentKey::new(1, 0);
+
+/// Canonical identity of the singleton native-v2 machine and inert boot state.
+pub const NATIVE_V2_MACHINE_COMPONENT_KEY: SnapshotV2ComponentKey =
+    SnapshotV2ComponentKey::new(2, 0);
+
+/// Canonical identity of singleton native-v2 HVF compatibility and global state.
+pub const NATIVE_V2_GLOBAL_COMPONENT_KEY: SnapshotV2ComponentKey =
+    SnapshotV2ComponentKey::new(3, 0);
+
+/// Canonical identity of the singleton native-v2 topology and lifecycle state.
+pub const NATIVE_V2_TOPOLOGY_COMPONENT_KEY: SnapshotV2ComponentKey =
+    SnapshotV2ComponentKey::new(4, 0);
+
+/// Native-v2 component kind used for one canonical per-vCPU state instance.
+pub const NATIVE_V2_VCPU_COMPONENT_KIND: u32 = 5;
+
+/// Returns the canonical key for one native-v2 per-vCPU state component.
+pub const fn native_v2_vcpu_component_key(instance: u32) -> SnapshotV2ComponentKey {
+    SnapshotV2ComponentKey::new(NATIVE_V2_VCPU_COMPONENT_KIND, instance)
+}
 
 impl fmt::Debug for SnapshotV2ComponentKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

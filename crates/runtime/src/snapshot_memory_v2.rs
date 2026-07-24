@@ -112,6 +112,7 @@ impl fmt::Debug for SnapshotV2MemoryExtent {
 /// Fully validated native-v2 memory topology and image identity.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotV2MemoryBinding {
+    version: SnapshotFormatVersion,
     image_id: SnapshotV2MemoryImageId,
     extents: Vec<SnapshotV2MemoryExtent>,
     file_length: u64,
@@ -119,6 +120,11 @@ pub struct SnapshotV2MemoryBinding {
 }
 
 impl SnapshotV2MemoryBinding {
+    /// Returns the exact admitted memory metadata version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        self.version
+    }
+
     /// Returns the opaque state/image pairing identity.
     pub const fn image_id(&self) -> SnapshotV2MemoryImageId {
         self.image_id
@@ -132,6 +138,11 @@ impl SnapshotV2MemoryBinding {
     /// Returns the exact complete memory-image length.
     pub const fn file_length(&self) -> u64 {
         self.file_length
+    }
+
+    /// Returns the redacted identity checksum to trusted graph-validation code.
+    pub const fn metadata_checksum(&self) -> u64 {
+        self.metadata_checksum
     }
 
     /// Encodes the exact state-component payload.
@@ -155,6 +166,7 @@ impl fmt::Debug for SnapshotV2MemoryBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SnapshotV2MemoryBinding")
+            .field("version", &self.version)
             .field("image_id", &REDACTED)
             .field("extent_count", &self.extents.len())
             .field("file_length", &self.file_length)
@@ -997,8 +1009,19 @@ fn build_binding(
     extents: Vec<SnapshotV2MemoryExtent>,
     file_length: u64,
 ) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError> {
+    build_binding_with_version(NATIVE_V2_SNAPSHOT_VERSION, image_id, extents, file_length)
+}
+
+fn build_binding_with_version(
+    version: SnapshotFormatVersion,
+    image_id: SnapshotV2MemoryImageId,
+    extents: Vec<SnapshotV2MemoryExtent>,
+    file_length: u64,
+) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError> {
+    validate_memory_version(version)?;
     validate_extents(&extents, file_length)?;
     let mut binding = SnapshotV2MemoryBinding {
+        version,
         image_id,
         extents,
         file_length,
@@ -1026,9 +1049,10 @@ fn encode_binding(
         .try_reserve_exact(length)
         .map_err(|source| SnapshotV2MemoryBindingError::MetadataAllocationFailed { source })?;
     bytes.extend_from_slice(&NATIVE_V2_MEMORY_MAGIC);
-    bytes.extend_from_slice(&NATIVE_V2_SNAPSHOT_VERSION.major().to_le_bytes());
-    bytes.extend_from_slice(&NATIVE_V2_SNAPSHOT_VERSION.minor().to_le_bytes());
-    bytes.extend_from_slice(&NATIVE_V2_SNAPSHOT_VERSION.patch().to_le_bytes());
+    validate_memory_version(binding.version)?;
+    bytes.extend_from_slice(&binding.version.major().to_le_bytes());
+    bytes.extend_from_slice(&binding.version.minor().to_le_bytes());
+    bytes.extend_from_slice(&binding.version.patch().to_le_bytes());
     bytes.extend_from_slice(
         &u16::try_from(NATIVE_V2_MEMORY_HEADER_BYTES)
             .map_err(|_| SnapshotV2MemoryBindingError::LengthOverflow)?
@@ -1076,9 +1100,7 @@ fn decode_binding(bytes: &[u8]) -> Result<SnapshotV2MemoryBinding, SnapshotV2Mem
         read_u16(bytes, VERSION_MINOR_OFFSET)?,
         read_u16(bytes, VERSION_PATCH_OFFSET)?,
     );
-    if version != NATIVE_V2_SNAPSHOT_VERSION {
-        return Err(SnapshotV2MemoryBindingError::UnsupportedVersion);
-    }
+    validate_memory_version(version)?;
     if usize::from(read_u16(bytes, HEADER_BYTES_OFFSET)?) != NATIVE_V2_MEMORY_HEADER_BYTES
         || read_u32(bytes, FLAGS_OFFSET)? != FLAGS
         || u64::from(read_u32(bytes, GUEST_GRANULE_OFFSET)?) != NATIVE_V2_MEMORY_GUEST_GRANULE
@@ -1130,11 +1152,24 @@ fn decode_binding(bytes: &[u8]) -> Result<SnapshotV2MemoryBinding, SnapshotV2Mem
     }
     validate_extents(&extents, file_length)?;
     Ok(SnapshotV2MemoryBinding {
+        version,
         image_id,
         extents,
         file_length,
         metadata_checksum: stored_checksum,
     })
+}
+
+fn validate_memory_version(
+    version: SnapshotFormatVersion,
+) -> Result<(), SnapshotV2MemoryBindingError> {
+    if version.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
+        && (1..=NATIVE_V2_SNAPSHOT_VERSION.minor()).contains(&version.minor())
+    {
+        Ok(())
+    } else {
+        Err(SnapshotV2MemoryBindingError::UnsupportedVersion)
+    }
 }
 
 fn validate_extent_count(count: usize) -> Result<(), SnapshotV2MemoryBindingError> {

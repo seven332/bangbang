@@ -557,8 +557,9 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 `2.0.0` fixture and keep the named native-v1 fixture byte-for-byte stable. A
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
-production `2.1.0` catalog admits only semantic memory kind 1 introduced in
-minor 1; the typed profile further requires instance 0. The mutation corpus
+production catalog admits semantic memory kind 1 introduced in minor 1; the
+current `2.2.0` writer additionally admits machine/global/topology kinds 2–4
+and per-vCPU kind 5 introduced in minor 2. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
 zero/order/duplicate/unknown cases, and component
@@ -569,9 +570,11 @@ named Firecracker-family incompatibility without invoking an unsupported
 resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
-Native-v2 lazy-memory tests pin exact multi-extent binding and complete `2.1.0`
-state fixtures. They cover canonical 64-KiB metadata/data offsets and sparse
-gaps, every binding/header/topology/length mutation, typed state profiles,
+Native-v2 lazy-memory tests retain exact multi-extent binding and complete
+`2.1.0` compatibility fixtures while proving that new output uses `2.2.0`.
+They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
+binding/header/topology/length mutation, exact admitted-version retention,
+typed state profiles,
 read-only/CLOEXEC/regular descriptor policy, final-symlink rejection,
 descriptor/path replacement, source truncation at both rechecks, retained-file
 and cursor independence, private COW isolation, clean dirty baselines, mixed
@@ -580,6 +583,19 @@ and partial mapping rollback. Writer coverage keeps output empty/position-zero,
 bounds all copying to 1-MiB chunks, exercises cancellation without returning a
 binding, and proves the exact final length. Run it with
 `cargo test -p bangbang-runtime snapshot_memory_v2 --locked`.
+
+Native-v2 HVF platform tests round-trip canonical 1-, 2-, and 32-vCPU graphs,
+all stable lifecycle dispositions, U32/U64/U128 CPU-application evidence, and
+explicit maximum-SVL SME Z/P/ZA/ZT0 state. Checksum-valid component rebuilds
+exercise exact profile/singleton/instance rules; every platform header, flag,
+reserved family, count, and length bound; closed optional ordering,
+duplicate/unknown tags, disposition, width, reserved bytes, feature
+dependencies, SIMD aliases, and the 16 MiB composite budget. Locally valid
+machine-memory/FDT, timer, optional-identity, redistributor, and vCPU-count
+mismatches prove whole-graph validation. CPU-template unit tests separately
+prove the receipt appears only after topology-wide application and retains the
+logical/common/effective equation with redacted diagnostics. Run this surface
+with `cargo test -p bangbang-hvf --lib snapshot_v2 --all-features --locked`.
 
 The signed `hvf_lifecycle` lazy-memory case writes a 64-MiB image, drops the
 source allocation, loads the retained file mapping, and proves bounded resident

@@ -14,6 +14,8 @@ use crate::vcpu::{HvfRegister, HvfSimdFpRegister, HvfSystemRegister};
 const CPU_TEMPLATE_VALUE_REDACTED: &str = "<redacted>";
 const CPU_TEMPLATE_U32_TRANSPORT_WIDTH_MESSAGE: &str =
     "arm64 CPU-template U32 register returned bits outside its architectural width";
+/// Maximum logical CPU-template entries retained by the native-v2 profile.
+pub const HVF_ARM64_CPU_TEMPLATE_APPLICATION_MAX_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HvfArm64CpuTemplateRegister64 {
@@ -47,11 +49,80 @@ impl fmt::Debug for HvfArm64CpuTemplateRegister {
     }
 }
 
+/// Exact architectural width of one retained CPU-template value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfArm64CpuTemplateValueWidth {
+    /// A 32-bit general-register view.
+    U32,
+    /// A 64-bit general or system register.
+    U64,
+    /// A 128-bit SIMD/FP register.
+    U128,
+}
+
+/// One redacted, exact-width CPU-template value.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HvfArm64CpuTemplateValue {
+pub enum HvfArm64CpuTemplateValue {
     U32(u32),
     U64(u64),
     U128(u128),
+}
+
+impl HvfArm64CpuTemplateValue {
+    /// Return the exact architectural width.
+    pub const fn width(self) -> HvfArm64CpuTemplateValueWidth {
+        match self {
+            Self::U32(_) => HvfArm64CpuTemplateValueWidth::U32,
+            Self::U64(_) => HvfArm64CpuTemplateValueWidth::U64,
+            Self::U128(_) => HvfArm64CpuTemplateValueWidth::U128,
+        }
+    }
+
+    /// Return the value in a zero-extended 128-bit transport slot.
+    pub const fn zero_extended(self) -> u128 {
+        match self {
+            Self::U32(value) => value as u128,
+            Self::U64(value) => value as u128,
+            Self::U128(value) => value,
+        }
+    }
+
+    const fn from_zero_extended(width: HvfArm64CpuTemplateValueWidth, value: u128) -> Option<Self> {
+        match width {
+            HvfArm64CpuTemplateValueWidth::U32 if value <= u32::MAX as u128 => {
+                Some(Self::U32(value as u32))
+            }
+            HvfArm64CpuTemplateValueWidth::U64 if value <= u64::MAX as u128 => {
+                Some(Self::U64(value as u64))
+            }
+            HvfArm64CpuTemplateValueWidth::U128 => Some(Self::U128(value)),
+            HvfArm64CpuTemplateValueWidth::U32 | HvfArm64CpuTemplateValueWidth::U64 => None,
+        }
+    }
+
+    const fn masked_value_is_canonical(self, filter: Self) -> bool {
+        match (self, filter) {
+            (Self::U32(value), Self::U32(filter)) => value & !filter == 0,
+            (Self::U64(value), Self::U64(filter)) => value & !filter == 0,
+            (Self::U128(value), Self::U128(filter)) => value & !filter == 0,
+            _ => false,
+        }
+    }
+
+    const fn apply(self, filter: Self, value: Self) -> Option<Self> {
+        match (self, filter, value) {
+            (Self::U32(baseline), Self::U32(filter), Self::U32(value)) => {
+                Some(Self::U32((baseline & !filter) | value))
+            }
+            (Self::U64(baseline), Self::U64(filter), Self::U64(value)) => {
+                Some(Self::U64((baseline & !filter) | value))
+            }
+            (Self::U128(baseline), Self::U128(filter), Self::U128(value)) => {
+                Some(Self::U128((baseline & !filter) | value))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Debug for HvfArm64CpuTemplateValue {
@@ -59,6 +130,233 @@ impl fmt::Debug for HvfArm64CpuTemplateValue {
         f.write_str(CPU_TEMPLATE_VALUE_REDACTED)
     }
 }
+
+/// One stable retained CPU-template register identity.
+///
+/// The numeric tag is a native-v2 schema identity rather than an HVF or KVM
+/// ABI value.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HvfArm64CpuTemplateRegisterTag(u16);
+
+impl HvfArm64CpuTemplateRegisterTag {
+    /// Return the stable native-v2 tag.
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Debug for HvfArm64CpuTemplateRegisterTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(CPU_TEMPLATE_VALUE_REDACTED)
+    }
+}
+
+/// One logical/common-baseline/effective CPU-template application entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64CpuTemplateApplicationEntry {
+    register: HvfArm64CpuTemplateRegister,
+    tag: HvfArm64CpuTemplateRegisterTag,
+    filter: HvfArm64CpuTemplateValue,
+    logical_value: HvfArm64CpuTemplateValue,
+    common_baseline: HvfArm64CpuTemplateValue,
+    effective_value: HvfArm64CpuTemplateValue,
+}
+
+impl HvfArm64CpuTemplateApplicationEntry {
+    /// Return the stable closed register tag.
+    pub const fn tag(&self) -> HvfArm64CpuTemplateRegisterTag {
+        self.tag
+    }
+
+    /// Return the exact architectural value width.
+    pub const fn width(&self) -> HvfArm64CpuTemplateValueWidth {
+        self.filter.width()
+    }
+
+    /// Return the logical modifier filter to trusted persistence code.
+    pub const fn filter(&self) -> HvfArm64CpuTemplateValue {
+        self.filter
+    }
+
+    /// Return the logical modifier value to trusted persistence code.
+    pub const fn logical_value(&self) -> HvfArm64CpuTemplateValue {
+        self.logical_value
+    }
+
+    /// Return the topology-wide common source baseline.
+    pub const fn common_baseline(&self) -> HvfArm64CpuTemplateValue {
+        self.common_baseline
+    }
+
+    /// Return the verified effective target.
+    pub const fn effective_value(&self) -> HvfArm64CpuTemplateValue {
+        self.effective_value
+    }
+
+    pub(crate) fn try_from_stable_values(
+        tag: u16,
+        width: HvfArm64CpuTemplateValueWidth,
+        filter: u128,
+        logical_value: u128,
+        common_baseline: u128,
+        effective_value: u128,
+    ) -> Result<Self, HvfArm64CpuTemplateApplicationStateError> {
+        let tag = HvfArm64CpuTemplateRegisterTag(tag);
+        let register = cpu_template_register_from_tag(tag)
+            .ok_or(HvfArm64CpuTemplateApplicationStateError::UnknownRegisterTag)?;
+        let expected_width = cpu_template_register_width(register);
+        if width != expected_width {
+            return Err(HvfArm64CpuTemplateApplicationStateError::WidthMismatch);
+        }
+        let filter = HvfArm64CpuTemplateValue::from_zero_extended(width, filter)
+            .ok_or(HvfArm64CpuTemplateApplicationStateError::WidthMismatch)?;
+        let logical_value = HvfArm64CpuTemplateValue::from_zero_extended(width, logical_value)
+            .ok_or(HvfArm64CpuTemplateApplicationStateError::WidthMismatch)?;
+        let common_baseline = HvfArm64CpuTemplateValue::from_zero_extended(width, common_baseline)
+            .ok_or(HvfArm64CpuTemplateApplicationStateError::WidthMismatch)?;
+        let effective_value = HvfArm64CpuTemplateValue::from_zero_extended(width, effective_value)
+            .ok_or(HvfArm64CpuTemplateApplicationStateError::WidthMismatch)?;
+        let entry = Self {
+            register,
+            tag,
+            filter,
+            logical_value,
+            common_baseline,
+            effective_value,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    fn from_application(
+        modifier: MappedModifier,
+        common_baseline: HvfArm64CpuTemplateValue,
+        target: HvfArm64CpuTemplateTarget,
+    ) -> Result<Self, HvfArm64CpuTemplateApplicationStateError> {
+        let register = modifier.register();
+        if target.register() != register {
+            return Err(HvfArm64CpuTemplateApplicationStateError::WidthMismatch);
+        }
+        let (filter, logical_value) = modifier.logical_values();
+        let tag = cpu_template_register_tag(register)
+            .ok_or(HvfArm64CpuTemplateApplicationStateError::UnknownRegisterTag)?;
+        let entry = Self {
+            register,
+            tag,
+            filter,
+            logical_value,
+            common_baseline,
+            effective_value: target.value(),
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    fn validate(self) -> Result<(), HvfArm64CpuTemplateApplicationStateError> {
+        let expected_width = cpu_template_register_width(self.register);
+        if self.filter.width() != expected_width
+            || self.logical_value.width() != expected_width
+            || self.common_baseline.width() != expected_width
+            || self.effective_value.width() != expected_width
+        {
+            return Err(HvfArm64CpuTemplateApplicationStateError::WidthMismatch);
+        }
+        if !self.logical_value.masked_value_is_canonical(self.filter) {
+            return Err(HvfArm64CpuTemplateApplicationStateError::NonCanonicalModifier);
+        }
+        if self.common_baseline.apply(self.filter, self.logical_value) != Some(self.effective_value)
+        {
+            return Err(HvfArm64CpuTemplateApplicationStateError::EffectiveValueMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for HvfArm64CpuTemplateApplicationEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64CpuTemplateApplicationEntry")
+            .field("width", &self.width())
+            .field("register", &CPU_TEMPLATE_VALUE_REDACTED)
+            .field("values", &CPU_TEMPLATE_VALUE_REDACTED)
+            .finish()
+    }
+}
+
+/// Complete retained evidence from one successful topology-wide application.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfArm64CpuTemplateApplicationState {
+    entries: Vec<HvfArm64CpuTemplateApplicationEntry>,
+}
+
+impl HvfArm64CpuTemplateApplicationState {
+    /// Build one checked stable application receipt from wire-level entries.
+    pub fn try_new(
+        entries: Vec<HvfArm64CpuTemplateApplicationEntry>,
+    ) -> Result<Self, HvfArm64CpuTemplateApplicationStateError> {
+        if entries.len() > HVF_ARM64_CPU_TEMPLATE_APPLICATION_MAX_ENTRIES {
+            return Err(HvfArm64CpuTemplateApplicationStateError::EntryCount);
+        }
+        let mut previous = None;
+        for entry in &entries {
+            entry.validate()?;
+            if previous.is_some_and(|previous| entry.tag <= previous) {
+                return Err(HvfArm64CpuTemplateApplicationStateError::NonCanonicalOrder);
+            }
+            previous = Some(entry.tag);
+        }
+        Ok(Self { entries })
+    }
+
+    /// Return canonical entries in stable tag order.
+    pub fn entries(&self) -> &[HvfArm64CpuTemplateApplicationEntry] {
+        &self.entries
+    }
+}
+
+impl fmt::Debug for HvfArm64CpuTemplateApplicationState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfArm64CpuTemplateApplicationState")
+            .field("entry_count", &self.entries.len())
+            .field("values", &CPU_TEMPLATE_VALUE_REDACTED)
+            .finish()
+    }
+}
+
+/// Value-free rejection while constructing retained CPU-template evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfArm64CpuTemplateApplicationStateError {
+    /// The application contains more entries than the runtime template bound.
+    EntryCount,
+    /// A stable register tag is outside the closed native-v2 inventory.
+    UnknownRegisterTag,
+    /// Entries are duplicated or not in stable tag order.
+    NonCanonicalOrder,
+    /// A value does not fit the register's exact architectural width.
+    WidthMismatch,
+    /// Logical modifier bits are set outside the supplied filter.
+    NonCanonicalModifier,
+    /// The retained effective target does not follow the modifier equation.
+    EffectiveValueMismatch,
+}
+
+impl fmt::Display for HvfArm64CpuTemplateApplicationStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let category = match self {
+            Self::EntryCount => "entry count",
+            Self::UnknownRegisterTag => "register tag",
+            Self::NonCanonicalOrder => "register order",
+            Self::WidthMismatch => "value width",
+            Self::NonCanonicalModifier => "logical modifier",
+            Self::EffectiveValueMismatch => "effective value",
+        };
+        write!(
+            f,
+            "invalid retained arm64 CPU-template application {category}"
+        )
+    }
+}
+
+impl std::error::Error for HvfArm64CpuTemplateApplicationStateError {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MappedModifier {
@@ -134,6 +432,23 @@ impl MappedModifier {
                 | (Self::U64 { .. }, HvfArm64CpuTemplateValue::U64(_))
                 | (Self::U128 { .. }, HvfArm64CpuTemplateValue::U128(_))
         )
+    }
+
+    const fn logical_values(self) -> (HvfArm64CpuTemplateValue, HvfArm64CpuTemplateValue) {
+        match self {
+            Self::U32 { filter, value, .. } => (
+                HvfArm64CpuTemplateValue::U32(filter),
+                HvfArm64CpuTemplateValue::U32(value),
+            ),
+            Self::U64 { filter, value, .. } => (
+                HvfArm64CpuTemplateValue::U64(filter),
+                HvfArm64CpuTemplateValue::U64(value),
+            ),
+            Self::U128 { filter, value, .. } => (
+                HvfArm64CpuTemplateValue::U128(filter),
+                HvfArm64CpuTemplateValue::U128(value),
+            ),
+        }
     }
 }
 
@@ -317,6 +632,198 @@ fn map_u64_register(
             ArmIdRegister::Mmfr2 => HvfSystemRegister::ID_AA64MMFR2_EL1,
         }),
         ArmRegister64::Actlr => HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ACTLR_EL1),
+    })
+}
+
+const CPU_TEMPLATE_TAG_FPCR: u16 = 1;
+const CPU_TEMPLATE_TAG_FPSR: u16 = 2;
+const CPU_TEMPLATE_TAG_X0: u16 = 3;
+const CPU_TEMPLATE_TAG_X30: u16 = CPU_TEMPLATE_TAG_X0 + 30;
+const CPU_TEMPLATE_TAG_PC: u16 = 34;
+const CPU_TEMPLATE_TAG_PSTATE: u16 = 35;
+const CPU_TEMPLATE_TAG_SP_EL0: u16 = 36;
+const CPU_TEMPLATE_TAG_SP_EL1: u16 = 37;
+const CPU_TEMPLATE_TAG_ELR_EL1: u16 = 38;
+const CPU_TEMPLATE_TAG_SPSR_EL1: u16 = 39;
+const CPU_TEMPLATE_TAG_ID_AA64PFR0_EL1: u16 = 40;
+const CPU_TEMPLATE_TAG_ID_AA64PFR1_EL1: u16 = 41;
+const CPU_TEMPLATE_TAG_ID_AA64ZFR0_EL1: u16 = 42;
+const CPU_TEMPLATE_TAG_ID_AA64SMFR0_EL1: u16 = 43;
+const CPU_TEMPLATE_TAG_ID_AA64DFR0_EL1: u16 = 44;
+const CPU_TEMPLATE_TAG_ID_AA64DFR1_EL1: u16 = 45;
+const CPU_TEMPLATE_TAG_ID_AA64ISAR0_EL1: u16 = 46;
+const CPU_TEMPLATE_TAG_ID_AA64ISAR1_EL1: u16 = 47;
+const CPU_TEMPLATE_TAG_ID_AA64MMFR0_EL1: u16 = 48;
+const CPU_TEMPLATE_TAG_ID_AA64MMFR1_EL1: u16 = 49;
+const CPU_TEMPLATE_TAG_ID_AA64MMFR2_EL1: u16 = 50;
+const CPU_TEMPLATE_TAG_ACTLR_EL1: u16 = 51;
+const CPU_TEMPLATE_TAG_Q0: u16 = 52;
+const CPU_TEMPLATE_TAG_Q31: u16 = CPU_TEMPLATE_TAG_Q0 + 31;
+
+fn cpu_template_register_width(
+    register: HvfArm64CpuTemplateRegister,
+) -> HvfArm64CpuTemplateValueWidth {
+    match register {
+        HvfArm64CpuTemplateRegister::U32(_) => HvfArm64CpuTemplateValueWidth::U32,
+        HvfArm64CpuTemplateRegister::U64(_) => HvfArm64CpuTemplateValueWidth::U64,
+        HvfArm64CpuTemplateRegister::U128(_) => HvfArm64CpuTemplateValueWidth::U128,
+    }
+}
+
+fn cpu_template_register_tag(
+    register: HvfArm64CpuTemplateRegister,
+) -> Option<HvfArm64CpuTemplateRegisterTag> {
+    let tag = match register {
+        HvfArm64CpuTemplateRegister::U32(register) if register == HvfRegister::FPCR => {
+            CPU_TEMPLATE_TAG_FPCR
+        }
+        HvfArm64CpuTemplateRegister::U32(register) if register == HvfRegister::FPSR => {
+            CPU_TEMPLATE_TAG_FPSR
+        }
+        HvfArm64CpuTemplateRegister::U32(_) => return None,
+        HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(register))
+            if (HvfRegister::X0.raw()..=HvfRegister::X0.raw() + 30).contains(&register.raw()) =>
+        {
+            let index = u16::try_from(register.raw() - HvfRegister::X0.raw()).ok()?;
+            if (1..=3).contains(&index) {
+                return None;
+            }
+            CPU_TEMPLATE_TAG_X0.checked_add(index)?
+        }
+        HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(register))
+            if register == HvfRegister::PC =>
+        {
+            CPU_TEMPLATE_TAG_PC
+        }
+        HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(register))
+            if register == HvfRegister::CPSR =>
+        {
+            CPU_TEMPLATE_TAG_PSTATE
+        }
+        HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(_)) => return None,
+        HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::System(register)) => {
+            if register == HvfSystemRegister::SP_EL0 {
+                CPU_TEMPLATE_TAG_SP_EL0
+            } else if register == HvfSystemRegister::SP_EL1 {
+                CPU_TEMPLATE_TAG_SP_EL1
+            } else if register == HvfSystemRegister::ELR_EL1 {
+                CPU_TEMPLATE_TAG_ELR_EL1
+            } else if register == HvfSystemRegister::SPSR_EL1 {
+                CPU_TEMPLATE_TAG_SPSR_EL1
+            } else if register == HvfSystemRegister::ID_AA64PFR0_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64PFR0_EL1
+            } else if register == HvfSystemRegister::ID_AA64PFR1_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64PFR1_EL1
+            } else if register == HvfSystemRegister::ID_AA64ZFR0_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64ZFR0_EL1
+            } else if register == HvfSystemRegister::ID_AA64SMFR0_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64SMFR0_EL1
+            } else if register == HvfSystemRegister::ID_AA64DFR0_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64DFR0_EL1
+            } else if register == HvfSystemRegister::ID_AA64DFR1_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64DFR1_EL1
+            } else if register == HvfSystemRegister::ID_AA64ISAR0_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64ISAR0_EL1
+            } else if register == HvfSystemRegister::ID_AA64ISAR1_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64ISAR1_EL1
+            } else if register == HvfSystemRegister::ID_AA64MMFR0_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64MMFR0_EL1
+            } else if register == HvfSystemRegister::ID_AA64MMFR1_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64MMFR1_EL1
+            } else if register == HvfSystemRegister::ID_AA64MMFR2_EL1 {
+                CPU_TEMPLATE_TAG_ID_AA64MMFR2_EL1
+            } else if register == HvfSystemRegister::ACTLR_EL1 {
+                CPU_TEMPLATE_TAG_ACTLR_EL1
+            } else {
+                return None;
+            }
+        }
+        HvfArm64CpuTemplateRegister::U128(register)
+            if (HvfSimdFpRegister::q(0)?.raw()..=HvfSimdFpRegister::q(31)?.raw())
+                .contains(&register.raw()) =>
+        {
+            let index = u16::try_from(register.raw() - HvfSimdFpRegister::q(0)?.raw()).ok()?;
+            CPU_TEMPLATE_TAG_Q0.checked_add(index)?
+        }
+        HvfArm64CpuTemplateRegister::U128(_) => return None,
+    };
+    Some(HvfArm64CpuTemplateRegisterTag(tag))
+}
+
+fn cpu_template_register_from_tag(
+    tag: HvfArm64CpuTemplateRegisterTag,
+) -> Option<HvfArm64CpuTemplateRegister> {
+    Some(match tag.raw() {
+        CPU_TEMPLATE_TAG_FPCR => HvfArm64CpuTemplateRegister::U32(HvfRegister::FPCR),
+        CPU_TEMPLATE_TAG_FPSR => HvfArm64CpuTemplateRegister::U32(HvfRegister::FPSR),
+        CPU_TEMPLATE_TAG_X0..=CPU_TEMPLATE_TAG_X30 => {
+            let index = u8::try_from(tag.raw() - CPU_TEMPLATE_TAG_X0).ok()?;
+            if (1..=3).contains(&index) {
+                return None;
+            }
+            HvfArm64CpuTemplateRegister::U64(HvfArm64CpuTemplateRegister64::General(
+                HvfRegister::general_purpose(index)?,
+            ))
+        }
+        CPU_TEMPLATE_TAG_PC => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::General(HvfRegister::PC),
+        ),
+        CPU_TEMPLATE_TAG_PSTATE => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::General(HvfRegister::CPSR),
+        ),
+        CPU_TEMPLATE_TAG_SP_EL0 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SP_EL0),
+        ),
+        CPU_TEMPLATE_TAG_SP_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SP_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ELR_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ELR_EL1),
+        ),
+        CPU_TEMPLATE_TAG_SPSR_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::SPSR_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64PFR0_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64PFR0_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64PFR1_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64PFR1_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64ZFR0_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64ZFR0_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64SMFR0_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64SMFR0_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64DFR0_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64DFR0_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64DFR1_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64DFR1_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64ISAR0_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64ISAR0_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64ISAR1_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64ISAR1_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64MMFR0_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64MMFR0_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64MMFR1_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64MMFR1_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ID_AA64MMFR2_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ID_AA64MMFR2_EL1),
+        ),
+        CPU_TEMPLATE_TAG_ACTLR_EL1 => HvfArm64CpuTemplateRegister::U64(
+            HvfArm64CpuTemplateRegister64::System(HvfSystemRegister::ACTLR_EL1),
+        ),
+        CPU_TEMPLATE_TAG_Q0..=CPU_TEMPLATE_TAG_Q31 => {
+            let index = u8::try_from(tag.raw() - CPU_TEMPLATE_TAG_Q0).ok()?;
+            HvfArm64CpuTemplateRegister::U128(HvfSimdFpRegister::q(index)?)
+        }
+        _ => return None,
     })
 }
 
@@ -567,19 +1074,28 @@ impl CpuTemplateMember for HvfVcpuRunner<'_> {
     }
 }
 
-pub(crate) fn apply_arm64_cpu_template(
+pub(crate) fn apply_arm64_cpu_template_with_state(
     runners: &[HvfVcpuRunner<'_>],
     mpidrs: &[u64],
     template: &PreparedHvfArm64CpuTemplate,
-) -> Result<(), HvfArm64CpuTemplateError> {
-    apply_custom_cpu_template_with(runners, mpidrs, template)
+) -> Result<HvfArm64CpuTemplateApplicationState, HvfArm64CpuTemplateError> {
+    apply_custom_cpu_template_with_state(runners, mpidrs, template)
 }
 
+#[cfg(test)]
 fn apply_custom_cpu_template_with<M: CpuTemplateMember>(
     members: &[M],
     mpidrs: &[u64],
     template: &PreparedHvfArm64CpuTemplate,
 ) -> Result<(), HvfArm64CpuTemplateError> {
+    apply_custom_cpu_template_with_state(members, mpidrs, template).map(|_| ())
+}
+
+fn apply_custom_cpu_template_with_state<M: CpuTemplateMember>(
+    members: &[M],
+    mpidrs: &[u64],
+    template: &PreparedHvfArm64CpuTemplate,
+) -> Result<HvfArm64CpuTemplateApplicationState, HvfArm64CpuTemplateError> {
     if members.is_empty() || members.len() != mpidrs.len() {
         return Err(HvfArm64CpuTemplateError::InvalidTopology {
             member_count: members.len(),
@@ -589,7 +1105,9 @@ fn apply_custom_cpu_template_with<M: CpuTemplateMember>(
 
     let modifiers = &template.modifiers;
     if modifiers.is_empty() {
-        return Ok(());
+        return Ok(HvfArm64CpuTemplateApplicationState {
+            entries: Vec::new(),
+        });
     }
 
     let registers = modifiers
@@ -620,7 +1138,9 @@ fn apply_custom_cpu_template_with<M: CpuTemplateMember>(
     }
 
     let Some(common_baseline) = baselines.first() else {
-        return Ok(());
+        return Ok(HvfArm64CpuTemplateApplicationState {
+            entries: Vec::new(),
+        });
     };
     let Some(&common_mpidr) = mpidrs.first() else {
         return Err(HvfArm64CpuTemplateError::InvalidTopology {
@@ -685,7 +1205,21 @@ fn apply_custom_cpu_template_with<M: CpuTemplateMember>(
             })?;
     }
 
-    Ok(())
+    let mut entries = Vec::with_capacity(modifiers.len());
+    for ((modifier, baseline), target) in modifiers
+        .iter()
+        .copied()
+        .zip(common_baseline.iter().copied())
+        .zip(targets.iter().copied())
+    {
+        let entry =
+            HvfArm64CpuTemplateApplicationEntry::from_application(modifier, baseline, target)
+                .map_err(|_| HvfArm64CpuTemplateError::InvalidRuntimeRegister)?;
+        entries.push(entry);
+    }
+    entries.sort_unstable_by_key(HvfArm64CpuTemplateApplicationEntry::tag);
+    HvfArm64CpuTemplateApplicationState::try_new(entries)
+        .map_err(|_| HvfArm64CpuTemplateError::InvalidRuntimeRegister)
 }
 
 pub(crate) trait HvfArm64CpuTemplateAccess {
@@ -2056,7 +2590,7 @@ mod tests {
             events: Rc::clone(&events),
         });
 
-        apply_custom_cpu_template_with(&members, &[0, 1], &template)
+        let application = apply_custom_cpu_template_with_state(&members, &[0, 1], &template)
             .expect("matching topology should accept the template");
 
         let expected_registers = vec![
@@ -2104,6 +2638,95 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(application.entries().len(), baseline.len());
+        assert!(
+            application
+                .entries()
+                .windows(2)
+                .all(|entries| entries[0].tag() < entries[1].tag())
+        );
+        for (common_baseline, filter, logical_value) in [
+            (baseline[0], PFR0_FILTER, 0),
+            (baseline[1], ISAR0_FILTER, ISAR0_VALUE),
+            (baseline[2], ISAR1_FILTER, ISAR1_VALUE),
+            (baseline[3], MMFR2_FILTER, 0),
+        ] {
+            let entry = application
+                .entries()
+                .iter()
+                .find(|entry| {
+                    entry.common_baseline().zero_extended() == u128::from(common_baseline)
+                })
+                .expect("each applied modifier should have one receipt entry");
+            assert_eq!(entry.width(), HvfArm64CpuTemplateValueWidth::U64);
+            assert_eq!(entry.filter().zero_extended(), u128::from(filter));
+            assert_eq!(
+                entry.logical_value().zero_extended(),
+                u128::from(logical_value)
+            );
+            assert_eq!(
+                entry.effective_value().zero_extended(),
+                u128::from((common_baseline & !filter) | logical_value)
+            );
+        }
+        let debug = format!("{application:?}");
+        assert!(debug.contains(CPU_TEMPLATE_VALUE_REDACTED));
+        assert!(!debug.contains("123456789abcdef0"));
+    }
+
+    #[test]
+    fn stable_application_entries_reject_unknown_tags_and_invalid_equations() {
+        for unknown_tag in [
+            CPU_TEMPLATE_TAG_X0 + 1,
+            CPU_TEMPLATE_TAG_X0 + 2,
+            CPU_TEMPLATE_TAG_X0 + 3,
+            u16::MAX,
+        ] {
+            assert!(matches!(
+                HvfArm64CpuTemplateApplicationEntry::try_from_stable_values(
+                    unknown_tag,
+                    HvfArm64CpuTemplateValueWidth::U64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                Err(HvfArm64CpuTemplateApplicationStateError::UnknownRegisterTag)
+            ));
+        }
+
+        let template = canonical_template();
+        let baseline = vec![HvfArm64CpuTemplateValue::U64(0); template.modifiers.len()];
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let members = [FakeMember {
+            index: 0,
+            baseline,
+            fail_read: false,
+            fail_apply: false,
+            events,
+        }];
+        let application = apply_custom_cpu_template_with_state(&members, &[0], &template)
+            .expect("fixture application should succeed");
+        let entry = application.entries()[0];
+        assert!(matches!(
+            HvfArm64CpuTemplateApplicationState::try_new(vec![
+                entry;
+                HVF_ARM64_CPU_TEMPLATE_APPLICATION_MAX_ENTRIES
+                    + 1
+            ]),
+            Err(HvfArm64CpuTemplateApplicationStateError::EntryCount)
+        ));
+        assert!(matches!(
+            HvfArm64CpuTemplateApplicationEntry::try_from_stable_values(
+                entry.tag().raw(),
+                entry.width(),
+                entry.filter().zero_extended(),
+                entry.logical_value().zero_extended(),
+                entry.common_baseline().zero_extended(),
+                entry.effective_value().zero_extended() ^ 1,
+            ),
+            Err(HvfArm64CpuTemplateApplicationStateError::EffectiveValueMismatch)
+        ));
     }
 
     #[test]

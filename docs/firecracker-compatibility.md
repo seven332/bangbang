@@ -3935,13 +3935,17 @@ Their eventual support level should follow the endpoint matrix:
   and portability remain #1490 work rather than live snapshot-compatibility
   claims
 - snapshot behavior beyond the implemented narrow native-v1 profile. The
-  library-only native-v2 `2.1.0` foundation now includes a canonical 64-KiB
-  aligned memory binding, retained read-only File validation, and demand-paged
-  private COW/HVF mappings with dirty and cleanup proof, but no public v2
-  create/load/describe dispatch or complete machine/vCPU/device state. Remaining
-  work includes public transactional artifacts, optional-device state, Diff
-  artifacts, overrides, Firecracker artifact compatibility, authentication,
-  clone policy, and cross-host portability
+  library-only native-v2 `2.2.0` profile retains readable `2.0.0`/`2.1.x`
+  state and adds an exact typed 1–32-vCPU machine/global-GIC/topology/vCPU
+  graph with CPU-application evidence and closed reviewed debug/SME state.
+  It remains data-only and composes with the canonical 64-KiB-aligned memory
+  binding, retained read-only File validation, and demand-paged private COW/HVF
+  mappings with dirty and cleanup proof. There is no public v2
+  create/load/describe dispatch, general device aggregate, or destination
+  resource/time/identity orchestration. Remaining work includes public
+  transactional artifacts, optional-device state, Diff artifacts, overrides,
+  Firecracker artifact compatibility, authentication, clone policy, and
+  cross-host portability
 - balloon producers outside the implemented queue/discard/reporting activity
   and serialized/restored balloon state; live paired PFN accounting and
   capture-ready ownership are implemented, while absent guest statistics are

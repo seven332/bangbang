@@ -634,7 +634,9 @@ fn encode_compatibility(
     Ok(encoder.finish())
 }
 
-fn encode_vcpu(state: &HvfSnapshotV1VcpuState) -> Result<Vec<u8>, HvfSnapshotV1EncodeError> {
+pub(crate) fn encode_vcpu(
+    state: &HvfSnapshotV1VcpuState,
+) -> Result<Vec<u8>, HvfSnapshotV1EncodeError> {
     let mut encoder = Encoder::with_capacity(2048)?;
     for value in state.general.general_purpose_registers() {
         encoder.u64(*value);
@@ -1024,7 +1026,9 @@ fn decode_compatibility(
     Ok(state)
 }
 
-fn decode_vcpu(payload: &[u8]) -> Result<HvfSnapshotV1VcpuState, HvfSnapshotV1DecodeError> {
+pub(crate) fn decode_vcpu(
+    payload: &[u8],
+) -> Result<HvfSnapshotV1VcpuState, HvfSnapshotV1DecodeError> {
     let mut decoder = Decoder::new(payload);
     let mut general_purpose_registers = [0; 31];
     for value in &mut general_purpose_registers {

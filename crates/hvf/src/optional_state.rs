@@ -137,6 +137,21 @@ impl HvfArm64DebugRegisterRestoreState {
             controls,
         })
     }
+
+    /// Return the exact implemented register count.
+    pub const fn implemented_count(&self) -> u8 {
+        self.implemented_count
+    }
+
+    /// Return all fixed-capacity value slots to trusted persistence code.
+    pub const fn values(&self) -> &[HvfArm64OptionalStateValue<u64>; DEBUG_REGISTER_CAPACITY] {
+        &self.values
+    }
+
+    /// Return all fixed-capacity control slots to trusted persistence code.
+    pub const fn controls(&self) -> &[HvfArm64OptionalStateValue<u64>; DEBUG_REGISTER_CAPACITY] {
+        &self.controls
+    }
 }
 
 type OptionalSmeBytes = HvfArm64OptionalStateValue<Box<[u8]>>;
@@ -395,6 +410,51 @@ impl HvfArm64SmeRestoreState {
             simd_fp,
         )
     }
+
+    /// Return the expected architectural SME feature version.
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Return the expected optional identification state.
+    pub const fn identification(&self) -> HvfArm64VcpuSveSmeIdentificationRegisterState {
+        self.identification
+    }
+
+    /// Return the exact configuration-wide maximum SVL in bytes.
+    pub const fn maximum_svl_bytes(&self) -> usize {
+        self.maximum_svl_bytes
+    }
+
+    /// Return the presence-aware target SME PSTATE.
+    pub const fn pstate(&self) -> HvfArm64OptionalStateValue<HvfArm64VcpuSmePstate> {
+        self.pstate
+    }
+
+    /// Return the three presence-aware SME system-register values.
+    pub const fn system_registers(&self) -> &[HvfArm64OptionalStateValue<u64>; 3] {
+        &self.system_registers
+    }
+
+    /// Return conditional streaming Z-register values.
+    pub fn z_registers(&self) -> Option<&[HvfArm64OptionalStateValue<Box<[u8]>>]> {
+        self.z_registers.as_deref()
+    }
+
+    /// Return conditional streaming predicate-register values.
+    pub fn p_registers(&self) -> Option<&[HvfArm64OptionalStateValue<Box<[u8]>>]> {
+        self.p_registers.as_deref()
+    }
+
+    /// Return conditional ZA state.
+    pub fn za_register(&self) -> Option<&HvfArm64OptionalStateValue<Box<[u8]>>> {
+        self.za_register.as_ref()
+    }
+
+    /// Return conditional SME2 ZT0 state.
+    pub const fn zt0_register(&self) -> Option<&HvfArm64OptionalStateValue<[u8; 64]>> {
+        self.zt0_register.as_ref()
+    }
 }
 
 /// Checked, detached optional arm64 state consumed by one never-run owner.
@@ -463,6 +523,36 @@ impl HvfArm64ReviewedOptionalStateRestore {
             sme,
             simd_fp,
         })
+    }
+
+    /// Return the common expected debug-feature identification value.
+    pub const fn expected_id_aa64dfr0_el1(&self) -> u64 {
+        self.expected_id_aa64dfr0_el1
+    }
+
+    /// Return the expected SME version, when SME is present.
+    pub const fn expected_sme_version(&self) -> Option<u8> {
+        self.expected_sme_version
+    }
+
+    /// Return the exact reviewed breakpoint inventory.
+    pub const fn breakpoints(&self) -> &HvfArm64DebugRegisterRestoreState {
+        &self.breakpoints
+    }
+
+    /// Return the exact reviewed watchpoint inventory.
+    pub const fn watchpoints(&self) -> &HvfArm64DebugRegisterRestoreState {
+        &self.watchpoints
+    }
+
+    /// Return reviewed SME state when the feature is present.
+    pub const fn sme(&self) -> Option<&HvfArm64SmeRestoreState> {
+        self.sme.as_ref()
+    }
+
+    /// Return the authoritative mandatory SIMD/FP state.
+    pub const fn simd_fp(&self) -> &HvfArm64VcpuSimdFpState {
+        &self.simd_fp
     }
 }
 

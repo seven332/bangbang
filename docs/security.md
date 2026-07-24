@@ -1231,19 +1231,27 @@ is resource-specific:
   it is not authentication, and a party that can rewrite the file can recompute
   it. Future payload schemas must therefore stay memory-safe and fail closed
   even for checksum-valid attacker-controlled bytes.
-- Native-v2 state is currently a library-only, incomplete VM-state format. Its
+- Native-v2 state is currently a library-only data format with no public
+  lifecycle or destination-resource construction. Its
   first pass treats all bytes as hostile, caps the complete file at 16 MiB,
   caps feature and component counts before table traversal, uses checked
   conversions and arithmetic, requires canonical packed ranges and exact EOF,
   and validates the whole-state CRC before publishing a borrowed view. The pass
   performs no count-proportional allocation. The immutable `2.0.0` catalogs are
-  empty; current `2.1.0` adds only semantic memory kind 1, instance 0. Unknown
-  mandatory behavior fails closed, while explicitly nonsemantic extensions can
-  survive complete structural validation. Errors and `Debug` omit identifiers,
-  payloads, format magic, guest contents, and raw state. The Firecracker prefix
-  classifier proves only an incompatible family and never deserializes or
-  translates upstream bitcode. No public create, describe, load, or VM action
-  consumes v2 in this slice.
+  empty; minor 1 adds semantic memory kind 1, instance 0, and the current
+  `2.2.0` writer adds exact singleton machine/global/topology kinds 2–4 plus
+  contiguous per-vCPU kind 5. The platform decoder verifies that complete
+  directory profile without payload-dependent allocation, caps every inner
+  count and length before reservation, allocation-free scans the closed
+  optional debug/SME registry, then cross-validates the complete owned graph.
+  Inert path bytes are never opened or resolved. Unknown mandatory behavior
+  fails closed, while explicitly nonsemantic structural extensions can survive
+  complete structural validation outside the exact platform profile. Errors
+  and `Debug` omit identifiers, paths, arguments, CPU/register values,
+  checksums used as identities, GIC bytes, format magic, guest contents, and raw
+  state. The Firecracker prefix classifier proves only an incompatible family
+  and never deserializes or translates upstream bitcode. No public create,
+  describe, load, or VM action consumes v2 in this slice.
 - Native-v2 lazy memory validates the state binding before opening or adopting
   a source, then requires a read-only close-on-exec regular descriptor, exact
   canonical length, stable descriptor identity/facts, an exact repeated header,
