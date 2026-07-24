@@ -861,6 +861,7 @@ mod tests {
     #[test]
     fn explicit_terminal_fans_out_once_and_rejects_later_work() {
         let (client_stream, peer_stream) = UnixStream::pair().expect("stream pair should open");
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
         let peer = thread::spawn(move || {
             let (mut peer, mut transport) = establish_peer(peer_stream);
             transport
@@ -870,7 +871,9 @@ mod tests {
                         .expect("terminal should build"),
                 )
                 .expect("terminal should send");
-            thread::sleep(Duration::from_millis(50));
+            release_receiver
+                .recv()
+                .expect("terminal client should release the peer");
         });
         let (terminal_sender, terminal_receiver) = mpsc::sync_channel(1);
         let observer = Arc::new(RecordingObserver {
@@ -906,12 +909,16 @@ mod tests {
                 .expect("terminal state should resolve"),
             Some(PagerError::PeerTerminal)
         );
+        release_sender
+            .send(())
+            .expect("terminal peer should be released");
         peer.join().expect("peer should join");
     }
 
     #[test]
     fn timeout_releases_every_pending_operation_with_one_terminal_notification() {
         let (client_stream, peer_stream) = UnixStream::pair().expect("stream pair should open");
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
         let peer = thread::spawn(move || {
             let (mut peer, mut transport) = establish_peer(peer_stream);
             for _ in 0..2 {
@@ -920,7 +927,9 @@ mod tests {
                     .expect("request should validate");
                 assert_eq!(request.kind(), PagerFrameKind::PageRequest);
             }
-            thread::sleep(Duration::from_millis(100));
+            release_receiver
+                .recv()
+                .expect("timed-out client should release the peer");
         });
         let (terminal_sender, terminal_receiver) = mpsc::sync_channel(1);
         let observer = Arc::new(RecordingObserver {
@@ -962,6 +971,9 @@ mod tests {
             PagerError::Timeout
         );
         assert_eq!(observer.count.load(Ordering::Relaxed), 1);
+        release_sender
+            .send(())
+            .expect("timed-out peer should be released");
         peer.join().expect("peer should join");
     }
 }
