@@ -10491,7 +10491,7 @@ fn codesign_entitlements(path: &Path) -> String {
 
 fn codesign_entitlement_dictionary(path: &Path) -> plist::Dictionary {
     let xml = codesign_entitlements(path);
-    if xml.is_empty() {
+    if xml.trim().is_empty() {
         return plist::Dictionary::new();
     }
     let value =

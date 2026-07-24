@@ -186,7 +186,23 @@ fn serve_snapshot(
                     .memory()
                     .read_slice(&mut page, GuestAddress::new(address.raw_value()))
                     .expect("pager-owned memory page should read");
-                if page.iter().all(|byte| *byte == 0) {
+                let is_zero = page.iter().all(|byte| *byte == 0);
+                {
+                    let mut report = report
+                        .lock()
+                        .expect("snapshot pager report should not be poisoned");
+                    if is_zero {
+                        report.page_zero += 1;
+                    } else {
+                        report.page_data += 1;
+                    }
+                    report.requests.push(SnapshotPagerRequest {
+                        region: request.region(),
+                        offset: request.offset(),
+                        access: request.access(),
+                    });
+                }
+                if is_zero {
                     transport
                         .send(
                             &peer
@@ -194,15 +210,6 @@ fn serve_snapshot(
                                 .expect("zero page response should build"),
                         )
                         .expect("zero page response should send");
-                    let mut report = report
-                        .lock()
-                        .expect("snapshot pager report should not be poisoned");
-                    report.page_zero += 1;
-                    report.requests.push(SnapshotPagerRequest {
-                        region: request.region(),
-                        offset: request.offset(),
-                        access: request.access(),
-                    });
                 } else {
                     transport
                         .send(
@@ -211,15 +218,6 @@ fn serve_snapshot(
                                 .expect("data page response should build"),
                         )
                         .expect("data page response should send");
-                    let mut report = report
-                        .lock()
-                        .expect("snapshot pager report should not be poisoned");
-                    report.page_data += 1;
-                    report.requests.push(SnapshotPagerRequest {
-                        region: request.region(),
-                        offset: request.offset(),
-                        access: request.access(),
-                    });
                 }
             }
             PagerFrameKind::Remove => {
