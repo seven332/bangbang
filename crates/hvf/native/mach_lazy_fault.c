@@ -333,6 +333,27 @@ int bangbang_mach_lazy_mapping_hide(
         mapping->page_size);
 }
 
+int bangbang_mach_lazy_mapping_zero_hidden(
+    struct bangbang_mach_lazy_mapping *mapping,
+    size_t region_index,
+    size_t offset,
+    size_t length) {
+    if (mapping == NULL || region_index >= mapping->region_count) {
+        return BANGBANG_MACH_INVALID;
+    }
+    struct bangbang_mach_region *region = &mapping->regions[region_index];
+    if (offset > region->size || length == 0 ||
+        length > region->size - offset ||
+        offset % mapping->page_size != 0 ||
+        length % mapping->page_size != 0) {
+        return BANGBANG_MACH_INVALID;
+    }
+    uint8_t *destination = (uint8_t *)region->alias + offset;
+    memset(destination, 0, length);
+    atomic_thread_fence(memory_order_seq_cst);
+    return BANGBANG_MACH_OK;
+}
+
 int bangbang_mach_lazy_mapping_publish(
     struct bangbang_mach_lazy_mapping *mapping,
     size_t region_index,

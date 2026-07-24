@@ -420,12 +420,12 @@ fn pager_reference_peer_child() {
         .expect("pager reference stream should accept");
     match mode.as_str() {
         "complete" => {
-            let report = ReferencePeer::new(3)
+            let report = ReferencePeer::new(4)
                 .expect("reference bound should validate")
                 .serve(stream, Duration::from_secs(5))
                 .expect("complete reference session should succeed");
             assert_eq!(report.page_data(), 1);
-            assert_eq!(report.page_zero(), 1);
+            assert_eq!(report.page_zero(), 2);
             assert_eq!(report.removals(), 1);
             assert_eq!(report.termination(), ReferencePeerTermination::Shutdown);
         }

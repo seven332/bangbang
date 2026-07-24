@@ -804,7 +804,7 @@ Those eight promotions moved the global counts at that checkpoint to
 228/170/3/17. #1491 retains repository-wide performance/observability work,
 not a directly owned live vsock row.
 
-After #1551, the checked
+After #1552, the checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 moves only `corpus:snapshot-page-faults` from `audit-required` to
 `missing-platform-feasible` with #1527 as its delivery owner. This records
@@ -826,21 +826,32 @@ and retries without advancing PC. Focused and signed tests cover multi-vCPU
 coalescing, stale/no-progress handling, execute/read/write population, guest
 entry, source failure, cancellation, and cleanup.
 
+The pager crate additionally owns a concurrent VMM client with serialized
+outbound request IDs, exact out-of-order mixed page/removal dispatch, bounded
+pending completions, cancellation/drained shutdown, and first-terminal
+fan-out. `HvfLazyPager` binds it to `LazyGuestMemory`. A shared/exclusive
+transition gate keeps external source waits outside platform publication,
+holds host and guest visibility together, and gives removal one ordered
+revoke-hide-zero-acknowledge-commit transaction. A superseded response retries
+under a newer generation. Peer EOF, timeout, malformed/mismatched traffic,
+explicit terminal, or worker loss preserves one stable `PeerFailure`.
+Focused and signed tests cover blocked population supersession, committed host
+and real stage-two revocation, and zero refault.
+
 The production launcher now also walks and anchors one configured pager socket,
 performs a bounded current-user connection outside App Sandbox, and transfers
 only a typed connected stream with minimum identity metadata through the atomic
 startup grant. The worker independently revalidates and claims that stream
 once. A bounded support-only reference peer and signed production-bundle cases
-cover complete protocol exchange, cancellation/terminal behavior, malformed
-traffic, EOF/timeout, both process-death orders, repeat launch, cleanup,
-redaction, signatures, and unchanged entitlements.
+cover complete client-driven data/zero/removal/refault exchange,
+cancellation/terminal behavior, malformed traffic, EOF/timeout, both
+process-death orders, repeat launch, cleanup, redaction, signatures, and
+unchanged entitlements.
 
-This is still not public runtime support: both bridges accept only a trusted
-in-process source, the granted stream is not wired to the coordinator,
-native-v1 `Uffd` rejects before resource access, the protocol is not Linux UFFD
-wire-compatible, and removal/failure propagation, consumer audit, restore, and
-final certification remain open. The current global counts remain
-228/169/4/17.
+This is still not public runtime support: native-v1 `Uffd` rejects before
+resource access, the protocol is not Linux UFFD wire-compatible, and consumer
+audit, restore, and final certification remain open. The current global counts
+remain 228/169/4/17.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
@@ -1377,7 +1388,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /snapshot/create` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /snapshot/load` | `snapshot_path` | required; redacted, opened or grant-adopted after preflight | The direct native-v1 loader opens it only after pristine/profile preflight. In contained mode an exact file tag selects `SnapshotStateInput`/`ReadOnly`; it is duplicated for bounded state decode without consumption and later atomically adopted with every tagged memory/root input. Diagnostics expose neither form. |
 | `PUT /snapshot/load` | `mem_backend` | required unless deprecated `mem_file_path` is present; redacted | Parsed as a strict `backend_path`/`backend_type` object. Exactly one backend form is required. Direct `File` uses the no-follow loader; a contained exact tag selects `SnapshotMemoryInput`/`ReadOnly` and is loaded from its atomically adopted descriptor. |
-| `PUT /snapshot/load` | `mem_backend.backend_type` | required when `mem_backend` is present | Accepts `File` and `Uffd`; only `File` passes the current native-v1 gate, while `Uffd` returns the same pre-resource snapshot-specific unsupported fault. The checked snapshot paging contract records a feasible public macOS equivalent plus internal protocol, lazy-anonymous-memory ownership, task-local host-fault, and HVF guest-fault slices under #1527, not current success or Linux wire compatibility. |
+| `PUT /snapshot/load` | `mem_backend.backend_type` | required when `mem_backend` is present | Accepts `File` and `Uffd`; only `File` passes the current native-v1 gate, while `Uffd` returns the same pre-resource snapshot-specific unsupported fault. The checked snapshot paging contract records a feasible public macOS equivalent plus concurrent pager client, lazy-anonymous-memory ownership, task-local host/HVF guest fault planes, ordered removal, and peer-failure propagation under #1527, not current success or Linux wire compatibility. |
 | `PUT /snapshot/load` | `mem_file_path` | deprecated-compatible alternative; normalized | Must not be combined with `mem_backend`; it is normalized to a redacted `File` backend and retains deprecated-usage provenance. |
 | `PUT /snapshot/load` | `enable_diff_snapshots` | deprecated-compatible optional boolean; normalized and implemented for tracking | ORed with `track_dirty_pages`; only true counts as deprecated usage. The effective value activates destination tracking but does not enable Diff artifact serialization. |
 | `PUT /snapshot/load` | `track_dirty_pages` | optional boolean; implemented | The destination request overrides the source snapshot's active flag. Tracking attaches after image population and before mapping/protection, runner creation, VMGenID replacement, VMClock update, or guest progress. |

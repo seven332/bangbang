@@ -146,6 +146,10 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "Implemented contained pager peer broker",
         "snapshot-pager-stream",
         "PagerGrantAuthority",
+        "PagerClient",
+        "HvfLazyPager",
+        "writer-preferring",
+        "removal during blocked population",
         "scripts/run-integration-tests.sh --test production_bundle -- pager_grant",
         "BBPAGER\\0",
         "cargo test -p bangbang-pager",
@@ -193,6 +197,21 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         );
     }
 
+    let pager_client = std::fs::read_to_string(repository_root.join("crates/pager/src/client.rs"))
+        .expect("checked pager client source must be readable");
+    for required in [
+        "pub struct PagerClient",
+        "pub trait PagerClientTerminalObserver",
+        "concurrent_page_and_removal_complete_out_of_order",
+        "explicit_terminal_fans_out_once_and_rejects_later_work",
+        "timeout_releases_every_pending_operation_with_one_terminal_notification",
+    ] {
+        assert!(
+            pager_client.contains(required),
+            "pager client must retain {required}"
+        );
+    }
+
     let lazy_source =
         std::fs::read_to_string(repository_root.join("crates/runtime/src/lazy_memory.rs"))
             .expect("checked lazy-memory coordinator source must be readable");
@@ -207,6 +226,9 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "removal_reserves_a_distinct_slot_before_superseding_loading",
         "removal_stays_counted_and_removing_until_acknowledged",
         "requested_peer_and_teardown_outcomes_wake_waiters",
+        "pub fn signal_terminal",
+        "nonblocking_terminal_signal_preserves_first_reason_during_removal",
+        "nonblocking_terminal_signal_wakes_duplicate_population_waiters",
         "generation_exhaustion_is_owner_terminal",
         "repeated_construction_and_destruction_leaves_no_retained_work",
     ] {
@@ -249,6 +271,7 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "EXC_MASK_BAD_ACCESS",
         "forward_exception",
         "restore_previous_if_current",
+        "bangbang_mach_lazy_mapping_zero_hidden",
         "BANGBANG_MACH_TERMINAL_EXIT_CODE = 70",
     ] {
         assert!(
@@ -265,6 +288,10 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "pub struct HvfLazyPageResolver",
         "pub struct HvfLazyHostFaultBridge",
         "resolve_host_address",
+        "pub fn remove_pages",
+        "begin_transition_write",
+        "removal_supersedes_blocked_population_and_retries_the_stale_response",
+        "removal_revokes_guest_permissions_and_refaults_zero_under_a_new_generation",
         "assume_initialized_by_platform",
         "owner_busy_install_rolls_back_candidate_aliases_without_protection",
         "shutdown_waits_for_an_admitted_host_population",
@@ -283,6 +310,7 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "pub(crate) struct HvfLazyGuestFaultHandler",
         "pub enum HvfLazyGuestResolutionFailure",
         "pub struct HvfHandledLazyGuestFault",
+        "pub(crate) fn revoke",
         "resolves_every_cross_page_byte_before_publishing_any_permission",
         "publishes_read_write_and_execute_as_serialized_permission_unions",
         "peer_stale_exit_is_admitted_once_then_reports_no_progress",
@@ -295,6 +323,24 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         );
     }
 
+    let pager_adapter =
+        std::fs::read_to_string(repository_root.join("crates/hvf/src/lazy_pager.rs"))
+            .expect("checked HVF pager adapter source must be readable");
+    for required in [
+        "pub struct HvfLazyPager",
+        "CoordinatorTerminalObserver",
+        "LazyGuestMemoryTerminalReason::PeerFailure",
+        "pager_adapter_completes_remove_refault_and_drained_shutdown",
+        "pager_peer_loss_closes_coordinator_once_as_peer_failure",
+        "requested_cancel_closes_peer_and_coordinator",
+        "reduced_in_flight_selection_fails_before_page_admission",
+    ] {
+        assert!(
+            pager_adapter.contains(required),
+            "HVF pager adapter must retain {required}"
+        );
+    }
+
     let signed_lifecycle =
         std::fs::read_to_string(repository_root.join("crates/hvf/tests/hvf_lifecycle.rs"))
             .expect("signed HVF lifecycle source must be readable");
@@ -303,6 +349,7 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "task_local_lazy_fault_bridge_forwards_and_preserves_a_later_owner",
         "task_local_lazy_fault_bridge_uses_fixed_terminal_exit_on_owned_failure",
         "hvf_lazy_guest_faults_populate_execute_read_and_write_before_retry",
+        "hvf_lazy_guest_removal_revokes_stage_two_and_refaults_zero",
         "hvf_lazy_guest_two_vcpus_coalesce_one_signed_page_request",
         "hvf_lazy_guest_unowned_instruction_fault_keeps_existing_error_path",
         "hvf_lazy_guest_source_failure_keeps_stage_two_closed_and_cleans_up",
@@ -312,6 +359,21 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         assert!(
             signed_lifecycle.contains(required),
             "signed host-fault evidence must retain {required}"
+        );
+    }
+
+    let contained_probe = std::fs::read_to_string(
+        repository_root.join("crates/bangbang/src/grant_integration_probe.rs"),
+    )
+    .expect("contained pager probe source must be readable");
+    for required in [
+        "PagerClient::connect",
+        "PagerClientPage::Zero",
+        "PagerGeneration::new(4)",
+    ] {
+        assert!(
+            contained_probe.contains(required),
+            "contained pager probe must retain {required}"
         );
     }
 
@@ -332,6 +394,8 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "Cancellation is session-wide and terminal",
         "Orderly shutdown is drain-only",
         "Runtime anonymous-memory coordinator",
+        "HVF integration and removal linearization",
+        "`PagerClient` owns the VMM-side live session",
         "retired-operation accounting",
         "only explicit validated `Removed`",
         "not Linux UFFD descriptor or wire compatibility",

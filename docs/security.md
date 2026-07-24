@@ -2120,9 +2120,9 @@ into unbounded waits.
 The checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 records positive public-macOS feasibility plus implemented standalone protocol
-and internal anonymous-memory ownership slices plus a contained connected-peer
-grant, not an activated restore backend. Native-v1 `Uffd` still rejects before
-path, socket, artifact, or backend access.
+and client, internal anonymous-memory ownership and fault/removal slices, plus
+a contained connected-peer grant, not an activated restore backend. Native-v1
+`Uffd` still rejects before path, socket, artifact, or backend access.
 
 The accepted complete boundary uses two in-worker protection planes: public
 Mach task exceptions mediate host accesses to owned absent guest pages, and HVF
@@ -2139,7 +2139,9 @@ page data. It has no peer strings, paths, addresses, descriptors, or task
 ports; Debug and errors are value-redacted. Its transport accepts only an
 already-connected stream, uses one absolute deadline across partial I/O,
 suppresses `SIGPIPE`, and becomes terminal after malformed input, timeout, EOF,
-or transport failure.
+or transport failure. The concurrent client caps pending work at the negotiated
+combined limit and releases every pending completion exactly once on the first
+terminal outcome.
 
 The production launcher now reduces the configured Unix path to that connected
 stream before worker spawn. It walks parent components without symlinks,
@@ -2172,7 +2174,7 @@ alias/port/thread before returning.
 
 The callback claims only ARM64 read/write protection faults whose address
 belongs to a retained lazy region. It revalidates the range in Rust before
-coordinator access. The trusted in-process source sees only opaque
+coordinator access. The trusted source, including `HvfLazyPager`, sees only opaque
 region/generation/access and aligned offset/length metadata—never host
 addresses, task/thread ports, aliases, or memory-entry rights. Complete data or
 zero bytes are written through the alias while the original remains hidden; a
@@ -2201,6 +2203,15 @@ failure poisons the guest handler and the shared resolver. No absent or
 partially initialized page is published; if a later page in one cross-page
 permission transaction fails, an earlier fully initialized page may remain
 accessible until VM teardown.
+
+Source retrieval holds no platform-transition permission. Final host
+publication, executable synchronization, and the complete guest permission
+union share one reader lease; a writer-preferring exclusive lease serializes
+removal. Under it, the handler first revokes the exact guest range and clears
+cached permission/stale history, then hides host access, zeroes and fences
+through the private alias, waits for the exact peer acknowledgement, and
+commits `Absent`. A retired old response can only retry under a newer
+generation; it cannot reopen either public plane.
 
 Lazy guest mappings cannot coexist with the current dirty-write protection
 overlay, and the backend refuses raw vCPU ownership that could bypass runner
@@ -2247,8 +2258,10 @@ zero or stale contents, fall through accidentally to `SIGBUS`, or swallow an
 unrelated crash. The protocol already bounds I/O and forbids automatic replay;
 the signed contained broker tests already prove bounded handshake,
 timeout/EOF, peer death, worker death, cancellation, terminal, and orderly
-shutdown at the process boundary. Mapping those outcomes onto the live
-coordinator remains the next slice; they cannot yet trigger native-v1 restore.
+shutdown at the process boundary. `HvfLazyPager` now maps those outcomes onto
+the live coordinator as the first stable nonblocking `PeerFailure`, releasing
+pending host and guest faults without waiting on a retained transition guard.
+They still cannot trigger native-v1 restore.
 External/shared mappings that bypass the task-local bridge remain pre-resource
 rejections until independently certified.
 

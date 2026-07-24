@@ -1113,17 +1113,21 @@ moves one exact corpus record to #1527-owned
 `missing-platform-feasible`, making the current overlay 228/169/4/17 without
 changing native-v1 rejection.
 
-Snapshot paging feasibility, its standalone protocol, internal
-lazy-anonymous-memory coordinator, and internal host/guest fault bridges are
-guarded separately from public runtime integration. The inventory test pins
+Snapshot paging feasibility, its standalone protocol/client, internal
+lazy-anonymous-memory coordinator, host/guest fault bridges, removal, and
+peer-failure propagation are guarded separately from public runtime
+integration. The inventory test pins
 the upstream contract, public macOS environment, signed prototype output,
 unchanged entitlement floor, stable pre-access rejection anchors, exact
 delivery owner, protocol/coordinator/host/guest source and documentation
 anchors, and nonterminal status. The pager package covers canonical framing,
 every
 split/coalesced boundary, adversarial input, negotiation, exact out-of-order
-matching, cancellation, shutdown, timeout/EOF, redaction, and two
-inherited-stream child-process sessions.
+matching, concurrent mixed page/removal completion, first-terminal fan-out,
+cancellation, shutdown, timeout/EOF, redaction, and two inherited-stream
+child-process sessions. The HVF adapter additionally proves requested
+cancellation, coordinator-first peer-loss signaling, and pre-fault rejection
+when a peer reduces the coordinator's preconstructed in-flight bound.
 
 Contained pager brokerage is tested as a separate startup-authority boundary.
 Session and launcher tests cover the closed connected-stream record, malformed
@@ -1131,7 +1135,8 @@ peer/source identity, CLOEXEC/status/type/identity/credential revalidation,
 one-time claim and cleanup, no-follow anchored connection, missing and
 non-socket targets, and source replacement. The bounded reference peer covers
 page data, zero, removal, cancellation, terminal, operation limits, and orderly
-shutdown without claiming Linux UFFD compatibility.
+shutdown without claiming Linux UFFD compatibility. The signed contained
+complete probe uses `PagerClient` and verifies remove followed by zero refault.
 
 The runtime lazy-memory tests use barriers, channels/condition wakeups, and
 bounded yield polling rather than sleeps. They cover absent private-anonymous
@@ -1155,7 +1160,8 @@ HVF host-fault unit tests use the real public Mach server for ordinary accesses
 and deterministic coordinator entry for failure paths. They cover host-page
 preflight, exact data/zero publication, read-to-write permission upgrade,
 source/content/coordinator terminalization, owner-busy alias rollback,
-admitted-action shutdown, redaction, and cleanup. The signed lifecycle cases
+admitted-action shutdown, blocked-response supersession, exact revoke/hide/zero
+ordering, peer-failure fan-out, redaction, and cleanup. The signed lifecycle cases
 then exercise real read-first, write-first, aligned atomic, and raw-pointer
 faults. A native prior handler repairs an unowned protected page after the
 bridge forwards it; that handler then replaces the bridge so shutdown proves
@@ -1177,7 +1183,9 @@ source/protection terminalization, redaction, dirty/raw exclusion, and canceled
 dispatch. The signed lifecycle test runs real execute-, read-, and write-first
 faults twice, verifies source-failure cleanup and no duplicate work after
 cancellation, blocks one source request until a second vCPU joins it, and
-proves an unowned instruction fault does not reach the lazy source. The
+proves an unowned instruction fault does not reach the lazy source. It also
+removes a committed real stage-two page and observes a newer-generation zero
+refault before guest progress. The
 guest-boot target starts directly on a lazy instruction page:
 
 ```sh
@@ -1188,9 +1196,8 @@ scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_in
 
 The final #1527 certification must run the complete signed wrapper without
 `--allow-unsupported` and exercise the production pager path before promotion.
-The retained prototypes, standalone protocol, internal coordinator, host/guest
-bridges, and ledger are not complete broker/removal/restore implementation
-evidence.
+The retained prototypes and implemented internal pager/removal path are not
+complete consumer-audit/restore/final-certification evidence.
 
 Run its two focused gates with:
 

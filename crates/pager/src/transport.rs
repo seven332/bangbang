@@ -52,6 +52,10 @@ impl PagerTransport {
         self.poisoned
     }
 
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+
     /// Sends exactly one frame under one absolute deadline.
     pub fn send(&mut self, frame: &PagerFrame) -> Result<(), PagerError> {
         self.require_live()?;

@@ -8,12 +8,14 @@
 #[cfg(not(unix))]
 compile_error!("bangbang-pager requires Unix socket semantics");
 
+mod client;
 mod error;
 mod frame;
 mod reference;
 mod state;
 mod transport;
 
+pub use client::{PagerClient, PagerClientPage, PagerClientState, PagerClientTerminalObserver};
 pub use error::PagerError;
 pub use frame::{
     CancelReason, HEADER_BYTES, MAX_FRAME_BYTES, MAX_IN_FLIGHT, MAX_PAGE_SIZE, MAX_REGIONS,

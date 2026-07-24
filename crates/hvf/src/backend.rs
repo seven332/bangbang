@@ -613,6 +613,14 @@ impl HvfBackend {
                     self.lazy_guest_fault_handler = Some(handler);
                     return Err(error);
                 }
+                if resolver.bind_guest_fault_handler(&handler).is_err() {
+                    handler.poison();
+                    self.guest_memory = Some(mapping);
+                    self.lazy_guest_fault_handler = Some(handler);
+                    return Err(HvfGuestMemoryMappingError::InvalidState(
+                        "lazy guest fault handler binding failed",
+                    ));
+                }
                 self.guest_memory = Some(mapping);
                 self.lazy_guest_fault_handler = Some(handler);
                 Ok(())

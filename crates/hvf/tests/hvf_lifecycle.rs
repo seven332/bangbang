@@ -89,16 +89,16 @@ fn app_sandbox_hvf_lifecycle_replay_requires_exact_bundle_layout() {
 mod lazy_host_fault_integration {
     use std::ffi::c_void;
     use std::ptr::NonNull;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     use bangbang_hvf::{
         HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfArm64BootRegisters, HvfBackend,
         HvfLazyGuestAccess, HvfLazyGuestFaultError, HvfLazyGuestResolutionFailure,
-        HvfLazyHostFaultBridge, HvfLazyPageContents, HvfLazyPageRequest, HvfLazyPageSource,
-        HvfLazyPageSourceError, HvfMemoryPermissions, HvfVcpuRunEvent, HvfVcpuRunMemberOutcome,
-        HvfVcpuRunStepOutcome, HvfVcpuRunnerError,
+        HvfLazyHostFaultBridge, HvfLazyPageContents, HvfLazyPageRemovalRequest, HvfLazyPageRequest,
+        HvfLazyPageSource, HvfLazyPageSourceError, HvfMemoryPermissions, HvfVcpuRunEvent,
+        HvfVcpuRunMemberOutcome, HvfVcpuRunStepOutcome, HvfVcpuRunnerError,
     };
     use bangbang_pager::{
         MAX_FRAME_BYTES, PageAccess, PagerLimits, PagerOperations, PagerRegionId,
@@ -133,6 +133,15 @@ mod lazy_host_fault_integration {
         page: Vec<u8>,
         entered: mpsc::Sender<()>,
         release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    struct SignedRemovalSource {
+        code: Vec<u8>,
+        data: Vec<u8>,
+        data_offset: u64,
+        removed: AtomicBool,
+        requests: Mutex<Vec<HvfLazyPageRequest>>,
+        removals: Mutex<Vec<HvfLazyPageRemovalRequest>>,
     }
 
     impl SignedLazySource {
@@ -193,6 +202,41 @@ mod lazy_host_fault_integration {
                 .recv()
                 .map_err(|_| HvfLazyPageSourceError::failed())?;
             Ok(HvfLazyPageContents::data(self.page.clone()))
+        }
+    }
+
+    impl HvfLazyPageSource for SignedRemovalSource {
+        fn page(
+            &self,
+            request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            self.requests
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            if request.offset() == 0 {
+                Ok(HvfLazyPageContents::data(self.code.clone()))
+            } else if request.offset() == self.data_offset {
+                if self.removed.load(Ordering::Acquire) {
+                    Ok(HvfLazyPageContents::zero())
+                } else {
+                    Ok(HvfLazyPageContents::data(self.data.clone()))
+                }
+            } else {
+                Err(HvfLazyPageSourceError::failed())
+            }
+        }
+
+        fn remove(&self, request: HvfLazyPageRemovalRequest) -> Result<(), HvfLazyPageSourceError> {
+            if request.offset() != self.data_offset || request.length() != self.data_offset {
+                return Err(HvfLazyPageSourceError::failed());
+            }
+            self.removals
+                .lock()
+                .map_err(|_| HvfLazyPageSourceError::failed())?
+                .push(request);
+            self.removed.store(true, Ordering::Release);
+            Ok(())
         }
     }
 
@@ -599,6 +643,144 @@ mod lazy_host_fault_integration {
                     .prior_handler_restored()
             );
         }
+    }
+
+    #[test]
+    fn hvf_lazy_guest_removal_revokes_stage_two_and_refaults_zero() {
+        let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+            .lock()
+            .expect("HVF lifecycle test lock should not be poisoned");
+        let page_size = usize::try_from(host_page_size().expect("host page size should be valid"))
+            .expect("host page size should fit usize");
+        let page_size_u64 = u64::try_from(page_size).expect("host page size should fit u64");
+        let guest_base = 0x10_0000_u64;
+        let page_addend = u32::try_from(page_size / 0x1000)
+            .expect("host page increment should fit AArch64 ADD immediate");
+        assert!(page_addend > 0 && page_addend <= 0xfff);
+        let add_one_page = 0x9140_0000_u32 | (page_addend << 10);
+        let instructions = [
+            0xd280_0000_u32,
+            0xf2a0_0200,
+            add_one_page,
+            0xb940_0001,
+            0xd280_0000,
+            0xd400_0002,
+        ];
+        let mut code = vec![0_u8; page_size];
+        for (index, instruction) in instructions.iter().enumerate() {
+            let start = index * std::mem::size_of::<u32>();
+            code[start..start + std::mem::size_of::<u32>()]
+                .copy_from_slice(&instruction.to_le_bytes());
+        }
+        let mut data = vec![0_u8; page_size];
+        data[..std::mem::size_of::<u64>()].copy_from_slice(&TEST_VALUE.to_ne_bytes());
+        let source = Arc::new(SignedRemovalSource {
+            code,
+            data,
+            data_offset: page_size_u64,
+            removed: AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
+            removals: Mutex::new(Vec::new()),
+        });
+        let memory = lazy_memory_at(guest_base, 2);
+        let pointer = memory.mapping_regions()[0]
+            .host_address()
+            .as_ptr()
+            .cast::<u8>();
+        let bridge = HvfLazyHostFaultBridge::install(
+            Arc::clone(&memory),
+            Arc::<SignedRemovalSource>::clone(&source),
+        )
+        .expect("signed lazy host bridge should install");
+        let mut backend = HvfBackend::new();
+        backend.create_vm().expect("HVF VM should be created");
+        backend
+            .map_lazy_guest_memory(bridge.resolver(), HvfMemoryPermissions::GUEST_RAM)
+            .expect("lazy guest memory should map with zero stage-two permission");
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("lazy-aware vCPU runner should start");
+        runner
+            .configure_arm64_boot_registers(HvfArm64BootRegisters {
+                kernel_entry: GuestAddress::new(guest_base),
+                fdt_address: GuestAddress::new(guest_base),
+            })
+            .expect("lazy guest boot registers should configure");
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+
+        assert!(matches!(
+            runner
+                .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                .expect("instruction page should resolve"),
+            HvfVcpuRunStepOutcome::LazyPage { fault }
+                if fault.fault().access() == HvfLazyGuestAccess::Execute
+        ));
+        assert!(matches!(
+            runner
+                .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                .expect("data page should resolve"),
+            HvfVcpuRunStepOutcome::LazyPage { fault }
+                if fault.fault().access() == HvfLazyGuestAccess::Read
+                    && fault.populated_pages() == 1
+                    && fault.permission_changes() == 1
+        ));
+        // SAFETY: the guest resolver committed and opened the exact data page.
+        let initial = unsafe { std::ptr::read_volatile(pointer.add(page_size).cast::<u64>()) };
+        assert_eq!(initial, TEST_VALUE);
+
+        let region = PagerRegionId::new(1).expect("signed region id should validate");
+        let removed = bridge
+            .remove_pages(region, page_size_u64, page_size_u64)
+            .expect("signed removal should revoke both permission planes");
+        assert_eq!(
+            memory
+                .page_state(region, page_size_u64)
+                .expect("removed page state should resolve"),
+            LazyPageState::Absent
+        );
+
+        let refault = runner
+            .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+            .expect("removed guest data should fault again");
+        assert!(matches!(
+            refault,
+            HvfVcpuRunStepOutcome::LazyPage { fault }
+                if fault.fault().access() == HvfLazyGuestAccess::Read
+                    && fault.populated_pages() == 1
+                    && fault.permission_changes() == 1
+        ));
+        assert!(matches!(
+            runner
+                .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+                .expect("zero-backed guest should reach HVC"),
+            HvfVcpuRunStepOutcome::Hvc { .. }
+        ));
+        // SAFETY: the guest refault committed zero and reopened host reads.
+        let refaulted = unsafe { std::ptr::read_volatile(pointer.add(page_size).cast::<u64>()) };
+        assert_eq!(refaulted, 0);
+
+        let requests = source.requests.lock().expect("request log should lock");
+        let removals = source.removals.lock().expect("removal log should lock");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(removals.len(), 1);
+        assert_eq!(requests[1].offset(), page_size_u64);
+        assert_eq!(requests[2].offset(), page_size_u64);
+        assert!(
+            requests[1].generation().get() < removed.generation().get()
+                && removed.generation().get() < requests[2].generation().get()
+        );
+        drop(requests);
+        drop(removals);
+
+        runner.shutdown().expect("lazy vCPU runner should stop");
+        std::mem::drop(runner);
+        backend
+            .unmap_guest_memory()
+            .expect("lazy guest mapping should unmap");
+        backend.destroy_vm().expect("HVF VM should be destroyed");
+        bridge
+            .shutdown()
+            .expect("lazy host bridge should shut down");
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 This ledger records the #1527 public-macOS feasibility decision for the pinned
 Firecracker snapshot page-fault corpus and the completed #1547 standalone
-protocol, #1548 coordinated lazy-anonymous-memory, and #1549 task-local host
-fault, #1550 HVF guest-fault, and #1551 contained peer-broker slices. It is not
-an aggregate runtime
+protocol, #1548 coordinated lazy-anonymous-memory, #1549 task-local host
+fault, #1550 HVF guest-fault, #1551 contained peer-broker, and #1552
+removal/peer-failure slices. It is not an aggregate runtime
 implementation claim: bangbang still rejects native-v1 `Uffd` before artifact
 or backend access.
 
@@ -139,9 +139,9 @@ evidence, not checked production implementation.
 ## Implemented standalone protocol
 
 The dedicated `crates/pager` package now implements the shared
-`bangbang-pager-v1` codec, VMM/peer state machines, and absolute-deadline
-transport over only an already-connected Unix stream. The normative wire and
-lifecycle are in
+`bangbang-pager-v1` codec, VMM/peer state machines, absolute-deadline transport,
+and a concurrent VMM-side client over only an already-connected Unix stream.
+The normative wire and lifecycle are in
 [`docs/snapshot-pager-protocol.md`](../../../docs/snapshot-pager-protocol.md).
 
 Its 24-byte `BBPAGER\0` v1 header bounds every advertised body before
@@ -154,15 +154,20 @@ offsets, and lengths—never host virtual addresses or paths.
 Request IDs are strictly increasing across page and removal work. Responses
 may complete out of order only when the complete stored tuple matches.
 Cancellation is session-wide and terminal; shutdown requires all work to
-drain. The transport uses one absolute deadline across partial I/O, suppresses
-`SIGPIPE`, and becomes poisoned after timeout, EOF, truncation, malformed input,
-or transport failure. V1 carries no peer strings, so malformed UTF-8 and
-peer-diagnostic leakage are excluded by construction.
+drain. `PagerClient` serializes outbound assignment while one receive owner
+dispatches exact out-of-order page/removal replies to a bounded pending map.
+The first timeout, EOF, truncation, malformed/mismatched response, explicit
+peer terminal, or worker failure releases every pending caller exactly once.
+The transport uses one absolute deadline across partial I/O, suppresses
+`SIGPIPE`, and becomes poisoned after transport failure. V1 carries no peer
+strings, so malformed UTF-8 and peer-diagnostic leakage are excluded by
+construction.
 
 Focused unit tests cover every kind, every split boundary, coalescing,
 exact/invalid bounds, reserved fields, Linux-UFFD-shaped input, handshake and
 region validation, replay/cross-session/mismatch, out-of-order completion,
-in-flight exhaustion, cancellation, shutdown, timeout/EOF, broken pipe, and
+in-flight exhaustion, concurrent page/removal out-of-order completion,
+terminal fan-out, cancellation, shutdown, timeout/EOF, broken pipe, and
 redaction. `crates/pager/tests/protocol_process.rs` uses an inherited connected
 stream to complete real data/zero/removal/shutdown and cancellation child
 sessions:
@@ -277,12 +282,23 @@ so the supported worker installs no competing per-thread bad-access owner.
 
 An owned callback error or unwind terminalizes the coordinator and exits the
 supervised worker with fixed status 70; it cannot fabricate zero/stale bytes,
-return into accidental `SIGBUS`, or wait without the later bounded source
-policy. Complete external-peer timeout/death and removal behavior remain
-#1552.
+return into accidental `SIGBUS`, or wait indefinitely. Peer timeout/death
+closes coordinator admission nonblockingly as the first stable `PeerFailure`;
+an already suspended callback is released through that same supervised
+terminal path.
+
+The resolver now separates source retrieval from platform visibility with a
+writer-preferring shared/exclusive transition gate. Page publication and the
+complete guest permission union retain one shared lease; removal takes the
+exclusive lease, retires loading generations, revokes stage-two permission,
+hides host permission, zeroes through the private alias while hidden, waits
+for exact `Removed`, commits `Absent`, and only then admits a newer fault.
+An old response that reaches `StaleGeneration` retries under the newer
+generation instead of terminalizing or reopening stale bytes.
 
 Focused tests cover host-page validation, exact data/zero and permission paths,
-source/content/coordinator failure, owner-busy rollback, admitted-action
+source/content/coordinator failure, removal during blocked population,
+host/guest revoke and zero refault, owner-busy rollback, admitted-action
 shutdown, redaction, and repeated cleanup. The signed `hvf_lifecycle` binary
 then performs real read-first, write-first, aligned atomic, and raw-pointer
 faults, forwards an unowned fault to a real prior Mach handler, preserves that
@@ -296,8 +312,11 @@ scripts/run-integration-tests.sh --test hvf_lifecycle -- lazy_host_fault_integra
 scripts/run-integration-tests.sh --test app_sandbox -- lazy_host_fault_integration::
 ```
 
-This slice does not connect `bangbang-pager-v1`, grant external source
-authority, integrate peer-driven removal or failure, certify every memory
+`HvfLazyPager` now connects the resolver source boundary to `PagerClient` and
+the same `LazyGuestMemory`. It rejects a peer-selected in-flight reduction
+before the first page operation because the coordinator has already
+preconstructed that exact combined operation bound; the protocol's independent
+maximum-frame reduction remains supported. This slice still does not certify every memory
 consumer, make native-v1 `Uffd` succeed, or promote the aggregate capability.
 
 ## Implemented HVF guest fault bridge
@@ -321,7 +340,13 @@ per-page state unions `READ`, `READ|WRITE`, and `EXECUTE` requirements across
 concurrent vCPUs, so a stale peer cannot downgrade a prior upgrade.
 Instruction contents are synchronized before execute permission. The runner
 then reports one `LazyPage` step and retries the same guest instruction without
-advancing PC.
+advancing PC. The resolver's shared transition lease remains live through
+instruction synchronization and every permission update.
+
+The active handler is weakly registered with the resolver. Exclusive removal
+uses that owner to revoke the exact aligned range to zero permission, reset
+cached unions, and clear overlapping per-vCPU stale history before host
+zeroing. Permission publication and revocation therefore cannot cross.
 
 One peer-stale exit after a concurrent publication is admitted as progress; an
 identical second exit fails closed instead of spinning. Source/coordinator,
@@ -339,7 +364,9 @@ terminalization, redaction, dirty/raw exclusion, and canceled dispatch. Signed
 lazy pages, repeat the lifecycle, observe fail-closed source error with
 cleanup, cancel an active runner without duplicate page work, block one source
 request while two vCPUs coalesce on it, and keep an unowned instruction fault
-on the prior error path. The signed `guest_boot` target boots its entry
+on the prior error path. A signed case removes a committed real guest page,
+observes a second stage-two fault, and refaults it to zero under a newer
+generation. The signed `guest_boot` target boots its entry
 instruction directly from a lazy mapping:
 
 ```sh
@@ -348,9 +375,8 @@ scripts/run-integration-tests.sh --test hvf_lifecycle -- hvf_lazy_guest_
 scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page
 ```
 
-This slice still uses a trusted in-process source. It does not broker a pager
-peer, integrate peer-driven removal/failure, certify bypassing memory
-consumers, activate native-v1 restore, or promote the aggregate capability.
+The source may now be the pager-backed adapter. Bypassing memory consumers,
+native-v1 restore activation, and aggregate promotion remain deferred.
 
 ## Implemented contained pager peer broker
 
@@ -373,8 +399,10 @@ entitlement, task/thread port, host address, or peer diagnostic enters the
 worker.
 
 `bangbang-pager` additionally supplies a bounded support-only reference peer
-over an already-connected stream. Signed production-bundle tests exercise
-data, zero, removal, drained shutdown, cancellation, peer terminal, refused
+over an already-connected stream. The contained worker probe now uses
+`PagerClient`, verifies data and zero, removes the data page, refaults it to
+zero, and drains. Signed production-bundle tests exercise that flow plus
+cancellation, peer terminal, refused
 connection, wrong descriptors and protocol, EOF, timeout, peer and worker
 death, repeat launch, cleanup and redaction while inspecting the unchanged
 launcher/worker signatures and entitlement floor:
@@ -383,10 +411,10 @@ launcher/worker signatures and entitlement floor:
 scripts/run-integration-tests.sh --test production_bundle -- pager_grant
 ```
 
-This slice does not connect the stream to `LazyGuestMemory` or either HVF
-bridge, propagate live peer removal/failure into the coordinator, certify every
-memory consumer, or activate native-v1 restore. The reference peer is support
-tooling, not a daemon or Linux UFFD compatibility.
+The same connected stream can now be adopted by `HvfLazyPager`; public restore
+assembly, every-consumer certification, and native-v1 activation remain
+deferred. The reference peer is support tooling, not a daemon or Linux UFFD
+compatibility.
 
 ## Decision and remaining delivery boundary
 
@@ -435,12 +463,11 @@ VM construction. The focused
 case additionally proves private UFFD paths remain redacted.
 
 Delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527)
-retains four integration/certification gates after the #1551 contained broker:
+retains three integration/certification gates after #1552:
 
-1. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
-2. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
-3. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
-4. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
+1. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
+2. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
+3. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
 
 There is no public `Uffd` success before #1554 and no
 `implemented-and-verified` inventory result before #1555. Delivery-time
@@ -451,4 +478,4 @@ continues to reject it.
 
 | Capability identity | Disposition | Delivery owner | Evidence | Result |
 | --- | --- | --- | --- | --- |
-| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol/process/reference-peer tests, `crates/runtime/src/lazy_memory.rs` coordinator/concurrency tests, `crates/hvf/src/lazy_host_fault.rs` focused plus signed/App Sandbox host-fault tests, `crates/hvf/src/lazy_guest_fault.rs` focused plus signed execute/read/write/failure/cancellation/guest-boot tests, and typed contained connected-stream grant plus signed production-bundle broker lifecycle tests; unchanged pre-access rejection | `nonterminal` |
+| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented concurrent pager client/protocol/process/reference-peer tests, nonblocking coordinator terminal/concurrency tests, host/guest transition-gate removal and zero-refault tests, signed real-HVF revocation/refault, pager-backed source failure fan-out, and typed contained connected-stream remove/refault plus broker lifecycle tests; unchanged pre-access rejection | `nonterminal` |

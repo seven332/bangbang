@@ -6,14 +6,15 @@ use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bangbang_hvf::{HvfBackend, HvfMemoryPermissions};
 use bangbang_pager::{
-    CancelReason, MAX_FRAME_BYTES, MIN_PAGE_SIZE, PageAccess, PagerError, PagerGeneration,
-    PagerLimits, PagerOperations, PagerRegion, PagerRegionId, PagerSessionId, PagerTransport,
-    PagerVmmState, REFERENCE_PAGE_BYTE, TerminalCode, VmmSession,
+    CancelReason, MAX_FRAME_BYTES, MIN_PAGE_SIZE, PageAccess, PagerClient, PagerClientPage,
+    PagerError, PagerGeneration, PagerLimits, PagerOperations, PagerRegion, PagerRegionId,
+    PagerSessionId, PagerTransport, PagerVmmState, REFERENCE_PAGE_BYTE, TerminalCode, VmmSession,
 };
 use bangbang_runtime::VmBackend;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryBacking, aarch64};
@@ -212,52 +213,63 @@ fn verify_pager_in_containment(
     if descriptor_flags < 0 || descriptor_flags & libc::FD_CLOEXEC == 0 {
         return Err(ContainedSessionError);
     }
-    let mut transport =
-        PagerTransport::new(stream, PAGER_TIMEOUT).map_err(|_| ContainedSessionError)?;
-    let mut vmm = pager_vmm().map_err(|_| ContainedSessionError)?;
-    establish_pager(&mut vmm, &mut transport).map_err(|_| ContainedSessionError)?;
-    match probe {
-        PagerProbeCase::Complete => {
-            run_complete_pager(&mut vmm, &mut transport).map_err(|_| ContainedSessionError)
-        }
-        PagerProbeCase::Cancel => {
-            transport
-                .send(
-                    &vmm.cancel(CancelReason::Requested)
-                        .map_err(|_| ContainedSessionError)?,
-                )
-                .map_err(|_| ContainedSessionError)?;
-            vmm.receive(transport.receive().map_err(|_| ContainedSessionError)?)
-                .map_err(|_| ContainedSessionError)?;
-            (vmm.state() == PagerVmmState::Closed)
-                .then_some(())
-                .ok_or(ContainedSessionError)
-        }
-        PagerProbeCase::Terminal => transport
+    if probe == PagerProbeCase::Terminal {
+        let mut transport =
+            PagerTransport::new(stream, PAGER_TIMEOUT).map_err(|_| ContainedSessionError)?;
+        let mut vmm = pager_vmm().map_err(|_| ContainedSessionError)?;
+        establish_pager(&mut vmm, &mut transport).map_err(|_| ContainedSessionError)?;
+        return transport
             .send(
                 &vmm.terminal(TerminalCode::Internal)
                     .map_err(|_| ContainedSessionError)?,
             )
+            .map_err(|_| ContainedSessionError);
+    }
+    let client = Arc::new(
+        PagerClient::connect(
+            pager_vmm().map_err(|_| ContainedSessionError)?,
+            stream,
+            PAGER_TIMEOUT,
+        )
+        .map_err(|_| ContainedSessionError)?,
+    );
+    match probe {
+        PagerProbeCase::Complete => run_complete_pager(&client).map_err(|_| ContainedSessionError),
+        PagerProbeCase::Cancel => client
+            .cancel(CancelReason::Requested)
             .map_err(|_| ContainedSessionError),
+        PagerProbeCase::Terminal => Err(ContainedSessionError),
         PagerProbeCase::Wait => {
-            let request = vmm
-                .request_page(
-                    PagerRegionId::new(1).map_err(|_| ContainedSessionError)?,
-                    PagerGeneration::new(1).map_err(|_| ContainedSessionError)?,
-                    0,
-                    PageAccess::Read,
-                )
-                .map_err(|_| ContainedSessionError)?;
-            transport
-                .send(&request)
-                .map_err(|_| ContainedSessionError)?;
+            let waiting_client = Arc::clone(&client);
+            let waiter = std::thread::spawn(move || {
+                waiting_client
+                    .page(
+                        PagerRegionId::new(1).map_err(|_| ContainedSessionError)?,
+                        PagerGeneration::new(1).map_err(|_| ContainedSessionError)?,
+                        0,
+                        PageAccess::Read,
+                    )
+                    .map_err(|_| ContainedSessionError)
+            });
+            let deadline = std::time::Instant::now() + PAGER_TIMEOUT;
+            while client
+                .pending_operations()
+                .map_err(|_| ContainedSessionError)?
+                == 0
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(ContainedSessionError);
+                }
+                std::thread::yield_now();
+            }
             println!("{PAGER_READY_LINE}");
             std::io::stdout()
                 .flush()
                 .map_err(|_| ContainedSessionError)?;
-            vmm.receive(transport.receive().map_err(|_| ContainedSessionError)?)
-                .map_err(|_| ContainedSessionError)?;
-            Ok(())
+            waiter
+                .join()
+                .map_err(|_| ContainedSessionError)?
+                .map(|_| ())
         }
     }
 }
@@ -295,30 +307,32 @@ fn establish_pager(vmm: &mut VmmSession, transport: &mut PagerTransport) -> Resu
     Ok(())
 }
 
-fn run_complete_pager(
-    vmm: &mut VmmSession,
-    transport: &mut PagerTransport,
-) -> Result<(), PagerError> {
+fn run_complete_pager(client: &PagerClient) -> Result<(), PagerError> {
     let region = PagerRegionId::new(1)?;
-    let generation = PagerGeneration::new(1)?;
-    for (offset, expected_data) in [
-        (0, Some(vec![REFERENCE_PAGE_BYTE; MIN_PAGE_SIZE as usize])),
-        (u64::from(MIN_PAGE_SIZE), None),
-    ] {
-        transport.send(&vmm.request_page(region, generation, offset, PageAccess::Read)?)?;
-        let response = vmm.receive(transport.receive()?)?;
-        if response.page_data().map(<[u8]>::to_vec) != expected_data {
-            return Err(PagerError::InvalidPeerState);
-        }
-    }
-    transport.send(&vmm.remove(region, generation, 0, u64::from(MIN_PAGE_SIZE))?)?;
-    vmm.receive(transport.receive()?)?;
-    transport.send(&vmm.shutdown()?)?;
-    vmm.receive(transport.receive()?)?;
-    if vmm.state() != PagerVmmState::Closed {
+    let first = client.page(region, PagerGeneration::new(1)?, 0, PageAccess::Read)?;
+    if first != PagerClientPage::Data(vec![REFERENCE_PAGE_BYTE; MIN_PAGE_SIZE as usize]) {
         return Err(PagerError::InvalidPeerState);
     }
-    Ok(())
+    if client.page(
+        region,
+        PagerGeneration::new(2)?,
+        u64::from(MIN_PAGE_SIZE),
+        PageAccess::Read,
+    )? != PagerClientPage::Zero
+    {
+        return Err(PagerError::InvalidPeerState);
+    }
+    client.remove(
+        region,
+        PagerGeneration::new(3)?,
+        0,
+        u64::from(MIN_PAGE_SIZE),
+    )?;
+    if client.page(region, PagerGeneration::new(4)?, 0, PageAccess::Read)? != PagerClientPage::Zero
+    {
+        return Err(PagerError::InvalidPeerState);
+    }
+    client.shutdown()
 }
 
 fn verify_block_control_in_containment(

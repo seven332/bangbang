@@ -82,6 +82,15 @@ impl MachLazyMapping {
     ) -> Result<(), MachLazyError> {
         imp::mapping_hide(self.raw, region_index, offset, length)
     }
+
+    pub(crate) fn zero_hidden(
+        &self,
+        region_index: usize,
+        offset: usize,
+        length: usize,
+    ) -> Result<(), MachLazyError> {
+        imp::mapping_zero_hidden(self.raw, region_index, offset, length)
+    }
 }
 
 impl std::fmt::Debug for MachLazyMapping {
@@ -206,6 +215,12 @@ mod imp {
             offset: usize,
             length: usize,
         ) -> i32;
+        fn bangbang_mach_lazy_mapping_zero_hidden(
+            mapping: *mut c_void,
+            region_index: usize,
+            offset: usize,
+            length: usize,
+        ) -> i32;
         fn bangbang_mach_lazy_mapping_publish(
             mapping: *mut c_void,
             region_index: usize,
@@ -288,6 +303,19 @@ mod imp {
         // revoking its original mapping permissions.
         status_result(unsafe {
             bangbang_mach_lazy_mapping_hide(mapping.as_ptr(), region_index, offset, length)
+        })
+    }
+
+    pub(super) fn mapping_zero_hidden(
+        mapping: NonNull<c_void>,
+        region_index: usize,
+        offset: usize,
+        length: usize,
+    ) -> Result<(), MachLazyError> {
+        // SAFETY: the native owner validates the exact retained alias range,
+        // writes every byte, and fences without opening primary permissions.
+        status_result(unsafe {
+            bangbang_mach_lazy_mapping_zero_hidden(mapping.as_ptr(), region_index, offset, length)
         })
     }
 
@@ -384,6 +412,15 @@ mod imp {
     }
 
     pub(super) fn mapping_hide(
+        _mapping: NonNull<c_void>,
+        _region_index: usize,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<(), MachLazyError> {
+        Err(MachLazyError::Operation)
+    }
+
+    pub(super) fn mapping_zero_hidden(
         _mapping: NonNull<c_void>,
         _region_index: usize,
         _offset: usize,

@@ -11,7 +11,9 @@ use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
 use crate::exit::{
     HvfExceptionExit, HvfLazyGuestAccess, HvfLazyGuestFault, HvfLazyGuestFaultCandidate,
 };
-use crate::lazy_host_fault::{HvfLazyHostFaultError, HvfLazyPageResolution, HvfLazyPageResolver};
+use crate::lazy_host_fault::{
+    HvfLazyHostFaultError, HvfLazyPageResolution, HvfLazyPageResolutionLease, HvfLazyPageResolver,
+};
 use crate::memory::{
     HvfGuestMemoryMappingError, HvfMemoryMapper, HvfMemoryPermissions, host_page_size,
 };
@@ -162,13 +164,14 @@ impl HvfHandledLazyGuestFault {
 trait LazyGuestPageResolver: fmt::Debug + Send + Sync {
     fn resolve(
         &self,
-        address: GuestAddress,
+        addresses: &[GuestAddress],
         access: PageAccess,
-    ) -> Result<HvfLazyPageResolution, HvfLazyGuestResolutionFailure>;
+    ) -> Result<HvfLazyPageResolutionLease, HvfLazyGuestResolutionFailure>;
 
     fn synchronize_instruction(
         &self,
         address: GuestAddress,
+        lease: &HvfLazyPageResolutionLease,
     ) -> Result<(), HvfLazyGuestResolutionFailure>;
 
     fn fail_closed(&self);
@@ -182,10 +185,13 @@ struct NoopLazyGuestPageResolver;
 impl LazyGuestPageResolver for NoopLazyGuestPageResolver {
     fn resolve(
         &self,
-        _address: GuestAddress,
+        addresses: &[GuestAddress],
         _access: PageAccess,
-    ) -> Result<HvfLazyPageResolution, HvfLazyGuestResolutionFailure> {
-        Ok(HvfLazyPageResolution::Present)
+    ) -> Result<HvfLazyPageResolutionLease, HvfLazyGuestResolutionFailure> {
+        Ok(HvfLazyPageResolutionLease::untracked(vec![
+            HvfLazyPageResolution::Present;
+            addresses.len()
+        ]))
     }
 
     fn fail_closed(&self) {}
@@ -193,6 +199,7 @@ impl LazyGuestPageResolver for NoopLazyGuestPageResolver {
     fn synchronize_instruction(
         &self,
         _address: GuestAddress,
+        _lease: &HvfLazyPageResolutionLease,
     ) -> Result<(), HvfLazyGuestResolutionFailure> {
         Ok(())
     }
@@ -201,10 +208,10 @@ impl LazyGuestPageResolver for NoopLazyGuestPageResolver {
 impl LazyGuestPageResolver for HvfLazyPageResolver {
     fn resolve(
         &self,
-        address: GuestAddress,
+        addresses: &[GuestAddress],
         access: PageAccess,
-    ) -> Result<HvfLazyPageResolution, HvfLazyGuestResolutionFailure> {
-        self.resolve_guest_address(address, access)
+    ) -> Result<HvfLazyPageResolutionLease, HvfLazyGuestResolutionFailure> {
+        self.resolve_guest_pages_leased(addresses, access)
             .map_err(|error| HvfLazyGuestResolutionFailure::from(&error))
     }
 
@@ -215,8 +222,9 @@ impl LazyGuestPageResolver for HvfLazyPageResolver {
     fn synchronize_instruction(
         &self,
         address: GuestAddress,
+        lease: &HvfLazyPageResolutionLease,
     ) -> Result<(), HvfLazyGuestResolutionFailure> {
-        self.synchronize_instruction_page(address)
+        self.synchronize_instruction_page(address, lease)
             .map_err(|error| HvfLazyGuestResolutionFailure::from(&error))
     }
 }
@@ -439,41 +447,45 @@ impl HvfLazyGuestFaultHandler {
         };
         let required_permissions = required_permissions(fault.access());
 
-        {
-            let mut state = self.lock_state()?;
-            state.ensure_active()?;
-            if pages_have_permissions(&state, region, first_page, last_page, required_permissions)?
-            {
-                admit_stale_or_fail(&mut state, member_index, admission)?;
-                return Ok(Some(HvfHandledLazyGuestFault {
-                    fault,
-                    populated_pages: 0,
-                    permission_changes: 0,
-                    stale_exit: true,
-                }));
-            }
-        }
-
         let resolver_access = match fault.access() {
             HvfLazyGuestAccess::Read | HvfLazyGuestAccess::Execute => PageAccess::Read,
             HvfLazyGuestAccess::Write => PageAccess::Write,
         };
-        let mut populated_pages = 0_usize;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(last_page - first_page + 1)
+            .map_err(|_| {
+                HvfLazyGuestFaultError::InvalidState(
+                    "lazy guest resolution page metadata allocation failed",
+                )
+            })?;
         for page_index in first_page..=last_page {
-            let page = region_page_address(region, self.page_size, page_index)?;
-            match self.resolver.resolve(page, resolver_access) {
-                Ok(HvfLazyPageResolution::Populated) => populated_pages += 1,
-                Ok(HvfLazyPageResolution::Present) => {}
-                Err(failure) => {
-                    self.poison_after_failure();
-                    return Err(HvfLazyGuestFaultError::Resolution { failure });
-                }
-            }
+            pages.push(region_page_address(region, self.page_size, page_index)?);
         }
+        let resolution_lease = match self.resolver.resolve(&pages, resolver_access) {
+            Ok(lease) => lease,
+            Err(failure) => {
+                self.poison_after_failure();
+                return Err(HvfLazyGuestFaultError::Resolution { failure });
+            }
+        };
+        if resolution_lease.resolutions().len() != pages.len() {
+            self.poison_after_failure();
+            return Err(HvfLazyGuestFaultError::InvalidState(
+                "lazy guest resolver returned incomplete page metadata",
+            ));
+        }
+        let populated_pages = resolution_lease
+            .resolutions()
+            .iter()
+            .filter(|resolution| **resolution == HvfLazyPageResolution::Populated)
+            .count();
         if fault.access() == HvfLazyGuestAccess::Execute {
-            for page_index in first_page..=last_page {
-                let page = region_page_address(region, self.page_size, page_index)?;
-                if let Err(failure) = self.resolver.synchronize_instruction(page) {
+            for page in &pages {
+                if let Err(failure) = self
+                    .resolver
+                    .synchronize_instruction(*page, &resolution_lease)
+                {
                     self.poison_after_failure();
                     return Err(HvfLazyGuestFaultError::Resolution { failure });
                 }
@@ -510,6 +522,7 @@ impl HvfLazyGuestFaultHandler {
             *permissions = next;
             permission_changes += 1;
         }
+        drop(resolution_lease);
 
         let stale_exit = permission_changes == 0;
         if stale_exit {
@@ -528,6 +541,52 @@ impl HvfLazyGuestFaultHandler {
             permission_changes,
             stale_exit,
         }))
+    }
+
+    pub(crate) fn revoke(&self, range: GuestMemoryRange) -> Result<(), HvfLazyGuestFaultError> {
+        if range.validate_alignment(self.page_size).is_err() {
+            return Err(HvfLazyGuestFaultError::InvalidState(
+                "lazy guest revocation range is not coordinator-page aligned",
+            ));
+        }
+        let (region, first_page, last_page) = self
+            .regions
+            .iter()
+            .copied()
+            .find_map(|region| {
+                self.page_span(region, range)
+                    .map(|(_, first, last)| (region, first, last))
+            })
+            .ok_or(HvfLazyGuestFaultError::InvalidState(
+                "lazy guest revocation range is not owned",
+            ))?;
+        let mut state = self.lock_state()?;
+        state.ensure_active()?;
+        let empty = HvfMemoryPermissions::new(false, false, false);
+        if let Err(source) = self.mapper.protect_region(range, empty) {
+            state.status = HandlerStatus::Poisoned;
+            drop(state);
+            self.resolver.fail_closed();
+            return Err(HvfLazyGuestFaultError::Protection {
+                page: range.start(),
+                source,
+            });
+        }
+        for page_index in first_page..=last_page {
+            let global_page = region.first_page.checked_add(page_index).ok_or(
+                HvfLazyGuestFaultError::InvalidState("lazy guest page index overflowed"),
+            )?;
+            let permissions = state.page_permissions.get_mut(global_page).ok_or(
+                HvfLazyGuestFaultError::InvalidState("lazy guest permission page disappeared"),
+            )?;
+            *permissions = empty;
+        }
+        for last in &mut state.last_admitted {
+            if last.is_some_and(|admission| admission.range.overlaps(range)) {
+                *last = None;
+            }
+        }
+        Ok(())
     }
 
     fn owned_page_span(
@@ -667,27 +726,6 @@ impl HandlerState {
     }
 }
 
-fn pages_have_permissions(
-    state: &HandlerState,
-    region: LazyGuestRegion,
-    first_page: usize,
-    last_page: usize,
-    required: HvfMemoryPermissions,
-) -> Result<bool, HvfLazyGuestFaultError> {
-    for page_index in first_page..=last_page {
-        let global_page = region.first_page.checked_add(page_index).ok_or(
-            HvfLazyGuestFaultError::InvalidState("lazy guest page index overflowed"),
-        )?;
-        let permissions = state.page_permissions.get(global_page).copied().ok_or(
-            HvfLazyGuestFaultError::InvalidState("lazy guest permission page disappeared"),
-        )?;
-        if !permissions.contains(required) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 fn admit_stale_or_fail(
     state: &mut HandlerState,
     member_index: usize,
@@ -785,26 +823,39 @@ mod tests {
     impl LazyGuestPageResolver for RecordingResolver {
         fn resolve(
             &self,
-            address: GuestAddress,
+            addresses: &[GuestAddress],
             access: PageAccess,
-        ) -> Result<HvfLazyPageResolution, HvfLazyGuestResolutionFailure> {
-            self.events
-                .lock()
-                .expect("event log should lock")
-                .push(Event::Resolve {
-                    page: address,
-                    access,
-                });
+        ) -> Result<HvfLazyPageResolutionLease, HvfLazyGuestResolutionFailure> {
             if self.fail.swap(false, Ordering::AcqRel) {
+                if let Some(address) = addresses.first().copied() {
+                    self.events
+                        .lock()
+                        .expect("event log should lock")
+                        .push(Event::Resolve {
+                            page: address,
+                            access,
+                        });
+                }
                 return Err(HvfLazyGuestResolutionFailure::Source);
             }
             let mut populated = self.populated.lock().expect("page set should lock");
-            if populated.contains(&address) {
-                Ok(HvfLazyPageResolution::Present)
-            } else {
-                populated.push(address);
-                Ok(HvfLazyPageResolution::Populated)
+            let mut resolutions = Vec::with_capacity(addresses.len());
+            for address in addresses {
+                self.events
+                    .lock()
+                    .expect("event log should lock")
+                    .push(Event::Resolve {
+                        page: *address,
+                        access,
+                    });
+                if populated.contains(address) {
+                    resolutions.push(HvfLazyPageResolution::Present);
+                } else {
+                    populated.push(*address);
+                    resolutions.push(HvfLazyPageResolution::Populated);
+                }
             }
+            Ok(HvfLazyPageResolutionLease::untracked(resolutions))
         }
 
         fn fail_closed(&self) {
@@ -814,6 +865,7 @@ mod tests {
         fn synchronize_instruction(
             &self,
             address: GuestAddress,
+            _lease: &HvfLazyPageResolutionLease,
         ) -> Result<(), HvfLazyGuestResolutionFailure> {
             self.events
                 .lock()
@@ -1061,8 +1113,8 @@ mod tests {
         );
         assert_eq!(
             events.lock().expect("event log should lock").len(),
-            2,
-            "stale peer exits must not repeat resolver or protection work"
+            4,
+            "stale exits revalidate content but must not repeat protection work"
         );
     }
 
