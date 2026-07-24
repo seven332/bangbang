@@ -10,6 +10,7 @@ use crate::memory::{GuestAddress, GuestMemoryRange};
 /// Failure while creating or extending guest-memory dirty metadata.
 #[derive(Debug)]
 pub enum GuestMemoryDirtyTrackerError {
+    ProtectedLazyMemory,
     InvalidPageSize {
         page_size: u64,
     },
@@ -32,6 +33,9 @@ pub enum GuestMemoryDirtyTrackerError {
 impl fmt::Display for GuestMemoryDirtyTrackerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProtectedLazyMemory => {
+                formatter.write_str("protected lazy guest memory cannot enable dirty tracking")
+            }
             Self::InvalidPageSize { page_size } => {
                 write!(formatter, "invalid dirty-page size {page_size}")
             }
@@ -61,7 +65,8 @@ impl std::error::Error for GuestMemoryDirtyTrackerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MetadataAllocationFailed { source } => Some(source),
-            Self::InvalidPageSize { .. }
+            Self::ProtectedLazyMemory
+            | Self::InvalidPageSize { .. }
             | Self::UnalignedRegion { .. }
             | Self::EmptyRegions
             | Self::UnorderedOrOverlappingRegion { .. }

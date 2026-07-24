@@ -150,6 +150,18 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "HvfLazyPager",
         "writer-preferring",
         "removal during blocked population",
+        "Implemented protected lazy consumer boundary",
+        "LazyGuestMemoryConsumerProfile",
+        "claim_protected_consumer",
+        "HvfLazyGuestMemoryConsumer",
+        "map_lazy_guest_memory_with_consumer",
+        "native_snapshot_guest_memory",
+        "consumer:guest-memory-slices",
+        "consumer:vhost-user",
+        "consumer:snapshot-full-save",
+        "consumer:teardown",
+        "pager-consumer",
+        "signed_pager_consumer_chain_runs_inside_app_sandbox",
         "scripts/run-integration-tests.sh --test production_bundle -- pager_grant",
         "BBPAGER\\0",
         "cargo test -p bangbang-pager",
@@ -162,6 +174,75 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         assert!(
             contract.contains(required),
             "snapshot paging contract must pin {required}"
+        );
+    }
+
+    let consumer_rows = contract
+        .lines()
+        .filter(|line| line.starts_with("| consumer:"))
+        .collect::<Vec<_>>();
+    let expected_consumers = BTreeSet::from([
+        "consumer:balloon-control",
+        "consumer:balloon-reclaim",
+        "consumer:block-sync-async",
+        "consumer:boot-fdt",
+        "consumer:eager-file-regression",
+        "consumer:entropy",
+        "consumer:guest-memory-atomic",
+        "consumer:guest-memory-raw-pointer",
+        "consumer:guest-memory-slices",
+        "consumer:hvf-stage-two",
+        "consumer:memory-hotplug-control",
+        "consumer:memory-hotplug-topology",
+        "consumer:network-vmnet-mmds",
+        "consumer:pmem",
+        "consumer:public-memory-borrow",
+        "consumer:snapshot-dirty-diff",
+        "consumer:snapshot-full-save",
+        "consumer:snapshot-restore-population",
+        "consumer:teardown",
+        "consumer:transport-mmio-pci",
+        "consumer:vhost-user",
+        "consumer:virtqueue-core",
+        "consumer:vmgenid-vmclock-pvtime",
+        "consumer:vsock",
+    ]);
+    let actual_consumers = consumer_rows
+        .iter()
+        .map(|row| {
+            row.split('|')
+                .nth(1)
+                .expect("consumer row must have an identity column")
+                .trim()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        consumer_rows.len(),
+        expected_consumers.len(),
+        "snapshot paging consumer row count drifted"
+    );
+    assert_eq!(
+        actual_consumers, expected_consumers,
+        "snapshot paging consumer identity set drifted"
+    );
+    for row in consumer_rows {
+        assert_eq!(
+            row.split('|').count(),
+            7,
+            "consumer row must retain exactly five data columns: {row}"
+        );
+        assert!(
+            [
+                "bridged",
+                "resolver-only",
+                "preflight-rejected",
+                "gated",
+                "ordered-owner",
+                "unchanged",
+            ]
+            .iter()
+            .any(|disposition| row.ends_with(&format!("| {disposition} |"))),
+            "consumer row must retain a closed disposition: {row}"
         );
     }
 
@@ -217,6 +298,9 @@ fn snapshot_paging_feasibility_policy_is_stable() {
             .expect("checked lazy-memory coordinator source must be readable");
     for required in [
         "pub struct LazyGuestMemory",
+        "pub struct LazyGuestMemoryConsumer",
+        "pub struct LazyGuestMemoryConsumerProfile",
+        "pub unsafe fn claim_protected_consumer",
         "pub struct LazyPagePopulation",
         "pub struct LazyPagePublication",
         "pub struct LazyPageRemoval",
@@ -230,6 +314,8 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "nonblocking_terminal_signal_preserves_first_reason_during_removal",
         "nonblocking_terminal_signal_wakes_duplicate_population_waiters",
         "generation_exhaustion_is_owner_terminal",
+        "protected_consumer_is_one_shot_and_gates_mutating_memory_operations",
+        "consumer_profile_classifies_each_incompatible_behavior",
         "repeated_construction_and_destruction_leaves_no_retained_work",
     ] {
         assert!(
@@ -287,6 +373,9 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "pub trait HvfLazyPageSource",
         "pub struct HvfLazyPageResolver",
         "pub struct HvfLazyHostFaultBridge",
+        "pub struct HvfLazyGuestMemoryConsumer",
+        "into_guest_memory_consumer",
+        "composite_consumer_resolves_ordinary_access_and_is_send_sync",
         "resolve_host_address",
         "pub fn remove_pages",
         "begin_transition_write",
@@ -354,6 +443,7 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "hvf_lazy_guest_unowned_instruction_fault_keeps_existing_error_path",
         "hvf_lazy_guest_source_failure_keeps_stage_two_closed_and_cleans_up",
         "hvf_lazy_guest_run_cancellation_does_not_repeat_page_work",
+        "map_lazy_guest_memory_with_consumer",
         "bangbang_mach_test_handler_reinstall",
     ] {
         assert!(
@@ -370,6 +460,10 @@ fn snapshot_paging_feasibility_policy_is_stable() {
         "PagerClient::connect",
         "PagerClientPage::Zero",
         "PagerGeneration::new(4)",
+        "run_lazy_consumer_pager",
+        "claim_protected_consumer",
+        "VirtqueueAvailableRing::new",
+        "write_snapshot_memory_image",
     ] {
         assert!(
             contained_probe.contains(required),

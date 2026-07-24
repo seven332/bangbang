@@ -5741,6 +5741,20 @@ fn signed_pager_grant_completes_and_repeats_under_unchanged_entitlements() {
 }
 
 #[test]
+fn signed_pager_consumer_chain_runs_inside_app_sandbox() {
+    let bundle = grant_test_bundle();
+    let fixture = PagerGrantFixture::new("consumer-chain");
+    let mut peer = fixture.start_peer("complete");
+    let output = run_pager_probe(&bundle, &fixture, "pager-consumer");
+
+    assert_output_success(&output, "signed contained pager consumer probe");
+    assert_pager_output_redacted(&output, &fixture);
+    peer.wait_success("pager consumer reference peer");
+    fixture.clear_socket();
+    assert!(session_entries().is_empty());
+}
+
+#[test]
 fn signed_pager_grant_covers_cancellation_and_terminal_shutdown() {
     let bundle = grant_test_bundle();
     for (index, (peer_mode, probe_case)) in

@@ -1317,11 +1317,14 @@ boot cases cover execute/read/write population, failure, cancellation, and
 cleanup, including one deliberately concurrent two-vCPU page request and an
 unowned instruction fault that retains the existing error path.
 
-Later integrations connect the coordinator to the protocol and have the
-launcher supply only the connected stream. Native-v1 `Uffd` remains rejected
-before resource access until #1527's restore gate; brokerage, peer
-removal/failure, consumer gating, restore, and final signed certification
-remain nonterminal.
+The coordinator is now connected to the protocol through the launcher's
+connected-stream grant, and ordered peer removal/failure plus the checked
+consumer boundary are implemented. A one-shot protected view covers
+in-process slice/atomic/raw/device/full-snapshot access under the Mach bridge;
+shared/export, dirty, ordinary balloon discard, dynamic topology, and public
+memory-borrow paths reject before escape. Native-v1 `Uffd` remains rejected
+before resource access until #1527's restore gate; restore and final signed
+certification remain nonterminal.
 
 ### Implemented public native-v1 restore order
 

@@ -585,8 +585,14 @@ lifecycle evidence. #1550 adds zero-permission lazy HVF mappings, exact owned
 data/instruction-fault mediation, resolve-before-permission ordering,
 serialized least-permission union, instruction-cache synchronization,
 multi-vCPU coalescing, and signed execute/read/write/failure/cancellation/guest-
-entry evidence. Peer wiring, consumer certification, and public restore remain
-open, so the current overlay remains 228/169/4/17.
+entry evidence. #1551 adds the contained connected-peer grant and bounded
+reference peer; #1552 adds ordered host/guest removal, zero refault, and stable
+peer-failure propagation. #1553 adds the checked complete consumer table, a
+one-shot protected ordinary-memory view, mutation/export/profile gates, an HVF
+composite retained through partial cleanup, closed public memory borrows, and a
+signed App Sandbox slice/raw/atomic/virtqueue/full-snapshot/removal chain.
+Public restore and final certification remain open, so the current overlay
+remains 228/169/4/17.
 
 ## Commands
 

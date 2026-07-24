@@ -14,7 +14,7 @@ use crate::gic::{
     RealHvfGicCreator,
 };
 use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
-use crate::lazy_host_fault::HvfLazyPageResolver;
+use crate::lazy_host_fault::{HvfLazyGuestMemoryConsumer, HvfLazyPageResolver};
 use crate::memory::{
     HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping, HvfMemoryMapper,
     HvfMemoryPermissions, HvfPmemFlushExecutor, HvfVirtioMemMappingCaptureError,
@@ -38,6 +38,7 @@ pub struct HvfBackend {
     vm_created: bool,
     guest_memory: Option<HvfGuestMemoryMapping>,
     lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
+    lazy_guest_memory_consumer: Option<HvfLazyGuestMemoryConsumer>,
     gic: Option<HvfGicMetadata>,
     gic_msi_signaler: Option<HvfGicMsiSignaler>,
     vcpu_topology_started: bool,
@@ -51,6 +52,7 @@ impl Default for HvfBackend {
             vm_created: false,
             guest_memory: None,
             lazy_guest_fault_handler: None,
+            lazy_guest_memory_consumer: None,
             gic: None,
             gic_msi_signaler: None,
             vcpu_topology_started: false,
@@ -109,6 +111,20 @@ impl HvfBackend {
         }
 
         self.map_lazy_guest_memory_with_configured_mapper(resolver, permissions)
+    }
+
+    /// Map protected lazy memory while retaining the only view available to
+    /// ordinary in-process device and snapshot consumers.
+    pub fn map_lazy_guest_memory_with_consumer(
+        &mut self,
+        consumer: HvfLazyGuestMemoryConsumer,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        if !Self::is_supported_target() {
+            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        }
+
+        self.map_lazy_guest_memory_consumer_with_configured_mapper(consumer, permissions)
     }
 
     pub(crate) fn map_guest_memory_with_pmem_devices(
@@ -173,6 +189,7 @@ impl HvfBackend {
 
         self.guest_memory = None;
         self.lazy_guest_fault_handler = None;
+        self.lazy_guest_memory_consumer = None;
         Ok(())
     }
 
@@ -230,12 +247,26 @@ impl HvfBackend {
     }
 
     pub(crate) fn mapped_guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
+        if let Some(consumer) = &self.lazy_guest_memory_consumer {
+            return Ok(consumer.memory());
+        }
         self.guest_memory
             .as_ref()
             .ok_or(HvfGuestMemoryMappingError::InvalidState(
                 GUEST_MEMORY_NOT_MAPPED_MESSAGE,
             ))?
             .memory()
+    }
+
+    pub(crate) fn mapped_guest_memory_for_public_access(
+        &self,
+    ) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
+        if self.lazy_guest_memory_consumer.is_some() {
+            return Err(HvfGuestMemoryMappingError::InvalidState(
+                "direct guest-memory borrowing is unavailable for lazy guest memory",
+            ));
+        }
+        self.mapped_guest_memory()
     }
 
     pub(crate) fn capture_virtio_mem_mapping_state(
@@ -251,12 +282,26 @@ impl HvfBackend {
     pub(crate) fn mapped_guest_memory_mut(
         &mut self,
     ) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
+        if let Some(consumer) = &mut self.lazy_guest_memory_consumer {
+            return Ok(consumer.memory_mut());
+        }
         self.guest_memory
             .as_mut()
             .ok_or(HvfGuestMemoryMappingError::InvalidState(
                 GUEST_MEMORY_NOT_MAPPED_MESSAGE,
             ))?
             .memory_mut()
+    }
+
+    pub(crate) fn mapped_guest_memory_for_public_access_mut(
+        &mut self,
+    ) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
+        if self.lazy_guest_memory_consumer.is_some() {
+            return Err(HvfGuestMemoryMappingError::InvalidState(
+                "direct guest-memory borrowing is unavailable for lazy guest memory",
+            ));
+        }
+        self.mapped_guest_memory_mut()
     }
 
     pub(crate) fn mapped_guest_memory_and_virtio_mem_executor_mut(
@@ -594,6 +639,24 @@ impl HvfBackend {
         resolver: HvfLazyPageResolver,
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.map_lazy_guest_memory_with_optional_consumer(resolver, None, permissions)
+    }
+
+    fn map_lazy_guest_memory_consumer_with_configured_mapper(
+        &mut self,
+        consumer: HvfLazyGuestMemoryConsumer,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let resolver = consumer.resolver();
+        self.map_lazy_guest_memory_with_optional_consumer(resolver, Some(consumer), permissions)
+    }
+
+    fn map_lazy_guest_memory_with_optional_consumer(
+        &mut self,
+        resolver: HvfLazyPageResolver,
+        mut consumer: Option<HvfLazyGuestMemoryConsumer>,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
         self.validate_lazy_guest_memory_mapping_state()?;
         let handler = HvfLazyGuestFaultHandler::prepare(
             resolver.clone(),
@@ -611,18 +674,21 @@ impl HvfBackend {
                     handler.poison();
                     self.guest_memory = Some(mapping);
                     self.lazy_guest_fault_handler = Some(handler);
+                    self.lazy_guest_memory_consumer = consumer.take();
                     return Err(error);
                 }
                 if resolver.bind_guest_fault_handler(&handler).is_err() {
                     handler.poison();
                     self.guest_memory = Some(mapping);
                     self.lazy_guest_fault_handler = Some(handler);
+                    self.lazy_guest_memory_consumer = consumer.take();
                     return Err(HvfGuestMemoryMappingError::InvalidState(
                         "lazy guest fault handler binding failed",
                     ));
                 }
                 self.guest_memory = Some(mapping);
                 self.lazy_guest_fault_handler = Some(handler);
+                self.lazy_guest_memory_consumer = consumer.take();
                 Ok(())
             }
             Err(failed_mapping) => {
@@ -630,6 +696,7 @@ impl HvfBackend {
                 if failed_mapping.mapping.has_mapped_regions() {
                     self.guest_memory = Some(failed_mapping.mapping);
                     self.lazy_guest_fault_handler = Some(handler);
+                    self.lazy_guest_memory_consumer = consumer.take();
                 }
                 Err(failed_mapping.error)
             }
@@ -708,6 +775,7 @@ impl HvfBackend {
             vm_created: false,
             guest_memory: None,
             lazy_guest_fault_handler: None,
+            lazy_guest_memory_consumer: None,
             gic: None,
             gic_msi_signaler: None,
             vcpu_topology_started: false,
@@ -722,6 +790,7 @@ impl HvfBackend {
             vm_created: false,
             guest_memory: None,
             lazy_guest_fault_handler: None,
+            lazy_guest_memory_consumer: None,
             gic: None,
             gic_msi_signaler: None,
             vcpu_topology_started: false,
@@ -799,6 +868,8 @@ impl Drop for HvfBackend {
     fn drop(&mut self) {
         if self.vm_created {
             let mut mapping_after_failed_unmap = None;
+            let lazy_handler = self.lazy_guest_fault_handler.take();
+            let lazy_consumer = self.lazy_guest_memory_consumer.take();
 
             if let Some(signaler) = &self.gic_msi_signaler {
                 signaler.deactivate();
@@ -813,9 +884,21 @@ impl Drop for HvfBackend {
             self.vm_created = false;
             self.clear_vm_owned_state();
 
-            if vm_destroyed && let Some(mapping) = mapping_after_failed_unmap {
+            if vm_destroyed && let Some(mapping) = mapping_after_failed_unmap.take() {
                 mapping.release_after_vm_destroy();
             }
+            if !vm_destroyed && mapping_after_failed_unmap.is_some() {
+                // The VM may still retain stage-two references after both
+                // unmap and destruction fail. Preserve every host and fault
+                // owner rather than releasing memory that HVF may still use.
+                std::mem::forget(mapping_after_failed_unmap);
+                std::mem::forget(lazy_handler);
+                std::mem::forget(lazy_consumer);
+                return;
+            }
+            drop(mapping_after_failed_unmap);
+            drop(lazy_handler);
+            drop(lazy_consumer);
         }
     }
 }
@@ -827,7 +910,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use bangbang_pager::{MAX_FRAME_BYTES, PagerLimits, PagerOperations, PagerRegionId};
     use bangbang_runtime::BackendError;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use bangbang_runtime::lazy_memory::{
+        LazyGuestMemory, LazyGuestMemoryLimits, LazyGuestMemoryRegion,
+    };
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
@@ -838,6 +927,11 @@ mod tests {
 
     use super::HvfBackend;
     use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::lazy_host_fault::{
+        HvfLazyGuestMemoryConsumer, HvfLazyHostFaultBridge, HvfLazyPageContents,
+        HvfLazyPageRequest, HvfLazyPageSource, HvfLazyPageSourceError, MACH_LAZY_TEST_LOCK,
+    };
     use crate::memory::{
         HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfMappedGuestMemoryRegion,
         HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions, host_page_size,
@@ -857,6 +951,58 @@ mod tests {
 
     fn page_size() -> u64 {
         host_page_size().expect("host page size should be available for tests")
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct ZeroLazyPageSource;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl HvfLazyPageSource for ZeroLazyPageSource {
+        fn page(
+            &self,
+            _request: HvfLazyPageRequest,
+        ) -> Result<HvfLazyPageContents, HvfLazyPageSourceError> {
+            Ok(HvfLazyPageContents::zero())
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn lazy_consumer(region_count: u16) -> HvfLazyGuestMemoryConsumer {
+        let page_size =
+            u32::try_from(page_size()).expect("host page size should fit the pager protocol");
+        let pager = PagerLimits::new(
+            page_size,
+            region_count,
+            region_count,
+            u32::try_from(MAX_FRAME_BYTES).expect("maximum frame size should fit u32"),
+            PagerOperations::v1(),
+        )
+        .expect("test pager limits should validate");
+        let limits = LazyGuestMemoryLimits::new(pager, u64::from(region_count), 8)
+            .expect("test lazy-memory limits should validate");
+        let mut regions = Vec::new();
+        for index in 0..region_count {
+            let offset = u64::from(index)
+                .checked_mul(u64::from(page_size))
+                .expect("test region offset should fit");
+            regions.push(
+                LazyGuestMemoryRegion::new(
+                    PagerRegionId::new(u32::from(index) + 1)
+                        .expect("test region identity should be nonzero"),
+                    range(0x8000_0000 + offset, u64::from(page_size)),
+                    offset,
+                    page_size,
+                )
+                .expect("test lazy region should validate"),
+            );
+        }
+        let memory = Arc::new(
+            LazyGuestMemory::new(limits, regions).expect("test lazy memory should construct"),
+        );
+        HvfLazyHostFaultBridge::install(memory, Arc::new(ZeroLazyPageSource))
+            .expect("test lazy host bridge should install")
+            .into_guest_memory_consumer()
+            .expect("test lazy consumer should claim once")
     }
 
     fn pmem_config(input: PmemConfigInput) -> PmemConfig {
@@ -1862,6 +2008,96 @@ mod tests {
         assert_eq!(mapper.unmap_count(), 2);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn lazy_composite_closes_public_borrows_and_survives_failed_unmap() {
+        let _test_lock = MACH_LAZY_TEST_LOCK
+            .lock()
+            .expect("Mach lazy test lock should not be poisoned");
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
+        backend.vm_created = true;
+        backend
+            .map_lazy_guest_memory_consumer_with_configured_mapper(
+                lazy_consumer(1),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("protected lazy consumer should map");
+
+        assert!(
+            backend
+                .mapped_guest_memory()
+                .expect("internal lazy memory should be available")
+                .is_protected_lazy()
+        );
+        assert!(matches!(
+            backend.mapped_guest_memory_for_public_access(),
+            Err(HvfGuestMemoryMappingError::InvalidState(
+                "direct guest-memory borrowing is unavailable for lazy guest memory"
+            ))
+        ));
+        assert!(matches!(
+            backend.mapped_guest_memory_for_public_access_mut(),
+            Err(HvfGuestMemoryMappingError::InvalidState(
+                "direct guest-memory borrowing is unavailable for lazy guest memory"
+            ))
+        ));
+
+        mapper.set_fail_unmap(true);
+        assert!(
+            backend
+                .unmap_guest_memory()
+                .expect_err("injected lazy unmap failure should be retained")
+                .to_string()
+                .contains("unmap")
+        );
+        assert!(backend.lazy_guest_memory_consumer.is_some());
+        assert!(
+            backend
+                .mapped_guest_memory()
+                .expect("consumer must remain after failed unmap")
+                .is_protected_lazy()
+        );
+
+        mapper.set_fail_unmap(false);
+        backend
+            .unmap_guest_memory()
+            .expect("retry should tear down guest mapping before host bridge");
+        assert!(backend.lazy_guest_memory_consumer.is_none());
+        assert_eq!(mapper.unmap_count(), 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn partial_lazy_mapping_retains_composite_until_cleanup() {
+        let _test_lock = MACH_LAZY_TEST_LOCK
+            .lock()
+            .expect("Mach lazy test lock should not be poisoned");
+        let mapper = Arc::new(RecordingMapper::default());
+        mapper.set_fail_map_call(Some(2));
+        mapper.set_fail_unmap(true);
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
+        backend.vm_created = true;
+
+        backend
+            .map_lazy_guest_memory_consumer_with_configured_mapper(
+                lazy_consumer(2),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect_err("second lazy mapping should fail");
+        assert!(backend.has_guest_memory_mapping());
+        assert!(backend.lazy_guest_memory_consumer.is_some());
+        assert!(backend.lazy_guest_fault_handler.is_some());
+
+        mapper.set_fail_map_call(None);
+        mapper.set_fail_unmap(false);
+        backend
+            .unmap_guest_memory()
+            .expect("partial lazy mapping should clean up while bridge is retained");
+        assert!(backend.lazy_guest_memory_consumer.is_none());
+        assert_eq!(mapper.unmap_count(), 2);
+    }
+
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     #[test]
     fn unsupported_target_rejects_vm_creation() {
@@ -1908,6 +2144,7 @@ mod tests {
                 state: Mutex::new(RecordingMapperState {
                     maps: Vec::new(),
                     unmaps: Vec::new(),
+                    fail_map_call: None,
                     fail_unmap,
                 }),
             }
@@ -1943,6 +2180,14 @@ mod tests {
                 .expect("state lock should not be poisoned")
                 .fail_unmap = fail_unmap;
         }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn set_fail_map_call(&self, fail_map_call: Option<usize>) {
+            self.state
+                .lock()
+                .expect("state lock should not be poisoned")
+                .fail_map_call = fail_map_call;
+        }
     }
 
     impl HvfMemoryMapper for RecordingMapper {
@@ -1951,11 +2196,14 @@ mod tests {
             request: HvfMemoryMapRequest,
             permissions: HvfMemoryPermissions,
         ) -> Result<(), BackendError> {
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .expect("state lock should not be poisoned")
-                .maps
-                .push((request, permissions));
+                .expect("state lock should not be poisoned");
+            state.maps.push((request, permissions));
+            if state.fail_map_call == Some(state.maps.len()) {
+                return Err(BackendError::Hypervisor("injected map failure".to_string()));
+            }
             Ok(())
         }
 
@@ -1991,6 +2239,7 @@ mod tests {
     struct RecordingMapperState {
         maps: Vec<(HvfMemoryMapRequest, HvfMemoryPermissions)>,
         unmaps: Vec<HvfMappedGuestMemoryRegion>,
+        fail_map_call: Option<usize>,
         fail_unmap: bool,
     }
 
