@@ -24,6 +24,7 @@ mod sme;
 mod snapshot;
 mod snapshot_bundle;
 mod snapshot_restore;
+mod snapshot_v2;
 mod startup;
 mod topology;
 mod vcpu;
@@ -36,7 +37,12 @@ pub use coordinator::{
     HvfVcpuRunControlReason, HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError, HvfVcpuRunEvent,
     HvfVcpuRunMemberOutcome, HvfVcpuRunMemberResult, HvfVcpuRunTerminalReport,
 };
-pub use cpu_template::{HvfArm64CpuTemplateError, HvfArm64CpuTemplateVcpuError};
+pub use cpu_template::{
+    HVF_ARM64_CPU_TEMPLATE_APPLICATION_MAX_ENTRIES, HvfArm64CpuTemplateApplicationEntry,
+    HvfArm64CpuTemplateApplicationState, HvfArm64CpuTemplateApplicationStateError,
+    HvfArm64CpuTemplateError, HvfArm64CpuTemplateRegisterTag, HvfArm64CpuTemplateValue,
+    HvfArm64CpuTemplateValueWidth, HvfArm64CpuTemplateVcpuError,
+};
 pub use dirty::{
     HvfDirtyWriteEpochResetError, HvfDirtyWriteFaultError, HvfDirtyWriteProtectionFailure,
     HvfDirtyWriteTracker, HvfDirtyWriteTrackerQueryError, HvfDirtyWriteTrackerStartError,
@@ -123,6 +129,14 @@ pub use snapshot_restore::{
     PrepareHvfSnapshotV1LoadError, PreparedHvfSnapshotV1LazyLoad, PreparedHvfSnapshotV1LazyState,
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1Memory, PreparedHvfSnapshotV1RuntimeRef,
     PreparedHvfSnapshotV1State,
+};
+pub use snapshot_v2::{
+    HVF_SNAPSHOT_V2_GIC_DEVICE_STATE_MAX_BYTES, HVF_SNAPSHOT_V2_MAX_BOOT_ARGUMENT_BYTES,
+    HVF_SNAPSHOT_V2_MAX_PATH_BYTES, HVF_SNAPSHOT_V2_MAX_SME_SVL_BYTES, HvfSnapshotV2BootState,
+    HvfSnapshotV2BuildError, HvfSnapshotV2DecodeError, HvfSnapshotV2EncodeError,
+    HvfSnapshotV2FdtState, HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
+    HvfSnapshotV2NativePath, HvfSnapshotV2PlatformState, HvfSnapshotV2VcpuState,
+    decode_hvf_snapshot_v2_platform_state, encode_hvf_snapshot_v2_platform_state,
 };
 pub use startup::{
     HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonCaptureState,

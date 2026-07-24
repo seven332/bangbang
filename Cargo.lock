@@ -139,6 +139,7 @@ dependencies = [
  "bangbang-pager",
  "bangbang-runtime",
  "cc",
+ "crc64",
  "device_tree",
  "libc",
  "plist",

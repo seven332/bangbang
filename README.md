@@ -495,12 +495,20 @@ failure/death/repeat cleanup, and the exact production entitlement floor.
 
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
-readable; the current `2.1.0` catalog adds exactly one semantic memory component
-whose bounded GPA extents bind a canonical 64-KiB-aligned image. Library callers
-can write that image or load it from one retained read-only `File` as writable
-`MAP_PRIVATE` regions, so pages arrive on demand and writes remain private. The
-state and fixed 64-KiB metadata are CRC-protected, but guest bytes deliberately
-are not checksummed or authenticated and require an external artifact
+readable, and `2.1.x` memory-only state remains readable with its exact paired
+image version. The current `2.2.0` writer adds a permanent typed HVF platform
+graph: singleton memory, machine, global, and topology components followed by
+contiguous per-vCPU components for up to 32 vCPUs. The graph retains inert boot
+metadata, redacted CPU-template application evidence, one VM-global GIC value,
+stable PSCI lifecycle state, complete mandatory vCPU state, and a closed
+reviewed debug/SME registry. Its directory profile is checked without
+payload-dependent allocation, every inner value is bounded, and the complete
+owned graph cross-validates before exposure; it still constructs no HVF
+resource. Library callers can separately write the bound 64-KiB-aligned memory
+image or load it from one retained read-only `File` as writable `MAP_PRIVATE`
+regions, so pages arrive on demand and writes remain private. State and fixed
+memory metadata are CRC-protected, but guest bytes deliberately are not
+checksummed or authenticated and require an external artifact
 authentication/encryption policy. No public create, load, describe, or version
 path emits or accepts v2 yet, and recognizing a pinned Firecracker bitcode
 prefix reports incompatibility rather than claiming decode or translation. The

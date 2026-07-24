@@ -6,7 +6,9 @@ use bangbang_runtime::machine::MAX_SUPPORTED_VCPUS;
 use bangbang_runtime::mmio::MmioDispatcher;
 
 use crate::coordinator::{HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError};
-use crate::cpu_template::{HvfArm64CpuTemplateError, PreparedHvfArm64CpuTemplate};
+use crate::cpu_template::{
+    HvfArm64CpuTemplateApplicationState, HvfArm64CpuTemplateError, PreparedHvfArm64CpuTemplate,
+};
 use crate::dirty::HvfDirtyWriteTracker;
 use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
 use crate::runner::{HvfVcpuMpidrAffinityStage, HvfVcpuRunner, HvfVcpuRunnerError};
@@ -317,13 +319,17 @@ impl<'vm> HvfVcpuTopology<'vm> {
         &self.mpidrs
     }
 
-    /// Preflight and apply one custom arm64 CPU template to the complete,
-    /// unpublished owner-thread topology.
-    pub(crate) fn apply_arm64_cpu_template(
+    /// Preflight and apply one custom arm64 CPU template, retaining the exact
+    /// common-baseline-derived state only after every owner verifies readback.
+    pub(crate) fn apply_arm64_cpu_template_with_state(
         &self,
         template: &PreparedHvfArm64CpuTemplate,
-    ) -> Result<(), HvfArm64CpuTemplateError> {
-        crate::cpu_template::apply_arm64_cpu_template(&self.runners, &self.mpidrs, template)
+    ) -> Result<HvfArm64CpuTemplateApplicationState, HvfArm64CpuTemplateError> {
+        crate::cpu_template::apply_arm64_cpu_template_with_state(
+            &self.runners,
+            &self.mpidrs,
+            template,
+        )
     }
 
     /// Consume this ordered topology into a concurrent bounded-run coordinator.

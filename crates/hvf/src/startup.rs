@@ -3171,6 +3171,7 @@ pub struct HvfArm64BootSession<'vm> {
     backend: &'vm mut HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    cpu_template_application: Option<crate::cpu_template::HvfArm64CpuTemplateApplicationState>,
     pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
     pci_data_devices: Option<HvfArm64BootPciDataDevices>,
     cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
@@ -3214,6 +3215,7 @@ pub struct OwnedHvfArm64BootSession {
     backend: HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    cpu_template_application: Option<crate::cpu_template::HvfArm64CpuTemplateApplicationState>,
     pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
     pci_data_devices: Option<HvfArm64BootPciDataDevices>,
     cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
@@ -7925,6 +7927,14 @@ impl HvfArm64BootSession<'_> {
         &self.runtime_resources
     }
 
+    /// Return retained evidence from a successful custom CPU-template
+    /// application, when startup configured one.
+    pub fn cpu_template_application(
+        &self,
+    ) -> Option<&crate::cpu_template::HvfArm64CpuTemplateApplicationState> {
+        self.cpu_template_application.as_ref()
+    }
+
     /// Publish and capture topology-ordered PVTime values after a pause barrier.
     ///
     /// This is a capture-ready handoff only; Wave 6 owns artifact encoding and
@@ -9550,6 +9560,7 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            cpu_template_application: prepared.cpu_template_application,
             pci_validation_endpoint: prepared.pci_validation_endpoint,
             pci_data_devices: prepared.pci_data_devices,
             cache_source: prepared.cache_source,
@@ -9892,6 +9903,7 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher,
             runtime_resources,
+            cpu_template_application: None,
             pci_validation_endpoint: None,
             pci_data_devices: None,
             cache_source,
@@ -10356,6 +10368,14 @@ impl OwnedHvfArm64BootSession {
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
         &self.runtime_resources
+    }
+
+    /// Return retained evidence from a successful custom CPU-template
+    /// application, when startup configured one.
+    pub fn cpu_template_application(
+        &self,
+    ) -> Option<&crate::cpu_template::HvfArm64CpuTemplateApplicationState> {
+        self.cpu_template_application.as_ref()
     }
 
     /// Publish and capture topology-ordered PVTime values after a pause barrier.
@@ -16688,6 +16708,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     runner: HvfArm64BootVcpuSession<'vm>,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    cpu_template_application: Option<crate::cpu_template::HvfArm64CpuTemplateApplicationState>,
     pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
     pci_data_devices: Option<HvfArm64BootPciDataDevices>,
     cache_source: crate::vcpu_config::HvfArm64VcpuCacheFdtSource,
@@ -16778,6 +16799,7 @@ impl HvfBackend {
             backend: self,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            cpu_template_application: prepared.cpu_template_application,
             pci_validation_endpoint: prepared.pci_validation_endpoint,
             pci_data_devices: prepared.pci_data_devices,
             cache_source: prepared.cache_source,
@@ -17062,11 +17084,11 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         .start_session_vcpu_topology(controller.machine_config().vcpu_count())
         .map_err(|source| HvfArm64BootSessionError::StartTopology { source })?;
     debug_assert_eq!(topology.mpidrs(), mpidrs);
-    if let Some(template) = cpu_template.as_ref() {
-        topology
-            .apply_arm64_cpu_template(template)
-            .map_err(|source| HvfArm64BootSessionError::CpuTemplate { source })?;
-    }
+    let cpu_template_application = cpu_template
+        .as_ref()
+        .map(|template| topology.apply_arm64_cpu_template_with_state(template))
+        .transpose()
+        .map_err(|source| HvfArm64BootSessionError::CpuTemplate { source })?;
     let mmio_dispatcher = Arc::new(Mutex::new(mmio_dispatcher));
     let coordinator = topology
         .into_run_coordinator(Arc::clone(&mmio_dispatcher), &[0])
@@ -17238,6 +17260,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         runner,
         mmio_dispatcher,
         runtime_resources: runtime,
+        cpu_template_application,
         pci_validation_endpoint,
         pci_data_devices,
         cache_source,

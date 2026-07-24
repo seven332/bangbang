@@ -7,10 +7,14 @@ snapshot and migration compatibility remains out of scope.
 
 The runtime library also has an isolated bangbang-native v2 state and lazy
 guest-memory foundation. The immutable `2.0.0` profile contains no semantic
-component; the current `2.1.0` profile adds one state-bound, demand-paged
-File/COW memory image. It is still not complete loadable VM state and is not
-emitted, described, or loaded by any public process path. The public lifecycle
-and CLI remain native-v1 until later Wave 6 work explicitly changes them.
+component, `2.1.x` adds one state-bound demand-paged File/COW memory image, and
+the current `2.2.0` profile adds a permanent typed multi-vCPU HVF platform
+graph. That graph is complete for the machine, compatibility/global GIC,
+stable topology, and reviewed vCPU state it represents, but it is not a
+loadable VM: it contains no general device aggregate and creates no HVF,
+owner-thread, clock/identity, or public lifecycle resource. It is not emitted,
+described, or loaded by any public process path. The public lifecycle and CLI
+remain native-v1 until later Wave 6 work explicitly changes them.
 Separately, `LazyGuestMemory` is the backend-neutral private-anonymous
 coordinator for the external-paging roadmap; it is not the v2 File/COW loader
 and now backs the narrow public native-v1 `Uffd` restore path on macOS Apple
@@ -239,10 +243,13 @@ directory and payload ranges validate. Patch changes do not alter semantics.
 The immutable production `2.0.0` catalogs are empty: its canonical fixture is
 the 64-byte header plus its eight-byte CRC, nonsemantic extensions can be
 structurally represented, and every required feature or semantic component
-rejects. The current writer emits `2.1.0`; its catalog adds semantic component
-kind `1`, introduced in minor 1, and the typed memory profile requires its sole
-instance to be `0`. The required-feature catalog remains empty because the
-semantic component itself is the mandatory compatibility identity. No other
+rejects. Minor 1 adds semantic memory kind `1`, whose typed profile requires
+its sole instance to be `0`. The current writer emits `2.2.0`; minor 2 adds
+semantic machine kind `2`, global kind `3`, topology kind `4`, and per-vCPU
+kind `5`. The required-feature catalog remains empty because those semantic
+component kinds are the mandatory compatibility identities. Decoded `2.1.x`
+memory bindings retain their exact admitted version so their unchanged paired
+image headers still validate; newly written bindings use `2.2.0`. No other
 identifier or future minor is reserved.
 
 Decoding first checks the fixed header, version, count caps, checked length and
@@ -273,7 +280,7 @@ binding header followed by one 24-byte entry per ordered guest extent:
 | Offset | Width | Field | Native-v2 memory rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | bytes `BANGM2A\0` |
-| 8..14 | 6 | semantic version | exact `2.1.0` |
+| 8..14 | 6 | semantic version | admitted `2.1.x` or `2.2.x`; current writer emits `2.2.0` |
 | 14 | 2 | header bytes | exact `64` |
 | 16 | 4 | flags | must be zero |
 | 20 | 4 | guest granule | exact `4096` bytes |
@@ -332,12 +339,84 @@ the complete state and memory artifacts outside this codec. After validation,
 the retained inode must remain immutable for the mapping lifetime; macOS offers
 no seal for an arbitrary external regular file, so concurrent external mutation
 or truncation violates the loader contract. Public native-v2 create/load,
-transactional pair publication, machine/vCPU/device state, Diff/merge,
-UFFD-equivalent runtime integration, and clone/portability policy remain
-follow-on work. The public feasibility decision is recorded separately in the
-checked
+transactional pair publication, general device state, destination resource
+construction, time/identity correction, Diff/merge, UFFD-equivalent runtime
+integration, and clone/portability policy remain follow-on work. The public
+feasibility decision is recorded separately in the checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md);
 File/COW remains a distinct backend.
+
+### Native V2 HVF Platform State Profile
+
+Minor 2 defines one exact, editor-friendly platform graph. Every directory
+entry is semantic, singleton kinds appear exactly once, and per-vCPU instances
+are contiguous:
+
+| Key | Payload | Cardinality |
+| --- | --- | --- |
+| `(1, 0)` | version-retaining memory binding above | exactly one |
+| `(2, 0)` | `BANGMC2\0` machine, inert boot/FDT, and CPU-application evidence | exactly one |
+| `(3, 0)` | `BANGGL2\0` common compatibility and one opaque VM-global GIC value | exactly one |
+| `(4, 0)` | `BANGTP2\0` stable topology and PSCI lifecycle state | exactly one |
+| `(5, i)` | `BANGVC2\0` complete state for vCPU index/MPIDR `i` | `i = 0..vcpu_count-1` |
+
+The borrowed directory scan requires 5–36 entries in that exact key order
+before any payload-dependent allocation. Each new payload then requires profile
+1, its exact fixed header size, zero flags/reserved fields, exact checked
+lengths, and complete consumption.
+
+Kind 2 stores the checked machine configuration, bounded native kernel/initrd
+path bytes, optional UTF-8 boot arguments, deterministic FDT placement/size and
+a redacted checksum identity. Paths are inert metadata: construction and decode
+neither resolve nor open them. A custom CPU-template receipt contains at most
+256 strictly tag-ordered entries. Each entry records a closed register tag,
+exact U32/U64/U128 width, logical filter/value, topology-wide common baseline,
+and the effective value already verified on every vCPU. The decoder rechecks
+width, canonical masked value, and
+`effective = (baseline & !filter) | logical_value`.
+
+Kind 3 directly stores common MIDR/MPIDR and reviewed identification registers,
+optional ZFR0/SMFR0 evidence, the cache manifest, primary MPIDR, GIC
+distributor/redistributor/SPI/timer/MSI metadata, RTC layout, and one nonempty
+opaque GIC byte string capped at 12 MiB. It deliberately does not reuse the
+native-v1 compatibility bytes: the native-v1 inactive-optional and fresh-RTC
+policy markers would contradict minor-2 active optional state.
+
+Kind 4 stores `1..=32` canonical members and preserves offline, runnable, or
+deferred PSCI `CPU_SUSPEND32/64` state. Kind 5 associates the same canonical
+index/MPIDR with the explicit policy-free native-v1 mandatory register field
+group, normalized timer state, pending IRQ/FIQ, vCPU-affine GIC ICC registers,
+and a reviewed optional registry. Reusing that mandatory field group changes no
+native-v1 outer byte or policy.
+
+The optional registry has a 64-byte `BANGOP2\0` header followed by at most 118
+records and 96 KiB. Each record has a `u16` tag, explicit-or-destination-default
+disposition, zero reserved bytes, exact `u32` architectural width, and payload
+only for explicit values. The closed sorted inventory is breakpoint values
+`1..=16`, breakpoint controls `17..=32`, watchpoint values `33..=48`,
+watchpoint controls `49..=64`, SME PSTATE `65`, SME system registers `66..=68`,
+Z0–Z31 `100..=131`, P0–P15 `132..=147`, ZA `148`, and SME2 ZT0 `149`.
+Implemented debug counts and active SME PSTATE determine the exact required
+subset. Unknown, missing, duplicate, unsorted, wrong-width, oversized, or
+feature-inapplicable records fail closed during a first allocation-free scan.
+Only then are bounded SME buffers allocated; the existing reviewed constructors
+recheck feature dependencies and Q/Z aliases. Maximum admitted SVL is the
+architectural 256 bytes.
+
+After local decoding, the owned graph validates deterministic machine-memory
+extents and FDT placement; topology/vCPU count, order, MPIDRs, primary identity,
+timer PPI, and redistributor capacity; common DFR0/SME evidence; and equality of
+mandatory versus reviewed SIMD/FP state. Encoding reruns the same graph
+validation. Native paths are capped at 4096 bytes, boot arguments at 2047
+bytes, and the maxima for 32 vCPUs, CPU evidence, optional registries, memory
+binding, and GIC remain below the independently enforced 16 MiB outer cap.
+Debug, display, and error values redact paths, arguments, register/CPU values,
+MPIDRs, checksums used as identities, and GIC bytes.
+
+The decoded value is still data only. It opens no artifact, creates no HVF VM
+or vCPU, starts no owner thread, maps no memory, and restores no device. Public
+native-v2 artifact publication and the transactional destination orchestration
+remain separate work.
 
 ### Stable Paused vCPU Topology State
 

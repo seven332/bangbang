@@ -93,7 +93,7 @@ fn canonical_test_directory_round_trips_borrowed_components() {
 }
 
 #[test]
-fn production_catalog_accepts_memory_and_nonsemantic_extensions() {
+fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensions() {
     let nonsemantic = [SnapshotV2Component::new(
         SnapshotV2ComponentKey::new(77, 3),
         SnapshotV2ComponentDisposition::NonSemantic,
@@ -104,22 +104,69 @@ fn production_catalog_accepts_memory_and_nonsemantic_extensions() {
     let decoded = decode_snapshot_v2_state(&encoded).expect("nonsemantic extension should decode");
     assert_eq!(decoded.components().collect::<Vec<_>>(), nonsemantic);
 
-    let memory = [SnapshotV2Component::new(
-        NATIVE_V2_MEMORY_COMPONENT_KEY,
-        SnapshotV2ComponentDisposition::Semantic,
-        b"semantic",
-    )];
-    let encoded_memory =
-        encode_snapshot_v2_state(&[], &memory).expect("memory component should encode");
+    let semantic = [
+        SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            b"memory",
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_MACHINE_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            b"machine",
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_GLOBAL_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            b"global",
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            b"topology",
+        ),
+        SnapshotV2Component::new(
+            native_v2_vcpu_component_key(0),
+            SnapshotV2ComponentDisposition::Semantic,
+            b"vcpu",
+        ),
+    ];
+    let encoded_semantic =
+        encode_snapshot_v2_state(&[], &semantic).expect("current semantic kinds should encode");
     assert_eq!(
-        decode_snapshot_v2_state(&encoded_memory)
-            .expect("memory component should decode")
-            .component(NATIVE_V2_MEMORY_COMPONENT_KEY),
-        Some(memory[0])
+        decode_snapshot_v2_state(&encoded_semantic)
+            .expect("current semantic kinds should decode")
+            .components()
+            .collect::<Vec<_>>(),
+        semantic
+    );
+
+    let version_one = SnapshotFormatVersion::new(2, 1, 0);
+    let machine = [SnapshotV2Component::new(
+        NATIVE_V2_MACHINE_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        b"machine",
+    )];
+    let premature_catalog = [CatalogEntry {
+        id: NATIVE_V2_MACHINE_COMPONENT_KEY.kind(),
+        introduced_minor: 0,
+    }];
+    let premature = encode_snapshot_v2_state_with_catalog_and_reserve(
+        &[],
+        &machine,
+        version_one,
+        &[],
+        &premature_catalog,
+        Vec::try_reserve_exact,
+    )
+    .expect("custom minor-one machine component should encode");
+    assert_eq!(
+        decode_snapshot_v2_state(&premature),
+        Err(SnapshotV2DecodeError::UnknownSemanticComponent)
     );
 
     let unknown = [SnapshotV2Component::new(
-        SnapshotV2ComponentKey::new(2, 3),
+        SnapshotV2ComponentKey::new(77, 3),
         SnapshotV2ComponentDisposition::Semantic,
         b"semantic",
     )];
@@ -128,9 +175,21 @@ fn production_catalog_accepts_memory_and_nonsemantic_extensions() {
         Err(SnapshotV2EncodeError::UnknownSemanticComponent)
     ));
 
-    let encoded_semantic = encode_test_state(&[], &unknown);
+    let unknown_catalog = [CatalogEntry {
+        id: 77,
+        introduced_minor: 0,
+    }];
+    let encoded_unknown = encode_snapshot_v2_state_with_catalog_and_reserve(
+        &[],
+        &unknown,
+        NATIVE_V2_SNAPSHOT_VERSION,
+        &[],
+        &unknown_catalog,
+        Vec::try_reserve_exact,
+    )
+    .expect("custom catalog should encode the unknown production kind");
     assert_eq!(
-        decode_snapshot_v2_state(&encoded_semantic),
+        decode_snapshot_v2_state(&encoded_unknown),
         Err(SnapshotV2DecodeError::UnknownSemanticComponent)
     );
 }
@@ -191,11 +250,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 2);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 3);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 2, 0),
+            found: SnapshotFormatVersion::new(2, 3, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );
