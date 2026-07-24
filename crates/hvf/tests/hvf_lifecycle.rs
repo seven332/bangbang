@@ -3922,6 +3922,267 @@ fn captures_arm64_sme_system_registers_on_runner_thread() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn restores_reviewed_optional_arm64_state_on_runner_thread() {
+    use bangbang_hvf::{
+        HvfArm64DebugRegisterRestoreState, HvfArm64OptionalStateValue,
+        HvfArm64ReviewedOptionalStateRestore, HvfArm64SmeRestoreState,
+        HvfArm64SmeRestoreStateInput, HvfArm64VcpuBreakpointRegisterState,
+        HvfArm64VcpuSmePRegisterState, HvfArm64VcpuSmePstate, HvfArm64VcpuSmeSystemRegisterState,
+        HvfArm64VcpuSmeZRegisterState, HvfArm64VcpuWatchpointRegisterState, HvfBackend,
+        HvfVcpuRunnerError,
+    };
+    use bangbang_runtime::VmBackend;
+
+    fn breakpoint_restore(
+        state: &HvfArm64VcpuBreakpointRegisterState,
+    ) -> HvfArm64DebugRegisterRestoreState {
+        let mut values = [HvfArm64OptionalStateValue::DestinationDefault; 16];
+        let mut controls = [HvfArm64OptionalStateValue::DestinationDefault; 16];
+        for (destination, value) in values.iter_mut().zip(state.breakpoint_value_registers()) {
+            *destination = HvfArm64OptionalStateValue::Explicit(*value);
+        }
+        for (destination, control) in controls
+            .iter_mut()
+            .zip(state.breakpoint_control_registers())
+        {
+            assert_eq!(control & 1, 0, "fresh breakpoint controls must be disabled");
+            *destination = HvfArm64OptionalStateValue::Explicit(*control);
+        }
+        HvfArm64DebugRegisterRestoreState::try_new(
+            state.implemented_breakpoint_count(),
+            values,
+            controls,
+        )
+        .expect("captured breakpoint inventory should be valid")
+    }
+
+    fn watchpoint_restore(
+        state: &HvfArm64VcpuWatchpointRegisterState,
+    ) -> HvfArm64DebugRegisterRestoreState {
+        let mut values = [HvfArm64OptionalStateValue::DestinationDefault; 16];
+        let mut controls = [HvfArm64OptionalStateValue::DestinationDefault; 16];
+        for (destination, value) in values.iter_mut().zip(state.watchpoint_value_registers()) {
+            *destination = HvfArm64OptionalStateValue::Explicit(*value);
+        }
+        for (destination, control) in controls
+            .iter_mut()
+            .zip(state.watchpoint_control_registers())
+        {
+            assert_eq!(control & 1, 0, "fresh watchpoint controls must be disabled");
+            *destination = HvfArm64OptionalStateValue::Explicit(*control);
+        }
+        HvfArm64DebugRegisterRestoreState::try_new(
+            state.implemented_watchpoint_count(),
+            values,
+            controls,
+        )
+        .expect("captured watchpoint inventory should be valid")
+    }
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        let identification = runner
+            .capture_arm64_identification_register_state()
+            .expect("destination identification should be captured");
+        let breakpoints = runner
+            .capture_arm64_breakpoint_register_state()
+            .expect("fresh breakpoint state should be captured");
+        let watchpoints = runner
+            .capture_arm64_watchpoint_register_state()
+            .expect("fresh watchpoint state should be captured");
+        let simd_fp = runner
+            .capture_arm64_simd_fp_state()
+            .expect("fresh SIMD/FP state should be captured");
+        let fresh_pstate =
+            assert_sme_pstate_capture_supported_or_unavailable(runner.capture_arm64_sme_pstate())
+                .expect("SME PSTATE should be captured or report unavailable");
+
+        let (expected_sme_version, sme, expected_z, expected_sme_system) =
+            if let Some(fresh_pstate) = fresh_pstate {
+                assert!(
+                    !fresh_pstate.streaming_sve_mode_enabled()
+                        && !fresh_pstate.za_storage_enabled(),
+                    "a new vCPU should expose inactive SME PSTATE"
+                );
+                let version = u8::try_from((identification.id_aa64pfr1_el1() >> 24) & 0xf)
+                    .expect("SME version field should fit in u8");
+                assert!(
+                    version <= 2,
+                    "reviewed restore should reject an unknown SME feature version"
+                );
+                let configuration = assert_sme_configuration_supported_or_unavailable(
+                    HvfBackend::arm64_sme_configuration(),
+                )
+                .expect("SME configuration query should not fail")
+                .expect("available SME PSTATE should have an SME configuration");
+                let maximum_svl_bytes = configuration.max_svl_bytes();
+                let sme_identification = runner
+                    .capture_arm64_sve_sme_identification_register_state()
+                    .expect("SVE/SME identification should be captured");
+                let sme_system = runner
+                    .capture_arm64_sme_system_register_state()
+                    .expect("fresh SME system state should be captured");
+                let expected_z: Vec<Box<[u8]>> = simd_fp
+                    .q_registers()
+                    .iter()
+                    .map(|q_register| {
+                        let mut value = vec![0; maximum_svl_bytes];
+                        value
+                            .get_mut(..16)
+                            .expect("maximum SVL should contain the Q alias")
+                            .copy_from_slice(q_register);
+                        value.into_boxed_slice()
+                    })
+                    .collect();
+                let z_registers = expected_z
+                    .iter()
+                    .cloned()
+                    .map(HvfArm64OptionalStateValue::Explicit)
+                    .collect();
+                let input = HvfArm64SmeRestoreStateInput::new(
+                    version,
+                    sme_identification,
+                    maximum_svl_bytes,
+                    HvfArm64OptionalStateValue::Explicit(HvfArm64VcpuSmePstate::new(true, true)),
+                    [HvfArm64OptionalStateValue::DestinationDefault; 3],
+                )
+                .with_streaming_registers(
+                    z_registers,
+                    vec![HvfArm64OptionalStateValue::DestinationDefault; 16],
+                )
+                .with_za_register(
+                    HvfArm64OptionalStateValue::DestinationDefault,
+                    (version >= 1).then_some(HvfArm64OptionalStateValue::DestinationDefault),
+                );
+                let sme = HvfArm64SmeRestoreState::try_new(input, &simd_fp)
+                    .expect("fresh-host SME restore state should be valid");
+                (Some(version), Some(sme), Some(expected_z), Some(sme_system))
+            } else {
+                assert_eq!(
+                    (identification.id_aa64pfr1_el1() >> 24) & 0xf,
+                    0xf,
+                    "unavailable SME state should agree with virtual identification"
+                );
+                (None, None, None, None)
+            };
+
+        let request = HvfArm64ReviewedOptionalStateRestore::try_new(
+            identification.id_aa64dfr0_el1(),
+            expected_sme_version,
+            breakpoint_restore(&breakpoints),
+            watchpoint_restore(&watchpoints),
+            sme,
+            simd_fp.clone(),
+        )
+        .expect("fresh reviewed optional-state request should be valid");
+        let second_attempt = request.clone();
+
+        runner
+            .restore_arm64_reviewed_optional_state(request)
+            .expect("reviewed optional state should restore on its permanent owner");
+
+        assert_eq!(
+            runner
+                .capture_arm64_breakpoint_register_state()
+                .expect("restored breakpoint state should be captured"),
+            breakpoints
+        );
+        assert_eq!(
+            runner
+                .capture_arm64_watchpoint_register_state()
+                .expect("restored watchpoint state should be captured"),
+            watchpoints
+        );
+        assert_eq!(
+            runner
+                .capture_arm64_simd_fp_state()
+                .expect("restored SIMD/FP state should be captured"),
+            simd_fp
+        );
+
+        if let (Some(version), Some(expected_z), Some(expected_sme_system)) =
+            (expected_sme_version, expected_z, expected_sme_system)
+        {
+            let restored_pstate = runner
+                .capture_arm64_sme_pstate()
+                .expect("restored SME PSTATE should be captured");
+            assert!(
+                restored_pstate.streaming_sve_mode_enabled()
+                    && restored_pstate.za_storage_enabled(),
+                "reviewed restore should publish the requested active SME PSTATE"
+            );
+            let restored_z = runner
+                .capture_arm64_sme_z_register_state()
+                .expect("restored streaming Z state should be captured");
+            for (index, expected) in expected_z.iter().enumerate() {
+                assert_eq!(
+                    restored_z.z_register(index),
+                    Some(expected.as_ref()),
+                    "restored Z register should match its Q-compatible request"
+                );
+            }
+            let restored_p = runner
+                .capture_arm64_sme_p_register_state()
+                .expect("restored streaming P state should be captured");
+            for index in 0..HvfArm64VcpuSmePRegisterState::REGISTER_COUNT {
+                assert!(
+                    restored_p
+                        .p_register(index)
+                        .expect("restored P inventory should be complete")
+                        .iter()
+                        .all(|byte| *byte == 0),
+                    "destination-default P registers should retain transition zero"
+                );
+            }
+            runner
+                .capture_arm64_sme_za_register_state()
+                .expect("restored destination-default ZA should remain readable");
+            if version >= 1 {
+                runner
+                    .capture_arm64_sme_zt0_register_state()
+                    .expect("restored destination-default ZT0 should remain readable");
+            }
+            let restored_system: HvfArm64VcpuSmeSystemRegisterState = runner
+                .capture_arm64_sme_system_register_state()
+                .expect("restored SME system state should be captured");
+            assert_eq!(restored_system, expected_sme_system);
+            assert_eq!(
+                restored_z.maximum_svl_bytes(),
+                expected_z
+                    .first()
+                    .expect("restored Z inventory should be nonempty")
+                    .len()
+            );
+            assert_eq!(
+                restored_p.predicate_width_bytes(),
+                restored_z.maximum_svl_bytes() / 8
+            );
+            assert_eq!(
+                HvfArm64VcpuSmeZRegisterState::REGISTER_COUNT,
+                expected_z.len()
+            );
+        }
+
+        assert!(matches!(
+            runner.restore_arm64_reviewed_optional_state(second_attempt),
+            Err(HvfVcpuRunnerError::InvalidState(
+                "vCPU runner reviewed optional state restore was already attempted"
+            ))
+        ));
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn captures_and_restores_arm64_system_context_registers_on_runner_thread() {
     use bangbang_hvf::{HvfArm64VcpuSystemContextRegisterState, HvfBackend};
     use bangbang_runtime::VmBackend;
