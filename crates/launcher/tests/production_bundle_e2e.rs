@@ -31,6 +31,10 @@ use bangbang_launcher::{
     JailerIsolationArgument, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME,
     OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
+use bangbang_pager::{
+    PagerError, PagerFrameKind, PagerTransport, PeerSession, ReferencePeer,
+    ReferencePeerTermination,
+};
 use bangbang_session::{
     BLOCK_CONTROL_BROKER_FD, Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY,
     SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy,
@@ -52,6 +56,12 @@ const GRANT_DELAY_OPTION: &str = "--bangbang-internal-grant-delay-v1";
 const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
 const GRANT_PROBE_MARKER: &str = "grant-integration-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
+const PAGER_GRANT_ID: &str = "probe-pager";
+const PAGER_GRANT_REF: &str = "bangbang-grant:probe-pager";
+const PAGER_PROBE_READY: &str = "status: pager integration probe ready";
+const PAGER_PEER_LISTENING: &str = "status: pager reference peer listening";
+const PAGER_PEER_PATH_ENV: &str = "BANGBANG_PAGER_REFERENCE_PATH";
+const PAGER_PEER_MODE_ENV: &str = "BANGBANG_PAGER_REFERENCE_MODE";
 const BLOCK_CONTROL_GRANT_ID: &str = "probe-block-control";
 const BLOCK_CONTROL_GRANT_REF: &str = "bangbang-grant:probe-block-control";
 const BLOCK_CONTROL_INITIAL_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_INITIAL";
@@ -391,6 +401,102 @@ fn jailer_command_with_policy(
     command.args(policy_args);
     command.arg("--");
     command
+}
+
+#[test]
+fn pager_reference_peer_child() {
+    let Some(path) = std::env::var_os(PAGER_PEER_PATH_ENV) else {
+        return;
+    };
+    let mode = std::env::var(PAGER_PEER_MODE_ENV).expect("pager peer mode should be present");
+    let listener =
+        UnixListener::bind(PathBuf::from(path)).expect("pager reference listener should bind");
+    println!("{PAGER_PEER_LISTENING}");
+    std::io::stdout()
+        .flush()
+        .expect("pager reference readiness should flush");
+    let (stream, _) = listener
+        .accept()
+        .expect("pager reference stream should accept");
+    match mode.as_str() {
+        "complete" => {
+            let report = ReferencePeer::new(3)
+                .expect("reference bound should validate")
+                .serve(stream, Duration::from_secs(5))
+                .expect("complete reference session should succeed");
+            assert_eq!(report.page_data(), 1);
+            assert_eq!(report.page_zero(), 1);
+            assert_eq!(report.removals(), 1);
+            assert_eq!(report.termination(), ReferencePeerTermination::Shutdown);
+        }
+        "cancel" => {
+            let report = ReferencePeer::new(1)
+                .expect("reference bound should validate")
+                .serve(stream, Duration::from_secs(5))
+                .expect("cancel reference session should succeed");
+            assert_eq!(report.termination(), ReferencePeerTermination::Cancelled);
+        }
+        "terminal" => {
+            let report = ReferencePeer::new(1)
+                .expect("reference bound should validate")
+                .serve(stream, Duration::from_secs(5))
+                .expect("terminal reference session should succeed");
+            assert_eq!(
+                report.termination(),
+                ReferencePeerTermination::Terminal(bangbang_pager::TerminalCode::Internal)
+            );
+        }
+        "hold" => run_holding_pager_peer(stream),
+        "corrupt" => {
+            let mut stream = stream;
+            stream
+                .write_all(b"{\"uffd\":true}")
+                .expect("corrupt peer bytes should write");
+        }
+        "eof" => {}
+        "stall" => {
+            thread::sleep(Duration::from_secs(2));
+        }
+        _ => panic!("unexpected pager reference mode"),
+    }
+}
+
+fn run_holding_pager_peer(stream: UnixStream) {
+    let mut transport =
+        PagerTransport::new(stream, Duration::from_secs(5)).expect("transport should initialize");
+    let mut peer = PeerSession::new();
+    let hello = peer
+        .receive(transport.receive().expect("hello should arrive"))
+        .expect("hello should validate");
+    assert_eq!(hello.kind(), PagerFrameKind::Hello);
+    let selected = peer
+        .offered_limits()
+        .expect("hello should contain bounded limits");
+    transport
+        .send(&peer.hello_ack(selected).expect("hello ack should build"))
+        .expect("hello ack should send");
+    let region = peer
+        .receive(transport.receive().expect("region should arrive"))
+        .expect("region should validate");
+    assert_eq!(region.kind(), PagerFrameKind::Region);
+    let start = peer
+        .receive(transport.receive().expect("start should arrive"))
+        .expect("start should validate");
+    assert_eq!(start.kind(), PagerFrameKind::Start);
+    transport
+        .send(&peer.ready().expect("ready should build"))
+        .expect("ready should send");
+    let request = peer
+        .receive(transport.receive().expect("page request should arrive"))
+        .expect("page request should validate");
+    assert_eq!(request.kind(), PagerFrameKind::PageRequest);
+    assert!(matches!(
+        transport.receive(),
+        Err(PagerError::Disconnected | PagerError::UnexpectedEof)
+            | Err(PagerError::Io(
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ))
+    ));
 }
 
 #[test]
@@ -5612,6 +5718,121 @@ fn signed_grants_authorize_only_typed_read_write_and_directory_operations() {
 }
 
 #[test]
+fn signed_pager_grant_completes_and_repeats_under_unchanged_entitlements() {
+    let bundle = grant_test_bundle();
+    let launcher_entitlements = codesign_entitlements(&bundle);
+    let worker_entitlements = codesign_entitlements(&worker_bundle(&bundle));
+    assert!(!launcher_entitlements.contains("com.apple.security.app-sandbox"));
+    assert!(!launcher_entitlements.contains("com.apple.security.hypervisor"));
+    assert_eq!(worker_entitlements.matches("<key>").count(), 2);
+    assert!(worker_entitlements.contains("<key>com.apple.security.app-sandbox</key>"));
+    assert!(worker_entitlements.contains("<key>com.apple.security.hypervisor</key>"));
+
+    let fixture = PagerGrantFixture::new("complete-repeat");
+    for cycle in 0..2 {
+        let mut peer = fixture.start_peer("complete");
+        let output = run_pager_probe(&bundle, &fixture, "pager-complete");
+        assert_output_success(&output, "signed contained pager probe");
+        assert_pager_output_redacted(&output, &fixture);
+        peer.wait_success(&format!("pager reference cycle {cycle}"));
+        fixture.clear_socket();
+        assert!(session_entries().is_empty());
+    }
+}
+
+#[test]
+fn signed_pager_grant_covers_cancellation_and_terminal_shutdown() {
+    let bundle = grant_test_bundle();
+    for (index, (peer_mode, probe_case)) in
+        [("cancel", "pager-cancel"), ("terminal", "pager-terminal")]
+            .into_iter()
+            .enumerate()
+    {
+        let fixture = PagerGrantFixture::new(&format!("lifecycle-{index}"));
+        let mut peer = fixture.start_peer(peer_mode);
+        let output = run_pager_probe(&bundle, &fixture, probe_case);
+        let peer_status = peer.wait("pager lifecycle reference peer");
+        assert_output_success(
+            &output,
+            &format!("signed contained pager {peer_mode} lifecycle probe"),
+        );
+        assert_pager_output_redacted(&output, &fixture);
+        assert!(
+            peer_status.success(),
+            "pager {peer_mode} reference peer should succeed: {peer_status:?}"
+        );
+        fixture.clear_socket();
+        assert!(session_entries().is_empty());
+    }
+}
+
+#[test]
+fn signed_pager_grant_rejects_connection_descriptor_and_protocol_failures() {
+    let bundle = grant_test_bundle();
+
+    let missing = PagerGrantFixture::new("missing");
+    let output = run_pager_probe(&bundle, &missing, "pager-complete");
+    assert_eq!(output.status.code(), Some(PROCESS_FAILURE_EXIT_CODE));
+    assert_pager_output_redacted(&output, &missing);
+    assert!(session_entries().is_empty());
+
+    let wrong = PagerGrantFixture::new("wrong-descriptor");
+    wrong.install_wrong_descriptor();
+    let output = run_pager_probe(&bundle, &wrong, "pager-complete");
+    assert_eq!(output.status.code(), Some(PROCESS_FAILURE_EXIT_CODE));
+    assert_pager_output_redacted(&output, &wrong);
+    assert!(session_entries().is_empty());
+
+    for (index, peer_mode) in ["corrupt", "eof", "stall"].into_iter().enumerate() {
+        let fixture = PagerGrantFixture::new(&format!("protocol-{index}"));
+        let mut peer = fixture.start_peer(peer_mode);
+        let started = Instant::now();
+        let output = run_pager_probe(&bundle, &fixture, "pager-complete");
+        assert_eq!(output.status.code(), Some(PROCESS_FAILURE_EXIT_CODE));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "pager {peer_mode} failure must remain bounded"
+        );
+        assert_pager_output_redacted(&output, &fixture);
+        peer.wait_success("failing pager reference peer");
+        fixture.clear_socket();
+        assert!(session_entries().is_empty());
+    }
+}
+
+#[test]
+fn signed_pager_grant_closes_streams_across_both_process_death_orders() {
+    let bundle = grant_test_bundle();
+    recover_session_root(&bundle);
+
+    let peer_death = PagerGrantFixture::new("peer-death");
+    let mut peer = peer_death.start_peer("hold");
+    let mut launcher = HoldingPagerLauncher::start(&bundle, &peer_death);
+    let peer_status = peer.kill(libc::SIGKILL, "pager peer SIGKILL");
+    assert_eq!(peer_status.signal(), Some(libc::SIGKILL));
+    assert_eq!(
+        launcher.wait("launcher after pager peer death").code(),
+        Some(PROCESS_FAILURE_EXIT_CODE)
+    );
+    peer_death.clear_socket();
+    assert!(session_entries().is_empty());
+
+    let worker_death = PagerGrantFixture::new("worker-death");
+    let mut peer = worker_death.start_peer("hold");
+    let mut launcher = HoldingPagerLauncher::start(&bundle, &worker_death);
+    let worker = only_worker_pid(&launcher.child);
+    // SAFETY: The worker is the sole live child of this unreaped launcher.
+    assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+    assert_eq!(
+        launcher.wait("pager worker SIGKILL").code(),
+        Some(128 + libc::SIGKILL)
+    );
+    peer.wait_success("pager reference after worker death");
+    worker_death.clear_socket();
+    assert!(session_entries().is_empty());
+}
+
+#[test]
 fn signed_contained_block_device_uses_launcher_control_broker() {
     let bundle = grant_test_bundle();
     let launcher_entitlements = codesign_entitlements(&bundle);
@@ -7640,6 +7861,285 @@ fn assert_redacted_private_grant_fault(
         assert!(
             !response.contains(&sensitive),
             "grant fault leaked private data"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct PagerGrantFixture {
+    _root: TestDir,
+    socket: PathBuf,
+    manifest: PathBuf,
+}
+
+impl PagerGrantFixture {
+    fn new(case: &str) -> Self {
+        let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let root = TestDir(
+            PathBuf::from("/private/tmp")
+                .join(format!("bbp-{}-{socket_id}-{case}", std::process::id())),
+        );
+        fs::create_dir(root.path()).expect("short pager root should create");
+        let canonical_root = fs::canonicalize(root.path()).expect("pager root should canonicalize");
+        let socket = canonical_root.join("snapshot-pager.sock");
+        let manifest = canonical_root.join("pager-grant-manifest.json");
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [{
+                "id": PAGER_GRANT_ID,
+                "role": "snapshot-pager-stream",
+                "access": "read-write",
+                "source": path_text(&socket),
+            }],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("pager manifest should serialize"),
+        )
+        .expect("pager manifest should write");
+        Self {
+            _root: root,
+            socket,
+            manifest,
+        }
+    }
+
+    fn start_peer(&self, mode: &str) -> PagerPeerProcess {
+        assert!(
+            !self.socket.exists(),
+            "pager socket path must be absent before peer bind"
+        );
+        PagerPeerProcess::start(&self.socket, mode, self.sensitive_strings())
+    }
+
+    fn clear_socket(&self) {
+        if self.socket.exists() {
+            fs::remove_file(&self.socket).expect("pager socket path should remove");
+        }
+    }
+
+    fn install_wrong_descriptor(&self) {
+        assert!(!self.socket.exists());
+        fs::write(&self.socket, b"not a socket\n").expect("wrong descriptor fixture should write");
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.socket),
+            path_text(&self.manifest),
+            PAGER_GRANT_ID,
+            PAGER_GRANT_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PagerPeerProcess {
+    child: Child,
+    stdout_reader: Option<JoinHandle<String>>,
+    stderr_reader: Option<JoinHandle<String>>,
+    sensitive: Vec<String>,
+    completed: bool,
+}
+
+impl PagerPeerProcess {
+    fn start(path: &Path, mode: &str, sensitive: Vec<String>) -> Self {
+        let mut child =
+            Command::new(std::env::current_exe().expect("test executable should exist"))
+                .args(["--exact", "pager_reference_peer_child", "--nocapture"])
+                .env(PAGER_PEER_PATH_ENV, path)
+                .env(PAGER_PEER_MODE_ENV, mode)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .expect("pager reference peer should start");
+        let (ready, stdout_reader) = read_stdout_until_line(&mut child, PAGER_PEER_LISTENING);
+        let stderr_reader = read_stream(child.stderr.take().expect("peer stderr should be piped"));
+        if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+            kill_child_group(&mut child);
+            let _ = child.wait();
+            let stdout = stdout_reader.join().expect("peer stdout should join");
+            let stderr = stderr_reader.join().expect("peer stderr should join");
+            panic!(
+                "pager reference peer should listen: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+        Self {
+            child,
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
+            sensitive,
+            completed: false,
+        }
+    }
+
+    fn wait(&mut self, context: &str) -> ExitStatus {
+        let status = if wait_for_child_exit(&self.child, PROCESS_TIMEOUT) {
+            self.child.wait().expect("pager peer wait should succeed")
+        } else {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+            panic!("timed out waiting for {context}");
+        };
+        self.completed = true;
+        let stdout = self
+            .stdout_reader
+            .take()
+            .expect("peer stdout reader should exist")
+            .join()
+            .expect("peer stdout reader should join");
+        let stderr = self
+            .stderr_reader
+            .take()
+            .expect("peer stderr reader should exist")
+            .join()
+            .expect("peer stderr reader should join");
+        let combined = format!("{stdout}{stderr}");
+        for sensitive in &self.sensitive {
+            assert!(
+                !combined.contains(sensitive),
+                "pager peer diagnostics must be redacted"
+            );
+        }
+        status
+    }
+
+    fn wait_success(&mut self, context: &str) {
+        let status = self.wait(context);
+        assert!(status.success(), "{context} should succeed: {status:?}");
+    }
+
+    fn kill(&mut self, signal: i32, context: &str) -> ExitStatus {
+        let pid = i32::try_from(self.child.id()).expect("peer PID should fit");
+        // SAFETY: The unreaped child owns this live PID and the signal is fixed by the test.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+        self.wait(context)
+    }
+}
+
+impl Drop for PagerPeerProcess {
+    fn drop(&mut self) {
+        if !self.completed {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HoldingPagerLauncher {
+    child: Child,
+    stdout_reader: Option<JoinHandle<String>>,
+    stderr_reader: Option<JoinHandle<String>>,
+    sensitive: Vec<String>,
+    completed: bool,
+}
+
+impl HoldingPagerLauncher {
+    fn start(bundle: &Path, fixture: &PagerGrantFixture) -> Self {
+        let mut command = pager_probe_command(bundle, fixture, "pager-wait");
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("holding pager launcher should start");
+        let (ready, stdout_reader) = read_stdout_until_line(&mut child, PAGER_PROBE_READY);
+        let stderr_reader = read_stream(child.stderr.take().expect("pager stderr should be piped"));
+        if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+            kill_child_group(&mut child);
+            let _ = child.wait();
+            let stdout = stdout_reader.join().expect("pager stdout should join");
+            let stderr = stderr_reader.join().expect("pager stderr should join");
+            panic!(
+                "pager probe should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+        Self {
+            child,
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
+            sensitive: fixture.sensitive_strings(),
+            completed: false,
+        }
+    }
+
+    fn wait(&mut self, context: &str) -> ExitStatus {
+        let status = if wait_for_child_exit(&self.child, PROCESS_TIMEOUT) {
+            self.child
+                .wait()
+                .expect("pager launcher wait should succeed")
+        } else {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+            panic!("timed out waiting for {context}");
+        };
+        self.completed = true;
+        let stdout = self
+            .stdout_reader
+            .take()
+            .expect("pager stdout reader should exist")
+            .join()
+            .expect("pager stdout should join");
+        let stderr = self
+            .stderr_reader
+            .take()
+            .expect("pager stderr reader should exist")
+            .join()
+            .expect("pager stderr should join");
+        let combined = format!("{stdout}{stderr}");
+        for sensitive in &self.sensitive {
+            assert!(
+                !combined.contains(sensitive),
+                "pager launcher diagnostics must be redacted"
+            );
+        }
+        status
+    }
+}
+
+impl Drop for HoldingPagerLauncher {
+    fn drop(&mut self) {
+        if !self.completed {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn pager_probe_command(bundle: &Path, fixture: &PagerGrantFixture, case: &str) -> Command {
+    let mut command = Command::new(launcher(bundle));
+    command
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .arg(GRANT_PROBE_OPTION)
+        .arg(case);
+    command
+}
+
+fn run_pager_probe(bundle: &Path, fixture: &PagerGrantFixture, case: &str) -> Output {
+    run_with_timeout(
+        &mut pager_probe_command(bundle, fixture, case),
+        PROCESS_TIMEOUT,
+        "signed pager grant probe",
+    )
+}
+
+fn assert_pager_output_redacted(output: &Output, fixture: &PagerGrantFixture) {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for sensitive in fixture.sensitive_strings() {
+        assert!(
+            !combined.contains(&sensitive),
+            "pager diagnostics must redact configured authority"
         );
     }
 }

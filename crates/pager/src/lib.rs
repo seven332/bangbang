@@ -10,6 +10,7 @@ compile_error!("bangbang-pager requires Unix socket semantics");
 
 mod error;
 mod frame;
+mod reference;
 mod state;
 mod transport;
 
@@ -19,6 +20,9 @@ pub use frame::{
     MIN_PAGE_SIZE, PageAccess, PagerFrame, PagerFrameDecoder, PagerFrameKind, PagerGeneration,
     PagerLimits, PagerOperations, PagerPageRequest, PagerPageResponse, PagerRegion, PagerRegionId,
     PagerRemoveRequest, PagerRequestId, PagerSessionId, TerminalCode, decode_frame, encode_frame,
+};
+pub use reference::{
+    REFERENCE_PAGE_BYTE, ReferencePeer, ReferencePeerReport, ReferencePeerTermination,
 };
 pub use state::{PagerPeerState, PagerVmmState, PeerSession, VmmSession};
 pub use transport::PagerTransport;

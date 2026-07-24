@@ -196,6 +196,8 @@ pub enum ResourceRole {
     SnapshotOutputDirectory = 15,
     /// Parent directory containing connect-only vhost-user sockets.
     VhostUserSocketDirectory = 16,
+    /// One launcher-connected snapshot pager stream.
+    SnapshotPagerStream = 17,
 }
 
 impl ResourceRole {
@@ -244,6 +246,7 @@ impl ResourceRole {
             | Self::VsockSocketDirectory
             | Self::SnapshotOutputDirectory => matches!(access, GrantAccess::CreateChildren),
             Self::VhostUserSocketDirectory => matches!(access, GrantAccess::ConnectChildren),
+            Self::SnapshotPagerStream => matches!(access, GrantAccess::ReadWrite),
         }
     }
 
@@ -265,6 +268,7 @@ impl ResourceRole {
             14 => Ok(Self::SnapshotMemoryInput),
             15 => Ok(Self::SnapshotOutputDirectory),
             16 => Ok(Self::VhostUserSocketDirectory),
+            17 => Ok(Self::SnapshotPagerStream),
             _ => Err(ProtocolError::InvalidFrame),
         }
     }
@@ -309,6 +313,8 @@ pub enum GrantObjectKind {
     Directory = 2,
     /// Existing macOS block-special device.
     BlockDevice = 3,
+    /// Already-connected local stream socket.
+    ConnectedUnixStream = 4,
 }
 
 impl GrantObjectKind {
@@ -317,6 +323,7 @@ impl GrantObjectKind {
             1 => Ok(Self::RegularFile),
             2 => Ok(Self::Directory),
             3 => Ok(Self::BlockDevice),
+            4 => Ok(Self::ConnectedUnixStream),
             _ => Err(ProtocolError::InvalidFrame),
         }
     }
@@ -334,6 +341,57 @@ pub struct ObjectIdentity {
 impl fmt::Debug for ObjectIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ObjectIdentity(<redacted>)")
+    }
+}
+
+/// Kernel-authenticated identity of one connected local-socket peer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectedUnixPeer {
+    user_id: u32,
+    group_id: u32,
+    process_id: u32,
+}
+
+impl ConnectedUnixPeer {
+    /// Builds one peer identity with a live positive process identifier.
+    #[must_use]
+    pub const fn new(user_id: u32, group_id: u32, process_id: u32) -> Option<Self> {
+        if process_id == 0 || process_id > i32::MAX as u32 {
+            return None;
+        }
+        Some(Self {
+            user_id,
+            group_id,
+            process_id,
+        })
+    }
+
+    /// Returns the authenticated effective user identifier.
+    #[must_use]
+    pub const fn user_id(self) -> u32 {
+        self.user_id
+    }
+
+    /// Returns the authenticated effective group identifier.
+    #[must_use]
+    pub const fn group_id(self) -> u32 {
+        self.group_id
+    }
+
+    /// Returns the authenticated live process identifier.
+    #[must_use]
+    pub const fn process_id(self) -> u32 {
+        self.process_id
+    }
+
+    fn from_wire(user_id: u32, group_id: u32, process_id: u32) -> Option<Self> {
+        Self::new(user_id, group_id, process_id)
+    }
+}
+
+impl fmt::Debug for ConnectedUnixPeer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConnectedUnixPeer(<redacted>)")
     }
 }
 
@@ -439,6 +497,23 @@ pub enum GrantRecord {
         /// Authenticated block-special metadata, absent for regular files.
         block_device: Option<BlockDeviceGrant>,
     },
+    /// Transfers one already-connected local stream socket.
+    ConnectedStream {
+        /// Opaque consumer identifier.
+        id: GrantId,
+        /// Semantic resource role.
+        role: ResourceRole,
+        /// Logical bidirectional stream access.
+        access: GrantAccess,
+        /// Expected descriptor identity.
+        identity: ObjectIdentity,
+        /// Validated pathname socket identity at launcher connect time.
+        source_identity: ObjectIdentity,
+        /// Expected stream status flags.
+        status_flags: u32,
+        /// Kernel-authenticated connected peer identity.
+        peer: ConnectedUnixPeer,
+    },
     /// Transfers a directory anchor and declares its bookmark fragments.
     ScopedDirectory {
         /// Opaque consumer identifier.
@@ -479,6 +554,7 @@ impl fmt::Debug for GrantRecord {
         let name = match self {
             Self::Begin { .. } => "Begin",
             Self::Descriptor { .. } => "Descriptor",
+            Self::ConnectedStream { .. } => "ConnectedStream",
             Self::ScopedDirectory { .. } => "ScopedDirectory",
             Self::BookmarkFragment { .. } => "BookmarkFragment",
             Self::Commit { .. } => "Commit",
@@ -492,7 +568,9 @@ impl GrantRecord {
     #[must_use]
     pub const fn descriptor_count(&self) -> u8 {
         match self {
-            Self::Descriptor { .. } | Self::ScopedDirectory { .. } => 1,
+            Self::Descriptor { .. }
+            | Self::ConnectedStream { .. }
+            | Self::ScopedDirectory { .. } => 1,
             Self::Begin { .. } | Self::BookmarkFragment { .. } | Self::Commit { .. } => 0,
         }
     }
@@ -633,6 +711,33 @@ fn encode_record(record: &GrantRecord) -> Result<(u16, Vec<u8>), ProtocolError> 
             payload.extend_from_slice(&block_count.to_be_bytes());
             payload.extend_from_slice(&capacity.to_be_bytes());
             Ok((2, payload))
+        }
+        GrantRecord::ConnectedStream {
+            id,
+            role,
+            access,
+            identity,
+            source_identity,
+            status_flags,
+            peer,
+        } => {
+            if !valid_connected_stream(*role, *access, *identity, *source_identity) {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            let mut payload = encode_grant_prefix(
+                id,
+                *role,
+                *access,
+                GrantObjectKind::ConnectedUnixStream,
+                *identity,
+            )?;
+            payload.extend_from_slice(&source_identity.device.to_be_bytes());
+            payload.extend_from_slice(&source_identity.inode.to_be_bytes());
+            payload.extend_from_slice(&status_flags.to_be_bytes());
+            payload.extend_from_slice(&peer.user_id().to_be_bytes());
+            payload.extend_from_slice(&peer.group_id().to_be_bytes());
+            payload.extend_from_slice(&peer.process_id().to_be_bytes());
+            Ok((6, payload))
         }
         GrantRecord::ScopedDirectory {
             id,
@@ -805,6 +910,36 @@ fn decode_record(kind: u16, payload: &[u8]) -> Result<GrantRecord, ProtocolError
                 bytes: fragment.to_vec(),
             })
         }
+        6 => {
+            let (id, role, access, object_kind, identity, offset) = decode_grant_prefix(payload)?;
+            if payload.len() != offset.saturating_add(32)
+                || object_kind != GrantObjectKind::ConnectedUnixStream
+            {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            let source_identity = ObjectIdentity {
+                device: read_u64(payload, offset)?,
+                inode: read_u64(payload, offset.saturating_add(8))?,
+            };
+            if !valid_connected_stream(role, access, identity, source_identity) {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            let peer = ConnectedUnixPeer::from_wire(
+                read_u32(payload, offset.saturating_add(20))?,
+                read_u32(payload, offset.saturating_add(24))?,
+                read_u32(payload, offset.saturating_add(28))?,
+            )
+            .ok_or(ProtocolError::InvalidFrame)?;
+            Ok(GrantRecord::ConnectedStream {
+                id,
+                role,
+                access,
+                identity,
+                source_identity,
+                status_flags: read_u32(payload, offset.saturating_add(16))?,
+                peer,
+            })
+        }
         _ => Err(ProtocolError::InvalidFrame),
     }
 }
@@ -823,6 +958,18 @@ fn valid_descriptor_kind(
         }
         _ => false,
     }
+}
+
+fn valid_connected_stream(
+    role: ResourceRole,
+    access: GrantAccess,
+    identity: ObjectIdentity,
+    source_identity: ObjectIdentity,
+) -> bool {
+    role == ResourceRole::SnapshotPagerStream
+        && access == GrantAccess::ReadWrite
+        && identity.inode != 0
+        && source_identity.inode != 0
 }
 
 fn encode_counts(grant_count: u16, record_count: u16, bookmark_bytes: u32) -> Vec<u8> {
@@ -984,6 +1131,21 @@ mod tests {
                     BlockDeviceGrant::new(12, 512, 8).expect("block tuple should be valid"),
                 ),
             },
+            GrantRecord::ConnectedStream {
+                id: id("pager"),
+                role: ResourceRole::SnapshotPagerStream,
+                access: GrantAccess::ReadWrite,
+                identity: ObjectIdentity {
+                    device: 13,
+                    inode: 14,
+                },
+                source_identity: ObjectIdentity {
+                    device: 15,
+                    inode: 16,
+                },
+                status_flags: 6,
+                peer: ConnectedUnixPeer::new(501, 20, 1234).expect("peer identity should validate"),
+            },
             GrantRecord::ScopedDirectory {
                 id: id("api"),
                 role: ResourceRole::ApiSocketDirectory,
@@ -1026,9 +1188,83 @@ mod tests {
             );
             let debug = format!("{expected:?}");
             assert!(
-                !debug.contains("kernel") && !debug.contains("api") && !debug.contains("vhost")
+                !debug.contains("kernel")
+                    && !debug.contains("api")
+                    && !debug.contains("vhost")
+                    && !debug.contains("pager")
             );
         }
+    }
+
+    #[test]
+    fn snapshot_pager_stream_is_singleton_bidirectional_and_redacted() {
+        let role = ResourceRole::SnapshotPagerStream;
+        assert!(!role.is_repeatable());
+        assert!(!role.is_scoped_directory());
+        assert!(role.permits(GrantAccess::ReadWrite));
+        for access in [
+            GrantAccess::ReadOnly,
+            GrantAccess::WriteOnly,
+            GrantAccess::CreateChildren,
+            GrantAccess::ConnectChildren,
+        ] {
+            assert!(!role.permits(access));
+        }
+        let peer = ConnectedUnixPeer::new(501, 20, 42).expect("positive peer PID should validate");
+        assert_eq!(peer.user_id(), 501);
+        assert_eq!(peer.group_id(), 20);
+        assert_eq!(peer.process_id(), 42);
+        assert_eq!(format!("{peer:?}"), "ConnectedUnixPeer(<redacted>)");
+        assert!(ConnectedUnixPeer::new(501, 20, 0).is_none());
+        assert!(ConnectedUnixPeer::new(501, 20, u32::MAX).is_none());
+    }
+
+    #[test]
+    fn connected_stream_wire_rejects_invalid_source_and_peer_identity() {
+        let stream_id = id("pager-wire");
+        let valid = frame(GrantRecord::ConnectedStream {
+            id: stream_id.clone(),
+            role: ResourceRole::SnapshotPagerStream,
+            access: GrantAccess::ReadWrite,
+            identity: ObjectIdentity {
+                device: 41,
+                inode: 42,
+            },
+            source_identity: ObjectIdentity {
+                device: 43,
+                inode: 44,
+            },
+            status_flags: 6,
+            peer: ConnectedUnixPeer::new(501, 20, 1234).expect("peer identity should validate"),
+        });
+        let encoded = encode_grant_frame(&valid).expect("connected stream should encode");
+        let record_offset = GRANT_HEADER_BYTES + 20 + stream_id.as_bytes().len();
+        let mut zero_pid = encoded.clone();
+        zero_pid[record_offset + 28..record_offset + 32].fill(0);
+        assert_eq!(
+            decode_grant_frame(&zero_pid),
+            Err(ProtocolError::InvalidFrame)
+        );
+
+        let invalid_source = frame(GrantRecord::ConnectedStream {
+            id: stream_id,
+            role: ResourceRole::SnapshotPagerStream,
+            access: GrantAccess::ReadWrite,
+            identity: ObjectIdentity {
+                device: 41,
+                inode: 42,
+            },
+            source_identity: ObjectIdentity {
+                device: 43,
+                inode: 0,
+            },
+            status_flags: 6,
+            peer: ConnectedUnixPeer::new(501, 20, 1234).expect("peer identity should validate"),
+        });
+        assert_eq!(
+            encode_grant_frame(&invalid_source),
+            Err(ProtocolError::InvalidFrame)
+        );
     }
 
     #[test]

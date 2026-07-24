@@ -172,7 +172,8 @@ crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process entrypoint and startup CLI
 crates/launcher   Production app bundle, nested-worker validation, and supervision
 crates/pager      Closed bangbang-pager-v1 codec, state machines, and
-                  already-connected deadline-bounded Unix transport
+                  already-connected deadline-bounded Unix transport plus a
+                  bounded support-only reference peer
 crates/session    Private launcher-worker protocol and runtime namespace ownership
 crates/vhost-user Strict vhost-user frontend protocol, SCM_RIGHTS framing,
                   and portable pipe queue notifiers used by direct block startup
@@ -392,11 +393,18 @@ portability remain unsupported. Native-v1 `Uffd` also remains rejected before
 resource access. The checked
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 records that a public macOS observable equivalent is feasible under #1527; it
-is not Linux UFFD wire compatibility or shipped runtime support. The standalone
+is not Linux UFFD wire compatibility or native-v1 restore support. The standalone
 [`bangbang-pager-v1` contract](docs/snapshot-pager-protocol.md) now implements
 the closed offset-only wire, role state machines, and already-connected
-deadline transport. The runtime now also owns validated private-anonymous lazy
-regions behind a distinct `LazyGuestMemory` type: compact page states,
+deadline transport. In contained mode the launcher now reduces one strictly
+walked, current-user Unix-socket path to a bounded connected stream before
+worker spawn. The atomic startup grant carries only the stream's kernel/source
+identity and redacted peer credentials; the worker independently revalidates
+and owns that one-time authority without receiving a path, directory, listener,
+network entitlement, task port, or host address. A bounded support-only
+reference peer drives signed protocol and process-lifecycle tests. The runtime
+also owns validated private-anonymous lazy regions behind a distinct
+`LazyGuestMemory` type: compact page states,
 strictly increasing generations, bounded duplicate-fault coalescing, scoped
 exact data/zero publication, retired-request accounting, acknowledged removal,
 and fail-closed teardown are implemented without exposing ordinary initialized
@@ -428,11 +436,11 @@ the mapping instead of spinning or exposing a partial page. Raw vCPU ownership
 and dirty-write tracking remain explicitly incompatible with this internal
 mode.
 
-These internal bridges still accept only a trusted in-process page source; they
-do not connect the pager transport, handle peer-driven removal/failure, audit
-bypassing consumers, or change the native-v1 gate. Launcher brokerage,
-transport/removal/failure wiring, consumer gating, restore, and final
-certification remain deferred under #1527.
+These internal bridges still accept only a trusted in-process page source; the
+contained pager grant is not yet connected to their coordinator. Peer-driven
+removal/failure propagation, bypassing-consumer audit, native-v1 restore, and
+final certification remain deferred under #1527, and the native-v1 `Uffd`
+gate remains unchanged.
 
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
@@ -759,12 +767,17 @@ resolved inode and active scope are revalidated in the worker.
 
 The initial roles are startup config/metadata, kernel/initrd, repeatable
 drive/pmem backing, logger/metrics/serial sinks, snapshot describe/state/memory
-inputs, and API/vsock/snapshot-output directories. The exact access matrix and
-hard limits are part of the closed protocol; unknown roles and operator-supplied
-bookmark bytes are rejected. Grant delivery uses 1024-byte datagrams, bounded
-bookmark fragmentation, SCM_RIGHTS, one five-second absolute deadline, and a
-session-owned one-time typed registry. Closing the launcher's duplicate does
-not revoke an already delivered descriptor; cleanup is cooperative ownership.
+inputs, API/vsock/snapshot-output directories, and one read-write
+`snapshot-pager-stream`. The pager role is the only path-sourced connected
+stream: the launcher anchors every parent, connects the exact current-user
+single-link Unix socket under a one-second deadline, rechecks the socket vnode,
+and transfers no pathname or directory authority. The exact access matrix and
+hard limits are part of the closed protocol; unknown roles and
+operator-supplied bookmark bytes are rejected. Grant delivery uses 1024-byte
+datagrams, bounded bookmark fragmentation, SCM_RIGHTS, one five-second absolute
+deadline, and session-owned one-time typed file, directory, and stream
+registries. Closing the launcher's duplicate does not revoke an already
+delivered descriptor; cleanup is cooperative ownership.
 
 Production consumers now adopt read-only startup config, startup metadata,
 kernel, initrd, snapshot describe/state/memory, and persisted snapshot-root
@@ -1412,7 +1425,8 @@ structured API/no-API readiness and cancellation, worker-first/launcher-first
 namespace cleanup, empty both-killed namespace recovery, concurrent-session
 isolation, owned-socket
 cleanup, mandatory empty-grant startup, typed read-only/write-only/directory
-grants, mismatch rollback, grant-phase cancellation/deadline behavior,
+and connected-stream grants, mismatch rollback, grant-phase
+cancellation/deadline behavior,
 grant-bearing crash/concurrency isolation, absence of the test exerciser from
 the normal production build, exact external config/metadata/kernel/initrd
 adoption by the normal worker, config-file and delayed API block/pmem adoption,
@@ -1437,7 +1451,12 @@ read/write/flush and guest-observed ID-only capacity refresh on the existing
 stream, and exercise all-PCI runtime target rejection, negotiation rollback,
 new-ID attach, manual guest removal, DELETE, Paused same-ID reuse through a
 second exact child, and exact stream closure. They likewise leave no helper or
-entitlement change. Abrupt launcher-first and worker-first cases replace the
+entitlement change. Signed contained-pager cases prove exact anchored
+connection, descriptor/peer revalidation, page/zero/removal/shutdown,
+cancellation and peer terminal behavior, malformed/EOF/timeout failures, both
+process-death orders, repeated launch and cleanup, path redaction, signature
+inspection, and the unchanged entitlement floor without activating native-v1
+restore. Abrupt launcher-first and worker-first cases replace the
 granted API pathname before death and prove both surviving cleanup owners
 preserve the replacement while clearing the matching private namespace record.
 Signed file-backed Async cases separately cover direct MMIO live path PATCH,

@@ -6,15 +6,16 @@ use std::fs::OpenOptions;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use crate::macos::bookmark::{BookmarkError, ScopedBookmark};
 use crate::macos::grant_transport::ReceivedGrant;
-use crate::macos::normalized_block_status_flags;
+use crate::macos::{normalized_block_status_flags, peer_identity};
 use crate::{
-    BatchId, BlockDeviceGrant, GrantAccess, GrantId, GrantObjectKind, GrantRecord,
-    MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS, ObjectIdentity,
-    ResourceRole, SessionId,
+    BatchId, BlockDeviceGrant, ConnectedUnixPeer, GrantAccess, GrantId, GrantObjectKind,
+    GrantRecord, MAX_BATCH_BOOKMARK_BYTES, MAX_BOOKMARK_BYTES, MAX_GRANT_RECORDS, MAX_GRANTS,
+    ObjectIdentity, ResourceRole, SessionId,
 };
 
 /// Redacted staging or adoption failure.
@@ -53,6 +54,7 @@ pub struct CommittedGrantBatch {
 pub struct GrantRegistry {
     files: HashMap<GrantId, GrantedFile>,
     directories: HashMap<GrantId, GrantedDirectory>,
+    streams: HashMap<GrantId, GrantedUnixStream>,
 }
 
 impl fmt::Debug for GrantRegistry {
@@ -68,13 +70,13 @@ impl GrantRegistry {
     /// Returns the number of unadopted grants.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.files.len() + self.directories.len()
+        self.files.len() + self.directories.len() + self.streams.len()
     }
 
     /// Returns whether no unadopted authority remains.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.directories.is_empty()
+        self.files.is_empty() && self.directories.is_empty() && self.streams.is_empty()
     }
 
     /// Adopts one exact existing-file descriptor once.
@@ -130,6 +132,22 @@ impl GrantRegistry {
         DirectoryGrantRegistry {
             entries: std::mem::take(&mut self.directories),
         }
+    }
+
+    /// Moves all connected-stream grants into a sendable one-time registry.
+    pub fn take_stream_registry(&mut self) -> ConnectedStreamGrantRegistry {
+        ConnectedStreamGrantRegistry {
+            entries: std::mem::take(&mut self.streams),
+        }
+    }
+
+    /// Adopts one exact connected local stream once.
+    pub fn take_connected_stream(
+        &mut self,
+        id: &GrantId,
+        role: ResourceRole,
+    ) -> Result<GrantedUnixStream, GrantRegistryError> {
+        take_connected_stream(&mut self.streams, id, role)
     }
 
     /// Adopts one exact active directory scope once.
@@ -259,6 +277,61 @@ impl FileGrantRegistry {
     }
 }
 
+/// One-time registry containing only connected local-stream grants.
+#[derive(Default)]
+pub struct ConnectedStreamGrantRegistry {
+    entries: HashMap<GrantId, GrantedUnixStream>,
+}
+
+impl fmt::Debug for ConnectedStreamGrantRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectedStreamGrantRegistry")
+            .field("entries", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ConnectedStreamGrantRegistry {
+    /// Returns the number of unadopted connected-stream grants.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether no unadopted connected-stream authority remains.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Adopts one exact connected local stream once.
+    pub fn take_connected_stream(
+        &mut self,
+        id: &GrantId,
+        role: ResourceRole,
+    ) -> Result<GrantedUnixStream, GrantRegistryError> {
+        take_connected_stream(&mut self.entries, id, role)
+    }
+
+    /// Returns one reserved connected stream after an aborted consumer transaction.
+    pub fn restore_connected_stream(
+        &mut self,
+        id: GrantId,
+        stream: GrantedUnixStream,
+    ) -> Result<(), GrantRegistryError> {
+        if self.entries.contains_key(&id)
+            || stream.role != ResourceRole::SnapshotPagerStream
+            || stream.access != GrantAccess::ReadWrite
+        {
+            return Err(GrantRegistryError);
+        }
+        let previous = self.entries.insert(id, stream);
+        debug_assert!(previous.is_none());
+        Ok(())
+    }
+}
+
 /// One-time owner-thread registry containing active directory scopes.
 #[derive(Default)]
 pub struct DirectoryGrantRegistry {
@@ -372,6 +445,24 @@ fn take_scoped_directories(
         directories.push(directory);
     }
     Ok(directories)
+}
+
+fn take_connected_stream(
+    entries: &mut HashMap<GrantId, GrantedUnixStream>,
+    id: &GrantId,
+    role: ResourceRole,
+) -> Result<GrantedUnixStream, GrantRegistryError> {
+    let matches = matches!(
+        entries.get(id),
+        Some(stream)
+            if stream.role == role
+                && role == ResourceRole::SnapshotPagerStream
+                && stream.access == GrantAccess::ReadWrite
+    );
+    if !matches {
+        return Err(GrantRegistryError);
+    }
+    entries.remove(id).ok_or(GrantRegistryError)
 }
 
 fn take_file(
@@ -578,6 +669,70 @@ impl GrantedFile {
     }
 }
 
+/// Adopted already-connected local stream capability.
+pub struct GrantedUnixStream {
+    role: ResourceRole,
+    access: GrantAccess,
+    identity: ObjectIdentity,
+    source_identity: ObjectIdentity,
+    status_flags: u32,
+    peer: ConnectedUnixPeer,
+    descriptor: OwnedFd,
+}
+
+impl fmt::Debug for GrantedUnixStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GrantedUnixStream")
+            .field("role", &self.role)
+            .field("access", &self.access)
+            .field("identity", &"<redacted>")
+            .field("source_identity", &"<redacted>")
+            .field("status_flags", &"<redacted>")
+            .field("peer", &"<redacted>")
+            .field("descriptor", &"<owned>")
+            .finish()
+    }
+}
+
+impl GrantedUnixStream {
+    /// Returns the verified connected descriptor identity.
+    #[must_use]
+    pub const fn identity(&self) -> ObjectIdentity {
+        self.identity
+    }
+
+    /// Returns the launcher-validated source socket identity.
+    #[must_use]
+    pub const fn source_identity(&self) -> ObjectIdentity {
+        self.source_identity
+    }
+
+    /// Returns the authenticated connected peer identity.
+    #[must_use]
+    pub const fn peer(&self) -> ConnectedUnixPeer {
+        self.peer
+    }
+
+    /// Returns the authenticated stable stream status.
+    #[must_use]
+    pub const fn status_flags(&self) -> u32 {
+        self.status_flags
+    }
+
+    /// Returns the live descriptor without transferring ownership.
+    #[must_use]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.descriptor.as_raw_fd()
+    }
+
+    /// Transfers the connected stream into its consumer.
+    #[must_use]
+    pub fn into_stream(self) -> UnixStream {
+        UnixStream::from(self.descriptor)
+    }
+}
+
 /// Adopted active process-lifetime directory scope.
 pub struct GrantedDirectory {
     role: ResourceRole,
@@ -771,6 +926,48 @@ impl StagedGrantBatch {
                 );
                 Ok(None)
             }
+            GrantRecord::ConnectedStream {
+                id,
+                role,
+                access,
+                identity,
+                source_identity,
+                status_flags,
+                peer,
+            } => {
+                self.require_open_batch()?;
+                if role != ResourceRole::SnapshotPagerStream
+                    || access != GrantAccess::ReadWrite
+                    || identity.inode == 0
+                    || source_identity.inode == 0
+                {
+                    return Err(GrantRegistryError);
+                }
+                let descriptor = descriptor.ok_or(GrantRegistryError)?;
+                validate_descriptor(
+                    descriptor.as_raw_fd(),
+                    GrantObjectKind::ConnectedUnixStream,
+                    access,
+                    identity,
+                    Some(status_flags),
+                    None,
+                )?;
+                validate_connected_stream_descriptor(descriptor.as_raw_fd(), peer)?;
+                self.insert_identity_role(&id, role, identity)?;
+                self.entries.insert(
+                    id,
+                    StagedResource::Stream {
+                        role,
+                        access,
+                        identity,
+                        source_identity,
+                        status_flags,
+                        peer,
+                        descriptor,
+                    },
+                );
+                Ok(None)
+            }
             GrantRecord::ScopedDirectory {
                 id,
                 role,
@@ -929,6 +1126,7 @@ impl StagedGrantBatch {
         let staged = std::mem::take(&mut self.entries);
         let mut files = HashMap::with_capacity(staged.len());
         let mut directories = HashMap::new();
+        let mut streams = HashMap::new();
         for (id, resource) in staged {
             match resource {
                 StagedResource::File {
@@ -949,6 +1147,28 @@ impl StagedGrantBatch {
                             identity,
                             status_flags,
                             block_device,
+                            descriptor,
+                        },
+                    );
+                }
+                StagedResource::Stream {
+                    role,
+                    access,
+                    identity,
+                    source_identity,
+                    status_flags,
+                    peer,
+                    descriptor,
+                } => {
+                    streams.insert(
+                        id,
+                        GrantedUnixStream {
+                            role,
+                            access,
+                            identity,
+                            source_identity,
+                            status_flags,
+                            peer,
                             descriptor,
                         },
                     );
@@ -980,7 +1200,11 @@ impl StagedGrantBatch {
             }
         }
         Ok(CommittedGrantBatch {
-            registry: GrantRegistry { files, directories },
+            registry: GrantRegistry {
+                files,
+                directories,
+                streams,
+            },
             batch: self.batch.ok_or(GrantRegistryError)?,
             grant_count: declaration.grant_count,
             final_sequence,
@@ -1003,6 +1227,15 @@ enum StagedResource {
         identity: ObjectIdentity,
         status_flags: u32,
         block_device: Option<BlockDeviceGrant>,
+        descriptor: OwnedFd,
+    },
+    Stream {
+        role: ResourceRole,
+        access: GrantAccess,
+        identity: ObjectIdentity,
+        source_identity: ObjectIdentity,
+        status_flags: u32,
+        peer: ConnectedUnixPeer,
         descriptor: OwnedFd,
     },
     Directory {
@@ -1037,6 +1270,8 @@ fn validate_descriptor(
         || expected_status_flags.is_some_and(|expected| {
             let actual = if kind == GrantObjectKind::BlockDevice {
                 normalized_block_status_flags(status_flags)
+            } else if kind == GrantObjectKind::ConnectedUnixStream {
+                u32::try_from(status_flags & (libc::O_ACCMODE | libc::O_NONBLOCK)).ok()
             } else {
                 u32::try_from(status_flags).ok()
             };
@@ -1050,6 +1285,7 @@ fn validate_descriptor(
         libc::S_IFREG => GrantObjectKind::RegularFile,
         libc::S_IFDIR => GrantObjectKind::Directory,
         libc::S_IFBLK => GrantObjectKind::BlockDevice,
+        libc::S_IFSOCK => GrantObjectKind::ConnectedUnixStream,
         _ => return Err(GrantRegistryError),
     };
     let actual_identity = ObjectIdentity {
@@ -1061,13 +1297,72 @@ fn validate_descriptor(
         || actual_identity != identity
         || match (kind, expected_block_device) {
             (GrantObjectKind::BlockDevice, Some(block)) => target_device != block.target_device(),
-            (GrantObjectKind::RegularFile | GrantObjectKind::Directory, None) => target_device != 0,
+            (
+                GrantObjectKind::RegularFile
+                | GrantObjectKind::Directory
+                | GrantObjectKind::ConnectedUnixStream,
+                None,
+            ) => target_device != 0,
             _ => true,
         }
     {
         return Err(GrantRegistryError);
     }
     Ok(())
+}
+
+fn validate_connected_stream_descriptor(
+    descriptor: RawFd,
+    expected_peer: ConnectedUnixPeer,
+) -> Result<(), GrantRegistryError> {
+    if socket_int_option(descriptor, libc::SO_TYPE)? != libc::SOCK_STREAM
+        || socket_int_option(descriptor, libc::SO_ERROR)? != 0
+    {
+        return Err(GrantRegistryError);
+    }
+    let mut address = MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+        .map_err(|_| GrantRegistryError)?;
+    // SAFETY: Address storage and length are writable for this live socket.
+    if unsafe { libc::getpeername(descriptor, address.as_mut_ptr().cast(), &raw mut length) } != 0 {
+        return Err(GrantRegistryError);
+    }
+    // SAFETY: Successful getpeername initialized the returned address prefix.
+    let address = unsafe { address.assume_init() };
+    if address.ss_family
+        != libc::sa_family_t::try_from(libc::AF_UNIX).map_err(|_| GrantRegistryError)?
+    {
+        return Err(GrantRegistryError);
+    }
+    let actual = peer_identity(descriptor).map_err(|_| GrantRegistryError)?;
+    let actual_pid = u32::try_from(actual.pid).map_err(|_| GrantRegistryError)?;
+    let actual_peer =
+        ConnectedUnixPeer::new(actual.uid, actual.gid, actual_pid).ok_or(GrantRegistryError)?;
+    if actual_peer != expected_peer {
+        return Err(GrantRegistryError);
+    }
+    Ok(())
+}
+
+fn socket_int_option(descriptor: RawFd, option: libc::c_int) -> Result<i32, GrantRegistryError> {
+    let mut value = 0_i32;
+    let mut length =
+        libc::socklen_t::try_from(std::mem::size_of::<i32>()).map_err(|_| GrantRegistryError)?;
+    // SAFETY: Value and length are writable for this live socket descriptor.
+    if unsafe {
+        libc::getsockopt(
+            descriptor,
+            libc::SOL_SOCKET,
+            option,
+            (&raw mut value).cast(),
+            &raw mut length,
+        )
+    } != 0
+        || usize::try_from(length).ok() != Some(std::mem::size_of::<i32>())
+    {
+        return Err(GrantRegistryError);
+    }
+    Ok(value)
 }
 
 fn descriptor_stat(descriptor: RawFd) -> Result<libc::stat, GrantRegistryError> {
@@ -1138,6 +1433,7 @@ fn normalized_device(device: libc::dev_t) -> u64 {
 mod tests {
     use std::fs::{self, File};
     use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::net::{UnixDatagram, UnixListener};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::macos::bookmark::create_implicit_bookmark;
@@ -1217,6 +1513,81 @@ mod tests {
             },
             descriptor,
         }
+    }
+
+    fn normalize_test_stream(descriptor: RawFd) {
+        // SAFETY: These fcntl operations update one live test descriptor.
+        let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert!(descriptor_flags >= 0);
+        // SAFETY: The descriptor remains live and uniquely owned by the fixture.
+        let set_descriptor_flags = unsafe {
+            libc::fcntl(
+                descriptor,
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        };
+        assert!(set_descriptor_flags >= 0);
+        // SAFETY: F_GETFL inspects the same live descriptor.
+        let status_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        assert!(status_flags >= 0);
+        // SAFETY: The descriptor remains live and uniquely owned by the fixture.
+        let set_status_flags =
+            unsafe { libc::fcntl(descriptor, libc::F_SETFL, status_flags | libc::O_NONBLOCK) };
+        assert!(set_status_flags >= 0);
+    }
+
+    fn stream_record(descriptor: RawFd, peer: ConnectedUnixPeer) -> GrantRecord {
+        let stat = descriptor_stat(descriptor).expect("socket stat should read");
+        // SAFETY: F_GETFL inspects one live test descriptor.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        GrantRecord::ConnectedStream {
+            id: GrantId::parse("rejected-pager").expect("ID should parse"),
+            role: ResourceRole::SnapshotPagerStream,
+            access: GrantAccess::ReadWrite,
+            identity: ObjectIdentity {
+                device: normalized_device(stat.st_dev),
+                inode: stat.st_ino,
+            },
+            source_identity: ObjectIdentity {
+                device: 201,
+                inode: 202,
+            },
+            status_flags: u32::try_from(flags & (libc::O_ACCMODE | libc::O_NONBLOCK))
+                .expect("socket flags should fit"),
+            peer,
+        }
+    }
+
+    fn assert_connected_stream_record_rejected(descriptor: OwnedFd, record: GrantRecord) {
+        let descriptor_number = descriptor.as_raw_fd();
+        let stat = descriptor_stat(descriptor_number).expect("descriptor stat should read");
+        let descriptor_identity = ObjectIdentity {
+            device: normalized_device(stat.st_dev),
+            inode: stat.st_ino,
+        };
+        let session = SessionId::from_bytes([37; 32]);
+        let batch = BatchId::from_bytes([38; 16]);
+        let mut staged = StagedGrantBatch::new(session);
+        staged
+            .accept(receive(
+                session,
+                batch,
+                0,
+                GrantRecord::Begin {
+                    grant_count: 1,
+                    record_count: 3,
+                    bookmark_bytes: 0,
+                },
+                None,
+            ))
+            .expect("begin should stage");
+        assert!(
+            staged
+                .accept(receive(session, batch, 1, record, Some(descriptor)))
+                .is_err()
+        );
+        assert_descriptor_released(descriptor_number, descriptor_identity);
     }
 
     #[test]
@@ -1391,6 +1762,266 @@ mod tests {
     }
 
     #[test]
+    fn connected_stream_is_revalidated_committed_and_adopted_once() {
+        let session = SessionId::from_bytes([33; 32]);
+        let batch = BatchId::from_bytes([34; 16]);
+        let id = GrantId::parse("snapshot-pager").expect("ID should parse");
+        let (stream, peer_stream) = UnixStream::pair().expect("stream pair should open");
+        stream
+            .set_nonblocking(true)
+            .expect("granted stream should become nonblocking");
+        let descriptor: OwnedFd = stream.into();
+        let stat = descriptor_stat(descriptor.as_raw_fd()).expect("stream stat should read");
+        // SAFETY: F_GETFL inspects the live connected stream.
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+        let status_flags = u32::try_from(flags & (libc::O_ACCMODE | libc::O_NONBLOCK))
+            .expect("stream flags should fit");
+        let identity = ObjectIdentity {
+            device: normalized_device(stat.st_dev),
+            inode: stat.st_ino,
+        };
+        let actual_peer =
+            peer_identity(descriptor.as_raw_fd()).expect("stream peer identity should read");
+        let peer = ConnectedUnixPeer::new(
+            actual_peer.uid,
+            actual_peer.gid,
+            u32::try_from(actual_peer.pid).expect("peer PID should fit"),
+        )
+        .expect("peer identity should validate");
+        let source_identity = ObjectIdentity {
+            device: 91,
+            inode: 92,
+        };
+        let mut staged = StagedGrantBatch::new(session);
+        staged
+            .accept(receive(
+                session,
+                batch,
+                0,
+                GrantRecord::Begin {
+                    grant_count: 1,
+                    record_count: 3,
+                    bookmark_bytes: 0,
+                },
+                None,
+            ))
+            .expect("begin should stage");
+        staged
+            .accept(receive(
+                session,
+                batch,
+                1,
+                GrantRecord::ConnectedStream {
+                    id: id.clone(),
+                    role: ResourceRole::SnapshotPagerStream,
+                    access: GrantAccess::ReadWrite,
+                    identity,
+                    source_identity,
+                    status_flags,
+                    peer,
+                },
+                Some(descriptor),
+            ))
+            .expect("connected stream should stage");
+        let mut registry = staged
+            .accept(receive(
+                session,
+                batch,
+                2,
+                GrantRecord::Commit {
+                    grant_count: 1,
+                    record_count: 3,
+                    bookmark_bytes: 0,
+                },
+                None,
+            ))
+            .expect("commit should validate")
+            .expect("registry should commit")
+            .registry;
+        assert_eq!(registry.len(), 1);
+        let mut streams = registry.take_stream_registry();
+        assert!(registry.is_empty());
+        assert_eq!(streams.len(), 1);
+        assert_eq!(
+            format!("{streams:?}"),
+            "ConnectedStreamGrantRegistry { entries: \"<redacted>\" }"
+        );
+        let granted = streams
+            .take_connected_stream(&id, ResourceRole::SnapshotPagerStream)
+            .expect("matching stream should adopt");
+        assert_eq!(granted.identity(), identity);
+        assert_eq!(granted.source_identity(), source_identity);
+        assert_eq!(granted.peer(), peer);
+        assert_eq!(granted.status_flags(), status_flags);
+        assert!(streams.is_empty());
+        assert!(
+            streams
+                .take_connected_stream(&id, ResourceRole::SnapshotPagerStream)
+                .is_err()
+        );
+        let adopted = granted.into_stream();
+        adopted
+            .set_write_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("adopted stream timeout should configure");
+        drop(peer_stream);
+    }
+
+    #[test]
+    fn connected_stream_record_rejects_a_regular_descriptor() {
+        let session = SessionId::from_bytes([35; 32]);
+        let batch = BatchId::from_bytes([36; 16]);
+        let file = unlinked_file();
+        let descriptor = duplicate(&file);
+        let stat = descriptor_stat(descriptor.as_raw_fd()).expect("file stat should read");
+        let identity = ObjectIdentity {
+            device: normalized_device(stat.st_dev),
+            inode: stat.st_ino,
+        };
+        let (peer_stream, _other) = UnixStream::pair().expect("peer fixture should open");
+        let actual_peer =
+            peer_identity(peer_stream.as_raw_fd()).expect("peer identity should read");
+        let peer = ConnectedUnixPeer::new(
+            actual_peer.uid,
+            actual_peer.gid,
+            u32::try_from(actual_peer.pid).expect("peer PID should fit"),
+        )
+        .expect("peer identity should validate");
+        let mut staged = StagedGrantBatch::new(session);
+        staged
+            .accept(receive(
+                session,
+                batch,
+                0,
+                GrantRecord::Begin {
+                    grant_count: 1,
+                    record_count: 3,
+                    bookmark_bytes: 0,
+                },
+                None,
+            ))
+            .expect("begin should stage");
+        assert!(
+            staged
+                .accept(receive(
+                    session,
+                    batch,
+                    1,
+                    GrantRecord::ConnectedStream {
+                        id: GrantId::parse("wrong-stream").expect("ID should parse"),
+                        role: ResourceRole::SnapshotPagerStream,
+                        access: GrantAccess::ReadWrite,
+                        identity,
+                        source_identity: ObjectIdentity {
+                            device: 101,
+                            inode: 102,
+                        },
+                        status_flags: u32::try_from(libc::O_RDWR | libc::O_NONBLOCK)
+                            .expect("flags should fit"),
+                        peer,
+                    },
+                    Some(descriptor),
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn connected_stream_record_rejects_listener_datagram_disconnected_and_mismatched_metadata() {
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+        let (peer_fixture, _peer_other) =
+            UnixStream::pair().expect("peer identity fixture should open");
+        let actual_peer =
+            peer_identity(peer_fixture.as_raw_fd()).expect("peer identity should read");
+        let peer = ConnectedUnixPeer::new(
+            actual_peer.uid,
+            actual_peer.gid,
+            u32::try_from(actual_peer.pid).expect("peer PID should fit"),
+        )
+        .expect("peer identity should validate");
+
+        let listener_path = std::env::temp_dir().join(format!(
+            "bangbang-grant-listener-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = UnixListener::bind(&listener_path).expect("listener fixture should bind");
+        fs::remove_file(&listener_path).expect("listener fixture name should unlink");
+        normalize_test_stream(listener.as_raw_fd());
+        let listener: OwnedFd = listener.into();
+        let record = stream_record(listener.as_raw_fd(), peer);
+        assert_connected_stream_record_rejected(listener, record);
+
+        let (datagram, _datagram_peer) =
+            UnixDatagram::pair().expect("datagram fixture should open");
+        normalize_test_stream(datagram.as_raw_fd());
+        let datagram: OwnedFd = datagram.into();
+        let record = stream_record(datagram.as_raw_fd(), peer);
+        assert_connected_stream_record_rejected(datagram, record);
+
+        // SAFETY: A successful socket result is immediately uniquely owned.
+        let disconnected = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(disconnected >= 0);
+        // SAFETY: `disconnected` is the fresh descriptor returned above.
+        let disconnected = unsafe { OwnedFd::from_raw_fd(disconnected) };
+        normalize_test_stream(disconnected.as_raw_fd());
+        let record = stream_record(disconnected.as_raw_fd(), peer);
+        assert_connected_stream_record_rejected(disconnected, record);
+
+        let (stream, _stream_peer) =
+            UnixStream::pair().expect("identity mismatch fixture should open");
+        normalize_test_stream(stream.as_raw_fd());
+        let descriptor: OwnedFd = stream.into();
+        let mut record = stream_record(descriptor.as_raw_fd(), peer);
+        let GrantRecord::ConnectedStream { identity, .. } = &mut record else {
+            panic!("helper should return a connected-stream record");
+        };
+        identity.inode = identity.inode.checked_add(1).unwrap_or(1);
+        assert_connected_stream_record_rejected(descriptor, record);
+
+        let (stream, _stream_peer) = UnixStream::pair().expect("peer mismatch fixture should open");
+        normalize_test_stream(stream.as_raw_fd());
+        let descriptor: OwnedFd = stream.into();
+        let mut record = stream_record(descriptor.as_raw_fd(), peer);
+        let GrantRecord::ConnectedStream { status_flags, .. } = &mut record else {
+            panic!("helper should return a connected-stream record");
+        };
+        *status_flags = u32::try_from(libc::O_RDWR).expect("access flags should fit");
+        assert_connected_stream_record_rejected(descriptor, record);
+
+        let (stream, _stream_peer) = UnixStream::pair().expect("peer mismatch fixture should open");
+        normalize_test_stream(stream.as_raw_fd());
+        let descriptor: OwnedFd = stream.into();
+        let mut record = stream_record(descriptor.as_raw_fd(), peer);
+        let GrantRecord::ConnectedStream {
+            peer: expected_peer,
+            ..
+        } = &mut record
+        else {
+            panic!("helper should return a connected-stream record");
+        };
+        let wrong_pid = if peer.process_id() == i32::MAX as u32 {
+            peer.process_id() - 1
+        } else {
+            peer.process_id() + 1
+        };
+        *expected_peer = ConnectedUnixPeer::new(peer.user_id(), peer.group_id(), wrong_pid)
+            .expect("wrong positive PID should validate");
+        assert_connected_stream_record_rejected(descriptor, record);
+
+        let (stream, _stream_peer) =
+            UnixStream::pair().expect("access mismatch fixture should open");
+        normalize_test_stream(stream.as_raw_fd());
+        let descriptor: OwnedFd = stream.into();
+        let mut record = stream_record(descriptor.as_raw_fd(), peer);
+        let GrantRecord::ConnectedStream { access, .. } = &mut record else {
+            panic!("helper should return a connected-stream record");
+        };
+        *access = GrantAccess::ReadOnly;
+        assert_connected_stream_record_rejected(descriptor, record);
+    }
+
+    #[test]
     fn dedicated_drive_operations_preserve_complete_block_metadata() {
         let source = File::open("/dev/null").expect("descriptor fixture should open");
         let descriptor = duplicate(&source);
@@ -1508,6 +2139,7 @@ mod tests {
                 ),
             ]),
             directories: HashMap::new(),
+            streams: HashMap::new(),
         };
         let mut files = registry.take_file_registry();
         assert!(registry.is_empty());

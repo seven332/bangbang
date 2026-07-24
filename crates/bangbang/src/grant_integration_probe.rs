@@ -10,6 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bangbang_hvf::{HvfBackend, HvfMemoryPermissions};
+use bangbang_pager::{
+    CancelReason, MAX_FRAME_BYTES, MIN_PAGE_SIZE, PageAccess, PagerError, PagerGeneration,
+    PagerLimits, PagerOperations, PagerRegion, PagerRegionId, PagerSessionId, PagerTransport,
+    PagerVmmState, REFERENCE_PAGE_BYTE, TerminalCode, VmmSession,
+};
 use bangbang_runtime::VmBackend;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryBacking, aarch64};
 use bangbang_session::{GrantAccess, GrantId, GrantObjectKind, ResourceRole};
@@ -18,6 +23,9 @@ use crate::contained_session::{ContainedSession, ContainedSessionError};
 
 const OPTION: &str = "--bangbang-internal-grant-probe-v1";
 const READY_LINE: &str = "status: grant integration probe ready";
+const PAGER_READY_LINE: &str = "status: pager integration probe ready";
+const PAGER_GRANT_REF: &str = "bangbang-grant:probe-pager";
+const PAGER_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTSIDE_FILE: &str = "bangbang-grant-probe-outside";
 const BLOCK_CONTROL_GRANT_REF: &str = "bangbang-grant:probe-block-control";
 const BLOCK_CONTROL_INITIAL_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_INITIAL";
@@ -54,7 +62,12 @@ pub(crate) fn run(
     session: &mut ContainedSession,
     args: &[OsString],
 ) -> Result<(), ContainedSessionError> {
-    let probe = ProbeCase::parse(probe_args(args).ok_or(ContainedSessionError)?)?;
+    let probe_args = probe_args(args).ok_or(ContainedSessionError)?;
+    if let Some(pager) = PagerProbeCase::parse(probe_args)? {
+        session.verify_launch_policy(2048, None, false)?;
+        return verify_pager_in_containment(session, pager);
+    }
+    let probe = ProbeCase::parse(probe_args)?;
     session.verify_launch_policy(probe.expected_no_file, probe.expected_file_size, false)?;
     let authority = session.grant_authority().ok_or(ContainedSessionError)?;
     if probe.verifies_block_control() {
@@ -172,6 +185,138 @@ pub(crate) fn run(
                 Err(_) => return Err(ContainedSessionError),
             }
         }
+    }
+    Ok(())
+}
+
+fn verify_pager_in_containment(
+    session: &ContainedSession,
+    probe: PagerProbeCase,
+) -> Result<(), ContainedSessionError> {
+    let authority = session
+        .pager_grant_authority()
+        .ok_or(ContainedSessionError)?;
+    if !authority.is_active() {
+        return Err(ContainedSessionError);
+    }
+    let claimed = authority
+        .claim(Path::new(PAGER_GRANT_REF))
+        .map_err(|_| ContainedSessionError)?
+        .ok_or(ContainedSessionError)?;
+    if claimed.source_identity().inode == 0 || claimed.peer().process_id() == 0 {
+        return Err(ContainedSessionError);
+    }
+    let stream = claimed.into_stream();
+    // SAFETY: F_GETFD observes the live claimed stream descriptor.
+    let descriptor_flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0 || descriptor_flags & libc::FD_CLOEXEC == 0 {
+        return Err(ContainedSessionError);
+    }
+    let mut transport =
+        PagerTransport::new(stream, PAGER_TIMEOUT).map_err(|_| ContainedSessionError)?;
+    let mut vmm = pager_vmm().map_err(|_| ContainedSessionError)?;
+    establish_pager(&mut vmm, &mut transport).map_err(|_| ContainedSessionError)?;
+    match probe {
+        PagerProbeCase::Complete => {
+            run_complete_pager(&mut vmm, &mut transport).map_err(|_| ContainedSessionError)
+        }
+        PagerProbeCase::Cancel => {
+            transport
+                .send(
+                    &vmm.cancel(CancelReason::Requested)
+                        .map_err(|_| ContainedSessionError)?,
+                )
+                .map_err(|_| ContainedSessionError)?;
+            vmm.receive(transport.receive().map_err(|_| ContainedSessionError)?)
+                .map_err(|_| ContainedSessionError)?;
+            (vmm.state() == PagerVmmState::Closed)
+                .then_some(())
+                .ok_or(ContainedSessionError)
+        }
+        PagerProbeCase::Terminal => transport
+            .send(
+                &vmm.terminal(TerminalCode::Internal)
+                    .map_err(|_| ContainedSessionError)?,
+            )
+            .map_err(|_| ContainedSessionError),
+        PagerProbeCase::Wait => {
+            let request = vmm
+                .request_page(
+                    PagerRegionId::new(1).map_err(|_| ContainedSessionError)?,
+                    PagerGeneration::new(1).map_err(|_| ContainedSessionError)?,
+                    0,
+                    PageAccess::Read,
+                )
+                .map_err(|_| ContainedSessionError)?;
+            transport
+                .send(&request)
+                .map_err(|_| ContainedSessionError)?;
+            println!("{PAGER_READY_LINE}");
+            std::io::stdout()
+                .flush()
+                .map_err(|_| ContainedSessionError)?;
+            vmm.receive(transport.receive().map_err(|_| ContainedSessionError)?)
+                .map_err(|_| ContainedSessionError)?;
+            Ok(())
+        }
+    }
+}
+
+fn pager_vmm() -> Result<VmmSession, PagerError> {
+    let limits = PagerLimits::new(
+        MIN_PAGE_SIZE,
+        1,
+        4,
+        u32::try_from(MAX_FRAME_BYTES).map_err(|_| PagerError::InvalidConfiguration)?,
+        PagerOperations::v1(),
+    )?;
+    let region = PagerRegion::new(
+        PagerRegionId::new(1)?,
+        0,
+        u64::from(MIN_PAGE_SIZE) * 2,
+        MIN_PAGE_SIZE,
+    )?;
+    VmmSession::new(
+        PagerSessionId::from_bytes([0x51; 32])?,
+        limits,
+        vec![region],
+    )
+}
+
+fn establish_pager(vmm: &mut VmmSession, transport: &mut PagerTransport) -> Result<(), PagerError> {
+    transport.send(&vmm.hello()?)?;
+    vmm.receive(transport.receive()?)?;
+    transport.send(&vmm.next_region()?)?;
+    transport.send(&vmm.start()?)?;
+    vmm.receive(transport.receive()?)?;
+    if vmm.state() != PagerVmmState::Active || vmm.selected_limits() != Some(vmm.offered_limits()) {
+        return Err(PagerError::InvalidPeerState);
+    }
+    Ok(())
+}
+
+fn run_complete_pager(
+    vmm: &mut VmmSession,
+    transport: &mut PagerTransport,
+) -> Result<(), PagerError> {
+    let region = PagerRegionId::new(1)?;
+    let generation = PagerGeneration::new(1)?;
+    for (offset, expected_data) in [
+        (0, Some(vec![REFERENCE_PAGE_BYTE; MIN_PAGE_SIZE as usize])),
+        (u64::from(MIN_PAGE_SIZE), None),
+    ] {
+        transport.send(&vmm.request_page(region, generation, offset, PageAccess::Read)?)?;
+        let response = vmm.receive(transport.receive()?)?;
+        if response.page_data().map(<[u8]>::to_vec) != expected_data {
+            return Err(PagerError::InvalidPeerState);
+        }
+    }
+    transport.send(&vmm.remove(region, generation, 0, u64::from(MIN_PAGE_SIZE))?)?;
+    vmm.receive(transport.receive()?)?;
+    transport.send(&vmm.shutdown()?)?;
+    vmm.receive(transport.receive()?)?;
+    if vmm.state() != PagerVmmState::Closed {
+        return Err(PagerError::InvalidPeerState);
     }
     Ok(())
 }
@@ -375,6 +520,33 @@ fn trigger_file_size_enforcement(
     // failed or produced an unexpected recoverable result.
     let _ = unsafe { libc::pwrite(descriptor, b"x".as_ptr().cast(), 1, length) };
     Err(ContainedSessionError)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagerProbeCase {
+    Complete,
+    Cancel,
+    Terminal,
+    Wait,
+}
+
+impl PagerProbeCase {
+    fn parse(args: &[OsString]) -> Result<Option<Self>, ContainedSessionError> {
+        let [option, value] = args else {
+            return Err(ContainedSessionError);
+        };
+        if option != OPTION {
+            return Err(ContainedSessionError);
+        }
+        Ok(match value.to_str() {
+            Some("pager-complete") => Some(Self::Complete),
+            Some("pager-cancel") => Some(Self::Cancel),
+            Some("pager-terminal") => Some(Self::Terminal),
+            Some("pager-wait") => Some(Self::Wait),
+            Some(value) if value.starts_with("pager-") => return Err(ContainedSessionError),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

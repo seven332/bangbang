@@ -100,6 +100,7 @@ version = "0.1.0"
 dependencies = [
  "bangbang-api",
  "bangbang-hvf",
+ "bangbang-pager",
  "bangbang-runtime",
  "bangbang-session",
  "block2",
@@ -148,6 +149,7 @@ dependencies = [
 name = "bangbang-launcher"
 version = "0.1.0"
 dependencies = [
+ "bangbang-pager",
  "bangbang-session",
  "libc",
  "plist",

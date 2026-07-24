@@ -2120,9 +2120,9 @@ into unbounded waits.
 The checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 records positive public-macOS feasibility plus implemented standalone protocol
-and internal anonymous-memory ownership slices, not a shipped pager.
-Native-v1 `Uffd` still rejects before path, socket, artifact, or backend
-access.
+and internal anonymous-memory ownership slices plus a contained connected-peer
+grant, not an activated restore backend. Native-v1 `Uffd` still rejects before
+path, socket, artifact, or backend access.
 
 The accepted complete boundary uses two in-worker protection planes: public
 Mach task exceptions mediate host accesses to owned absent guest pages, and HVF
@@ -2139,10 +2139,20 @@ page data. It has no peer strings, paths, addresses, descriptors, or task
 ports; Debug and errors are value-redacted. Its transport accepts only an
 already-connected stream, uses one absolute deadline across partial I/O,
 suppresses `SIGPIPE`, and becomes terminal after malformed input, timeout, EOF,
-or transport failure. Later launcher work reduces the configured Unix path to
-that connected stream. This adds no ambient network entitlement, dynamic Mach
-service, root requirement, private API, entitlement weakening, or host-wide
-setting.
+or transport failure.
+
+The production launcher now reduces the configured Unix path to that connected
+stream before worker spawn. It walks parent components without symlinks,
+anchors the final relative connect, requires one current-user single-link socket
+vnode before and after the bounded operation, and records only kernel/source
+identity plus redacted peer UID/GID/PID. The existing atomic startup-grant
+channel transfers exactly one read-write connected stream. The worker
+independently revalidates CLOEXEC, nonblocking read-write status, socket and
+source identity, connection state, peer credentials, exact role, and one-time
+grant ID before adoption. Unclaimed authority closes on reader loss or
+contained-session teardown. This adds no path/directory/listener authority,
+ambient network entitlement, dynamic Mach service, root requirement, private
+API, entitlement weakening, or host-wide setting.
 
 The runtime's `LazyGuestMemory` is a separate owner rather than an alternate
 mode on ordinary initialized `GuestMemory`. It allocates only private anonymous
@@ -2235,10 +2245,12 @@ fail-closed supervision gate. An owned callback error or unwind terminalizes
 the coordinator and exits the worker with fixed status 70; it cannot fabricate
 zero or stale contents, fall through accidentally to `SIGBUS`, or swallow an
 unrelated crash. The protocol already bounds I/O and forbids automatic replay;
-the later peer integration must map timeout/EOF/death onto this one terminal
-path rather than wait indefinitely. External/shared mappings that bypass the
-task-local bridge remain pre-resource rejections until independently
-certified.
+the signed contained broker tests already prove bounded handshake,
+timeout/EOF, peer death, worker death, cancellation, terminal, and orderly
+shutdown at the process boundary. Mapping those outcomes onto the live
+coordinator remains the next slice; they cannot yet trigger native-v1 restore.
+External/shared mappings that bypass the task-local bridge remain pre-resource
+rejections until independently certified.
 
 ## Guest Data Exposure
 

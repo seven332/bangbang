@@ -6,11 +6,12 @@ repository.workspace = true
 
 [features]
 default = []
-grant-integration-probe = []
+grant-integration-probe = ["dep:bangbang-pager"]
 
 [dependencies]
 bangbang-api = { path = "../api" }
 bangbang-hvf = { path = "../hvf" }
+bangbang-pager = { path = "../pager", optional = true }
 bangbang-runtime = { path = "../runtime" }
 bangbang-session = { path = "../session" }
 block2 = "0.6.2"
