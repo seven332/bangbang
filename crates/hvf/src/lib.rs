@@ -8,6 +8,7 @@ mod dirty;
 mod exit;
 mod ffi;
 mod gic;
+mod lazy_guest_fault;
 mod lazy_host_fault;
 mod mach_lazy;
 mod memory;
@@ -39,10 +40,11 @@ pub use dirty::{
     HvfDirtyWriteTrackerStopError,
 };
 pub use exit::{
-    HvfExceptionExit, HvfHvcDecodeError, HvfHvcExit, HvfMmioAccess, HvfMmioAccessSize,
-    HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth,
-    HvfMmioResolveError, HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfSys64DecodeError,
-    HvfSys64Direction, HvfSys64Exit, HvfSys64Register, HvfVcpuExit, HvfVcpuExitResolveError,
+    HvfExceptionExit, HvfHvcDecodeError, HvfHvcExit, HvfLazyGuestAccess, HvfLazyGuestFault,
+    HvfMmioAccess, HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister,
+    HvfMmioRegisterWidth, HvfMmioResolveError, HvfResolvedMmioAccess, HvfResolvedVcpuExit,
+    HvfSys64DecodeError, HvfSys64Direction, HvfSys64Exit, HvfSys64Register, HvfVcpuExit,
+    HvfVcpuExitResolveError,
 };
 pub use gic::{
     HvfArm64GicIccRegister, HvfArm64GicIccRegisterRestoreError,
@@ -54,6 +56,9 @@ pub use gic::{
     HvfGicMsiSignalError, HvfGicMsiSignaler, HvfGicRedistributor, HvfGicRegion,
     HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicTimerInterrupts,
     HvfInterruptLineAllocationError,
+};
+pub use lazy_guest_fault::{
+    HvfHandledLazyGuestFault, HvfLazyGuestFaultError, HvfLazyGuestResolutionFailure,
 };
 pub use lazy_host_fault::{
     HVF_LAZY_HOST_FAULT_TERMINAL_EXIT_CODE, HvfLazyHostFaultBridge, HvfLazyHostFaultError,

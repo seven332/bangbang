@@ -15,8 +15,9 @@ Separately, `LazyGuestMemory` is the backend-neutral private-anonymous
 coordinator for the external-paging roadmap; it is not the v2 File/COW loader
 and is not connected to a public restore path yet. `bangbang-hvf` now binds
 that coordinator to task-local public-Mach host faults through a trusted
-in-process content-source interface; pager transport, guest faults, and public
-restore remain separate later gates.
+in-process content-source interface and to HVF stage-two guest
+read/write/execute faults. Pager transport and public restore remain separate
+later gates.
 
 ## Current Status
 
@@ -1305,13 +1306,22 @@ tests cover reads, writes, atomics, raw pointers, forwarding, later-owner
 preservation, repeated cleanup, and terminal failure.
 
 This is still not a usable restore backend. The adapter accepts a trusted
-in-process content source but opens no peer or pager transport, installs no HVF
-guest permission, and exposes no native-v1 API success. Later integrations use
-HVF for guest faults, connect the coordinator to the protocol, and have the
+in-process content source but opens no peer or pager transport and exposes no
+native-v1 API success. The HVF guest adapter now maps lazy regions with no
+initial stage-two access, classifies owned data/instruction aborts, resolves all
+touched pages, synchronizes instruction contents, publishes serialized
+read/write/execute permission unions, and retries without advancing PC.
+Multi-vCPU duplicates share coordinator work, while stale no-progress,
+resolver, and protection failures close the path. Signed lifecycle and guest
+boot cases cover execute/read/write population, failure, cancellation, and
+cleanup, including one deliberately concurrent two-vCPU page request and an
+unowned instruction fault that retains the existing error path.
+
+Later integrations connect the coordinator to the protocol and have the
 launcher supply only the connected stream. Native-v1 `Uffd` remains rejected
-before resource access until #1527's restore gate; guest fault delivery,
-brokerage, peer removal/failure, consumer gating, restore, and final signed
-certification remain nonterminal.
+before resource access until #1527's restore gate; brokerage, peer
+removal/failure, consumer gating, restore, and final signed certification
+remain nonterminal.
 
 ### Implemented public native-v1 restore order
 

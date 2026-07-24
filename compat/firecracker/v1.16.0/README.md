@@ -92,14 +92,15 @@ claims mechanically visible.
   API/live outcomes, and retains six explicit #1490 optional-device encoding,
   public restore, clone/version, and portability handoffs.
 - [`snapshot-paging-contract.md`](snapshot-paging-contract.md) is the
-  #1546/#1547/#1548/#1549 checked public-macOS UFFD-equivalent feasibility,
-  standalone protocol, coordinated lazy-anonymous-memory, and task-local host
-  fault ledger. It pins the exact page-fault corpus, upstream observable
-  contract, signed prototype evidence, implemented bounded
+  #1546/#1547/#1548/#1549/#1550 checked public-macOS UFFD-equivalent
+  feasibility, standalone protocol, coordinated lazy-anonymous-memory, and
+  internal host/guest fault ledger. It pins the exact page-fault corpus,
+  upstream observable contract, signed prototype evidence, implemented bounded
   `bangbang-pager-v1` wire/state/connected-transport slice, distinct runtime
-  anonymous mapping owner/page lifecycle, public-Mach host bridge, current
-  pre-access rejection, security boundary, and remaining #1527 gates without
-  claiming Linux wire compatibility or runtime support.
+  anonymous mapping owner/page lifecycle, public-Mach host bridge, HVF
+  read/write/execute guest bridge, current pre-access rejection, security
+  boundary, and remaining #1527 gates without claiming Linux wire
+  compatibility or runtime support.
 
 Regeneration may produce a candidate `source-manifest.json`; it must never
 create or rewrite a capability disposition, owner, evidence reference,
@@ -580,8 +581,12 @@ coalescing, retired-operation accounting, acknowledged removal, and terminal
 concurrency tests. #1549 adds the public-Mach task-local host protection plane,
 private complete-before-visible aliases, coordinator/source adapter,
 forwarding/conditional restoration, and signed direct/App Sandbox failure and
-lifecycle evidence. Guest faults, peer wiring, consumer certification, and
-public restore remain open, so the current overlay remains 228/169/4/17.
+lifecycle evidence. #1550 adds zero-permission lazy HVF mappings, exact owned
+data/instruction-fault mediation, resolve-before-permission ordering,
+serialized least-permission union, instruction-cache synchronization,
+multi-vCPU coalescing, and signed execute/read/write/failure/cancellation/guest-
+entry evidence. Peer wiring, consumer certification, and public restore remain
+open, so the current overlay remains 228/169/4/17.
 
 ## Commands
 

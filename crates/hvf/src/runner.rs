@@ -26,6 +26,9 @@ use crate::gic::{
     HvfGicError, HvfGicIccRegisterReader, HvfGicIccRegisterRestorer, HvfGicPpiPendingWriter,
     HvfGicStateRestorer, HvfGicStateSnapshotter, validate_gic_ppi_pending_intid,
 };
+use crate::lazy_guest_fault::{
+    HvfHandledLazyGuestFault, HvfLazyGuestFaultError, HvfLazyGuestFaultHandler,
+};
 use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
     PsciCall, PsciCallAction, PsciCoordinatedDispatch, PsciCoordinatorRequest,
@@ -112,6 +115,8 @@ const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
 const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
 const RAW_RUN_WITH_DIRTY_TRACKING_MESSAGE: &str =
     "raw vCPU run is unavailable while dirty-write tracking is active";
+const RAW_RUN_WITH_LAZY_GUEST_PAGING_MESSAGE: &str =
+    "raw vCPU run is unavailable while lazy guest paging is active";
 const METADATA_READ_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has metadata read in flight";
 const MPIDR_ALREADY_CONFIGURED_MESSAGE: &str = "vCPU runner MPIDR affinity is already configured";
 const MPIDR_CONFIGURATION_FAILED_MESSAGE: &str =
@@ -205,6 +210,7 @@ pub enum HvfVcpuRunnerError {
     },
     VcpuExitResolve(HvfVcpuExitResolveError),
     DirtyWriteFault(HvfDirtyWriteFaultError),
+    LazyGuestFault(HvfLazyGuestFaultError),
     MmioDispatch(HvfMmioDispatchError),
     RetainedVtimerWait {
         stage: HvfVcpuRetainedVtimerWaitStage,
@@ -578,6 +584,11 @@ pub enum HvfVcpuRunStepOutcome {
         page: GuestAddress,
         first_write: bool,
     },
+    /// One lazy guest access was resolved and should retry at the same PC.
+    LazyPage {
+        /// Validated fault and page-publication accounting.
+        fault: HvfHandledLazyGuestFault,
+    },
     VtimerActivated,
     Unknown {
         reason: u32,
@@ -705,6 +716,7 @@ impl fmt::Display for HvfVcpuRunnerError {
             }
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
             Self::DirtyWriteFault(err) => write!(f, "{err}"),
+            Self::LazyGuestFault(err) => write!(f, "{err}"),
             Self::MmioDispatch(err) => write!(f, "{err}"),
             Self::RetainedVtimerWait { stage, source } => {
                 write!(f, "retained virtual-timer wait {stage} failed: {source}")
@@ -775,6 +787,7 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::SnapshotRestore { source, .. } => Some(source.as_ref()),
             Self::VcpuExitResolve(err) => Some(err),
             Self::DirtyWriteFault(err) => Some(err),
+            Self::LazyGuestFault(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
             Self::RetainedVtimerWait { source, .. } => Some(source.as_ref()),
             Self::MpidrAffinity {
@@ -899,6 +912,12 @@ impl From<HvfDirtyWriteFaultError> for HvfVcpuRunnerError {
     }
 }
 
+impl From<HvfLazyGuestFaultError> for HvfVcpuRunnerError {
+    fn from(err: HvfLazyGuestFaultError) -> Self {
+        Self::LazyGuestFault(err)
+    }
+}
+
 impl From<HvfMmioDispatchError> for HvfVcpuRunnerError {
     fn from(err: HvfMmioDispatchError) -> Self {
         Self::MmioDispatch(err)
@@ -913,6 +932,8 @@ pub struct HvfVcpuRunner<'vm> {
     dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
     dirty_write_member_index: usize,
     dirty_write_owner_registered: AtomicBool,
+    lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
+    lazy_guest_member_index: usize,
     _vm: PhantomData<&'vm HvfBackend>,
 }
 
@@ -1162,6 +1183,8 @@ enum RunnerCommand {
         dispatcher: SharedMmioDispatcher,
         dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
         dirty_write_member_index: usize,
+        lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
+        lazy_guest_member_index: usize,
         response_sender: mpsc::Sender<Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>>,
     },
     RunOnceAndHandleMmioCoordinated {
@@ -1171,6 +1194,8 @@ enum RunnerCommand {
         dispatcher: SharedMmioDispatcher,
         dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
         dirty_write_member_index: usize,
+        lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
+        lazy_guest_member_index: usize,
         completion_sender: mpsc::Sender<HvfVcpuRunCompletion>,
     },
     WaitForRetainedVtimer {
@@ -2910,24 +2935,6 @@ impl RunnerVcpu for RealRunnerVcpu {
 }
 
 impl<'vm> HvfVcpuRunner<'vm> {
-    pub(crate) fn new() -> Result<Self, HvfVcpuRunnerError> {
-        Self::new_with_mpidr(0)
-    }
-
-    pub(crate) fn new_with_mpidr(expected: u64) -> Result<Self, HvfVcpuRunnerError> {
-        let runner = Self::new_unconfigured()?;
-        match runner.configure_mpidr_el1(expected) {
-            Ok(_) => Ok(runner),
-            Err(source) => match runner.shutdown() {
-                Ok(()) => Err(source),
-                Err(cleanup) => Err(HvfVcpuRunnerError::MpidrAffinityCleanup {
-                    source: Box::new(source),
-                    cleanup: Box::new(cleanup),
-                }),
-            },
-        }
-    }
-
     pub(crate) fn new_unconfigured() -> Result<Self, HvfVcpuRunnerError> {
         Self::from_started_with_mpidr_state(
             spawn_runner_thread(RealRunnerVcpu::create)?,
@@ -2936,12 +2943,16 @@ impl<'vm> HvfVcpuRunner<'vm> {
         )
     }
 
-    pub(crate) fn new_with_dirty_write_tracker(
+    pub(crate) fn new_with_memory_fault_handlers(
         member_index: usize,
         dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+        lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
     ) -> Result<Self, HvfVcpuRunnerError> {
-        let runner =
-            Self::new_unconfigured_with_dirty_write_tracker(member_index, dirty_write_tracker)?;
+        let runner = Self::new_unconfigured_with_memory_fault_handlers(
+            member_index,
+            dirty_write_tracker,
+            lazy_guest_fault_handler,
+        )?;
         match runner.configure_mpidr_el1(0) {
             Ok(_) => Ok(runner),
             Err(source) => match runner.shutdown() {
@@ -2954,10 +2965,21 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
     }
 
-    pub(crate) fn new_unconfigured_with_dirty_write_tracker(
+    pub(crate) fn new_unconfigured_with_memory_fault_handlers(
         member_index: usize,
         dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+        lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
     ) -> Result<Self, HvfVcpuRunnerError> {
+        if dirty_write_tracker.is_some() && lazy_guest_fault_handler.is_some() {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                "dirty-write tracking and lazy guest paging cannot share stage-two ownership",
+            ));
+        }
+        if let Some(handler) = lazy_guest_fault_handler.as_ref() {
+            handler
+                .ensure_active()
+                .map_err(HvfVcpuRunnerError::Backend)?;
+        }
         if let Some(tracker) = dirty_write_tracker.as_ref() {
             tracker.register_owner(member_index)?;
         }
@@ -2975,6 +2997,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .store(dirty_write_tracker.is_some(), Ordering::Release);
         runner.dirty_write_tracker = dirty_write_tracker;
         runner.dirty_write_member_index = member_index;
+        runner.lazy_guest_fault_handler = lazy_guest_fault_handler;
+        runner.lazy_guest_member_index = member_index;
         Ok(runner)
     }
 
@@ -4360,6 +4384,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
             dirty_write_tracker: None,
             dirty_write_member_index: 0,
             dirty_write_owner_registered: AtomicBool::new(false),
+            lazy_guest_fault_handler: None,
+            lazy_guest_member_index: 0,
             _vm: PhantomData,
         })
     }
@@ -4478,6 +4504,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if self.dirty_write_tracker.is_some() {
             return Err(HvfVcpuRunnerError::InvalidState(
                 RAW_RUN_WITH_DIRTY_TRACKING_MESSAGE,
+            ));
+        }
+        if self.lazy_guest_fault_handler.is_some() {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RAW_RUN_WITH_LAZY_GUEST_PAGING_MESSAGE,
             ));
         }
         let mut state = self.lock_state()?;
@@ -4611,6 +4642,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 dispatcher,
                 dirty_write_tracker: self.dirty_write_tracker.as_ref().map(Arc::clone),
                 dirty_write_member_index: self.dirty_write_member_index,
+                lazy_guest_fault_handler: self.lazy_guest_fault_handler.as_ref().map(Arc::clone),
+                lazy_guest_member_index: self.lazy_guest_member_index,
                 response_sender,
             })
             .is_err()
@@ -4691,6 +4724,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
             dispatcher,
             dirty_write_tracker: self.dirty_write_tracker.as_ref().map(Arc::clone),
             dirty_write_member_index: self.dirty_write_member_index,
+            lazy_guest_fault_handler: self.lazy_guest_fault_handler.as_ref().map(Arc::clone),
+            lazy_guest_member_index: self.lazy_guest_member_index,
             completion_sender,
         };
         if let Err(err) = self.command_sender.send(command) {
@@ -7087,13 +7122,20 @@ fn run_runner_thread<C, V>(
                 dispatcher,
                 dirty_write_tracker,
                 dirty_write_member_index,
+                lazy_guest_fault_handler,
+                lazy_guest_member_index,
                 response_sender,
             } => {
+                let memory_fault_handlers = RunnerMemoryFaultHandlers {
+                    dirty_write_tracker: dirty_write_tracker.as_deref(),
+                    dirty_write_member_index,
+                    lazy_guest_fault_handler: lazy_guest_fault_handler.as_deref(),
+                    lazy_guest_member_index,
+                };
                 let result = run_once_and_handle_mmio_on_runner_thread(
                     &mut vcpu,
                     &dispatcher,
-                    dirty_write_tracker.as_deref(),
-                    dirty_write_member_index,
+                    memory_fault_handlers,
                     &mut pvtime,
                 );
                 let _ = response_sender.send(result);
@@ -7105,15 +7147,22 @@ fn run_runner_thread<C, V>(
                 dispatcher,
                 dirty_write_tracker,
                 dirty_write_member_index,
+                lazy_guest_fault_handler,
+                lazy_guest_member_index,
                 completion_sender,
             } => {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let memory_fault_handlers = RunnerMemoryFaultHandlers {
+                        dirty_write_tracker: dirty_write_tracker.as_deref(),
+                        dirty_write_member_index,
+                        lazy_guest_fault_handler: lazy_guest_fault_handler.as_deref(),
+                        lazy_guest_member_index,
+                    };
                     let result = run_once_and_handle_mmio_coordinated_on_runner_thread(
                         &mut vcpu,
                         &dispatcher,
                         &mut psci_state,
-                        dirty_write_tracker.as_deref(),
-                        dirty_write_member_index,
+                        memory_fault_handlers,
                         &mut pvtime,
                     );
                     record_coordinated_psci_pending(&state, result)
@@ -8261,11 +8310,18 @@ fn run_once_with_pvtime_on_runner_thread(
     Ok(exit)
 }
 
+#[derive(Clone, Copy)]
+struct RunnerMemoryFaultHandlers<'a> {
+    dirty_write_tracker: Option<&'a HvfDirtyWriteTracker>,
+    dirty_write_member_index: usize,
+    lazy_guest_fault_handler: Option<&'a HvfLazyGuestFaultHandler>,
+    lazy_guest_member_index: usize,
+}
+
 fn run_once_and_handle_mmio_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     dispatcher: &SharedMmioDispatcher,
-    dirty_write_tracker: Option<&HvfDirtyWriteTracker>,
-    dirty_write_member_index: usize,
+    memory_fault_handlers: RunnerMemoryFaultHandlers<'_>,
     pvtime: &mut HvfArm64PvTimeAccounting,
 ) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
     let policy = pvtime.policy();
@@ -8280,8 +8336,21 @@ fn run_once_and_handle_mmio_on_runner_thread(
             if let Ok(sys64) = exit.decode_sys64() {
                 return handle_sys64_on_runner_thread(vcpu, sys64);
             }
-            if let Some(tracker) = dirty_write_tracker
-                && let Some(handled) = tracker.handle_exception(dirty_write_member_index, exit)?
+            if let Some(handler) = memory_fault_handlers.lazy_guest_fault_handler
+                && let Some(candidate) = handler.classify(exit)?
+            {
+                let pc = vcpu
+                    .read_register(HvfRegister::PC)
+                    .map_err(HvfVcpuRunnerError::Backend)?;
+                if let Some(fault) =
+                    handler.handle(memory_fault_handlers.lazy_guest_member_index, candidate, pc)?
+                {
+                    return Ok(HvfVcpuRunStepOutcome::LazyPage { fault });
+                }
+            }
+            if let Some(tracker) = memory_fault_handlers.dirty_write_tracker
+                && let Some(handled) = tracker
+                    .handle_exception(memory_fault_handlers.dirty_write_member_index, exit)?
             {
                 return Ok(HvfVcpuRunStepOutcome::DirtyWrite {
                     page: handled.page(),
@@ -8307,8 +8376,7 @@ fn run_once_and_handle_mmio_coordinated_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     dispatcher: &SharedMmioDispatcher,
     psci_state: &mut RunnerThreadPsciState,
-    dirty_write_tracker: Option<&HvfDirtyWriteTracker>,
-    dirty_write_member_index: usize,
+    memory_fault_handlers: RunnerMemoryFaultHandlers<'_>,
     pvtime: &mut HvfArm64PvTimeAccounting,
 ) -> Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError> {
     let policy = pvtime.policy();
@@ -8324,8 +8392,23 @@ fn run_once_and_handle_mmio_coordinated_on_runner_thread(
                 return handle_sys64_on_runner_thread(vcpu, sys64)
                     .map(HvfVcpuCoordinatedRunStepOutcome::Handled);
             }
-            if let Some(tracker) = dirty_write_tracker
-                && let Some(handled) = tracker.handle_exception(dirty_write_member_index, exit)?
+            if let Some(handler) = memory_fault_handlers.lazy_guest_fault_handler
+                && let Some(candidate) = handler.classify(exit)?
+            {
+                let pc = vcpu
+                    .read_register(HvfRegister::PC)
+                    .map_err(HvfVcpuRunnerError::Backend)?;
+                if let Some(fault) =
+                    handler.handle(memory_fault_handlers.lazy_guest_member_index, candidate, pc)?
+                {
+                    return Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                        HvfVcpuRunStepOutcome::LazyPage { fault },
+                    ));
+                }
+            }
+            if let Some(tracker) = memory_fault_handlers.dirty_write_tracker
+                && let Some(handled) = tracker
+                    .handle_exception(memory_fault_handlers.dirty_write_member_index, exit)?
             {
                 return Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
                     HvfVcpuRunStepOutcome::DirtyWrite {
@@ -8685,6 +8768,7 @@ pub(crate) mod tests {
         HvfArm64GicIccRegisterRestoreOperation, HvfArm64GicIccRegisterState, HvfGicDeviceState,
         HvfGicError, restore_arm64_gic_icc_register_state_with,
     };
+    use crate::lazy_guest_fault::{HvfLazyGuestFaultError, HvfLazyGuestFaultHandler};
     use crate::memory::{
         HvfMappedGuestMemoryRegion, HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions,
     };
@@ -17557,6 +17641,14 @@ pub(crate) mod tests {
         })
     }
 
+    fn lazy_read_exception_exit(physical_address: u64) -> HvfVcpuExit {
+        HvfVcpuExit::Exception(HvfExceptionExit {
+            syndrome: 0x9381_0007,
+            virtual_address: physical_address,
+            physical_address,
+        })
+    }
+
     fn hvc_exception_exit(immediate: u16) -> HvfVcpuExit {
         HvfVcpuExit::Exception(HvfExceptionExit {
             syndrome: hvc_syndrome(immediate),
@@ -18941,6 +19033,30 @@ pub(crate) mod tests {
             .dirty_write_owner_registered
             .store(true, std::sync::atomic::Ordering::Release);
         tracker
+    }
+
+    fn attach_lazy_guest_fault_handler(
+        runner: &mut HvfVcpuRunner<'static>,
+        member_index: usize,
+        mapper: Arc<RunnerProtectionMapper>,
+        start: u64,
+        page_count: u64,
+    ) -> Arc<HvfLazyGuestFaultHandler> {
+        let page_size = 0x1000;
+        let size = page_count
+            .checked_mul(page_size)
+            .expect("test lazy mapping size should not overflow");
+        let range = GuestMemoryRange::new(GuestAddress::new(start), size)
+            .expect("test lazy mapping should be valid");
+        let handler = HvfLazyGuestFaultHandler::active_noop_for_test(
+            mapper,
+            &[range],
+            page_size,
+            HvfMemoryPermissions::GUEST_RAM,
+        );
+        runner.lazy_guest_fault_handler = Some(Arc::clone(&handler));
+        runner.lazy_guest_member_index = member_index;
+        handler
     }
 
     fn start_psci_run_step_recording_runner(
@@ -34141,6 +34257,94 @@ pub(crate) mod tests {
 
         runner.shutdown().expect("tracked runner should shut down");
         tracker.stop().expect("owner-free tracker should stop");
+    }
+
+    #[test]
+    fn lazy_guest_fault_retries_without_pc_advance_mmio_or_raw_run_bypass() {
+        let (mut runner, dispatched_receiver, register_write_receiver) =
+            start_run_step_recording_runner(
+                Ok(lazy_read_exception_exit(0x4123)),
+                Ok(MmioDispatchOutcome::Write),
+            );
+        let mapper = Arc::new(RunnerProtectionMapper::default());
+        let _handler = attach_lazy_guest_fault_handler(&mut runner, 0, mapper.clone(), 0x4000, 2);
+        let dispatcher = shared_dispatcher();
+        let dispatcher_guard = dispatcher
+            .lock()
+            .expect("dispatcher lock should remain available");
+
+        let outcome = runner
+            .run_once_and_handle_mmio(Arc::clone(&dispatcher))
+            .expect("owned lazy read should resolve");
+        let HvfVcpuRunStepOutcome::LazyPage { fault } = outcome else {
+            panic!("owned lazy read should return a lazy-page outcome");
+        };
+        assert_eq!(
+            fault.fault().range(),
+            GuestMemoryRange::new(GuestAddress::new(0x4123), 4)
+                .expect("fault range should be valid")
+        );
+        assert_eq!(
+            fault.fault().access(),
+            crate::exit::HvfLazyGuestAccess::Read
+        );
+        assert_eq!(fault.permission_changes(), 1);
+        assert!(!fault.stale_exit());
+        assert_eq!(
+            mapper.calls(),
+            vec![(
+                GuestMemoryRange::new(GuestAddress::new(0x4000), 0x1000)
+                    .expect("protected page should be valid"),
+                HvfMemoryPermissions::READ,
+            )]
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(
+            dispatched_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RAW_RUN_WITH_LAZY_GUEST_PAGING_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)),
+            Err(HvfVcpuRunnerError::LazyGuestFault(
+                HvfLazyGuestFaultError::NoProgress {
+                    page: GuestAddress::new(0x4000),
+                    access: crate::exit::HvfLazyGuestAccess::Read,
+                }
+            ))
+        );
+
+        drop(dispatcher_guard);
+        runner.shutdown().expect("lazy runner should shut down");
+    }
+
+    #[test]
+    fn canceled_exit_performs_no_lazy_resolution_or_permission_work() {
+        let mut runner = start_run_step_exit_runner(Ok(HvfVcpuExit::Canceled));
+        let mapper = Arc::new(RunnerProtectionMapper::default());
+        let _handler = attach_lazy_guest_fault_handler(&mut runner, 0, mapper.clone(), 0x4000, 1);
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Canceled)
+        );
+        assert!(mapper.calls().is_empty());
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RAW_RUN_WITH_LAZY_GUEST_PAGING_MESSAGE
+            ))
+        );
+
+        runner.shutdown().expect("lazy runner should shut down");
     }
 
     #[test]

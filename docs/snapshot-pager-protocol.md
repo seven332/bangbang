@@ -254,9 +254,16 @@ restores conditionally, and fails closed with fixed worker exit status 70. Its
 current `HvfLazyPageSource` is a trusted in-process boundary; it does not adopt
 or drive a `PagerTransport`.
 
+The HVF crate also binds the same resolver to zero-permission guest mappings.
+Its runner classifies owned data/instruction aborts, resolves every touched
+page, synchronizes executable contents, publishes serialized least-permission
+unions, and retries without PC advance. Focused and signed coverage includes
+multi-vCPU coalescing, execute/read/write population, lazy entry boot, failure,
+cancellation, and cleanup. This remains a trusted in-process source boundary;
+it does not drive `PagerTransport`.
+
 Still deferred are transport/coordinator wiring, socket brokerage, source
-grants, HVF guest-fault mediation, peer-driven removal/failure integration,
-consumer gating, native-v1 restore activation, and final signed end-to-end
-certification. Until those #1527 slices complete, native-v1 `Uffd` remains
-rejected before resource access and the checked capability remains
-`missing-platform-feasible`.
+grants, peer-driven removal/failure integration, consumer gating, native-v1
+restore activation, and final signed end-to-end certification. Until those
+#1527 slices complete, native-v1 `Uffd` remains rejected before resource access
+and the checked capability remains `missing-platform-feasible`.

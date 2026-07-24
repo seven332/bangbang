@@ -415,11 +415,24 @@ process. Signed tests cover reads, writes, atomics, raw pointers, forwarding,
 replacement, repeated teardown, and terminal failure both directly and under
 the production App Sandbox entitlement floor.
 
-This internal bridge accepts only a trusted in-process page source; it does not
-connect the pager transport, install HVF guest permissions, handle peer-driven
-removal/failure, audit bypassing consumers, or change the native-v1 gate. Guest
-fault delivery, launcher brokerage, transport/removal/failure wiring, consumer
-gating, restore, and final certification remain deferred under #1527.
+The HVF backend now binds the same resolver to a second, guest-facing
+protection plane. Lazy regions enter HVF with zero stage-two permissions;
+validated data and instruction aborts populate every touched page before the
+runner publishes the serialized least-permission union and retries without
+advancing PC. Signed Apple-Silicon tests cover execute-, read-, and write-first
+population, a lazy guest entry page, source failure, cleanup, and run
+cancellation. A signed two-vCPU case proves duplicate work coalesces through
+the coordinator, and an unowned instruction fault retains the existing error
+path, while a repeated stale exit or any resolver/protection failure closes
+the mapping instead of spinning or exposing a partial page. Raw vCPU ownership
+and dirty-write tracking remain explicitly incompatible with this internal
+mode.
+
+These internal bridges still accept only a trusted in-process page source; they
+do not connect the pager transport, handle peer-driven removal/failure, audit
+bypassing consumers, or change the native-v1 gate. Launcher brokerage,
+transport/removal/failure wiring, consumer gating, restore, and final
+certification remain deferred under #1527.
 
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
@@ -1338,10 +1351,10 @@ exact 14-record set to eight terminal API/live outcomes and six precise #1490
 artifact/restore/clone handoffs. The
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 then moves its one exact corpus record to feasible-but-undelivered #1527
-ownership while preserving native-v1 rejection. Its standalone protocol slice
-backend-neutral coordinated lazy-anonymous-memory slice, and task-local public
-Mach host-fault bridge are implemented and tested without promoting the
-aggregate capability.
+ownership while preserving native-v1 rejection. Its standalone protocol
+slice, backend-neutral coordinated lazy-anonymous-memory slice, task-local
+public-Mach host-fault bridge, and HVF guest read/write/execute fault bridge
+are implemented and tested without promoting the aggregate capability.
 The repository-wide disposition counts remain 228/169/4/17.
 
 ## Build And Test

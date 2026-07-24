@@ -11,7 +11,9 @@ const ESR_EC_SHIFT: u64 = 26;
 const ESR_EC_MASK: u64 = 0x3f;
 const ESR_EC_HVC: u8 = 0x16;
 const ESR_EC_SYS64: u8 = 0x18;
+const ESR_EC_INSTRUCTION_ABORT_LOWER_EL: u8 = 0x20;
 const ESR_EC_DATA_ABORT_LOWER_EL: u8 = 0x24;
+const ESR_IL: u64 = 1 << 25;
 const ESR_ISS_HVC_IMMEDIATE_MASK: u64 = 0xffff;
 const ESR_ISS_ISV: u64 = 1 << 24;
 const ESR_ISS_SYS64_DIRECTION: u64 = 1;
@@ -34,18 +36,95 @@ const ESR_ISS_SRT_SHIFT: u64 = 16;
 const ESR_ISS_SRT_MASK: u64 = 0x1f;
 const ESR_ISS_SF: u64 = 1 << 15;
 const ESR_ISS_CM: u64 = 1 << 8;
+const ESR_ISS_EA: u64 = 1 << 9;
+const ESR_ISS_FNV: u64 = 1 << 10;
 const ESR_ISS_S1PTW: u64 = 1 << 7;
 const ESR_ISS_WNR: u64 = 1 << 6;
 const ESR_ISS_DFSC_MASK: u64 = 0x3f;
-// Signed Apple Silicon evidence shows that the initial pre-owner protection
-// exits as a level-three translation fault, a write-first fault on an untouched
-// lazy private-file page exits as a level-two translation fault, and
-// re-protecting a page after one writable epoch exits as a level-three
-// permission fault. This empirical HVF contract must remain exact and is never
-// sufficient without tracker-owned range and protection-state checks.
+// Signed Apple Silicon evidence shows level-one, level-two, and level-three
+// translation faults across zero-permission lazy instruction/data mappings,
+// while re-protecting a page after one writable epoch exits as a level-three
+// permission fault. The lazy classifier accepts that complete observed set.
+// The dirty-write predicate below deliberately remains narrower, and neither
+// classifier is ownership evidence without its handler's range/state checks.
+const ESR_ISS_DFSC_LEVEL_ONE_TRANSLATION: u64 = 0x05;
 const ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION: u64 = 0x06;
 const ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION: u64 = 0x07;
 const ESR_ISS_DFSC_LEVEL_THREE_PERMISSION: u64 = 0x0f;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfLazyGuestAccess {
+    /// A guest data read.
+    Read,
+    /// A guest data write.
+    Write,
+    /// A guest instruction fetch.
+    Execute,
+}
+
+/// Validated owned guest access that was mediated by the lazy-page bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfLazyGuestFault {
+    range: GuestMemoryRange,
+    virtual_address: GuestAddress,
+    pc: GuestAddress,
+    access: HvfLazyGuestAccess,
+}
+
+impl HvfLazyGuestFault {
+    /// Return the exact faulting IPA byte range.
+    pub const fn range(self) -> GuestMemoryRange {
+        self.range
+    }
+
+    /// Return the guest virtual fault address reported by HVF.
+    pub const fn virtual_address(self) -> GuestAddress {
+        self.virtual_address
+    }
+
+    /// Return the aligned vCPU PC captured before resolution.
+    pub const fn pc(self) -> GuestAddress {
+        self.pc
+    }
+
+    /// Return the decoded guest access class.
+    pub const fn access(self) -> HvfLazyGuestAccess {
+        self.access
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HvfLazyGuestFaultCandidate {
+    range: GuestMemoryRange,
+    virtual_address: GuestAddress,
+    access: HvfLazyGuestAccess,
+}
+
+impl HvfLazyGuestFaultCandidate {
+    pub(crate) const fn range(self) -> GuestMemoryRange {
+        self.range
+    }
+
+    pub(crate) const fn access(self) -> HvfLazyGuestAccess {
+        self.access
+    }
+
+    pub(crate) fn validate_pc(self, pc: u64) -> Option<HvfLazyGuestFault> {
+        if !pc.is_multiple_of(4)
+            || (self.access == HvfLazyGuestAccess::Execute
+                && self.virtual_address.raw_value() != pc)
+        {
+            return None;
+        }
+
+        Some(HvfLazyGuestFault {
+            range: self.range,
+            virtual_address: self.virtual_address,
+            pc: GuestAddress::new(pc),
+            access: self.access,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfExceptionExit {
@@ -55,6 +134,42 @@ pub struct HvfExceptionExit {
 }
 
 impl HvfExceptionExit {
+    pub(crate) fn decode_lazy_guest_fault_candidate(self) -> Option<HvfLazyGuestFaultCandidate> {
+        if self.syndrome & ESR_IL == 0
+            || self.syndrome & (ESR_ISS_EA | ESR_ISS_FNV) != 0
+            || !has_observed_hvf_protection_status(self.syndrome)
+        {
+            return None;
+        }
+
+        match exception_class(self.syndrome) {
+            ESR_EC_DATA_ABORT_LOWER_EL => {
+                let access = self.decode_mmio_access().ok()?;
+                Some(HvfLazyGuestFaultCandidate {
+                    range: access.range(),
+                    virtual_address: GuestAddress::new(self.virtual_address),
+                    access: match access.direction() {
+                        HvfMmioDirection::Read => HvfLazyGuestAccess::Read,
+                        HvfMmioDirection::Write => HvfLazyGuestAccess::Write,
+                    },
+                })
+            }
+            ESR_EC_INSTRUCTION_ABORT_LOWER_EL => {
+                if self.syndrome & ESR_ISS_S1PTW != 0 || !self.physical_address.is_multiple_of(4) {
+                    return None;
+                }
+                let range =
+                    GuestMemoryRange::new(GuestAddress::new(self.physical_address), 4).ok()?;
+                Some(HvfLazyGuestFaultCandidate {
+                    range,
+                    virtual_address: GuestAddress::new(self.virtual_address),
+                    access: HvfLazyGuestAccess::Execute,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Match only the syndrome observed for an HVF-protected write.
     ///
     /// This predicate is not ownership evidence. The dirty tracker must also
@@ -158,6 +273,16 @@ impl HvfExceptionExit {
             },
         })
     }
+}
+
+const fn has_observed_hvf_protection_status(syndrome: u64) -> bool {
+    matches!(
+        syndrome & ESR_ISS_DFSC_MASK,
+        ESR_ISS_DFSC_LEVEL_ONE_TRANSLATION
+            | ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION
+            | ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION
+            | ESR_ISS_DFSC_LEVEL_THREE_PERMISSION
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -677,16 +802,17 @@ mod tests {
     use std::error::Error as _;
 
     use super::{
-        ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_HVC, ESR_EC_SHIFT, ESR_EC_SYS64, ESR_ISS_CM,
-        ESR_ISS_DFSC_LEVEL_THREE_PERMISSION, ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION,
-        ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION, ESR_ISS_DFSC_MASK, ESR_ISS_ISV, ESR_ISS_S1PTW,
-        ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_SYS64_CRM_SHIFT,
+        ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_HVC, ESR_EC_SHIFT, ESR_EC_SYS64, ESR_IL, ESR_ISS_CM,
+        ESR_ISS_DFSC_LEVEL_ONE_TRANSLATION, ESR_ISS_DFSC_LEVEL_THREE_PERMISSION,
+        ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION, ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION,
+        ESR_ISS_DFSC_MASK, ESR_ISS_EA, ESR_ISS_FNV, ESR_ISS_ISV, ESR_ISS_S1PTW, ESR_ISS_SAS_SHIFT,
+        ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_SYS64_CRM_SHIFT,
         ESR_ISS_SYS64_CRN_SHIFT, ESR_ISS_SYS64_DIRECTION, ESR_ISS_SYS64_OP0_SHIFT,
         ESR_ISS_SYS64_OP1_SHIFT, ESR_ISS_SYS64_OP2_SHIFT, ESR_ISS_SYS64_RT_SHIFT, ESR_ISS_WNR,
-        HvfExceptionExit, HvfHvcDecodeError, HvfMmioAccessSize, HvfMmioDecodeError,
-        HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth, HvfMmioResolveError,
-        HvfResolvedVcpuExit, HvfSys64DecodeError, HvfSys64Direction, HvfSys64Register, HvfVcpuExit,
-        HvfVcpuExitResolveError,
+        HvfExceptionExit, HvfHvcDecodeError, HvfLazyGuestAccess, HvfMmioAccessSize,
+        HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth,
+        HvfMmioResolveError, HvfResolvedVcpuExit, HvfSys64DecodeError, HvfSys64Direction,
+        HvfSys64Register, HvfVcpuExit, HvfVcpuExitResolveError,
     };
     use bangbang_runtime::{
         memory::{GuestAddress, GuestMemoryError, GuestMemoryRange},
@@ -814,6 +940,124 @@ mod tests {
                 !exception_exit(syndrome, 0x4123).matches_observed_hvf_protected_write_syndrome()
             );
         }
+    }
+
+    #[test]
+    fn decodes_signed_lazy_read_write_and_instruction_faults() {
+        let read = HvfExceptionExit {
+            syndrome: 0x9381_0007,
+            virtual_address: 0x4000,
+            physical_address: 0x2000,
+        }
+        .decode_lazy_guest_fault_candidate()
+        .expect("signed read fault should classify")
+        .validate_pc(0x1000)
+        .expect("aligned data-fault PC should validate");
+        assert_eq!(read.range(), range(0x2000, 4));
+        assert_eq!(read.virtual_address(), GuestAddress::new(0x4000));
+        assert_eq!(read.pc(), GuestAddress::new(0x1000));
+        assert_eq!(read.access(), HvfLazyGuestAccess::Read);
+
+        let write = HvfExceptionExit {
+            syndrome: 0x9381_0047,
+            virtual_address: 0x4000,
+            physical_address: 0x2000,
+        }
+        .decode_lazy_guest_fault_candidate()
+        .expect("signed write fault should classify")
+        .validate_pc(0x1000)
+        .expect("aligned data-fault PC should validate");
+        assert_eq!(write.range(), range(0x2000, 4));
+        assert_eq!(write.access(), HvfLazyGuestAccess::Write);
+
+        let instruction = HvfExceptionExit {
+            syndrome: 0x8200_0006,
+            virtual_address: 0x3000,
+            physical_address: 0x5000,
+        }
+        .decode_lazy_guest_fault_candidate()
+        .expect("signed instruction fault should classify")
+        .validate_pc(0x3000)
+        .expect("matching instruction PC should validate");
+        assert_eq!(instruction.range(), range(0x5000, 4));
+        assert_eq!(instruction.virtual_address(), GuestAddress::new(0x3000));
+        assert_eq!(instruction.pc(), GuestAddress::new(0x3000));
+        assert_eq!(instruction.access(), HvfLazyGuestAccess::Execute);
+    }
+
+    #[test]
+    fn lazy_fault_classifier_rejects_invalid_status_and_vcpu_state() {
+        let instruction = HvfExceptionExit {
+            syndrome: 0x8200_0006,
+            virtual_address: 0x3000,
+            physical_address: 0x5000,
+        };
+        let candidate = instruction
+            .decode_lazy_guest_fault_candidate()
+            .expect("baseline instruction fault should classify");
+        assert_eq!(candidate.validate_pc(0x3004), None);
+        assert_eq!(candidate.validate_pc(0x3001), None);
+
+        for syndrome in [
+            instruction.syndrome & !ESR_IL,
+            instruction.syndrome | ESR_ISS_EA,
+            instruction.syndrome | ESR_ISS_FNV,
+            instruction.syndrome | ESR_ISS_S1PTW,
+            (instruction.syndrome & !ESR_ISS_DFSC_MASK) | 0x04,
+            (0x21_u64 << ESR_EC_SHIFT) | ESR_IL | ESR_ISS_DFSC_LEVEL_TWO_TRANSLATION,
+        ] {
+            assert_eq!(
+                HvfExceptionExit {
+                    syndrome,
+                    ..instruction
+                }
+                .decode_lazy_guest_fault_candidate(),
+                None
+            );
+        }
+        assert_eq!(
+            HvfExceptionExit {
+                physical_address: instruction.physical_address + 1,
+                ..instruction
+            }
+            .decode_lazy_guest_fault_candidate(),
+            None
+        );
+
+        let data_without_isv = HvfExceptionExit {
+            syndrome: (u64::from(ESR_EC_DATA_ABORT_LOWER_EL) << ESR_EC_SHIFT)
+                | ESR_ISS_DFSC_LEVEL_THREE_TRANSLATION,
+            virtual_address: 0x4000,
+            physical_address: 0x2000,
+        };
+        assert_eq!(data_without_isv.decode_lazy_guest_fault_candidate(), None);
+        let valid_data_syndrome = data_without_isv.syndrome | ESR_ISS_ISV | ESR_IL;
+        for syndrome in [
+            valid_data_syndrome | ESR_ISS_FNV,
+            valid_data_syndrome | ESR_ISS_EA,
+            valid_data_syndrome | ESR_ISS_CM,
+            valid_data_syndrome | ESR_ISS_S1PTW,
+            valid_data_syndrome & !ESR_IL,
+        ] {
+            assert_eq!(
+                HvfExceptionExit {
+                    syndrome,
+                    ..data_without_isv
+                }
+                .decode_lazy_guest_fault_candidate(),
+                None
+            );
+        }
+
+        assert!(
+            HvfExceptionExit {
+                syndrome: (instruction.syndrome & !ESR_ISS_DFSC_MASK)
+                    | ESR_ISS_DFSC_LEVEL_ONE_TRANSLATION,
+                ..instruction
+            }
+            .decode_lazy_guest_fault_candidate()
+            .is_some()
+        );
     }
 
     #[test]

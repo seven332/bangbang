@@ -8,6 +8,7 @@ use bangbang_runtime::mmio::MmioDispatcher;
 use crate::coordinator::{HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError};
 use crate::cpu_template::{HvfArm64CpuTemplateError, PreparedHvfArm64CpuTemplate};
 use crate::dirty::HvfDirtyWriteTracker;
+use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
 use crate::runner::{HvfVcpuMpidrAffinityStage, HvfVcpuRunner, HvfVcpuRunnerError};
 
 const MAX_ORDERED_MPIDR: u64 = MAX_SUPPORTED_VCPUS as u64 - 1;
@@ -281,15 +282,17 @@ impl<'vm> HvfVcpuTopology<'vm> {
     pub(crate) fn create(
         vcpu_count: u8,
         dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+        lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
     ) -> Result<Self, HvfVcpuTopologyError> {
         let created = create_ordered_topology_with(
             vcpu_count,
             crate::ffi::get_max_vcpu_count,
             |_, _| Ok(()),
             |index| {
-                HvfVcpuRunner::new_unconfigured_with_dirty_write_tracker(
+                HvfVcpuRunner::new_unconfigured_with_memory_fault_handlers(
                     index,
                     dirty_write_tracker.as_ref().map(Arc::clone),
+                    lazy_guest_fault_handler.as_ref().map(Arc::clone),
                 )
             },
         )?;

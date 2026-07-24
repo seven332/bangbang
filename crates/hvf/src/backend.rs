@@ -13,6 +13,8 @@ use crate::gic::{
     HvfGicCreator, HvfGicError, HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiSignaler,
     RealHvfGicCreator,
 };
+use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
+use crate::lazy_host_fault::HvfLazyPageResolver;
 use crate::memory::{
     HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping, HvfMemoryMapper,
     HvfMemoryPermissions, HvfPmemFlushExecutor, HvfVirtioMemMappingCaptureError,
@@ -35,6 +37,7 @@ const VCPU_TOPOLOGY_ALREADY_OWNED_MESSAGE: &str = "vCPU topology has already sta
 pub struct HvfBackend {
     vm_created: bool,
     guest_memory: Option<HvfGuestMemoryMapping>,
+    lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
     gic: Option<HvfGicMetadata>,
     gic_msi_signaler: Option<HvfGicMsiSignaler>,
     vcpu_topology_started: bool,
@@ -47,6 +50,7 @@ impl Default for HvfBackend {
         Self {
             vm_created: false,
             guest_memory: None,
+            lazy_guest_fault_handler: None,
             gic: None,
             gic_msi_signaler: None,
             vcpu_topology_started: false,
@@ -91,6 +95,20 @@ impl HvfBackend {
         }
 
         self.map_guest_memory_with_configured_mapper(memory, permissions)
+    }
+
+    /// Map resolver-owned anonymous memory and force first guest accesses to
+    /// the shared lazy-page coordinator.
+    pub fn map_lazy_guest_memory(
+        &mut self,
+        resolver: HvfLazyPageResolver,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        if !Self::is_supported_target() {
+            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        }
+
+        self.map_lazy_guest_memory_with_configured_mapper(resolver, permissions)
     }
 
     pub(crate) fn map_guest_memory_with_pmem_devices(
@@ -154,6 +172,7 @@ impl HvfBackend {
         }
 
         self.guest_memory = None;
+        self.lazy_guest_fault_handler = None;
         Ok(())
     }
 
@@ -178,6 +197,11 @@ impl HvfBackend {
         if self.vcpu_topology_started {
             return Err(HvfDirtyWriteTrackerStartError::InvalidState(
                 "dirty-write tracking must start before vCPU ownership",
+            ));
+        }
+        if self.lazy_guest_fault_handler.is_some() {
+            return Err(HvfDirtyWriteTrackerStartError::InvalidState(
+                "dirty-write tracking is unavailable for lazy guest memory",
             ));
         }
         self.guest_memory
@@ -377,6 +401,11 @@ impl HvfBackend {
                 "raw vCPU ownership is unavailable while dirty-write tracking is active",
             ));
         }
+        if self.lazy_guest_fault_handler.is_some() {
+            return Err(BackendError::InvalidState(
+                "raw vCPU ownership is unavailable while lazy guest paging is active",
+            ));
+        }
 
         let vcpu = HvfVcpu::new()?;
         self.vcpu_topology_started = true;
@@ -389,10 +418,10 @@ impl HvfBackend {
         let tracker = self
             .active_dirty_write_tracker()
             .map_err(HvfVcpuRunnerError::Backend)?;
-        let runner = match tracker {
-            Some(tracker) => HvfVcpuRunner::new_with_dirty_write_tracker(0, Some(tracker))?,
-            None => HvfVcpuRunner::new()?,
-        };
+        let lazy_handler = self
+            .active_lazy_guest_fault_handler()
+            .map_err(HvfVcpuRunnerError::Backend)?;
+        let runner = HvfVcpuRunner::new_with_memory_fault_handlers(0, tracker, lazy_handler)?;
         self.vcpu_topology_started = true;
         Ok(runner)
     }
@@ -407,10 +436,10 @@ impl HvfBackend {
         let tracker = self
             .active_dirty_write_tracker()
             .map_err(HvfVcpuRunnerError::Backend)?;
-        let runner = match tracker {
-            Some(tracker) => HvfVcpuRunner::new_with_dirty_write_tracker(0, Some(tracker))?,
-            None => HvfVcpuRunner::new()?,
-        };
+        let lazy_handler = self
+            .active_lazy_guest_fault_handler()
+            .map_err(HvfVcpuRunnerError::Backend)?;
+        let runner = HvfVcpuRunner::new_with_memory_fault_handlers(0, tracker, lazy_handler)?;
         self.vcpu_topology_started = true;
         Ok(runner)
     }
@@ -424,7 +453,8 @@ impl HvfBackend {
         self.validate_vcpu_topology_start()?;
 
         let tracker = self.active_dirty_write_tracker()?;
-        let topology = HvfVcpuTopology::create(vcpu_count, tracker)?;
+        let lazy_handler = self.active_lazy_guest_fault_handler()?;
+        let topology = HvfVcpuTopology::create(vcpu_count, tracker, lazy_handler)?;
         self.vcpu_topology_started = true;
         Ok(topology)
     }
@@ -440,7 +470,8 @@ impl HvfBackend {
         self.validate_vcpu_topology_start()?;
 
         let tracker = self.active_dirty_write_tracker()?;
-        let topology = HvfVcpuTopology::create(vcpu_count, tracker)?;
+        let lazy_handler = self.active_lazy_guest_fault_handler()?;
+        let topology = HvfVcpuTopology::create(vcpu_count, tracker, lazy_handler)?;
         self.vcpu_topology_started = true;
         Ok(topology)
     }
@@ -456,6 +487,11 @@ impl HvfBackend {
             )
             .into());
         }
+        if let Some(handler) = &self.lazy_guest_fault_handler {
+            handler
+                .ensure_active()
+                .map_err(HvfVcpuRunnerError::Backend)?;
+        }
 
         Ok(())
     }
@@ -466,6 +502,17 @@ impl HvfBackend {
         self.guest_memory
             .as_ref()
             .map_or(Ok(None), HvfGuestMemoryMapping::active_dirty_write_tracker)
+    }
+
+    fn active_lazy_guest_fault_handler(
+        &self,
+    ) -> Result<Option<Arc<HvfLazyGuestFaultHandler>>, BackendError> {
+        if let Some(handler) = &self.lazy_guest_fault_handler {
+            handler.ensure_active()?;
+            Ok(Some(Arc::clone(handler)))
+        } else {
+            Ok(None)
+        }
     }
 
     fn validate_vcpu_topology_start(&self) -> Result<(), HvfVcpuTopologyError> {
@@ -542,6 +589,55 @@ impl HvfBackend {
         self.map_guest_memory_with_host_mappings(memory, permissions, Vec::new())
     }
 
+    fn map_lazy_guest_memory_with_configured_mapper(
+        &mut self,
+        resolver: HvfLazyPageResolver,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.validate_lazy_guest_memory_mapping_state()?;
+        let handler = HvfLazyGuestFaultHandler::prepare(
+            resolver.clone(),
+            permissions,
+            Arc::clone(&self.memory_mapper),
+        )?;
+        let result = HvfGuestMemoryMapping::map_lazy_with_mapper(
+            resolver.mapping_regions(),
+            permissions,
+            Arc::clone(&self.memory_mapper),
+        );
+        match result {
+            Ok(mapping) => {
+                if let Err(error) = handler.activate() {
+                    handler.poison();
+                    self.guest_memory = Some(mapping);
+                    self.lazy_guest_fault_handler = Some(handler);
+                    return Err(error);
+                }
+                self.guest_memory = Some(mapping);
+                self.lazy_guest_fault_handler = Some(handler);
+                Ok(())
+            }
+            Err(failed_mapping) => {
+                handler.poison();
+                if failed_mapping.mapping.has_mapped_regions() {
+                    self.guest_memory = Some(failed_mapping.mapping);
+                    self.lazy_guest_fault_handler = Some(handler);
+                }
+                Err(failed_mapping.error)
+            }
+        }
+    }
+
+    fn validate_lazy_guest_memory_mapping_state(&self) -> Result<(), HvfGuestMemoryMappingError> {
+        self.validate_guest_memory_mapping_state()?;
+        if self.vcpu_topology_started {
+            return Err(HvfGuestMemoryMappingError::InvalidState(
+                "lazy guest memory must map before vCPU ownership",
+            ));
+        }
+        Ok(())
+    }
+
     fn map_guest_memory_with_pmem_devices_and_configured_mapper(
         &mut self,
         memory: GuestMemory,
@@ -603,6 +699,7 @@ impl HvfBackend {
         Self {
             vm_created: false,
             guest_memory: None,
+            lazy_guest_fault_handler: None,
             gic: None,
             gic_msi_signaler: None,
             vcpu_topology_started: false,
@@ -616,6 +713,7 @@ impl HvfBackend {
         Self {
             vm_created: false,
             guest_memory: None,
+            lazy_guest_fault_handler: None,
             gic: None,
             gic_msi_signaler: None,
             vcpu_topology_started: false,
@@ -731,9 +829,10 @@ mod tests {
     };
 
     use super::HvfBackend;
+    use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
     use crate::memory::{
-        HvfMappedGuestMemoryRegion, HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions,
-        host_page_size,
+        HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfMappedGuestMemoryRegion,
+        HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions, host_page_size,
     };
 
     fn range(start: u64, size: u64) -> GuestMemoryRange {
@@ -898,6 +997,73 @@ mod tests {
             .expect("tracker stop should be idempotent");
         assert!(!tracker.is_active().expect("stopped tracker should query"));
         backend.unmap_guest_memory().expect("test RAM should unmap");
+    }
+
+    #[test]
+    fn lazy_mapping_blocks_dirty_and_raw_ownership_until_unmapped() {
+        if !HvfBackend::is_supported_target() {
+            return;
+        }
+
+        let page_size = page_size();
+        let guest_range = range(0, page_size);
+        let memory = memory_for_ranges(vec![guest_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mapping = HvfGuestMemoryMapping::map_lazy_with_mapper(
+            memory.regions(),
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("test lazy mapping should zero-protect");
+        let handler = HvfLazyGuestFaultHandler::active_noop_for_test(
+            mapper.clone(),
+            &[guest_range],
+            page_size,
+            HvfMemoryPermissions::GUEST_RAM,
+        );
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper);
+        backend.vm_created = true;
+        backend.guest_memory = Some(mapping);
+        backend.lazy_guest_fault_handler = Some(handler);
+
+        assert_eq!(
+            backend
+                .start_dirty_write_tracking()
+                .expect_err("dirty tracking must not bypass lazy WRITE ownership"),
+            crate::dirty::HvfDirtyWriteTrackerStartError::InvalidState(
+                "dirty-write tracking is unavailable for lazy guest memory"
+            )
+        );
+        assert_eq!(
+            backend
+                .create_vcpu()
+                .expect_err("raw vCPU must not bypass lazy fault handling"),
+            BackendError::InvalidState(
+                "raw vCPU ownership is unavailable while lazy guest paging is active"
+            )
+        );
+
+        backend
+            .unmap_guest_memory()
+            .expect("lazy mapping should unmap");
+        assert!(backend.guest_memory.is_none());
+        assert!(backend.lazy_guest_fault_handler.is_none());
+    }
+
+    #[test]
+    fn lazy_mapping_state_rejects_every_post_vcpu_attempt() {
+        let mut backend = HvfBackend::default();
+        backend.vm_created = true;
+        backend.vcpu_topology_started = true;
+
+        assert!(matches!(
+            backend.validate_lazy_guest_memory_mapping_state(),
+            Err(HvfGuestMemoryMappingError::InvalidState(
+                "lazy guest memory must map before vCPU ownership"
+            ))
+        ));
+        assert!(backend.guest_memory.is_none());
+        assert!(backend.lazy_guest_fault_handler.is_none());
     }
 
     #[test]

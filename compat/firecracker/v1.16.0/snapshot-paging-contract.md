@@ -3,8 +3,9 @@
 This ledger records the #1527 public-macOS feasibility decision for the pinned
 Firecracker snapshot page-fault corpus and the completed #1547 standalone
 protocol, #1548 coordinated lazy-anonymous-memory, and #1549 task-local host
-fault slices. It is not an aggregate runtime implementation claim: bangbang
-still rejects native-v1 `Uffd` before artifact or backend access.
+fault, and #1550 HVF guest-fault slices. It is not an aggregate runtime
+implementation claim: bangbang still rejects native-v1 `Uffd` before artifact
+or backend access.
 
 ## Pinned upstream contract
 
@@ -175,7 +176,7 @@ mediate a Mach/HVF fault, grant source authority, or change API behavior.
 ## Implemented coordinated lazy anonymous memory
 
 `crates/runtime/src/lazy_memory.rs` now implements the backend-neutral mapping
-owner and page lifecycle shared by the host and later guest fault bridges.
+owner and page lifecycle shared by the host and guest fault bridges.
 `LazyGuestMemory` is a distinct type rather than a lazy mode on initialized
 `GuestMemory`; it transactionally allocates validated private-anonymous regions
 but exposes no ordinary safe read/write/atomic/discard/export surface and reads
@@ -225,9 +226,9 @@ cargo test -p bangbang-runtime lazy_memory --all-features --locked
 
 This slice installs no Mach exception port, HVF mapping/protection, socket,
 source authority, peer state machine, native-v1 restore route, or public API
-success. The coordinator alone does not enforce logical absence; the host
-adapter below binds one protection plane, while guest access and bypassing
-consumers remain gated on later HVF and consumer-audit slices.
+success. The coordinator alone does not enforce logical absence; the host and
+guest adapters below bind its two internal protection planes, while bypassing
+consumers remain gated on a later audit slice.
 
 ## Implemented task-local host fault bridge
 
@@ -295,9 +296,60 @@ scripts/run-integration-tests.sh --test app_sandbox -- lazy_host_fault_integrati
 ```
 
 This slice does not connect `bangbang-pager-v1`, grant external source
-authority, install HVF guest permissions, integrate peer-driven removal or
-failure, certify every memory consumer, make native-v1 `Uffd` succeed, or
-promote the aggregate capability.
+authority, integrate peer-driven removal or failure, certify every memory
+consumer, make native-v1 `Uffd` succeed, or promote the aggregate capability.
+
+## Implemented HVF guest fault bridge
+
+`crates/hvf/src/lazy_guest_fault.rs` now binds the same resolver to owned HVF
+guest faults. `HvfBackend::map_lazy_guest_memory` maps each retained lazy region
+at its validated maximum permissions, removes all stage-two access
+transactionally, and activates the handler only after the complete mapping is
+hidden. Dirty-write tracking and raw vCPU creation reject this mode rather than
+installing a second protection owner or bypassing runner dispatch.
+
+The exception decoder admits only signed-observed ARM64 data and instruction
+abort forms. Data faults retain exact width/direction and IPA; instruction
+faults require a valid VA/PC relationship and aligned four-byte IPA. HVC and
+SYS64 handling run first, and unowned, disallowed, or malformed candidates
+continue to the existing dirty/MMIO path without reaching the source.
+
+For an owned candidate, the handler resolves every touched page through
+`HvfLazyPageResolver` before publishing any stage-two permission. Serialized
+per-page state unions `READ`, `READ|WRITE`, and `EXECUTE` requirements across
+concurrent vCPUs, so a stale peer cannot downgrade a prior upgrade.
+Instruction contents are synchronized before execute permission. The runner
+then reports one `LazyPage` step and retries the same guest instruction without
+advancing PC.
+
+One peer-stale exit after a concurrent publication is admitted as progress; an
+identical second exit fails closed instead of spinning. Source/coordinator,
+instruction synchronization, and `hv_vm_protect` failures poison the guest
+handler and shared resolver before later publication. Setup rollback unmaps
+every region it can and retains any failed mapping for explicit cleanup.
+Canceled HVF exits do not perform lazy work, while an operation already
+synchronously admitted follows the coordinator's bounded drain contract.
+
+Focused tests cover exact syndrome classification, cross-page
+resolve-before-permission ordering, serialized permission unions, multi-vCPU
+coalescing, stale/no-progress detection, setup rollback, source/protection
+terminalization, redaction, dirty/raw exclusion, and canceled dispatch. Signed
+`hvf_lifecycle` cases execute first from a lazy page, read and write separate
+lazy pages, repeat the lifecycle, observe fail-closed source error with
+cleanup, cancel an active runner without duplicate page work, block one source
+request while two vCPUs coalesce on it, and keep an unowned instruction fault
+on the prior error path. The signed `guest_boot` target boots its entry
+instruction directly from a lazy mapping:
+
+```sh
+cargo test -p bangbang-hvf --lib --all-features --locked lazy_guest
+scripts/run-integration-tests.sh --test hvf_lifecycle -- hvf_lazy_guest_
+scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page
+```
+
+This slice still uses a trusted in-process source. It does not broker a pager
+peer, integrate peer-driven removal/failure, certify bypassing memory
+consumers, activate native-v1 restore, or promote the aggregate capability.
 
 ## Decision and remaining delivery boundary
 
@@ -346,14 +398,13 @@ VM construction. The focused
 case additionally proves private UFFD paths remain redacted.
 
 Delivery parent [#1527](https://github.com/seven332/bangbang/issues/1527)
-retains six integration/certification gates after the #1549 host bridge:
+retains five integration/certification gates after the #1550 guest bridge:
 
-1. [#1550](https://github.com/seven332/bangbang/issues/1550) bridges HVF guest faults.
-2. [#1551](https://github.com/seven332/bangbang/issues/1551) brokers the contained peer.
-3. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
-4. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
-5. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
-6. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
+1. [#1551](https://github.com/seven332/bangbang/issues/1551) brokers the contained peer.
+2. [#1552](https://github.com/seven332/bangbang/issues/1552) integrates removal and failure.
+3. [#1553](https://github.com/seven332/bangbang/issues/1553) audits and gates every memory consumer.
+4. [#1554](https://github.com/seven332/bangbang/issues/1554) integrates supported native-v1 restore.
+5. [#1555](https://github.com/seven332/bangbang/issues/1555) runs signed certification and promotes only direct evidence.
 
 There is no public `Uffd` success before #1554 and no
 `implemented-and-verified` inventory result before #1555. Delivery-time
@@ -364,4 +415,4 @@ continues to reject it.
 
 | Capability identity | Disposition | Delivery owner | Evidence | Result |
 | --- | --- | --- | --- | --- |
-| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol/process tests, `crates/runtime/src/lazy_memory.rs` coordinator/concurrency tests, and `crates/hvf/src/lazy_host_fault.rs` focused plus signed/App Sandbox host-fault tests; unchanged pre-access rejection | `nonterminal` |
+| `corpus:snapshot-page-faults` | `missing-platform-feasible` | [#1527](https://github.com/seven332/bangbang/issues/1527) | Pinned upstream contract; public SDK/source audit; signed host, guest, removal, peer-loss, cleanup, and App Sandbox prototype output; implemented `crates/pager` protocol/process tests, `crates/runtime/src/lazy_memory.rs` coordinator/concurrency tests, `crates/hvf/src/lazy_host_fault.rs` focused plus signed/App Sandbox host-fault tests, and `crates/hvf/src/lazy_guest_fault.rs` focused plus signed execute/read/write/failure/cancellation/guest-boot tests; unchanged pre-access rejection | `nonterminal` |
