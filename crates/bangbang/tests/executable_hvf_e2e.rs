@@ -11382,7 +11382,7 @@ mod macos_arm64 {
                 Instant::now() < deadline,
                 "terminal destination should exit after its stdout consumer closes"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(10));
         };
         let mut terminal_stderr = String::new();
         terminal
