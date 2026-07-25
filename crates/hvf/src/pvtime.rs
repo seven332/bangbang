@@ -409,6 +409,11 @@ pub struct HvfArm64PvTimeVcpuCaptureState {
 }
 
 impl HvfArm64PvTimeVcpuCaptureState {
+    #[cfg(test)]
+    pub(crate) const fn new(stolen_time_ns: u64) -> Self {
+        Self { stolen_time_ns }
+    }
+
     pub const fn stolen_time_ns(self) -> u64 {
         self.stolen_time_ns
     }

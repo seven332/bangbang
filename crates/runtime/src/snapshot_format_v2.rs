@@ -39,7 +39,7 @@ pub const NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION: SnapshotFormatVersion =
     SnapshotFormatVersion::new(2, 0, 0);
 
 /// Semantic version emitted by the current native-v2 writer.
-pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 2, 0);
+pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 3, 0);
 
 /// Fixed native-v2 state header size.
 pub const NATIVE_V2_SNAPSHOT_HEADER_BYTES: usize = 64;
@@ -86,6 +86,10 @@ const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[
     CatalogEntry {
         id: NATIVE_V2_VCPU_COMPONENT_KIND,
         introduced_minor: 2,
+    },
+    CatalogEntry {
+        id: NATIVE_V2_TIME_COMPONENT_KEY.kind,
+        introduced_minor: 3,
     },
 ];
 
@@ -159,6 +163,9 @@ pub const NATIVE_V2_VCPU_COMPONENT_KIND: u32 = 5;
 pub const fn native_v2_vcpu_component_key(instance: u32) -> SnapshotV2ComponentKey {
     SnapshotV2ComponentKey::new(NATIVE_V2_VCPU_COMPONENT_KIND, instance)
 }
+
+/// Canonical identity of singleton native-v2 time and clone-identity state.
+pub const NATIVE_V2_TIME_COMPONENT_KEY: SnapshotV2ComponentKey = SnapshotV2ComponentKey::new(6, 0);
 
 impl fmt::Debug for SnapshotV2ComponentKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

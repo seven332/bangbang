@@ -12,6 +12,7 @@ use crate::cpu_template::{
 use crate::dirty::HvfDirtyWriteTracker;
 use crate::gic::HvfGicDeviceState;
 use crate::lazy_guest_fault::HvfLazyGuestFaultHandler;
+use crate::pvtime::HvfArm64PvTimeAccountingConfig;
 use crate::runner::{
     HvfArm64SnapshotV2VcpuRestore, HvfVcpuMpidrAffinityStage, HvfVcpuRunner, HvfVcpuRunnerError,
 };
@@ -380,6 +381,31 @@ impl<'vm> HvfVcpuTopology<'vm> {
                 "stable import destination member index is invalid",
             ))?
             .ensure_stable_import_ready()
+    }
+
+    pub(crate) fn ensure_snapshot_restore_available(
+        &self,
+        index: usize,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runners
+            .get(index)
+            .ok_or(HvfVcpuRunnerError::InvalidState(
+                "native-v2 destination member index is invalid",
+            ))?
+            .ensure_snapshot_restore_available()
+    }
+
+    pub(crate) fn configure_arm64_snapshot_v2_pvtime(
+        &self,
+        index: usize,
+        config: HvfArm64PvTimeAccountingConfig,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        self.runners
+            .get(index)
+            .ok_or(HvfVcpuRunnerError::InvalidState(
+                "native-v2 destination member index is invalid",
+            ))?
+            .configure_arm64_pvtime(config)
     }
 
     pub(crate) fn restore_arm64_snapshot_v2_global_gic(

@@ -426,8 +426,11 @@ scripts/run-integration-tests.sh --test hvf_lifecycle -- measures_real_hvf_vcpu_
 scripts/run-integration-tests.sh --test guest_boot -- certifies_linux_pvtime_contention_idle_and_paused_accounting --exact
 ```
 
-These gates do not claim KVM's ARM device attribute, PVTime artifact encoding,
-restore orchestration, repeated clone behavior, or cross-host clock portability.
+These live gates do not claim KVM's ARM device attribute or cross-host clock
+portability. Native-v2 #1529 separately covers portable PVTime encoding,
+focused restore orchestration, and repeated immutable clone behavior; it does
+not turn the KVM attribute into an HVF mechanism or activate the public v2
+lifecycle.
 
 Validation for internal PSCI secondary-power changes must cover both CPU_ON calling
 conventions, exact X1-X3 reads and 32-bit truncation, MPIDR reserved-bit
@@ -558,8 +561,9 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.2.0` writer additionally admits machine/global/topology kinds 2–4
-and per-vCPU kind 5 introduced in minor 2. The mutation corpus
+current `2.3.0` writer additionally admits machine/global/topology kinds 2–4
+and per-vCPU kind 5 introduced in minor 2, plus singleton time kind 6
+introduced in minor 3. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
 zero/order/duplicate/unknown cases, and component
@@ -571,7 +575,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.2.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.3.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -586,20 +590,23 @@ binding, and proves the exact final length. Run it with
 
 Native-v2 HVF platform tests round-trip canonical 1-, 2-, and 32-vCPU graphs,
 all stable lifecycle dispositions, U32/U64/U128 CPU-application evidence, and
-explicit maximum-SVL SME Z/P/ZA/ZT0 state. Checksum-valid component rebuilds
-exercise exact profile/singleton/instance rules; every platform header, flag,
-reserved family, count, and length bound; closed optional ordering,
-duplicate/unknown tags, disposition, width, reserved bytes, feature
-dependencies, SIMD aliases, and the 16 MiB composite budget. Locally valid
-machine-memory/FDT, timer, optional-identity, redistributor, and vCPU-count
+explicit maximum-SVL SME Z/P/ZA/ZT0 state. They also round-trip the fixed
+PL031/PVTime/VMGenID/VMClock schema and its four policy tags. Checksum-valid
+component rebuilds exercise exact profile/singleton/instance rules; every
+platform and time header, flag, policy, reserved field, count, ABI, and length
+bound; closed optional ordering, duplicate/unknown tags, disposition, width,
+feature dependencies, SIMD aliases, and the 16 MiB composite budget. Locally
+valid machine-memory/FDT, timer, optional-identity, redistributor, vCPU-count,
+RTC, canonical identity placement/SPI, PVTime layout/backing, and time-ABI
 mismatches prove whole-graph validation. CPU-template unit tests separately
 prove the receipt appears only after topology-wide application and retains the
 logical/common/effective equation with redacted diagnostics. Reconstruction
 tests inject every preflight/VM/memory/GIC/topology/CPU/compatibility/global/
-per-vCPU/lifecycle/publication stage, assert the exact shared reverse cleanup
-sequence, and retain all cleanup failures. CPU replay tests require every
-destination baseline read before the first effective-target write and preserve
-read/apply failure positions. Run these surfaces with
+per-vCPU/RTC/PVTime/identity/lifecycle/publication stage, assert the exact
+shared reverse cleanup sequence and identity commit boundary, and retain all
+cleanup failures. CPU replay tests require every destination baseline read
+before the first effective-target write and preserve read/apply failure
+positions. Run these surfaces with
 `cargo test -p bangbang-hvf --lib --all-features --locked`.
 
 The signed `hvf_lifecycle` lazy-memory case writes a 64-MiB image, drops the
@@ -615,14 +622,19 @@ real HVF.
 
 The same signed target contains the native-v2 platform completion gate. A
 three-vCPU bare guest reaches a paused runnable/suspended/offline graph, writes
-the canonical memory image, captures twice to prove non-consuming source
-ownership, structurally decodes before construction, loads already-authorized
-memory, destroys the source VM, and restores a fresh focused platform. Before
-resume it requires equivalent full recapture and unchanged guest progress.
-After resume it proves retained virtual-timer PPI publication and
-`CPU_SUSPEND64` completion, primary continuation, CPU_ON of the initially
-offline third owner, both secondary CPU_OFF transitions, a final valid
-recapture, and clean shutdown. Run the focused proof with:
+fresh canonical memory images, captures repeatedly to prove non-consuming
+source ownership, structurally decodes before construction, loads
+already-authorized memory, destroys the source VM, and restores fresh focused
+platforms repeatedly from the same immutable graph. Before ordinary progress,
+the guest acknowledges VMGenID then VMClock and observes a fresh clone ID,
+the saved-counter VMClock transition, destination-current PL031 rather than
+source mutable state, and exact PVTime discovery/cumulative time. The proof
+also recaptures one restored clone to a fresh image and restores it again.
+Before each resume it requires an equivalent lifecycle graph and unchanged
+ordinary guest progress. After resume it proves retained virtual-timer PPI
+publication and `CPU_SUSPEND64` completion, primary continuation, CPU_ON of the
+initially offline third owner, both secondary CPU_OFF transitions, a final
+valid recapture, and clean shutdown. Run the focused proof with:
 
 ```sh
 scripts/run-integration-tests.sh --test hvf_lifecycle -- \
@@ -2202,9 +2214,9 @@ connection exchange through the signed executable, including sustained
 bidirectional streams and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, that RTC alarm
-interrupts, PVTime artifact restore or cross-host clock portability, or broader
-RTC-adjacent behavior beyond the checked PL031/VMGenID/VMClock/PVTime contract is
-supported, or that full
+interrupts, public time-state restoration outside the focused native-v2
+profile, cross-host clock portability, or broader RTC-adjacent behavior beyond
+the checked PL031/VMGenID/VMClock/PVTime contract is supported, or that full
 block, balloon, memory-hotplug, pmem, and vsock runtime behavior is complete.
 Entropy and network optional-device encoding, restore, migration/clone, and
 cross-host policy remain the exact Wave 6 #1490 handoff; the network producer

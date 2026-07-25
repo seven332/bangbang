@@ -130,6 +130,11 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
             SnapshotV2ComponentDisposition::Semantic,
             b"vcpu",
         ),
+        SnapshotV2Component::new(
+            NATIVE_V2_TIME_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            b"time",
+        ),
     ];
     let encoded_semantic =
         encode_snapshot_v2_state(&[], &semantic).expect("current semantic kinds should encode");
@@ -250,11 +255,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 3);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 4);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 3, 0),
+            found: SnapshotFormatVersion::new(2, 4, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );

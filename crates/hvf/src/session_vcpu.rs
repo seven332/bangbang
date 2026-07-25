@@ -274,6 +274,9 @@ pub enum HvfArm64SnapshotV2TopologyCaptureError {
         index: usize,
         source: Box<HvfVcpuRunCoordinatorError>,
     },
+    PvTime {
+        source: Box<HvfVcpuRunCoordinatorError>,
+    },
     Allocation,
     LifecycleChanged,
 }
@@ -286,6 +289,9 @@ impl fmt::Display for HvfArm64SnapshotV2TopologyCaptureError {
             }
             Self::Member { index, source } => {
                 write!(f, "native-v2 vCPU {index} capture failed: {source}")
+            }
+            Self::PvTime { source } => {
+                write!(f, "native-v2 topology PVTime capture failed: {source}")
             }
             Self::Allocation => f.write_str("native-v2 topology capture allocation failed"),
             Self::LifecycleChanged => {
@@ -300,6 +306,7 @@ impl std::error::Error for HvfArm64SnapshotV2TopologyCaptureError {
         match self {
             Self::Lifecycle { source, .. } => Some(source.as_ref()),
             Self::Member { source, .. } => Some(source.as_ref()),
+            Self::PvTime { source } => Some(source.as_ref()),
             Self::Allocation | Self::LifecycleChanged => None,
         }
     }
@@ -636,6 +643,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         (
             HvfArm64StablePausedTopologyState,
             Vec<HvfArm64SnapshotV2VcpuCapture>,
+            HvfArm64PvTimeCaptureState,
         ),
         HvfArm64SnapshotV2TopologyCaptureError,
     > {
@@ -660,6 +668,11 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
                 })?;
             captures.push(capture);
         }
+        let pvtime = self.capture_arm64_pvtime().map_err(|source| {
+            HvfArm64SnapshotV2TopologyCaptureError::PvTime {
+                source: Box::new(source),
+            }
+        })?;
         let after = self.capture_stable_paused_topology().map_err(|source| {
             HvfArm64SnapshotV2TopologyCaptureError::Lifecycle {
                 stage: "final lifecycle capture",
@@ -669,7 +682,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         if after != stable {
             return Err(HvfArm64SnapshotV2TopologyCaptureError::LifecycleChanged);
         }
-        Ok((stable, captures))
+        Ok((stable, captures, pvtime))
     }
 
     /// Consume never-run destination owners into one coordinator born paused.

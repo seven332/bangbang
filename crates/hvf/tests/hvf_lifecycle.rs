@@ -2022,9 +2022,17 @@ fn assert_native_v2_platform_recapture_equivalent(
     source: &bangbang_hvf::HvfSnapshotV2PlatformState,
     recaptured: &bangbang_hvf::HvfSnapshotV2PlatformState,
 ) {
-    assert_eq!(recaptured.memory(), source.memory());
+    assert_eq!(recaptured.memory().version(), source.memory().version());
+    assert_eq!(recaptured.memory().extents(), source.memory().extents());
+    assert_eq!(
+        recaptured.memory().file_length(),
+        source.memory().file_length()
+    );
     assert_eq!(recaptured.machine(), source.machine());
-    assert_eq!(recaptured.global(), source.global());
+    assert_eq!(
+        recaptured.global().compatibility(),
+        source.global().compatibility()
+    );
     assert_eq!(recaptured.topology(), source.topology());
     assert_eq!(recaptured.vcpus().len(), source.vcpus().len());
     for (source_vcpu, recaptured_vcpu) in source.vcpus().iter().zip(recaptured.vcpus()) {
@@ -9367,7 +9375,7 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_hvf::{
         HvfArm64BootRunLoopOutcome, HvfArm64BootSessionConfig, HvfArm64BootSnapshotV2CaptureError,
@@ -9380,22 +9388,25 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     use bangbang_runtime::block::BlockMmioLayout;
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::machine::MachineConfigInput;
-    use bangbang_runtime::memory::{
-        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
-    };
+    use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::pmem::PmemMmioLayout;
     use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
     use bangbang_runtime::snapshot_memory_v2::{
-        load_snapshot_v2_memory_file, write_snapshot_v2_memory_image,
+        SnapshotV2MemoryWriteError, load_snapshot_v2_memory_file,
     };
+    use bangbang_runtime::startup::ARM64_BOOT_VMGENID_SIZE;
+    use bangbang_runtime::vmclock::{VMCLOCK_ABI_SIZE, VmClockAbi};
     use bangbang_runtime::vsock::VsockMmioLayout;
 
     const SECONDARY_ONE_OFFSET: u64 = 0x1000;
     const SECONDARY_TWO_OFFSET: u64 = 0x2000;
+    const VECTOR_OFFSET: u64 = 0x3000;
+    const IRQ_HANDLER_OFFSET: u64 = VECTOR_OFFSET + 0x280;
     const FLAGS_OFFSET: u64 = 0x4000;
-    const FLAGS_SIZE: usize = 0x40;
+    const FLAGS_SIZE: usize = 0x80;
+    const CONFIG_OFFSET: u64 = 0x5000;
     const CPU_ON_ONE_RESULT: usize = 0x00;
     const PRIMARY_BEFORE_CAPTURE: usize = 0x08;
     const PRE_SUSPEND: usize = 0x0c;
@@ -9406,44 +9417,165 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     const CPU_ON_TWO_RESULT: usize = 0x30;
     const CPU_TWO_PROGRESS: usize = 0x38;
     const FINAL_CHECKPOINT: usize = 0x3c;
+    const IDENTITY_ACK_COUNT: usize = 0x40;
+    const VMGENID_ACK: usize = 0x44;
+    const VMCLOCK_ACK: usize = 0x48;
+    const SOURCE_RTC_SECONDS: usize = 0x4c;
+    const GUEST_VMGENID_WORD: usize = 0x50;
+    const GUEST_VMCLOCK_SEQUENCE: usize = 0x58;
+    const GUEST_VMCLOCK_GENERATION: usize = 0x60;
+    const GUEST_RTC_SECONDS: usize = 0x68;
+    const GUEST_PVTIME_IPA: usize = 0x70;
+    const GUEST_PVTIME_STOLEN_NS: usize = 0x78;
     const SENTINEL: u64 = 0x5a5a;
+    const SOURCE_RTC_SENTINEL: u32 = 0x1234;
+    const IDENTITY_ACK_FUNCTION: u64 = 0x7ffe;
     const PSCI_VERSION: u64 = 0x8400_0000;
     const PSCI_CPU_SUSPEND_64: u64 = 0xc400_0001;
     const PSCI_CPU_ON_64: u64 = 0xc400_0003;
+    const ARM_SMCCC_PV_TIME_ST_64: u64 = 0xc500_0021;
 
     let primary_code = arm64_instruction_bytes(&[
-        arm64_adr(0, FLAGS_OFFSET, 19),             // adr x19, flags
-        0xd280_0060,                                // mov x0, #3
-        0xf2b8_8000,                                // movk x0, #0xc400, lsl #16 (CPU_ON64)
-        0xd280_0021,                                // mov x1, #1
-        arm64_adr(4 * 4, SECONDARY_ONE_OFFSET, 2),  // adr x2, secondary one
-        arm64_adr(5 * 4, FLAGS_OFFSET, 3),          // adr x3, flags
-        0xd400_0002,                                // hvc #0
-        0xf900_0260,                                // str x0, [x19]
-        0xb940_0e64,                                // ldr w4, [x19, #0xc]
-        0x34ff_ffe4,                                // cbz w4, previous instruction
-        0x5280_0024,                                // mov w4, #1
-        0xb900_0a64,                                // str w4, [x19, #8]
-        0xd280_0000,                                // mov x0, #0
-        0xf2b0_8000,                                // movk x0, #0x8400, lsl #16 (PSCI_VERSION)
-        0xd400_0002,                                // hvc #0 (source checkpoint)
-        0xb900_2a64,                                // str w4, [x19, #0x28]
-        0xb940_1265,                                // ldr w5, [x19, #0x10]
-        0x34ff_ffe5,                                // cbz w5, previous instruction
-        0xd280_0060,                                // mov x0, #3
-        0xf2b8_8000,                                // movk x0, #0xc400, lsl #16 (CPU_ON64)
-        0xd280_0041,                                // mov x1, #2
-        arm64_adr(21 * 4, SECONDARY_TWO_OFFSET, 2), // adr x2, secondary two
-        arm64_adr(22 * 4, FLAGS_OFFSET, 3),         // adr x3, flags
-        0xd400_0002,                                // hvc #0
-        0xf900_1a60,                                // str x0, [x19, #0x30]
-        0xb940_3a66,                                // ldr w6, [x19, #0x38]
-        0x34ff_ffe6,                                // cbz w6, previous instruction
-        0xb900_3e64,                                // str w4, [x19, #0x3c]
-        0xd280_0000,                                // mov x0, #0
-        0xf2b0_8000,                                // movk x0, #0x8400, lsl #16 (PSCI_VERSION)
-        0xd400_0002,                                // hvc #0 (final checkpoint)
-        0x1400_0000,                                // b .
+        arm64_adr(0, FLAGS_OFFSET, 19),            // adr x19, flags
+        arm64_adr(4, CONFIG_OFFSET, 18),           // adr x18, config
+        0xf940_0254,                               // ldr x20, [x18] (GICD)
+        0xf940_0655,                               // ldr x21, [x18, #8] (GICR)
+        0xf940_0e57,                               // ldr x23, [x18, #24] (VBAR)
+        0xd518_c017,                               // msr VBAR_EL1, x23
+        0xd503_3fdf,                               // isb
+        0x9100_52a1,                               // add x1, x21, #0x14 (GICR_WAKER)
+        0xb940_0022,                               // ldr w2, [x1]
+        0x121e_7842,                               // bic w2, w2, #2 (ProcessorSleep)
+        0xb900_0022,                               // str w2, [x1]
+        0xb940_0022,                               // ldr w2, [x1]
+        0x3717_ffe2, // tbnz w2, #2, previous instruction (ChildrenAsleep)
+        0xb940_1256, // ldr w22, [x18, #16] (VMGenID INTID)
+        0x5280_1007, // mov w7, #0x80 (higher priority)
+        0x9400_004f, // bl configure_spi
+        0xb940_1656, // ldr w22, [x18, #20] (VMClock INTID)
+        0x5280_1207, // mov w7, #0x90
+        0x9400_004c, // bl configure_spi
+        0xb940_0287, // ldr w7, [x20] (GICD_CTLR)
+        0x5280_0248, // mov w8, #0x12 (ARE_NS | EnableGrp1NS)
+        0x2a08_00e7, // orr w7, w7, w8
+        0xb900_0287, // str w7, [x20]
+        0xd503_3f9f, // dsb sy
+        0xb940_0287, // ldr w7, [x20]
+        0x37ff_ffe7, // tbnz w7, #31, previous instruction (RWP)
+        0xd538_cca1, // mrs x1, ICC_SRE_EL1
+        0xb240_0021, // orr x1, x1, #1
+        0xd518_cca1, // msr ICC_SRE_EL1, x1
+        0xd503_3fdf, // isb
+        0xd280_1fe1, // mov x1, #0xff
+        0xd518_4601, // msr ICC_PMR_EL1, x1
+        0xd518_cc7f, // msr ICC_BPR1_EL1, xzr
+        0xd280_0021, // mov x1, #1
+        0xd518_cce1, // msr ICC_IGRPEN1_EL1, x1
+        0xd503_3fdf, // isb
+        0xd503_42ff, // msr DAIFClr, #2
+        0xf940_1a48, // ldr x8, [x18, #48] (PL031)
+        0x5282_4689, // mov w9, #0x1234
+        0xb900_0909, // str w9, [x8, #8] (RTC_LOAD)
+        0xb940_0109, // ldr w9, [x8] (RTC_DR)
+        0xb900_4e69, // str w9, [x19, #0x4c]
+        0xd280_0060, // mov x0, #3
+        0xf2b8_8000, // movk x0, #0xc400, lsl #16 (CPU_ON64)
+        0xd280_0021, // mov x1, #1
+        arm64_adr(0xb4, SECONDARY_ONE_OFFSET, 2), // adr x2, secondary one
+        arm64_adr(0xb8, FLAGS_OFFSET, 3), // adr x3, flags
+        0xd400_0002, // hvc #0
+        0xf900_0260, // str x0, [x19]
+        0xb940_0e64, // ldr w4, [x19, #0xc]
+        0x34ff_ffe4, // cbz w4, previous instruction
+        0x5280_0024, // mov w4, #1
+        0xb900_0a64, // str w4, [x19, #8]
+        0xd280_0000, // mov x0, #0
+        0xf2b0_8000, // movk x0, #0x8400, lsl #16 (PSCI_VERSION)
+        0xd400_0002, // hvc #0 (source checkpoint)
+        0xb940_4267, // ldr w7, [x19, #0x40]
+        0x7100_08ff, // cmp w7, #2
+        0x54ff_ffc1, // b.ne to acknowledgement count load
+        0xf940_1248, // ldr x8, [x18, #32] (VMGenID)
+        0xf940_0109, // ldr x9, [x8]
+        0xf900_2a69, // str x9, [x19, #0x50]
+        0xf940_1648, // ldr x8, [x18, #40] (VMClock)
+        0xb940_0d09, // ldr w9, [x8, #12] (sequence)
+        0xb900_5a69, // str w9, [x19, #0x58]
+        0xf940_3509, // ldr x9, [x8, #104] (generation)
+        0xf900_3269, // str x9, [x19, #0x60]
+        0xf940_1a48, // ldr x8, [x18, #48] (PL031)
+        0xb940_0109, // ldr w9, [x8] (RTC_DR)
+        0xb900_6a69, // str w9, [x19, #0x68]
+        0xd280_0420, // mov x0, #0x21
+        0xf2b8_a000, // movk x0, #0xc500, lsl #16 (PV_TIME_ST64)
+        0xd400_0002, // hvc #0
+        0xf900_3a60, // str x0, [x19, #0x70]
+        0xf940_0409, // ldr x9, [x0, #8] (stolen time)
+        0xf900_3e69, // str x9, [x19, #0x78]
+        0x5280_0024, // mov w4, #1
+        0xb900_2a64, // str w4, [x19, #0x28]
+        0xb940_1265, // ldr w5, [x19, #0x10]
+        0x34ff_ffe5, // cbz w5, previous instruction
+        0xd280_0060, // mov x0, #3
+        0xf2b8_8000, // movk x0, #0xc400, lsl #16 (CPU_ON64)
+        0xd280_0041, // mov x1, #2
+        arm64_adr(0x14c, SECONDARY_TWO_OFFSET, 2), // adr x2, secondary two
+        arm64_adr(0x150, FLAGS_OFFSET, 3), // adr x3, flags
+        0xd400_0002, // hvc #0
+        0xf900_1a60, // str x0, [x19, #0x30]
+        0xb940_3a66, // ldr w6, [x19, #0x38]
+        0x34ff_ffe6, // cbz w6, previous instruction
+        0xb900_3e64, // str w4, [x19, #0x3c]
+        0xd280_0000, // mov x0, #0
+        0xf2b0_8000, // movk x0, #0x8400, lsl #16 (PSCI_VERSION)
+        0xd400_0002, // hvc #0 (final checkpoint)
+        0x1400_0000, // b .
+        0x1200_12c3, // configure_spi: and w3, w22, #31
+        0x5280_0024, // mov w4, #1
+        0x1ac3_2084, // lsl w4, w4, w3
+        0x5305_7ec5, // lsr w5, w22, #5
+        0x9102_0286, // add x6, x20, #0x80 (GICD_IGROUPR)
+        0x8b05_08c6, // add x6, x6, x5, lsl #2
+        0xb940_00c9, // ldr w9, [x6]
+        0x2a04_0129, // orr w9, w9, w4
+        0xb900_00c9, // str w9, [x6]
+        0x1200_0ec3, // and w3, w22, #15
+        0x531f_7863, // lsl w3, w3, #1
+        0x1100_0463, // add w3, w3, #1
+        0x5280_0024, // mov w4, #1
+        0x1ac3_2084, // lsl w4, w4, w3
+        0x9130_0286, // add x6, x20, #0xc00 (GICD_ICFGR)
+        0x5304_7ec5, // lsr w5, w22, #4
+        0x8b05_08c6, // add x6, x6, x5, lsl #2
+        0xb940_00c9, // ldr w9, [x6]
+        0x2a04_0129, // orr w9, w9, w4
+        0xb900_00c9, // str w9, [x6]
+        0x9110_0286, // add x6, x20, #0x400 (GICD_IPRIORITYR)
+        0x8b16_00c6, // add x6, x6, x22
+        0x3900_00c7, // strb w7, [x6]
+        0x9140_1a86, // add x6, x20, #0x6000 (GICD_IROUTER)
+        0x8b16_0cc6, // add x6, x6, x22, lsl #3
+        0xf900_00df, // str xzr, [x6]
+        0x1200_12c3, // and w3, w22, #31
+        0x5280_0024, // mov w4, #1
+        0x1ac3_2084, // lsl w4, w4, w3
+        0x5305_7ec5, // lsr w5, w22, #5
+        0x9104_0286, // add x6, x20, #0x100 (GICD_ISENABLER)
+        0x8b05_08c6, // add x6, x6, x5, lsl #2
+        0xb900_00c4, // str w4, [x6]
+        0xd65f_03c0, // ret
+    ]);
+    let irq_code = arm64_instruction_bytes(&[
+        0xd538_cc00, // mrs x0, ICC_IAR1_EL1
+        0xb940_4261, // ldr w1, [x19, #0x40]
+        0x9101_1262, // add x2, x19, #0x44
+        0xb821_7840, // str w0, [x2, x1, lsl #2]
+        0x1100_0421, // add w1, w1, #1
+        0xb900_4261, // str w1, [x19, #0x40]
+        0xd518_cc20, // msr ICC_EOIR1_EL1, x0
+        0xd28f_ffc0, // mov x0, #0x7ffe
+        0xd400_0002, // hvc #0
+        0xd69f_03e0, // eret
     ]);
     let secondary_one_code = arm64_instruction_bytes(&[
         0xaa00_03f3, // mov x19, x0
@@ -9517,9 +9649,37 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     let secondary_two_entry = primary_entry
         .checked_add(SECONDARY_TWO_OFFSET)
         .expect("secondary-two entry should fit");
+    let vector_base = primary_entry
+        .checked_add(VECTOR_OFFSET)
+        .expect("exception-vector base should fit");
+    let irq_handler = primary_entry
+        .checked_add(IRQ_HANDLER_OFFSET)
+        .expect("IRQ handler should fit");
     let flags = primary_entry
         .checked_add(FLAGS_OFFSET)
         .expect("shared flags should fit");
+    let guest_config_address = primary_entry
+        .checked_add(CONFIG_OFFSET)
+        .expect("guest evidence configuration should fit");
+    let gic = source.gic_metadata();
+    let vmgenid = source.runtime_resources().vmgenid_device;
+    let vmclock = source.runtime_resources().vmclock_device;
+    let vmgenid_intid = vmgenid.fdt_device.interrupt_line.raw_value();
+    let vmclock_intid = vmclock.fdt_device.interrupt_line.raw_value();
+    assert_ne!(
+        vmgenid_intid, vmclock_intid,
+        "identity notification lines must remain distinct"
+    );
+    let mut guest_config = Vec::with_capacity(56);
+    guest_config.extend_from_slice(&gic.distributor.base.to_le_bytes());
+    guest_config.extend_from_slice(&gic.redistributor.region.base.to_le_bytes());
+    guest_config.extend_from_slice(&vmgenid_intid.to_le_bytes());
+    guest_config.extend_from_slice(&vmclock_intid.to_le_bytes());
+    guest_config.extend_from_slice(&vector_base.raw_value().to_le_bytes());
+    guest_config.extend_from_slice(&vmgenid.range.start().raw_value().to_le_bytes());
+    guest_config.extend_from_slice(&vmclock.range.start().raw_value().to_le_bytes());
+    guest_config.extend_from_slice(&test_rtc_mmio_layout().base().raw_value().to_le_bytes());
+    assert_eq!(guest_config.len(), 56);
     {
         let memory = source
             .guest_memory_mut()
@@ -9534,8 +9694,14 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
             .write_slice(&secondary_two_code, secondary_two_entry)
             .expect("secondary-two code should fit");
         memory
+            .write_slice(&irq_code, irq_handler)
+            .expect("identity IRQ handler should fit");
+        memory
             .write_slice(&[0; FLAGS_SIZE], flags)
             .expect("shared flags should fit");
+        memory
+            .write_slice(&guest_config, guest_config_address)
+            .expect("guest evidence configuration should fit");
     }
     let source_flags_host = {
         let memory = source
@@ -9570,7 +9736,7 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     let one_step = NonZeroUsize::new(1).expect("one is nonzero");
     let mut source_checkpoint = false;
     let mut source_suspend = false;
-    for _ in 0..12 {
+    for _ in 0..24 {
         let mut observed = None;
         let outcome = source
             .run_loop_with_observer(&source_stop, one_step, |step| observed = Some(*step))
@@ -9607,26 +9773,16 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     assert_eq!(read_source_u32(POST_SUSPEND), 0);
     assert_eq!(read_source_u32(PRIMARY_AFTER_RESTORE), 0);
     assert_eq!(read_source_u32(CPU_TWO_PROGRESS), 0);
+    assert_eq!(read_source_u32(IDENTITY_ACK_COUNT), 0);
+    assert!(
+        read_source_u32(SOURCE_RTC_SECONDS).wrapping_sub(SOURCE_RTC_SENTINEL) <= 5,
+        "source guest should observe its deliberately mutated PL031 value"
+    );
 
     source
         .pause_for_snapshot_v2_capture()
         .expect("source should complete a snapshot-v2 pause without redispatch");
 
-    let memory_artifact =
-        TempFile::new_len("native-v2-platform-memory", 0).expect("memory artifact should create");
-    let mut writer = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(memory_artifact.path())
-        .expect("memory artifact should open for writing");
-    let binding = write_snapshot_v2_memory_image(
-        source
-            .guest_memory()
-            .expect("paused source memory should remain available"),
-        &mut writer,
-    )
-    .expect("paused source memory should stream");
-    drop(writer);
     let boot = HvfSnapshotV2BootState::try_new(
         HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
             .expect("kernel metadata path should validate"),
@@ -9634,44 +9790,51 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
         None,
     )
     .expect("native-v2 boot metadata should validate");
-    let capture_input = HvfArm64BootSnapshotV2CaptureInput::new(binding, boot.clone());
-    let mismatched_layout = GuestMemoryLayout::new(vec![
-        GuestMemoryRange::new(
-            GuestAddress::new(0),
-            host_page_size().expect("mismatched binding page size should remain available"),
-        )
-        .expect("mismatched binding range should validate"),
-    ])
-    .expect("mismatched binding layout should validate");
-    let mismatched_memory =
-        GuestMemory::allocate(&mismatched_layout).expect("mismatched memory should allocate");
-    let mismatched_artifact = TempFile::new_len("native-v2-platform-mismatched-memory", 0)
-        .expect("mismatched memory artifact should create");
-    let mut mismatched_writer = OpenOptions::new()
+    let capture_input = HvfArm64BootSnapshotV2CaptureInput::new(boot);
+    let nonempty_artifact = TempFile::new_len("native-v2-platform-nonempty-memory", 1)
+        .expect("nonempty memory artifact should create");
+    let mut nonempty_writer = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(mismatched_artifact.path())
-        .expect("mismatched memory artifact should open");
-    let mismatched_binding =
-        write_snapshot_v2_memory_image(&mismatched_memory, &mut mismatched_writer)
-            .expect("mismatched memory binding should encode");
+        .open(nonempty_artifact.path())
+        .expect("nonempty memory artifact should open");
     let capture_error = source
-        .capture_snapshot_v2_platform(HvfArm64BootSnapshotV2CaptureInput::new(
-            mismatched_binding,
-            boot,
-        ))
-        .expect_err("mismatched binding should reject after paused owner capture");
-    assert!(matches!(
-        capture_error,
-        HvfArm64BootSnapshotV2CaptureError::MemoryBindingMismatch
-    ));
+        .capture_snapshot_v2_platform(capture_input.clone(), &mut nonempty_writer)
+        .expect_err("nonempty memory output should reject after stable owner capture");
+    assert!(
+        matches!(
+            capture_error,
+            HvfArm64BootSnapshotV2CaptureError::MemoryImage {
+                source: SnapshotV2MemoryWriteError::NonEmptyOutput
+            }
+        ),
+        "unexpected capture error: {capture_error:?}"
+    );
+    let first_memory_artifact = TempFile::new_len("native-v2-platform-first-memory", 0)
+        .expect("first memory artifact should create");
+    let mut first_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(first_memory_artifact.path())
+        .expect("first memory artifact should open");
     let first_capture = source
-        .capture_snapshot_v2_platform(capture_input.clone())
+        .capture_snapshot_v2_platform(capture_input.clone(), &mut first_writer)
         .expect("first paused platform capture should succeed");
+    drop(first_writer);
+    let memory_artifact =
+        TempFile::new_len("native-v2-platform-memory", 0).expect("memory artifact should create");
+    let mut writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(memory_artifact.path())
+        .expect("memory artifact should open for writing");
     let second_capture = source
-        .capture_snapshot_v2_platform(capture_input)
+        .capture_snapshot_v2_platform(capture_input, &mut writer)
         .expect("source capture should be non-consuming and reusable");
+    drop(writer);
     assert_native_v2_platform_recapture_equivalent(&first_capture, &second_capture);
+    assert_eq!(first_capture.global(), second_capture.global());
+    assert_eq!(first_capture.time(), second_capture.time());
     assert!(matches!(
         second_capture.topology().members()[0].disposition(),
         HvfArm64StableVcpuDisposition::Runnable
@@ -9685,6 +9848,18 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
         HvfArm64StableVcpuDisposition::Offline
     ));
     let virtual_timer_intid = second_capture.topology().virtual_timer_intid();
+    let mut source_vmgenid = [0; ARM64_BOOT_VMGENID_SIZE];
+    source
+        .guest_memory()
+        .expect("source memory should remain mapped")
+        .read_slice(
+            &mut source_vmgenid,
+            second_capture.time().vmgenid().range().start(),
+        )
+        .expect("source VMGenID should read");
+    assert!(source_vmgenid.iter().any(|byte| *byte != 0));
+    let source_vmclock = second_capture.time().vmclock_abi();
+    let source_pvtime = second_capture.time().pvtime_vcpus().to_vec();
 
     let encoded = encode_hvf_snapshot_v2_platform_state(&second_capture)
         .expect("complete platform should encode");
@@ -9693,7 +9868,23 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     let decoded = decode_hvf_snapshot_v2_platform_state(&structural)
         .expect("typed platform should decode and cross-validate");
     assert_native_v2_platform_recapture_equivalent(&second_capture, &decoded);
-    let restored_memory = load_snapshot_v2_memory_file(
+    assert_eq!(decoded.global(), second_capture.global());
+    assert_eq!(decoded.time(), second_capture.time());
+    let assert_vmclock_transition = |saved: VmClockAbi, destination: VmClockAbi| {
+        assert_eq!(
+            destination.sequence(),
+            (saved.sequence() | 1).wrapping_add(1)
+        );
+        assert_eq!(
+            destination.disruption_marker(),
+            saved.disruption_marker().wrapping_add(1)
+        );
+        assert_eq!(
+            destination.generation_counter(),
+            saved.generation_counter().wrapping_add(1)
+        );
+    };
+    let first_clone_memory = load_snapshot_v2_memory_file(
         &structural,
         File::open(memory_artifact.path()).expect("memory artifact should open read-only"),
     )
@@ -9704,14 +9895,186 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
         .expect("paused source should shut down cleanly");
     drop(source);
 
+    let mut first_clone = restore_hvf_snapshot_v2_platform(decoded.clone(), first_clone_memory)
+        .expect("first immutable native-v2 clone should restore");
+    assert_eq!(first_clone.vcpu_count(), 3);
+    assert_eq!(first_clone.vcpu_mpidrs(), [0, 1, 2]);
+    let mut first_clone_vmgenid = [0; ARM64_BOOT_VMGENID_SIZE];
+    first_clone
+        .guest_memory()
+        .expect("first clone memory should remain mapped")
+        .read_slice(
+            &mut first_clone_vmgenid,
+            second_capture.time().vmgenid().range().start(),
+        )
+        .expect("first clone VMGenID should read");
+    assert!(first_clone_vmgenid.iter().any(|byte| *byte != 0));
+    assert_ne!(first_clone_vmgenid, source_vmgenid);
+
+    let first_clone_memory_artifact = TempFile::new_len("native-v2-platform-first-clone-memory", 0)
+        .expect("first-clone memory artifact should create");
+    let mut first_clone_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(first_clone_memory_artifact.path())
+        .expect("first-clone memory artifact should open");
+    let immediate_recapture = first_clone
+        .capture_snapshot_v2_platform(&mut first_clone_writer)
+        .expect("first clone should remain paused and recapturable");
+    drop(first_clone_writer);
+    assert_native_v2_platform_recapture_equivalent(&second_capture, &immediate_recapture);
+    assert_eq!(
+        immediate_recapture.time().rtc_layout(),
+        second_capture.time().rtc_layout()
+    );
+    assert_eq!(
+        immediate_recapture.time().vmgenid(),
+        second_capture.time().vmgenid()
+    );
+    assert_eq!(
+        immediate_recapture.time().vmclock(),
+        second_capture.time().vmclock()
+    );
+    assert_eq!(
+        immediate_recapture.time().pvtime_vcpus(),
+        source_pvtime.as_slice(),
+        "snapshot downtime must not be charged as PVTime stolen time"
+    );
+    assert_vmclock_transition(source_vmclock, immediate_recapture.time().vmclock_abi());
+
+    let recaptured_encoded = encode_hvf_snapshot_v2_platform_state(&immediate_recapture)
+        .expect("recaptured first clone should encode");
+    let recaptured_structural = decode_snapshot_v2_state(&recaptured_encoded)
+        .expect("recaptured first-clone container should decode");
+    let recaptured_decoded = decode_hvf_snapshot_v2_platform_state(&recaptured_structural)
+        .expect("recaptured first clone should cross-validate");
+    assert_eq!(recaptured_decoded, immediate_recapture);
+    first_clone
+        .shutdown()
+        .expect("first immutable clone should shut down cleanly");
+    drop(first_clone);
+
+    let second_clone_memory = load_snapshot_v2_memory_file(
+        &structural,
+        File::open(memory_artifact.path()).expect("memory artifact should reopen read-only"),
+    )
+    .expect("same immutable memory artifact should load again");
+    let mut second_clone = restore_hvf_snapshot_v2_platform(decoded.clone(), second_clone_memory)
+        .expect("second immutable native-v2 clone should restore");
+    let mut second_clone_vmgenid = [0; ARM64_BOOT_VMGENID_SIZE];
+    let mut second_clone_vmclock_bytes = [0; VMCLOCK_ABI_SIZE];
+    {
+        let memory = second_clone
+            .guest_memory()
+            .expect("second clone memory should remain mapped");
+        memory
+            .read_slice(
+                &mut second_clone_vmgenid,
+                second_capture.time().vmgenid().range().start(),
+            )
+            .expect("second clone VMGenID should read");
+        memory
+            .read_slice(
+                &mut second_clone_vmclock_bytes,
+                second_capture.time().vmclock().range().start(),
+            )
+            .expect("second clone VMClock should read");
+    }
+    assert!(second_clone_vmgenid.iter().any(|byte| *byte != 0));
+    assert_ne!(second_clone_vmgenid, source_vmgenid);
+    assert_ne!(
+        second_clone_vmgenid, first_clone_vmgenid,
+        "repeated loads of one immutable image need distinct clone identities"
+    );
+    let second_clone_vmclock = VmClockAbi::from_bytes(second_clone_vmclock_bytes)
+        .expect("second clone VMClock should remain valid");
+    assert_vmclock_transition(source_vmclock, second_clone_vmclock);
+    second_clone
+        .shutdown()
+        .expect("second immutable clone should shut down cleanly");
+    drop(second_clone);
+
+    let recaptured_memory = load_snapshot_v2_memory_file(
+        &recaptured_structural,
+        File::open(first_clone_memory_artifact.path())
+            .expect("first-clone memory artifact should open read-only"),
+    )
+    .expect("recaptured first-clone memory should load");
+    let mut recaptured_clone =
+        restore_hvf_snapshot_v2_platform(recaptured_decoded, recaptured_memory)
+            .expect("recaptured paused clone should restore again");
+    assert_eq!(recaptured_clone.vcpu_count(), 3);
+    assert_eq!(recaptured_clone.vcpu_mpidrs(), [0, 1, 2]);
+    let mut recaptured_clone_vmgenid = [0; ARM64_BOOT_VMGENID_SIZE];
+    let mut recaptured_clone_vmclock_bytes = [0; VMCLOCK_ABI_SIZE];
+    {
+        let memory = recaptured_clone
+            .guest_memory()
+            .expect("restored recapture memory should remain mapped");
+        memory
+            .read_slice(
+                &mut recaptured_clone_vmgenid,
+                immediate_recapture.time().vmgenid().range().start(),
+            )
+            .expect("restored recapture VMGenID should read");
+        memory
+            .read_slice(
+                &mut recaptured_clone_vmclock_bytes,
+                immediate_recapture.time().vmclock().range().start(),
+            )
+            .expect("restored recapture VMClock should read");
+    }
+    assert!(recaptured_clone_vmgenid.iter().any(|byte| *byte != 0));
+    assert_ne!(recaptured_clone_vmgenid, source_vmgenid);
+    assert_ne!(recaptured_clone_vmgenid, first_clone_vmgenid);
+    assert_ne!(recaptured_clone_vmgenid, second_clone_vmgenid);
+    let recaptured_clone_vmclock = VmClockAbi::from_bytes(recaptured_clone_vmclock_bytes)
+        .expect("restored recapture VMClock should remain valid");
+    assert_vmclock_transition(
+        immediate_recapture.time().vmclock_abi(),
+        recaptured_clone_vmclock,
+    );
+    recaptured_clone
+        .shutdown()
+        .expect("recaptured clone should shut down cleanly");
+    drop(recaptured_clone);
+
+    let restored_memory = load_snapshot_v2_memory_file(
+        &structural,
+        File::open(memory_artifact.path()).expect("original memory artifact should reopen"),
+    )
+    .expect("original immutable memory artifact should load for guest evidence");
     let mut restored = restore_hvf_snapshot_v2_platform(decoded, restored_memory)
-        .expect("fresh native-v2 platform should restore");
+        .expect("clean original native-v2 clone should restore for guest evidence");
     assert_eq!(restored.vcpu_count(), 3);
     assert_eq!(restored.vcpu_mpidrs(), [0, 1, 2]);
-    let immediate_recapture = restored
-        .capture_snapshot_v2_platform()
-        .expect("first published destination state should remain paused and recapturable");
-    assert_native_v2_platform_recapture_equivalent(&second_capture, &immediate_recapture);
+    let mut restored_vmgenid = [0; ARM64_BOOT_VMGENID_SIZE];
+    let mut restored_vmclock_bytes = [0; VMCLOCK_ABI_SIZE];
+    {
+        let memory = restored
+            .guest_memory()
+            .expect("clean restored memory should remain mapped");
+        memory
+            .read_slice(
+                &mut restored_vmgenid,
+                second_capture.time().vmgenid().range().start(),
+            )
+            .expect("clean restored VMGenID should read");
+        memory
+            .read_slice(
+                &mut restored_vmclock_bytes,
+                second_capture.time().vmclock().range().start(),
+            )
+            .expect("clean restored VMClock should read");
+    }
+    assert!(restored_vmgenid.iter().any(|byte| *byte != 0));
+    assert_ne!(restored_vmgenid, source_vmgenid);
+    assert_ne!(restored_vmgenid, first_clone_vmgenid);
+    assert_ne!(restored_vmgenid, second_clone_vmgenid);
+    assert_ne!(restored_vmgenid, recaptured_clone_vmgenid);
+    let restored_vmclock =
+        VmClockAbi::from_bytes(restored_vmclock_bytes).expect("clean VMClock should remain valid");
+    assert_vmclock_transition(source_vmclock, restored_vmclock);
     let restored_flags_host = {
         let memory = restored
             .guest_memory()
@@ -9741,7 +10104,24 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     assert_eq!(read_restored_u32(PRIMARY_AFTER_RESTORE), 0);
     assert_eq!(read_restored_u32(POST_SUSPEND), 0);
     assert_eq!(read_restored_u32(CPU_TWO_PROGRESS), 0);
+    assert_eq!(read_restored_u32(IDENTITY_ACK_COUNT), 0);
+    assert_eq!(read_restored_u32(VMGENID_ACK), 0);
+    assert_eq!(read_restored_u32(VMCLOCK_ACK), 0);
+    assert!(
+        read_restored_u32(SOURCE_RTC_SECONDS).wrapping_sub(SOURCE_RTC_SENTINEL) <= 5,
+        "the original immutable artifact should retain source guest evidence"
+    );
+    assert_eq!(read_restored_u64(GUEST_VMGENID_WORD), 0);
+    assert_eq!(read_restored_u32(GUEST_VMCLOCK_SEQUENCE), 0);
+    assert_eq!(read_restored_u64(GUEST_VMCLOCK_GENERATION), 0);
+    assert_eq!(read_restored_u32(GUEST_RTC_SECONDS), 0);
+    assert_eq!(read_restored_u64(GUEST_PVTIME_IPA), 0);
+    assert_eq!(read_restored_u64(GUEST_PVTIME_STOLEN_NS), 0);
 
+    let rtc_before_resume = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("destination wall clock should follow the Unix epoch")
+        .as_secs() as u32;
     restored
         .resume()
         .expect("paused destination should resume once");
@@ -9763,8 +10143,10 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     let mut cpu_one_offline = false;
     let mut cpu_two_offline = false;
     let mut final_checkpoint = false;
+    let mut identity_acknowledgements = Vec::new();
+    let mut pvtime_query_completed = false;
     let mut direct_vtimer_exits = 0;
-    for _ in 0..32 {
+    for _ in 0..64 {
         let step = restored
             .run_step(|entry| {
                 entry == secondary_one_entry.raw_value() || entry == secondary_two_entry.raw_value()
@@ -9788,6 +10170,43 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
                 return_value: 0x0001_0000,
                 ..
             } => final_checkpoint = true,
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: IDENTITY_ACK_FUNCTION,
+                return_value: 0xffff_ffff,
+                ..
+            } => {
+                let count = read_restored_u32(IDENTITY_ACK_COUNT);
+                let acknowledged = match count {
+                    1 => read_restored_u32(VMGENID_ACK),
+                    2 => read_restored_u32(VMCLOCK_ACK),
+                    other => panic!("unexpected identity acknowledgement count {other}"),
+                };
+                identity_acknowledgements.push(acknowledged);
+                assert_eq!(
+                    read_restored_u32(PRIMARY_AFTER_RESTORE),
+                    0,
+                    "ordinary progress must wait for both identity notifications"
+                );
+            }
+            HvfVcpuRunStepOutcome::Hvc {
+                function_id: ARM_SMCCC_PV_TIME_ST_64,
+                return_value,
+                ..
+            } => {
+                assert_eq!(
+                    return_value,
+                    second_capture.time().pvtime_vcpus()[0]
+                        .record_ipa()
+                        .raw_value()
+                );
+                assert_eq!(
+                    identity_acknowledgements,
+                    [vmgenid_intid, vmclock_intid],
+                    "the guest must acknowledge VMGenID before VMClock"
+                );
+                assert_eq!(read_restored_u32(PRIMARY_AFTER_RESTORE), 0);
+                pvtime_query_completed = true;
+            }
             HvfVcpuRunStepOutcome::VtimerActivated => {
                 direct_vtimer_exits += 1;
                 restored
@@ -9801,6 +10220,7 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
             && cpu_one_offline
             && cpu_two_offline
             && final_checkpoint
+            && pvtime_query_completed
         {
             break;
         }
@@ -9818,6 +10238,15 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
         final_checkpoint,
         "restored primary should reach its checkpoint"
     );
+    assert_eq!(
+        identity_acknowledgements,
+        [vmgenid_intid, vmclock_intid],
+        "signed guest IRQ acknowledgements must preserve restore notification order"
+    );
+    assert!(
+        pvtime_query_completed,
+        "restored primary should query its PVTime record before ordinary progress"
+    );
     assert_eq!(read_restored_u32(PRIMARY_AFTER_RESTORE), 1);
     assert_eq!(read_restored_u32(POST_SUSPEND), 1);
     assert_eq!(read_restored_u64(SUSPEND_RESULT), 0);
@@ -9825,6 +10254,48 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     assert_eq!(read_restored_u64(CPU_ON_TWO_RESULT), 0);
     assert_eq!(read_restored_u32(CPU_TWO_PROGRESS), 1);
     assert_eq!(read_restored_u32(FINAL_CHECKPOINT), 1);
+    assert_eq!(
+        read_restored_u64(GUEST_VMGENID_WORD),
+        u64::from_le_bytes(
+            restored_vmgenid[..8]
+                .try_into()
+                .expect("VMGenID prefix should be eight bytes")
+        ),
+        "restored guest must observe the fresh destination VMGenID"
+    );
+    assert_eq!(
+        read_restored_u32(GUEST_VMCLOCK_SEQUENCE),
+        restored_vmclock.sequence(),
+        "restored guest must observe the completed VMClock sequence"
+    );
+    assert_eq!(
+        read_restored_u64(GUEST_VMCLOCK_GENERATION),
+        restored_vmclock.generation_counter(),
+        "restored guest must observe the completed VMClock generation"
+    );
+    let rtc_after_progress = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("destination wall clock should follow the Unix epoch")
+        .as_secs() as u32;
+    let guest_rtc_seconds = read_restored_u32(GUEST_RTC_SECONDS);
+    assert!(
+        (rtc_before_resume..=rtc_after_progress).contains(&guest_rtc_seconds),
+        "restored guest PL031 value must come from destination SystemTime"
+    );
+    assert!(
+        guest_rtc_seconds.wrapping_sub(SOURCE_RTC_SENTINEL) > 5,
+        "restored PL031 must not retain the source guest's mutable RTC load"
+    );
+    let primary_pvtime = second_capture.time().pvtime_vcpus()[0];
+    assert_eq!(
+        read_restored_u64(GUEST_PVTIME_IPA),
+        primary_pvtime.record_ipa().raw_value(),
+        "restored guest must discover its topology-ordered PVTime record"
+    );
+    assert!(
+        read_restored_u64(GUEST_PVTIME_STOLEN_NS) >= primary_pvtime.stolen_time_ns(),
+        "restored guest PVTime must continue from the captured accumulator"
+    );
     assert!(
         direct_vtimer_exits <= 1,
         "the retained suspended timer should publish its PPI without duplicate direct exits"
@@ -9836,9 +10307,17 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
         .expect("idle continued topology should accept a final pause")
         .wait()
         .expect("final pause should complete");
+    let final_memory_artifact = TempFile::new_len("native-v2-platform-final-memory", 0)
+        .expect("final memory artifact should create");
+    let mut final_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(final_memory_artifact.path())
+        .expect("final memory artifact should open");
     let final_capture = restored
-        .capture_snapshot_v2_platform()
+        .capture_snapshot_v2_platform(&mut final_writer)
         .expect("continued platform should remain capture-ready");
+    drop(final_writer);
     assert!(matches!(
         final_capture.topology().members()[0].disposition(),
         HvfArm64StableVcpuDisposition::Runnable

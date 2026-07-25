@@ -70,13 +70,15 @@ claims mechanically visible.
   leaves, records default stdout, configured-output stdin exclusion, bounded
   terminal/FIFO RX and exact MMIO capture-ready ownership, and hands the one
   serialization/endpoint-reconstruction aggregate to Wave 6.
-- [`time-identity-contract.md`](time-identity-contract.md) is the #1477/#1478/#1480
-  PL031, VMGenID, VMClock, and PVTime ledger. It records complete
+- [`time-identity-contract.md`](time-identity-contract.md) is the
+  #1477/#1478/#1480/#1529 PL031, VMGenID, VMClock, and PVTime ledger. It records complete
   typed VMClock capture, backward-compatible native-v1 state, ordered
   destination notifications, postcommit terminality, fresh destination PL031
   time, public per-vCPU PVTime measurement/accounting/publication/discovery,
-  capture-ready cumulative values, and signed Linux proof while handing the one
-  aggregate record to Wave 6 #1490 for clone/portability certification.
+  capture-ready cumulative values, native-v2 `2.3.0` portable time/identity
+  encoding, repeat-clone restore/recapture, and signed guest proof while handing
+  the one aggregate record to Wave 6 #1490 for public composition and broader
+  cross-host portability certification.
 - [`remaining-device-contract.md`](remaining-device-contract.md) is the #1481
   checked aggregate ledger. It joins the exact 52 balloon, 19 memory-hotplug,
   seven entropy, six serial, and one time/identity records; pins the 77 terminal
@@ -502,7 +504,8 @@ PL031 reconstruction uses destination wall clock with every unsupported alarm
 register clear. Signed cross-process guest code observes both VMGenID halves,
 stable VMClock sequence/counters, and non-regressing RTC time. The checked
 [`time-identity-contract.md`](time-identity-contract.md) retains
-`semantic.device:rtc-vmclock-vmgenid-and-pvtime` as `audit-required`.
+`semantic.device:rtc-vmclock-vmgenid-and-pvtime` as `audit-required` pending
+public native-v2 composition and broader cross-host portability.
 
 #1478 adds the exact 64-byte-per-vCPU PVTime ABI placement, checked startup
 initialization and rollback, owner-thread `hv_vcpu_get_exec_time` measurement
@@ -604,6 +607,14 @@ before/during/after removal and zero refault, multi-vCPU/failure/death/repeat
 cleanup, exact empty-launcher/two-key-worker entitlement dictionaries, and the
 full repository matrix. It promotes only `corpus:snapshot-page-faults`, so the
 current overlay is 229/169/3/17.
+
+#1529 then advances the internal native-v2 writer to `2.3.0`, appends the
+portable time/clone-identity component, and reconstructs destination PL031,
+PVTime, VMGenID, and VMClock before paused publication. Signed three-vCPU
+evidence proves repeat immutable loads, notification order, destination time,
+PVTime continuity, and recapture-to-restore. The aggregate record remains
+`audit-required` only for public production composition and broader cross-host
+migration/clone portability, so the current overlay remains 229/169/3/17.
 
 ## Commands
 

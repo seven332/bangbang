@@ -1,12 +1,27 @@
 //! Unpublished native-v2 multi-vCPU HVF platform reconstruction.
 
 use std::fmt;
+use std::io::{Seek, Write};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
-use bangbang_runtime::memory::{GuestMemory, GuestMemoryAccessError};
+use bangbang_runtime::memory::{
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange, aarch64,
+};
 use bangbang_runtime::mmio::MmioDispatcher;
-use bangbang_runtime::snapshot_memory_v2::SnapshotV2MemoryBinding;
+use bangbang_runtime::pvtime::{
+    ARM64_PVTIME_STOLEN_TIME_OFFSET, ARM64_PVTIME_STRUCTURE_SIZE, Arm64PvTimeLayout,
+    Arm64PvTimeStAbi,
+};
+use bangbang_runtime::rtc::RtcMmioLayout;
+use bangbang_runtime::snapshot_memory_v2::{
+    SnapshotV2MemoryBinding, write_snapshot_v2_memory_image,
+};
+use bangbang_runtime::startup::{
+    Arm64BootResourceError, Arm64BootRtcDevice, Arm64BootVmClockDevice, Arm64BootVmGenIdDevice,
+    PrepareArm64SnapshotTimeIdentityError, prepare_arm64_snapshot_time_identity,
+    register_arm64_boot_rtc_mmio, replace_arm64_boot_vmgenid,
+};
 use bangbang_runtime::{BackendError, VmBackend};
 use crc64::crc64;
 
@@ -14,8 +29,11 @@ use crate::backend::HvfBackend;
 use crate::coordinator::{HvfVcpuRunControl, HvfVcpuRunCoordinatorError};
 use crate::cpu_template::HvfArm64CpuTemplateError;
 use crate::dirty::HvfDirtyWriteTrackerStartError;
-use crate::gic::{HvfGicError, HvfGicMsiConfiguration};
+use crate::gic::{
+    HvfGicError, HvfGicMetadata, HvfGicMsiConfiguration, HvfGicSpiSignalError, HvfGicSpiSignaler,
+};
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
+use crate::pvtime::HvfArm64PvTimeAccountingConfig;
 use crate::runner::{HvfArm64SnapshotV2VcpuRestore, HvfVcpuRunStepOutcome, HvfVcpuRunnerError};
 use crate::session_vcpu::{
     HvfArm64BootVcpuError, HvfArm64BootVcpuSession, HvfArm64StablePausedTopologyCaptureError,
@@ -24,9 +42,14 @@ use crate::session_vcpu::{
 use crate::snapshot_bundle::HvfSnapshotV1CompatibilityState;
 use crate::snapshot_v2::{
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
-    HvfSnapshotV2VcpuState,
+    HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
 };
-use crate::startup::{HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage};
+use crate::startup::{
+    HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
+    HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
+    capture_hvf_snapshot_v2_time_state, replace_vmgenid_and_signal_with,
+    update_vmclock_and_signal_with,
+};
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
 use crate::vcpu::HvfArm64VcpuIdentificationRegisterState;
 
@@ -55,6 +78,16 @@ pub enum HvfSnapshotV2PlatformRestoreStage {
     GlobalGic,
     /// Restore one complete per-vCPU component.
     Vcpu { index: usize },
+    /// Install the fresh destination-time PL031 MMIO handler.
+    Rtc,
+    /// Configure one never-run vCPU's restored PVTime accumulator.
+    PvTime { index: usize },
+    /// Validate all runners and identity notification lines before mutation.
+    TimeIdentityPreflight,
+    /// Replace and notify the destination VMGenID.
+    VmGenId,
+    /// Atomically update and notify the destination VMClock.
+    VmClock,
     /// Import offline/runnable/suspended state into a coordinator born paused.
     Lifecycle,
     /// Publish the completed paused owner without exposing a raw topology.
@@ -76,6 +109,11 @@ impl fmt::Display for HvfSnapshotV2PlatformRestoreStage {
             }
             Self::GlobalGic => f.write_str("global GIC restore"),
             Self::Vcpu { index } => write!(f, "vCPU {index} restore"),
+            Self::Rtc => f.write_str("destination PL031 installation"),
+            Self::PvTime { index } => write!(f, "vCPU {index} PVTime restore"),
+            Self::TimeIdentityPreflight => f.write_str("time/identity preflight"),
+            Self::VmGenId => f.write_str("VMGenID replacement and notification"),
+            Self::VmClock => f.write_str("VMClock update and notification"),
             Self::Lifecycle => f.write_str("paused lifecycle import"),
             Self::Publication => f.write_str("paused platform publication"),
         }
@@ -98,6 +136,12 @@ pub enum HvfSnapshotV2PlatformRestoreFailure {
     CacheQuery(BackendError),
     /// Destination cache facts differ from the prepared compatibility state.
     CacheMismatch,
+    /// Portable identity devices disagree with supplied guest memory.
+    TimePreparation(PrepareArm64SnapshotTimeIdentityError),
+    /// One supplied PVTime record could not be read.
+    PvTimeRead(GuestMemoryAccessError),
+    /// One supplied PVTime record is invalid or differs from portable state.
+    PvTimeMismatch,
     /// Empty VM construction failed.
     CreateVm(BackendError),
     /// Guest-memory registration failed.
@@ -122,6 +166,26 @@ pub enum HvfSnapshotV2PlatformRestoreFailure {
     GlobalGic(HvfVcpuRunnerError),
     /// One complete per-vCPU restoration failed.
     Vcpu(HvfVcpuRunnerError),
+    /// Fresh destination PL031 installation failed.
+    Rtc(Arm64BootResourceError),
+    /// A restored PVTime publisher address overflowed.
+    PvTimeAddress,
+    /// A restored PVTime atomic publisher could not be created.
+    PvTimePublisher(GuestMemoryAccessError),
+    /// Mapped guest memory became unavailable while preparing PVTime.
+    PvTimeMemory(HvfGuestMemoryMappingError),
+    /// One never-run vCPU rejected PVTime configuration.
+    PvTime(HvfVcpuRunnerError),
+    /// One destination runner was no longer available for identity restore.
+    TimeIdentityRunner(HvfVcpuRunnerError),
+    /// Identity interrupt signaling could not be prepared.
+    TimeIdentitySignaler(HvfGicSpiSignalError),
+    /// Mapped guest memory became unavailable before identity mutation.
+    TimeIdentityMemory(HvfGuestMemoryMappingError),
+    /// VMGenID replacement or notification failed.
+    VmGenId(HvfArm64BootVmGenIdRestoreError),
+    /// VMClock update or notification failed.
+    VmClock(HvfArm64BootVmClockRestoreError),
     /// Stable paused lifecycle import failed and consumed the raw topology.
     Lifecycle(HvfArm64StablePausedTopologyImportError),
 }
@@ -136,6 +200,9 @@ impl HvfSnapshotV2PlatformRestoreFailure {
             Self::FdtIdentity => "FDT identity",
             Self::CacheQuery(_) => "cache query",
             Self::CacheMismatch => "cache compatibility",
+            Self::TimePreparation(_) => "time identity preparation",
+            Self::PvTimeRead(_) => "PVTime preflight read",
+            Self::PvTimeMismatch => "PVTime preflight agreement",
             Self::CreateVm(_) => "VM creation",
             Self::MapMemory(_) => "memory mapping",
             Self::DirtyTracking(_) => "dirty tracking",
@@ -148,6 +215,16 @@ impl HvfSnapshotV2PlatformRestoreFailure {
             Self::CompatibilityMismatch => "compatibility mismatch",
             Self::GlobalGic(_) => "global GIC restore",
             Self::Vcpu(_) => "vCPU restore",
+            Self::Rtc(_) => "PL031 installation",
+            Self::PvTimeAddress => "PVTime publisher address",
+            Self::PvTimePublisher(_) => "PVTime publisher",
+            Self::PvTimeMemory(_) => "PVTime guest memory",
+            Self::PvTime(_) => "PVTime restore",
+            Self::TimeIdentityRunner(_) => "time identity runner preflight",
+            Self::TimeIdentitySignaler(_) => "time identity signaler preflight",
+            Self::TimeIdentityMemory(_) => "time identity guest memory",
+            Self::VmGenId(_) => "VMGenID restore",
+            Self::VmClock(_) => "VMClock restore",
             Self::Lifecycle(_) => "lifecycle import",
         }
     }
@@ -173,6 +250,8 @@ impl std::error::Error for HvfSnapshotV2PlatformRestoreFailure {
         match self {
             Self::FdtRead(source) => Some(source),
             Self::CacheQuery(source) | Self::CreateVm(source) => Some(source),
+            Self::TimePreparation(source) => Some(source),
+            Self::PvTimeRead(source) => Some(source),
             Self::MapMemory(source) => Some(source),
             Self::DirtyTracking(source) => Some(source),
             Self::CreateGic(source) => Some(source),
@@ -181,15 +260,25 @@ impl std::error::Error for HvfSnapshotV2PlatformRestoreFailure {
             Self::CompatibilityRead(source) | Self::GlobalGic(source) | Self::Vcpu(source) => {
                 Some(source)
             }
+            Self::Rtc(source) => Some(source),
+            Self::PvTimePublisher(source) => Some(source),
+            Self::PvTimeMemory(source) => Some(source),
+            Self::PvTime(source) | Self::TimeIdentityRunner(source) => Some(source),
+            Self::TimeIdentitySignaler(source) => Some(source),
+            Self::TimeIdentityMemory(source) => Some(source),
+            Self::VmGenId(source) => Some(source),
+            Self::VmClock(source) => Some(source),
             Self::Lifecycle(source) => Some(source),
             Self::Allocation
             | Self::MemoryTopology
             | Self::FdtAllocation
             | Self::FdtIdentity
             | Self::CacheMismatch
+            | Self::PvTimeMismatch
             | Self::GicMetadata
             | Self::TopologyIdentity
-            | Self::CompatibilityMismatch => None,
+            | Self::CompatibilityMismatch
+            | Self::PvTimeAddress => None,
         }
     }
 }
@@ -257,6 +346,7 @@ impl std::error::Error for HvfSnapshotV2PlatformCleanupFailure {
 /// Primary restore failure plus every later reverse-cleanup failure.
 pub struct HvfSnapshotV2PlatformRestoreError {
     stage: HvfSnapshotV2PlatformRestoreStage,
+    committed: bool,
     failure: Box<HvfSnapshotV2PlatformRestoreFailure>,
     cleanup: Vec<HvfSnapshotV2PlatformCleanupFailure>,
 }
@@ -267,8 +357,10 @@ impl HvfSnapshotV2PlatformRestoreError {
         failure: HvfSnapshotV2PlatformRestoreFailure,
         cleanup: Vec<HvfSnapshotV2PlatformCleanupFailure>,
     ) -> Self {
+        let committed = restore_failure_is_committed(stage, &failure);
         Self {
             stage,
+            committed,
             failure: Box::new(failure),
             cleanup,
         }
@@ -277,6 +369,11 @@ impl HvfSnapshotV2PlatformRestoreError {
     /// Return the value-free primary reconstruction stage.
     pub const fn stage(&self) -> HvfSnapshotV2PlatformRestoreStage {
         self.stage
+    }
+
+    /// Return whether guest-visible clone identity had already committed.
+    pub const fn is_committed(&self) -> bool {
+        self.committed
     }
 
     /// Return the typed primary failure.
@@ -294,6 +391,7 @@ impl fmt::Debug for HvfSnapshotV2PlatformRestoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HvfSnapshotV2PlatformRestoreError")
             .field("stage", &self.stage)
+            .field("committed", &self.committed)
             .field("failure", &self.failure)
             .field("cleanup", &self.cleanup)
             .finish()
@@ -303,6 +401,9 @@ impl fmt::Debug for HvfSnapshotV2PlatformRestoreError {
 impl fmt::Display for HvfSnapshotV2PlatformRestoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "native-v2 platform restore failed at {}", self.stage)?;
+        if self.committed {
+            f.write_str(" after destination identity committed")?;
+        }
         if !self.cleanup.is_empty() {
             write!(
                 f,
@@ -317,6 +418,28 @@ impl fmt::Display for HvfSnapshotV2PlatformRestoreError {
 impl std::error::Error for HvfSnapshotV2PlatformRestoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.failure.as_ref())
+    }
+}
+
+fn restore_failure_is_committed(
+    stage: HvfSnapshotV2PlatformRestoreStage,
+    failure: &HvfSnapshotV2PlatformRestoreFailure,
+) -> bool {
+    match (stage, failure) {
+        (
+            HvfSnapshotV2PlatformRestoreStage::VmGenId,
+            HvfSnapshotV2PlatformRestoreFailure::VmGenId(source),
+        ) => source.is_committed(),
+        (
+            HvfSnapshotV2PlatformRestoreStage::VmClock,
+            HvfSnapshotV2PlatformRestoreFailure::VmClock(_),
+        )
+        | (
+            HvfSnapshotV2PlatformRestoreStage::Lifecycle,
+            HvfSnapshotV2PlatformRestoreFailure::Lifecycle(_),
+        )
+        | (HvfSnapshotV2PlatformRestoreStage::Publication, _) => true,
+        _ => false,
     }
 }
 
@@ -349,15 +472,20 @@ impl std::error::Error for HvfSnapshotV2PlatformShutdownError {
 
 /// Focused unpublished destination whose first observable lifecycle is paused.
 ///
-/// This owner intentionally excludes devices, time correction, public actions,
-/// and path-based loading. The vCPU session is declared before the backend so
-/// owners are dropped before VM memory.
+/// This owner includes the destination-owned time/identity resources required
+/// before execution, but intentionally excludes general devices, public
+/// actions, and path-based loading. The vCPU session is declared before the
+/// backend so owners are dropped before VM memory.
 pub struct RestoredHvfSnapshotV2Platform {
     runner: HvfArm64BootVcpuSession<'static>,
     backend: HvfBackend,
     memory_binding: SnapshotV2MemoryBinding,
     machine: HvfSnapshotV2MachineState,
     compatibility: HvfSnapshotV1CompatibilityState,
+    rtc_device: Arm64BootRtcDevice,
+    vmgenid_device: Arm64BootVmGenIdDevice,
+    vmclock_device: Arm64BootVmClockDevice,
+    pvtime_layout: Arm64PvTimeLayout,
 }
 
 impl RestoredHvfSnapshotV2Platform {
@@ -398,23 +526,21 @@ impl RestoredHvfSnapshotV2Platform {
 
     /// Recapture the complete reconstructed platform while it remains paused.
     ///
-    /// This reuses the retained memory binding and inert machine metadata,
-    /// verifies the mapped FDT identity, and reobserves every owner-thread
-    /// vCPU component without opening a path.
-    pub fn capture_snapshot_v2_platform(
+    /// This creates a fresh binding only after PVTime publication, reuses inert
+    /// machine metadata, verifies the mapped FDT identity, and reobserves every
+    /// owner-thread vCPU component without opening a path.
+    pub fn capture_snapshot_v2_platform<W: Write + Seek>(
         &mut self,
+        memory_writer: &mut W,
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
-        let (stable, captures) = self
-            .runner
-            .capture_arm64_snapshot_v2_topology()
-            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
+        let (stable, captures, pvtime_capture) =
+            self.runner
+                .capture_arm64_snapshot_v2_topology()
+                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
         let memory = self
             .backend
             .mapped_guest_memory()
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::GuestMemory { source })?;
-        if !memory_matches_binding(memory, &self.memory_binding) {
-            return Err(HvfArm64BootSnapshotV2CaptureError::MemoryBindingMismatch);
-        }
         verify_capture_fdt_identity(memory, &self.machine)?;
         if captures.len() != stable.members().len() {
             return Err(HvfArm64BootSnapshotV2CaptureError::CompatibilityMismatch {
@@ -484,12 +610,28 @@ impl RestoredHvfSnapshotV2Platform {
                 stage: HvfArm64BootSnapshotV2CaptureStage::GlobalGic,
                 source,
             })?;
+        let rtc_layout = RtcMmioLayout::new(
+            self.rtc_device.region.range().start(),
+            self.rtc_device.region.id(),
+        );
+        let time = capture_hvf_snapshot_v2_time_state(
+            memory,
+            rtc_layout,
+            &self.vmgenid_device,
+            &self.vmclock_device,
+            Some(&self.pvtime_layout),
+            &pvtime_capture,
+        )
+        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
+        let memory_binding = write_snapshot_v2_memory_image(memory, memory_writer)
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
         HvfSnapshotV2PlatformState::try_new(
-            self.memory_binding.clone(),
+            memory_binding,
             self.machine.clone(),
             global,
             stable,
             vcpus,
+            time,
         )
         .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
             stage: HvfArm64BootSnapshotV2CaptureStage::Platform,
@@ -594,6 +736,31 @@ pub fn restore_hvf_snapshot_v2_platform(
             cleanup,
         ));
     }
+    let prepared_time_identity = match prepare_arm64_snapshot_time_identity(
+        &memory,
+        state.time().vmgenid(),
+        state.time().vmclock(),
+        state.time().vmclock_abi(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(source) => {
+            return Err(HvfSnapshotV2PlatformRestoreError::new(
+                HvfSnapshotV2PlatformRestoreStage::Preflight,
+                HvfSnapshotV2PlatformRestoreFailure::TimePreparation(source),
+                cleanup,
+            ));
+        }
+    };
+    let pvtime_layout = match verify_snapshot_v2_pvtime_memory(&memory, state.time()) {
+        Ok(layout) => layout,
+        Err(failure) => {
+            return Err(HvfSnapshotV2PlatformRestoreError::new(
+                HvfSnapshotV2PlatformRestoreStage::Preflight,
+                failure,
+                cleanup,
+            ));
+        }
+    };
     let destination_cache = match HvfBackend::arm64_vcpu_cache_manifest() {
         Ok(destination_cache) => destination_cache,
         Err(source) => {
@@ -612,8 +779,9 @@ pub fn restore_hvf_snapshot_v2_platform(
         ));
     }
 
-    let (memory_binding, machine, global, stable, vcpus) = state.into_parts();
+    let (memory_binding, machine, global, stable, vcpus, time) = state.into_parts();
     let (compatibility, global_gic) = global.into_parts();
+    let (mut vmgenid_device, mut vmclock_device) = prepared_time_identity.into_parts();
     let mut backend = HvfBackend::new();
     let mut topology: Option<HvfVcpuTopology<'static>> = None;
 
@@ -846,7 +1014,84 @@ pub fn restore_hvf_snapshot_v2_platform(
         }
     }
 
-    let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+    let mut dispatcher = MmioDispatcher::new();
+    let rtc_device = match register_arm64_boot_rtc_mmio(&mut dispatcher, time.rtc_layout()) {
+        Ok(device) => device,
+        Err(source) => {
+            return Err(failed_restore(
+                HvfSnapshotV2PlatformRestoreStage::Rtc,
+                HvfSnapshotV2PlatformRestoreFailure::Rtc(source),
+                &mut topology,
+                &mut backend,
+                cleanup,
+            ));
+        }
+    };
+
+    let pvtime_configs = match prepare_snapshot_v2_pvtime_configs(&backend, &time) {
+        Ok(configs) => configs,
+        Err(failure) => {
+            let (index, failure) = *failure;
+            return Err(failed_restore(
+                HvfSnapshotV2PlatformRestoreStage::PvTime { index },
+                failure,
+                &mut topology,
+                &mut backend,
+                cleanup,
+            ));
+        }
+    };
+    let Some(created_topology) = topology.as_ref() else {
+        return Err(failed_restore(
+            HvfSnapshotV2PlatformRestoreStage::Topology,
+            HvfSnapshotV2PlatformRestoreFailure::TopologyIdentity,
+            &mut topology,
+            &mut backend,
+            cleanup,
+        ));
+    };
+    for index in 0..pvtime_configs.len() {
+        if let Err(source) = created_topology.ensure_snapshot_restore_available(index) {
+            return Err(failed_restore(
+                HvfSnapshotV2PlatformRestoreStage::PvTime { index },
+                HvfSnapshotV2PlatformRestoreFailure::PvTime(source),
+                &mut topology,
+                &mut backend,
+                cleanup,
+            ));
+        }
+    }
+    for (index, config) in pvtime_configs.into_iter().enumerate() {
+        if let Err(source) = created_topology.configure_arm64_snapshot_v2_pvtime(index, config) {
+            return Err(failed_restore(
+                HvfSnapshotV2PlatformRestoreStage::PvTime { index },
+                HvfSnapshotV2PlatformRestoreFailure::PvTime(source),
+                &mut topology,
+                &mut backend,
+                cleanup,
+            ));
+        }
+    }
+
+    if let Err(failure) = restore_snapshot_v2_time_identity(
+        created_topology,
+        &mut backend,
+        expected_gic,
+        &time,
+        &mut vmgenid_device,
+        &mut vmclock_device,
+    ) {
+        let (stage, failure) = *failure;
+        return Err(failed_restore(
+            stage,
+            failure,
+            &mut topology,
+            &mut backend,
+            cleanup,
+        ));
+    }
+
+    let dispatcher = Arc::new(Mutex::new(dispatcher));
     let Some(raw_topology) = topology.take() else {
         return Err(failed_restore(
             HvfSnapshotV2PlatformRestoreStage::Topology,
@@ -880,6 +1125,149 @@ pub fn restore_hvf_snapshot_v2_platform(
         memory_binding,
         machine,
         compatibility,
+        rtc_device,
+        vmgenid_device,
+        vmclock_device,
+        pvtime_layout,
+    })
+}
+
+fn verify_snapshot_v2_pvtime_memory(
+    memory: &GuestMemory,
+    time: &HvfSnapshotV2TimeState,
+) -> Result<Arm64PvTimeLayout, HvfSnapshotV2PlatformRestoreFailure> {
+    let arena_size = time
+        .vmgenid()
+        .range()
+        .start()
+        .raw_value()
+        .checked_sub(aarch64::SYSTEM_MEM_START)
+        .ok_or(HvfSnapshotV2PlatformRestoreFailure::PvTimeMismatch)?;
+    let arena = GuestMemoryRange::new(GuestAddress::new(aarch64::SYSTEM_MEM_START), arena_size)
+        .map_err(|_| HvfSnapshotV2PlatformRestoreFailure::PvTimeMismatch)?;
+    let count = u8::try_from(time.pvtime_vcpus().len())
+        .map_err(|_| HvfSnapshotV2PlatformRestoreFailure::PvTimeMismatch)?;
+    let layout = Arm64PvTimeLayout::plan(count, arena)
+        .map_err(|_| HvfSnapshotV2PlatformRestoreFailure::PvTimeMismatch)?;
+    for (expected, captured) in layout.records().iter().zip(time.pvtime_vcpus()) {
+        if expected.start() != captured.record_ipa() {
+            return Err(HvfSnapshotV2PlatformRestoreFailure::PvTimeMismatch);
+        }
+        let mut bytes = [0; ARM64_PVTIME_STRUCTURE_SIZE];
+        memory
+            .read_slice(&mut bytes, expected.start())
+            .map_err(HvfSnapshotV2PlatformRestoreFailure::PvTimeRead)?;
+        let observed = Arm64PvTimeStAbi::from_bytes(bytes)
+            .map_err(|_| HvfSnapshotV2PlatformRestoreFailure::PvTimeMismatch)?;
+        if observed.stolen_time_ns() != captured.stolen_time_ns() {
+            return Err(HvfSnapshotV2PlatformRestoreFailure::PvTimeMismatch);
+        }
+    }
+    Ok(layout)
+}
+
+fn prepare_snapshot_v2_pvtime_configs(
+    backend: &HvfBackend,
+    time: &HvfSnapshotV2TimeState,
+) -> Result<Vec<HvfArm64PvTimeAccountingConfig>, Box<(usize, HvfSnapshotV2PlatformRestoreFailure)>>
+{
+    let memory = backend.mapped_guest_memory().map_err(|source| {
+        Box::new((0, HvfSnapshotV2PlatformRestoreFailure::PvTimeMemory(source)))
+    })?;
+    let mut configs = Vec::new();
+    configs
+        .try_reserve_exact(time.pvtime_vcpus().len())
+        .map_err(|_| Box::new((0, HvfSnapshotV2PlatformRestoreFailure::Allocation)))?;
+    for captured in time.pvtime_vcpus() {
+        let index = usize::try_from(captured.index())
+            .map_err(|_| Box::new((0, HvfSnapshotV2PlatformRestoreFailure::PvTimeAddress)))?;
+        let address = captured
+            .record_ipa()
+            .checked_add(ARM64_PVTIME_STOLEN_TIME_OFFSET as u64)
+            .ok_or_else(|| Box::new((index, HvfSnapshotV2PlatformRestoreFailure::PvTimeAddress)))?;
+        let publisher = memory.atomic_u64(address).map_err(|source| {
+            Box::new((
+                index,
+                HvfSnapshotV2PlatformRestoreFailure::PvTimePublisher(source),
+            ))
+        })?;
+        configs.push(HvfArm64PvTimeAccountingConfig::new(
+            captured.record_ipa().raw_value(),
+            publisher,
+            captured.stolen_time_ns(),
+            None,
+        ));
+    }
+    Ok(configs)
+}
+
+fn restore_snapshot_v2_time_identity(
+    topology: &HvfVcpuTopology<'_>,
+    backend: &mut HvfBackend,
+    gic: HvfGicMetadata,
+    time: &HvfSnapshotV2TimeState,
+    vmgenid: &mut Arm64BootVmGenIdDevice,
+    vmclock: &mut Arm64BootVmClockDevice,
+) -> Result<
+    (),
+    Box<(
+        HvfSnapshotV2PlatformRestoreStage,
+        HvfSnapshotV2PlatformRestoreFailure,
+    )>,
+> {
+    for index in 0..time.pvtime_vcpus().len() {
+        topology
+            .ensure_snapshot_restore_available(index)
+            .map_err(|source| {
+                Box::new((
+                    HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight,
+                    HvfSnapshotV2PlatformRestoreFailure::TimeIdentityRunner(source),
+                ))
+            })?;
+    }
+    let signaler = HvfGicSpiSignaler::from_metadata(&gic).map_err(|source| {
+        Box::new((
+            HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight,
+            HvfSnapshotV2PlatformRestoreFailure::TimeIdentitySignaler(source),
+        ))
+    })?;
+    for line in [
+        time.vmgenid().interrupt_line(),
+        time.vmclock().interrupt_line(),
+    ] {
+        signaler.validate_line(line).map_err(|source| {
+            Box::new((
+                HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight,
+                HvfSnapshotV2PlatformRestoreFailure::TimeIdentitySignaler(source),
+            ))
+        })?;
+    }
+    let memory = backend.mapped_guest_memory_mut().map_err(|source| {
+        Box::new((
+            HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight,
+            HvfSnapshotV2PlatformRestoreFailure::TimeIdentityMemory(source),
+        ))
+    })?;
+    replace_vmgenid_and_signal_with(memory, vmgenid, replace_arm64_boot_vmgenid, || {
+        signaler.set_level(time.vmgenid().interrupt_line(), true)
+    })
+    .map_err(|source| {
+        Box::new((
+            HvfSnapshotV2PlatformRestoreStage::VmGenId,
+            HvfSnapshotV2PlatformRestoreFailure::VmGenId(source),
+        ))
+    })?;
+    update_vmclock_and_signal_with(
+        memory,
+        vmclock,
+        |memory, device| device.abi.update_after_restore(memory, device.range),
+        || signaler.set_level(time.vmclock().interrupt_line(), true),
+    )
+    .map_err(|source| {
+        Box::new((
+            HvfSnapshotV2PlatformRestoreStage::VmClock,
+            HvfSnapshotV2PlatformRestoreFailure::VmClock(source),
+        ))
     })
 }
 
@@ -958,7 +1346,12 @@ fn restore_ownership_before_failure(stage: HvfSnapshotV2PlatformRestoreStage) ->
         | HvfSnapshotV2PlatformRestoreStage::CpuTemplate
         | HvfSnapshotV2PlatformRestoreStage::Compatibility { .. }
         | HvfSnapshotV2PlatformRestoreStage::GlobalGic
-        | HvfSnapshotV2PlatformRestoreStage::Vcpu { .. } => RestoreOwnership::Topology,
+        | HvfSnapshotV2PlatformRestoreStage::Vcpu { .. }
+        | HvfSnapshotV2PlatformRestoreStage::Rtc
+        | HvfSnapshotV2PlatformRestoreStage::PvTime { .. }
+        | HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight
+        | HvfSnapshotV2PlatformRestoreStage::VmGenId
+        | HvfSnapshotV2PlatformRestoreStage::VmClock => RestoreOwnership::Topology,
         HvfSnapshotV2PlatformRestoreStage::Publication => RestoreOwnership::Session,
     }
 }
@@ -1099,7 +1492,12 @@ fn run_restore_protocol<P: RestoreProtocol>(
             | HvfSnapshotV2PlatformRestoreStage::CpuTemplate
             | HvfSnapshotV2PlatformRestoreStage::Compatibility { .. }
             | HvfSnapshotV2PlatformRestoreStage::GlobalGic
-            | HvfSnapshotV2PlatformRestoreStage::Vcpu { .. } => {}
+            | HvfSnapshotV2PlatformRestoreStage::Vcpu { .. }
+            | HvfSnapshotV2PlatformRestoreStage::Rtc
+            | HvfSnapshotV2PlatformRestoreStage::PvTime { .. }
+            | HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight
+            | HvfSnapshotV2PlatformRestoreStage::VmGenId
+            | HvfSnapshotV2PlatformRestoreStage::VmClock => {}
         }
     }
     Ok(())
@@ -1121,7 +1519,12 @@ fn restore_protocol_stages(vcpu_count: usize) -> Vec<HvfSnapshotV2PlatformRestor
     );
     stages.push(HvfSnapshotV2PlatformRestoreStage::GlobalGic);
     stages.extend((0..vcpu_count).map(|index| HvfSnapshotV2PlatformRestoreStage::Vcpu { index }));
+    stages.push(HvfSnapshotV2PlatformRestoreStage::Rtc);
+    stages.extend((0..vcpu_count).map(|index| HvfSnapshotV2PlatformRestoreStage::PvTime { index }));
     stages.extend([
+        HvfSnapshotV2PlatformRestoreStage::TimeIdentityPreflight,
+        HvfSnapshotV2PlatformRestoreStage::VmGenId,
+        HvfSnapshotV2PlatformRestoreStage::VmClock,
         HvfSnapshotV2PlatformRestoreStage::Lifecycle,
         HvfSnapshotV2PlatformRestoreStage::Publication,
     ]);
@@ -1279,6 +1682,50 @@ mod tests {
                 .into_iter()
                 .map(ProtocolEvent::Execute)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn restore_error_marks_the_first_guest_visible_identity_commit_boundary() {
+        let before_identity = HvfSnapshotV2PlatformRestoreError::new(
+            HvfSnapshotV2PlatformRestoreStage::Preflight,
+            HvfSnapshotV2PlatformRestoreFailure::MemoryTopology,
+            Vec::new(),
+        );
+        assert!(!before_identity.is_committed());
+
+        let replacement_failure = HvfSnapshotV2PlatformRestoreError::new(
+            HvfSnapshotV2PlatformRestoreStage::VmGenId,
+            HvfSnapshotV2PlatformRestoreFailure::VmGenId(
+                HvfArm64BootVmGenIdRestoreError::Replacement {
+                    source: bangbang_runtime::startup::Arm64BootVmGenIdReplacementError::Random,
+                },
+            ),
+            Vec::new(),
+        );
+        assert!(!replacement_failure.is_committed());
+
+        let vmgenid_signal_failure = HvfSnapshotV2PlatformRestoreError::new(
+            HvfSnapshotV2PlatformRestoreStage::VmGenId,
+            HvfSnapshotV2PlatformRestoreFailure::VmGenId(HvfArm64BootVmGenIdRestoreError::Signal {
+                source: HvfGicSpiSignalError::InvalidState("injected"),
+            }),
+            Vec::new(),
+        );
+        assert!(vmgenid_signal_failure.is_committed());
+
+        let vmclock_failure = HvfSnapshotV2PlatformRestoreError::new(
+            HvfSnapshotV2PlatformRestoreStage::VmClock,
+            HvfSnapshotV2PlatformRestoreFailure::VmClock(HvfArm64BootVmClockRestoreError::Update {
+                source: bangbang_runtime::vmclock::VmClockRestoreUpdateError::InvalidRange,
+            }),
+            Vec::new(),
+        );
+        assert!(vmclock_failure.is_committed());
+        assert!(
+            vmclock_failure
+                .to_string()
+                .contains("after destination identity committed")
         );
     }
 

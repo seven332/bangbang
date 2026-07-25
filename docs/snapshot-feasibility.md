@@ -8,13 +8,14 @@ snapshot and migration compatibility remains out of scope.
 The runtime library also has an isolated bangbang-native v2 state and lazy
 guest-memory foundation. The immutable `2.0.0` profile contains no semantic
 component, `2.1.x` adds one state-bound demand-paged File/COW memory image, and
-the current `2.2.0` profile adds a permanent typed multi-vCPU HVF platform
-graph. That graph is complete for the machine, compatibility/global GIC,
-stable topology, and reviewed vCPU state it represents, but it is not a
-loadable VM: it contains no general device aggregate and creates no HVF,
-owner-thread, clock/identity, or public lifecycle resource. It is not emitted,
-described, or loaded by any public process path. The public lifecycle and CLI
-remain native-v1 until later Wave 6 work explicitly changes them.
+`2.2.x` adds a permanent typed multi-vCPU HVF platform graph. The current
+`2.3.0` writer appends portable PL031, PVTime, VMGenID, and VMClock state and
+clone policies. The decoded graph itself remains data: it contains no general
+device aggregate and creates no HVF, owner-thread, or public lifecycle
+resource. A focused unpublished consumer can reconstruct its complete
+multi-vCPU platform and time/identity ownership, but no public process path
+emits, describes, or loads v2. The public lifecycle and CLI remain native-v1
+until later Wave 6 work explicitly changes them.
 Separately, `LazyGuestMemory` is the backend-neutral private-anonymous
 coordinator for the external-paging roadmap; it is not the v2 File/COW loader
 and now backs the narrow public native-v1 `Uffd` restore path on macOS Apple
@@ -244,13 +245,14 @@ The immutable production `2.0.0` catalogs are empty: its canonical fixture is
 the 64-byte header plus its eight-byte CRC, nonsemantic extensions can be
 structurally represented, and every required feature or semantic component
 rejects. Minor 1 adds semantic memory kind `1`, whose typed profile requires
-its sole instance to be `0`. The current writer emits `2.2.0`; minor 2 adds
-semantic machine kind `2`, global kind `3`, topology kind `4`, and per-vCPU
-kind `5`. The required-feature catalog remains empty because those semantic
-component kinds are the mandatory compatibility identities. Decoded `2.1.x`
-memory bindings retain their exact admitted version so their unchanged paired
-image headers still validate; newly written bindings use `2.2.0`. No other
-identifier or future minor is reserved.
+its sole instance to be `0`. Minor 2 adds semantic machine kind `2`, global
+kind `3`, topology kind `4`, and per-vCPU kind `5`. The current writer emits
+`2.3.0`; minor 3 adds singleton time/clone-identity kind `6`. The
+required-feature catalog remains empty because those semantic component kinds
+are the mandatory compatibility identities. Decoded `2.1.x`, `2.2.x`, and
+`2.3.x` memory bindings retain their exact admitted version so their unchanged
+paired image headers still validate; newly written bindings use `2.3.0`. No
+other identifier or future minor is reserved.
 
 Decoding first checks the fixed header, version, count caps, checked length and
 offset arithmetic, exact length, whole-state CRC, complete feature inventory,
@@ -280,7 +282,7 @@ binding header followed by one 24-byte entry per ordered guest extent:
 | Offset | Width | Field | Native-v2 memory rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | bytes `BANGM2A\0` |
-| 8..14 | 6 | semantic version | admitted `2.1.x` or `2.2.x`; current writer emits `2.2.0` |
+| 8..14 | 6 | semantic version | admitted `2.1.x`, `2.2.x`, or `2.3.x`; current writer emits `2.3.0` |
 | 14 | 2 | header bytes | exact `64` |
 | 16 | 4 | flags | must be zero |
 | 20 | 4 | guest granule | exact `4096` bytes |
@@ -340,19 +342,21 @@ the retained inode must remain immutable for the mapping lifetime; macOS offers
 no seal for an arbitrary external regular file, so concurrent external mutation
 or truncation violates the loader contract. Public native-v2 create/load,
 transactional pair publication, general device state, production-session
-construction, time/identity correction, Diff/merge, UFFD-equivalent runtime
-integration, and clone/portability policy remain follow-on work. The focused
-unpublished HVF reconstruction boundary below consumes an already-authorized
-`GuestMemory`; it does not open this memory artifact itself. The public
-feasibility decision is recorded separately in the checked
+construction, Diff/merge, UFFD-equivalent runtime integration, and broader
+cross-host portability policy remain follow-on work. The focused unpublished
+HVF reconstruction boundary below consumes an already-authorized
+`GuestMemory`; it does not open this memory artifact itself. Its implemented
+clone policy covers fresh identity and portable time semantics on the validated
+destination profile, not public artifact publication or arbitrary-host
+migration. The public feasibility decision is recorded separately in the checked
 [snapshot paging contract](../compat/firecracker/v1.16.0/snapshot-paging-contract.md);
 File/COW remains a distinct backend.
 
 ### Native V2 HVF Platform State Profile
 
-Minor 2 defines one exact, editor-friendly platform graph. Every directory
-entry is semantic, singleton kinds appear exactly once, and per-vCPU instances
-are contiguous:
+Minor 2 defines the base editor-friendly platform graph, and minor 3 appends
+its portable time/clone-identity component. Every directory entry is semantic,
+singleton kinds appear exactly once, and per-vCPU instances are contiguous:
 
 | Key | Payload | Cardinality |
 | --- | --- | --- |
@@ -361,8 +365,9 @@ are contiguous:
 | `(3, 0)` | `BANGGL2\0` common compatibility and one opaque VM-global GIC value | exactly one |
 | `(4, 0)` | `BANGTP2\0` stable topology and PSCI lifecycle state | exactly one |
 | `(5, i)` | `BANGVC2\0` complete state for vCPU index/MPIDR `i` | `i = 0..vcpu_count-1` |
+| `(6, 0)` | `BANGTM2\0` portable PL031/PVTime/VMGenID/VMClock state and policies | exactly one, after all vCPUs |
 
-The borrowed directory scan requires 5–36 entries in that exact key order
+The current borrowed directory scan requires 6–37 entries in that exact key order
 before any payload-dependent allocation. Each new payload then requires profile
 1, its exact fixed header size, zero flags/reserved fields, exact checked
 lengths, and complete consumption.
@@ -391,6 +396,17 @@ group, normalized timer state, pending IRQ/FIQ, vCPU-affine GIC ICC registers,
 and a reviewed optional registry. Reusing that mandatory field group changes no
 native-v1 outer byte or policy.
 
+Kind 6 has a fixed 240-byte `BANGTM2\0` header followed by one fixed 24-byte
+record per topology-ordered vCPU. Its four closed policies require a fresh
+destination-SystemTime PL031 reset, preserved cumulative PVTime excluding
+snapshot downtime, regenerated-and-notified VMGenID, and
+incremented-and-notified VMClock. The header retains PL031 placement,
+VMGenID/VMClock guest ranges, FDT ranges and distinct SPI lines, plus the exact
+112-byte VMClock ABI. Each vCPU record carries its canonical index, standard
+aligned record IPA, and cumulative stolen nanoseconds. It deliberately
+serializes no source VMGenID bytes, PL031 mutable register state, host pointer,
+`Instant`, or absolute wall-clock anchor.
+
 The optional registry has a 64-byte `BANGOP2\0` header followed by at most 118
 records and 96 KiB. Each record has a `u16` tag, explicit-or-destination-default
 disposition, zero reserved bytes, exact `u32` architectural width, and payload
@@ -408,12 +424,15 @@ architectural 256 bytes.
 After local decoding, the owned graph validates deterministic machine-memory
 extents and FDT placement; topology/vCPU count, order, MPIDRs, primary identity,
 timer PPI, and redistributor capacity; common DFR0/SME evidence; and equality of
-mandatory versus reviewed SIMD/FP state. Encoding reruns the same graph
-validation. Native paths are capped at 4096 bytes, boot arguments at 2047
-bytes, and the maxima for 32 vCPUs, CPU evidence, optional registries, memory
-binding, and GIC remain below the independently enforced 16 MiB outer cap.
-Debug, display, and error values redact paths, arguments, register/CPU values,
-MPIDRs, checksums used as identities, and GIC bytes.
+mandatory versus reviewed SIMD/FP state. It also checks RTC equality with the
+global compatibility facts, canonical VMGenID/VMClock placement and memory
+backing, distinct in-range SPI lines, exact PVTime count/layout/backing, and
+VMClock ABI validity. Encoding reruns the same graph validation. Native paths
+are capped at 4096 bytes, boot arguments at 2047 bytes, and the maxima for 32
+vCPUs, CPU evidence, optional registries, memory binding, GIC, and time state
+remain below the independently enforced 16 MiB outer cap. Debug, display, and
+error values redact paths, arguments, register/CPU values, MPIDRs, checksums
+used as identities, GIC bytes, and clone identity.
 
 Decode remains data only: it opens no artifact, creates no HVF VM or vCPU,
 starts no owner thread, maps no memory, and restores no device. #1569 adds a
@@ -421,24 +440,35 @@ separate unpublished consumer for this already-decoded value. Source capture
 requires a completed topology pause, revalidates an exact suspended token
 without consuming it, captures the opaque GIC only on vCPU 0 and ICC/timer/
 pending/mandatory/reviewed-optional state on every owner, and recaptures the
-lifecycle graph before publishing the aggregate. It accepts only an existing
-memory binding and checked inert boot metadata; failure leaves the paused
-source reusable.
+lifecycle graph around the topology-ordered PVTime publication. It validates
+guest VMClock/PVTime bytes and VMGenID agreement with the retained owner,
+captures only portable time/identity semantics, validates checked inert boot
+metadata, and streams a fresh state-bound memory image after those facts are
+accepted. Failure leaves the paused source reusable.
 
 Destination reconstruction accepts only the owned validated graph and an
 already-authorized `GuestMemory`. Exact ranges, FDT checksum, and destination
-cache facts are checked before VM creation. The unpublished guard then creates
-VM, memory/dirty tracking, exact GIC, the complete never-run topology, retained
-CPU-template targets, common identity, global GIC, canonical per-vCPU state,
-and finally fresh-token lifecycle state. No raw topology, run control, or
-resume capability escapes before the resulting focused owner is published
-`Paused`. Every partial failure attempts topology then backend cleanup in
-reverse ownership order and retains the primary plus all cleanup failures.
+cache facts, time metadata, guest ABI bytes, PVTime records, identity
+destinations, and notification lines are checked before VM creation. The
+unpublished guard then creates VM, memory/dirty tracking, exact GIC, the
+complete never-run topology, retained CPU-template targets, common identity,
+global GIC, and canonical per-vCPU state. It next creates a fresh PL031,
+configures destination PVTime from the saved cumulative values, preflights all
+identity runners/signallers/guest writes, replaces and signals a fresh VMGenID,
+applies and signals the saved-counter VMClock transition, imports fresh
+lifecycle tokens, and only then publishes the focused owner `Paused`.
 
-The focused owner deliberately reconstructs no device, limiter, external
-endpoint, PL031 time, VMGenID, VMClock, or PVTime correction state. Public
-native-v2 artifact publication, production-session composition, and actions
-remain #1530 work; time/PVTime/identity remains #1529, and optional device
+No raw topology, run control, or resume capability escapes earlier. Every
+partial failure attempts topology then backend cleanup in reverse ownership
+order and retains the primary plus all cleanup failures. A failure that commits
+the first guest-visible VMGenID write, or occurs at any later identity,
+lifecycle, or publication stage, is explicitly terminal even when cleanup
+succeeds. Repeat loads never mutate the decoded source graph, and a paused
+destination can recapture to a fresh memory/state identity for another restore.
+
+The focused owner deliberately reconstructs no general virtio device, limiter,
+or external endpoint. Public native-v2 artifact publication,
+production-session composition, and actions remain #1530 work; optional device
 serialization/restoration remains in its device slices.
 
 ### Stable Paused vCPU Topology State
@@ -473,11 +503,12 @@ down the consumed unpublished topology. A successful immediate recapture is
 equivalent to the source stable graph but contains none of its process-local
 tokens.
 
-Native-v1 bytes and its one-vCPU profile remain unchanged. Native-v2 `2.2.0`
-now encodes this value as kind 4 and #1569 composes it with the complete
-reviewed multi-vCPU register aggregate for unpublished paused reconstruction.
-Public create/load reconstruction and complete production-resource ownership
-remain outside this foundation.
+Native-v1 bytes and its one-vCPU profile remain unchanged. Native-v2 `2.2.x`
+introduced this value as kind 4 and #1569 composes it with the complete
+reviewed multi-vCPU register aggregate for unpublished paused reconstruction;
+the current `2.3.0` graph retains that exact topology payload and appends the
+time/clone-identity component. Public create/load reconstruction and complete
+production-resource ownership remain outside this foundation.
 
 ## Native V1 Guest-Memory Image and Binding
 
@@ -1765,6 +1796,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | --- | --- | --- |
 | Stable paused arm64 topology capture/import (wire-format-neutral foundation implemented) | #1567 adds a checked `1..=32` topology graph with canonical index/MPIDR identity, virtual-timer PPI, offline/runnable dispositions, and redacted CPU_SUSPEND32/64 X1-X3/post-trap-PC continuations. Capture requires a completed topology pause and cross-validates coordinator, PSCI, session, runner, HVC, and owner registers before publication. Import prevalidates before mutation, allocates fresh destination tokens, constructs the coordinator born Paused, installs suspended members in order, and dispatches nothing until explicit resume generation 1. Failure aborts installed calls in reverse order, clears dispatch state, retains cleanup evidence, and consumes the unpublished topology. Native-v1/native-v2 bytes and public snapshot reconstruction remain unchanged. | Empty/maximum/oversized/canonicality/PPI/primary-offline/PC-alignment boundaries; both suspend conventions and exact register checks; power/runner token inequality; paused admission and no pre-resume dispatch; offline/runnable/suspended import and equivalent recapture; reverse rollback, shutdown, redaction, and existing pause/resume/timer-wake lifecycle coverage. |
 | Unpublished native-v2 multi-vCPU platform capture/reconstruction (implemented) | #1569 composes the `2.2.0` graph from one completed paused source, existing memory binding, inert boot metadata, retained machine/CPU facts, singular global GIC, and canonical per-vCPU owner captures. Restore preflights supplied memory/FDT/cache before HVF, creates the complete never-run destination, replays retained CPU targets, restores global then per-vCPU state, imports fresh lifecycle tokens, and publishes only one focused owner born Paused. It opens no recorded path and intentionally excludes public actions, devices, and time/identity correction. | Every restore-stage failure and reverse cleanup sequence; CPU-receipt replay/drift/read/apply failures; source reuse and redaction; strict Clippy/unit gates; signed three-vCPU runnable/suspended/offline capture, encode/decode, fresh restore, no-early-progress recapture, timer-PPI/PSCI completion, offline CPU_ON continuation, final recapture, and clean shutdown. |
+| Native-v2 time and clone identity (implemented) | #1529 advances the writer to `2.3.0` and appends singleton kind 6 after every vCPU. It carries only portable PL031/PVTime/VMGenID/VMClock state and four closed policies: destination-SystemTime RTC reset, cumulative stolen time without downtime, fresh notified VMGenID, and saved-counter notified VMClock. Source capture validates guest and retained-owner agreement before creating a fresh memory binding. Restore preflights all guest destinations, installs PL031/PVTime, signals VMGenID then VMClock, imports lifecycle state, and publishes Paused; any failure after the first committed identity write is terminal. Public actions and general devices remain excluded. | Fixed schema fixtures and hostile time-policy/count/layout/ABI/cross-component mutations; source capture ordering and reusable failure; all RTC/PVTime/identity restore stages and commit boundary; exact aarch64 `clock_realtime` rejection tied to pinned Firecracker sources; signed three-vCPU repeat load, distinct clone IDs, saved-counter transitions, guest-observed notification order and time values, recapture-to-restore, no early progress, continuation, and cleanup. |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence and complete publication transaction (implemented for native-v1 baseline) | #1162 introduced acknowledged RAII quiescence for block and entropy; #1389 added the topology-wide SMP pause barrier and PMEM guard; #1390 includes network, acquires all four failure-atomically, drains tokens only after complete acknowledgement, preserves in-flight/deferred/deadline work, and holds the worker lease through commit plus the post-publication hook. Process API/MMDS/controller and periodic work are serialized by the synchronous owner borrow. | Deterministic scheduler, supervisor, cancellation/seal, publication-visibility, process/API serialization, and fresh-retry tests plus combined signed SMP pause and one-vCPU baseline publication evidence. |
 | Complete dirty epochs and public tracking (implemented) | #1395 supplies fail-closed HVF protection/fault retry. #1396 adds the shared `GuestMemory` bitmap, exact initial/reprotected DFSC `0x07`/`0x0f` ownership checks, every current bounded host/device writer, conservative discard, protected wholly-dirty dynamic RAM, destination load ordering, and post-visible-Full reset/rollback/poison semantics. Machine and load tracking flags are enabled without adding Diff artifacts. | Exact/repeated/concurrent host and CPU union, discard, dynamic mapping, load override/VMGenID, publication/cancellation/reset failures, and public transaction tests plus signed normal boot/load, two-vCPU current-device, and two-epoch exact-set evidence. |

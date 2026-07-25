@@ -207,7 +207,7 @@ fn binding_mutations_reject_header_integrity_topology_and_trailing_bytes() {
     ));
 
     let mut invalid_version = encoded.clone();
-    replace_u16(&mut invalid_version, VERSION_MINOR_OFFSET, 3);
+    replace_u16(&mut invalid_version, VERSION_MINOR_OFFSET, 4);
     replace_binding_checksum(&mut invalid_version);
     assert!(matches!(
         decode_binding(&invalid_version),

@@ -7,8 +7,8 @@ replacing their row-specific semantic contracts. The selector contains exactly
 one time/identity aggregate.
 
 Exactly 77 rows are `implemented-and-verified`. Eight rows remain
-`audit-required` because complete snapshot serialization, restore,
-clone/migration, portability, and restored-guest outcomes belong to
+`audit-required` because their remaining optional-device or public-production
+snapshot composition, clone/migration portability, and terminal certification belong to
 [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). The
 repository-wide observability, tools, and specification work belongs to
 [Wave 7 #1491](https://github.com/seven332/bangbang/issues/1491), but zero rows
@@ -82,18 +82,22 @@ proven-platform-impossible.
   `signed_executable_streams_default_serial_stdio_across_lifecycle_boundaries`
   and `signed_executable_isolates_concurrent_default_serial_stdio_streams`;
   also `AGG-SIGNED`.
-- `T-IMPL` — `crates/runtime/src/{pvtime,rtc,snapshot_device,vmclock}.rs`
-  and `crates/hvf/src/{ffi,pvtime,runner,psci,startup,snapshot_restore}.rs`.
+- `T-IMPL` —
+  `crates/runtime/src/{pvtime,rtc,snapshot_device,snapshot_format_v2,startup,vmclock}.rs`
+  and
+  `crates/hvf/src/{ffi,pvtime,runner,psci,snapshot_restore,snapshot_v2,snapshot_v2_platform,startup}.rs`.
 - `T-FOCUSED` —
   `vmgenid_restore_replaces_before_signaling`,
   `vmclock_restore_updates_before_signaling`,
-  `time_identity_vmclock_failure_is_terminal_after_vmgenid_commit`, and
+  `time_identity_vmclock_failure_is_terminal_after_vmgenid_commit`,
+  native-v2 time codec/cross-graph/restore-stage tests, and
   `AGG-FOCUSED`.
 - `T-SIGNED` —
   `signed_executable_exposes_rtc_to_direct_rootfs_guest`,
   `signed_executable_exposes_vmclock_to_direct_rootfs_guest`,
   `signed_executable_creates_and_restores_native_v1_snapshot_across_processes`,
   `guest_boot::certifies_linux_pvtime_contention_idle_and_paused_accounting`,
+  `hvf_lifecycle::native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progress`,
   and `AGG-SIGNED`.
 - `W6-BALLOON` — exact owner
   [#1490](https://github.com/seven332/bangbang/issues/1490): encode and restore
@@ -113,9 +117,10 @@ proven-platform-impossible.
   UART/RX/pending-intent state, reconstruct fresh authorized endpoints, define
   terminal/FIFO portability, and prove signed restored-guest behavior.
 - `W6-TIME` — exact owner
-  [#1490](https://github.com/seven332/bangbang/issues/1490): encode and restore
-  PVTime state, define repeated-clone and cross-host time-source portability,
-  and prove signed restored-guest behavior.
+  [#1490](https://github.com/seven332/bangbang/issues/1490): connect #1529's
+  implemented portable time/identity graph and repeat-clone restore to the
+  public production lifecycle, then certify broader cross-host time-source
+  migration/clone portability.
 - `W7` — exact out-of-selector owner
   [#1491](https://github.com/seven332/bangbang/issues/1491): repository-wide
   observability, public tools, and applicable specification outcomes only.
@@ -225,4 +230,7 @@ helper, socket, or session root after independent EOF and termination.
 
 Capture-ready values remain private validated live state. This contract does
 not claim Firecracker artifact compatibility, restored optional devices,
-PVTime clone portability, or Wave 7 aggregate observability.
+public native-v2 production composition, arbitrary cross-host time-source
+portability, or Wave 7 aggregate observability. #1529 separately proves the
+focused native-v2 PVTime/identity clone boundary without changing this
+aggregate row's disposition.

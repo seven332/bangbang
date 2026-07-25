@@ -844,6 +844,128 @@ pub struct Arm64BootVmClockDevice {
     pub fdt_device: Arm64FdtVmClockDevice,
 }
 
+/// Destination-owned VMGenID and VMClock devices prepared from portable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedArm64SnapshotTimeIdentity {
+    vmgenid: Arm64BootVmGenIdDevice,
+    vmclock: Arm64BootVmClockDevice,
+}
+
+impl PreparedArm64SnapshotTimeIdentity {
+    pub const fn vmgenid(&self) -> &Arm64BootVmGenIdDevice {
+        &self.vmgenid
+    }
+
+    pub const fn vmclock(&self) -> &Arm64BootVmClockDevice {
+        &self.vmclock
+    }
+
+    pub const fn into_parts(self) -> (Arm64BootVmGenIdDevice, Arm64BootVmClockDevice) {
+        (self.vmgenid, self.vmclock)
+    }
+}
+
+/// Failure while preparing portable time identity against restored guest RAM.
+#[derive(Debug)]
+pub enum PrepareArm64SnapshotTimeIdentityError {
+    InvalidVmGenIdMetadata,
+    InvalidVmClockMetadata,
+    ConflictingMetadata,
+    ReadVmGenId { source: GuestMemoryAccessError },
+    ReadVmClock { source: GuestMemoryAccessError },
+    InvalidVmClockAbi,
+    VmClockStateMismatch,
+}
+
+impl fmt::Display for PrepareArm64SnapshotTimeIdentityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidVmGenIdMetadata => "portable VMGenID metadata is invalid",
+            Self::InvalidVmClockMetadata => "portable VMClock metadata is invalid",
+            Self::ConflictingMetadata => "portable time identity metadata conflicts",
+            Self::ReadVmGenId { .. } => "restored VMGenID guest bytes could not be read",
+            Self::ReadVmClock { .. } => "restored VMClock guest bytes could not be read",
+            Self::InvalidVmClockAbi => "restored VMClock guest ABI is invalid",
+            Self::VmClockStateMismatch => "restored VMClock guest ABI differs from portable state",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for PrepareArm64SnapshotTimeIdentityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadVmGenId { source } | Self::ReadVmClock { source } => Some(source),
+            Self::InvalidVmGenIdMetadata
+            | Self::InvalidVmClockMetadata
+            | Self::ConflictingMetadata
+            | Self::InvalidVmClockAbi
+            | Self::VmClockStateMismatch => None,
+        }
+    }
+}
+
+/// Prepare destination-owned identity devices without committing a new identity.
+///
+/// The old VMGenID is retained only in this ephemeral owner so replacement can
+/// guarantee a distinct value. The captured VMClock ABI must exactly match
+/// restored guest memory before either device may be mutated.
+pub fn prepare_arm64_snapshot_time_identity(
+    memory: &GuestMemory,
+    vmgenid: SnapshotV1PlatformDeviceMetadata,
+    vmclock: SnapshotV1PlatformDeviceMetadata,
+    captured_vmclock: VmClockAbi,
+) -> Result<PreparedArm64SnapshotTimeIdentity, PrepareArm64SnapshotTimeIdentityError> {
+    validate_platform_metadata(vmgenid, ARM64_FDT_VMGENID_SIZE, memory)
+        .map_err(|_| PrepareArm64SnapshotTimeIdentityError::InvalidVmGenIdMetadata)?;
+    validate_platform_metadata(vmclock, ARM64_FDT_VMCLOCK_SIZE, memory)
+        .map_err(|_| PrepareArm64SnapshotTimeIdentityError::InvalidVmClockMetadata)?;
+    if vmgenid.range().start() != ARM64_BOOT_VMGENID_ADDRESS {
+        return Err(PrepareArm64SnapshotTimeIdentityError::InvalidVmGenIdMetadata);
+    }
+    if vmclock.range().start() != ARM64_BOOT_VMCLOCK_ADDRESS {
+        return Err(PrepareArm64SnapshotTimeIdentityError::InvalidVmClockMetadata);
+    }
+    if vmgenid.range().overlaps(vmclock.range())
+        || vmgenid.interrupt_line() == vmclock.interrupt_line()
+    {
+        return Err(PrepareArm64SnapshotTimeIdentityError::ConflictingMetadata);
+    }
+
+    let mut generation_id = [0; ARM64_BOOT_VMGENID_SIZE];
+    memory
+        .read_slice(&mut generation_id, vmgenid.range().start())
+        .map_err(|source| PrepareArm64SnapshotTimeIdentityError::ReadVmGenId { source })?;
+    let mut vmclock_bytes = [0; crate::vmclock::VMCLOCK_ABI_SIZE];
+    memory
+        .read_slice(&mut vmclock_bytes, vmclock.range().start())
+        .map_err(|source| PrepareArm64SnapshotTimeIdentityError::ReadVmClock { source })?;
+    let observed_vmclock = VmClockAbi::from_bytes(vmclock_bytes)
+        .map_err(|_| PrepareArm64SnapshotTimeIdentityError::InvalidVmClockAbi)?;
+    if observed_vmclock != captured_vmclock {
+        return Err(PrepareArm64SnapshotTimeIdentityError::VmClockStateMismatch);
+    }
+
+    Ok(PreparedArm64SnapshotTimeIdentity {
+        vmgenid: Arm64BootVmGenIdDevice {
+            range: vmgenid.range(),
+            generation_id,
+            fdt_device: Arm64FdtVmGenIdDevice {
+                region: vmgenid.fdt_region(),
+                interrupt_line: vmgenid.interrupt_line(),
+            },
+        },
+        vmclock: Arm64BootVmClockDevice {
+            range: vmclock.range(),
+            abi: captured_vmclock,
+            fdt_device: Arm64FdtVmClockDevice {
+                region: vmclock.fdt_region(),
+                interrupt_line: vmclock.interrupt_line(),
+            },
+        },
+    })
+}
+
 pub struct PreparedSnapshotV1DeviceProfile {
     drive_config: DriveConfig,
     block_handler: VirtioBlockMmioHandler,
@@ -6094,6 +6216,17 @@ fn arm64_boot_memory_hotplug_device_metadata(
     )
 }
 
+/// Install a fresh destination-time PL031 device at a checked MMIO layout.
+///
+/// Mutable source PL031 registers are deliberately not accepted. The returned
+/// device and handler begin at reset state and use destination `SystemTime`.
+pub fn register_arm64_boot_rtc_mmio(
+    dispatcher: &mut MmioDispatcher,
+    layout: RtcMmioLayout,
+) -> Result<Arm64BootRtcDevice, Arm64BootResourceError> {
+    register_rtc_mmio(dispatcher, Arm64BootRtcDeviceConfig::new(layout))
+}
+
 fn register_rtc_mmio(
     dispatcher: &mut MmioDispatcher,
     config: Arm64BootRtcDeviceConfig,
@@ -6204,12 +6337,13 @@ mod tests {
         Arm64BootResources, Arm64BootRtcDeviceConfig, Arm64BootRtcMmioRegistrationError,
         Arm64BootSerialCaptureError, Arm64BootSerialDeviceConfig,
         Arm64BootSerialMmioRegistrationError, Arm64BootSnapshotV1DeviceCaptureError,
-        Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError, MIB, VmStartupResources,
+        Arm64BootVmGenIdDevice, Arm64BootVmGenIdReplacementError, MIB,
+        PrepareArm64SnapshotTimeIdentityError, VmStartupResources,
         arm64_boot_network_device_metadata, balloon_hinting_status_for_device,
         balloon_stats_for_device, block_device_metadata, capture_entropy_state_for_device_at,
         capture_serial_state_for_device, ensure_nonzero_vmgenid_generation_id,
-        initial_vmclock_range, initial_vmgenid_range, prepare_pci_validation,
-        replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
+        initial_vmclock_range, initial_vmgenid_range, prepare_arm64_snapshot_time_identity,
+        prepare_pci_validation, replace_arm64_boot_vmgenid_with, start_balloon_hinting_for_device,
         stop_balloon_hinting_for_device, update_balloon_config_for_device,
         update_balloon_statistics_for_device, update_block_device_for_devices_with_opened,
     };
@@ -9724,6 +9858,118 @@ mod tests {
                 interrupt_line: line(127),
             },
         }
+    }
+
+    fn snapshot_time_identity_metadata(
+        range: GuestMemoryRange,
+        interrupt_line: GuestInterruptLine,
+    ) -> crate::snapshot_device::SnapshotV1PlatformDeviceMetadata {
+        crate::snapshot_device::SnapshotV1PlatformDeviceMetadata::new(
+            range,
+            Arm64FdtRegion {
+                base: range.start().raw_value(),
+                size: range.size(),
+            },
+            interrupt_line,
+        )
+    }
+
+    #[test]
+    fn snapshot_time_identity_preflight_retains_only_destination_owned_devices() {
+        let generation_id = [0x31; ARM64_BOOT_VMGENID_SIZE];
+        let vmclock_abi = VmClockAbi::initial();
+        let vmgenid_range = initial_vmgenid_range().expect("VMGenID range should validate");
+        let vmclock_range = initial_vmclock_range().expect("VMClock range should validate");
+        let vmgenid = snapshot_time_identity_metadata(vmgenid_range, line(127));
+        let vmclock = snapshot_time_identity_metadata(vmclock_range, line(126));
+        let mut memory = vmgenid_replacement_test_memory();
+        memory
+            .write_slice(&generation_id, vmgenid_range.start())
+            .expect("source VMGenID should write");
+        memory
+            .write_slice(&vmclock_abi.to_bytes(), vmclock_range.start())
+            .expect("source VMClock should write");
+
+        let prepared = prepare_arm64_snapshot_time_identity(&memory, vmgenid, vmclock, vmclock_abi)
+            .expect("portable identity should preflight");
+
+        assert_eq!(prepared.vmgenid().range, vmgenid_range);
+        assert_eq!(prepared.vmgenid().generation_id, generation_id);
+        assert_eq!(prepared.vmgenid().fdt_device.region, vmgenid.fdt_region());
+        assert_eq!(
+            prepared.vmgenid().fdt_device.interrupt_line,
+            vmgenid.interrupt_line()
+        );
+        assert_eq!(prepared.vmclock().range, vmclock_range);
+        assert_eq!(prepared.vmclock().abi, vmclock_abi);
+        assert_eq!(prepared.vmclock().fdt_device.region, vmclock.fdt_region());
+        assert_eq!(
+            prepared.vmclock().fdt_device.interrupt_line,
+            vmclock.interrupt_line()
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, vmgenid_range.start(), ARM64_BOOT_VMGENID_SIZE),
+            generation_id
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, vmclock_range.start(), VMCLOCK_ABI_SIZE),
+            vmclock_abi.to_bytes()
+        );
+    }
+
+    #[test]
+    fn snapshot_time_identity_preflight_rejects_memory_disagreement_before_mutation() {
+        let generation_id = [0x42; ARM64_BOOT_VMGENID_SIZE];
+        let vmclock_abi = VmClockAbi::initial();
+        let mut different_vmclock_bytes = vmclock_abi.to_bytes();
+        different_vmclock_bytes[104..112].copy_from_slice(&1_u64.to_le_bytes());
+        let different_vmclock =
+            VmClockAbi::from_bytes(different_vmclock_bytes).expect("different ABI should validate");
+        let vmgenid_range = initial_vmgenid_range().expect("VMGenID range should validate");
+        let vmclock_range = initial_vmclock_range().expect("VMClock range should validate");
+        let vmgenid = snapshot_time_identity_metadata(vmgenid_range, line(127));
+        let vmclock = snapshot_time_identity_metadata(vmclock_range, line(126));
+        let mut memory = vmgenid_replacement_test_memory();
+        memory
+            .write_slice(&generation_id, vmgenid_range.start())
+            .expect("source VMGenID should write");
+        memory
+            .write_slice(&vmclock_abi.to_bytes(), vmclock_range.start())
+            .expect("source VMClock should write");
+
+        assert!(matches!(
+            prepare_arm64_snapshot_time_identity(&memory, vmgenid, vmclock, different_vmclock,),
+            Err(PrepareArm64SnapshotTimeIdentityError::VmClockStateMismatch)
+        ));
+        assert_eq!(
+            read_guest_bytes(&memory, vmgenid_range.start(), ARM64_BOOT_VMGENID_SIZE),
+            generation_id
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, vmclock_range.start(), VMCLOCK_ABI_SIZE),
+            vmclock_abi.to_bytes()
+        );
+    }
+
+    #[test]
+    fn snapshot_time_identity_preflight_rejects_conflicting_notifications() {
+        let vmclock_abi = VmClockAbi::initial();
+        let vmgenid_range = initial_vmgenid_range().expect("VMGenID range should validate");
+        let vmclock_range = initial_vmclock_range().expect("VMClock range should validate");
+        let vmgenid = snapshot_time_identity_metadata(vmgenid_range, line(127));
+        let vmclock = snapshot_time_identity_metadata(vmclock_range, line(127));
+        let mut memory = vmgenid_replacement_test_memory();
+        memory
+            .write_slice(&[0x53; ARM64_BOOT_VMGENID_SIZE], vmgenid_range.start())
+            .expect("source VMGenID should write");
+        memory
+            .write_slice(&vmclock_abi.to_bytes(), vmclock_range.start())
+            .expect("source VMClock should write");
+
+        assert!(matches!(
+            prepare_arm64_snapshot_time_identity(&memory, vmgenid, vmclock, vmclock_abi),
+            Err(PrepareArm64SnapshotTimeIdentityError::ConflictingMetadata)
+        ));
     }
 
     #[test]
