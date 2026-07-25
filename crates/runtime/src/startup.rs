@@ -6227,6 +6227,19 @@ pub fn register_arm64_boot_rtc_mmio(
     register_rtc_mmio(dispatcher, Arm64BootRtcDeviceConfig::new(layout))
 }
 
+/// Install one fresh destination-owned serial device into an existing arm64
+/// boot MMIO dispatcher.
+///
+/// Mutable source UART registers are deliberately not accepted. The handler
+/// starts from the canonical reset state and retains only the supplied fresh
+/// destination output owner.
+pub fn register_arm64_boot_serial_mmio(
+    dispatcher: &mut MmioDispatcher,
+    config: Arm64BootSerialDeviceConfig,
+) -> Result<Arm64BootSerialDevice, Arm64BootResourceError> {
+    register_serial_mmio(dispatcher, config)
+}
+
 fn register_rtc_mmio(
     dispatcher: &mut MmioDispatcher,
     config: Arm64BootRtcDeviceConfig,

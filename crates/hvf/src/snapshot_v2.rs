@@ -3323,4 +3323,4 @@ fn decode_zt0_value(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

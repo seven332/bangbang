@@ -13,7 +13,7 @@ use crate::snapshot_bundle::tests::fixture as native_v1_fixture;
 
 const FIXTURE_MEMORY_MIB: u64 = 4;
 
-fn platform_fixture(with_sme: bool) -> HvfSnapshotV2PlatformState {
+pub(crate) fn platform_fixture(with_sme: bool) -> HvfSnapshotV2PlatformState {
     platform_fixture_with_count(2, with_sme)
 }
 

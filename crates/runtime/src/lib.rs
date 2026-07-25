@@ -1379,6 +1379,23 @@ impl VmmController {
         })
     }
 
+    fn snapshot_v2_load_profile(&self) -> Result<snapshot::SnapshotV2LoadProfile, VmmActionError> {
+        Ok(snapshot::SnapshotV2LoadProfile {
+            machine_is_default: self.machine_config == machine::MachineConfig::default()
+                && self.custom_cpu_template.is_none(),
+            boot_source_configured: self.boot_source_config.is_some(),
+            drive_configured: !self.drive_configs.as_slice().is_empty(),
+            network_configured: !self.network_interface_configs.as_slice().is_empty(),
+            vsock_configured: self.vsock_config.is_some(),
+            pmem_configured: !self.pmem_configs.as_slice().is_empty(),
+            balloon_configured: self.balloon_config.is_some(),
+            memory_hotplug_configured: self.memory_hotplug_config.is_some(),
+            entropy_configured: self.entropy_config.is_some(),
+            mmds_configured: self.snapshot_mmds_configured()?,
+            serial_is_default: self.serial_config == serial::SerialConfig::default(),
+        })
+    }
+
     pub fn preflight_create_snapshot(
         &self,
         input: &snapshot::SnapshotCreateInput,
@@ -1446,6 +1463,30 @@ impl VmmController {
         .map_err(|_| VmmActionError::SnapshotUnsupported)
     }
 
+    /// Preflights the private native-v2 File/COW destination profile.
+    ///
+    /// This method neither dispatches the public load action nor grants path
+    /// authority.
+    pub fn preflight_load_snapshot_v2(
+        &self,
+        input: &snapshot::SnapshotLoadInput,
+    ) -> Result<(), VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: "LoadSnapshot",
+                state: self.instance_info.state,
+            });
+        }
+
+        snapshot::classify_v2_load_request(input)
+            .map_err(|_| VmmActionError::SnapshotUnsupported)?;
+        snapshot::classify_v2_load_eligibility(
+            self.snapshot_load_history_fresh,
+            self.snapshot_v2_load_profile()?,
+        )
+        .map_err(|_| VmmActionError::SnapshotUnsupported)
+    }
+
     /// Commit a completely restored native-v1 session as paused controller state.
     pub fn commit_snapshot_v1_load(
         &mut self,
@@ -1454,6 +1495,23 @@ impl VmmController {
         let (machine_config, drive_configs, serial_config, resume_requested) = commit.into_parts();
         self.machine_config = machine_config;
         self.custom_cpu_template = None;
+        self.drive_configs = drive_configs;
+        self.serial_config = serial_config;
+        self.snapshot_load_history_fresh = false;
+        self.instance_info.state = InstanceState::Paused;
+        resume_requested
+    }
+
+    /// Commit a completely restored native-v2 session as paused controller state.
+    pub fn commit_snapshot_v2_load(
+        &mut self,
+        commit: snapshot::SnapshotV2ControllerCommit,
+    ) -> bool {
+        let (machine_config, boot_source_config, drive_configs, serial_config, resume_requested) =
+            commit.into_parts();
+        self.machine_config = machine_config;
+        self.custom_cpu_template = None;
+        self.boot_source_config = Some(boot_source_config);
         self.drive_configs = drive_configs;
         self.serial_config = serial_config;
         self.snapshot_load_history_fresh = false;
@@ -2159,7 +2217,7 @@ mod tests {
         serial::{SerialConfigError, SerialConfigInput, SerialRateLimiterConfig},
         snapshot::{
             SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend,
-            SnapshotMemoryBackendType, SnapshotType,
+            SnapshotMemoryBackendType, SnapshotType, SnapshotV2ControllerCommit,
         },
         vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
     };
@@ -3319,6 +3377,97 @@ mod tests {
             controller.preflight_load_snapshot(&snapshot_load_input()),
             Err(VmmActionError::SnapshotUnsupported)
         );
+    }
+
+    #[test]
+    fn private_native_v2_load_preflight_is_file_only_and_preserves_public_v1_policy() {
+        let controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let file = snapshot_load_input()
+            .with_track_dirty_pages(true)
+            .with_resume_vm(true);
+        assert_eq!(controller.preflight_load_snapshot_v2(&file), Ok(()));
+        assert_eq!(controller.preflight_load_snapshot(&file), Ok(()));
+
+        let uffd = SnapshotLoadInput::new(
+            "/private/state",
+            SnapshotMemoryBackend::new("/private/memory", SnapshotMemoryBackendType::Uffd),
+        );
+        assert_eq!(
+            controller.preflight_load_snapshot_v2(&uffd),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        assert_eq!(controller.preflight_load_snapshot(&uffd), Ok(()));
+
+        let deprecated = snapshot_load_input().with_deprecated_fields_used(true);
+        assert_eq!(
+            controller.preflight_load_snapshot_v2(&deprecated),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+        assert_eq!(
+            controller.preflight_load_snapshot(&deprecated),
+            Ok(()),
+            "native-v1 compatibility must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn private_native_v2_controller_commit_publishes_paused_inert_configuration() {
+        let metrics_path = unique_metrics_path("native-v2-controller-commit");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutLogger(LoggerConfigInput::new()))
+            .expect("destination logger should configure");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                metrics_path.clone(),
+            )))
+            .expect("destination metrics should configure");
+
+        let machine = MachineConfigInput::new(2, 256)
+            .with_track_dirty_pages(true)
+            .validate()
+            .expect("restored machine fixture should validate");
+        let boot = BootSourceConfigInput::new("/inert/source/kernel")
+            .with_initrd_path("/inert/source/initrd")
+            .with_boot_args("console=ttyS0")
+            .validate()
+            .expect("inert boot metadata should validate");
+        let resume = controller
+            .commit_snapshot_v2_load(SnapshotV2ControllerCommit::new(machine, boot, true));
+
+        assert!(resume);
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert_eq!(controller.machine_config(), machine);
+        let retained = controller
+            .boot_source_config()
+            .expect("restored inert boot metadata should be retained");
+        assert_eq!(
+            retained.kernel_image_path(),
+            Path::new("/inert/source/kernel")
+        );
+        assert_eq!(
+            retained.initrd_path(),
+            Some(Path::new("/inert/source/initrd"))
+        );
+        assert_eq!(retained.boot_args(), Some("console=ttyS0"));
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+        assert_eq!(
+            controller.serial_config(),
+            &super::serial::SerialConfig::default()
+        );
+        assert_eq!(
+            controller.preflight_load_snapshot_v2(&snapshot_load_input()),
+            Err(VmmActionError::UnsupportedState {
+                action: "LoadSnapshot",
+                state: InstanceState::Paused,
+            })
+        );
+
+        controller
+            .flush_metrics_with_diagnostics(&MetricsDiagnostics::default())
+            .expect("destination metrics owner should survive v2 commit");
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]

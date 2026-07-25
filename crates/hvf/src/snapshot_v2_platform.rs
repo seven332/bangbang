@@ -5,22 +5,26 @@ use std::io::{Seek, Write};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
+use device_tree::{DeviceTree, Node};
+
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange, aarch64,
 };
-use bangbang_runtime::mmio::MmioDispatcher;
+use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::pvtime::{
     ARM64_PVTIME_STOLEN_TIME_OFFSET, ARM64_PVTIME_STRUCTURE_SIZE, Arm64PvTimeLayout,
     Arm64PvTimeStAbi,
 };
-use bangbang_runtime::rtc::RtcMmioLayout;
+use bangbang_runtime::rtc::{RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
+use bangbang_runtime::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SharedSerialOutput};
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, write_snapshot_v2_memory_image,
 };
 use bangbang_runtime::startup::{
-    Arm64BootResourceError, Arm64BootRtcDevice, Arm64BootVmClockDevice, Arm64BootVmGenIdDevice,
-    PrepareArm64SnapshotTimeIdentityError, prepare_arm64_snapshot_time_identity,
-    register_arm64_boot_rtc_mmio, replace_arm64_boot_vmgenid,
+    Arm64BootResourceError, Arm64BootRtcDevice, Arm64BootSerialDevice, Arm64BootSerialDeviceConfig,
+    Arm64BootVmClockDevice, Arm64BootVmGenIdDevice, PrepareArm64SnapshotTimeIdentityError,
+    prepare_arm64_snapshot_time_identity, register_arm64_boot_rtc_mmio,
+    register_arm64_boot_serial_mmio, replace_arm64_boot_vmgenid,
 };
 use bangbang_runtime::{BackendError, VmBackend};
 use crc64::crc64;
@@ -30,7 +34,8 @@ use crate::coordinator::{HvfVcpuRunControl, HvfVcpuRunCoordinatorError};
 use crate::cpu_template::HvfArm64CpuTemplateError;
 use crate::dirty::HvfDirtyWriteTrackerStartError;
 use crate::gic::{
-    HvfGicError, HvfGicMetadata, HvfGicMsiConfiguration, HvfGicSpiSignalError, HvfGicSpiSignaler,
+    HvfGicError, HvfGicInterruptLineAllocator, HvfGicMetadata, HvfGicMsiConfiguration,
+    HvfGicSpiSignalError, HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
 use crate::pvtime::HvfArm64PvTimeAccountingConfig;
@@ -54,12 +59,40 @@ use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
 use crate::vcpu::HvfArm64VcpuIdentificationRegisterState;
 
 const REDACTED: &str = "<redacted>";
+const PROCESS_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
+const PROCESS_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(20);
+const PROCESS_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
+const PROCESS_RTC_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(10);
+
+/// Closed fresh-output shell accepted by native-v2 process reconstruction.
+pub struct HvfSnapshotV2DefaultProcessShell {
+    serial_output: SharedSerialOutput,
+}
+
+impl HvfSnapshotV2DefaultProcessShell {
+    /// Bind one fresh destination output to the canonical process UART.
+    pub const fn new(serial_output: SharedSerialOutput) -> Self {
+        Self { serial_output }
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2DefaultProcessShell {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2DefaultProcessShell")
+            .field("profile", &"default-uart")
+            .field("output", &REDACTED)
+            .finish()
+    }
+}
 
 /// Ordered reconstruction stage for the unpublished native-v2 platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HvfSnapshotV2PlatformRestoreStage {
     /// Validate supplied memory, FDT identity, cache identity, and cleanup storage.
     Preflight,
+    /// Validate and install the exact fresh destination process shell.
+    ProcessShell,
     /// Create the empty Hypervisor.framework VM.
     Vm,
     /// Register guest memory and optional dirty tracking.
@@ -98,6 +131,7 @@ impl fmt::Display for HvfSnapshotV2PlatformRestoreStage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Preflight => f.write_str("preflight"),
+            Self::ProcessShell => f.write_str("default process shell"),
             Self::Vm => f.write_str("VM creation"),
             Self::Memory => f.write_str("guest memory"),
             Self::Gic => f.write_str("GIC creation"),
@@ -120,6 +154,54 @@ impl fmt::Display for HvfSnapshotV2PlatformRestoreStage {
     }
 }
 
+/// Value-free reason that a retained FDT is not the canonical focused process shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HvfSnapshotV2ProcessFdtMismatch {
+    /// The retained FDT does not describe the focused process profile.
+    Profile,
+    /// The retained FDT cannot be parsed.
+    Parse,
+    /// The retained FDT has an unexpected root-node inventory.
+    RootInventory,
+    /// The retained FDT has an unexpected CPU inventory or topology.
+    CpuInventory,
+    /// The retained FDT memory range does not match the admitted binding.
+    Memory,
+    /// The retained FDT boot metadata does not match the admitted state.
+    Boot,
+    /// The retained FDT GIC description does not match the admitted state.
+    Gic,
+    /// The retained FDT timer description does not match the admitted state.
+    Timer,
+    /// The retained FDT RTC description does not match the focused shell.
+    Rtc,
+    /// The retained FDT UART description does not match the focused shell.
+    Serial,
+    /// The retained FDT VM generation ID description does not match the admitted state.
+    VmGenId,
+    /// The retained FDT VM clock description does not match the admitted state.
+    VmClock,
+}
+
+impl fmt::Display for HvfSnapshotV2ProcessFdtMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Profile => "profile",
+            Self::Parse => "parse",
+            Self::RootInventory => "root inventory",
+            Self::CpuInventory => "CPU inventory",
+            Self::Memory => "memory",
+            Self::Boot => "boot",
+            Self::Gic => "GIC",
+            Self::Timer => "timer",
+            Self::Rtc => "RTC",
+            Self::Serial => "serial",
+            Self::VmGenId => "VMGenID",
+            Self::VmClock => "VMClock",
+        })
+    }
+}
+
 /// Typed primary failure retained by a native-v2 platform restore error.
 pub enum HvfSnapshotV2PlatformRestoreFailure {
     /// Cleanup evidence could not be reserved before construction.
@@ -132,6 +214,16 @@ pub enum HvfSnapshotV2PlatformRestoreFailure {
     FdtRead(GuestMemoryAccessError),
     /// Supplied memory does not contain the prepared FDT identity.
     FdtIdentity,
+    /// The retained FDT is not the exact minimal destination process shell.
+    ProcessShellFdt {
+        mismatch: HvfSnapshotV2ProcessFdtMismatch,
+    },
+    /// Deterministic minimal-profile interrupt allocation failed or disagreed.
+    ProcessShellInterrupt(HvfInterruptLineAllocationError),
+    /// Retained identity lines differ from the minimal serial-first allocation.
+    ProcessShellInterruptIdentity,
+    /// Fresh destination UART installation failed.
+    ProcessShellSerial(Arm64BootResourceError),
     /// Querying the destination cache profile failed.
     CacheQuery(BackendError),
     /// Destination cache facts differ from the prepared compatibility state.
@@ -198,6 +290,10 @@ impl HvfSnapshotV2PlatformRestoreFailure {
             Self::FdtAllocation => "FDT allocation",
             Self::FdtRead(_) => "FDT read",
             Self::FdtIdentity => "FDT identity",
+            Self::ProcessShellFdt { .. } => "default process FDT shell",
+            Self::ProcessShellInterrupt(_) => "default process interrupt shell",
+            Self::ProcessShellInterruptIdentity => "default process interrupt identity",
+            Self::ProcessShellSerial(_) => "default process serial shell",
             Self::CacheQuery(_) => "cache query",
             Self::CacheMismatch => "cache compatibility",
             Self::TimePreparation(_) => "time identity preparation",
@@ -232,8 +328,13 @@ impl HvfSnapshotV2PlatformRestoreFailure {
 
 impl fmt::Debug for HvfSnapshotV2PlatformRestoreFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mismatch = match self {
+            Self::ProcessShellFdt { mismatch } => Some(mismatch),
+            _ => None,
+        };
         f.debug_struct("HvfSnapshotV2PlatformRestoreFailure")
             .field("category", &self.category())
+            .field("mismatch", &mismatch)
             .field("source", &REDACTED)
             .finish()
     }
@@ -249,6 +350,8 @@ impl std::error::Error for HvfSnapshotV2PlatformRestoreFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::FdtRead(source) => Some(source),
+            Self::ProcessShellInterrupt(source) => Some(source),
+            Self::ProcessShellSerial(source) => Some(source),
             Self::CacheQuery(source) | Self::CreateVm(source) => Some(source),
             Self::TimePreparation(source) => Some(source),
             Self::PvTimeRead(source) => Some(source),
@@ -273,6 +376,8 @@ impl std::error::Error for HvfSnapshotV2PlatformRestoreFailure {
             | Self::MemoryTopology
             | Self::FdtAllocation
             | Self::FdtIdentity
+            | Self::ProcessShellFdt { .. }
+            | Self::ProcessShellInterruptIdentity
             | Self::CacheMismatch
             | Self::PvTimeMismatch
             | Self::GicMetadata
@@ -483,6 +588,7 @@ pub struct RestoredHvfSnapshotV2Platform {
     machine: HvfSnapshotV2MachineState,
     compatibility: HvfSnapshotV1CompatibilityState,
     rtc_device: Arm64BootRtcDevice,
+    serial_device: Option<Arm64BootSerialDevice>,
     vmgenid_device: Arm64BootVmGenIdDevice,
     vmclock_device: Arm64BootVmClockDevice,
     pvtime_layout: Arm64PvTimeLayout,
@@ -512,6 +618,13 @@ impl RestoredHvfSnapshotV2Platform {
     /// Return the destination-validated common compatibility facts.
     pub const fn compatibility(&self) -> &HvfSnapshotV1CompatibilityState {
         &self.compatibility
+    }
+
+    /// Borrow the fresh process UART output when this owner was reconstructed
+    /// through the closed process shell.
+    #[doc(hidden)]
+    pub fn serial_output(&self) -> Option<&SharedSerialOutput> {
+        self.serial_device.as_ref().map(|device| &device.output)
     }
 
     /// Reobserve the complete paused lifecycle graph.
@@ -713,6 +826,26 @@ pub fn restore_hvf_snapshot_v2_platform(
     state: HvfSnapshotV2PlatformState,
     memory: GuestMemory,
 ) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(state, memory, None)
+}
+
+/// Reconstruct one native-v2 platform with the exact default process UART.
+///
+/// The retained FDT, minimal interrupt sequence, and fresh output owner are
+/// validated and installed before Hypervisor.framework VM construction.
+pub fn restore_hvf_snapshot_v2_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2DefaultProcessShell,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(state, memory, Some(shell))
+}
+
+fn restore_hvf_snapshot_v2_platform_with_shell(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    process_shell: Option<HvfSnapshotV2DefaultProcessShell>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
     debug_assert!(cleanup_sequence(RestoreOwnership::Empty).is_empty());
     let mut cleanup = Vec::new();
     if cleanup.try_reserve_exact(2).is_err() {
@@ -729,13 +862,27 @@ pub fn restore_hvf_snapshot_v2_platform(
             cleanup,
         ));
     }
-    if let Err(failure) = verify_fdt_identity(&memory, state.machine()) {
-        return Err(HvfSnapshotV2PlatformRestoreError::new(
-            HvfSnapshotV2PlatformRestoreStage::Preflight,
-            failure,
-            cleanup,
-        ));
-    }
+    let fdt_bytes = match verified_fdt_bytes(&memory, state.machine()) {
+        Ok(bytes) => bytes,
+        Err(failure) => {
+            return Err(HvfSnapshotV2PlatformRestoreError::new(
+                HvfSnapshotV2PlatformRestoreStage::Preflight,
+                failure,
+                cleanup,
+            ));
+        }
+    };
+    let (mut dispatcher, serial_device) =
+        match prepare_process_shell(process_shell, &state, &fdt_bytes) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                return Err(HvfSnapshotV2PlatformRestoreError::new(
+                    HvfSnapshotV2PlatformRestoreStage::ProcessShell,
+                    failure,
+                    cleanup,
+                ));
+            }
+        };
     let prepared_time_identity = match prepare_arm64_snapshot_time_identity(
         &memory,
         state.time().vmgenid(),
@@ -1014,7 +1161,6 @@ pub fn restore_hvf_snapshot_v2_platform(
         }
     }
 
-    let mut dispatcher = MmioDispatcher::new();
     let rtc_device = match register_arm64_boot_rtc_mmio(&mut dispatcher, time.rtc_layout()) {
         Ok(device) => device,
         Err(source) => {
@@ -1126,6 +1272,7 @@ pub fn restore_hvf_snapshot_v2_platform(
         machine,
         compatibility,
         rtc_device,
+        serial_device,
         vmgenid_device,
         vmclock_device,
         pvtime_layout,
@@ -1336,7 +1483,8 @@ fn cleanup_sequence(ownership: RestoreOwnership) -> &'static [HvfSnapshotV2Platf
 
 fn restore_ownership_before_failure(stage: HvfSnapshotV2PlatformRestoreStage) -> RestoreOwnership {
     match stage {
-        HvfSnapshotV2PlatformRestoreStage::Preflight => RestoreOwnership::Empty,
+        HvfSnapshotV2PlatformRestoreStage::Preflight
+        | HvfSnapshotV2PlatformRestoreStage::ProcessShell => RestoreOwnership::Empty,
         HvfSnapshotV2PlatformRestoreStage::Vm
         | HvfSnapshotV2PlatformRestoreStage::Memory
         | HvfSnapshotV2PlatformRestoreStage::Gic
@@ -1365,10 +1513,448 @@ fn memory_matches_binding(memory: &GuestMemory, binding: &SnapshotV2MemoryBindin
             .all(|(region, extent)| region.range() == extent.range())
 }
 
-fn verify_fdt_identity(
+fn prepare_process_shell(
+    shell: Option<HvfSnapshotV2DefaultProcessShell>,
+    state: &HvfSnapshotV2PlatformState,
+    fdt_bytes: &[u8],
+) -> Result<(MmioDispatcher, Option<Arm64BootSerialDevice>), HvfSnapshotV2PlatformRestoreFailure> {
+    let mut dispatcher = MmioDispatcher::new();
+    let Some(shell) = shell else {
+        return Ok((dispatcher, None));
+    };
+
+    let gic = state.global().compatibility().gic_metadata();
+    if gic.msi.is_some()
+        || state.time().rtc_layout()
+            != RtcMmioLayout::new(PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID)
+    {
+        return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+            mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+        });
+    }
+    let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
+        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
+    let serial_interrupt = allocator
+        .allocate()
+        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
+    let vmgenid_interrupt = allocator
+        .allocate()
+        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
+    let vmclock_interrupt = allocator
+        .allocate()
+        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
+    if state.time().vmgenid().interrupt_line() != vmgenid_interrupt
+        || state.time().vmclock().interrupt_line() != vmclock_interrupt
+    {
+        return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
+    }
+    validate_default_process_fdt(fdt_bytes, state, serial_interrupt)
+        .map_err(|mismatch| HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt { mismatch })?;
+
+    let serial = register_arm64_boot_serial_mmio(
+        &mut dispatcher,
+        Arm64BootSerialDeviceConfig::new(
+            PROCESS_SERIAL_MMIO_REGION_ID,
+            PROCESS_SERIAL_MMIO_BASE,
+            serial_interrupt,
+            shell.serial_output,
+        ),
+    )
+    .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellSerial)?;
+    Ok((dispatcher, Some(serial)))
+}
+
+fn validate_default_process_fdt(
+    bytes: &[u8],
+    state: &HvfSnapshotV2PlatformState,
+    serial_interrupt: bangbang_runtime::interrupt::GuestInterruptLine,
+) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
+    let tree = DeviceTree::load(bytes).map_err(|_| HvfSnapshotV2ProcessFdtMismatch::Parse)?;
+    let time = state.time();
+    let gic = state.global().compatibility().gic_metadata();
+    let serial_name =
+        |name: &str| node_name_has_number(name, "uart@", 16, PROCESS_SERIAL_MMIO_BASE.raw_value());
+    let rtc_name =
+        |name: &str| node_name_has_number(name, "rtc@", 16, PROCESS_RTC_MMIO_BASE.raw_value());
+    let vmclock_name =
+        |name: &str| node_name_has_number(name, "ptp@", 10, time.vmclock().fdt_region().base);
+    if tree.root.children.len() != 11
+        || [
+            "cpus",
+            "memory@ram",
+            "chosen",
+            "intc",
+            "timer",
+            "apb-pclk",
+            "psci",
+            "vmgenid",
+        ]
+        .iter()
+        .any(|name| child_named(&tree.root, name).is_none())
+        || child_matching(&tree.root, |node| serial_name(&node.name)).is_none()
+        || child_matching(&tree.root, |node| rtc_name(&node.name)).is_none()
+        || child_matching(&tree.root, |node| vmclock_name(&node.name)).is_none()
+        || !tree
+            .root
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "linux,dummy-virt")
+        || !tree
+            .root
+            .prop_u32("#address-cells")
+            .is_ok_and(|cells| cells == 2)
+        || !tree
+            .root
+            .prop_u32("#size-cells")
+            .is_ok_and(|cells| cells == 2)
+        || !tree
+            .root
+            .prop_u32("interrupt-parent")
+            .is_ok_and(|phandle| phandle == 1)
+    {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory);
+    }
+
+    let Some(clock) = child_named(&tree.root, "apb-pclk") else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory);
+    };
+    let Some(psci) = child_named(&tree.root, "psci") else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory);
+    };
+    if !clock.children.is_empty()
+        || !clock
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "fixed-clock")
+        || !clock.prop_u32("#clock-cells").is_ok_and(|cells| cells == 0)
+        || !clock
+            .prop_u32("clock-frequency")
+            .is_ok_and(|frequency| frequency == 24_000_000)
+        || !clock
+            .prop_str("clock-output-names")
+            .is_ok_and(|name| name == "clk24mhz")
+        || !clock.prop_u32("phandle").is_ok_and(|phandle| phandle == 2)
+        || !psci.children.is_empty()
+        || !psci
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "arm,psci-0.2")
+        || !psci.prop_str("method").is_ok_and(|method| method == "hvc")
+    {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory);
+    }
+
+    let Some(cpus) = child_named(&tree.root, "cpus") else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::CpuInventory);
+    };
+    if cpus.children.len() != state.topology().members().len()
+        || cpus
+            .children
+            .iter()
+            .zip(state.topology().members())
+            .any(|(node, member)| {
+                !node_name_has_number(&node.name, "cpu@", 16, member.mpidr())
+                    || !property_u64_cells_equal(node, "reg", &[member.mpidr()])
+                    || !node
+                        .prop_str("enable-method")
+                        .is_ok_and(|method| method == "psci")
+            })
+    {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::CpuInventory);
+    }
+
+    let Some(memory) = child_named(&tree.root, "memory@ram") else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Memory);
+    };
+    if !memory_property_matches_binding(memory, state.memory()) {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Memory);
+    }
+
+    let Some(chosen) = child_named(&tree.root, "chosen") else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Boot);
+    };
+    let Some(expected_boot_args) =
+        expected_process_boot_arguments(state.machine().boot().boot_arguments())
+    else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Boot);
+    };
+    if !chosen
+        .prop_str("bootargs")
+        .is_ok_and(|arguments| arguments == expected_boot_args.as_str())
+        || chosen.has_prop("linux,initrd-start") != state.machine().boot().initrd_path().is_some()
+        || chosen.has_prop("linux,initrd-end") != state.machine().boot().initrd_path().is_some()
+    {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Boot);
+    }
+
+    let Some(intc) = child_named(&tree.root, "intc") else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Gic);
+    };
+    if !intc.children.is_empty()
+        || !intc
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "arm,gic-v3")
+        || !property_u64_cells_equal(
+            intc,
+            "reg",
+            &[
+                gic.distributor.base,
+                gic.distributor.size,
+                gic.redistributor.region.base,
+                gic.redistributor.region.size,
+            ],
+        )
+    {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Gic);
+    }
+    let Ok(timer_metadata) = gic.arm64_fdt_timer_interrupts() else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Timer);
+    };
+    let Some(timer) = child_named(&tree.root, "timer") else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Timer);
+    };
+    if !property_u32_cells_equal(
+        timer,
+        "interrupts",
+        &[
+            1,
+            timer_metadata.secure_physical,
+            4,
+            1,
+            timer_metadata.non_secure_physical,
+            4,
+            1,
+            timer_metadata.virtual_timer,
+            4,
+            1,
+            timer_metadata.hypervisor,
+            4,
+        ],
+    ) {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Timer);
+    }
+
+    let Some(rtc) = child_matching(&tree.root, |node| rtc_name(&node.name)) else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Rtc);
+    };
+    if !rtc.children.is_empty()
+        || rtc.prop_raw("compatible").map(Vec::as_slice) != Some(b"arm,pl031\0arm,primecell\0")
+        || !property_u64_cells_equal(
+            rtc,
+            "reg",
+            &[
+                PROCESS_RTC_MMIO_BASE.raw_value(),
+                RTC_MMIO_DEVICE_WINDOW_SIZE,
+            ],
+        )
+        || !rtc.prop_u32("clocks").is_ok_and(|phandle| phandle == 2)
+        || !rtc
+            .prop_str("clock-names")
+            .is_ok_and(|name| name == "apb_pclk")
+    {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Rtc);
+    }
+
+    let Some(serial) = child_matching(&tree.root, |node| serial_name(&node.name)) else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Serial);
+    };
+    let Some(serial_interrupt_cell) = serial_interrupt.raw_value().checked_sub(32) else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Serial);
+    };
+    if !serial.children.is_empty()
+        || !serial
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "ns16550a")
+        || !property_u64_cells_equal(
+            serial,
+            "reg",
+            &[
+                PROCESS_SERIAL_MMIO_BASE.raw_value(),
+                SERIAL_MMIO_DEVICE_WINDOW_SIZE,
+            ],
+        )
+        || !property_u32_cells_equal(serial, "interrupts", &[0, serial_interrupt_cell, 1])
+        || !serial.prop_u32("clocks").is_ok_and(|phandle| phandle == 2)
+        || !serial
+            .prop_str("clock-names")
+            .is_ok_and(|name| name == "apb_pclk")
+    {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Serial);
+    }
+
+    let Some(vmgenid) = child_named(&tree.root, "vmgenid") else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::VmGenId);
+    };
+    let vmgenid_metadata = time.vmgenid();
+    let Some(vmgenid_interrupt_cell) = vmgenid_metadata
+        .interrupt_line()
+        .raw_value()
+        .checked_sub(32)
+    else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::VmGenId);
+    };
+    if !vmgenid.children.is_empty()
+        || !vmgenid
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "microsoft,vmgenid")
+        || !property_u64_cells_equal(
+            vmgenid,
+            "reg",
+            &[
+                vmgenid_metadata.fdt_region().base,
+                vmgenid_metadata.fdt_region().size,
+            ],
+        )
+        || !property_u32_cells_equal(vmgenid, "interrupts", &[0, vmgenid_interrupt_cell, 1])
+    {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::VmGenId);
+    }
+
+    let Some(vmclock) = child_matching(&tree.root, |node| vmclock_name(&node.name)) else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::VmClock);
+    };
+    let vmclock_metadata = time.vmclock();
+    let Some(vmclock_interrupt_cell) = vmclock_metadata
+        .interrupt_line()
+        .raw_value()
+        .checked_sub(32)
+    else {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::VmClock);
+    };
+    if vmclock.children.is_empty()
+        && vmclock
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "amazon,vmclock")
+        && property_u64_cells_equal(
+            vmclock,
+            "reg",
+            &[
+                vmclock_metadata.fdt_region().base,
+                vmclock_metadata.fdt_region().size,
+            ],
+        )
+        && property_u32_cells_equal(vmclock, "interrupts", &[0, vmclock_interrupt_cell, 1])
+    {
+        Ok(())
+    } else {
+        Err(HvfSnapshotV2ProcessFdtMismatch::VmClock)
+    }
+}
+
+fn child_named<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
+    let mut matches = node.children.iter().filter(|child| child.name == name);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn child_matching(node: &Node, mut predicate: impl FnMut(&Node) -> bool) -> Option<&Node> {
+    let mut matches = node.children.iter().filter(|child| predicate(child));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn node_name_has_number(name: &str, prefix: &str, radix: u32, expected: u64) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|value| u64::from_str_radix(value, radix).ok())
+        == Some(expected)
+}
+
+fn property_u32_cells_equal(node: &Node, name: &str, expected: &[u32]) -> bool {
+    let Some(raw) = node.prop_raw(name) else {
+        return false;
+    };
+    raw.len() == expected.len().saturating_mul(4)
+        && raw.chunks_exact(4).zip(expected).all(|(chunk, expected)| {
+            <[u8; 4]>::try_from(chunk).map(u32::from_be_bytes).ok() == Some(*expected)
+        })
+}
+
+fn property_u64_cells_equal(node: &Node, name: &str, expected: &[u64]) -> bool {
+    let Some(raw) = node.prop_raw(name) else {
+        return false;
+    };
+    raw.len() == expected.len().saturating_mul(8)
+        && raw.chunks_exact(8).zip(expected).all(|(chunk, expected)| {
+            <[u8; 8]>::try_from(chunk).map(u64::from_be_bytes).ok() == Some(*expected)
+        })
+}
+
+fn memory_property_matches_binding(node: &Node, binding: &SnapshotV2MemoryBinding) -> bool {
+    let Some(raw) = node.prop_raw("reg") else {
+        return false;
+    };
+    if raw.len() != binding.extents().len().saturating_mul(16) {
+        return false;
+    }
+    raw.chunks_exact(16)
+        .zip(binding.extents())
+        .enumerate()
+        .all(|(index, (chunk, extent))| {
+            let (start, size) = chunk.split_at(8);
+            let range = extent.range();
+            let (expected_start, expected_size) = if index == 0 {
+                let Some(start) = range
+                    .start()
+                    .checked_add(bangbang_runtime::memory::aarch64::SYSTEM_MEM_SIZE)
+                else {
+                    return false;
+                };
+                let Some(size) = range
+                    .size()
+                    .checked_sub(bangbang_runtime::memory::aarch64::SYSTEM_MEM_SIZE)
+                else {
+                    return false;
+                };
+                (start.raw_value(), size)
+            } else {
+                (range.start().raw_value(), range.size())
+            };
+            <[u8; 8]>::try_from(start).map(u64::from_be_bytes).ok() == Some(expected_start)
+                && <[u8; 8]>::try_from(size).map(u64::from_be_bytes).ok() == Some(expected_size)
+        })
+}
+
+fn expected_process_boot_arguments(source: Option<&str>) -> Option<String> {
+    let source = source.unwrap_or(bangbang_runtime::boot::DEFAULT_KERNEL_COMMAND_LINE);
+    let separator = " -- ";
+    let split = source.match_indices(separator).find(|(index, _)| {
+        source
+            .get(..*index)
+            .is_some_and(|prefix| prefix.matches('"').count().is_multiple_of(2))
+    });
+    let (kernel, init) = match split {
+        Some((index, _)) => (
+            source.get(..index)?.trim(),
+            source.get(index.checked_add(separator.len())?..)?.trim(),
+        ),
+        None => (source.trim(), ""),
+    };
+    if kernel.is_empty() && !init.is_empty() {
+        return None;
+    }
+    let capacity = kernel
+        .len()
+        .checked_add(" pci=off".len())?
+        .checked_add(if init.is_empty() {
+            0
+        } else {
+            separator.len().checked_add(init.len())?
+        })?;
+    let mut expected = String::new();
+    expected.try_reserve_exact(capacity).ok()?;
+    expected.push_str(kernel);
+    if !kernel.is_empty() {
+        expected.push(' ');
+    }
+    expected.push_str("pci=off");
+    if !init.is_empty() {
+        expected.push_str(separator);
+        expected.push_str(init);
+    }
+    Some(expected)
+}
+
+fn verified_fdt_bytes(
     memory: &GuestMemory,
     machine: &HvfSnapshotV2MachineState,
-) -> Result<(), HvfSnapshotV2PlatformRestoreFailure> {
+) -> Result<Vec<u8>, HvfSnapshotV2PlatformRestoreFailure> {
     let fdt = machine.fdt();
     let size = usize::try_from(fdt.size())
         .map_err(|_| HvfSnapshotV2PlatformRestoreFailure::FdtAllocation)?;
@@ -1383,7 +1969,7 @@ fn verify_fdt_identity(
     if crc64(0, &bytes) != fdt.checksum() {
         return Err(HvfSnapshotV2PlatformRestoreFailure::FdtIdentity);
     }
-    Ok(())
+    Ok(bytes)
 }
 
 fn verify_capture_fdt_identity(
@@ -1486,6 +2072,7 @@ fn run_restore_protocol<P: RestoreProtocol>(
                 ownership = RestoreOwnership::Empty;
             }
             HvfSnapshotV2PlatformRestoreStage::Preflight
+            | HvfSnapshotV2PlatformRestoreStage::ProcessShell
             | HvfSnapshotV2PlatformRestoreStage::Vm
             | HvfSnapshotV2PlatformRestoreStage::Memory
             | HvfSnapshotV2PlatformRestoreStage::Gic
@@ -1507,6 +2094,7 @@ fn run_restore_protocol<P: RestoreProtocol>(
 fn restore_protocol_stages(vcpu_count: usize) -> Vec<HvfSnapshotV2PlatformRestoreStage> {
     let mut stages = vec![
         HvfSnapshotV2PlatformRestoreStage::Preflight,
+        HvfSnapshotV2PlatformRestoreStage::ProcessShell,
         HvfSnapshotV2PlatformRestoreStage::Vm,
         HvfSnapshotV2PlatformRestoreStage::Memory,
         HvfSnapshotV2PlatformRestoreStage::Gic,
@@ -1534,6 +2122,308 @@ fn restore_protocol_stages(vcpu_count: usize) -> Vec<HvfSnapshotV2PlatformRestor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process_platform_fixture() -> HvfSnapshotV2PlatformState {
+        let state = crate::snapshot_v2::tests::platform_fixture(false);
+        let gic = state.global().compatibility().gic_metadata();
+        let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
+            .expect("fixture GIC should provide an interrupt allocator");
+        let _serial_interrupt = allocator
+            .allocate()
+            .expect("fixture serial interrupt should allocate");
+        let vmgenid_interrupt = allocator
+            .allocate()
+            .expect("fixture VMGenID interrupt should allocate");
+        let vmclock_interrupt = allocator
+            .allocate()
+            .expect("fixture VMClock interrupt should allocate");
+        let (memory, machine, global, topology, vcpus, time) = state.into_parts();
+        let boot = crate::snapshot_v2::HvfSnapshotV2BootState::try_new(
+            machine.boot().kernel_path().clone(),
+            None,
+            machine.boot().boot_arguments(),
+        )
+        .expect("process fixture boot metadata should validate");
+        let machine = HvfSnapshotV2MachineState::try_new(
+            machine.machine(),
+            boot,
+            machine.fdt(),
+            machine.cpu_template().cloned(),
+        )
+        .expect("process fixture machine metadata should validate");
+        let (rtc, vmgenid, vmclock, vmclock_abi, pvtime) = time.into_parts();
+        let vmgenid = bangbang_runtime::snapshot_device::SnapshotV1PlatformDeviceMetadata::new(
+            vmgenid.range(),
+            vmgenid.fdt_region(),
+            vmgenid_interrupt,
+        );
+        let vmclock = bangbang_runtime::snapshot_device::SnapshotV1PlatformDeviceMetadata::new(
+            vmclock.range(),
+            vmclock.fdt_region(),
+            vmclock_interrupt,
+        );
+        let time = HvfSnapshotV2TimeState::try_new(rtc, vmgenid, vmclock, vmclock_abi, pvtime)
+            .expect("process fixture time metadata should validate");
+        HvfSnapshotV2PlatformState::try_new(memory, machine, global, topology, vcpus, time)
+            .expect("process fixture platform should cross-validate")
+    }
+
+    fn fixture_shell_devices(
+        state: &HvfSnapshotV2PlatformState,
+    ) -> (
+        bangbang_runtime::fdt::Arm64FdtSerialDevice,
+        bangbang_runtime::fdt::Arm64FdtRtcDevice,
+        bangbang_runtime::fdt::Arm64FdtVmGenIdDevice,
+        bangbang_runtime::fdt::Arm64FdtVmClockDevice,
+    ) {
+        let gic = state.global().compatibility().gic_metadata();
+        let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
+            .expect("fixture GIC should provide an interrupt allocator");
+        let serial_interrupt = allocator
+            .allocate()
+            .expect("fixture serial interrupt should allocate");
+        let expected_vmgenid = allocator
+            .allocate()
+            .expect("fixture VMGenID interrupt should allocate");
+        let expected_vmclock = allocator
+            .allocate()
+            .expect("fixture VMClock interrupt should allocate");
+        assert_eq!(state.time().vmgenid().interrupt_line(), expected_vmgenid);
+        assert_eq!(state.time().vmclock().interrupt_line(), expected_vmclock);
+        let rtc_layout = state.time().rtc_layout();
+        (
+            bangbang_runtime::fdt::Arm64FdtSerialDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: PROCESS_SERIAL_MMIO_BASE.raw_value(),
+                    size: SERIAL_MMIO_DEVICE_WINDOW_SIZE,
+                },
+                interrupt_line: serial_interrupt,
+            },
+            bangbang_runtime::fdt::Arm64FdtRtcDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: rtc_layout.base().raw_value(),
+                    size: RTC_MMIO_DEVICE_WINDOW_SIZE,
+                },
+            },
+            bangbang_runtime::fdt::Arm64FdtVmGenIdDevice {
+                region: state.time().vmgenid().fdt_region(),
+                interrupt_line: state.time().vmgenid().interrupt_line(),
+            },
+            bangbang_runtime::fdt::Arm64FdtVmClockDevice {
+                region: state.time().vmclock().fdt_region(),
+                interrupt_line: state.time().vmclock().interrupt_line(),
+            },
+        )
+    }
+
+    fn build_process_fdt_fixture(
+        state: &HvfSnapshotV2PlatformState,
+        serial: bangbang_runtime::fdt::Arm64FdtSerialDevice,
+        rtc: bangbang_runtime::fdt::Arm64FdtRtcDevice,
+        vmgenid: bangbang_runtime::fdt::Arm64FdtVmGenIdDevice,
+        vmclock: bangbang_runtime::fdt::Arm64FdtVmClockDevice,
+        optional_devices: &[bangbang_runtime::fdt::Arm64FdtVirtioMmioDevice],
+    ) -> Vec<u8> {
+        let ranges = state
+            .memory()
+            .extents()
+            .iter()
+            .map(|extent| extent.range())
+            .collect();
+        let layout = bangbang_runtime::memory::GuestMemoryLayout::new(ranges)
+            .expect("fixture memory layout should validate");
+        let cache = bangbang_runtime::fdt::Arm64FdtCache::new(
+            1,
+            bangbang_runtime::fdt::Arm64FdtCacheType::Unified,
+            32_768,
+            64,
+            64,
+            8,
+            1,
+        )
+        .expect("fixture cache geometry should validate");
+        let cache_hierarchy = bangbang_runtime::fdt::Arm64FdtCacheHierarchy::new(vec![cache])
+            .expect("fixture cache hierarchy should validate");
+        let mpidrs = state
+            .topology()
+            .members()
+            .iter()
+            .map(|member| member.mpidr())
+            .collect::<Vec<_>>();
+        let command_line = expected_process_boot_arguments(state.machine().boot().boot_arguments())
+            .expect("fixture command line should normalize");
+        let initrd =
+            state
+                .machine()
+                .boot()
+                .initrd_path()
+                .map(|_| bangbang_runtime::boot::LoadedInitrd {
+                    address: GuestAddress::new(aarch64::DRAM_MEM_START + 0x1_0000),
+                    size: 4096,
+                });
+        let gic = state.global().compatibility().gic_metadata();
+        bangbang_runtime::fdt::build_arm64_fdt(&bangbang_runtime::fdt::Arm64FdtConfig {
+            layout: &layout,
+            boot: bangbang_runtime::fdt::Arm64FdtBootInfo {
+                command_line: &command_line,
+                initrd,
+            },
+            vcpu_mpidrs: &mpidrs,
+            cache_hierarchy: &cache_hierarchy,
+            gic: gic.arm64_fdt_gic(),
+            timer: gic
+                .arm64_fdt_timer_interrupts()
+                .expect("fixture timer metadata should validate"),
+            rtc_device: Some(rtc),
+            serial_device: Some(serial),
+            vmgenid_device: Some(vmgenid),
+            vmclock_device: Some(vmclock),
+            virtio_mmio_devices: optional_devices,
+        })
+        .expect("fixture FDT should build")
+    }
+
+    #[test]
+    fn exact_default_process_fdt_is_accepted_and_hostile_profiles_are_rejected() {
+        let state = process_platform_fixture();
+        let (serial, rtc, vmgenid, vmclock) = fixture_shell_devices(&state);
+        let valid = build_process_fdt_fixture(&state, serial, rtc, vmgenid, vmclock, &[]);
+        assert_eq!(
+            validate_default_process_fdt(&valid, &state, serial.interrupt_line),
+            Ok(())
+        );
+        assert_eq!(
+            validate_default_process_fdt(b"not an FDT", &state, serial.interrupt_line),
+            Err(HvfSnapshotV2ProcessFdtMismatch::Parse)
+        );
+
+        let optional = bangbang_runtime::fdt::Arm64FdtVirtioMmioDevice {
+            region: bangbang_runtime::fdt::Arm64FdtRegion {
+                base: 0x5000_0000,
+                size: bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            },
+            interrupt_line: bangbang_runtime::interrupt::GuestInterruptLine::new(
+                vmclock.interrupt_line.raw_value() + 1,
+            )
+            .expect("fixture optional-device interrupt should validate"),
+        };
+        let with_optional =
+            build_process_fdt_fixture(&state, serial, rtc, vmgenid, vmclock, &[optional]);
+        assert_eq!(
+            validate_default_process_fdt(&with_optional, &state, serial.interrupt_line),
+            Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory)
+        );
+    }
+
+    #[test]
+    fn default_process_fdt_rejects_serial_rtc_and_identity_drift() {
+        let state = process_platform_fixture();
+        let (serial, rtc, vmgenid, vmclock) = fixture_shell_devices(&state);
+
+        let wrong_serial_size = bangbang_runtime::fdt::Arm64FdtSerialDevice {
+            region: bangbang_runtime::fdt::Arm64FdtRegion {
+                size: SERIAL_MMIO_DEVICE_WINDOW_SIZE * 2,
+                ..serial.region
+            },
+            ..serial
+        };
+        let bytes =
+            build_process_fdt_fixture(&state, wrong_serial_size, rtc, vmgenid, vmclock, &[]);
+        assert_eq!(
+            validate_default_process_fdt(&bytes, &state, serial.interrupt_line),
+            Err(HvfSnapshotV2ProcessFdtMismatch::Serial)
+        );
+
+        let wrong_serial_interrupt = bangbang_runtime::fdt::Arm64FdtSerialDevice {
+            interrupt_line: bangbang_runtime::interrupt::GuestInterruptLine::new(
+                vmclock.interrupt_line.raw_value() + 1,
+            )
+            .expect("fixture serial interrupt drift should validate"),
+            ..serial
+        };
+        let bytes =
+            build_process_fdt_fixture(&state, wrong_serial_interrupt, rtc, vmgenid, vmclock, &[]);
+        assert_eq!(
+            validate_default_process_fdt(&bytes, &state, serial.interrupt_line),
+            Err(HvfSnapshotV2ProcessFdtMismatch::Serial)
+        );
+
+        let wrong_rtc_size = bangbang_runtime::fdt::Arm64FdtRtcDevice {
+            region: bangbang_runtime::fdt::Arm64FdtRegion {
+                size: RTC_MMIO_DEVICE_WINDOW_SIZE / 2,
+                ..rtc.region
+            },
+        };
+        let bytes =
+            build_process_fdt_fixture(&state, serial, wrong_rtc_size, vmgenid, vmclock, &[]);
+        assert_eq!(
+            validate_default_process_fdt(&bytes, &state, serial.interrupt_line),
+            Err(HvfSnapshotV2ProcessFdtMismatch::Rtc)
+        );
+
+        let wrong_vmgenid = bangbang_runtime::fdt::Arm64FdtVmGenIdDevice {
+            interrupt_line: bangbang_runtime::interrupt::GuestInterruptLine::new(
+                vmclock.interrupt_line.raw_value() + 1,
+            )
+            .expect("fixture VMGenID interrupt drift should validate"),
+            ..vmgenid
+        };
+        let bytes = build_process_fdt_fixture(&state, serial, rtc, wrong_vmgenid, vmclock, &[]);
+        assert_eq!(
+            validate_default_process_fdt(&bytes, &state, serial.interrupt_line),
+            Err(HvfSnapshotV2ProcessFdtMismatch::VmGenId)
+        );
+
+        let wrong_vmclock = bangbang_runtime::fdt::Arm64FdtVmClockDevice {
+            interrupt_line: bangbang_runtime::interrupt::GuestInterruptLine::new(
+                vmclock.interrupt_line.raw_value() + 2,
+            )
+            .expect("fixture VMClock interrupt drift should validate"),
+            ..vmclock
+        };
+        let bytes = build_process_fdt_fixture(&state, serial, rtc, vmgenid, wrong_vmclock, &[]);
+        assert_eq!(
+            validate_default_process_fdt(&bytes, &state, serial.interrupt_line),
+            Err(HvfSnapshotV2ProcessFdtMismatch::VmClock)
+        );
+    }
+
+    #[test]
+    fn process_fdt_memory_omits_the_reserved_arm64_system_area() {
+        let range = GuestMemoryRange::new(
+            GuestAddress::new(aarch64::DRAM_MEM_START),
+            aarch64::SYSTEM_MEM_SIZE * 2,
+        )
+        .expect("test memory range should validate");
+        let layout = bangbang_runtime::memory::GuestMemoryLayout::new(vec![range])
+            .expect("test memory layout should validate");
+        let memory = GuestMemory::allocate(&layout).expect("test guest memory should allocate");
+        let mut image = std::io::Cursor::new(Vec::new());
+        let binding = write_snapshot_v2_memory_image(&memory, &mut image)
+            .expect("test native-v2 binding should encode");
+        let advertised_start = aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE;
+        let advertised_size = range.size() - aarch64::SYSTEM_MEM_SIZE;
+        let mut advertised = Vec::with_capacity(16);
+        advertised.extend_from_slice(&advertised_start.to_be_bytes());
+        advertised.extend_from_slice(&advertised_size.to_be_bytes());
+        let node = Node {
+            name: "memory@ram".to_owned(),
+            props: vec![("reg".to_owned(), advertised)],
+            children: Vec::new(),
+        };
+
+        assert!(memory_property_matches_binding(&node, &binding));
+
+        let mut unadjusted = Vec::with_capacity(16);
+        unadjusted.extend_from_slice(&range.start().raw_value().to_be_bytes());
+        unadjusted.extend_from_slice(&range.size().to_be_bytes());
+        let unadjusted_node = Node {
+            name: "memory@ram".to_owned(),
+            props: vec![("reg".to_owned(), unadjusted)],
+            children: Vec::new(),
+        };
+        assert!(!memory_property_matches_binding(&unadjusted_node, &binding));
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ProtocolEvent {

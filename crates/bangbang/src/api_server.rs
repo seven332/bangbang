@@ -2843,7 +2843,9 @@ mod tests {
             input: &SnapshotLoadInput,
         ) -> Result<SnapshotV1LoadSuccess<Self::Session>, NativeV1SnapshotLoadError> {
             if !self.snapshot_operations_succeed {
-                return Err(NativeV1SnapshotLoadError::ProcessTerminal);
+                return Err(NativeV1SnapshotLoadError::ProcessPreparation(
+                    BackendError::InvalidState("test snapshot load failed"),
+                ));
             }
             let drive =
                 DriveConfigInput::new("root", "root", "/private/fake-api-restored-root", true)
@@ -9027,7 +9029,7 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(
-            "failed to load snapshot: hypervisor error: native-v1 load process is terminal"
+            "failed to load snapshot: hypervisor error: native-v1 process preparation failed"
         ));
         assert!(!response.contains("private-load-state-1254"));
         assert!(!response.contains("private-load-memory-1254"));

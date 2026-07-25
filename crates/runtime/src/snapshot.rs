@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::block::{DriveConfig, DriveConfigs};
+use crate::boot::BootSourceConfig;
 use crate::machine::MachineConfig;
 use crate::serial::SerialConfig;
 use crate::vsock::{VsockBackendSelector, VsockBackendSelectorError};
@@ -51,6 +52,64 @@ impl fmt::Debug for SnapshotV1ControllerCommit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SnapshotV1ControllerCommit")
             .field("profile", &"native-v1")
+            .field("configuration", &REDACTED)
+            .field("resume_requested", &self.resume_requested)
+            .finish()
+    }
+}
+
+/// Preallocated controller state committed only after native-v2 restore success.
+pub struct SnapshotV2ControllerCommit {
+    machine_config: MachineConfig,
+    boot_source_config: BootSourceConfig,
+    drive_configs: DriveConfigs,
+    serial_config: SerialConfig,
+    resume_requested: bool,
+}
+
+impl SnapshotV2ControllerCommit {
+    /// Retains already-decoded machine and inert boot metadata for publication.
+    pub fn new(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        resume_requested: bool,
+    ) -> Self {
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::new(),
+            serial_config: SerialConfig::default(),
+            resume_requested,
+        }
+    }
+
+    pub const fn resume_requested(&self) -> bool {
+        self.resume_requested
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        MachineConfig,
+        BootSourceConfig,
+        DriveConfigs,
+        SerialConfig,
+        bool,
+    ) {
+        (
+            self.machine_config,
+            self.boot_source_config,
+            self.drive_configs,
+            self.serial_config,
+            self.resume_requested,
+        )
+    }
+}
+
+impl fmt::Debug for SnapshotV2ControllerCommit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotV2ControllerCommit")
+            .field("profile", &"native-v2")
             .field("configuration", &REDACTED)
             .field("resume_requested", &self.resume_requested)
             .finish()
@@ -477,6 +536,27 @@ pub(crate) enum SnapshotV2CreateRejection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotV2LoadRejection {
+    MemoryBackend,
+    LoadClockRealtime,
+    LoadNetworkOverrides,
+    LoadVsockOverride,
+    DeprecatedFields,
+    MachineProfile,
+    BootSource,
+    DriveDevice,
+    NetworkDevice,
+    VsockDevice,
+    PmemDevice,
+    BalloonDevice,
+    MemoryHotplugDevice,
+    EntropyDevice,
+    MmdsState,
+    SerialConfig,
+    LoadProcessConfigured,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SnapshotV2CreateProfile {
     pub(crate) boot_source_configured: bool,
     pub(crate) drive_configured: bool,
@@ -506,6 +586,21 @@ pub(crate) struct SnapshotV1VmProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SnapshotV1LoadProfile {
+    pub(crate) machine_is_default: bool,
+    pub(crate) boot_source_configured: bool,
+    pub(crate) drive_configured: bool,
+    pub(crate) network_configured: bool,
+    pub(crate) vsock_configured: bool,
+    pub(crate) pmem_configured: bool,
+    pub(crate) balloon_configured: bool,
+    pub(crate) memory_hotplug_configured: bool,
+    pub(crate) entropy_configured: bool,
+    pub(crate) mmds_configured: bool,
+    pub(crate) serial_is_default: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotV2LoadProfile {
     pub(crate) machine_is_default: bool,
     pub(crate) boot_source_configured: bool,
     pub(crate) drive_configured: bool,
@@ -702,6 +797,80 @@ pub(crate) fn classify_v1_load_eligibility(
 }
 
 #[cfg(test)]
+pub(crate) fn classify_v2_load(
+    input: &SnapshotLoadInput,
+    snapshot_load_history_fresh: bool,
+    profile: SnapshotV2LoadProfile,
+) -> Result<(), SnapshotV2LoadRejection> {
+    classify_v2_load_request(input)?;
+    classify_v2_load_eligibility(snapshot_load_history_fresh, profile)
+}
+
+pub(crate) fn classify_v2_load_request(
+    input: &SnapshotLoadInput,
+) -> Result<(), SnapshotV2LoadRejection> {
+    if input.mem_backend.backend_type != SnapshotMemoryBackendType::File {
+        return Err(SnapshotV2LoadRejection::MemoryBackend);
+    }
+    if input.clock_realtime {
+        return Err(SnapshotV2LoadRejection::LoadClockRealtime);
+    }
+    if !input.network_overrides.is_empty() {
+        return Err(SnapshotV2LoadRejection::LoadNetworkOverrides);
+    }
+    if input.vsock_override.is_some() {
+        return Err(SnapshotV2LoadRejection::LoadVsockOverride);
+    }
+    if input.deprecated_fields_used {
+        return Err(SnapshotV2LoadRejection::DeprecatedFields);
+    }
+    Ok(())
+}
+
+pub(crate) fn classify_v2_load_eligibility(
+    snapshot_load_history_fresh: bool,
+    profile: SnapshotV2LoadProfile,
+) -> Result<(), SnapshotV2LoadRejection> {
+    if !snapshot_load_history_fresh {
+        return Err(SnapshotV2LoadRejection::LoadProcessConfigured);
+    }
+    if !profile.machine_is_default {
+        return Err(SnapshotV2LoadRejection::MachineProfile);
+    }
+    if profile.boot_source_configured {
+        return Err(SnapshotV2LoadRejection::BootSource);
+    }
+    if profile.drive_configured {
+        return Err(SnapshotV2LoadRejection::DriveDevice);
+    }
+    if profile.network_configured {
+        return Err(SnapshotV2LoadRejection::NetworkDevice);
+    }
+    if profile.vsock_configured {
+        return Err(SnapshotV2LoadRejection::VsockDevice);
+    }
+    if profile.pmem_configured {
+        return Err(SnapshotV2LoadRejection::PmemDevice);
+    }
+    if profile.balloon_configured {
+        return Err(SnapshotV2LoadRejection::BalloonDevice);
+    }
+    if profile.memory_hotplug_configured {
+        return Err(SnapshotV2LoadRejection::MemoryHotplugDevice);
+    }
+    if profile.entropy_configured {
+        return Err(SnapshotV2LoadRejection::EntropyDevice);
+    }
+    if profile.mmds_configured {
+        return Err(SnapshotV2LoadRejection::MmdsState);
+    }
+    if !profile.serial_is_default {
+        return Err(SnapshotV2LoadRejection::SerialConfig);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -744,6 +913,22 @@ mod tests {
 
     fn clean_load_profile() -> SnapshotV1LoadProfile {
         SnapshotV1LoadProfile {
+            machine_is_default: true,
+            boot_source_configured: false,
+            drive_configured: false,
+            network_configured: false,
+            vsock_configured: false,
+            pmem_configured: false,
+            balloon_configured: false,
+            memory_hotplug_configured: false,
+            entropy_configured: false,
+            mmds_configured: false,
+            serial_is_default: true,
+        }
+    }
+
+    fn clean_v2_load_profile() -> SnapshotV2LoadProfile {
+        SnapshotV2LoadProfile {
             machine_is_default: true,
             boot_source_configured: false,
             drive_configured: false,
@@ -1189,6 +1374,144 @@ mod tests {
         ];
         for (profile, expected) in profile_cases {
             assert_eq!(classify_v1_load(&file_load(), true, profile), Err(expected));
+        }
+    }
+
+    #[test]
+    fn native_v2_load_policy_accepts_only_file_and_a_pristine_destination() {
+        assert_eq!(
+            classify_v2_load(&file_load(), true, clean_v2_load_profile()),
+            Ok(())
+        );
+        assert_eq!(
+            classify_v2_load(
+                &file_load()
+                    .with_track_dirty_pages(true)
+                    .with_resume_vm(true),
+                true,
+                clean_v2_load_profile(),
+            ),
+            Ok(())
+        );
+
+        let request_cases = [
+            (
+                SnapshotLoadInput::new(
+                    "state",
+                    SnapshotMemoryBackend::new("memory", SnapshotMemoryBackendType::Uffd),
+                ),
+                SnapshotV2LoadRejection::MemoryBackend,
+            ),
+            (
+                file_load().with_clock_realtime(true),
+                SnapshotV2LoadRejection::LoadClockRealtime,
+            ),
+            (
+                file_load()
+                    .with_network_overrides(vec![SnapshotNetworkOverride::new("eth0", "tap0")]),
+                SnapshotV2LoadRejection::LoadNetworkOverrides,
+            ),
+            (
+                file_load().with_vsock_override(SnapshotVsockOverride::new("vsock")),
+                SnapshotV2LoadRejection::LoadVsockOverride,
+            ),
+            (
+                file_load().with_deprecated_fields_used(true),
+                SnapshotV2LoadRejection::DeprecatedFields,
+            ),
+        ];
+        for (input, expected) in request_cases {
+            assert_eq!(
+                classify_v2_load(&input, true, clean_v2_load_profile()),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            classify_v2_load(&file_load(), false, clean_v2_load_profile()),
+            Err(SnapshotV2LoadRejection::LoadProcessConfigured)
+        );
+
+        let profile_cases = [
+            (
+                SnapshotV2LoadProfile {
+                    machine_is_default: false,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::MachineProfile,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    boot_source_configured: true,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::BootSource,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    drive_configured: true,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::DriveDevice,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    network_configured: true,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::NetworkDevice,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    vsock_configured: true,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::VsockDevice,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    pmem_configured: true,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::PmemDevice,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    balloon_configured: true,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::BalloonDevice,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    memory_hotplug_configured: true,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::MemoryHotplugDevice,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    entropy_configured: true,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::EntropyDevice,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    mmds_configured: true,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::MmdsState,
+            ),
+            (
+                SnapshotV2LoadProfile {
+                    serial_is_default: false,
+                    ..clean_v2_load_profile()
+                },
+                SnapshotV2LoadRejection::SerialConfig,
+            ),
+        ];
+        for (profile, expected) in profile_cases {
+            assert_eq!(classify_v2_load(&file_load(), true, profile), Err(expected));
         }
     }
 

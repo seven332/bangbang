@@ -2925,8 +2925,8 @@ mod platform {
     #[cfg(test)]
     pub(crate) use tests::{
         TestDirectory as TestVhostDirectory, empty_grant_authority_for_vhost_test,
-        file_grant_authority_for_test, vhost_directory_authority_for_test,
-        vsock_directory_authority_for_test,
+        file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
+        vhost_directory_authority_for_test, vsock_directory_authority_for_test,
     };
 
     #[cfg(test)]
@@ -3172,6 +3172,66 @@ mod platform {
                 .registry
         }
 
+        fn snapshot_file_registry(state_path: &Path, memory_path: &Path) -> GrantRegistry {
+            let session = SessionId::from_bytes([33; 32]);
+            let batch = BatchId::from_bytes([34; 16]);
+            let mut staged = StagedGrantBatch::new(session);
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    0,
+                    GrantRecord::Begin {
+                        grant_count: 2,
+                        record_count: 4,
+                        bookmark_bytes: 0,
+                    },
+                    None,
+                ))
+                .expect("snapshot grant begin should stage");
+            for (sequence, (id, role, path)) in [
+                (
+                    "snapshot-state",
+                    ResourceRole::SnapshotStateInput,
+                    state_path,
+                ),
+                (
+                    "snapshot-memory",
+                    ResourceRole::SnapshotMemoryInput,
+                    memory_path,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (record, descriptor) = file_record(id, role, GrantAccess::ReadOnly, path);
+                staged
+                    .accept(received(
+                        session,
+                        batch,
+                        u64::try_from(sequence + 1).expect("snapshot sequence should fit"),
+                        record,
+                        Some(descriptor),
+                    ))
+                    .expect("snapshot descriptor should stage");
+            }
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    3,
+                    GrantRecord::Commit {
+                        grant_count: 2,
+                        record_count: 4,
+                        bookmark_bytes: 0,
+                    },
+                    None,
+                ))
+                .expect("snapshot grant commit should validate")
+                .expect("snapshot grant commit should return a registry")
+                .registry
+        }
+
         fn directory_registry(id: &str, role: ResourceRole) -> (GrantRegistry, TestDirectory) {
             let directory = TestDirectory::new();
             let bookmark = create_implicit_bookmark(directory.path(), true)
@@ -3274,6 +3334,14 @@ mod platform {
 
         pub(crate) fn file_grant_authority_for_test() -> GrantAuthority {
             let mut registry = file_registry();
+            GrantAuthority::new(registry.take_file_registry())
+        }
+
+        pub(crate) fn snapshot_file_grant_authority_for_test(
+            state_path: &Path,
+            memory_path: &Path,
+        ) -> GrantAuthority {
+            let mut registry = snapshot_file_registry(state_path, memory_path);
             GrantAuthority::new(registry.take_file_registry())
         }
 
@@ -4479,5 +4547,6 @@ pub(crate) use platform::{
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{
     TestVhostDirectory, empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
-    vhost_directory_authority_for_test, vsock_directory_authority_for_test,
+    snapshot_file_grant_authority_for_test, vhost_directory_authority_for_test,
+    vsock_directory_authority_for_test,
 };

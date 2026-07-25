@@ -2831,9 +2831,12 @@ composes that publisher with a strictly admitted paused production session,
 canonical default UART proof, cancellable topology/memory capture, exact 2.3
 encoding, inner-coordinator recovery, and repeat source publication. A signed
 two-vCPU process proof and the signed runnable/suspended/offline HVF proof cover
-the real owners. No public process action invokes the v2 path yet; public
-activation, v2 process restore, optional devices, and broader cross-host
-portability remain Wave 6 work.
+the real owners. #1577 privately restores prepared File/COW pairs state-first
+into pristine normal processes, validates the exact default FDT/UART/RTC/time
+shell before HVF, installs fresh destination serial output, and commits a
+closed supervisor session initially Paused before ordinary lifecycle resume.
+No public process action invokes the v2 path yet; public activation, optional
+devices, and broader cross-host portability remain Wave 6 work.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are
 not part of the minimal RTC device. The backend-neutral arm64 FDT builder emits
@@ -3953,7 +3956,7 @@ Their eventual support level should follow the endpoint matrix:
   and portability remain #1490 work rather than live snapshot-compatibility
   claims
 - snapshot behavior beyond the implemented narrow native-v1 profile. The
-  library-only native-v2 profile retains readable `2.0.0`/`2.1.x`/`2.2.x`
+  private native-v2 profile retains readable `2.0.0`/`2.1.x`/`2.2.x`
   state. The current `2.3.0` writer carries an exact typed 1–32-vCPU
   machine/global-GIC/topology/vCPU graph plus singleton portable
   PL031/PVTime/VMGenID/VMClock state, with CPU-application evidence and closed
@@ -3967,14 +3970,17 @@ Their eventual support level should follow the endpoint matrix:
   timer-suspended lifecycle tokens, and publishes only Paused. Signed
   three-vCPU proof covers repeat immutable loads, distinct clone identities,
   ordered guest notifications/time observations, recapture-to-restore, timer
-  PPI, secondary PSCI completion, and initially offline continuation. There is
-  no public v2 create/load/describe dispatch, general device aggregate, or
-  production resource composition. A VM-free closed native-family handoff now
-  publishes current-v2 and prepares/loads compatible v1/v2 pairs through the
-  existing anchored no-clobber transaction without changing the public v1
-  surface. Remaining work includes public lifecycle routing, optional-device
-  state, Diff artifacts, overrides, Firecracker artifact compatibility,
-  authentication, and broader cross-host portability
+  PPI, secondary PSCI completion, and initially offline continuation. A VM-free
+  closed native-family handoff publishes current-v2 and prepares/loads
+  compatible v1/v2 pairs through the existing anchored no-clobber transaction.
+  The private normal-process adapter admits only pristine File/COW destinations,
+  validates the exact minimal FDT/UART/RTC/time shell before HVF, installs fresh
+  destination serial output, and commits a closed session initially Paused.
+  There is no public v2 create/load/describe dispatch or general device
+  aggregate, and the public v1 surface is unchanged. Remaining work includes
+  public lifecycle routing, optional-device state, Diff artifacts, overrides,
+  Firecracker artifact compatibility, authentication, and broader cross-host
+  portability
 - balloon producers outside the implemented queue/discard/reporting activity
   and serialized/restored balloon state; live paired PFN accounting and
   capture-ready ownership are implemented, while absent guest statistics are
@@ -4005,8 +4011,9 @@ Their eventual support level should follow the endpoint matrix:
   slot mechanism
 - complete production snapshot ownership beyond the current one-vCPU
   native-v1 aggregate and the focused unpublished native-v2 multi-vCPU
-  platform, including generic optional devices, the four-scheduler/public
-  transaction, and external-buffer policy
+  platform plus its minimal private normal-process adapter, including generic
+  optional devices, the four-scheduler/public transaction, and external-buffer
+  policy
 - runtime device attach/remove behavior beyond implemented in-place updates and
   stable unsupported paths
 
