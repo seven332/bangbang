@@ -1238,12 +1238,16 @@ is resource-specific:
   conversions and arithmetic, requires canonical packed ranges and exact EOF,
   and validates the whole-state CRC before publishing a borrowed view. The pass
   performs no count-proportional allocation. The immutable `2.0.0` catalogs are
-  empty; minor 1 adds semantic memory kind 1, instance 0, and the current
-  `2.2.0` writer adds exact singleton machine/global/topology kinds 2–4 plus
-  contiguous per-vCPU kind 5. The platform decoder verifies that complete
-  directory profile without payload-dependent allocation, caps every inner
-  count and length before reservation, allocation-free scans the closed
-  optional debug/SME registry, then cross-validates the complete owned graph.
+  empty; minor 1 adds semantic memory kind 1, minor 2 adds exact singleton
+  machine/global/topology kinds 2–4 plus contiguous per-vCPU kind 5, and the
+  current `2.3.0` writer appends singleton time/clone-identity kind 6. The
+  platform decoder verifies that complete directory profile without
+  payload-dependent allocation, caps every inner count and length before
+  reservation, allocation-free scans the closed optional debug/SME registry,
+  then cross-validates the complete owned graph. Time state admits only four
+  fixed policies, exact canonical placements and notification lines, a valid
+  VMClock ABI, and topology-ordered PVTime records; source VMGenID bytes,
+  pointers, `Instant` values, and absolute time anchors never enter the format.
   Inert path bytes are never opened or resolved. Unknown mandatory behavior
   fails closed, while explicitly nonsemantic structural extensions can survive
   complete structural validation outside the exact platform profile. Errors
@@ -1251,16 +1255,20 @@ is resource-specific:
   checksums used as identities, GIC bytes, format magic, guest contents, and raw
   state. The Firecracker prefix classifier proves only an incompatible family
   and never deserializes or translates upstream bitcode. The unpublished
-  #1569 reconstruction boundary accepts only this owned cross-validated graph
-  plus an already-authorized `GuestMemory`; it never opens an inert kernel,
-  initrd, or memory path. Exact memory ranges, mapped FDT checksum, and
-  destination cache identity are checked before VM creation. The guard owns VM,
-  memory, GIC, all never-run vCPU owners, CPU replay, global GIC, per-vCPU
-  state, and fresh lifecycle import until it can publish one paused focused
-  owner. Partial failure attempts reverse topology/backend cleanup and retains
+  #1569/#1529 reconstruction boundary accepts only this owned cross-validated
+  graph plus an already-authorized `GuestMemory`; it never opens an inert
+  kernel, initrd, or memory path. Exact memory ranges, mapped FDT checksum,
+  destination cache identity, guest VMClock/PVTime bytes, and identity
+  destinations are checked before VM creation. The guard owns VM, memory, GIC,
+  all never-run vCPU owners, CPU replay, global GIC, per-vCPU state, fresh
+  PL031, PVTime accounting, VMGenID/VMClock resources, and lifecycle import
+  until it can publish one paused focused owner. VMGenID is freshly generated;
+  it is written and signalled before the saved-counter VMClock transition. A
+  failure after the first guest-visible identity write is terminal, while
+  earlier partial failure attempts reverse topology/backend cleanup and retains
   value-free primary and cleanup evidence. No control or runnable owner escapes
-  earlier. Devices, host endpoints, time/PVTime/identity correction, public
-  create/describe/load, and VM actions remain outside this boundary.
+  earlier. General devices, host endpoints, public create/describe/load, and VM
+  actions remain outside this boundary.
 - Native-v2 lazy memory validates the state binding before opening or adopting
   a source, then requires a read-only close-on-exec regular descriptor, exact
   canonical length, stable descriptor identity/facts, an exact repeated header,

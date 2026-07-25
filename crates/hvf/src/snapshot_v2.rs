@@ -6,22 +6,29 @@ use std::fmt;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 
+use bangbang_runtime::fdt::{ARM64_FDT_VMCLOCK_SIZE, ARM64_FDT_VMGENID_SIZE, Arm64FdtRegion};
+use bangbang_runtime::interrupt::GuestInterruptLine;
 use bangbang_runtime::machine::{
     MAX_SUPPORTED_VCPUS, MachineConfig, MachineConfigCpuTemplate, MachineConfigHugePages,
     MachineConfigInput,
 };
-use bangbang_runtime::memory::{GuestAddress, aarch64};
+use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange, aarch64};
+use bangbang_runtime::pvtime::{
+    ARM64_PVTIME_STRUCTURE_ALIGNMENT, ARM64_PVTIME_STRUCTURE_SIZE, Arm64PvTimeLayout,
+};
 use bangbang_runtime::rtc::{RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
+use bangbang_runtime::snapshot_device::SnapshotV1PlatformDeviceMetadata;
 use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_GLOBAL_COMPONENT_KEY, NATIVE_V2_MACHINE_COMPONENT_KEY,
-    NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_TOPOLOGY_COMPONENT_KEY, SnapshotV2Component,
-    SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
+    NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_TIME_COMPONENT_KEY, NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
+    SnapshotV2Component, SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
     encode_snapshot_v2_state, native_v2_vcpu_component_key,
 };
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError, SnapshotV2MemoryStateError,
     decode_snapshot_v2_memory_binding,
 };
+use bangbang_runtime::vmclock::{VMCLOCK_ABI_SIZE, VmClockAbi};
 
 use crate::cpu_template::{
     HVF_ARM64_CPU_TEMPLATE_APPLICATION_MAX_ENTRIES, HvfArm64CpuTemplateApplicationEntry,
@@ -62,6 +69,7 @@ const MACHINE_MAGIC: [u8; 8] = *b"BANGMC2\0";
 const GLOBAL_MAGIC: [u8; 8] = *b"BANGGL2\0";
 const TOPOLOGY_MAGIC: [u8; 8] = *b"BANGTP2\0";
 const VCPU_MAGIC: [u8; 8] = *b"BANGVC2\0";
+const TIME_MAGIC: [u8; 8] = *b"BANGTM2\0";
 const OPTIONAL_MAGIC: [u8; 8] = *b"BANGOP2\0";
 const MACHINE_HEADER_BYTES: usize = 80;
 const MACHINE_CPU_ENTRY_BYTES: usize = 72;
@@ -71,6 +79,12 @@ const TOPOLOGY_HEADER_BYTES: usize = 32;
 const TOPOLOGY_MEMBER_BYTES: usize = 48;
 const VCPU_HEADER_BYTES: usize = 48;
 const VCPU_INTERRUPT_BYTES: usize = 144;
+const TIME_HEADER_BYTES: usize = 240;
+const TIME_PVTIME_ENTRY_BYTES: usize = 24;
+const TIME_RTC_POLICY_DESTINATION_SYSTEM_TIME: u8 = 1;
+const TIME_PVTIME_POLICY_PRESERVE_EXCLUDE_DOWNTIME: u8 = 1;
+const TIME_VMGENID_POLICY_REGENERATE_NOTIFY: u8 = 1;
+const TIME_VMCLOCK_POLICY_INCREMENT_NOTIFY: u8 = 1;
 const OPTIONAL_HEADER_BYTES: usize = 64;
 const OPTIONAL_RECORD_HEADER_BYTES: usize = 12;
 const OPTIONAL_DEBUG_CAPACITY: usize = 16;
@@ -471,6 +485,192 @@ impl fmt::Debug for HvfSnapshotV2VcpuState {
     }
 }
 
+/// Portable PL031 reconstruction policy for native-v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2RtcRestorePolicy {
+    /// Reset mutable PL031 state and anchor it to destination `SystemTime`.
+    DestinationSystemTimeReset,
+}
+
+/// Portable arm64 PVTime downtime policy for native-v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2PvTimeRestorePolicy {
+    /// Preserve cumulative stolen time and exclude paused snapshot downtime.
+    PreserveCumulativeExcludeDowntime,
+}
+
+/// Portable VMGenID reconstruction policy for native-v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2VmGenIdRestorePolicy {
+    /// Generate, publish, and notify a fresh destination identity.
+    RegenerateAndNotify,
+}
+
+/// Portable VMClock reconstruction policy for native-v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2VmClockRestorePolicy {
+    /// Atomically increment saved disruption/generation state and notify.
+    IncrementAndNotify,
+}
+
+/// One topology-ordered arm64 PVTime capture retained by native-v2.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfSnapshotV2PvTimeVcpuState {
+    index: u32,
+    record_ipa: GuestAddress,
+    stolen_time_ns: u64,
+}
+
+impl HvfSnapshotV2PvTimeVcpuState {
+    /// Construct one locally checked per-vCPU PVTime value.
+    pub fn try_new(
+        index: u32,
+        record_ipa: GuestAddress,
+        stolen_time_ns: u64,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        if index >= u32::from(MAX_SUPPORTED_VCPUS)
+            || !record_ipa
+                .raw_value()
+                .is_multiple_of(ARM64_PVTIME_STRUCTURE_ALIGNMENT)
+        {
+            return Err(HvfSnapshotV2BuildError::Time);
+        }
+        Ok(Self {
+            index,
+            record_ipa,
+            stolen_time_ns,
+        })
+    }
+
+    /// Return the canonical vCPU index.
+    pub const fn index(self) -> u32 {
+        self.index
+    }
+
+    /// Return the guest-physical standard stolen-time record address.
+    pub const fn record_ipa(self) -> GuestAddress {
+        self.record_ipa
+    }
+
+    /// Return the captured cumulative stolen time.
+    pub const fn stolen_time_ns(self) -> u64 {
+        self.stolen_time_ns
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2PvTimeVcpuState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfSnapshotV2PvTimeVcpuState")
+            .field("index", &self.index)
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Complete portable native-v2 time and clone-identity state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfSnapshotV2TimeState {
+    rtc_layout: RtcMmioLayout,
+    vmgenid: SnapshotV1PlatformDeviceMetadata,
+    vmclock: SnapshotV1PlatformDeviceMetadata,
+    vmclock_abi: VmClockAbi,
+    pvtime_vcpus: Vec<HvfSnapshotV2PvTimeVcpuState>,
+}
+
+impl HvfSnapshotV2TimeState {
+    /// Construct one locally checked time component.
+    pub fn try_new(
+        rtc_layout: RtcMmioLayout,
+        vmgenid: SnapshotV1PlatformDeviceMetadata,
+        vmclock: SnapshotV1PlatformDeviceMetadata,
+        vmclock_abi: VmClockAbi,
+        pvtime_vcpus: Vec<HvfSnapshotV2PvTimeVcpuState>,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let state = Self {
+            rtc_layout,
+            vmgenid,
+            vmclock,
+            vmclock_abi,
+            pvtime_vcpus,
+        };
+        validate_time(&state)?;
+        Ok(state)
+    }
+
+    /// Return the destination-owned PL031 placement.
+    pub const fn rtc_layout(&self) -> RtcMmioLayout {
+        self.rtc_layout
+    }
+
+    /// Return the supported PL031 restore policy.
+    pub const fn rtc_restore_policy(&self) -> HvfSnapshotV2RtcRestorePolicy {
+        HvfSnapshotV2RtcRestorePolicy::DestinationSystemTimeReset
+    }
+
+    /// Return portable VMGenID placement and notification metadata.
+    pub const fn vmgenid(&self) -> SnapshotV1PlatformDeviceMetadata {
+        self.vmgenid
+    }
+
+    /// Return the supported VMGenID restore policy.
+    pub const fn vmgenid_restore_policy(&self) -> HvfSnapshotV2VmGenIdRestorePolicy {
+        HvfSnapshotV2VmGenIdRestorePolicy::RegenerateAndNotify
+    }
+
+    /// Return portable VMClock placement and notification metadata.
+    pub const fn vmclock(&self) -> SnapshotV1PlatformDeviceMetadata {
+        self.vmclock
+    }
+
+    /// Return the exact captured VMClock ABI.
+    pub const fn vmclock_abi(&self) -> VmClockAbi {
+        self.vmclock_abi
+    }
+
+    /// Return the supported VMClock restore policy.
+    pub const fn vmclock_restore_policy(&self) -> HvfSnapshotV2VmClockRestorePolicy {
+        HvfSnapshotV2VmClockRestorePolicy::IncrementAndNotify
+    }
+
+    /// Return ordered per-vCPU PVTime values.
+    pub fn pvtime_vcpus(&self) -> &[HvfSnapshotV2PvTimeVcpuState] {
+        &self.pvtime_vcpus
+    }
+
+    /// Return the supported PVTime downtime policy.
+    pub const fn pvtime_restore_policy(&self) -> HvfSnapshotV2PvTimeRestorePolicy {
+        HvfSnapshotV2PvTimeRestorePolicy::PreserveCumulativeExcludeDowntime
+    }
+
+    /// Consume the portable state into placement, ABI, and per-vCPU values.
+    pub fn into_parts(
+        self,
+    ) -> (
+        RtcMmioLayout,
+        SnapshotV1PlatformDeviceMetadata,
+        SnapshotV1PlatformDeviceMetadata,
+        VmClockAbi,
+        Vec<HvfSnapshotV2PvTimeVcpuState>,
+    ) {
+        (
+            self.rtc_layout,
+            self.vmgenid,
+            self.vmclock,
+            self.vmclock_abi,
+            self.pvtime_vcpus,
+        )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2TimeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfSnapshotV2TimeState")
+            .field("vcpu_count", &self.pvtime_vcpus.len())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
 /// Completely decoded and cross-validated native-v2 platform graph.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HvfSnapshotV2PlatformState {
@@ -479,6 +679,7 @@ pub struct HvfSnapshotV2PlatformState {
     global: HvfSnapshotV2GlobalState,
     topology: HvfArm64StablePausedTopologyState,
     vcpus: Vec<HvfSnapshotV2VcpuState>,
+    time: HvfSnapshotV2TimeState,
 }
 
 impl HvfSnapshotV2PlatformState {
@@ -489,6 +690,7 @@ impl HvfSnapshotV2PlatformState {
         global: HvfSnapshotV2GlobalState,
         topology: HvfArm64StablePausedTopologyState,
         vcpus: Vec<HvfSnapshotV2VcpuState>,
+        time: HvfSnapshotV2TimeState,
     ) -> Result<Self, HvfSnapshotV2BuildError> {
         let state = Self {
             memory,
@@ -496,6 +698,7 @@ impl HvfSnapshotV2PlatformState {
             global,
             topology,
             vcpus,
+            time,
         };
         validate_platform(&state)?;
         Ok(state)
@@ -526,7 +729,12 @@ impl HvfSnapshotV2PlatformState {
         &self.vcpus
     }
 
-    /// Consume the graph into its memory, machine, global, lifecycle, and vCPU components.
+    /// Return portable time and clone-identity state.
+    pub const fn time(&self) -> &HvfSnapshotV2TimeState {
+        &self.time
+    }
+
+    /// Consume the graph into all canonical semantic components.
     pub fn into_parts(
         self,
     ) -> (
@@ -535,6 +743,7 @@ impl HvfSnapshotV2PlatformState {
         HvfSnapshotV2GlobalState,
         HvfArm64StablePausedTopologyState,
         Vec<HvfSnapshotV2VcpuState>,
+        HvfSnapshotV2TimeState,
     ) {
         (
             self.memory,
@@ -542,6 +751,7 @@ impl HvfSnapshotV2PlatformState {
             self.global,
             self.topology,
             self.vcpus,
+            self.time,
         )
     }
 }
@@ -580,6 +790,8 @@ pub enum HvfSnapshotV2BuildError {
     Vcpu,
     /// Reviewed optional state is invalid.
     Optional,
+    /// Time or clone-identity state is locally invalid.
+    Time,
     /// Two otherwise valid components disagree.
     CrossComponent,
 }
@@ -598,6 +810,7 @@ impl fmt::Display for HvfSnapshotV2BuildError {
             Self::Topology => "topology",
             Self::Vcpu => "vCPU",
             Self::Optional => "optional state",
+            Self::Time => "time and clone identity",
             Self::CrossComponent => "cross-component relationship",
         };
         write!(f, "invalid native-v2 HVF platform {category}")
@@ -619,9 +832,49 @@ fn validate_machine_config(machine: MachineConfig) -> Result<(), HvfSnapshotV2Bu
     Ok(())
 }
 
+fn validate_time(state: &HvfSnapshotV2TimeState) -> Result<(), HvfSnapshotV2BuildError> {
+    if state.pvtime_vcpus.is_empty()
+        || state.pvtime_vcpus.len() > usize::from(MAX_SUPPORTED_VCPUS)
+        || state.vmgenid.interrupt_line() == state.vmclock.interrupt_line()
+        || !platform_metadata_is_locally_valid(state.vmgenid, ARM64_FDT_VMGENID_SIZE)
+        || !platform_metadata_is_locally_valid(state.vmclock, ARM64_FDT_VMCLOCK_SIZE)
+        || VmClockAbi::from_bytes(state.vmclock_abi.to_bytes()).is_err()
+    {
+        return Err(HvfSnapshotV2BuildError::Time);
+    }
+    for (position, vcpu) in state.pvtime_vcpus.iter().enumerate() {
+        if usize::try_from(vcpu.index).ok() != Some(position)
+            || !vcpu
+                .record_ipa
+                .raw_value()
+                .is_multiple_of(ARM64_PVTIME_STRUCTURE_ALIGNMENT)
+        {
+            return Err(HvfSnapshotV2BuildError::Time);
+        }
+    }
+    Ok(())
+}
+
+fn platform_metadata_is_locally_valid(
+    metadata: SnapshotV1PlatformDeviceMetadata,
+    expected_size: u64,
+) -> bool {
+    let range = metadata.range();
+    let fdt = metadata.fdt_region();
+    range.size() == expected_size
+        && fdt.base == range.start().raw_value()
+        && fdt.size == range.size()
+        && range
+            .start()
+            .raw_value()
+            .checked_add(range.size())
+            .is_some()
+}
+
 fn validate_platform(state: &HvfSnapshotV2PlatformState) -> Result<(), HvfSnapshotV2BuildError> {
     validate_machine_config(state.machine.machine)?;
     validate_compatibility(&state.global.compatibility)?;
+    validate_time(&state.time)?;
     if state.global.gic_device.is_empty()
         || state.global.gic_device.len() > HVF_SNAPSHOT_V2_GIC_DEVICE_STATE_MAX_BYTES
     {
@@ -717,7 +970,88 @@ fn validate_platform(state: &HvfSnapshotV2PlatformState) -> Result<(), HvfSnapsh
             _ => return Err(HvfSnapshotV2BuildError::CrossComponent),
         }
     }
+    validate_platform_time(state, &layout)?;
     Ok(())
+}
+
+fn validate_platform_time(
+    state: &HvfSnapshotV2PlatformState,
+    memory_layout: &bangbang_runtime::memory::GuestMemoryLayout,
+) -> Result<(), HvfSnapshotV2BuildError> {
+    let time = &state.time;
+    let expected_count = usize::from(state.machine.machine.vcpu_count());
+    if time.pvtime_vcpus.len() != expected_count
+        || time.rtc_layout != state.global.compatibility.rtc_mmio_layout()
+    {
+        return Err(HvfSnapshotV2BuildError::CrossComponent);
+    }
+
+    let expected_vmclock = aarch64::SYSTEM_MEM_START
+        .checked_add(aarch64::SYSTEM_MEM_SIZE)
+        .and_then(|end| end.checked_sub(ARM64_FDT_VMCLOCK_SIZE))
+        .ok_or(HvfSnapshotV2BuildError::Time)?;
+    let expected_vmgenid = expected_vmclock
+        .checked_sub(ARM64_FDT_VMGENID_SIZE)
+        .ok_or(HvfSnapshotV2BuildError::Time)?;
+    if time.vmclock.range().start().raw_value() != expected_vmclock
+        || time.vmgenid.range().start().raw_value() != expected_vmgenid
+        || time.vmclock.range().overlaps(time.vmgenid.range())
+        || !range_is_backed(memory_layout, time.vmclock.range())
+        || !range_is_backed(memory_layout, time.vmgenid.range())
+    {
+        return Err(HvfSnapshotV2BuildError::CrossComponent);
+    }
+
+    let spi = state
+        .global
+        .compatibility
+        .gic_metadata()
+        .spi_interrupt_range;
+    let spi_end = spi
+        .base
+        .checked_add(spi.count)
+        .ok_or(HvfSnapshotV2BuildError::Compatibility)?;
+    for line in [
+        time.vmgenid.interrupt_line().raw_value(),
+        time.vmclock.interrupt_line().raw_value(),
+    ] {
+        if line < spi.base || line >= spi_end {
+            return Err(HvfSnapshotV2BuildError::CrossComponent);
+        }
+    }
+
+    let arena_size = expected_vmgenid
+        .checked_sub(aarch64::SYSTEM_MEM_START)
+        .ok_or(HvfSnapshotV2BuildError::Time)?;
+    let arena = GuestMemoryRange::new(GuestAddress::new(aarch64::SYSTEM_MEM_START), arena_size)
+        .map_err(|_| HvfSnapshotV2BuildError::Time)?;
+    let expected_layout = Arm64PvTimeLayout::plan(state.machine.machine.vcpu_count(), arena)
+        .map_err(|_| HvfSnapshotV2BuildError::Time)?;
+    for (captured, expected_range) in time
+        .pvtime_vcpus
+        .iter()
+        .zip(expected_layout.records().iter())
+    {
+        let captured_range = GuestMemoryRange::new(
+            captured.record_ipa,
+            u64::try_from(ARM64_PVTIME_STRUCTURE_SIZE)
+                .map_err(|_| HvfSnapshotV2BuildError::Time)?,
+        )
+        .map_err(|_| HvfSnapshotV2BuildError::Time)?;
+        if captured_range != *expected_range || !range_is_backed(memory_layout, captured_range) {
+            return Err(HvfSnapshotV2BuildError::CrossComponent);
+        }
+    }
+    Ok(())
+}
+
+fn range_is_backed(
+    layout: &bangbang_runtime::memory::GuestMemoryLayout,
+    range: GuestMemoryRange,
+) -> bool {
+    layout.ranges().iter().any(|backing| {
+        backing.contains(range.start()) && range.end_exclusive() <= backing.end_exclusive()
+    })
 }
 
 fn validate_compatibility(
@@ -1032,6 +1366,8 @@ pub enum HvfSnapshotV2DecodeError {
     InvalidTopology,
     /// Per-vCPU mandatory/timer/interrupt state is invalid.
     InvalidVcpu,
+    /// Time or clone-identity component is invalid.
+    InvalidTime,
     /// The reviewed optional registry is invalid.
     InvalidOptional,
     /// A bounded typed allocation failed.
@@ -1065,6 +1401,7 @@ impl fmt::Display for HvfSnapshotV2DecodeError {
             Self::InvalidGlobal => "native-v2 HVF global component is invalid",
             Self::InvalidTopology => "native-v2 HVF topology component is invalid",
             Self::InvalidVcpu => "native-v2 HVF vCPU component is invalid",
+            Self::InvalidTime => "native-v2 HVF time component is invalid",
             Self::InvalidOptional => "native-v2 HVF optional registry is invalid",
             Self::Allocation(_) => "native-v2 HVF typed allocation failed",
             Self::Memory(_) => "native-v2 HVF memory binding is invalid",
@@ -1099,6 +1436,7 @@ pub fn encode_hvf_snapshot_v2_platform_state(
     let machine = encode_machine(&state.machine)?;
     let global = encode_global(&state.global)?;
     let topology = encode_topology(&state.topology)?;
+    let time = encode_time(&state.time)?;
     let mut vcpu_payloads = Vec::new();
     vcpu_payloads
         .try_reserve_exact(state.vcpus.len())
@@ -1107,7 +1445,7 @@ pub fn encode_hvf_snapshot_v2_platform_state(
         vcpu_payloads.push(encode_platform_vcpu(vcpu)?);
     }
 
-    let component_count = 4_usize
+    let component_count = 5_usize
         .checked_add(vcpu_payloads.len())
         .ok_or(HvfSnapshotV2EncodeError::LengthOverflow)?;
     let mut components = Vec::new();
@@ -1135,6 +1473,11 @@ pub fn encode_hvf_snapshot_v2_platform_state(
             payload,
         ));
     }
+    components.push(SnapshotV2Component::new(
+        NATIVE_V2_TIME_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &time,
+    ));
     encode_snapshot_v2_state(&[], &components).map_err(HvfSnapshotV2EncodeError::Container)
 }
 
@@ -1151,6 +1494,7 @@ pub fn decode_hvf_snapshot_v2_platform_state(
     let machine = decode_machine(component_payload(state, NATIVE_V2_MACHINE_COMPONENT_KEY)?)?;
     let global = decode_global(component_payload(state, NATIVE_V2_GLOBAL_COMPONENT_KEY)?)?;
     let topology = decode_topology(component_payload(state, NATIVE_V2_TOPOLOGY_COMPONENT_KEY)?)?;
+    let time = decode_time(component_payload(state, NATIVE_V2_TIME_COMPONENT_KEY)?)?;
 
     let mut vcpus = Vec::new();
     vcpus
@@ -1162,21 +1506,21 @@ pub fn decode_hvf_snapshot_v2_platform_state(
         );
         vcpus.push(decode_platform_vcpu(component_payload(state, key)?)?);
     }
-    HvfSnapshotV2PlatformState::try_new(memory, machine, global, topology, vcpus)
+    HvfSnapshotV2PlatformState::try_new(memory, machine, global, topology, vcpus, time)
         .map_err(HvfSnapshotV2DecodeError::Build)
 }
 
 fn scan_component_profile(state: &SnapshotV2State<'_>) -> Result<usize, HvfSnapshotV2DecodeError> {
-    if state.metadata().version().minor() < 2 {
+    if state.metadata().version().minor() < 3 {
         return Err(HvfSnapshotV2DecodeError::UnsupportedProfile);
     }
     let count = usize::try_from(state.metadata().component_count())
         .map_err(|_| HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
-    let max_count = 4_usize + usize::from(MAX_SUPPORTED_VCPUS);
-    if !(5..=max_count).contains(&count) {
+    let max_count = 5_usize + usize::from(MAX_SUPPORTED_VCPUS);
+    if !(6..=max_count).contains(&count) {
         return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
     }
-    let vcpu_count = count - 4;
+    let vcpu_count = count - 5;
     for (position, component) in state.components().enumerate() {
         if component.disposition() != SnapshotV2ComponentDisposition::Semantic {
             return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
@@ -1186,10 +1530,11 @@ fn scan_component_profile(state: &SnapshotV2State<'_>) -> Result<usize, HvfSnaps
             1 => NATIVE_V2_MACHINE_COMPONENT_KEY,
             2 => NATIVE_V2_GLOBAL_COMPONENT_KEY,
             3 => NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
-            _ => native_v2_vcpu_component_key(
+            position if position < 4 + vcpu_count => native_v2_vcpu_component_key(
                 u32::try_from(position - 4)
                     .map_err(|_| HvfSnapshotV2DecodeError::InvalidComponentProfile)?,
             ),
+            _ => NATIVE_V2_TIME_COMPONENT_KEY,
         };
         if component.key() != expected {
             return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
@@ -1701,6 +2046,148 @@ fn decode_interrupt_range(
         base: decoder.u32()?,
         count: decoder.u32()?,
     })
+}
+
+fn encode_time(state: &HvfSnapshotV2TimeState) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+    let entry_bytes = state
+        .pvtime_vcpus
+        .len()
+        .checked_mul(TIME_PVTIME_ENTRY_BYTES)
+        .ok_or(HvfSnapshotV2EncodeError::LengthOverflow)?;
+    let capacity = TIME_HEADER_BYTES
+        .checked_add(entry_bytes)
+        .ok_or(HvfSnapshotV2EncodeError::LengthOverflow)?;
+    let mut encoder =
+        Encoder::with_capacity(capacity).map_err(HvfSnapshotV2EncodeError::Allocation)?;
+    encoder.bytes(&TIME_MAGIC);
+    encoder.u16(COMPONENT_PROFILE);
+    encoder.u16(
+        u16::try_from(TIME_HEADER_BYTES).map_err(|_| HvfSnapshotV2EncodeError::LengthOverflow)?,
+    );
+    encoder.u32(COMPONENT_FLAGS);
+    encoder.u8(TIME_RTC_POLICY_DESTINATION_SYSTEM_TIME);
+    encoder.u8(TIME_PVTIME_POLICY_PRESERVE_EXCLUDE_DOWNTIME);
+    encoder.u8(TIME_VMGENID_POLICY_REGENERATE_NOTIFY);
+    encoder.u8(TIME_VMCLOCK_POLICY_INCREMENT_NOTIFY);
+    encoder.zeroes(4);
+    encoder.u32(
+        u32::try_from(state.pvtime_vcpus.len())
+            .map_err(|_| HvfSnapshotV2EncodeError::LengthOverflow)?,
+    );
+    encoder.u32(
+        u32::try_from(TIME_PVTIME_ENTRY_BYTES)
+            .map_err(|_| HvfSnapshotV2EncodeError::LengthOverflow)?,
+    );
+    encoder.u64(state.rtc_layout.base().raw_value());
+    encoder.u64(state.rtc_layout.region_id().raw_value());
+    encode_platform_metadata(&mut encoder, state.vmgenid);
+    encode_platform_metadata(&mut encoder, state.vmclock);
+    encoder.bytes(&state.vmclock_abi.to_bytes());
+    debug_assert_eq!(encoder.len(), TIME_HEADER_BYTES);
+    for vcpu in &state.pvtime_vcpus {
+        encoder.u32(vcpu.index);
+        encoder.zeroes(4);
+        encoder.u64(vcpu.record_ipa.raw_value());
+        encoder.u64(vcpu.stolen_time_ns);
+    }
+    debug_assert_eq!(encoder.len(), capacity);
+    Ok(encoder.finish())
+}
+
+fn encode_platform_metadata(encoder: &mut Encoder, metadata: SnapshotV1PlatformDeviceMetadata) {
+    encoder.u64(metadata.range().start().raw_value());
+    encoder.u64(metadata.range().size());
+    encoder.u64(metadata.fdt_region().base);
+    encoder.u64(metadata.fdt_region().size);
+    encoder.u32(metadata.interrupt_line().raw_value());
+    encoder.zeroes(4);
+}
+
+fn decode_time(payload: &[u8]) -> Result<HvfSnapshotV2TimeState, HvfSnapshotV2DecodeError> {
+    if payload.len() < TIME_HEADER_BYTES {
+        return Err(HvfSnapshotV2DecodeError::Truncated);
+    }
+    let mut decoder = Decoder::new(payload);
+    if decoder.array::<8>()? != TIME_MAGIC
+        || decoder.u16()? != COMPONENT_PROFILE
+        || usize::from(decoder.u16()?) != TIME_HEADER_BYTES
+        || decoder.u32()? != COMPONENT_FLAGS
+    {
+        return Err(HvfSnapshotV2DecodeError::InvalidHeader);
+    }
+    if decoder.u8()? != TIME_RTC_POLICY_DESTINATION_SYSTEM_TIME
+        || decoder.u8()? != TIME_PVTIME_POLICY_PRESERVE_EXCLUDE_DOWNTIME
+        || decoder.u8()? != TIME_VMGENID_POLICY_REGENERATE_NOTIFY
+        || decoder.u8()? != TIME_VMCLOCK_POLICY_INCREMENT_NOTIFY
+    {
+        return Err(HvfSnapshotV2DecodeError::InvalidTime);
+    }
+    decoder.zeroes(4)?;
+    let vcpu_count =
+        usize::try_from(decoder.u32()?).map_err(|_| HvfSnapshotV2DecodeError::InvalidLength)?;
+    if vcpu_count == 0
+        || vcpu_count > usize::from(MAX_SUPPORTED_VCPUS)
+        || usize::try_from(decoder.u32()?).map_err(|_| HvfSnapshotV2DecodeError::InvalidLength)?
+            != TIME_PVTIME_ENTRY_BYTES
+    {
+        return Err(HvfSnapshotV2DecodeError::InvalidLength);
+    }
+    let expected_length = TIME_HEADER_BYTES
+        .checked_add(
+            vcpu_count
+                .checked_mul(TIME_PVTIME_ENTRY_BYTES)
+                .ok_or(HvfSnapshotV2DecodeError::InvalidLength)?,
+        )
+        .ok_or(HvfSnapshotV2DecodeError::InvalidLength)?;
+    if payload.len() != expected_length {
+        return Err(HvfSnapshotV2DecodeError::InvalidLength);
+    }
+    let rtc_layout = RtcMmioLayout::new(
+        GuestAddress::new(decoder.u64()?),
+        bangbang_runtime::mmio::MmioRegionId::new(decoder.u64()?),
+    );
+    let vmgenid = decode_platform_metadata(&mut decoder)?;
+    let vmclock = decode_platform_metadata(&mut decoder)?;
+    let vmclock_abi = VmClockAbi::from_bytes(decoder.array::<VMCLOCK_ABI_SIZE>()?)
+        .map_err(|_| HvfSnapshotV2DecodeError::InvalidTime)?;
+    debug_assert_eq!(decoder.position, TIME_HEADER_BYTES);
+
+    let mut pvtime_vcpus = Vec::new();
+    pvtime_vcpus
+        .try_reserve_exact(vcpu_count)
+        .map_err(HvfSnapshotV2DecodeError::Allocation)?;
+    for _ in 0..vcpu_count {
+        let index = decoder.u32()?;
+        decoder.zeroes(4)?;
+        let record_ipa = GuestAddress::new(decoder.u64()?);
+        let stolen_time_ns = decoder.u64()?;
+        pvtime_vcpus.push(
+            HvfSnapshotV2PvTimeVcpuState::try_new(index, record_ipa, stolen_time_ns)
+                .map_err(|_| HvfSnapshotV2DecodeError::InvalidTime)?,
+        );
+    }
+    decoder.finish()?;
+    HvfSnapshotV2TimeState::try_new(rtc_layout, vmgenid, vmclock, vmclock_abi, pvtime_vcpus)
+        .map_err(|_| HvfSnapshotV2DecodeError::InvalidTime)
+}
+
+fn decode_platform_metadata(
+    decoder: &mut Decoder<'_>,
+) -> Result<SnapshotV1PlatformDeviceMetadata, HvfSnapshotV2DecodeError> {
+    let range = GuestMemoryRange::new(GuestAddress::new(decoder.u64()?), decoder.u64()?)
+        .map_err(|_| HvfSnapshotV2DecodeError::InvalidTime)?;
+    let fdt_region = Arm64FdtRegion {
+        base: decoder.u64()?,
+        size: decoder.u64()?,
+    };
+    let interrupt_line = GuestInterruptLine::new(decoder.u32()?)
+        .map_err(|_| HvfSnapshotV2DecodeError::InvalidTime)?;
+    decoder.zeroes(4)?;
+    Ok(SnapshotV1PlatformDeviceMetadata::new(
+        range,
+        fdt_region,
+        interrupt_line,
+    ))
 }
 
 fn encode_topology(

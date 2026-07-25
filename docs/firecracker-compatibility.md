@@ -364,7 +364,7 @@ optional-device parity.
 | [#5793 cross-slot virtio-mem updates](https://github.com/firecracker-microvm/firecracker/pull/5793) | Implemented at bangbang's block-owned/HVF-mapping abstraction. Firecracker updates [every intersecting KVM slot](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/mem/device.rs#L502-L554); bangbang does not expose KVM slot identity and instead proves adjacent, partial, cross-conceptual-slot, and rollback behavior over exact dynamic mappings. |
 | [#5794 balloon statistics bound](https://github.com/firecracker-microvm/firecracker/pull/5794) and [#5884 hinting `204`](https://github.com/firecracker-microvm/firecracker/pull/5884) | Implemented. Statistics are bounded to the same [256-tag limit](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/devices/virtio/balloon/device.rs#L48-L52); hinting routes return `204 No Content`. |
 | [#5818 virtio initialization/status sequencing](https://github.com/firecracker-microvm/firecracker/pull/5818) | The new PCI sequencing is transport-limited; existing virtio-MMIO ordered initialization and clear-bit rejection except reset are implemented and tested. |
-| [#5809 x86 KVM clock restore](https://github.com/firecracker-microvm/firecracker/pull/5809) | Platform/profile-limited. The x86 KVM clock and `clock_realtime` adjustment mechanism is unavailable on arm64 HVF and remains rejected. It is separate from bangbang's implemented aarch64 VMClock ABI capture, counter update, and notification during native-v1 restore. |
+| [#5809 x86 KVM clock restore](https://github.com/firecracker-microvm/firecracker/pull/5809) | Architecture-limited. Pinned Firecracker [rejects `clock_realtime=true` on aarch64 before VM-state restore](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/builder.rs#L482-L498), while its [adjustment is an x86 KVM-clock operation](https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/x86_64/vm.rs#L138-L149). bangbang mirrors that aarch64 semantic rejection; it is not classified as an incidental macOS limitation and is separate from implemented aarch64 VMClock ABI capture, counter update, and notification. |
 
 Other v1.16.0 changelog entries are not silently absorbed into this device
 scope. [#5824 serial limiting](https://github.com/firecracker-microvm/firecracker/pull/5824)
@@ -420,8 +420,8 @@ without claiming KVM's registration mechanism.
 artifact support. The checked
 [aggregate remaining-device contract](../compat/firecracker/v1.16.0/remaining-device-contract.md)
 selects exactly 85 records across balloon, memory hotplug, entropy, serial, and
-time/identity: 77 are terminal and the same eight serialization/restore
-aggregates remain `audit-required`. One public signed process profile composes
+time/identity: 77 are terminal and the same eight aggregate rows remain
+`audit-required` for their Wave 6 terminal handoffs. One public signed process profile composes
 the full device set over default MMIO and product PCI, including concurrent
 virtio-mem and balloon control, entropy retry pressure, greater-than-FIFO
 default serial input across pause, ordered snapshot preflight rejection, and
@@ -786,6 +786,12 @@ outcomes, all assigned to Wave 6 #1490 for serialization, restore,
 clone/portability policy, and signed restored-guest proof. No selected row is a
 Wave 7 #1491 handoff, and the global counts at that checkpoint remain
 191/207/3/17.
+
+#1529 later adds portable native-v2 `2.3.0` time/identity encoding, repeated
+immutable clone restore, recapture, and signed three-vCPU guest observation.
+The one aggregate record remains `audit-required` only for public production
+composition and broader cross-host migration/clone portability, so this slice
+changes no disposition.
 
 After #1496, the checked
 [network and MMDS closure contract](../compat/firecracker/v1.16.0/network-mmds-contract.md)
@@ -1413,7 +1419,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /snapshot/load` | `enable_diff_snapshots` | deprecated-compatible optional boolean; normalized and implemented for tracking | ORed with `track_dirty_pages`; only true counts as deprecated usage. The effective value activates destination tracking but does not enable Diff artifact serialization. |
 | `PUT /snapshot/load` | `track_dirty_pages` | optional boolean; implemented for `File`, rejected for `Uffd` | The destination request overrides the source snapshot's active flag. For `File`, tracking attaches after image population and before mapping/protection, runner creation, VMGenID replacement, VMClock update, or guest progress. `Uffd` rejects an effective true value during consumer-profile preflight because dirty write protection would conflict with lazy guest permission ownership. |
 | `PUT /snapshot/load` | `resume_vm` | optional; implemented | Load always commits an initially paused real session first. `false` returns `204` in `Paused`; `true` then uses the ordinary process/session resume path and returns only in `Running`. |
-| `PUT /snapshot/load` | `clock_realtime` | optional; retained, rejected when true | Retained through VMM policy; native-v1 rejects clock adjustment before any VM construction. |
+| `PUT /snapshot/load` | `clock_realtime` | optional; retained, rejected when true | Retained through VMM policy; the aarch64 compatibility gate rejects the x86-only KVM-clock adjustment during request preflight, before any VM construction. |
 | `PUT /snapshot/load` | `network_overrides` | optional; retained/redacted, rejected when nonempty | Required entry fields are retained but both interface ID and host device name are redacted; native-v1 does not apply overrides. |
 | `PUT /snapshot/load` | `vsock_override` | optional; retained/redacted, rejected when present | The UDS path is retained but redacted; native-v1 does not apply the override. |
 | `PUT /snapshot/load` | unknown `network_overrides` or `vsock_override` fields | accepted by parser | Matches Firecracker's current nested override parser, which ignores unknown fields in these objects while preserving typed validation for required fields. |
@@ -2816,9 +2822,10 @@ barrier returns topology-ordered cumulative values without source clock
 baselines. Signed Linux requires `stolen time PV`, nonzero monotonic `/proc/stat`
 steal under controlled contention, unchanged idle accounting, and unchanged
 paused captures. This is not a claim of KVM's device attribute or PVTime
-artifact restore; #1481 certifies the live/capture-ready aggregate, while the
-one time/identity record remains nonterminal under Wave 6 #1490 for artifact
-restore and clone/portability behavior.
+artifact compatibility. #1481 certifies the live/capture-ready aggregate, and
+#1529 serializes its portable topology-ordered cumulative values in native-v2
+and restores destination accounting without charging snapshot downtime. Public
+artifact publication and broader cross-host portability remain Wave 6 work.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are
 not part of the minimal RTC device. The backend-neutral arm64 FDT builder emits
@@ -2860,8 +2867,11 @@ even if cleanup succeeds, so no partial destination runs. Signed cross-process
 coverage proves both saved VMGenID halves change, the VMClock sequence is stable
 and even, both counters change, and RTC time does not regress. The exact
 [time/identity ledger](../compat/firecracker/v1.16.0/time-identity-contract.md)
-keeps optional-device profiles, PVTime artifact restore/clone behavior, and
-broader cross-host portability as separate work.
+keeps optional-device profiles and broader cross-host portability as separate
+work. Native-v2 #1529 applies the same ordered clone identity transition after
+fresh PL031 and PVTime reconstruction; signed three-vCPU guest evidence proves
+VMGenID-before-VMClock notification, destination-current RTC, preserved PVTime,
+repeat immutable loads, and recapture-to-restore.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
@@ -3935,22 +3945,26 @@ Their eventual support level should follow the endpoint matrix:
   and portability remain #1490 work rather than live snapshot-compatibility
   claims
 - snapshot behavior beyond the implemented narrow native-v1 profile. The
-  library-only native-v2 `2.2.0` profile retains readable `2.0.0`/`2.1.x`
-  state and adds an exact typed 1–32-vCPU machine/global-GIC/topology/vCPU
-  graph with CPU-application evidence and closed reviewed debug/SME state.
-  An unpublished focused boundary now captures a completed paused source,
-  composes that graph with the canonical 64-KiB-aligned memory binding, and
-  reconstructs a fresh complete never-run HVF topology from already-authorized
-  private-COW memory. It verifies CPU/cache/MPIDR/FDT/GIC compatibility,
-  restores global then canonical per-vCPU state, imports fresh offline/
-  runnable/timer-suspended lifecycle tokens, and publishes only Paused. Signed
-  three-vCPU proof resumes through timer PPI, secondary PSCI completion, and
-  initially offline continuation. There is no public v2 create/load/describe
-  dispatch, general device aggregate, production resource composition, or
-  time/PVTime/identity correction. Remaining work includes public
+  library-only native-v2 profile retains readable `2.0.0`/`2.1.x`/`2.2.x`
+  state. The current `2.3.0` writer carries an exact typed 1–32-vCPU
+  machine/global-GIC/topology/vCPU graph plus singleton portable
+  PL031/PVTime/VMGenID/VMClock state, with CPU-application evidence and closed
+  reviewed debug/SME state. An unpublished focused boundary captures a
+  completed paused source into a fresh canonical 64-KiB-aligned memory binding
+  and reconstructs a complete never-run HVF topology from already-authorized
+  private-COW memory. It verifies CPU/cache/MPIDR/FDT/GIC/time compatibility,
+  restores global then canonical per-vCPU state, creates destination-current
+  PL031 and downtime-excluding PVTime, signals a fresh VMGenID followed by the
+  saved-counter VMClock transition, imports fresh offline/runnable/
+  timer-suspended lifecycle tokens, and publishes only Paused. Signed
+  three-vCPU proof covers repeat immutable loads, distinct clone identities,
+  ordered guest notifications/time observations, recapture-to-restore, timer
+  PPI, secondary PSCI completion, and initially offline continuation. There is
+  no public v2 create/load/describe dispatch, general device aggregate, or
+  production resource composition. Remaining work includes public
   transactional artifacts, optional-device state, Diff artifacts, overrides,
-  Firecracker artifact compatibility, authentication, clone policy, and
-  cross-host portability
+  Firecracker artifact compatibility, authentication, and broader cross-host
+  portability
 - balloon producers outside the implemented queue/discard/reporting activity
   and serialized/restored balloon state; live paired PFN accounting and
   capture-ready ownership are implemented, while absent guest statistics are
@@ -3982,7 +3996,7 @@ Their eventual support level should follow the endpoint matrix:
 - complete production snapshot ownership beyond the current one-vCPU
   native-v1 aggregate and the focused unpublished native-v2 multi-vCPU
   platform, including generic optional devices, the four-scheduler/public
-  transaction, time/identity correction, and external-buffer policy
+  transaction, and external-buffer policy
 - runtime device attach/remove behavior beyond implemented in-place updates and
   stable unsupported paths
 

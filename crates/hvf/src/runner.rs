@@ -6522,7 +6522,12 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
-        ensure_no_pending_psci_call(&state)?;
+        // PVTime belongs to the runner rather than the architectural PSCI
+        // transaction. A stable paused CPU_SUSPEND owner must therefore remain
+        // captureable without completing or aborting its deferred guest call.
+        if !matches!(&command, RunnerCommand::CaptureArm64PvTime { .. }) {
+            ensure_no_pending_psci_call(&state)?;
+        }
         if require_never_run && state.run_started {
             return Err(HvfVcpuRunnerError::InvalidState(
                 PVTIME_CONFIGURATION_AFTER_RUN_MESSAGE,
@@ -36423,6 +36428,66 @@ pub(crate) mod tests {
                 .expect("abort should clear both owner records");
             runner.shutdown().expect("runner should shut down");
         }
+    }
+
+    #[test]
+    fn pvtime_capture_preserves_a_stable_deferred_cpu_suspend() {
+        let arguments = [0x11, 0x22, 0x33];
+        let (runner, _register_reads, register_writes) =
+            start_coordinated_psci_run_step_recording_runner(
+                PSCI_CPU_SUSPEND_64,
+                arguments,
+                0,
+                false,
+            );
+        let pvtime_range = GuestMemoryRange::new(GuestAddress::new(0), 64 * 1024)
+            .expect("suspended PVTime range should validate");
+        let pvtime_layout = GuestMemoryLayout::new(vec![pvtime_range])
+            .expect("suspended PVTime layout should validate");
+        let pvtime_memory =
+            GuestMemory::allocate(&pvtime_layout).expect("suspended PVTime memory should map");
+        let pvtime_publisher = pvtime_memory
+            .atomic_u64(GuestAddress::new(8))
+            .expect("suspended PVTime publisher should validate");
+        runner
+            .configure_arm64_pvtime(HvfArm64PvTimeAccountingConfig::new(
+                0x801f_e800,
+                pvtime_publisher,
+                73,
+                None,
+            ))
+            .expect("PVTime should configure before stable import");
+        let stable = HvfArm64StableCpuSuspendState::new(
+            HvfArm64CpuSuspendConvention::Call64,
+            arguments,
+            0x8000,
+        )
+        .expect("stable CPU_SUSPEND should validate");
+        let token = runner
+            .restore_stable_cpu_suspend(&stable)
+            .expect("stable CPU_SUSPEND should install");
+
+        assert_eq!(
+            runner
+                .capture_arm64_pvtime()
+                .expect("deferred CPU_SUSPEND PVTime should capture")
+                .expect("configured PVTime should remain present")
+                .stolen_time_ns(),
+            73
+        );
+        assert_eq!(
+            runner
+                .capture_stable_cpu_suspend()
+                .expect("PVTime capture must preserve the deferred call")
+                .token(),
+            token
+        );
+        assert_eq!(register_writes.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        runner
+            .abort_stable_cpu_suspend(token)
+            .expect("stable CPU_SUSPEND should abort");
+        runner.shutdown().expect("runner should shut down");
     }
 
     #[test]

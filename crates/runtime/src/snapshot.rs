@@ -559,6 +559,8 @@ pub(crate) fn classify_v1_load(
 pub(crate) fn classify_v1_load_request(
     input: &SnapshotLoadInput,
 ) -> Result<(), SnapshotV1Rejection> {
+    // Firecracker v1.16.0 rejects this on aarch64 before VM-state restore
+    // because the adjustment is implemented only by the x86 KVM clock path.
     if input.clock_realtime {
         return Err(SnapshotV1Rejection::LoadClockRealtime);
     }
@@ -1000,5 +1002,14 @@ mod tests {
         for (profile, expected) in profile_cases {
             assert_eq!(classify_v1_load(&file_load(), true, profile), Err(expected));
         }
+    }
+
+    #[test]
+    fn aarch64_clock_realtime_is_rejected_at_request_preflight() {
+        assert_eq!(
+            classify_v1_load_request(&file_load().with_clock_realtime(true)),
+            Err(SnapshotV1Rejection::LoadClockRealtime)
+        );
+        assert_eq!(classify_v1_load_request(&file_load()), Ok(()));
     }
 }

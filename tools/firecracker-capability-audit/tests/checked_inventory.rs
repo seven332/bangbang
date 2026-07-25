@@ -1707,6 +1707,28 @@ fn delivery_closure_policy_is_stable() {
             capability.summary.contains(WAVE_6_ISSUE_URL),
             "remaining-device Wave 6 summary must name its exact issue URL: {id}"
         );
+        if *id == TIME_IDENTITY_WAVE_6[0] {
+            for delivered in [
+                "Native-v2 2.3",
+                "repeated immutable clone restore",
+                "signed multi-vCPU restored-guest evidence",
+            ] {
+                assert!(
+                    capability.summary.contains(delivered),
+                    "time/identity Wave 6 summary must retain delivered {delivered}: {id}"
+                );
+            }
+            for remaining in [
+                "public production lifecycle composition",
+                "cross-host time-source migration/clone portability",
+            ] {
+                assert!(
+                    capability.summary.contains(remaining),
+                    "time/identity Wave 6 summary must name remaining {remaining}: {id}"
+                );
+            }
+            continue;
+        }
         for outcome in ["restore", "portability", "signed restored-guest"] {
             assert!(
                 capability.summary.contains(outcome),

@@ -76,19 +76,27 @@ use bangbang_runtime::pmem::{
     PmemUpdateError, PreparedPmemDevice, VIRTIO_PMEM_DEVICE_ID, VIRTIO_PMEM_QUEUE_SIZES,
     VirtioPmemConfigSpace, VirtioPmemDevice, VirtioPmemFlushStatus,
 };
-use bangbang_runtime::pvtime::ARM64_PVTIME_STOLEN_TIME_OFFSET;
+use bangbang_runtime::pvtime::{
+    ARM64_PVTIME_STOLEN_TIME_OFFSET, ARM64_PVTIME_STRUCTURE_SIZE, Arm64PvTimeLayout,
+    Arm64PvTimeStAbi,
+};
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
     CaptureReadySerialState, SERIAL_RECEIVE_FIFO_CAPACITY, SerialConfig, SerialStdioInput,
     SharedSerialOutput, SharedSerialOutputBuffer,
 };
-use bangbang_runtime::snapshot_device::{SnapshotV1BlockRetryState, SnapshotV1DeviceState};
-use bangbang_runtime::snapshot_memory_v2::SnapshotV2MemoryBinding;
+use bangbang_runtime::snapshot_device::{
+    SnapshotV1BlockRetryState, SnapshotV1DeviceState, SnapshotV1PlatformDeviceMetadata,
+};
+use bangbang_runtime::snapshot_memory_v2::{
+    SnapshotV2MemoryWriteError, write_snapshot_v2_memory_image,
+};
 use bangbang_runtime::startup::{
-    Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
-    Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatch,
-    Arm64BootBlockNotificationDispatchError, Arm64BootBlockNotificationDispatches,
-    Arm64BootBlockWakeupFdsError, Arm64BootEntropyCaptureError,
+    ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonNotificationDispatch,
+    Arm64BootBalloonNotificationDispatchError, Arm64BootBalloonNotificationDispatches,
+    Arm64BootBlockNotificationDispatch, Arm64BootBlockNotificationDispatchError,
+    Arm64BootBlockNotificationDispatches, Arm64BootBlockWakeupFdsError,
+    Arm64BootEntropyCaptureError,
     Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
@@ -137,7 +145,7 @@ use bangbang_runtime::virtio_pci::{
     VirtioPciDiagnostics, VirtioPciEndpoint, VirtioPciEndpointError, VirtioPciEndpointPhase,
     VirtioPciIdentity, VirtioPciPublicationError,
 };
-use bangbang_runtime::vmclock::VmClockRestoreUpdateError;
+use bangbang_runtime::vmclock::{VMCLOCK_ABI_SIZE, VmClockAbi, VmClockRestoreUpdateError};
 use bangbang_runtime::vsock::{
     VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockCaptureValidation,
     VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockMmioCaptureState,
@@ -187,7 +195,7 @@ use crate::snapshot_restore::{
 use crate::snapshot_v2::{
     HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2FdtState,
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
-    HvfSnapshotV2VcpuState,
+    HvfSnapshotV2PvTimeVcpuState, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
 };
 use crate::topology::{HvfVcpuTopologyError, prepare_ordered_mpidrs};
 use crate::vcpu::{
@@ -4902,19 +4910,17 @@ impl std::error::Error for HvfArm64BootSnapshotV1StateCaptureError {
 /// source session.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HvfArm64BootSnapshotV2CaptureInput {
-    memory: SnapshotV2MemoryBinding,
     boot: HvfSnapshotV2BootState,
 }
 
 impl HvfArm64BootSnapshotV2CaptureInput {
-    /// Construct one capture input from an existing memory-image binding and
-    /// already-checked inert boot metadata.
-    pub const fn new(memory: SnapshotV2MemoryBinding, boot: HvfSnapshotV2BootState) -> Self {
-        Self { memory, boot }
+    /// Construct one capture input from already-checked inert boot metadata.
+    pub const fn new(boot: HvfSnapshotV2BootState) -> Self {
+        Self { boot }
     }
 
-    fn into_parts(self) -> (SnapshotV2MemoryBinding, HvfSnapshotV2BootState) {
-        (self.memory, self.boot)
+    fn into_boot(self) -> HvfSnapshotV2BootState {
+        self.boot
     }
 }
 
@@ -4942,6 +4948,8 @@ pub enum HvfArm64BootSnapshotV2CaptureStage {
     GlobalGic,
     /// Construct one canonical per-vCPU component.
     Vcpu { index: usize },
+    /// Capture guest-agreed time and clone-identity state.
+    Time,
     /// Cross-validate the complete native-v2 platform graph.
     Platform,
 }
@@ -4955,7 +4963,71 @@ impl fmt::Display for HvfArm64BootSnapshotV2CaptureStage {
             Self::Compatibility => f.write_str("compatibility"),
             Self::GlobalGic => f.write_str("global GIC"),
             Self::Vcpu { index } => write!(f, "vCPU {index}"),
+            Self::Time => f.write_str("time and clone identity"),
             Self::Platform => f.write_str("platform graph"),
+        }
+    }
+}
+
+/// Failure while capturing portable native-v2 time and identity state.
+#[derive(Debug)]
+pub enum HvfSnapshotV2TimeCaptureError {
+    /// The source has no prepared topology-ordered PVTime layout.
+    MissingPvTimeLayout,
+    /// Captured PVTime count differs from the prepared topology.
+    PvTimeCount,
+    /// Source VMGenID guest bytes could not be read.
+    ReadVmGenId { source: GuestMemoryAccessError },
+    /// Source VMGenID guest bytes differ from retained runtime metadata.
+    VmGenIdMismatch,
+    /// Source VMClock guest bytes could not be read.
+    ReadVmClock { source: GuestMemoryAccessError },
+    /// Source VMClock ABI is invalid or differs from retained runtime metadata.
+    VmClockMismatch,
+    /// One PVTime guest record could not be read.
+    ReadPvTime {
+        index: usize,
+        source: GuestMemoryAccessError,
+    },
+    /// One PVTime guest record is invalid or differs from its owner capture.
+    PvTimeMismatch { index: usize },
+    /// The portable time value rejected the captured relationship.
+    Build { source: HvfSnapshotV2BuildError },
+    /// Bounded per-vCPU storage could not be reserved.
+    Allocation,
+}
+
+impl fmt::Display for HvfSnapshotV2TimeCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::MissingPvTimeLayout => "native-v2 source has no prepared PVTime layout",
+            Self::PvTimeCount => "native-v2 source PVTime topology is inconsistent",
+            Self::ReadVmGenId { .. } => "native-v2 source VMGenID read failed",
+            Self::VmGenIdMismatch => "native-v2 source VMGenID state is inconsistent",
+            Self::ReadVmClock { .. } => "native-v2 source VMClock read failed",
+            Self::VmClockMismatch => "native-v2 source VMClock state is inconsistent",
+            Self::ReadPvTime { .. } => "native-v2 source PVTime record read failed",
+            Self::PvTimeMismatch { .. } => "native-v2 source PVTime record is inconsistent",
+            Self::Build { .. } => "native-v2 source time component is invalid",
+            Self::Allocation => "native-v2 source time capture allocation failed",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2TimeCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadVmGenId { source }
+            | Self::ReadVmClock { source }
+            | Self::ReadPvTime { source, .. } => Some(source),
+            Self::Build { source } => Some(source),
+            Self::MissingPvTimeLayout
+            | Self::PvTimeCount
+            | Self::VmGenIdMismatch
+            | Self::VmClockMismatch
+            | Self::PvTimeMismatch { .. }
+            | Self::Allocation => None,
         }
     }
 }
@@ -4969,8 +5041,6 @@ pub enum HvfArm64BootSnapshotV2CaptureError {
     },
     /// The source session no longer exposes its mapped guest memory.
     GuestMemory { source: HvfGuestMemoryMappingError },
-    /// The supplied memory binding does not exactly name the mapped ranges.
-    MemoryBindingMismatch,
     /// The source session has no retained boot/FDT origin.
     MissingBootOrigin,
     /// The source session has no mandatory PL031 RTC.
@@ -4981,10 +5051,16 @@ pub enum HvfArm64BootSnapshotV2CaptureError {
     FdtRead { source: GuestMemoryAccessError },
     /// Mapped guest memory no longer contains the retained FDT identity.
     FdtIdentityMismatch,
+    /// Stable guest memory could not be streamed into a fresh native-v2 image.
+    MemoryImage { source: SnapshotV2MemoryWriteError },
     /// One member disagreed with the common processor/cache identity.
     CompatibilityMismatch { index: usize },
     /// Global GIC state was absent, duplicated, empty, or assigned incorrectly.
     GlobalGicShape { index: usize },
+    /// Guest-agreed time and clone-identity capture failed.
+    Time {
+        source: HvfSnapshotV2TimeCaptureError,
+    },
     /// A checked native-v2 component rejected the captured values.
     Build {
         stage: HvfArm64BootSnapshotV2CaptureStage,
@@ -5003,9 +5079,6 @@ impl fmt::Display for HvfArm64BootSnapshotV2CaptureError {
             Self::GuestMemory { source } => {
                 write!(f, "native-v2 source guest memory is unavailable: {source}")
             }
-            Self::MemoryBindingMismatch => {
-                f.write_str("native-v2 memory binding disagrees with source guest memory")
-            }
             Self::MissingBootOrigin => {
                 f.write_str("native-v2 source is missing retained boot/FDT metadata")
             }
@@ -5016,6 +5089,9 @@ impl fmt::Display for HvfArm64BootSnapshotV2CaptureError {
             }
             Self::FdtIdentityMismatch => {
                 f.write_str("native-v2 FDT identity changed after reconstruction")
+            }
+            Self::MemoryImage { source } => {
+                write!(f, "native-v2 memory image capture failed: {source}")
             }
             Self::CompatibilityMismatch { index } => {
                 write!(
@@ -5029,6 +5105,7 @@ impl fmt::Display for HvfArm64BootSnapshotV2CaptureError {
                     "native-v2 vCPU {index} returned invalid global GIC ownership"
                 )
             }
+            Self::Time { source } => write!(f, "native-v2 time capture failed: {source}"),
             Self::Build { stage, source } => {
                 write!(f, "native-v2 {stage} construction failed: {source}")
             }
@@ -5043,9 +5120,10 @@ impl std::error::Error for HvfArm64BootSnapshotV2CaptureError {
             Self::Topology { source } => Some(source),
             Self::GuestMemory { source } => Some(source),
             Self::FdtRead { source } => Some(source),
+            Self::MemoryImage { source } => Some(source),
+            Self::Time { source } => Some(source),
             Self::Build { source, .. } => Some(source),
-            Self::MemoryBindingMismatch
-            | Self::MissingBootOrigin
+            Self::MissingBootOrigin
             | Self::MissingRtc
             | Self::FdtAllocation
             | Self::FdtIdentityMismatch
@@ -5054,6 +5132,85 @@ impl std::error::Error for HvfArm64BootSnapshotV2CaptureError {
             | Self::Allocation => None,
         }
     }
+}
+
+pub(crate) fn capture_hvf_snapshot_v2_time_state(
+    memory: &GuestMemory,
+    rtc_layout: RtcMmioLayout,
+    vmgenid: &Arm64BootVmGenIdDevice,
+    vmclock: &Arm64BootVmClockDevice,
+    pvtime_layout: Option<&Arm64PvTimeLayout>,
+    pvtime_capture: &HvfArm64PvTimeCaptureState,
+) -> Result<HvfSnapshotV2TimeState, HvfSnapshotV2TimeCaptureError> {
+    let layout = pvtime_layout.ok_or(HvfSnapshotV2TimeCaptureError::MissingPvTimeLayout)?;
+    if layout.len() != pvtime_capture.vcpus().len() {
+        return Err(HvfSnapshotV2TimeCaptureError::PvTimeCount);
+    }
+
+    let mut observed_vmgenid = [0; ARM64_BOOT_VMGENID_SIZE];
+    memory
+        .read_slice(&mut observed_vmgenid, vmgenid.range.start())
+        .map_err(|source| HvfSnapshotV2TimeCaptureError::ReadVmGenId { source })?;
+    if observed_vmgenid != vmgenid.generation_id {
+        return Err(HvfSnapshotV2TimeCaptureError::VmGenIdMismatch);
+    }
+
+    let mut observed_vmclock_bytes = [0; VMCLOCK_ABI_SIZE];
+    memory
+        .read_slice(&mut observed_vmclock_bytes, vmclock.range.start())
+        .map_err(|source| HvfSnapshotV2TimeCaptureError::ReadVmClock { source })?;
+    let observed_vmclock = VmClockAbi::from_bytes(observed_vmclock_bytes)
+        .map_err(|_| HvfSnapshotV2TimeCaptureError::VmClockMismatch)?;
+    if observed_vmclock != vmclock.abi {
+        return Err(HvfSnapshotV2TimeCaptureError::VmClockMismatch);
+    }
+
+    let mut pvtime_vcpus = Vec::new();
+    pvtime_vcpus
+        .try_reserve_exact(layout.len())
+        .map_err(|_| HvfSnapshotV2TimeCaptureError::Allocation)?;
+    for (index, (range, captured)) in layout
+        .records()
+        .iter()
+        .copied()
+        .zip(pvtime_capture.vcpus())
+        .enumerate()
+    {
+        let mut bytes = [0; ARM64_PVTIME_STRUCTURE_SIZE];
+        memory
+            .read_slice(&mut bytes, range.start())
+            .map_err(|source| HvfSnapshotV2TimeCaptureError::ReadPvTime { index, source })?;
+        let observed = Arm64PvTimeStAbi::from_bytes(bytes)
+            .map_err(|_| HvfSnapshotV2TimeCaptureError::PvTimeMismatch { index })?;
+        if observed.stolen_time_ns() != captured.stolen_time_ns() {
+            return Err(HvfSnapshotV2TimeCaptureError::PvTimeMismatch { index });
+        }
+        pvtime_vcpus.push(
+            HvfSnapshotV2PvTimeVcpuState::try_new(
+                u32::try_from(index).map_err(|_| HvfSnapshotV2TimeCaptureError::PvTimeCount)?,
+                range.start(),
+                captured.stolen_time_ns(),
+            )
+            .map_err(|source| HvfSnapshotV2TimeCaptureError::Build { source })?,
+        );
+    }
+
+    HvfSnapshotV2TimeState::try_new(
+        rtc_layout,
+        SnapshotV1PlatformDeviceMetadata::new(
+            vmgenid.range,
+            vmgenid.fdt_device.region,
+            vmgenid.fdt_device.interrupt_line,
+        ),
+        SnapshotV1PlatformDeviceMetadata::new(
+            vmclock.range,
+            vmclock.fdt_device.region,
+            vmclock.fdt_device.interrupt_line,
+        ),
+        observed_vmclock,
+        pvtime_vcpus,
+    )
+    .map_err(|source| HvfSnapshotV2TimeCaptureError::Build { source })
 }
 
 impl fmt::Display for HvfArm64BootSnapshotV1DeviceCaptureError {
@@ -7111,19 +7268,17 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
     fn capture(
         self,
         input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut (impl std::io::Write + std::io::Seek),
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
-        let (stable, captures) = self
-            .runner
-            .capture_arm64_snapshot_v2_topology()
-            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
+        let (stable, captures, pvtime_capture) =
+            self.runner
+                .capture_arm64_snapshot_v2_topology()
+                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
         let memory = self
             .backend
             .mapped_guest_memory()
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::GuestMemory { source })?;
-        let (memory_binding, boot) = input.into_parts();
-        if !memory_matches_snapshot_v2_binding(memory, &memory_binding) {
-            return Err(HvfArm64BootSnapshotV2CaptureError::MemoryBindingMismatch);
-        }
+        let boot = input.into_boot();
 
         let boot_origin = self
             .runtime_resources
@@ -7234,6 +7389,15 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
             global_gic.ok_or(HvfArm64BootSnapshotV2CaptureError::GlobalGicShape { index: 0 })?;
 
         let rtc_mmio_layout = RtcMmioLayout::new(rtc.region.range().start(), rtc.region.id());
+        let time = capture_hvf_snapshot_v2_time_state(
+            memory,
+            rtc_mmio_layout,
+            &self.runtime_resources.vmgenid_device,
+            &self.runtime_resources.vmclock_device,
+            self.runtime_resources.pvtime_state.layout(),
+            &pvtime_capture,
+        )
+        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
         let compatibility = HvfSnapshotV1CompatibilityState::new(
             primary_identification,
             primary_optional_identification,
@@ -7259,25 +7423,14 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
                     source,
                 }
             })?;
-        HvfSnapshotV2PlatformState::try_new(memory_binding, machine, global, stable, vcpus).map_err(
-            |source| HvfArm64BootSnapshotV2CaptureError::Build {
+        let memory_binding = write_snapshot_v2_memory_image(memory, memory_writer)
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
+        HvfSnapshotV2PlatformState::try_new(memory_binding, machine, global, stable, vcpus, time)
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
                 stage: HvfArm64BootSnapshotV2CaptureStage::Platform,
                 source,
-            },
-        )
+            })
     }
-}
-
-fn memory_matches_snapshot_v2_binding(
-    memory: &GuestMemory,
-    binding: &SnapshotV2MemoryBinding,
-) -> bool {
-    memory.regions().len() == binding.extents().len()
-        && memory
-            .regions()
-            .iter()
-            .zip(binding.extents())
-            .all(|(region, extent)| region.range() == extent.range())
 }
 
 fn same_common_arm64_identification(
@@ -8304,8 +8457,8 @@ impl HvfArm64BootSession<'_> {
 
     /// Publish and capture topology-ordered PVTime values after a pause barrier.
     ///
-    /// This is a capture-ready handoff only; Wave 6 owns artifact encoding and
-    /// destination orchestration.
+    /// Native-v2 capture persists this handoff in its time component; other
+    /// snapshot profiles decide independently whether to encode it.
     pub fn capture_arm64_pvtime(
         &self,
     ) -> Result<HvfArm64PvTimeCaptureState, HvfVcpuRunCoordinatorError> {
@@ -8325,11 +8478,12 @@ impl HvfArm64BootSession<'_> {
     /// Capture the unpublished complete native-v2 platform graph after a
     /// completed topology-wide pause.
     ///
-    /// The supplied paths remain inert metadata and the supplied memory
-    /// binding must exactly describe this session's already-mapped memory.
-    pub fn capture_snapshot_v2_platform(
+    /// The supplied paths remain inert metadata. Guest memory is streamed only
+    /// after the topology-wide capture has published its stable PVTime values.
+    pub fn capture_snapshot_v2_platform<W: std::io::Write + std::io::Seek>(
         &mut self,
         input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
         HvfArm64BootSnapshotV2CaptureOwner {
             runner: &mut self.runner,
@@ -8339,7 +8493,7 @@ impl HvfArm64BootSession<'_> {
             cache_source: self.cache_source,
             gic: self.gic,
         }
-        .capture(input)
+        .capture(input, memory_writer)
     }
 
     /// Complete a topology-wide pause without dispatching new guest work.
@@ -10791,11 +10945,12 @@ impl OwnedHvfArm64BootSession {
     /// Capture the unpublished complete native-v2 platform graph after a
     /// completed topology-wide pause.
     ///
-    /// The supplied paths remain inert metadata and the supplied memory
-    /// binding must exactly describe this session's already-mapped memory.
-    pub fn capture_snapshot_v2_platform(
+    /// The supplied paths remain inert metadata. Guest memory is streamed only
+    /// after the topology-wide capture has published its stable PVTime values.
+    pub fn capture_snapshot_v2_platform<W: std::io::Write + std::io::Seek>(
         &mut self,
         input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
         HvfArm64BootSnapshotV2CaptureOwner {
             runner: &mut self.runner,
@@ -10805,7 +10960,7 @@ impl OwnedHvfArm64BootSession {
             cache_source: self.cache_source,
             gic: self.gic,
         }
-        .capture(input)
+        .capture(input, memory_writer)
     }
 
     /// Complete a topology-wide pause without dispatching new guest work.
@@ -16408,7 +16563,7 @@ fn replace_vmgenid_for_snapshot_restore(
     )
 }
 
-fn replace_vmgenid_and_signal_with(
+pub(crate) fn replace_vmgenid_and_signal_with(
     memory: &mut GuestMemory,
     device: &mut Arm64BootVmGenIdDevice,
     replace: impl FnOnce(
@@ -16450,7 +16605,7 @@ fn update_vmclock_for_snapshot_restore(
     )
 }
 
-fn update_vmclock_and_signal_with(
+pub(crate) fn update_vmclock_and_signal_with(
     memory: &mut GuestMemory,
     device: &mut Arm64BootVmClockDevice,
     update: impl FnOnce(
@@ -16512,7 +16667,7 @@ fn restore_time_identity_for_snapshot(
     )
 }
 
-fn restore_time_identity_and_signal_with(
+pub(crate) fn restore_time_identity_and_signal_with(
     memory: &mut GuestMemory,
     vmgenid: &mut Arm64BootVmGenIdDevice,
     vmclock: &mut Arm64BootVmClockDevice,
@@ -18797,6 +18952,9 @@ mod tests {
         PmemConfigInput, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT, VIRTIO_PMEM_REQUEST_SIZE,
         VIRTIO_PMEM_REQUEST_TYPE_FLUSH, VIRTIO_PMEM_STATUS_SIZE, VirtioPmemFlushStatus,
     };
+    use bangbang_runtime::pvtime::{
+        ARM64_PVTIME_STOLEN_TIME_OFFSET, Arm64PvTimeLayout, Arm64PvTimeStAbi,
+    };
     use bangbang_runtime::rtc::RtcMmioLayout;
     use bangbang_runtime::serial::{
         SERIAL_INTERRUPT_ENABLE_RECEIVED_DATA_AVAILABLE, SERIAL_INTERRUPT_ENABLE_REGISTER_OFFSET,
@@ -18855,10 +19013,10 @@ mod tests {
         HvfArm64BootTimeIdentityRestoreError, HvfArm64BootTimerDeviceConfig,
         HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
         HvfArm64BootVsockNotificationDispatchError, PCI_ENDPOINT_SLOT_COUNT,
-        allocate_interrupt_lines, collect_balloon_notification_dispatches,
-        collect_block_notification_dispatches, collect_entropy_notification_dispatches,
-        collect_memory_hotplug_notification_dispatches, collect_network_notification_dispatches,
-        collect_vsock_notification_dispatches,
+        allocate_interrupt_lines, capture_hvf_snapshot_v2_time_state,
+        collect_balloon_notification_dispatches, collect_block_notification_dispatches,
+        collect_entropy_notification_dispatches, collect_memory_hotplug_notification_dispatches,
+        collect_network_notification_dispatches, collect_vsock_notification_dispatches,
         dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, dispatch_serial_input_with,
         lock_boot_mmio_dispatcher, lock_boot_mmio_dispatcher_runtime,
@@ -18885,6 +19043,7 @@ mod tests {
         HvfGicInterruptRange, HvfGicMetadata, HvfGicRedistributor, HvfGicRegion,
         HvfGicSpiSignalError,
     };
+    use crate::pvtime::{HvfArm64PvTimeCaptureState, HvfArm64PvTimeVcpuCaptureState};
     use crate::runner::tests::start_secondary_configure_recording_runner;
     use crate::runner::{HvfVcpuRunStepOutcome, HvfVcpuRunnerError};
 
@@ -19341,6 +19500,134 @@ mod tests {
             },
         };
         (memory, device)
+    }
+
+    fn snapshot_v2_time_capture_test_state() -> (
+        GuestMemory,
+        RtcMmioLayout,
+        Arm64BootVmGenIdDevice,
+        Arm64BootVmClockDevice,
+        Arm64PvTimeLayout,
+        HvfArm64PvTimeCaptureState,
+    ) {
+        let (mut memory, vmclock) = vmclock_restore_test_memory_and_device();
+        let vmgenid_range = GuestMemoryRange::new(
+            GuestAddress::new(vmclock.range.start().raw_value() - ARM64_FDT_VMGENID_SIZE),
+            ARM64_FDT_VMGENID_SIZE,
+        )
+        .expect("VMGenID range should validate");
+        let vmgenid = Arm64BootVmGenIdDevice {
+            range: vmgenid_range,
+            generation_id: [0xa5; ARM64_BOOT_VMGENID_SIZE],
+            fdt_device: Arm64FdtVmGenIdDevice {
+                region: Arm64FdtRegion {
+                    base: vmgenid_range.start().raw_value(),
+                    size: vmgenid_range.size(),
+                },
+                interrupt_line: line(127),
+            },
+        };
+        memory
+            .write_slice(&vmgenid.generation_id, vmgenid.range.start())
+            .expect("VMGenID capture fixture should write");
+        let arena = GuestMemoryRange::new(
+            GuestAddress::new(aarch64::SYSTEM_MEM_START),
+            vmgenid
+                .range
+                .start()
+                .raw_value()
+                .checked_sub(aarch64::SYSTEM_MEM_START)
+                .expect("PVTime arena should validate"),
+        )
+        .expect("PVTime arena should validate");
+        let pvtime_layout =
+            Arm64PvTimeLayout::plan(2, arena).expect("PVTime layout should validate");
+        let stolen_times = [111_u64, 222_u64];
+        for (range, stolen_time_ns) in pvtime_layout.records().iter().zip(stolen_times) {
+            let mut bytes = Arm64PvTimeStAbi::initial().to_bytes();
+            bytes[ARM64_PVTIME_STOLEN_TIME_OFFSET..ARM64_PVTIME_STOLEN_TIME_OFFSET + 8]
+                .copy_from_slice(&stolen_time_ns.to_le_bytes());
+            memory
+                .write_slice(&bytes, range.start())
+                .expect("PVTime capture fixture should write");
+        }
+        let pvtime_capture = HvfArm64PvTimeCaptureState::new(
+            stolen_times
+                .into_iter()
+                .map(HvfArm64PvTimeVcpuCaptureState::new)
+                .collect(),
+        );
+        (
+            memory,
+            RtcMmioLayout::new(GuestAddress::new(0x4000_1000), MmioRegionId::new(10)),
+            vmgenid,
+            vmclock,
+            pvtime_layout,
+            pvtime_capture,
+        )
+    }
+
+    #[test]
+    fn snapshot_v2_time_capture_retains_portable_guest_agreed_state() {
+        let (memory, rtc, vmgenid, vmclock, pvtime_layout, pvtime_capture) =
+            snapshot_v2_time_capture_test_state();
+
+        let time = capture_hvf_snapshot_v2_time_state(
+            &memory,
+            rtc,
+            &vmgenid,
+            &vmclock,
+            Some(&pvtime_layout),
+            &pvtime_capture,
+        )
+        .expect("stable guest-agreed time should capture");
+
+        assert_eq!(time.rtc_layout(), rtc);
+        assert_eq!(time.vmgenid().range(), vmgenid.range);
+        assert_eq!(time.vmclock().range(), vmclock.range);
+        assert_eq!(time.vmclock_abi(), vmclock.abi);
+        assert_eq!(time.pvtime_vcpus().len(), 2);
+        for (index, (captured, expected_range)) in time
+            .pvtime_vcpus()
+            .iter()
+            .zip(pvtime_layout.records())
+            .enumerate()
+        {
+            assert_eq!(
+                captured.index(),
+                u32::try_from(index).expect("index should fit")
+            );
+            assert_eq!(captured.record_ipa(), expected_range.start());
+            assert_eq!(captured.stolen_time_ns(), [111, 222][index]);
+        }
+        let debug = format!("{time:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("165, 165"));
+    }
+
+    #[test]
+    fn snapshot_v2_time_capture_rejects_pvtime_guest_owner_disagreement() {
+        let (mut memory, rtc, vmgenid, vmclock, pvtime_layout, pvtime_capture) =
+            snapshot_v2_time_capture_test_state();
+        let second_stolen_time = pvtime_layout.records()[1]
+            .start()
+            .checked_add(ARM64_PVTIME_STOLEN_TIME_OFFSET as u64)
+            .expect("PVTime field should fit");
+        memory
+            .write_slice(&999_u64.to_le_bytes(), second_stolen_time)
+            .expect("mismatched PVTime should write");
+
+        assert!(matches!(
+            capture_hvf_snapshot_v2_time_state(
+                &memory,
+                rtc,
+                &vmgenid,
+                &vmclock,
+                Some(&pvtime_layout),
+                &pvtime_capture,
+            ),
+            Err(super::HvfSnapshotV2TimeCaptureError::PvTimeMismatch { index: 1 })
+        ));
     }
 
     #[test]

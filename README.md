@@ -30,8 +30,9 @@ owns per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime now
 publishes per-vCPU stolen time from bounded owner-thread wall/execution samples,
 enables standard 64-bit SMCCC discovery when the HVF measurement primitive is
 available, and has signed Linux contention/idle/pause certification. PVTime
-artifact serialization/restore and serialized/restorable pmem snapshot state
-remain explicit Wave 6 limits.
+serialization and clone restore are implemented in the unpublished native-v2
+platform profile; public native-v2 lifecycle composition and
+serialized/restorable pmem snapshot state remain explicit Wave 6 limits.
 Host discard never promises synchronous RSS or footprint
 reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
@@ -496,23 +497,38 @@ failure/death/repeat cleanup, and the exact production entitlement floor.
 Separately, the runtime library implements the first bangbang-native v2 arm64
 state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
 readable, and `2.1.x` memory-only state remains readable with its exact paired
-image version. The current `2.2.0` writer adds a permanent typed HVF platform
-graph: singleton memory, machine, global, and topology components followed by
-contiguous per-vCPU components for up to 32 vCPUs. The graph retains inert boot
-metadata, redacted CPU-template application evidence, one VM-global GIC value,
-stable PSCI lifecycle state, complete mandatory vCPU state, and a closed
+image version. Minor `2.2.x` adds a permanent typed HVF graph with singleton
+memory, machine, global, and topology components followed by contiguous
+per-vCPU components for up to 32 vCPUs. The current `2.3.0` writer appends one
+singleton time component after those vCPU components. It retains portable
+PL031 placement and destination-reset policy, topology-ordered cumulative
+PVTime values, VMGenID/VMClock placement and notification metadata, and the
+complete VMClock ABI without persisting a source VMGenID, host pointer,
+`Instant`, or wall-clock anchor.
+
+The unpublished native-v2 reconstruction guard consumes this complete graph
+and already-authorized memory, creates a fresh destination PL031 anchored to
+destination `SystemTime`, restores PVTime while excluding snapshot downtime,
+generates and signals a fresh VMGenID, applies Firecracker's saved-counter
+VMClock transition and signal, and only then publishes the multi-vCPU owner
+`Paused`. Signed three-vCPU coverage proves repeatable immutable loads,
+recapture-to-restore, ordered guest notifications, guest-visible clock values,
+and no ordinary progress before explicit resume. The graph also retains inert
+boot metadata, redacted CPU-template application evidence, one VM-global GIC
+value, stable PSCI lifecycle state, complete mandatory vCPU state, and a closed
 reviewed debug/SME registry. Its directory profile is checked without
 payload-dependent allocation, every inner value is bounded, and the complete
-owned graph cross-validates before exposure; it still constructs no HVF
-resource. Library callers can separately write the bound 64-KiB-aligned memory
-image or load it from one retained read-only `File` as writable `MAP_PRIVATE`
-regions, so pages arrive on demand and writes remain private. State and fixed
-memory metadata are CRC-protected, but guest bytes deliberately are not
-checksummed or authenticated and require an external artifact
-authentication/encryption policy. No public create, load, describe, or version
-path emits or accepts v2 yet, and recognizing a pinned Firecracker bitcode
-prefix reports incompatibility rather than claiming decode or translation. The
-exact wire, ownership, and compatibility contract is documented in
+owned graph cross-validates before exposure.
+
+Library callers can write the bound 64-KiB-aligned memory image or load it from
+one retained read-only `File` as writable `MAP_PRIVATE` regions, so pages arrive
+on demand and writes remain private. State and fixed memory metadata are
+CRC-protected, but guest bytes deliberately are not checksummed or
+authenticated and require an external artifact authentication/encryption
+policy. No public create, load, describe, or version path emits or accepts v2
+yet, and recognizing a pinned Firecracker bitcode prefix reports
+incompatibility rather than claiming decode or translation. The exact wire,
+ownership, and compatibility contract is documented in
 [Snapshot Feasibility](docs/snapshot-feasibility.md#native-v2-structural-state-foundation).
 
 ## Process CLI
@@ -1412,8 +1428,9 @@ records its exact five-terminal/two-Wave-6 split, and the
 its exact five-terminal/one-Wave-6 split. The
 [time and identity restore ledger](compat/firecracker/v1.16.0/time-identity-contract.md)
 records the completed PL031, VMGenID, VMClock, and live/capture-ready public
-PVTime behavior while retaining its one aggregate record for Wave 6
-clone/portability certification. The
+PVTime behavior plus focused native-v2 time/clone restore, while retaining its
+one aggregate record for Wave 6 public composition and broader cross-host
+portability certification. The
 [aggregate remaining-device ledger](compat/firecracker/v1.16.0/remaining-device-contract.md)
 joins those five family ledgers into an exact 85-record,
 77-terminal/eight-Wave-6 closure. The

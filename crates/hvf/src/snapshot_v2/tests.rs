@@ -18,7 +18,7 @@ fn platform_fixture(with_sme: bool) -> HvfSnapshotV2PlatformState {
 }
 
 fn platform_fixture_with_count(vcpu_count: u8, with_sme: bool) -> HvfSnapshotV2PlatformState {
-    let (_, compatibility, mandatory, interrupts, _) = native_v1_fixture().into_parts();
+    let (_, compatibility, mandatory, interrupts, devices) = native_v1_fixture().into_parts();
     let source_identification = compatibility.identification();
     let pfr0 = if with_sme {
         source_identification.id_aa64pfr0_el1() & !(0xf << 32)
@@ -83,6 +83,7 @@ fn platform_fixture_with_count(vcpu_count: u8, with_sme: bool) -> HvfSnapshotV2P
     .expect("fixture FDT should validate");
     let machine = HvfSnapshotV2MachineState::try_new(machine, boot, fdt, None)
         .expect("fixture machine state should validate");
+    let rtc_mmio_layout = compatibility.rtc_mmio_layout();
     let global = HvfSnapshotV2GlobalState::try_new(compatibility, interrupts.gic_device.clone())
         .expect("fixture global state should validate");
     let topology_members = (0..usize::from(vcpu_count))
@@ -128,7 +129,63 @@ fn platform_fixture_with_count(vcpu_count: u8, with_sme: bool) -> HvfSnapshotV2P
             .expect("fixture vCPU should validate"),
         );
     }
-    HvfSnapshotV2PlatformState::try_new(memory_binding, machine, global, topology, vcpus)
+    let vmclock_base = aarch64::SYSTEM_MEM_START
+        .checked_add(aarch64::SYSTEM_MEM_SIZE)
+        .and_then(|end| end.checked_sub(ARM64_FDT_VMCLOCK_SIZE))
+        .expect("fixture VMClock placement should validate");
+    let vmgenid_base = vmclock_base
+        .checked_sub(ARM64_FDT_VMGENID_SIZE)
+        .expect("fixture VMGenID placement should validate");
+    let platform_metadata = |base: u64, size: u64, interrupt_line: GuestInterruptLine| {
+        SnapshotV1PlatformDeviceMetadata::new(
+            GuestMemoryRange::new(GuestAddress::new(base), size)
+                .expect("fixture platform range should validate"),
+            Arm64FdtRegion { base, size },
+            interrupt_line,
+        )
+    };
+    let vmgenid = platform_metadata(
+        vmgenid_base,
+        ARM64_FDT_VMGENID_SIZE,
+        devices.vmgenid().interrupt_line(),
+    );
+    let vmclock = platform_metadata(
+        vmclock_base,
+        ARM64_FDT_VMCLOCK_SIZE,
+        devices.vmclock().interrupt_line(),
+    );
+    let arena_size = vmgenid
+        .range()
+        .start()
+        .raw_value()
+        .checked_sub(aarch64::SYSTEM_MEM_START)
+        .expect("fixture PVTime arena should validate");
+    let arena = GuestMemoryRange::new(GuestAddress::new(aarch64::SYSTEM_MEM_START), arena_size)
+        .expect("fixture PVTime arena should validate");
+    let pvtime_layout =
+        Arm64PvTimeLayout::plan(vcpu_count, arena).expect("fixture PVTime layout should validate");
+    let pvtime_vcpus = pvtime_layout
+        .records()
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            HvfSnapshotV2PvTimeVcpuState::try_new(
+                u32::try_from(index).expect("fixture index should fit"),
+                record.start(),
+                100 + u64::try_from(index).expect("fixture index should fit"),
+            )
+            .expect("fixture PVTime state should validate")
+        })
+        .collect();
+    let time = HvfSnapshotV2TimeState::try_new(
+        rtc_mmio_layout,
+        vmgenid,
+        vmclock,
+        devices.vmclock_abi().unwrap_or_else(VmClockAbi::initial),
+        pvtime_vcpus,
+    )
+    .expect("fixture time state should validate");
+    HvfSnapshotV2PlatformState::try_new(memory_binding, machine, global, topology, vcpus, time)
         .expect("fixture platform should validate")
 }
 
@@ -327,6 +384,7 @@ fn round_trips_complete_multi_vcpu_platform_state() {
             NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
         ];
         expected_keys.extend((0..u32::from(vcpu_count)).map(native_v2_vcpu_component_key));
+        expected_keys.push(NATIVE_V2_TIME_COMPONENT_KEY);
         assert_eq!(keys, expected_keys);
         let decoded =
             decode_hvf_snapshot_v2_platform_state(&structural).expect("platform should decode");
@@ -593,6 +651,41 @@ fn rejects_minor_one_memory_only_state_as_hvf_profile_before_payload_decode() {
 }
 
 #[test]
+fn keeps_minor_two_platform_structure_readable_but_requires_time_for_typed_profile() {
+    let encoded = rebuild_without_component(&encoded_fixture(false), NATIVE_V2_TIME_COMPONENT_KEY);
+    let mut minor_two = rebuild_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_MEMORY_COMPONENT_KEY {
+            payload[10..12].copy_from_slice(&2_u16.to_le_bytes());
+            payload[12..14].copy_from_slice(&0_u16.to_le_bytes());
+            payload[48..56].fill(0);
+            let checksum = crc64::crc64(0, payload);
+            payload[48..56].copy_from_slice(&checksum.to_le_bytes());
+        }
+    });
+    minor_two[10..12].copy_from_slice(&2_u16.to_le_bytes());
+    let checksum_offset =
+        minor_two.len() - bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES;
+    let checksum = crc64::crc64(0, &minor_two[..checksum_offset]);
+    minor_two[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+
+    let state =
+        decode_snapshot_v2_state(&minor_two).expect("minor-two structure should remain readable");
+    assert_eq!(state.metadata().version().minor(), 2);
+    assert!(state.component(NATIVE_V2_TIME_COMPONENT_KEY).is_none());
+    assert_eq!(
+        decode_snapshot_v2_memory_binding(&state)
+            .expect("minor-two memory binding should remain readable")
+            .version()
+            .minor(),
+        2
+    );
+    assert!(matches!(
+        decode_hvf_snapshot_v2_platform_state(&state),
+        Err(HvfSnapshotV2DecodeError::UnsupportedProfile)
+    ));
+}
+
+#[test]
 fn rejects_component_reserved_bytes_and_invalid_topology_disposition() {
     let encoded = encoded_fixture(false);
     let reserved = rebuild_components(&encoded, |key, _, payload| {
@@ -650,6 +743,7 @@ fn rejects_every_platform_component_header_flag_and_reserved_family() {
         NATIVE_V2_GLOBAL_COMPONENT_KEY,
         NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
         native_v2_vcpu_component_key(0),
+        NATIVE_V2_TIME_COMPONENT_KEY,
     ] {
         let bad_magic = rebuild_components(&encoded, |candidate, _, payload| {
             if *candidate == key {
@@ -689,6 +783,7 @@ fn rejects_every_platform_component_header_flag_and_reserved_family() {
         (NATIVE_V2_GLOBAL_COMPONENT_KEY, 20),
         (NATIVE_V2_TOPOLOGY_COMPONENT_KEY, 24),
         (native_v2_vcpu_component_key(0), 20),
+        (NATIVE_V2_TIME_COMPONENT_KEY, 20),
     ] {
         let bad_reserved = rebuild_components(&encoded, |candidate, _, payload| {
             if *candidate == key {
@@ -791,6 +886,24 @@ fn rejects_component_counts_and_lengths_before_dependent_allocation() {
         Err(HvfSnapshotV2DecodeError::InvalidLength)
     ));
 
+    for (offset, value) in [
+        (24, 0_u32),
+        (
+            28,
+            u32::try_from(TIME_PVTIME_ENTRY_BYTES - 1).expect("entry size should fit"),
+        ),
+    ] {
+        let time = rebuild_components(&encoded, |key, _, payload| {
+            if *key == NATIVE_V2_TIME_COMPONENT_KEY {
+                payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        });
+        assert!(matches!(
+            decode_platform(&time),
+            Err(HvfSnapshotV2DecodeError::InvalidLength)
+        ));
+    }
+
     for (relative_offset, value) in [
         (24, 0_u32),
         (
@@ -877,6 +990,52 @@ fn rejects_duplicate_unknown_malformed_and_out_of_order_optional_records() {
     assert!(matches!(
         decode_platform(&bad_reserved),
         Err(HvfSnapshotV2DecodeError::NonzeroReserved)
+    ));
+}
+
+#[test]
+fn rejects_unknown_time_policies_and_malformed_time_records() {
+    let encoded = encoded_fixture(false);
+    for offset in 16..20 {
+        let unknown_policy = rebuild_components(&encoded, |key, _, payload| {
+            if *key == NATIVE_V2_TIME_COMPONENT_KEY {
+                payload[offset] = u8::MAX;
+            }
+        });
+        assert!(matches!(
+            decode_platform(&unknown_policy),
+            Err(HvfSnapshotV2DecodeError::InvalidTime)
+        ));
+    }
+
+    let entry_reserved = rebuild_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_TIME_COMPONENT_KEY {
+            payload[TIME_HEADER_BYTES + 4] = 1;
+        }
+    });
+    assert!(matches!(
+        decode_platform(&entry_reserved),
+        Err(HvfSnapshotV2DecodeError::NonzeroReserved)
+    ));
+
+    let out_of_order_index = rebuild_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_TIME_COMPONENT_KEY {
+            payload[TIME_HEADER_BYTES..TIME_HEADER_BYTES + 4].copy_from_slice(&1_u32.to_le_bytes());
+        }
+    });
+    assert!(matches!(
+        decode_platform(&out_of_order_index),
+        Err(HvfSnapshotV2DecodeError::InvalidTime)
+    ));
+
+    let invalid_vmclock = rebuild_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_TIME_COMPONENT_KEY {
+            payload[128] ^= u8::MAX;
+        }
+    });
+    assert!(matches!(
+        decode_platform(&invalid_vmclock),
+        Err(HvfSnapshotV2DecodeError::InvalidTime)
     ));
 }
 
@@ -1054,6 +1213,48 @@ fn rejects_locally_valid_cross_component_mismatches_in_stable_order() {
             HvfSnapshotV2BuildError::CrossComponent
         ))
     ));
+
+    let rtc_identity = rebuild_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_TIME_COMPONENT_KEY {
+            payload[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        }
+    });
+    assert!(matches!(
+        decode_platform(&rtc_identity),
+        Err(HvfSnapshotV2DecodeError::Build(
+            HvfSnapshotV2BuildError::CrossComponent
+        ))
+    ));
+
+    let vmgenid_line = rebuild_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_TIME_COMPONENT_KEY {
+            payload[80..84].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+    });
+    assert!(matches!(
+        decode_platform(&vmgenid_line),
+        Err(HvfSnapshotV2DecodeError::Build(
+            HvfSnapshotV2BuildError::CrossComponent
+        ))
+    ));
+
+    let pvtime_record = rebuild_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_TIME_COMPONENT_KEY {
+            let current = u64::from_le_bytes(
+                payload[TIME_HEADER_BYTES + 8..TIME_HEADER_BYTES + 16]
+                    .try_into()
+                    .expect("fixed PVTime address"),
+            );
+            payload[TIME_HEADER_BYTES + 8..TIME_HEADER_BYTES + 16]
+                .copy_from_slice(&(current + ARM64_PVTIME_STRUCTURE_ALIGNMENT).to_le_bytes());
+        }
+    });
+    assert!(matches!(
+        decode_platform(&pvtime_record),
+        Err(HvfSnapshotV2DecodeError::Build(
+            HvfSnapshotV2BuildError::CrossComponent
+        ))
+    ));
 }
 
 #[test]
@@ -1183,7 +1384,7 @@ fn bounds_inert_metadata_global_state_and_debug_output() {
 fn admitted_component_maxima_fit_the_structural_file_budget() {
     let mandatory_bytes =
         encode_vcpu(platform_fixture(false).vcpus()[0].mandatory()).expect("vCPU should encode");
-    let maximum_component_count = 4 + usize::from(MAX_SUPPORTED_VCPUS);
+    let maximum_component_count = 5 + usize::from(MAX_SUPPORTED_VCPUS);
     let maximum_machine = MACHINE_HEADER_BYTES
         + HVF_SNAPSHOT_V2_MAX_PATH_BYTES * 2
         + HVF_SNAPSHOT_V2_MAX_BOOT_ARGUMENT_BYTES
