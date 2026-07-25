@@ -267,6 +267,18 @@ image IDs, checksums, guest bytes, or GIC contents. CRC-64/Jones and random
 image identity detect accidental corruption or mismatched pairs, not malicious
 rewriting, confidentiality, provenance, or authorization.
 
+The VM-free artifact boundary accepts one closed owned native-family
+commitment. Native-v2 construction decodes the exact retained state bytes and
+derives their singleton memory binding internally; there is no public
+caller-supplied `(state, binding)` assertion. The shared macOS transaction
+accepts only exact current-version v2 output, while bounded state-first readers
+retain compatible older-minor input. Publication verifies the owned read-write
+staging descriptor's position, length, header, zero padding, identity, and
+stability without mapping it. Final v2 loading remains a distinct policy that
+requires read-only and close-on-exec access, revalidates the same facts, and
+retains private File/COW mappings. None of these inert handoffs authorizes a VM,
+host endpoint, public API action, or production session.
+
 Native-v1 publication holds paused-worker admission, block/PMEM/network/entropy
 retry quiescence, and all four runner operation domains through non-memory
 encoding, complete memory streaming, artifact verification and synchronization,
@@ -1325,11 +1337,13 @@ is resource-specific:
   writer. Writer destruction closes its descriptor before publishing a close
   proof; retention or `mem::forget` fails without waiting and before any file
   barrier or rename. Producer failures retain a typed source only through a
-  trusted accessor while formatted diagnostics redact it. Before sync, a
-  fixed-size verifier matches the actual memory header identity, data/file
-  lengths, EOF, and stored checksum trailer to the returned codec binding. This
-  is mismatch detection for a trusted producer, not full validation: only the
-  loader recomputes CRC and validates GPA ranges.
+  trusted accessor while formatted diagnostics redact it. Before sync, the
+  selected closed family invokes its verifier: v1 matches header identity,
+  data/file lengths, EOF, and the stored checksum trailer; v2 matches the exact
+  final position and length, state-derived header, zero metadata padding,
+  regular-file identity, and unchanged facts. These are trusted-producer
+  mismatch checks, not artifact authentication; the final loaders retain their
+  stronger family-specific input policies.
 - Destination directories are trusted security boundaries. Darwin has no
   public rename or unlink conditioned on the identity of an already-open file,
   so the immediate staging inode check is best-effort and has a residual race.

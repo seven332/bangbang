@@ -660,7 +660,17 @@ entries precede one callback, earlier failures skip it, ordinary drop and
 explicit close satisfy the close proof, retained/forgotten/error-owned writers
 never publish, panic and typed producer failure clean staging and permit retry,
 and short/extra/wrong-identity/wrong-length/wrong-trailer output cannot commit.
-The lightweight verifier is not a substitute for loader CRC/GPA validation.
+Native-family coverage additionally proves that the closed v2 value derives its
+binding from the exact state bytes, current-version publication cannot be
+bypassed with a compatible-reader value, both family adapters traverse the same
+injected transaction stages, and unrelated v2 state/image identities fail
+before publication. Direct and already-opened v1/v2 loads preserve descriptor
+identity after path replacement; v2 requires read-only/CLOEXEC input, retains
+private File/COW regions, isolates repeated-load writes, and leaves source bytes
+unchanged. The v2 staging verifier separately covers exact position, length,
+header, zero padding, and read-write staging acceptance without weakening the
+final loader policy. The lightweight verifiers are not substitutes for loader
+CRC/GPA validation.
 Failure hooks may prove an observed replacement is refused, but must not claim
 atomic source identity against a hostile directory writer. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_artifact --locked`.

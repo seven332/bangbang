@@ -659,6 +659,7 @@ pub enum SnapshotV2MemoryLoadError {
     InvalidPath,
     Open { kind: io::ErrorKind },
     Inspect { kind: io::ErrorKind },
+    PositionMismatch,
     DescriptorNotReadOnly,
     DescriptorNotCloseOnExec,
     NotRegularFile,
@@ -682,6 +683,9 @@ impl fmt::Display for SnapshotV2MemoryLoadError {
                     formatter,
                     "native-v2 memory descriptor inspection failed: {kind}"
                 )
+            }
+            Self::PositionMismatch => {
+                formatter.write_str("native-v2 memory descriptor position does not match state")
             }
             Self::DescriptorNotReadOnly => {
                 formatter.write_str("native-v2 memory descriptor is not read-only")
@@ -779,27 +783,7 @@ fn load_snapshot_v2_memory_binding_from_file_with_hook(
     }
     hook(SnapshotV2MemoryLoadStage::Preflight, &file);
 
-    let metadata_bytes = usize::try_from(NATIVE_V2_MEMORY_ALIGNMENT)
-        .map_err(|_| SnapshotV2MemoryLoadError::FileLengthMismatch)?;
-    let mut metadata = Vec::new();
-    metadata
-        .try_reserve_exact(metadata_bytes)
-        .map_err(|source| SnapshotV2MemoryLoadError::MetadataAllocationFailed { source })?;
-    metadata.resize(metadata_bytes, 0);
-    read_exact_at(&file, &mut metadata, 0)?;
-
-    let expected_header = binding
-        .image_header()
-        .map_err(SnapshotV2MemoryStateError::Binding)?;
-    if metadata.get(..NATIVE_V2_MEMORY_HEADER_BYTES) != Some(expected_header.as_slice()) {
-        return Err(SnapshotV2MemoryLoadError::MemoryHeaderMismatch);
-    }
-    if metadata
-        .get(NATIVE_V2_MEMORY_HEADER_BYTES..)
-        .is_none_or(|padding| padding.iter().any(|byte| *byte != 0))
-    {
-        return Err(SnapshotV2MemoryLoadError::NonZeroMetadataPadding);
-    }
+    verify_memory_metadata(binding, &file)?;
     hook(SnapshotV2MemoryLoadStage::Metadata, &file);
     let after_metadata = inspect_file(&file)?;
     if after_metadata != before {
@@ -832,6 +816,76 @@ fn load_snapshot_v2_memory_binding_from_file_with_hook(
     Ok(memory)
 }
 
+/// Verifies one transaction-owned native-v2 staging descriptor without mapping it.
+///
+/// Publication owns a read-write descriptor, unlike the final retained-file
+/// loader. This verifier therefore checks the exact output position, length,
+/// regular-file identity, header, zero padding, and source stability without
+/// applying the final loader's read-only policy.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn verify_snapshot_v2_memory_image_output(
+    binding: &SnapshotV2MemoryBinding,
+    file: &mut File,
+) -> Result<(), SnapshotV2MemoryLoadError> {
+    verify_snapshot_v2_memory_image_output_with_hook(binding, file, |_| {})
+}
+
+fn verify_snapshot_v2_memory_image_output_with_hook(
+    binding: &SnapshotV2MemoryBinding,
+    file: &mut File,
+    mut hook: impl FnMut(&File),
+) -> Result<(), SnapshotV2MemoryLoadError> {
+    let before = inspect_file_facts(file)?;
+    validate_regular_file(&before)?;
+    let position = file
+        .stream_position()
+        .map_err(|source| SnapshotV2MemoryLoadError::Inspect {
+            kind: source.kind(),
+        })?;
+    if position != binding.file_length() {
+        return Err(SnapshotV2MemoryLoadError::PositionMismatch);
+    }
+    if before.length != binding.file_length() {
+        return Err(SnapshotV2MemoryLoadError::FileLengthMismatch);
+    }
+    verify_memory_metadata(binding, file)?;
+    hook(file);
+    let after = inspect_file_facts(file)?;
+    validate_regular_file(&after)?;
+    if after != before {
+        return Err(SnapshotV2MemoryLoadError::SourceChanged);
+    }
+    Ok(())
+}
+
+fn verify_memory_metadata(
+    binding: &SnapshotV2MemoryBinding,
+    file: &File,
+) -> Result<(), SnapshotV2MemoryLoadError> {
+    let metadata_bytes = usize::try_from(NATIVE_V2_MEMORY_ALIGNMENT)
+        .map_err(|_| SnapshotV2MemoryLoadError::FileLengthMismatch)?;
+    let mut metadata = Vec::new();
+    metadata
+        .try_reserve_exact(metadata_bytes)
+        .map_err(|source| SnapshotV2MemoryLoadError::MetadataAllocationFailed { source })?;
+    metadata.resize(metadata_bytes, 0);
+    read_exact_at(file, &mut metadata, 0)?;
+
+    let expected_header = binding
+        .image_header()
+        .map_err(SnapshotV2MemoryStateError::Binding)?;
+    if metadata.get(..NATIVE_V2_MEMORY_HEADER_BYTES) != Some(expected_header.as_slice()) {
+        return Err(SnapshotV2MemoryLoadError::MemoryHeaderMismatch);
+    }
+    if metadata
+        .get(NATIVE_V2_MEMORY_HEADER_BYTES..)
+        .is_none_or(|padding| padding.iter().any(|byte| *byte != 0))
+    {
+        return Err(SnapshotV2MemoryLoadError::NonZeroMetadataPadding);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileFacts {
     device: u64,
@@ -847,6 +901,18 @@ struct FileFacts {
 }
 
 fn inspect_file(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
+    let facts = inspect_file_facts(file)?;
+    if facts.status_flags & libc::O_ACCMODE != libc::O_RDONLY {
+        return Err(SnapshotV2MemoryLoadError::DescriptorNotReadOnly);
+    }
+    if facts.descriptor_flags & libc::FD_CLOEXEC == 0 {
+        return Err(SnapshotV2MemoryLoadError::DescriptorNotCloseOnExec);
+    }
+    validate_regular_file(&facts)?;
+    Ok(facts)
+}
+
+fn inspect_file_facts(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
     // SAFETY: `file` owns a live descriptor and these commands have no pointer
     // arguments.
     let status_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
@@ -855,9 +921,6 @@ fn inspect_file(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
             kind: io::Error::last_os_error().kind(),
         });
     }
-    if status_flags & libc::O_ACCMODE != libc::O_RDONLY {
-        return Err(SnapshotV2MemoryLoadError::DescriptorNotReadOnly);
-    }
     // SAFETY: as above, `F_GETFD` reads descriptor-local flags only.
     let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
     if descriptor_flags < 0 {
@@ -865,18 +928,12 @@ fn inspect_file(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
             kind: io::Error::last_os_error().kind(),
         });
     }
-    if descriptor_flags & libc::FD_CLOEXEC == 0 {
-        return Err(SnapshotV2MemoryLoadError::DescriptorNotCloseOnExec);
-    }
 
     let metadata = file
         .metadata()
         .map_err(|source| SnapshotV2MemoryLoadError::Inspect {
             kind: source.kind(),
         })?;
-    if !metadata.file_type().is_file() {
-        return Err(SnapshotV2MemoryLoadError::NotRegularFile);
-    }
     Ok(FileFacts {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -889,6 +946,14 @@ fn inspect_file(file: &File) -> Result<FileFacts, SnapshotV2MemoryLoadError> {
         status_flags,
         descriptor_flags,
     })
+}
+
+fn validate_regular_file(facts: &FileFacts) -> Result<(), SnapshotV2MemoryLoadError> {
+    if facts.mode & u32::from(libc::S_IFMT) == u32::from(libc::S_IFREG) {
+        Ok(())
+    } else {
+        Err(SnapshotV2MemoryLoadError::NotRegularFile)
+    }
 }
 
 fn read_exact_at(

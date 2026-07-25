@@ -504,6 +504,100 @@ fn adopted_file_load_is_lazy_cow_cursor_independent_and_source_preserving() {
 }
 
 #[test]
+fn publication_verifier_accepts_rw_staging_and_checks_position_length_header_and_padding() {
+    let memory = test_memory();
+    let (image, binding) = write_test_image(&memory, TEST_ID);
+    let valid = TempFile::new("publication-valid", &image);
+    let mut staging = valid.open_read_write();
+    staging
+        .seek(SeekFrom::End(0))
+        .expect("staging position should seek to the completed end");
+    verify_snapshot_v2_memory_image_output(&binding, &mut staging)
+        .expect("complete read-write staging should verify");
+
+    let mut wrong_position = valid.open_read_write();
+    assert!(matches!(
+        verify_snapshot_v2_memory_image_output(&binding, &mut wrong_position),
+        Err(SnapshotV2MemoryLoadError::PositionMismatch)
+    ));
+
+    let short = TempFile::new("publication-short", &image[..image.len() - 1]);
+    let mut short_file = short.open_read_write();
+    short_file
+        .seek(SeekFrom::Start(binding.file_length()))
+        .expect("short staging should seek");
+    assert!(matches!(
+        verify_snapshot_v2_memory_image_output(&binding, &mut short_file),
+        Err(SnapshotV2MemoryLoadError::FileLengthMismatch)
+    ));
+
+    let mut extended_bytes = image.clone();
+    extended_bytes.push(0);
+    let extended = TempFile::new("publication-extended", &extended_bytes);
+    let mut extended_file = extended.open_read_write();
+    extended_file
+        .seek(SeekFrom::Start(binding.file_length()))
+        .expect("extended staging should seek to the bound length");
+    assert!(matches!(
+        verify_snapshot_v2_memory_image_output(&binding, &mut extended_file),
+        Err(SnapshotV2MemoryLoadError::FileLengthMismatch)
+    ));
+
+    let mut invalid_header = image.clone();
+    invalid_header[MAGIC_OFFSET] ^= 0x01;
+    let invalid_header = TempFile::new("publication-header", &invalid_header);
+    let mut invalid_header_file = invalid_header.open_read_write();
+    invalid_header_file
+        .seek(SeekFrom::End(0))
+        .expect("header staging should seek");
+    assert!(matches!(
+        verify_snapshot_v2_memory_image_output(&binding, &mut invalid_header_file),
+        Err(SnapshotV2MemoryLoadError::MemoryHeaderMismatch)
+    ));
+
+    let mut invalid_padding = image;
+    invalid_padding[NATIVE_V2_MEMORY_HEADER_BYTES] = 1;
+    let invalid_padding = TempFile::new("publication-padding", &invalid_padding);
+    let mut invalid_padding_file = invalid_padding.open_read_write();
+    invalid_padding_file
+        .seek(SeekFrom::End(0))
+        .expect("padding staging should seek");
+    assert!(matches!(
+        verify_snapshot_v2_memory_image_output(&binding, &mut invalid_padding_file),
+        Err(SnapshotV2MemoryLoadError::NonZeroMetadataPadding)
+    ));
+
+    let valid_bytes = fs::read(valid.path()).expect("valid staging bytes should read");
+    let mutated = TempFile::new("publication-mutated", &valid_bytes);
+    let mut mutated_file = mutated.open_read_write();
+    mutated_file
+        .seek(SeekFrom::End(0))
+        .expect("mutated staging should seek");
+    let mutator = mutated.open_read_write();
+    let error =
+        verify_snapshot_v2_memory_image_output_with_hook(&binding, &mut mutated_file, |_| {
+            mutator
+                .set_len(binding.file_length() - 1)
+                .expect("test mutation should truncate staging");
+        })
+        .expect_err("staging mutation during verification must fail");
+    assert!(matches!(error, SnapshotV2MemoryLoadError::SourceChanged));
+
+    let mut pipe_descriptors = [-1; 2];
+    // SAFETY: the array has room for both descriptors returned by `pipe`.
+    assert_eq!(unsafe { libc::pipe(pipe_descriptors.as_mut_ptr()) }, 0);
+    let [read_descriptor, write_descriptor] = pipe_descriptors;
+    // SAFETY: the write descriptor is live and no longer needed by the test.
+    assert_eq!(unsafe { libc::close(write_descriptor) }, 0);
+    // SAFETY: ownership of the live read descriptor transfers exactly once.
+    let mut pipe_file = unsafe { File::from_raw_fd(read_descriptor) };
+    assert!(matches!(
+        verify_snapshot_v2_memory_image_output(&binding, &mut pipe_file),
+        Err(SnapshotV2MemoryLoadError::NotRegularFile)
+    ));
+}
+
+#[test]
 fn loader_rejects_access_flags_length_header_padding_and_binding_substitution() {
     let memory = test_memory();
     let (image, binding) = write_test_image(&memory, TEST_ID);
