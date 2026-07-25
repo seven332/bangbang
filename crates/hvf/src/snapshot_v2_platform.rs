@@ -69,8 +69,9 @@ use crate::snapshot_v2::{
 use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
-    capture_hvf_snapshot_v2_time_state, pci_root_restore_gic_msi_configuration,
-    replace_vmgenid_and_signal_with, update_vmclock_and_signal_with,
+    capture_hvf_snapshot_v2_time_state, pci_root_restore_bar_region_id,
+    pci_root_restore_gic_msi_configuration, replace_vmgenid_and_signal_with,
+    update_vmclock_and_signal_with,
 };
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
 use crate::vcpu::HvfArm64VcpuIdentificationRegisterState;
@@ -80,7 +81,6 @@ const PROCESS_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
 const PROCESS_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(20);
 const PROCESS_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
 const PROCESS_RTC_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(10);
-const PROCESS_PCI_ROOT_BAR_REGION_ID: MmioRegionId = MmioRegionId::new(4100);
 
 /// Destination process policy needed to verify the exact root allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1884,6 +1884,8 @@ fn prepare_root_resource_plan(
             let expected_bar =
                 GuestMemoryRange::new(address_plan.bar64().start(), VIRTIO_PCI_CAPABILITY_BAR_SIZE)
                     .map_err(|_| PrepareHvfSnapshotV2RootPlanError::ResourcePlan)?;
+            let bar_region_id = pci_root_restore_bar_region_id()
+                .map_err(|_| PrepareHvfSnapshotV2RootPlanError::ResourcePlan)?;
             if pci.sbdf() != expected_sbdf
                 || pci.bar_index() != VIRTIO_PCI_CAPABILITY_BAR_INDEX
                 || pci.bar_address_space() != PciBarAddressSpace::Memory64
@@ -1895,7 +1897,7 @@ fn prepare_root_resource_plan(
             }
             HvfSnapshotV2RootTransportPlan::Pci {
                 sbdf: expected_sbdf,
-                bar_region_id: PROCESS_PCI_ROOT_BAR_REGION_ID,
+                bar_region_id,
                 bar_range: expected_bar,
                 msi,
             }
@@ -2403,7 +2405,7 @@ fn validate_process_root_nodes(
         ) => {
             if graph.sbdf() != sbdf
                 || graph.bar_range() != bar_range
-                || bar_region_id != PROCESS_PCI_ROOT_BAR_REGION_ID
+                || pci_root_restore_bar_region_id().ok() != Some(bar_region_id)
                 || !validate_process_pci_host(root_node)
                 || !validate_process_gic_msi(intc, msi)
             {
@@ -3545,7 +3547,10 @@ mod tests {
             )
             .expect("first endpoint identity should validate")
         );
-        assert_eq!(bar_region_id, PROCESS_PCI_ROOT_BAR_REGION_ID);
+        assert_eq!(
+            bar_region_id,
+            pci_root_restore_bar_region_id().expect("root BAR region id should validate")
+        );
         assert_eq!(
             bar_range,
             GuestMemoryRange::new(

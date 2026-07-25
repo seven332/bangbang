@@ -1578,6 +1578,13 @@ impl fmt::Debug for PreparedNativeSnapshotLoad {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectRootSelectorPolicy {
+    TreatAsPath,
+    RejectGrantReference,
+}
+
+#[cfg(target_os = "macos")]
 struct PreparedSnapshotRootBackingLease {
     selector: Option<PathBuf>,
     claim: Option<PreparedDriveBackingClaim>,
@@ -1589,13 +1596,16 @@ impl PreparedSnapshotRootBackingLease {
     fn prepare(
         selector: &Path,
         authority: Option<&GrantAuthority>,
+        direct_policy: DirectRootSelectorPolicy,
     ) -> Result<Self, GrantClaimError> {
         let claim = match authority {
             Some(authority) => {
                 authority.prepare_drive_backing_claim(selector, GrantAccess::ReadOnly)?
             }
             None => {
-                if grant_reference_id(selector)?.is_some() {
+                if direct_policy == DirectRootSelectorPolicy::RejectGrantReference
+                    && grant_reference_id(selector)?.is_some()
+                {
                     return Err(GrantClaimError);
                 }
                 None
@@ -4801,6 +4811,7 @@ where
         let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
             state.root_backing_path(),
             self.grant_authority.as_ref(),
+            DirectRootSelectorPolicy::TreatAsPath,
         )
         .map_err(NativeV1SnapshotLoadError::Resource)?;
         let root = root_lease
@@ -4888,6 +4899,7 @@ where
         let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
             state.root_backing_path(),
             self.grant_authority.as_ref(),
+            DirectRootSelectorPolicy::RejectGrantReference,
         )
         .map_err(NativeV1SnapshotLoadError::Resource)?;
         let root = root_lease
@@ -5174,9 +5186,12 @@ where
         .map_err(NativeV1SnapshotLoadError::Artifact)?;
         let state = PreparedHvfSnapshotV1State::from_prepared_state(state)
             .map_err(NativeV1SnapshotLoadError::Prepare)?;
-        let mut root_lease =
-            PreparedSnapshotRootBackingLease::prepare(state.root_backing_path(), Some(authority))
-                .map_err(NativeV1SnapshotLoadError::Resource)?;
+        let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
+            state.root_backing_path(),
+            Some(authority),
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .map_err(NativeV1SnapshotLoadError::Resource)?;
         let root = root_lease
             .take_snapshot_read_only_file()
             .map_err(NativeV1SnapshotLoadError::Resource)?;
@@ -5272,6 +5287,7 @@ where
         let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
             state.root_backing_path(),
             self.grant_authority.as_ref(),
+            DirectRootSelectorPolicy::RejectGrantReference,
         )
         .map_err(NativeV1SnapshotLoadError::Resource)?;
         let root = root_lease
@@ -5980,6 +5996,7 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
         let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
             Path::new(prepared.selector()),
             self.grant_authority.as_ref(),
+            DirectRootSelectorPolicy::TreatAsPath,
         )
         .map_err(|source| {
             NativeV2SnapshotLoadError::RootBacking(SnapshotRootBackingLeaseError::Grant(source))
@@ -5997,7 +6014,7 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
             memory,
             root,
             resources,
-            root_lease: Some(root_lease),
+            root_lease,
             controller_commit,
             serial_output,
             guest_ranges,
@@ -6282,7 +6299,7 @@ struct PreparedHvfSnapshotV2RootProcessLoad {
     memory: GuestMemory,
     root: PreparedSnapshotV2RootBlock,
     resources: HvfSnapshotV2RootResourcePlan,
-    root_lease: Option<PreparedSnapshotRootBackingLease>,
+    root_lease: PreparedSnapshotRootBackingLease,
     controller_commit: SnapshotV2ControllerCommit,
     serial_output: SharedSerialOutput,
     guest_ranges: Vec<GuestMemoryRange>,
@@ -6306,11 +6323,36 @@ impl fmt::Debug for PreparedHvfSnapshotV2RootProcessLoad {
     reason = "exact-2.4 root restore stays dormant until endpoint reconstruction lands"
 )]
 impl PreparedHvfSnapshotV2RootProcessLoad {
-    fn commit_root_claim(&mut self) {
-        if let Some(lease) = self.root_lease.take() {
-            lease.commit();
+    fn into_parts(self) -> PreparedHvfSnapshotV2RootProcessLoadParts {
+        PreparedHvfSnapshotV2RootProcessLoadParts {
+            platform: self.platform,
+            memory: self.memory,
+            root: self.root,
+            resources: self.resources,
+            root_lease: self.root_lease,
+            controller_commit: self.controller_commit,
+            serial_output: self.serial_output,
+            guest_ranges: self.guest_ranges,
+            virtual_timer_intid: self.virtual_timer_intid,
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "exact-2.4 root restore stays dormant until endpoint reconstruction lands"
+)]
+struct PreparedHvfSnapshotV2RootProcessLoadParts {
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    root: PreparedSnapshotV2RootBlock,
+    resources: HvfSnapshotV2RootResourcePlan,
+    root_lease: PreparedSnapshotRootBackingLease,
+    controller_commit: SnapshotV2ControllerCommit,
+    serial_output: SharedSerialOutput,
+    guest_ranges: Vec<GuestMemoryRange>,
+    virtual_timer_intid: u32,
 }
 
 #[allow(
@@ -14715,7 +14757,10 @@ mod tests {
         snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
     #[cfg(target_os = "macos")]
-    use super::{GrantAccess, PreparedSnapshotRootBackingLease, SnapshotRootBackingLeaseError};
+    use super::{
+        DirectRootSelectorPolicy, GrantAccess, PreparedSnapshotRootBackingLease,
+        SnapshotRootBackingLeaseError,
+    };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -15075,8 +15120,12 @@ mod tests {
     #[test]
     fn root_backing_lease_direct_path_is_read_only_redacted_and_single_use() {
         let root = TempFilePath::create_with_bytes("root-lease-direct", b"root");
-        let mut lease = PreparedSnapshotRootBackingLease::prepare(root.path(), None)
-            .expect("direct root lease should prepare");
+        let mut lease = PreparedSnapshotRootBackingLease::prepare(
+            root.path(),
+            None,
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .expect("direct root lease should prepare");
         assert!(!format!("{lease:?}").contains(&root.path().display().to_string()));
         let backing = lease
             .open_snapshot_read_only()
@@ -15093,16 +15142,32 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn root_backing_lease_has_no_grant_fallback_and_rejects_wrong_access() {
+    fn root_backing_lease_preserves_direct_grant_shaped_paths_without_contained_fallback() {
+        let mut direct = PreparedSnapshotRootBackingLease::prepare(
+            Path::new("bangbang-grant:missing"),
+            None,
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .expect("direct mode should retain grant-shaped bytes as a pathname");
+        let (selector, file) = direct
+            .consume()
+            .expect("direct grant-shaped pathname should consume");
+        assert_eq!(selector, PathBuf::from("bangbang-grant:missing"));
+        assert!(file.is_none());
         assert!(
-            PreparedSnapshotRootBackingLease::prepare(Path::new("bangbang-grant:missing"), None,)
-                .is_err()
+            PreparedSnapshotRootBackingLease::prepare(
+                Path::new("bangbang-grant:missing"),
+                None,
+                DirectRootSelectorPolicy::RejectGrantReference,
+            )
+            .is_err()
         );
         let authority = file_grant_authority_for_test();
         assert!(
             PreparedSnapshotRootBackingLease::prepare(
                 Path::new("bangbang-grant:missing"),
                 Some(&authority),
+                DirectRootSelectorPolicy::TreatAsPath,
             )
             .is_err()
         );
@@ -15110,6 +15175,7 @@ mod tests {
             PreparedSnapshotRootBackingLease::prepare(
                 Path::new("bangbang-grant:drive-rw"),
                 Some(&authority),
+                DirectRootSelectorPolicy::TreatAsPath,
             )
             .is_err()
         );
@@ -15122,9 +15188,12 @@ mod tests {
 
         let authority = file_grant_authority_for_test();
         let observer = authority.clone();
-        let mut cancelled =
-            PreparedSnapshotRootBackingLease::prepare(Path::new(ROOT), Some(&authority))
-                .expect("contained root lease should prepare");
+        let mut cancelled = PreparedSnapshotRootBackingLease::prepare(
+            Path::new(ROOT),
+            Some(&authority),
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .expect("contained root lease should prepare");
         let backing = cancelled
             .open_snapshot_read_only()
             .expect("contained root backing should adopt");
@@ -15140,9 +15209,12 @@ mod tests {
 
         let authority = file_grant_authority_for_test();
         let observer = authority.clone();
-        let mut committed =
-            PreparedSnapshotRootBackingLease::prepare(Path::new(ROOT), Some(&authority))
-                .expect("contained root lease should prepare");
+        let mut committed = PreparedSnapshotRootBackingLease::prepare(
+            Path::new(ROOT),
+            Some(&authority),
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .expect("contained root lease should prepare");
         drop(
             committed
                 .open_snapshot_read_only()
