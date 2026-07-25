@@ -9394,7 +9394,7 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     use bangbang_runtime::pmem::PmemMmioLayout;
     use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
     use bangbang_runtime::snapshot_memory_v2::{
-        SnapshotV2MemoryWriteError, load_snapshot_v2_memory_file,
+        SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError, load_snapshot_v2_memory_file,
     };
     use bangbang_runtime::startup::ARM64_BOOT_VMGENID_SIZE;
     use bangbang_runtime::vmclock::{VMCLOCK_ABI_SIZE, VmClockAbi};
@@ -9810,6 +9810,38 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
         ),
         "unexpected capture error: {capture_error:?}"
     );
+    let cancelled_artifact = TempFile::new_len("native-v2-platform-cancelled-memory", 0)
+        .expect("cancelled memory artifact should create");
+    let mut cancelled_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(cancelled_artifact.path())
+        .expect("cancelled memory artifact should open");
+    let capture_error = source
+        .capture_snapshot_v2_platform_with_cancel(
+            capture_input.clone(),
+            &mut cancelled_writer,
+            |stage| matches!(stage, SnapshotV2MemoryIoStage::Data { extent_index: 0 }),
+        )
+        .expect_err("bounded memory cancellation should abort platform capture");
+    assert!(
+        matches!(
+            capture_error,
+            HvfArm64BootSnapshotV2CaptureError::MemoryImage {
+                source: SnapshotV2MemoryWriteError::Cancelled {
+                    stage: SnapshotV2MemoryIoStage::Data { extent_index: 0 }
+                }
+            }
+        ),
+        "unexpected cancelled capture error: {capture_error:?}"
+    );
+    drop(cancelled_writer);
+    source
+        .resume_after_snapshot_v2_capture()
+        .expect("cancelled source coordinator should recover");
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("recovered cancelled source should pause again");
     let first_memory_artifact = TempFile::new_len("native-v2-platform-first-memory", 0)
         .expect("first memory artifact should create");
     let mut first_writer = OpenOptions::new()
@@ -9821,6 +9853,12 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
         .capture_snapshot_v2_platform(capture_input.clone(), &mut first_writer)
         .expect("first paused platform capture should succeed");
     drop(first_writer);
+    source
+        .resume_after_snapshot_v2_capture()
+        .expect("source coordinator should recover without outer guest dispatch");
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("recovered source should complete a fresh snapshot-v2 pause");
     let memory_artifact =
         TempFile::new_len("native-v2-platform-memory", 0).expect("memory artifact should create");
     let mut writer = OpenOptions::new()
@@ -9829,8 +9867,8 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
         .open(memory_artifact.path())
         .expect("memory artifact should open for writing");
     let second_capture = source
-        .capture_snapshot_v2_platform(capture_input, &mut writer)
-        .expect("source capture should be non-consuming and reusable");
+        .capture_snapshot_v2_platform_with_cancel(capture_input, &mut writer, |_| false)
+        .expect("recovered source should support cancellable recapture");
     drop(writer);
     assert_native_v2_platform_recapture_equivalent(&first_capture, &second_capture);
     assert_eq!(first_capture.global(), second_capture.global());

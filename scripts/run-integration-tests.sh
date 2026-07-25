@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-supported_tests=(hvf_lifecycle guest_boot executable_hvf_e2e app_sandbox production_bundle)
+supported_tests=(hvf_lifecycle guest_boot native_v2_process executable_hvf_e2e app_sandbox production_bundle)
 
 usage() {
   cat <<'EOF'
@@ -15,7 +15,8 @@ Options:
   --allow-unsupported  Exit 0 instead of 1 when the host cannot execute HVF.
   --test NAME          Run one integration test target. Can be repeated.
                        Supported values: hvf_lifecycle, guest_boot,
-                       executable_hvf_e2e, app_sandbox, production_bundle.
+                       native_v2_process, executable_hvf_e2e, app_sandbox,
+                       production_bundle.
   -h, --help           Show this help.
 
 Arguments after -- are passed to each signed Rust test binary or executable
@@ -333,6 +334,58 @@ build_executable_hvf_e2e() {
     --no-run
 }
 
+build_native_v2_process_test() {
+  local cargo_messages="$tmp_dir/cargo-test-native-v2-process.json"
+  local test_bins_file="$tmp_dir/test-bins-native-v2-process"
+
+  cargo test \
+    -p bangbang \
+    --bin bangbang \
+    --all-features \
+    --locked \
+    --target "$target_triple" \
+    --no-run \
+    --message-format=json \
+    > "$cargo_messages"
+
+  python3 - "$cargo_messages" > "$test_bins_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as messages:
+    for line in messages:
+        message = json.loads(line)
+        target = message.get("target", {})
+        executable = message.get("executable")
+
+        if (
+            message.get("reason") == "compiler-artifact"
+            and executable is not None
+            and target.get("name") == "bangbang"
+            and "bin" in target.get("kind", [])
+            and message.get("profile", {}).get("test") is True
+        ):
+            sys.stdout.write(executable)
+            sys.stdout.write("\0")
+PY
+
+  local test_bins=()
+  local test_bin
+  while IFS= read -r -d "" test_bin; do
+    if [[ -n "$test_bin" ]]; then
+      test_bins+=("$test_bin")
+    fi
+  done < "$test_bins_file"
+
+  if [[ "${#test_bins[@]}" -ne 1 ]]; then
+    echo "failed to locate the unique bangbang binary unit-test executable" >&2
+    exit 1
+  fi
+
+  native_v2_process_bin="$tmp_dir/bangbang-native-v2-process-test"
+  scripts/sign-hvf-binary.sh "${test_bins[0]}" "$native_v2_process_bin"
+}
+
 host_os="$(uname -s)"
 host_arch="$(uname -m)"
 
@@ -370,6 +423,7 @@ built_test_bins=()
 signed_test_names=()
 signed_test_bins=()
 executable_hvf_e2e_bangbang=""
+native_v2_process_bin=""
 app_sandbox_hvf_bin=""
 app_sandbox_bangbang_bin=""
 production_bundle_path=""
@@ -385,6 +439,9 @@ for test_name in "${selected_tests[@]}"; do
       ;;
     executable_hvf_e2e)
       build_executable_hvf_e2e
+      ;;
+    native_v2_process)
+      build_native_v2_process_test
       ;;
     guest_boot | hvf_lifecycle)
       build_and_sign_test "$test_name"
@@ -452,6 +509,23 @@ for index in "${!signed_test_bins[@]}"; do
       ;;
   esac
 done
+
+if contains native_v2_process "${selected_tests[@]}"; then
+  if [[ "${#test_args[@]}" -eq 0 ]]; then
+    "$native_v2_process_bin" \
+      --test-threads=1 \
+      --ignored \
+      --exact \
+      vmm::tests::signed_native_v2_process_publishes_recaptures_and_resumes_private_pair
+  else
+    "$native_v2_process_bin" \
+      --test-threads=1 \
+      --ignored \
+      --exact \
+      vmm::tests::signed_native_v2_process_publishes_recaptures_and_resumes_private_pair \
+      "${test_args[@]}"
+  fi
+fi
 
 if contains app_sandbox "${selected_tests[@]}"; then
   if [[ "${#test_args[@]}" -eq 0 ]]; then

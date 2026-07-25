@@ -31,8 +31,10 @@ publishes per-vCPU stolen time from bounded owner-thread wall/execution samples,
 enables standard 64-bit SMCCC discovery when the HVF measurement primitive is
 available, and has signed Linux contention/idle/pause certification. PVTime
 serialization and clone restore are implemented in the unpublished native-v2
-platform profile; public native-v2 lifecycle composition and
-serialized/restorable pmem snapshot state remain explicit Wave 6 limits.
+platform profile. A private, non-dispatched process seam now publishes current
+native-v2 2.3 pairs from a strictly minimal paused production session and
+recovers that source for resume or recapture; public native-v2 activation,
+restore, and serialized/restorable pmem state remain explicit Wave 6 limits.
 Host discard never promises synchronous RSS or footprint
 reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
