@@ -652,12 +652,19 @@ scripts/run-integration-tests.sh --test native_v2_process
 The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices. The test
-starts and pauses the real process-owned HVF supervisor, publishes and loads a
-current native-v2 pair, checks runnable-primary/offline-secondary topology,
-uses the ordinary process resume and pause actions, publishes a second fresh
-pair, and shuts down cleanly. This group is part of the default integration
-set and must run without `--allow-unsupported` on supported Apple Silicon. It
-adds no API, CLI, config-file, or environment activation for native-v2.
+starts and pauses the real process-owned HVF supervisor, publishes one current
+native-v2 pair, resumes and repauses the source, publishes a fresh recapture,
+and drops the source. It restores the first immutable pair into one fresh
+normal process initially `Paused`, proves the pristine no-drive profile and
+fresh destination UART/metrics state, explicitly resumes and repauses it, then
+shuts it down. A second fresh process restores the same pair with resume intent,
+through already-opened contained state/memory descriptors after both source
+paths are replaced, uses the ordinary action gate to reach `Running`, pauses,
+and shuts down. The replacements remain untouched. The adapter also checks the
+exact default FDT/UART/RTC/time shell and admits no optional device. This group
+is part of the default integration set and must run without
+`--allow-unsupported` on supported Apple Silicon. It adds no API, CLI,
+config-file, or environment activation for native-v2.
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,

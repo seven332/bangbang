@@ -13,9 +13,10 @@ component, `2.1.x` adds one state-bound demand-paged File/COW memory image, and
 clone policies. The decoded graph itself remains data: it contains no general
 device aggregate and creates no HVF, owner-thread, or public lifecycle
 resource. A focused unpublished consumer can reconstruct its complete
-multi-vCPU platform and time/identity ownership, but no public process path
-emits, describes, or loads v2. The public lifecycle and CLI remain native-v1
-until later Wave 6 work explicitly changes them.
+multi-vCPU platform and time/identity ownership. An internal, non-dispatched
+normal-process seam can publish and restore the minimal v2 profile, but no
+public API, CLI, or config-file path emits, describes, or loads v2. The public
+lifecycle remains native-v1 until later Wave 6 work explicitly changes it.
 Separately, `LazyGuestMemory` is the backend-neutral private-anonymous
 coordinator for the external-paging roadmap; it is not the v2 File/COW loader
 and now backs the narrow public native-v1 `Uffd` restore path on macOS Apple
@@ -348,10 +349,10 @@ The v2 commitment derives its binding only from its retained state bytes;
 publication verifies a transaction-owned read-write staging inode without
 mapping it, while final loading independently requires read-only, close-on-exec
 File/COW ownership. The private process composition described below now
-constructs and publishes current v2 from an admitted paused production session.
-Public native-v2 create/load, general device state, Diff/merge, UFFD-equivalent
-runtime integration, and broader cross-host portability policy remain
-follow-on work.
+constructs, publishes, and restores current v2 through admitted minimal
+production sessions. Public native-v2 create/load, general device state,
+Diff/merge, UFFD-equivalent runtime integration, and broader cross-host
+portability policy remain follow-on work.
 The focused unpublished HVF reconstruction boundary below consumes an
 already-authorized `GuestMemory`; it does not open this memory artifact itself.
 Its implemented
@@ -388,8 +389,52 @@ no-clobber, cleanup, and memory-first/state-last transaction.
 Boot kernel/initrd paths and arguments are copied into bounded inert metadata
 from the admitted controller only; capture does not reopen them. Public
 `VmmAction::CreateSnapshot`, HTTP, CLI, config-file behavior, and native-v1
-bytes remain unchanged. Public v2 activation and v2 process restore are later
-#1530 slices.
+bytes remain unchanged. The internal process restore boundary is described
+next; public v2 activation remains a later #1530 slice.
+
+### Internal Paused Native V2 Process Restore
+
+#1577 adds an internal, non-dispatched `ProcessVmm`/starter/session path that
+restores a prepared native-v2 2.3 pair into the normal process lifecycle.
+Admission is state-first and accepts only a pristine destination, File/COW
+memory, exact direct or already-opened contained descriptors, and the minimal
+profile published by #1576. Uffd memory, overrides, drives and other optional
+devices, PCI, and boot-timer state fail before process construction. Recorded
+kernel and initrd paths remain inert metadata and are never reopened; logger
+and metrics ownership comes from the destination process.
+
+Before HVF construction, the process adapter validates the exact default arm64
+FDT shell: adjusted RAM ranges, CPUs, GIC, timer, fixed clock, PSCI, PL031 RTC,
+one UART, VMGenID, and VMClock with the captured interrupt identities. Optional,
+missing, duplicate, or drifted nodes fail closed. It then installs a fresh UART
+with either a new destination buffer or output-only stdout; restored processes
+never inherit source serial bytes or open stdin. The focused platform retains
+only RTC/time/identity and that fresh UART rather than reconstructing a general
+device aggregate.
+
+A closed supervisor-session variant owns the boot or native-v2 platform
+without exposing raw run control. The imported coordinator is run-ready before
+publication, but the outer worker and controller are committed `Paused`.
+Session assignment precedes the infallible controller commit; a requested
+resume is then performed through the ordinary process action gate. The
+restored controller retains the decoded machine facts, inert boot metadata,
+empty drives, default serial configuration, and destination-owned observability
+state.
+
+Failures before resource adoption and unpublished cleanup remain retryable.
+Failures after an HVF owner is adopted, controller/session commit begins, or
+cleanup becomes ambiguous terminate the worker. The same terminal latch is
+shared by ordinary boot, native-v1 restore, and native-v2 restore, so no later
+construction path can replace a possibly live VM. A signed two-vCPU proof
+publishes and recaptures one source, destroys it, restores the same immutable
+pair directly and through retained contained descriptors after path
+replacement into two fresh processes, checks the initial paused boundary,
+exercises explicit and requested resume through ordinary lifecycle actions,
+and shuts both destinations down cleanly.
+
+Public create/load/describe actions, HTTP, CLI, and config-file behavior remain
+native-v1. General optional-device state, serial input and endpoint restoration,
+Uffd/Diff native-v2 memory, and public activation remain later Wave 6 work.
 
 ### Native V2 HVF Platform State Profile
 
@@ -505,11 +550,12 @@ lifecycle, or publication stage, is explicitly terminal even when cleanup
 succeeds. Repeat loads never mutate the decoded source graph, and a paused
 destination can recapture to a fresh memory/state identity for another restore.
 
-The focused owner deliberately reconstructs no general virtio device, limiter,
-or external endpoint. Private minimal production-session capture/publication
-is implemented by #1576; public native-v2 activation, process restore, and
-actions remain #1530 work. Optional-device serialization/restoration remains
-in its device slices.
+The focused platform deliberately reconstructs no general virtio device,
+limiter, or external endpoint. #1577's private process adapter validates the
+exact default FDT shell, adds a fresh output-only or buffered UART, and commits
+that owner into the normal lifecycle initially `Paused`. Public native-v2
+activation and actions remain #1578 work; general serial input and optional-
+device serialization/restoration remain in their device slices.
 
 ### Stable Paused vCPU Topology State
 
@@ -1838,6 +1884,7 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Unpublished native-v2 multi-vCPU platform capture/reconstruction (implemented) | #1569 composes the `2.2.0` graph from one completed paused source, existing memory binding, inert boot metadata, retained machine/CPU facts, singular global GIC, and canonical per-vCPU owner captures. Restore preflights supplied memory/FDT/cache before HVF, creates the complete never-run destination, replays retained CPU targets, restores global then per-vCPU state, imports fresh lifecycle tokens, and publishes only one focused owner born Paused. It opens no recorded path and intentionally excludes public actions, devices, and time/identity correction. | Every restore-stage failure and reverse cleanup sequence; CPU-receipt replay/drift/read/apply failures; source reuse and redaction; strict Clippy/unit gates; signed three-vCPU runnable/suspended/offline capture, encode/decode, fresh restore, no-early-progress recapture, timer-PPI/PSCI completion, offline CPU_ON continuation, final recapture, and clean shutdown. |
 | Native-v2 time and clone identity (implemented) | #1529 advances the writer to `2.3.0` and appends singleton kind 6 after every vCPU. It carries only portable PL031/PVTime/VMGenID/VMClock state and four closed policies: destination-SystemTime RTC reset, cumulative stolen time without downtime, fresh notified VMGenID, and saved-counter notified VMClock. Source capture validates guest and retained-owner agreement before creating a fresh memory binding. Restore preflights all guest destinations, installs PL031/PVTime, signals VMGenID then VMClock, imports lifecycle state, and publishes Paused; any failure after the first committed identity write is terminal. Public actions and general devices remain excluded. | Fixed schema fixtures and hostile time-policy/count/layout/ABI/cross-component mutations; source capture ordering and reusable failure; all RTC/PVTime/identity restore stages and commit boundary; exact aarch64 `clock_realtime` rejection tied to pinned Firecracker sources; signed three-vCPU repeat load, distinct clone IDs, saved-counter transitions, guest-observed notification order and time values, recapture-to-restore, no early progress, continuation, and cleanup. |
 | Private paused-process native-v2 publication (implemented) | #1576 admits only a minimal `Paused` `Full` production source, proves default reset-compatible UART state from the live validated model before staging, derives inert boot metadata without path reopen, and composes topology pause, cancellable memory streaming, exact 2.3 encoding, source recovery, commit seal, and post-publication dirty-epoch handling in one supervisor command. It reuses direct/contained native-family outputs while leaving public create native-v1. | Exhaustive controller-profile rejection, real-model UART comparison, direct/output publication, collision and staging cleanup, cancellation/retry, topology/recovery/panic/post-commit terminal paths, repeat loader validation, signed three-vCPU cancellation/recovery/recapture, and a separately signed two-vCPU private process publish/resume/repause/recapture proof. |
+| Private paused-process native-v2 restoration (implemented) | #1577 admits only pristine File/COW destinations, classifies direct or contained state before resource adoption, retains decoded machine facts and inert boot metadata, validates the exact default arm64 FDT/UART/RTC/time shell, and commits a closed focused supervisor plus controller into the normal process lifecycle initially Paused. Fresh buffered or stdout-only serial never inherits source bytes or opens stdin; requested resume uses the ordinary action gate. Pre-adoption failures are retryable, while owner, commit, or ambiguous-cleanup failures share the terminal construction latch with boot and native-v1 restore. Public load remains native-v1. | State-first family and descriptor/profile rejection; exact hostile FDT node/range/interrupt/identity checks; fresh serial and controller adoption; session/commit/cleanup/terminal-latch faults; repeated immutable File/COW loads; and a signed two-vCPU source recapture followed by paused and resume-requested restore into two fresh normal processes with lifecycle and clean-shutdown proof. |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence and complete publication transaction (implemented for native-v1 baseline) | #1162 introduced acknowledged RAII quiescence for block and entropy; #1389 added the topology-wide SMP pause barrier and PMEM guard; #1390 includes network, acquires all four failure-atomically, drains tokens only after complete acknowledgement, preserves in-flight/deferred/deadline work, and holds the worker lease through commit plus the post-publication hook. Process API/MMDS/controller and periodic work are serialized by the synchronous owner borrow. | Deterministic scheduler, supervisor, cancellation/seal, publication-visibility, process/API serialization, and fresh-retry tests plus combined signed SMP pause and one-vCPU baseline publication evidence. |
 | Complete dirty epochs and public tracking (implemented) | #1395 supplies fail-closed HVF protection/fault retry. #1396 adds the shared `GuestMemory` bitmap, exact initial/reprotected DFSC `0x07`/`0x0f` ownership checks, every current bounded host/device writer, conservative discard, protected wholly-dirty dynamic RAM, destination load ordering, and post-visible-Full reset/rollback/poison semantics. Machine and load tracking flags are enabled without adding Diff artifacts. | Exact/repeated/concurrent host and CPU union, discard, dynamic mapping, load override/VMGenID, publication/cancellation/reset failures, and public transaction tests plus signed normal boot/load, two-vCPU current-device, and two-epoch exact-set evidence. |

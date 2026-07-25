@@ -766,6 +766,42 @@ impl SerialStdio {
         Self::from_descriptors(libc::STDIN_FILENO, libc::STDOUT_FILENO)
     }
 
+    /// Prepare only process stdout for destination-owned serial output.
+    ///
+    /// Unlike [`Self::from_process_standard_streams`], this never inspects,
+    /// duplicates, configures, or retains stdin.
+    pub fn output_from_process_standard_stream() -> Result<SerialStdioOutput, SerialStdioError> {
+        Self::output_from_descriptor(libc::STDOUT_FILENO)
+    }
+
+    /// Prepare only one caller-owned output descriptor.
+    #[doc(hidden)]
+    pub fn output_from_descriptor(
+        output_descriptor: RawFd,
+    ) -> Result<SerialStdioOutput, SerialStdioError> {
+        let output = duplicate_stdio_descriptor(output_descriptor)
+            .map_err(|source| SerialStdioError::DuplicateOutput { source })?;
+        let output_flags = descriptor_status_flags(output.as_raw_fd())
+            .map_err(|source| SerialStdioError::InspectOutput { source })?;
+        if output_flags & libc::O_ACCMODE == libc::O_RDONLY {
+            return Err(SerialStdioError::OutputNotWritable);
+        }
+
+        let descriptors = Arc::new(SerialStdioDescriptors {
+            output,
+            output_flags,
+            input: None,
+            input_flags: None,
+            input_termios: None,
+        });
+        set_descriptor_status_flags(
+            descriptors.output.as_raw_fd(),
+            output_flags | libc::O_NONBLOCK,
+        )
+        .map_err(|source| SerialStdioError::ConfigureOutput { source })?;
+        Ok(SerialStdioOutput { descriptors })
+    }
+
     /// Prepare caller-owned descriptors while retaining the caller's ownership.
     ///
     /// This exists for focused descriptor and pseudo-terminal verification. The
@@ -2380,6 +2416,33 @@ mod tests {
             .expect("closed stdin should not prevent stdout setup")
             .into_parts();
         assert!(input.is_none());
+    }
+
+    #[test]
+    fn serial_stdio_output_only_never_requires_or_retains_input() {
+        let (mut output_reader, output_writer) = pipe_files();
+        let original_output_flags =
+            super::descriptor_status_flags(output_writer.as_raw_fd()).expect("output flags");
+
+        let mut output = SerialStdio::output_from_descriptor(output_writer.as_raw_fd())
+            .expect("output-only stdio should prepare without an input descriptor");
+        assert!(output.descriptors.input.is_none());
+        output
+            .write_byte(b'V')
+            .expect("output-only stdout byte should write");
+        let mut byte = [0];
+        output_reader
+            .read_exact(&mut byte)
+            .expect("output-only pipe should receive byte");
+        assert_eq!(byte, *b"V");
+
+        drop(output);
+        assert_eq!(
+            super::descriptor_status_flags(output_writer.as_raw_fd())
+                .expect("restored output flags")
+                & (libc::O_ACCMODE | libc::O_NONBLOCK),
+            original_output_flags & (libc::O_ACCMODE | libc::O_NONBLOCK)
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -142,10 +142,12 @@ pub use snapshot_v2::{
     decode_hvf_snapshot_v2_platform_state, encode_hvf_snapshot_v2_platform_state,
 };
 pub use snapshot_v2_platform::{
-    HvfSnapshotV2PlatformCleanupFailure, HvfSnapshotV2PlatformCleanupStage,
-    HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformRestoreFailure,
-    HvfSnapshotV2PlatformRestoreStage, HvfSnapshotV2PlatformShutdownError,
+    HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2PlatformCleanupFailure,
+    HvfSnapshotV2PlatformCleanupStage, HvfSnapshotV2PlatformRestoreError,
+    HvfSnapshotV2PlatformRestoreFailure, HvfSnapshotV2PlatformRestoreStage,
+    HvfSnapshotV2PlatformShutdownError, HvfSnapshotV2ProcessFdtMismatch,
     RestoredHvfSnapshotV2Platform, restore_hvf_snapshot_v2_platform,
+    restore_hvf_snapshot_v2_process_platform,
 };
 pub use startup::{
     HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonCaptureState,

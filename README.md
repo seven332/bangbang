@@ -33,8 +33,11 @@ available, and has signed Linux contention/idle/pause certification. PVTime
 serialization and clone restore are implemented in the unpublished native-v2
 platform profile. A private, non-dispatched process seam now publishes current
 native-v2 2.3 pairs from a strictly minimal paused production session and
-recovers that source for resume or recapture; public native-v2 activation,
-restore, and serialized/restorable pmem state remain explicit Wave 6 limits.
+recovers that source for resume or recapture. The same private seam restores
+prepared File/COW pairs into fresh normal processes initially paused, with an
+exact minimal FDT/device shell, fresh destination serial output, and ordinary
+lifecycle resume. Public native-v2 activation/load and serialized/restorable
+pmem state remain explicit Wave 6 limits.
 Host discard never promises synchronous RSS or footprint
 reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
@@ -527,7 +530,13 @@ one retained read-only `File` as writable `MAP_PRIVATE` regions, so pages arrive
 on demand and writes remain private. State and fixed memory metadata are
 CRC-protected, but guest bytes deliberately are not checksummed or
 authenticated and require an external artifact authentication/encryption
-policy. No public create, load, describe, or version path emits or accepts v2
+policy. The internal normal-process adapter admits only pristine File/COW
+destinations, loads direct or contained pairs state-first, validates the exact
+default arm64 FDT, UART, RTC, and time/identity shell, installs fresh buffered
+or stdout-only output without stdin, and publishes a closed supervisor session
+initially `Paused`. The same immutable pair can restore into multiple fresh
+destinations; requested resume still passes through the ordinary lifecycle
+gate. No public create, load, describe, or version path emits or accepts v2
 yet, and recognizing a pinned Firecracker bitcode prefix reports
 incompatibility rather than claiming decode or translation. The exact wire,
 ownership, and compatibility contract is documented in

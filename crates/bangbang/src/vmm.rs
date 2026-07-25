@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, TryReserveError};
+use std::ffi::OsString;
 use std::fmt;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
@@ -36,10 +37,13 @@ use bangbang_hvf::{
     HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState, HvfBackend, HvfSnapshotV1Bundle,
     HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
     HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfSnapshotV2BootState, HvfSnapshotV2BuildError,
-    HvfSnapshotV2EncodeError, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformState,
-    HvfVcpuRunCoordinatorError, OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError,
-    PreparedHvfArm64BootPciNetworkRemoval, PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State,
-    encode_hvf_snapshot_v2_platform_state,
+    HvfSnapshotV2DecodeError, HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
+    HvfSnapshotV2NativePath, HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformState,
+    HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
+    PrepareHvfSnapshotV1LoadError, PreparedHvfArm64BootPciNetworkRemoval,
+    PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
+    decode_hvf_snapshot_v2_platform_state, encode_hvf_snapshot_v2_platform_state,
+    restore_hvf_snapshot_v2_process_platform,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -53,14 +57,14 @@ use bangbang_runtime::block::{
     DriveUpdateInput, PreparedBlockDevice, PreparedVhostUserBlockFrontend,
     RuntimeBlockDeviceResource,
 };
-use bangbang_runtime::boot::{BootSourceConfigInput, BootSourceFiles};
+use bangbang_runtime::boot::{BootSourceConfigError, BootSourceConfigInput, BootSourceFiles};
 use bangbang_runtime::boot_timer::BootTimerMmioLayout;
 use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::{EntropyConfig, EntropyMmioLayout};
 use bangbang_runtime::lazy_memory::LazyGuestMemoryConsumerProfile;
 use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
-use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
 use bangbang_runtime::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdate,
     MemoryHotplugSizeUpdateInput, MemoryHotplugStatus, MemoryHotplugStatusError,
@@ -104,20 +108,27 @@ use bangbang_runtime::serial::{
 };
 use bangbang_runtime::snapshot::{
     SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackendType, SnapshotV1ControllerCommit,
+    SnapshotV2ControllerCommit,
 };
 #[cfg(target_os = "macos")]
 use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
 use bangbang_runtime::snapshot_artifact::{
-    NativeSnapshotArtifactState, NativeSnapshotArtifactStateError,
-    NativeSnapshotPublicationOutcome, SnapshotArtifactLoadError, SnapshotArtifactOutput,
-    SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotCommitDurability,
-    SnapshotMemoryStagingWriter, SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
-    load_snapshot_artifacts, prepare_snapshot_state_file, prepare_snapshot_state_path,
+    LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactFamily, NativeSnapshotArtifactState,
+    NativeSnapshotArtifactStateError, NativeSnapshotPublicationOutcome, SnapshotArtifactLoadError,
+    SnapshotArtifactOutput, SnapshotArtifactOutputs, SnapshotArtifactPaths,
+    SnapshotCommitDurability, SnapshotMemoryStagingWriter, SnapshotPublicationOutcome,
+    SnapshotPublicationTransactionError, load_prepared_native_snapshot_memory_file,
+    load_prepared_native_snapshot_memory_path, load_snapshot_artifacts,
+    prepare_native_snapshot_state_file, prepare_native_snapshot_state_path,
+    prepare_snapshot_state_file, prepare_snapshot_state_path,
     publish_native_snapshot_artifacts_to_with, publish_native_snapshot_artifacts_with,
     publish_snapshot_artifacts_to_with, publish_snapshot_artifacts_with,
 };
 use bangbang_runtime::snapshot_commit::{SnapshotCommitKind, SnapshotCommitRecord};
 use bangbang_runtime::snapshot_device::SnapshotV1DeviceState;
+use bangbang_runtime::snapshot_format::{
+    NativeSnapshotFormatError, NativeSnapshotState, decode_native_snapshot_state,
+};
 use bangbang_runtime::snapshot_memory::{
     SnapshotMemoryIoStage, SnapshotMemoryWriteError, write_snapshot_memory_image_with_cancel,
 };
@@ -836,6 +847,192 @@ impl<S> fmt::Debug for SnapshotV1LoadSuccess<S> {
             .field("session", &"<redacted>")
             .field("controller_commit", &self.controller_commit)
             .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+pub(crate) struct SnapshotV2LoadSuccess<S> {
+    session: S,
+    controller_commit: SnapshotV2ControllerCommit,
+}
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+impl<S> SnapshotV2LoadSuccess<S> {
+    const fn new(session: S, controller_commit: SnapshotV2ControllerCommit) -> Self {
+        Self {
+            session,
+            controller_commit,
+        }
+    }
+
+    fn into_parts(self) -> (S, SnapshotV2ControllerCommit) {
+        (self.session, self.controller_commit)
+    }
+}
+
+impl<S> fmt::Debug for SnapshotV2LoadSuccess<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotV2LoadSuccess")
+            .field("session", &"<redacted>")
+            .field("controller_commit", &self.controller_commit)
+            .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+#[derive(Debug)]
+pub(crate) enum NativeV2SnapshotLoadError {
+    Preflight(VmmActionError),
+    ProcessTerminal,
+    Resource(GrantClaimError),
+    AfterResourceAdoption {
+        source: Box<NativeV2SnapshotLoadError>,
+    },
+    Artifact(SnapshotArtifactLoadError),
+    UnexpectedFamily(NativeSnapshotArtifactFamily),
+    State(NativeSnapshotFormatError),
+    Decode(HvfSnapshotV2DecodeError),
+    BootMetadata(BootSourceConfigError),
+    Allocation(TryReserveError),
+    ProcessPreparation(BackendError),
+    Restore(HvfSnapshotV2PlatformRestoreError),
+    RunReady {
+        source: HvfVcpuRunCoordinatorError,
+        cleanup: Option<BackendError>,
+    },
+    WorkerStart {
+        source: BackendError,
+        cleanup: Option<BackendError>,
+    },
+    Resume(BackendError),
+}
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+impl NativeV2SnapshotLoadError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::ProcessTerminal
+            | Self::AfterResourceAdoption { .. }
+            | Self::RunReady { .. }
+            | Self::WorkerStart { .. }
+            | Self::Resume(_) => true,
+            Self::Restore(source) => source.is_committed() || !source.cleanup_failures().is_empty(),
+            Self::Preflight(_)
+            | Self::Resource(_)
+            | Self::Artifact(_)
+            | Self::UnexpectedFamily(_)
+            | Self::State(_)
+            | Self::Decode(_)
+            | Self::BootMetadata(_)
+            | Self::Allocation(_)
+            | Self::ProcessPreparation(_) => false,
+        }
+    }
+}
+
+impl fmt::Display for NativeV2SnapshotLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preflight(source) => {
+                write!(formatter, "native-v2 load preflight failed: {source}")
+            }
+            Self::ProcessTerminal => formatter.write_str("native-v2 load process is terminal"),
+            Self::Resource(source) => {
+                write!(formatter, "native-v2 resource adoption failed: {source}")
+            }
+            Self::AfterResourceAdoption { source } => {
+                write!(
+                    formatter,
+                    "native-v2 load failed after resource adoption: {source}"
+                )
+            }
+            Self::Artifact(source) => write!(formatter, "native-v2 artifact load failed: {source}"),
+            Self::UnexpectedFamily(actual) => {
+                write!(
+                    formatter,
+                    "native-v2 load found an unexpected {actual} artifact"
+                )
+            }
+            Self::State(source) => write!(formatter, "native-v2 state decode failed: {source}"),
+            Self::Decode(source) => {
+                write!(formatter, "native-v2 platform decode failed: {source}")
+            }
+            Self::BootMetadata(source) => {
+                write!(
+                    formatter,
+                    "native-v2 inert boot metadata is invalid: {source}"
+                )
+            }
+            Self::Allocation(_) => {
+                formatter.write_str("native-v2 process preparation allocation failed")
+            }
+            Self::ProcessPreparation(source) => {
+                write!(
+                    formatter,
+                    "native-v2 process shell preparation failed: {source}"
+                )
+            }
+            Self::Restore(source) => write!(formatter, "native-v2 HVF restore failed: {source}"),
+            Self::RunReady { cleanup, .. } => {
+                formatter.write_str("native-v2 run coordinator preparation failed")?;
+                if cleanup.is_some() {
+                    formatter.write_str("; platform cleanup also failed")?;
+                }
+                Ok(())
+            }
+            Self::WorkerStart {
+                source, cleanup, ..
+            } => {
+                write!(
+                    formatter,
+                    "native-v2 paused worker startup failed: {source}"
+                )?;
+                if cleanup.is_some() {
+                    formatter.write_str("; platform cleanup also failed")?;
+                }
+                Ok(())
+            }
+            Self::Resume(source) => {
+                write!(
+                    formatter,
+                    "native-v2 restored process resume failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV2SnapshotLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Preflight(source) => Some(source),
+            Self::Resource(source) => Some(source),
+            Self::AfterResourceAdoption { source } => Some(source.as_ref()),
+            Self::Artifact(source) => Some(source),
+            Self::State(source) => Some(source),
+            Self::Decode(source) => Some(source),
+            Self::BootMetadata(source) => Some(source),
+            Self::Allocation(source) => Some(source),
+            Self::ProcessPreparation(source) => Some(source),
+            Self::Restore(source) => Some(source),
+            Self::RunReady { source, .. } => Some(source),
+            Self::WorkerStart { source, .. } => Some(source),
+            Self::Resume(source) => Some(source),
+            Self::ProcessTerminal | Self::UnexpectedFamily(_) => None,
+        }
     }
 }
 
@@ -2589,6 +2786,11 @@ where
     }
 
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
+        if self.terminal_snapshot_load_failure || self.terminal_instance_start_failure {
+            return Err(VmmActionError::InstanceStart(BackendError::InvalidState(
+                "process cannot construct another VM after a terminal construction failure",
+            )));
+        }
         self.controller.preflight_instance_start()?;
         validate_process_vmnet_authority(&self.controller, self.vmnet_authority)
             .map_err(process_vmnet_authority_action_error)?;
@@ -3896,6 +4098,39 @@ where
             .map(ProcessSessionDiagnostics::process_exit_status)
             .unwrap_or_default()
     }
+
+    fn resume_native_v2_snapshot_if_requested(
+        &mut self,
+        resume_requested: bool,
+    ) -> Result<bool, NativeV2SnapshotLoadError> {
+        if !resume_requested {
+            return Ok(false);
+        }
+        self.resume_instance().map_err(|error| {
+            let source = match error {
+                VmmActionError::Lifecycle(source) => source,
+                _ => BackendError::InvalidState(
+                    "restored native-v2 resume failed before running-state commit",
+                ),
+            };
+            NativeV2SnapshotLoadError::Resume(source)
+        })?;
+        Ok(true)
+    }
+
+    fn record_native_v2_snapshot_load_result(
+        &mut self,
+        result: Result<bool, NativeV2SnapshotLoadError>,
+    ) -> Result<bool, NativeV2SnapshotLoadError> {
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|source| source.is_terminal())
+        {
+            self.terminal_snapshot_load_failure = true;
+        }
+        result
+    }
 }
 
 impl<S> ProcessVmm<S>
@@ -4208,7 +4443,7 @@ where
         &mut self,
         input: &SnapshotLoadInput,
     ) -> Result<bool, NativeV1SnapshotLoadError> {
-        if self.terminal_snapshot_load_failure {
+        if self.terminal_snapshot_load_failure || self.terminal_instance_start_failure {
             return Err(NativeV1SnapshotLoadError::ProcessTerminal);
         }
         let result = self.restore_native_v1_snapshot_once(input);
@@ -4260,6 +4495,196 @@ where
         let (session, controller_commit) = restored.into_parts();
         self.started_session = Some(session);
         Ok(self.controller.commit_snapshot_v1_load(controller_commit))
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+impl ProcessVmm<HvfInstanceStartExecutor> {
+    fn prepare_direct_snapshot_v2_load(
+        &self,
+        input: &SnapshotLoadInput,
+    ) -> Result<LoadedNativeSnapshotArtifacts, NativeV2SnapshotLoadError> {
+        let prepared = prepare_native_snapshot_state_path(Path::new(input.snapshot_path()))
+            .map_err(NativeV2SnapshotLoadError::Artifact)?;
+        if prepared.family() != NativeSnapshotArtifactFamily::V2 {
+            return Err(NativeV2SnapshotLoadError::UnexpectedFamily(
+                prepared.family(),
+            ));
+        }
+        load_prepared_native_snapshot_memory_path(
+            prepared,
+            Path::new(input.mem_backend().backend_path()),
+        )
+        .map_err(NativeV2SnapshotLoadError::Artifact)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_contained_snapshot_v2_load(
+        &self,
+        input: &SnapshotLoadInput,
+    ) -> Result<Option<LoadedNativeSnapshotArtifacts>, NativeV2SnapshotLoadError> {
+        let Some(authority) = &self.grant_authority else {
+            return Ok(None);
+        };
+        let state_path = Path::new(input.snapshot_path());
+        let memory_path = Path::new(input.mem_backend().backend_path());
+        let state_id =
+            grant_reference_id(state_path).map_err(NativeV2SnapshotLoadError::Resource)?;
+        let memory_id =
+            grant_reference_id(memory_path).map_err(NativeV2SnapshotLoadError::Resource)?;
+        if state_id.is_none() && memory_id.is_none() {
+            return Ok(None);
+        }
+
+        let state_file = if let Some(id) = &state_id {
+            let mut files = authority
+                .duplicate_exact_files(&[(
+                    id.clone(),
+                    ResourceRole::SnapshotStateInput,
+                    GrantAccess::ReadOnly,
+                )])
+                .map_err(NativeV2SnapshotLoadError::Resource)?
+                .into_iter();
+            let file = files
+                .next()
+                .ok_or(NativeV2SnapshotLoadError::Resource(GrantClaimError))?;
+            debug_assert!(files.next().is_none());
+            Some(file)
+        } else {
+            None
+        };
+        let prepared = match state_file {
+            Some(file) => prepare_native_snapshot_state_file(file),
+            None => prepare_native_snapshot_state_path(state_path),
+        }
+        .map_err(NativeV2SnapshotLoadError::Artifact)?;
+        if prepared.family() != NativeSnapshotArtifactFamily::V2 {
+            return Err(NativeV2SnapshotLoadError::UnexpectedFamily(
+                prepared.family(),
+            ));
+        }
+
+        let mut requests = Vec::with_capacity(2);
+        if let Some(id) = &state_id {
+            requests.push((
+                id.clone(),
+                ResourceRole::SnapshotStateInput,
+                GrantAccess::ReadOnly,
+            ));
+        }
+        if let Some(id) = &memory_id {
+            requests.push((
+                id.clone(),
+                ResourceRole::SnapshotMemoryInput,
+                GrantAccess::ReadOnly,
+            ));
+        }
+        let mut files = authority
+            .take_exact_files(&requests)
+            .map_err(NativeV2SnapshotLoadError::Resource)?
+            .into_iter();
+        if state_id.is_some() {
+            drop(
+                files
+                    .next()
+                    .ok_or_else(|| NativeV2SnapshotLoadError::AfterResourceAdoption {
+                        source: Box::new(NativeV2SnapshotLoadError::Resource(GrantClaimError)),
+                    })?,
+            );
+        }
+        let memory_file = memory_id
+            .as_ref()
+            .map(|_| {
+                files
+                    .next()
+                    .ok_or_else(|| NativeV2SnapshotLoadError::AfterResourceAdoption {
+                        source: Box::new(NativeV2SnapshotLoadError::Resource(GrantClaimError)),
+                    })
+            })
+            .transpose()?;
+        debug_assert!(files.next().is_none());
+
+        let loaded = match memory_file {
+            Some(file) => load_prepared_native_snapshot_memory_file(prepared, file),
+            None => load_prepared_native_snapshot_memory_path(prepared, memory_path),
+        }
+        .map_err(|source| NativeV2SnapshotLoadError::AfterResourceAdoption {
+            source: Box::new(NativeV2SnapshotLoadError::Artifact(source)),
+        })?;
+        Ok(Some(loaded))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn prepare_contained_snapshot_v2_load(
+        &self,
+        _input: &SnapshotLoadInput,
+    ) -> Result<Option<LoadedNativeSnapshotArtifacts>, NativeV2SnapshotLoadError> {
+        Ok(None)
+    }
+
+    /// Restores one admitted native-v2 pair and commits the focused session paused.
+    pub(crate) fn restore_native_v2_snapshot(
+        &mut self,
+        input: &SnapshotLoadInput,
+    ) -> Result<bool, NativeV2SnapshotLoadError> {
+        if self.terminal_snapshot_load_failure || self.terminal_instance_start_failure {
+            return Err(NativeV2SnapshotLoadError::ProcessTerminal);
+        }
+        let result = self
+            .restore_native_v2_snapshot_once(input)
+            .and_then(|resume_requested| {
+                self.resume_native_v2_snapshot_if_requested(resume_requested)
+            });
+        self.record_native_v2_snapshot_load_result(result)
+    }
+
+    fn restore_native_v2_snapshot_once(
+        &mut self,
+        input: &SnapshotLoadInput,
+    ) -> Result<bool, NativeV2SnapshotLoadError> {
+        self.controller
+            .preflight_load_snapshot_v2(input)
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+        self.starter
+            .preflight_snapshot_v2_process()
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+
+        let contained = self.prepare_contained_snapshot_v2_load(input)?;
+        let resource_adopted = contained.is_some();
+        let artifacts = match contained {
+            Some(artifacts) => artifacts,
+            None => self.prepare_direct_snapshot_v2_load(input)?,
+        };
+        let prepared = self
+            .starter
+            .prepare_snapshot_v2_process_load(input, artifacts)
+            .map_err(|source| {
+                if resource_adopted {
+                    NativeV2SnapshotLoadError::AfterResourceAdoption {
+                        source: Box::new(source),
+                    }
+                } else {
+                    source
+                }
+            })?;
+        let restored = self
+            .starter
+            .load_prepared_snapshot_v2_process(prepared)
+            .map_err(|source| {
+                if resource_adopted {
+                    NativeV2SnapshotLoadError::AfterResourceAdoption {
+                        source: Box::new(source),
+                    }
+                } else {
+                    source
+                }
+            })?;
+        let (session, controller_commit) = restored.into_parts();
+        self.started_session = Some(session);
+        Ok(self.controller.commit_snapshot_v2_load(controller_commit))
     }
 }
 
@@ -4692,8 +5117,152 @@ fn snapshot_destination_machine_config(
     source.with_track_dirty_pages(track_dirty_pages)
 }
 
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+struct PreparedHvfSnapshotV2ProcessLoad {
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    controller_commit: SnapshotV2ControllerCommit,
+    process_shell: HvfSnapshotV2DefaultProcessShell,
+    serial_output: SharedSerialOutput,
+    guest_ranges: Vec<GuestMemoryRange>,
+    virtual_timer_intid: u32,
+}
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+fn native_v2_boot_source_config(
+    state: &HvfSnapshotV2BootState,
+) -> Result<bangbang_runtime::boot::BootSourceConfig, BootSourceConfigError> {
+    let mut input =
+        BootSourceConfigInput::new(OsString::from_vec(state.kernel_path().as_bytes().to_vec()));
+    if let Some(initrd) = state.initrd_path() {
+        input = input.with_initrd_path(OsString::from_vec(initrd.as_bytes().to_vec()));
+    }
+    if let Some(arguments) = state.boot_arguments() {
+        input = input.with_boot_args(arguments);
+    }
+    input.validate()
+}
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+impl HvfInstanceStartExecutor {
+    fn prepare_snapshot_v2_process_load(
+        &self,
+        input: &SnapshotLoadInput,
+        artifacts: LoadedNativeSnapshotArtifacts,
+    ) -> Result<PreparedHvfSnapshotV2ProcessLoad, NativeV2SnapshotLoadError> {
+        if artifacts.family() != NativeSnapshotArtifactFamily::V2 {
+            return Err(NativeV2SnapshotLoadError::UnexpectedFamily(
+                artifacts.family(),
+            ));
+        }
+        let (artifact_state, memory) = artifacts.into_parts();
+        let (bytes, _binding) = artifact_state
+            .into_v2_parts()
+            .map_err(|state| NativeV2SnapshotLoadError::UnexpectedFamily(state.family()))?;
+        let decoded =
+            decode_native_snapshot_state(&bytes).map_err(NativeV2SnapshotLoadError::State)?;
+        let NativeSnapshotState::V2(decoded) = decoded else {
+            return Err(NativeV2SnapshotLoadError::UnexpectedFamily(
+                NativeSnapshotArtifactFamily::V1,
+            ));
+        };
+        let state = decode_hvf_snapshot_v2_platform_state(&decoded)
+            .map_err(NativeV2SnapshotLoadError::Decode)?;
+        let boot_source_config = native_v2_boot_source_config(state.machine().boot())
+            .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
+        let machine = snapshot_destination_machine_config(
+            state.machine().machine(),
+            input.track_dirty_pages(),
+        );
+        let controller_commit =
+            SnapshotV2ControllerCommit::new(machine, boot_source_config, input.resume_vm());
+        let mut guest_ranges = Vec::new();
+        guest_ranges
+            .try_reserve_exact(memory.regions().len())
+            .map_err(NativeV2SnapshotLoadError::Allocation)?;
+        guest_ranges.extend(memory.regions().iter().map(|region| region.range()));
+
+        let rate_limiter = SerialConfig::default().rate_limiter();
+        let serial_output = if self.process_serial_stdio {
+            let output = SerialStdio::output_from_process_standard_stream().map_err(|source| {
+                NativeV2SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(format!(
+                    "failed to initialize native-v2 serial standard output: {source}"
+                )))
+            })?;
+            SharedSerialOutput::with_rate_limiter(output, rate_limiter)
+        } else {
+            SharedSerialOutput::with_rate_limiter(self.serial_output.clone(), rate_limiter)
+        };
+        let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone());
+        let virtual_timer_intid = state.topology().virtual_timer_intid();
+
+        Ok(PreparedHvfSnapshotV2ProcessLoad {
+            state,
+            memory,
+            controller_commit,
+            process_shell,
+            serial_output,
+            guest_ranges,
+            virtual_timer_intid,
+        })
+    }
+
+    fn load_prepared_snapshot_v2_process(
+        &mut self,
+        prepared: PreparedHvfSnapshotV2ProcessLoad,
+    ) -> Result<SnapshotV2LoadSuccess<HvfProcessSession>, NativeV2SnapshotLoadError> {
+        let PreparedHvfSnapshotV2ProcessLoad {
+            state,
+            memory,
+            controller_commit,
+            process_shell,
+            serial_output,
+            guest_ranges,
+            virtual_timer_intid,
+        } = prepared;
+        let mut platform = restore_hvf_snapshot_v2_process_platform(state, memory, process_shell)
+            .map_err(NativeV2SnapshotLoadError::Restore)?;
+        if let Err(source) = platform.resume() {
+            let cleanup = platform
+                .shutdown()
+                .err()
+                .map(|source| BackendError::Hypervisor(source.to_string()));
+            return Err(NativeV2SnapshotLoadError::RunReady { source, cleanup });
+        }
+
+        let process_session =
+            ProcessHvfSnapshotV2Session::new(platform, guest_ranges, virtual_timer_intid);
+        let supervisor = match HvfSnapshotV2RunLoopSupervisor::start_paused(
+            process_session,
+            default_hvf_boot_run_loop_step_limit(),
+        ) {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                let (source, mut session) = error.into_parts();
+                let cleanup = session.shutdown().err();
+                return Err(NativeV2SnapshotLoadError::WorkerStart { source, cleanup });
+            }
+        };
+
+        self.active_serial_output = Some(serial_output);
+        Ok(SnapshotV2LoadSuccess::new(
+            HvfProcessSession::SnapshotV2(supervisor),
+            controller_commit,
+        ))
+    }
+}
+
 impl InstanceStartExecutor for HvfInstanceStartExecutor {
-    type Session = HvfBootRunLoopSupervisor;
+    type Session = HvfProcessSession;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, InstanceStartError> {
         self.start_with_startup_resources(
@@ -4805,7 +5374,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         };
         self.active_serial_output = Some(serial_output);
 
-        Ok(supervisor)
+        Ok(HvfProcessSession::Boot(supervisor))
     }
 
     fn preflight_snapshot_v1_storage(
@@ -4814,7 +5383,10 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         configs: CaptureReadyStorageConfigs,
         cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<(), HvfArm64BootStorageCaptureError> {
-        session.preflight_capture_ready_storage(configs, cancellation)
+        session
+            .boot_mut()
+            .ok_or_else(HvfArm64BootStorageCaptureError::owner_unavailable)?
+            .preflight_capture_ready_storage(configs, cancellation)
     }
 
     fn preflight_snapshot_v1_balloon(
@@ -4822,7 +5394,11 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         session: &mut Self::Session,
         config: Option<BalloonConfig>,
     ) -> Result<(), HvfArm64BootBalloonCaptureError> {
-        session.capture_ready_balloon_state(config).map(|_| ())
+        session
+            .boot_mut()
+            .ok_or(HvfArm64BootBalloonCaptureError::OwnerUnavailable)?
+            .capture_ready_balloon_state(config)
+            .map(|_| ())
     }
 
     fn preflight_snapshot_v1_memory_hotplug(
@@ -4831,6 +5407,8 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         config: Option<MemoryHotplugConfig>,
     ) -> Result<(), HvfArm64BootMemoryHotplugCaptureError> {
         session
+            .boot_mut()
+            .ok_or(HvfArm64BootMemoryHotplugCaptureError::OwnerUnavailable)?
             .capture_ready_memory_hotplug_state(config)
             .map(|_| ())
     }
@@ -4840,7 +5418,11 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         session: &mut Self::Session,
         config: Option<EntropyConfig>,
     ) -> Result<(), HvfArm64BootEntropyCaptureError> {
-        session.capture_ready_entropy_state(config).map(|_| ())
+        session
+            .boot_mut()
+            .ok_or(HvfArm64BootEntropyCaptureError::OwnerUnavailable)?
+            .capture_ready_entropy_state(config)
+            .map(|_| ())
     }
 
     fn preflight_snapshot_v1_serial(
@@ -4848,7 +5430,11 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         session: &mut Self::Session,
         config: SerialConfig,
     ) -> Result<(), HvfArm64BootSerialCaptureError> {
-        session.capture_ready_serial_state(config).map(|_| ())
+        session
+            .boot_mut()
+            .ok_or(HvfArm64BootSerialCaptureError::OwnerUnavailable)?
+            .capture_ready_serial_state(config)
+            .map(|_| ())
     }
 
     fn preflight_snapshot_v1_network(
@@ -4860,6 +5446,8 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         mmds_state: MmdsStateHandle,
     ) -> Result<(), ProcessCaptureReadyNetworkError> {
         session
+            .boot_mut()
+            .ok_or(ProcessCaptureReadyNetworkError::OwnerUnavailable)?
             .capture_ready_network_state(vmnet_authority, configs, mmds_config, mmds_state)
             .map(|_| ())
     }
@@ -4871,6 +5459,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<(), HvfArm64BootVsockCaptureError> {
         session
+            .boot_mut()
+            .ok_or_else(|| {
+                HvfArm64BootVsockCaptureError::owner_unavailable(
+                    HvfArm64BootVsockCaptureDisposition::Terminal,
+                )
+            })?
             .preflight_capture_ready_vsock(config, cancellation)
             .map(|_| ())
     }
@@ -4884,6 +5478,8 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
         session
+            .boot_mut()
+            .ok_or(NativeV1SnapshotPublicationError::ConfigurationUnavailable)?
             .publish_native_v1_snapshot(drive_config, serial_config, paths, cancellation)
             .map_err(NativeV1SnapshotPublicationError::Transaction)
     }
@@ -4897,6 +5493,8 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         cancellation: NativeV1SnapshotCaptureCancellation,
     ) -> Result<SnapshotPublicationOutcome, NativeV1SnapshotPublicationError> {
         session
+            .boot_mut()
+            .ok_or(NativeV1SnapshotPublicationError::ConfigurationUnavailable)?
             .publish_native_v1_snapshot_to(drive_config, serial_config, outputs, cancellation)
             .map_err(NativeV1SnapshotPublicationError::Transaction)
     }
@@ -4918,6 +5516,8 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         cancellation: NativeV2SnapshotCaptureCancellation,
     ) -> Result<NativeSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
         session
+            .boot_mut()
+            .ok_or(NativeV2SnapshotPublicationError::ConfigurationUnavailable)?
             .publish_native_v2_snapshot(input, serial_config, paths, cancellation)
             .map_err(NativeV2SnapshotPublicationError::Transaction)
     }
@@ -4931,6 +5531,8 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         cancellation: NativeV2SnapshotCaptureCancellation,
     ) -> Result<NativeSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
         session
+            .boot_mut()
+            .ok_or(NativeV2SnapshotPublicationError::ConfigurationUnavailable)?
             .publish_native_v2_snapshot_to(input, serial_config, outputs, cancellation)
             .map_err(NativeV2SnapshotPublicationError::Transaction)
     }
@@ -5005,7 +5607,10 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
 
         self.serial_output = serial_output_buffer;
         self.active_serial_output = Some(serial_output);
-        Ok(SnapshotV1LoadSuccess::new(supervisor, controller_commit))
+        Ok(SnapshotV1LoadSuccess::new(
+            HvfProcessSession::Boot(supervisor),
+            controller_commit,
+        ))
     }
 
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
@@ -5019,6 +5624,176 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
 pub(crate) type HvfBootRunLoopSupervisor = BootRunLoopSupervisor<
     ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider>,
 >;
+
+pub(crate) type HvfSnapshotV2RunLoopSupervisor = BootRunLoopSupervisor<ProcessHvfSnapshotV2Session>;
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+pub(crate) enum HvfProcessSession {
+    Boot(HvfBootRunLoopSupervisor),
+    SnapshotV2(HvfSnapshotV2RunLoopSupervisor),
+}
+
+impl HvfProcessSession {
+    fn boot_mut(&mut self) -> Option<&mut HvfBootRunLoopSupervisor> {
+        match self {
+            Self::Boot(session) => Some(session),
+            Self::SnapshotV2(_) => None,
+        }
+    }
+
+    fn diagnostics(&self) -> &dyn ProcessSessionDiagnostics {
+        match self {
+            Self::Boot(session) => session,
+            Self::SnapshotV2(session) => session,
+        }
+    }
+
+    fn diagnostics_mut(&mut self) -> &mut dyn ProcessSessionDiagnostics {
+        match self {
+            Self::Boot(session) => session,
+            Self::SnapshotV2(session) => session,
+        }
+    }
+}
+
+impl fmt::Debug for HvfProcessSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Boot(session) => formatter.debug_tuple("Boot").field(session).finish(),
+            Self::SnapshotV2(session) => {
+                formatter.debug_tuple("SnapshotV2").field(session).finish()
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcessHvfSnapshotV2StopToken {
+    stop_requested: Arc<AtomicBool>,
+}
+
+impl ProcessHvfSnapshotV2StopToken {
+    fn is_stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Acquire)
+    }
+}
+
+impl fmt::Debug for ProcessHvfSnapshotV2StopToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessHvfSnapshotV2StopToken")
+            .field("stop_requested", &self.is_stop_requested())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcessHvfSnapshotV2Control {
+    stop_requested: Arc<AtomicBool>,
+    wakeup_requested: Arc<AtomicBool>,
+    vcpu: HvfVcpuRunControl,
+}
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+impl ProcessHvfSnapshotV2Control {
+    fn new(vcpu: HvfVcpuRunControl) -> Self {
+        Self {
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            wakeup_requested: Arc::new(AtomicBool::new(false)),
+            vcpu,
+        }
+    }
+
+    fn take_wakeup_request(&self) -> bool {
+        self.wakeup_requested.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl fmt::Debug for ProcessHvfSnapshotV2Control {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessHvfSnapshotV2Control")
+            .field(
+                "stop_requested",
+                &self.stop_requested.load(Ordering::Acquire),
+            )
+            .field(
+                "wakeup_requested",
+                &self.wakeup_requested.load(Ordering::Acquire),
+            )
+            .finish()
+    }
+}
+
+impl BootRunLoopControl for ProcessHvfSnapshotV2Control {
+    type Error = HvfVcpuRunCoordinatorError;
+    type StopToken = ProcessHvfSnapshotV2StopToken;
+
+    fn stop_token(&self) -> Self::StopToken {
+        ProcessHvfSnapshotV2StopToken {
+            stop_requested: Arc::clone(&self.stop_requested),
+        }
+    }
+
+    fn request_stop(&self) -> Result<(), Self::Error> {
+        self.stop_requested.store(true, Ordering::Release);
+        self.vcpu.request_stop().map(|_| ())
+    }
+
+    fn request_wakeup(&self) -> Result<(), Self::Error> {
+        self.wakeup_requested.store(true, Ordering::Release);
+        self.vcpu.request_wakeup().map(|_| ())
+    }
+}
+
+pub(crate) struct ProcessHvfSnapshotV2Session {
+    platform: RestoredHvfSnapshotV2Platform,
+    control: ProcessHvfSnapshotV2Control,
+    guest_ranges: Vec<GuestMemoryRange>,
+    virtual_timer_intid: u32,
+}
+
+#[allow(
+    dead_code,
+    reason = "private native-v2 process restore is exercised by the signed integration group"
+)]
+impl ProcessHvfSnapshotV2Session {
+    fn new(
+        platform: RestoredHvfSnapshotV2Platform,
+        guest_ranges: Vec<GuestMemoryRange>,
+        virtual_timer_intid: u32,
+    ) -> Self {
+        let control = ProcessHvfSnapshotV2Control::new(platform.control());
+        Self {
+            platform,
+            control,
+            guest_ranges,
+            virtual_timer_intid,
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), BackendError> {
+        self.platform
+            .shutdown()
+            .map_err(|source| BackendError::Hypervisor(source.to_string()))
+    }
+}
+
+impl fmt::Debug for ProcessHvfSnapshotV2Session {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessHvfSnapshotV2Session")
+            .field("vcpu_count", &self.platform.vcpu_count())
+            .field("guest_range_count", &self.guest_ranges.len())
+            .finish()
+    }
+}
 
 pub(crate) struct ProcessHvfBootSession<S, P> {
     packet_io: P,
@@ -9122,6 +9897,109 @@ where
     }
 }
 
+impl BootRunLoopSession for ProcessHvfSnapshotV2Session {
+    type Control = ProcessHvfSnapshotV2Control;
+    type Error = HvfArm64BootRunLoopError;
+    type Outcome = HvfArm64BootRunLoopOutcome;
+    type SnapshotAuxiliaryQuiescenceGuard = ();
+
+    fn run_loop_control(&self) -> Self::Control {
+        self.control.clone()
+    }
+
+    fn shutdown_run_loop_auxiliary_work(&mut self) -> Result<(), BackendError> {
+        self.shutdown()
+    }
+
+    fn quiesce_snapshot_auxiliary_work(
+        &self,
+    ) -> Result<Self::SnapshotAuxiliaryQuiescenceGuard, BackendError> {
+        Err(BackendError::InvalidState(
+            "native-v2 focused process session cannot create snapshots",
+        ))
+    }
+
+    fn run_loop(
+        &mut self,
+        stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
+        max_steps: NonZeroUsize,
+    ) -> Result<Self::Outcome, Self::Error> {
+        let mut steps = 0usize;
+        loop {
+            if stop_token.is_stop_requested() {
+                return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+            }
+            let guest_ranges = &self.guest_ranges;
+            let outcome = self
+                .platform
+                .run_step(|entry| {
+                    guest_ranges
+                        .iter()
+                        .any(|range| range.contains(GuestAddress::new(entry)))
+                })
+                .map_err(|source| HvfArm64BootRunLoopError::RunStep {
+                    steps_completed: steps,
+                    source: Box::new(source),
+                })?;
+            steps = steps.saturating_add(1);
+
+            match outcome {
+                HvfVcpuRunStepOutcome::Canceled => {
+                    if stop_token.is_stop_requested() {
+                        return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                    }
+                    if self.control.take_wakeup_request() {
+                        return Ok(HvfArm64BootRunLoopOutcome::Wakeup { steps });
+                    }
+                }
+                HvfVcpuRunStepOutcome::VtimerActivated => {
+                    self.platform
+                        .set_last_step_ppi_pending(self.virtual_timer_intid)
+                        .map_err(|source| HvfArm64BootRunLoopError::HandleVirtualTimer {
+                            steps_completed: steps,
+                            source: Box::new(source),
+                        })?;
+                    if stop_token.is_stop_requested() {
+                        return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                    }
+                }
+                HvfVcpuRunStepOutcome::GuestShutdown { .. } => {
+                    return Ok(HvfArm64BootRunLoopOutcome::GuestShutdown { steps });
+                }
+                HvfVcpuRunStepOutcome::GuestReset { .. } => {
+                    return Ok(HvfArm64BootRunLoopOutcome::GuestReset { steps });
+                }
+                HvfVcpuRunStepOutcome::Unknown { reason } => {
+                    return Ok(HvfArm64BootRunLoopOutcome::Unknown { steps, reason });
+                }
+                HvfVcpuRunStepOutcome::Hvc { .. }
+                | HvfVcpuRunStepOutcome::CpuOff { .. }
+                | HvfVcpuRunStepOutcome::CpuSuspend { .. }
+                | HvfVcpuRunStepOutcome::Sys64 { .. }
+                | HvfVcpuRunStepOutcome::Mmio { .. }
+                | HvfVcpuRunStepOutcome::DirtyWrite { .. }
+                | HvfVcpuRunStepOutcome::LazyPage { .. } => {
+                    if stop_token.is_stop_requested() {
+                        return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                    }
+                }
+            }
+
+            if steps == max_steps.get() {
+                return Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { steps });
+            }
+        }
+    }
+
+    fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
+        matches!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { .. }
+                | HvfArm64BootRunLoopOutcome::Wakeup { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BootRunLoopWorkerStatus<O> {
     Running,
@@ -11454,6 +12332,177 @@ where
     })
 }
 
+impl ProcessSessionDiagnostics for HvfProcessSession {
+    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
+        self.diagnostics().metrics_diagnostics()
+    }
+
+    fn pause(&mut self) -> Result<(), BackendError> {
+        self.diagnostics_mut().pause()
+    }
+
+    fn resume(&mut self) -> Result<(), BackendError> {
+        self.diagnostics_mut().resume()
+    }
+
+    #[cfg(test)]
+    fn run_snapshot_create_barrier(&mut self) -> Result<(), BackendError> {
+        self.diagnostics_mut().run_snapshot_create_barrier()
+    }
+
+    fn update_block_device(
+        &mut self,
+        config: &DriveConfig,
+        backing_update: BlockBackingUpdate,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
+        mode: DriveLiveUpdateMode,
+    ) -> Result<(), DriveUpdateError> {
+        self.diagnostics_mut().update_block_device(
+            config,
+            backing_update,
+            rate_limiter_update,
+            mode,
+        )
+    }
+
+    fn insert_runtime_block_device(
+        &mut self,
+        resource: RuntimeBlockDeviceResource,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        self.diagnostics_mut().insert_runtime_block_device(resource)
+    }
+
+    fn preflight_runtime_vhost_user_block_device(
+        &mut self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        self.diagnostics_mut()
+            .preflight_runtime_vhost_user_block_device(drive_id)
+    }
+
+    fn remove_runtime_block_device(
+        &mut self,
+        drive_id: &str,
+    ) -> Result<(), DriveRuntimeMutationError> {
+        self.diagnostics_mut().remove_runtime_block_device(drive_id)
+    }
+
+    fn preflight_runtime_pmem_device(
+        &mut self,
+        config: &PmemConfig,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        self.diagnostics_mut().preflight_runtime_pmem_device(config)
+    }
+
+    fn insert_runtime_pmem_device(
+        &mut self,
+        config: PmemConfig,
+        backing: PmemFileBacking,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        self.diagnostics_mut()
+            .insert_runtime_pmem_device(config, backing)
+    }
+
+    fn remove_runtime_pmem_device(
+        &mut self,
+        pmem_id: &str,
+    ) -> Result<(), PmemRuntimeMutationError> {
+        self.diagnostics_mut().remove_runtime_pmem_device(pmem_id)
+    }
+
+    fn insert_runtime_network_device(
+        &mut self,
+        config: NetworkInterfaceConfig,
+        authority: ProcessVmnetAuthority,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        self.diagnostics_mut()
+            .insert_runtime_network_device(config, authority)
+    }
+
+    fn remove_runtime_network_device(
+        &mut self,
+        iface_id: &str,
+    ) -> Result<(), NetworkRuntimeMutationError> {
+        self.diagnostics_mut()
+            .remove_runtime_network_device(iface_id)
+    }
+
+    fn update_network_interface(
+        &mut self,
+        update: NetworkInterfaceUpdate,
+    ) -> Result<(), NetworkInterfaceUpdateError> {
+        self.diagnostics_mut().update_network_interface(update)
+    }
+
+    fn update_pmem(&mut self, update: PmemUpdate) -> Result<(), PmemUpdateError> {
+        self.diagnostics_mut().update_pmem(update)
+    }
+
+    fn update_balloon(&mut self, config: BalloonConfig) -> Result<(), BalloonUpdateError> {
+        self.diagnostics_mut().update_balloon(config)
+    }
+
+    fn update_balloon_statistics(
+        &mut self,
+        input: BalloonStatsUpdateInput,
+    ) -> Result<(), BalloonUpdateError> {
+        self.diagnostics_mut().update_balloon_statistics(input)
+    }
+
+    fn update_memory_hotplug(
+        &mut self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        self.diagnostics_mut().update_memory_hotplug(update)
+    }
+
+    fn memory_hotplug_status(
+        &mut self,
+        config: MemoryHotplugConfig,
+        requested_size_mib: u64,
+    ) -> Result<MemoryHotplugStatus, MemoryHotplugStatusError> {
+        self.diagnostics_mut()
+            .memory_hotplug_status(config, requested_size_mib)
+    }
+
+    fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
+        self.diagnostics_mut().trigger_balloon_statistics_update()
+    }
+
+    fn balloon_stats(&mut self, config: BalloonConfig) -> Result<BalloonStats, BalloonStatsError> {
+        self.diagnostics_mut().balloon_stats(config)
+    }
+
+    fn balloon_hinting_status(
+        &mut self,
+    ) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+        self.diagnostics_mut().balloon_hinting_status()
+    }
+
+    fn start_balloon_hinting(
+        &mut self,
+        input: BalloonHintingStartInput,
+    ) -> Result<(), BalloonHintingCommandError> {
+        self.diagnostics_mut().start_balloon_hinting(input)
+    }
+
+    fn stop_balloon_hinting(&mut self) -> Result<(), BalloonHintingCommandError> {
+        self.diagnostics_mut().stop_balloon_hinting()
+    }
+
+    fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+        self.diagnostics().process_exit_wakeup_fd()
+    }
+
+    fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+        self.diagnostics_mut().drain_process_exit_wakeup()
+    }
+
+    fn process_exit_status(&self) -> ProcessSessionExitStatus {
+        self.diagnostics().process_exit_status()
+    }
+}
+
 impl<S> ProcessSessionDiagnostics for BootRunLoopSupervisor<S>
 where
     S: BootRunLoopSession,
@@ -12105,7 +13154,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     use crate::contained_session::{
         TestVhostDirectory, VhostUserBrokerAuthority, empty_grant_authority_for_vhost_test,
-        file_grant_authority_for_test, vhost_directory_authority_for_test,
+        file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
+        vhost_directory_authority_for_test,
     };
 
     use crate::host_network::virtio_vmnet::VmnetVirtioNetworkPacketIoStopError;
@@ -12145,15 +13195,16 @@ mod tests {
         NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
         NativeV1SnapshotPublicationTransactionError, NativeV2SnapshotCaptureCancellation,
         NativeV2SnapshotCaptureError, NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
-        NativeV2SnapshotPublicationDestination, NativeV2SnapshotPublicationError,
-        NativeV2SnapshotPublicationProducerError, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, ProcessCaptureReadyNetworkError, ProcessHvfBootSession,
-        ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
-        ProcessNetworkPacketIoProviderBuildError, ProcessNetworkPacketIoRegistry,
-        ProcessNetworkPacketIoRegistryError, ProcessNetworkPacketIoStopError,
-        ProcessRuntimeNetworkPacketIoProvider, ProcessSessionDiagnostics, ProcessSessionExitStatus,
-        ProcessVmm, ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
-        SnapshotCreateSession, SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        NativeV2SnapshotLoadError, NativeV2SnapshotPublicationDestination,
+        NativeV2SnapshotPublicationError, NativeV2SnapshotPublicationProducerError,
+        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink,
+        ProcessCaptureReadyNetworkError, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
+        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
+        ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
+        ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
+        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
+        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
         require_native_v1_composite_record, snapshot_destination_machine_config,
         vsock_capture_error_from_boot_run_loop_command,
@@ -16256,6 +17307,115 @@ mod tests {
         assert_eq!(
             vmm.process_exit_status(),
             super::ProcessSessionExitStatus::Terminal
+        );
+    }
+
+    #[test]
+    fn native_v2_resource_adoption_failure_latches_all_process_construction_paths() {
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("ordinary boot source should configure before the terminal failure");
+
+        let retryable = vmm
+            .record_native_v2_snapshot_load_result(Err(
+                NativeV2SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                    "test retryable native-v2 preparation failed",
+                )),
+            ))
+            .expect_err("pre-adoption preparation should remain retryable");
+        assert!(matches!(
+            retryable,
+            NativeV2SnapshotLoadError::ProcessPreparation(_)
+        ));
+        assert_eq!(
+            vmm.process_exit_status(),
+            super::ProcessSessionExitStatus::Running
+        );
+
+        let terminal = vmm
+            .record_native_v2_snapshot_load_result(Err(
+                NativeV2SnapshotLoadError::AfterResourceAdoption {
+                    source: Box::new(NativeV2SnapshotLoadError::ProcessPreparation(
+                        BackendError::InvalidState(
+                            "test post-adoption native-v2 preparation failed",
+                        ),
+                    )),
+                },
+            ))
+            .expect_err("post-adoption preparation should be terminal");
+        assert!(matches!(
+            terminal,
+            NativeV2SnapshotLoadError::AfterResourceAdoption { .. }
+        ));
+        assert_eq!(
+            vmm.process_exit_status(),
+            super::ProcessSessionExitStatus::Terminal
+        );
+        assert!(matches!(
+            vmm.restore_native_v2_snapshot(&snapshot_load_input(false)),
+            Err(NativeV2SnapshotLoadError::ProcessTerminal)
+        ));
+        assert!(matches!(
+            vmm.restore_native_v1_snapshot(&snapshot_load_input(false)),
+            Err(NativeV1SnapshotLoadError::ProcessTerminal)
+        ));
+        assert_eq!(
+            vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::InstanceStart(BackendError::InvalidState(
+                "process cannot construct another VM after a terminal construction failure",
+            )))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+    }
+
+    #[test]
+    fn native_v2_requested_resume_failure_latches_after_paused_publication() {
+        let source = BackendError::Hypervisor("injected native-v2 resume failure".to_string());
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_resume_result(181, source.clone()),
+        ));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("resume failure fixture should start");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("resume failure fixture should publish paused state");
+
+        let result = vmm.resume_native_v2_snapshot_if_requested(true);
+        let error = vmm
+            .record_native_v2_snapshot_load_result(result)
+            .expect_err("requested resume failure must be terminal");
+        assert!(matches!(
+            error,
+            NativeV2SnapshotLoadError::Resume(ref actual) if *actual == source
+        ));
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("failed resume must retain the published session")
+                .resume_count,
+            1
+        );
+        assert_eq!(
+            vmm.process_exit_status(),
+            super::ProcessSessionExitStatus::Terminal
+        );
+        assert!(matches!(
+            vmm.restore_native_v1_snapshot(&snapshot_load_input(false)),
+            Err(NativeV1SnapshotLoadError::ProcessTerminal)
+        ));
+        assert_eq!(
+            vmm.handle_action(VmmAction::InstanceStart),
+            Err(VmmActionError::InstanceStart(BackendError::InvalidState(
+                "process cannot construct another VM after a terminal construction failure",
+            )))
         );
     }
 
@@ -23517,6 +24677,137 @@ mod tests {
         second_directory.assert_no_staging();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_process_rejects_other_family_and_incomplete_profile_before_construction() {
+        let v1_directory = TempSnapshotDirectory::new("native-v2-reject-v1-family");
+        let v1_paths = v1_directory.paths();
+        let mut v1_source = snapshot_profile_vmm(FakeStarter::success(183));
+        v1_source
+            .handle_action(VmmAction::InstanceStart)
+            .expect("native-v1 fixture should start");
+        v1_source
+            .handle_action(VmmAction::Pause)
+            .expect("native-v1 fixture should pause");
+        v1_source
+            .publish_native_v1_snapshot(&SnapshotCreateInput::new(
+                SnapshotType::Full,
+                v1_paths.state(),
+                v1_paths.memory(),
+            ))
+            .expect("native-v1 fixture should publish");
+        drop(v1_source);
+
+        let mut destination = ProcessVmm::with_starter(
+            "native-v2-hostile-destination",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        );
+        let v1_error = destination
+            .restore_native_v2_snapshot(&SnapshotLoadInput::new(
+                v1_paths.state(),
+                SnapshotMemoryBackend::new(v1_paths.memory(), SnapshotMemoryBackendType::File),
+            ))
+            .expect_err("native-v1 family must fail before process construction");
+        assert!(matches!(
+            &v1_error,
+            NativeV2SnapshotLoadError::UnexpectedFamily(NativeSnapshotArtifactFamily::V1)
+        ));
+        assert_eq!(destination.instance_info().state, InstanceState::NotStarted);
+        assert!(!destination.has_started_session());
+        assert!(!destination.terminal_snapshot_load_failure);
+
+        let v2_directory = TempSnapshotDirectory::new("native-v2-reject-incomplete-profile");
+        let v2_paths = v2_directory.paths();
+        let mut v2_source = paused_native_v2_profile_vmm(FakeStarter::success(184));
+        v2_source
+            .publish_native_v2_snapshot(&SnapshotCreateInput::new(
+                SnapshotType::Full,
+                v2_paths.state(),
+                v2_paths.memory(),
+            ))
+            .expect("memory-only native-v2 fixture should publish");
+        drop(v2_source);
+
+        let v2_error = destination
+            .restore_native_v2_snapshot(&SnapshotLoadInput::new(
+                v2_paths.state(),
+                SnapshotMemoryBackend::new(v2_paths.memory(), SnapshotMemoryBackendType::File),
+            ))
+            .expect_err("incomplete native-v2 profile must fail before process construction");
+        assert!(matches!(&v2_error, NativeV2SnapshotLoadError::Decode(_)));
+        let diagnostics = format!("{v1_error:?} {v1_error} {v2_error:?} {v2_error}");
+        assert!(!diagnostics.contains("native-v2-reject-v1-family"));
+        assert!(!diagnostics.contains("native-v2-reject-incomplete-profile"));
+        assert_eq!(destination.instance_info().state, InstanceState::NotStarted);
+        assert!(!destination.has_started_session());
+        assert!(!destination.terminal_snapshot_load_failure);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn contained_native_v2_process_preparation_uses_retained_pair_after_path_replacement() {
+        const STATE_REFERENCE: &str = "bangbang-grant:snapshot-state";
+        const MEMORY_REFERENCE: &str = "bangbang-grant:snapshot-memory";
+
+        let directory = TempSnapshotDirectory::new("native-v2-contained-load");
+        let paths = directory.paths();
+        let input = SnapshotCreateInput::new(SnapshotType::Full, paths.state(), paths.memory());
+        let mut source = paused_native_v2_profile_vmm(FakeStarter::success(182));
+        source
+            .publish_native_v2_snapshot(&input)
+            .expect("contained fixture should publish one native-v2 pair");
+        drop(source);
+
+        let authority = snapshot_file_grant_authority_for_test(paths.state(), paths.memory());
+        let replacement_state = paths.state().with_file_name("replacement.state");
+        let replacement_memory = paths.memory().with_file_name("replacement.memory");
+        fs::write(&replacement_state, b"replacement state")
+            .expect("replacement state should write");
+        fs::write(&replacement_memory, b"replacement memory")
+            .expect("replacement memory should write");
+        fs::rename(&replacement_state, paths.state())
+            .expect("replacement state should replace the granted path");
+        fs::rename(&replacement_memory, paths.memory())
+            .expect("replacement memory should replace the granted path");
+
+        let destination = ProcessVmm::with_starter(
+            "native-v2-contained-destination",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        )
+        .with_grant_authority(Some(authority));
+        let load = SnapshotLoadInput::new(
+            STATE_REFERENCE,
+            SnapshotMemoryBackend::new(MEMORY_REFERENCE, SnapshotMemoryBackendType::File),
+        );
+        let loaded = destination
+            .prepare_contained_snapshot_v2_load(&load)
+            .expect("retained contained descriptors should prepare")
+            .expect("explicit grant references should select contained preparation");
+        assert_eq!(loaded.family(), NativeSnapshotArtifactFamily::V2);
+        assert_eq!(loaded.memory().total_size(), 16 * 1024);
+        drop(loaded);
+
+        let error = destination
+            .prepare_contained_snapshot_v2_load(&load)
+            .expect_err("successful preparation should consume both exact grants");
+        assert!(matches!(error, NativeV2SnapshotLoadError::Resource(_)));
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("snapshot-state"));
+        assert!(!diagnostics.contains("snapshot-memory"));
+        assert_eq!(
+            fs::read(paths.state()).expect("replacement state should remain"),
+            b"replacement state"
+        );
+        assert_eq!(
+            fs::read(paths.memory()).expect("replacement memory should remain"),
+            b"replacement memory"
+        );
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     #[ignore = "requires the signed native_v2_process integration group"]
@@ -23529,6 +24820,8 @@ mod tests {
         const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
         const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
         const ARM64_BRANCH_TO_SELF: u32 = 0x1400_0000;
+        const STATE_REFERENCE: &str = "bangbang-grant:snapshot-state";
+        const MEMORY_REFERENCE: &str = "bangbang-grant:snapshot-memory";
 
         let mut image = vec![0_u8; ARM64_IMAGE_HEADER_SIZE];
         image[..4].copy_from_slice(&ARM64_BRANCH_TO_SELF.to_le_bytes());
@@ -23588,6 +24881,8 @@ mod tests {
             first_platform.topology().members()[1].disposition(),
             HvfArm64StableVcpuDisposition::Offline
         ));
+        drop(first_platform);
+        drop(first);
         first_directory.assert_no_staging();
 
         vmm.handle_action(VmmAction::Resume)
@@ -23614,6 +24909,93 @@ mod tests {
         second_directory.assert_no_staging();
 
         drop(vmm);
+
+        let paused_load = SnapshotLoadInput::new(
+            first_paths.state(),
+            SnapshotMemoryBackend::new(first_paths.memory(), SnapshotMemoryBackendType::File),
+        );
+        let mut paused_destination = ProcessVmm::with_starter(
+            "native-v2-paused-destination",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        );
+        assert!(
+            !paused_destination
+                .restore_native_v2_snapshot(&paused_load)
+                .expect("private native-v2 load should publish one paused destination")
+        );
+        assert_eq!(
+            paused_destination.instance_info().state,
+            InstanceState::Paused
+        );
+        assert!(paused_destination.drive_configs().is_empty());
+        assert_eq!(
+            paused_destination
+                .starter
+                .active_serial_output
+                .as_ref()
+                .expect("restored destination should retain its fresh UART output")
+                .metrics(),
+            SerialOutputMetrics::default()
+        );
+        paused_destination
+            .handle_action(VmmAction::Resume)
+            .expect("restored paused destination should resume");
+        paused_destination
+            .handle_action(VmmAction::Pause)
+            .expect("restored destination should pause again");
+        drop(paused_destination);
+
+        let authority =
+            snapshot_file_grant_authority_for_test(first_paths.state(), first_paths.memory());
+        let replacement_state = first_paths
+            .state()
+            .with_file_name("contained-replacement.state");
+        let replacement_memory = first_paths
+            .memory()
+            .with_file_name("contained-replacement.memory");
+        fs::write(&replacement_state, b"replacement state")
+            .expect("contained replacement state should write");
+        fs::write(&replacement_memory, b"replacement memory")
+            .expect("contained replacement memory should write");
+        fs::rename(&replacement_state, first_paths.state())
+            .expect("contained replacement state should replace the path");
+        fs::rename(&replacement_memory, first_paths.memory())
+            .expect("contained replacement memory should replace the path");
+
+        let resumed_load = SnapshotLoadInput::new(
+            STATE_REFERENCE,
+            SnapshotMemoryBackend::new(MEMORY_REFERENCE, SnapshotMemoryBackendType::File),
+        )
+        .with_resume_vm(true);
+        let mut resumed_destination = ProcessVmm::with_starter(
+            "native-v2-resumed-destination",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        )
+        .with_grant_authority(Some(authority));
+        let resume_requested = resumed_destination
+            .restore_native_v2_snapshot(&resumed_load)
+            .expect("the retained contained pair should restore into a fresh destination");
+        assert!(resume_requested);
+        assert_eq!(
+            resumed_destination.instance_info().state,
+            InstanceState::Running
+        );
+        resumed_destination
+            .handle_action(VmmAction::Pause)
+            .expect("resumed destination should remain controllable");
+        drop(resumed_destination);
+        assert_eq!(
+            fs::read(first_paths.state()).expect("contained replacement state should remain"),
+            b"replacement state"
+        );
+        assert_eq!(
+            fs::read(first_paths.memory()).expect("contained replacement memory should remain"),
+            b"replacement memory"
+        );
     }
 
     #[cfg(target_os = "macos")]
