@@ -2,15 +2,18 @@
 
 use std::fmt;
 use std::mem::size_of;
+use std::time::Instant;
 
 use crate::block::{
-    BlockCaptureIoEngine, DriveCacheType, DriveConfig, DriveIoEngine, DriveRateLimiterConfig,
-    DriveTokenBucketConfig, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID,
-    VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_SECTOR_SHIFT, VirtioBlockDeviceId,
-    VirtioBlockRateLimiterState, VirtioBlockTokenBucketState,
+    BlockCaptureIoEngine, BlockFileBacking, DriveCacheType, DriveConfig, DriveIoEngine,
+    DriveRateLimiterConfig, DriveTokenBucketConfig, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE,
+    VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_SIZE,
+    VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC,
+    VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceId, VirtioBlockQueue,
+    VirtioBlockRateLimiter, VirtioBlockRateLimiterState, VirtioBlockTokenBucketState,
 };
 use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
-use crate::memory::{GuestAddress, GuestMemoryRange};
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
 use crate::mmio::MmioRegion;
 use crate::pci::{
     PCI_BAR64_SIZE, PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
@@ -839,6 +842,334 @@ impl SnapshotV2DeviceGraph {
 }
 
 redacted_debug!(SnapshotV2DeviceGraph, "SnapshotV2DeviceGraph");
+
+/// Proof that one validated 2.4 root graph can continue against loaded memory.
+///
+/// The selector remains inert data until the destination authority layer
+/// resolves it. No path is retained after [`Self::prepare_backing`] succeeds.
+pub struct SnapshotV2RootRestorePlan {
+    selector: String,
+    drive_id: String,
+    partuuid: Option<String>,
+    cache_type: DriveCacheType,
+    capacity_sectors: u64,
+    device_id: VirtioBlockDeviceId,
+    queue_ranges: Option<[GuestMemoryRange; 3]>,
+    active_queue: Option<VirtioBlockQueue>,
+    rate_limiter: Option<VirtioBlockRateLimiter>,
+    retry: StorageRetryState,
+    virtio: SnapshotV2VirtioState,
+    transport: SnapshotV2DeviceTransport,
+}
+
+impl SnapshotV2RootRestorePlan {
+    /// Validates a complete graph against already-loaded guest memory.
+    ///
+    /// Queue geometry must be wholly contained by individual memory regions;
+    /// an otherwise readable range spanning adjacent regions is rejected.
+    /// Active queue cursors and limiter time state are also restored here so
+    /// all untrusted continuation data is rejected before backing access.
+    pub fn prepare(
+        graph: SnapshotV2DeviceGraph,
+        memory: &GuestMemory,
+        now: Instant,
+    ) -> Result<Self, SnapshotV2RootRestorePlanError> {
+        validate_graph(&graph).map_err(|_| SnapshotV2RootRestorePlanError::InvalidGraph)?;
+
+        let SnapshotV2DeviceGraph { record, .. } = graph;
+        let SnapshotV2DeviceRecord {
+            config,
+            block,
+            virtio,
+            transport,
+            ..
+        } = record;
+        let SnapshotV2RootBlockConfig {
+            drive_id,
+            partuuid,
+            cache_type,
+            rate_limiter,
+            selector,
+        } = config;
+        let SnapshotV2BlockState {
+            capacity_sectors,
+            device_id,
+            active_queue,
+            limiter,
+            retry,
+        } = block;
+        let queue_state = *virtio
+            .queues
+            .first()
+            .ok_or(SnapshotV2RootRestorePlanError::InvalidGraph)?;
+
+        let queue_ranges =
+            queue_ranges(&queue_state).map_err(|_| SnapshotV2RootRestorePlanError::InvalidGraph)?;
+        if let Some(ranges) = queue_ranges
+            && ranges
+                .into_iter()
+                .any(|range| !range_is_wholly_contained(memory, range))
+        {
+            return Err(SnapshotV2RootRestorePlanError::QueueMemory);
+        }
+
+        let active_queue = active_queue
+            .map(|cursor| {
+                let queue = VirtioMmioQueueState::from_parts(
+                    queue_state.max_size,
+                    queue_state.size,
+                    queue_state.ready,
+                    queue_state.descriptor_table,
+                    queue_state.driver_ring,
+                    queue_state.device_ring,
+                );
+                let event_idx_enabled =
+                    feature_enabled(virtio.driver_features, VIRTIO_RING_FEATURE_EVENT_IDX);
+                let indirect_descriptors_enabled =
+                    feature_enabled(virtio.driver_features, VIRTIO_RING_FEATURE_INDIRECT_DESC);
+                let queue = VirtioBlockQueue::from_snapshot_state(
+                    &queue,
+                    cursor,
+                    event_idx_enabled,
+                    indirect_descriptors_enabled,
+                )
+                .map_err(|_| SnapshotV2RootRestorePlanError::QueueContinuation)?;
+                queue
+                    .validate_snapshot_state(memory, retry != StorageRetryState::None)
+                    .map_err(|_| SnapshotV2RootRestorePlanError::QueueContinuation)?;
+                Ok(queue)
+            })
+            .transpose()?;
+
+        let limiter = persisted_limiter_state(rate_limiter, limiter)?;
+        let rate_limiter =
+            VirtioBlockRateLimiter::from_persisted_state_at(rate_limiter, limiter, now)
+                .map_err(|_| SnapshotV2RootRestorePlanError::RateLimiter)?;
+
+        Ok(Self {
+            selector,
+            drive_id,
+            partuuid,
+            cache_type,
+            capacity_sectors,
+            device_id,
+            queue_ranges,
+            active_queue,
+            rate_limiter,
+            retry,
+            virtio,
+            transport,
+        })
+    }
+
+    /// Returns the inert, untrusted backing selector.
+    pub fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    /// Returns the stable public drive identifier.
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    /// Returns the optional root partition identifier.
+    pub fn partuuid(&self) -> Option<&str> {
+        self.partuuid.as_deref()
+    }
+
+    /// Returns the graph-selected transport kind.
+    pub const fn transport_kind(&self) -> SnapshotV2DeviceTransportKind {
+        self.transport.kind()
+    }
+
+    /// Returns the validated common virtio continuation.
+    pub const fn virtio(&self) -> &SnapshotV2VirtioState {
+        &self.virtio
+    }
+
+    /// Returns the validated transport continuation.
+    pub const fn transport(&self) -> &SnapshotV2DeviceTransport {
+        &self.transport
+    }
+
+    /// Returns the canonical guest-visible capacity.
+    pub const fn capacity_sectors(&self) -> u64 {
+        self.capacity_sectors
+    }
+
+    /// Returns the validated descriptor, available, and used ring ranges.
+    pub const fn queue_ranges(&self) -> Option<[GuestMemoryRange; 3]> {
+        self.queue_ranges
+    }
+
+    /// Binds one already-authorized backing and removes all path-shaped data.
+    pub fn prepare_backing(
+        self,
+        backing: BlockFileBacking,
+    ) -> Result<PreparedSnapshotV2RootBlock, SnapshotV2RootBackingError> {
+        if !backing.kind().is_regular_file() || !backing.is_read_only() {
+            return Err(SnapshotV2RootBackingError::UnsupportedBacking);
+        }
+        let config_space = VirtioBlockConfigSpace::from_backing(&backing, self.cache_type);
+        if config_space.config_len() != VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE
+            || config_space.capacity_sectors() != self.capacity_sectors
+            || !config_space.is_read_only()
+            || config_space.cache_type() != self.cache_type
+            || config_space.available_features() != self.virtio.available_features
+        {
+            return Err(SnapshotV2RootBackingError::GeometryMismatch);
+        }
+
+        let device = VirtioBlockDevice::from_snapshot_parts(
+            backing,
+            self.device_id,
+            self.active_queue,
+            self.rate_limiter,
+            self.retry != StorageRetryState::None,
+        );
+        Ok(PreparedSnapshotV2RootBlock {
+            config_space,
+            device,
+            continuation: SnapshotV2RootContinuation {
+                drive_id: self.drive_id,
+                partuuid: self.partuuid,
+                retry: self.retry,
+                virtio: self.virtio,
+                transport: self.transport,
+            },
+        })
+    }
+}
+
+redacted_debug!(SnapshotV2RootRestorePlan, "SnapshotV2RootRestorePlan");
+
+/// Pathless root-block owner prepared for later endpoint reconstruction.
+pub struct PreparedSnapshotV2RootBlock {
+    config_space: VirtioBlockConfigSpace,
+    device: VirtioBlockDevice,
+    continuation: SnapshotV2RootContinuation,
+}
+
+impl PreparedSnapshotV2RootBlock {
+    /// Returns the canonical block configuration space.
+    pub const fn config_space(&self) -> VirtioBlockConfigSpace {
+        self.config_space
+    }
+
+    /// Returns the prepared pathless block device.
+    pub const fn device(&self) -> &VirtioBlockDevice {
+        &self.device
+    }
+
+    /// Returns the remaining guest-visible continuation.
+    pub const fn continuation(&self) -> &SnapshotV2RootContinuation {
+        &self.continuation
+    }
+
+    /// Separates the prepared device from its value-only continuation.
+    pub fn into_parts(
+        self,
+    ) -> (
+        VirtioBlockConfigSpace,
+        VirtioBlockDevice,
+        SnapshotV2RootContinuation,
+    ) {
+        (self.config_space, self.device, self.continuation)
+    }
+}
+
+redacted_debug!(PreparedSnapshotV2RootBlock, "PreparedSnapshotV2RootBlock");
+
+/// Pathless value state needed to reconstruct the root transport owner.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SnapshotV2RootContinuation {
+    drive_id: String,
+    partuuid: Option<String>,
+    retry: StorageRetryState,
+    virtio: SnapshotV2VirtioState,
+    transport: SnapshotV2DeviceTransport,
+}
+
+impl SnapshotV2RootContinuation {
+    /// Returns the stable public drive identifier.
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    /// Returns the optional root partition identifier.
+    pub fn partuuid(&self) -> Option<&str> {
+        self.partuuid.as_deref()
+    }
+
+    /// Returns the retained retry disposition.
+    pub const fn retry(&self) -> StorageRetryState {
+        self.retry
+    }
+
+    /// Returns the common virtio continuation.
+    pub const fn virtio(&self) -> &SnapshotV2VirtioState {
+        &self.virtio
+    }
+
+    /// Returns the tagged transport continuation.
+    pub const fn transport(&self) -> &SnapshotV2DeviceTransport {
+        &self.transport
+    }
+}
+
+redacted_debug!(SnapshotV2RootContinuation, "SnapshotV2RootContinuation");
+
+/// Failure while proving a root graph against loaded destination state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2RootRestorePlanError {
+    /// The graph no longer satisfies the exact 2.4 singleton profile.
+    InvalidGraph,
+    /// A queue range is not wholly contained by one guest-memory region.
+    QueueMemory,
+    /// Active guest queue cursors or pending work are inconsistent.
+    QueueContinuation,
+    /// Persisted limiter state cannot be anchored at destination time.
+    RateLimiter,
+}
+
+impl fmt::Display for SnapshotV2RootRestorePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidGraph => formatter.write_str("native-v2 root graph is invalid"),
+            Self::QueueMemory => formatter.write_str("native-v2 root queue memory is invalid"),
+            Self::QueueContinuation => {
+                formatter.write_str("native-v2 root queue continuation is invalid")
+            }
+            Self::RateLimiter => formatter.write_str("native-v2 root rate limiter is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotV2RootRestorePlanError {}
+
+/// Failure while binding an authorized backing to a validated root plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2RootBackingError {
+    /// Only regular, read-only backings are admitted.
+    UnsupportedBacking,
+    /// Guest-visible backing geometry or features differ from the graph.
+    GeometryMismatch,
+}
+
+impl fmt::Display for SnapshotV2RootBackingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedBacking => {
+                formatter.write_str("native-v2 root backing is unsupported")
+            }
+            Self::GeometryMismatch => {
+                formatter.write_str("native-v2 root backing geometry is inconsistent")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotV2RootBackingError {}
 
 /// Failure while converting detached runtime state into an artifact graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1839,6 +2170,47 @@ fn queue_ranges(
     let used = GuestMemoryRange::new(queue.device_ring, used_size)
         .map_err(|_| GraphValidationError::Virtio)?;
     Ok(Some([descriptor, available, used]))
+}
+
+fn range_is_wholly_contained(memory: &GuestMemory, range: GuestMemoryRange) -> bool {
+    memory.regions().iter().any(|region| {
+        let region = region.range();
+        region.start().raw_value() <= range.start().raw_value()
+            && range.end_exclusive().raw_value() <= region.end_exclusive().raw_value()
+    })
+}
+
+const fn feature_enabled(features: u64, feature: u32) -> bool {
+    features & (1_u64 << feature) != 0
+}
+
+fn persisted_limiter_state(
+    config: Option<DriveRateLimiterConfig>,
+    state: SnapshotV2BlockLimiterState,
+) -> Result<VirtioBlockRateLimiterState, SnapshotV2RootRestorePlanError> {
+    Ok(VirtioBlockRateLimiterState::new(
+        persisted_bucket_state(
+            config.and_then(DriveRateLimiterConfig::bandwidth),
+            state.bandwidth,
+        )?,
+        persisted_bucket_state(config.and_then(DriveRateLimiterConfig::ops), state.ops)?,
+    ))
+}
+
+fn persisted_bucket_state(
+    config: Option<DriveTokenBucketConfig>,
+    state: Option<SnapshotV2BlockBucketState>,
+) -> Result<Option<VirtioBlockTokenBucketState>, SnapshotV2RootRestorePlanError> {
+    match (config, state) {
+        (Some(config), Some(state)) => Ok(Some(VirtioBlockTokenBucketState::new(
+            config,
+            state.budget,
+            state.remaining_burst,
+            state.age_nanos,
+        ))),
+        (None, None) => Ok(None),
+        _ => Err(SnapshotV2RootRestorePlanError::InvalidGraph),
+    }
 }
 
 fn validate_mmio_state(state: &SnapshotV2MmioDeviceState) -> Result<(), GraphValidationError> {

@@ -11,6 +11,8 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
@@ -41,11 +43,14 @@ use bangbang_hvf::{
     HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfSnapshotV2BootState, HvfSnapshotV2BuildError,
     HvfSnapshotV2DecodeError, HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
     HvfSnapshotV2NativePath, HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformState,
-    HvfSnapshotV2State, HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome,
-    OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError, PreparedHvfArm64BootPciNetworkRemoval,
-    PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
-    decode_hvf_snapshot_v2_platform_state, encode_hvf_snapshot_v2_platform_state,
-    encode_hvf_snapshot_v2_state, restore_hvf_snapshot_v2_process_platform,
+    HvfSnapshotV2RootProcessConfig, HvfSnapshotV2RootResourcePlan, HvfSnapshotV2State,
+    HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
+    PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2RootPlanError,
+    PreparedHvfArm64BootPciNetworkRemoval, PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State,
+    RestoredHvfSnapshotV2Platform, decode_hvf_snapshot_v2_platform_state,
+    decode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_platform_state,
+    encode_hvf_snapshot_v2_state, prepare_hvf_snapshot_v2_root_plan,
+    restore_hvf_snapshot_v2_process_platform,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -53,6 +58,8 @@ use bangbang_runtime::balloon::{
     BalloonHintingStatus, BalloonHintingStatusError, BalloonStats, BalloonStatsError,
     BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
 };
+#[cfg(target_os = "macos")]
+use bangbang_runtime::block::SnapshotBlockFileBackingError;
 use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveBackendConfig, DriveConfig, DriveConfigInput,
     DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig, DriveRuntimeMutationError,
@@ -130,11 +137,15 @@ use bangbang_runtime::snapshot_artifact::{
 use bangbang_runtime::snapshot_commit::{SnapshotCommitKind, SnapshotCommitRecord};
 use bangbang_runtime::snapshot_device::SnapshotV1DeviceState;
 use bangbang_runtime::snapshot_device_v2::{
-    NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
-    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransportKind,
+    NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, PreparedSnapshotV2RootBlock,
+    SnapshotV2DeviceGraph, SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransportKind,
+    SnapshotV2RootBackingError,
 };
 use bangbang_runtime::snapshot_format::{
     NativeSnapshotFormatError, NativeSnapshotState, decode_native_snapshot_state,
+};
+use bangbang_runtime::snapshot_format_v2::{
+    SnapshotV2DecodeError, decode_snapshot_v2_state_with_compatibility_version,
 };
 use bangbang_runtime::snapshot_memory::{
     SnapshotMemoryIoStage, SnapshotMemoryWriteError, write_snapshot_memory_image_with_cancel,
@@ -1183,7 +1194,13 @@ pub(crate) enum NativeV2SnapshotLoadError {
     Artifact(SnapshotArtifactLoadError),
     UnexpectedFamily(NativeSnapshotArtifactFamily),
     State(NativeSnapshotFormatError),
+    CandidateFormat(SnapshotV2DecodeError),
+    CandidateMismatch,
     Decode(HvfSnapshotV2DecodeError),
+    RootPlan(PrepareHvfSnapshotV2RootPlanError),
+    #[cfg(target_os = "macos")]
+    RootBacking(SnapshotRootBackingLeaseError),
+    RootBundle(SnapshotV2RootBackingError),
     BootMetadata(BootSourceConfigError),
     Allocation(TryReserveError),
     ProcessPreparation(BackendError),
@@ -1217,10 +1234,16 @@ impl NativeV2SnapshotLoadError {
             | Self::Artifact(_)
             | Self::UnexpectedFamily(_)
             | Self::State(_)
+            | Self::CandidateFormat(_)
+            | Self::CandidateMismatch
             | Self::Decode(_)
+            | Self::RootPlan(_)
+            | Self::RootBundle(_)
             | Self::BootMetadata(_)
             | Self::Allocation(_)
             | Self::ProcessPreparation(_) => false,
+            #[cfg(target_os = "macos")]
+            Self::RootBacking(_) => false,
         }
     }
 }
@@ -1249,8 +1272,33 @@ impl fmt::Display for NativeV2SnapshotLoadError {
                 )
             }
             Self::State(source) => write!(formatter, "native-v2 state decode failed: {source}"),
+            Self::CandidateFormat(source) => {
+                write!(formatter, "native-v2 candidate decode failed: {source}")
+            }
+            Self::CandidateMismatch => {
+                formatter.write_str("native-v2 candidate components are inconsistent")
+            }
             Self::Decode(source) => {
                 write!(formatter, "native-v2 platform decode failed: {source}")
+            }
+            Self::RootPlan(source) => {
+                write!(
+                    formatter,
+                    "native-v2 root plan preparation failed: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::RootBacking(source) => {
+                write!(
+                    formatter,
+                    "native-v2 root backing adoption failed: {source}"
+                )
+            }
+            Self::RootBundle(source) => {
+                write!(
+                    formatter,
+                    "native-v2 root bundle preparation failed: {source}"
+                )
             }
             Self::BootMetadata(source) => {
                 write!(
@@ -1305,7 +1353,12 @@ impl std::error::Error for NativeV2SnapshotLoadError {
             Self::AfterResourceAdoption { source } => Some(source.as_ref()),
             Self::Artifact(source) => Some(source),
             Self::State(source) => Some(source),
+            Self::CandidateFormat(source) => Some(source),
             Self::Decode(source) => Some(source),
+            Self::RootPlan(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::RootBacking(source) => Some(source),
+            Self::RootBundle(source) => Some(source),
             Self::BootMetadata(source) => Some(source),
             Self::Allocation(source) => Some(source),
             Self::ProcessPreparation(source) => Some(source),
@@ -1313,7 +1366,7 @@ impl std::error::Error for NativeV2SnapshotLoadError {
             Self::RunReady { source, .. } => Some(source),
             Self::WorkerStart { source, .. } => Some(source),
             Self::Resume(source) => Some(source),
-            Self::ProcessTerminal | Self::UnexpectedFamily(_) => None,
+            Self::ProcessTerminal | Self::UnexpectedFamily(_) | Self::CandidateMismatch => None,
         }
     }
 }
@@ -1521,6 +1574,128 @@ impl fmt::Debug for PreparedNativeSnapshotLoad {
             .field("state", &"<redacted>")
             .field("authority", &"<redacted>")
             .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectRootSelectorPolicy {
+    TreatAsPath,
+    RejectGrantReference,
+}
+
+#[cfg(target_os = "macos")]
+struct PreparedSnapshotRootBackingLease {
+    selector: Option<PathBuf>,
+    claim: Option<PreparedDriveBackingClaim>,
+    consumed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedSnapshotRootBackingLease {
+    fn prepare(
+        selector: &Path,
+        authority: Option<&GrantAuthority>,
+        direct_policy: DirectRootSelectorPolicy,
+    ) -> Result<Self, GrantClaimError> {
+        let claim = match authority {
+            Some(authority) => {
+                authority.prepare_drive_backing_claim(selector, GrantAccess::ReadOnly)?
+            }
+            None => {
+                if direct_policy == DirectRootSelectorPolicy::RejectGrantReference
+                    && grant_reference_id(selector)?.is_some()
+                {
+                    return Err(GrantClaimError);
+                }
+                None
+            }
+        };
+        Ok(Self {
+            selector: Some(selector.to_path_buf()),
+            claim,
+            consumed: false,
+        })
+    }
+
+    fn take_snapshot_read_only_file(&mut self) -> Result<Option<File>, GrantClaimError> {
+        let (_selector, file) = self.consume()?;
+        Ok(file)
+    }
+
+    fn consume(&mut self) -> Result<(PathBuf, Option<File>), GrantClaimError> {
+        if self.consumed {
+            return Err(GrantClaimError);
+        }
+        self.consumed = true;
+        let selector = self.selector.take().ok_or(GrantClaimError)?;
+        let file = self
+            .claim
+            .as_mut()
+            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
+            .transpose()?;
+        Ok((selector, file))
+    }
+
+    fn open_snapshot_read_only(
+        &mut self,
+    ) -> Result<BlockFileBacking, SnapshotRootBackingLeaseError> {
+        let (selector, file) = self
+            .consume()
+            .map_err(SnapshotRootBackingLeaseError::Grant)?;
+        match file {
+            Some(file) => BlockFileBacking::from_snapshot_read_only_file(file)
+                .map(|(backing, _identity)| backing)
+                .map_err(SnapshotRootBackingLeaseError::Backing),
+            None => BlockFileBacking::open_snapshot_read_only(&selector)
+                .map(|(backing, _identity)| backing)
+                .map_err(SnapshotRootBackingLeaseError::Backing),
+        }
+    }
+
+    fn commit(self) {
+        if let Some(claim) = self.claim {
+            claim.commit();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for PreparedSnapshotRootBackingLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotRootBackingLease")
+            .field("selector", &self.selector.as_ref().map(|_| "<redacted>"))
+            .field("claim", &self.claim.as_ref().map(|_| "<provisional>"))
+            .field("consumed", &self.consumed)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub(crate) enum SnapshotRootBackingLeaseError {
+    Grant(GrantClaimError),
+    Backing(SnapshotBlockFileBackingError),
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for SnapshotRootBackingLeaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Grant(_) => formatter.write_str("snapshot root authority validation failed"),
+            Self::Backing(_) => formatter.write_str("snapshot root backing validation failed"),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for SnapshotRootBackingLeaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Grant(source) => Some(source),
+            Self::Backing(source) => Some(source),
+        }
     }
 }
 
@@ -4633,20 +4808,14 @@ where
         let state = state.into_v1().map_err(NativeV1SnapshotLoadError::State)?;
         let state = PreparedHvfSnapshotV1State::from_prepared_state(state)
             .map_err(NativeV1SnapshotLoadError::Prepare)?;
-        let mut root_claim = self
-            .grant_authority
-            .as_ref()
-            .map(|authority| {
-                authority
-                    .prepare_drive_backing_claim(state.root_backing_path(), GrantAccess::ReadOnly)
-            })
-            .transpose()
-            .map_err(NativeV1SnapshotLoadError::Resource)?
-            .flatten();
-        let root = root_claim
-            .as_mut()
-            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
-            .transpose()
+        let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
+            state.root_backing_path(),
+            self.grant_authority.as_ref(),
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .map_err(NativeV1SnapshotLoadError::Resource)?;
+        let root = root_lease
+            .take_snapshot_read_only_file()
             .map_err(NativeV1SnapshotLoadError::Resource)?;
 
         let mut files = self
@@ -4675,9 +4844,7 @@ where
         let prepared = prepared
             .finish(root, Instant::now())
             .map_err(NativeV1SnapshotLoadError::Prepare)?;
-        if let Some(claim) = root_claim {
-            claim.commit();
-        }
+        root_lease.commit();
         Ok(prepared)
     }
 
@@ -4729,24 +4896,14 @@ where
             .map_err(NativeV1SnapshotLoadError::Prepare)?
             .prepare_lazy()
             .map_err(NativeV1SnapshotLoadError::Prepare)?;
-        let mut root_claim = match &self.grant_authority {
-            Some(authority) => authority
-                .prepare_drive_backing_claim(state.root_backing_path(), GrantAccess::ReadOnly)
-                .map_err(NativeV1SnapshotLoadError::Resource)?,
-            None => {
-                if grant_reference_id(state.root_backing_path())
-                    .map_err(NativeV1SnapshotLoadError::Resource)?
-                    .is_some()
-                {
-                    return Err(NativeV1SnapshotLoadError::Resource(GrantClaimError));
-                }
-                None
-            }
-        };
-        let root = root_claim
-            .as_mut()
-            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
-            .transpose()
+        let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
+            state.root_backing_path(),
+            self.grant_authority.as_ref(),
+            DirectRootSelectorPolicy::RejectGrantReference,
+        )
+        .map_err(NativeV1SnapshotLoadError::Resource)?;
+        let root = root_lease
+            .take_snapshot_read_only_file()
             .map_err(NativeV1SnapshotLoadError::Resource)?;
         let state = state
             .prepare_root_backing(root)
@@ -4773,9 +4930,7 @@ where
         if let Some(claim) = state_claim {
             claim.commit();
         }
-        if let Some(claim) = root_claim {
-            claim.commit();
-        }
+        root_lease.commit();
         Ok(prepared)
     }
 
@@ -5031,13 +5186,14 @@ where
         .map_err(NativeV1SnapshotLoadError::Artifact)?;
         let state = PreparedHvfSnapshotV1State::from_prepared_state(state)
             .map_err(NativeV1SnapshotLoadError::Prepare)?;
-        let mut root_claim = authority
-            .prepare_drive_backing_claim(state.root_backing_path(), GrantAccess::ReadOnly)
-            .map_err(NativeV1SnapshotLoadError::Resource)?;
-        let root = root_claim
-            .as_mut()
-            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
-            .transpose()
+        let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
+            state.root_backing_path(),
+            Some(authority),
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .map_err(NativeV1SnapshotLoadError::Resource)?;
+        let root = root_lease
+            .take_snapshot_read_only_file()
             .map_err(NativeV1SnapshotLoadError::Resource)?;
 
         let mut requests = Vec::with_capacity(2);
@@ -5081,9 +5237,7 @@ where
         let prepared = prepared
             .finish(root, Instant::now())
             .map_err(NativeV1SnapshotLoadError::Prepare)?;
-        if let Some(claim) = root_claim {
-            claim.commit();
-        }
+        root_lease.commit();
         Ok(Some(prepared))
     }
 
@@ -5130,24 +5284,14 @@ where
             .prepare_lazy()
             .map_err(NativeV1SnapshotLoadError::Prepare)?;
 
-        let mut root_claim = match &self.grant_authority {
-            Some(authority) => authority
-                .prepare_drive_backing_claim(state.root_backing_path(), GrantAccess::ReadOnly)
-                .map_err(NativeV1SnapshotLoadError::Resource)?,
-            None => {
-                if grant_reference_id(state.root_backing_path())
-                    .map_err(NativeV1SnapshotLoadError::Resource)?
-                    .is_some()
-                {
-                    return Err(NativeV1SnapshotLoadError::Resource(GrantClaimError));
-                }
-                None
-            }
-        };
-        let root = root_claim
-            .as_mut()
-            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
-            .transpose()
+        let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
+            state.root_backing_path(),
+            self.grant_authority.as_ref(),
+            DirectRootSelectorPolicy::RejectGrantReference,
+        )
+        .map_err(NativeV1SnapshotLoadError::Resource)?;
+        let root = root_lease
+            .take_snapshot_read_only_file()
             .map_err(NativeV1SnapshotLoadError::Resource)?;
         let state = state
             .prepare_root_backing(root)
@@ -5174,9 +5318,7 @@ where
         if let Some(claim) = state_claim {
             claim.commit();
         }
-        if let Some(claim) = root_claim {
-            claim.commit();
-        }
+        root_lease.commit();
         Ok(prepared)
     }
 
@@ -5783,6 +5925,103 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    fn prepare_native_v2_root_candidate_load(
+        &self,
+        input: &SnapshotLoadInput,
+        candidate: NativeV2SnapshotCandidateState,
+        memory: GuestMemory,
+    ) -> Result<PreparedHvfSnapshotV2RootProcessLoad, NativeV2SnapshotLoadError> {
+        if self.terminal_snapshot_load_failure || self.terminal_instance_start_failure {
+            return Err(NativeV2SnapshotLoadError::ProcessTerminal);
+        }
+        self.controller
+            .preflight_load_snapshot_v2(input)
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+        self.starter
+            .preflight_snapshot_v2_root_process()
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+        if self.starter.pci_enabled != self.pci_enabled {
+            return Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
+
+        let (bytes, binding, graph) = candidate.into_parts();
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &bytes,
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        )
+        .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
+        let state =
+            decode_hvf_snapshot_v2_state(&structural).map_err(NativeV2SnapshotLoadError::Decode)?;
+        if state.platform().memory() != &binding || state.device_graph() != &graph {
+            return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+        }
+
+        let boot_source_config = native_v2_boot_source_config(state.platform().machine().boot())
+            .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
+        let machine = snapshot_destination_machine_config(
+            state.platform().machine().machine(),
+            input.track_dirty_pages(),
+        );
+        let controller_commit =
+            SnapshotV2ControllerCommit::new(machine, boot_source_config, input.resume_vm());
+        let mut guest_ranges = Vec::new();
+        guest_ranges
+            .try_reserve_exact(memory.regions().len())
+            .map_err(NativeV2SnapshotLoadError::Allocation)?;
+        guest_ranges.extend(memory.regions().iter().map(|region| region.range()));
+        let virtual_timer_intid = state.platform().topology().virtual_timer_intid();
+
+        let process = HvfSnapshotV2RootProcessConfig::new(
+            BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
+            self.pci_enabled,
+        );
+        let prepared = prepare_hvf_snapshot_v2_root_plan(state, memory, process, Instant::now())
+            .map_err(NativeV2SnapshotLoadError::RootPlan)?;
+
+        let rate_limiter = SerialConfig::default().rate_limiter();
+        let serial_output = if self.starter.process_serial_stdio {
+            let output = SerialStdio::output_from_process_standard_stream().map_err(|source| {
+                NativeV2SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(format!(
+                    "failed to initialize native-v2 serial standard output: {source}"
+                )))
+            })?;
+            SharedSerialOutput::with_rate_limiter(output, rate_limiter)
+        } else {
+            SharedSerialOutput::with_rate_limiter(self.starter.serial_output.clone(), rate_limiter)
+        };
+
+        let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
+            Path::new(prepared.selector()),
+            self.grant_authority.as_ref(),
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .map_err(|source| {
+            NativeV2SnapshotLoadError::RootBacking(SnapshotRootBackingLeaseError::Grant(source))
+        })?;
+        let (platform, memory, root, resources) = prepared.into_parts();
+        let backing = root_lease
+            .open_snapshot_read_only()
+            .map_err(NativeV2SnapshotLoadError::RootBacking)?;
+        let root = root
+            .prepare_backing(backing)
+            .map_err(NativeV2SnapshotLoadError::RootBundle)?;
+
+        Ok(PreparedHvfSnapshotV2RootProcessLoad {
+            platform,
+            memory,
+            root,
+            resources,
+            root_lease,
+            controller_commit,
+            serial_output,
+            guest_ranges,
+            virtual_timer_intid,
+        })
+    }
+
     fn capture_native_v2_root_candidate(
         &mut self,
         output: BoxedNativeV2SnapshotMemoryOutput,
@@ -5830,6 +6069,15 @@ const _: fn(
     NativeV2SnapshotCaptureCancellation,
 ) -> Result<NativeV2SnapshotCandidateState, NativeV2RootCandidateProcessError> =
     ProcessVmm::<HvfInstanceStartExecutor>::capture_native_v2_root_candidate;
+
+#[cfg(target_os = "macos")]
+const _: fn(
+    &ProcessVmm<HvfInstanceStartExecutor>,
+    &SnapshotLoadInput,
+    NativeV2SnapshotCandidateState,
+    GuestMemory,
+) -> Result<PreparedHvfSnapshotV2RootProcessLoad, NativeV2SnapshotLoadError> =
+    ProcessVmm::<HvfInstanceStartExecutor>::prepare_native_v2_root_candidate_load;
 
 // Keep the pre-dispatch native-v1 load seam type-checked for focused legacy
 // compatibility tests; public loads use the one-open family dispatcher.
@@ -5951,6 +6199,15 @@ impl HvfInstanceStartExecutor {
         default_hvf_boot_session_config(SharedSerialOutput::from(self.serial_output.clone()))
     }
 
+    #[cfg(target_os = "macos")]
+    fn preflight_snapshot_v2_root_process(&self) -> Result<(), VmmActionError> {
+        if self.boot_timer_enabled {
+            Err(VmmActionError::SnapshotUnsupported)
+        } else {
+            Ok(())
+        }
+    }
+
     fn serial_output_for_controller(
         &self,
         controller: &VmmController,
@@ -6030,6 +6287,72 @@ fn snapshot_destination_machine_config(
     track_dirty_pages: bool,
 ) -> bangbang_runtime::machine::MachineConfig {
     source.with_track_dirty_pages(track_dirty_pages)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "exact-2.4 root restore stays dormant until endpoint reconstruction lands"
+)]
+struct PreparedHvfSnapshotV2RootProcessLoad {
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    root: PreparedSnapshotV2RootBlock,
+    resources: HvfSnapshotV2RootResourcePlan,
+    root_lease: PreparedSnapshotRootBackingLease,
+    controller_commit: SnapshotV2ControllerCommit,
+    serial_output: SharedSerialOutput,
+    guest_ranges: Vec<GuestMemoryRange>,
+    virtual_timer_intid: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for PreparedHvfSnapshotV2RootProcessLoad {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedHvfSnapshotV2RootProcessLoad")
+            .field("transport", &self.resources.transport().kind())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "exact-2.4 root restore stays dormant until endpoint reconstruction lands"
+)]
+impl PreparedHvfSnapshotV2RootProcessLoad {
+    fn into_parts(self) -> PreparedHvfSnapshotV2RootProcessLoadParts {
+        PreparedHvfSnapshotV2RootProcessLoadParts {
+            platform: self.platform,
+            memory: self.memory,
+            root: self.root,
+            resources: self.resources,
+            root_lease: self.root_lease,
+            controller_commit: self.controller_commit,
+            serial_output: self.serial_output,
+            guest_ranges: self.guest_ranges,
+            virtual_timer_intid: self.virtual_timer_intid,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "exact-2.4 root restore stays dormant until endpoint reconstruction lands"
+)]
+struct PreparedHvfSnapshotV2RootProcessLoadParts {
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    root: PreparedSnapshotV2RootBlock,
+    resources: HvfSnapshotV2RootResourcePlan,
+    root_lease: PreparedSnapshotRootBackingLease,
+    controller_commit: SnapshotV2ControllerCommit,
+    serial_output: SharedSerialOutput,
+    guest_ranges: Vec<GuestMemoryRange>,
+    virtual_timer_intid: u32,
 }
 
 #[allow(
@@ -14433,6 +14756,11 @@ mod tests {
         native_v2_platform_capture_is_terminal, require_native_v1_composite_record,
         snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
+    #[cfg(target_os = "macos")]
+    use super::{
+        DirectRootSelectorPolicy, GrantAccess, PreparedSnapshotRootBackingLease,
+        SnapshotRootBackingLeaseError,
+    };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -14786,6 +15114,118 @@ mod tests {
         fn drop(&mut self) {
             let _ = remove_file(&self.path);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_backing_lease_direct_path_is_read_only_redacted_and_single_use() {
+        let root = TempFilePath::create_with_bytes("root-lease-direct", b"root");
+        let mut lease = PreparedSnapshotRootBackingLease::prepare(
+            root.path(),
+            None,
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .expect("direct root lease should prepare");
+        assert!(!format!("{lease:?}").contains(&root.path().display().to_string()));
+        let backing = lease
+            .open_snapshot_read_only()
+            .expect("direct root backing should open");
+        assert!(backing.kind().is_regular_file());
+        assert!(backing.is_read_only());
+        assert_eq!(backing.len(), 4);
+        assert!(matches!(
+            lease.open_snapshot_read_only(),
+            Err(SnapshotRootBackingLeaseError::Grant(_))
+        ));
+        lease.commit();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_backing_lease_preserves_direct_grant_shaped_paths_without_contained_fallback() {
+        let mut direct = PreparedSnapshotRootBackingLease::prepare(
+            Path::new("bangbang-grant:missing"),
+            None,
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .expect("direct mode should retain grant-shaped bytes as a pathname");
+        let (selector, file) = direct
+            .consume()
+            .expect("direct grant-shaped pathname should consume");
+        assert_eq!(selector, PathBuf::from("bangbang-grant:missing"));
+        assert!(file.is_none());
+        assert!(
+            PreparedSnapshotRootBackingLease::prepare(
+                Path::new("bangbang-grant:missing"),
+                None,
+                DirectRootSelectorPolicy::RejectGrantReference,
+            )
+            .is_err()
+        );
+        let authority = file_grant_authority_for_test();
+        assert!(
+            PreparedSnapshotRootBackingLease::prepare(
+                Path::new("bangbang-grant:missing"),
+                Some(&authority),
+                DirectRootSelectorPolicy::TreatAsPath,
+            )
+            .is_err()
+        );
+        assert!(
+            PreparedSnapshotRootBackingLease::prepare(
+                Path::new("bangbang-grant:drive-rw"),
+                Some(&authority),
+                DirectRootSelectorPolicy::TreatAsPath,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_backing_lease_abort_restores_and_commit_consumes_exact_grant() {
+        const ROOT: &str = "bangbang-grant:drive-ro";
+
+        let authority = file_grant_authority_for_test();
+        let observer = authority.clone();
+        let mut cancelled = PreparedSnapshotRootBackingLease::prepare(
+            Path::new(ROOT),
+            Some(&authority),
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .expect("contained root lease should prepare");
+        let backing = cancelled
+            .open_snapshot_read_only()
+            .expect("contained root backing should adopt");
+        assert!(backing.kind().is_regular_file());
+        assert!(backing.is_read_only());
+        drop(backing);
+        drop(cancelled);
+        let restored = observer
+            .prepare_drive_backing_claim(Path::new(ROOT), GrantAccess::ReadOnly)
+            .expect("cancelled lease should restore exact grant")
+            .expect("restored grant should reserve again");
+        drop(restored);
+
+        let authority = file_grant_authority_for_test();
+        let observer = authority.clone();
+        let mut committed = PreparedSnapshotRootBackingLease::prepare(
+            Path::new(ROOT),
+            Some(&authority),
+            DirectRootSelectorPolicy::TreatAsPath,
+        )
+        .expect("contained root lease should prepare");
+        drop(
+            committed
+                .open_snapshot_read_only()
+                .expect("contained root backing should adopt"),
+        );
+        committed.commit();
+        assert!(
+            observer
+                .prepare_drive_backing_claim(Path::new(ROOT), GrantAccess::ReadOnly)
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "macos")]

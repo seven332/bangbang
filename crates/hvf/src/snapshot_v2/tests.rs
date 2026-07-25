@@ -18,9 +18,9 @@ use super::*;
 use crate::snapshot_bundle::tests::fixture as native_v1_fixture;
 
 const FIXTURE_MEMORY_MIB: u64 = 4;
-const MMIO_GRAPH_FIXTURE_HEX: &str =
+pub(crate) const MMIO_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2/fixtures/mmio.hex");
-const PCI_GRAPH_FIXTURE_HEX: &str =
+pub(crate) const PCI_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2/fixtures/pci.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
@@ -283,7 +283,7 @@ fn encoded_fixture(with_sme: bool) -> Vec<u8> {
         .expect("fixture platform should encode")
 }
 
-fn fixture_bytes(hex: &str) -> Vec<u8> {
+pub(crate) fn fixture_bytes(hex: &str) -> Vec<u8> {
     let hex = hex.trim();
     assert!(hex.len().is_multiple_of(2));
     hex.as_bytes()
@@ -295,7 +295,7 @@ fn fixture_bytes(hex: &str) -> Vec<u8> {
         .collect()
 }
 
-fn deterministic_minor_four_platform_fixture() -> HvfSnapshotV2PlatformState {
+pub(crate) fn deterministic_minor_four_platform_fixture() -> HvfSnapshotV2PlatformState {
     let mut platform = platform_fixture(false);
     let mut binding = platform
         .memory()
@@ -337,7 +337,7 @@ fn deterministic_minor_four_platform_fixture() -> HvfSnapshotV2PlatformState {
     platform
 }
 
-fn complete_state_fixture(graph_hex: &str) -> HvfSnapshotV2State {
+pub(crate) fn complete_state_fixture(graph_hex: &str) -> HvfSnapshotV2State {
     let graph = SnapshotV2DeviceGraph::decode(
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         &fixture_bytes(graph_hex),

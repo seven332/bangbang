@@ -168,6 +168,37 @@ impl KernelCommandLine {
     }
 }
 
+/// Builds the canonical process command line for one read-only root block.
+///
+/// Transport policy is inserted before root selection while Linux init
+/// arguments, when present, remain after the canonical ` -- ` separator.
+pub fn canonical_process_root_block_command_line(
+    boot_args: Option<&str>,
+    pci_enabled: bool,
+    partuuid: Option<&str>,
+    read_only: bool,
+) -> Result<String, BootCommandLineError> {
+    let mut command_line = validate_command_line_text(boot_args)?;
+    if !pci_enabled {
+        command_line = command_line.with_appended_kernel_args(["pci=off"])?;
+    }
+    let (root, mode) = root_block_kernel_arguments(partuuid, read_only);
+    command_line = command_line.with_appended_kernel_args([root.as_str(), mode])?;
+    Ok(command_line.text)
+}
+
+/// Returns the canonical Linux root selector and access-mode arguments.
+pub fn root_block_kernel_arguments(
+    partuuid: Option<&str>,
+    read_only: bool,
+) -> (String, &'static str) {
+    let root = partuuid
+        .map(|partuuid| format!("root=PARTUUID={partuuid}"))
+        .unwrap_or_else(|| "root=/dev/vda".to_string());
+    let mode = if read_only { "ro" } else { "rw" };
+    (root, mode)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedBootSource {
     pub command_line: KernelCommandLine,

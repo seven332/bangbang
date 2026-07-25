@@ -10,6 +10,7 @@ use crate::block::{
     BlockFileBacking, DriveConfigInput, PreparedBlockDevice, VIRTIO_BLOCK_QUEUE_SIZES,
     VirtioBlockConfigSpace, VirtioBlockDevice,
 };
+use crate::memory::{GuestMemory, GuestMemoryLayout};
 use crate::message_interrupt::{
     GuestMessage, GuestMessageInterrupt, GuestMessageInterruptRegistry,
     GuestMessageInterruptSignalError,
@@ -1161,6 +1162,107 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+fn root_restore_memory(ranges: Vec<GuestMemoryRange>) -> GuestMemory {
+    let layout = GuestMemoryLayout::new(ranges).expect("restore memory layout should validate");
+    let mut memory = GuestMemory::allocate(&layout).expect("restore memory should allocate");
+    memory
+        .write_slice(&8_u16.to_le_bytes(), GuestAddress::new(0x2_0002))
+        .expect("available cursor should write");
+    memory
+        .write_slice(&6_u16.to_le_bytes(), GuestAddress::new(0x3_0002))
+        .expect("used cursor should write");
+    memory
+}
+
+fn contiguous_root_restore_memory() -> GuestMemory {
+    root_restore_memory(vec![
+        GuestMemoryRange::new(GuestAddress::new(0), 0x4_0000)
+            .expect("restore memory range should validate"),
+    ])
+}
+
+#[test]
+fn root_restore_plan_prepares_pathless_mmio_and_pci_backings() {
+    for graph in [mmio_graph(), pci_graph()] {
+        let memory = contiguous_root_restore_memory();
+        let plan = SnapshotV2RootRestorePlan::prepare(graph, &memory, Instant::now())
+            .expect("root restore graph should prepare");
+        assert_eq!(plan.selector(), "root-selector");
+        assert_eq!(plan.drive_id(), "rootfs");
+        assert_eq!(plan.partuuid(), Some("1111-2222"));
+        assert_eq!(plan.capacity_sectors(), 2048);
+        assert!(!format!("{plan:?}").contains(plan.selector()));
+
+        let file = TempFile::new("restore-root.img", 2048 << VIRTIO_BLOCK_SECTOR_SHIFT);
+        let (backing, _) = BlockFileBacking::open_snapshot_read_only(file.path())
+            .expect("restore root backing should open");
+        let prepared = plan
+            .prepare_backing(backing)
+            .expect("restore root backing should prepare");
+        assert_eq!(prepared.config_space().capacity_sectors(), 2048);
+        assert!(prepared.config_space().is_read_only());
+        assert_eq!(
+            prepared
+                .device()
+                .backing()
+                .expect("prepared device should retain file backing")
+                .len(),
+            2048 << VIRTIO_BLOCK_SECTOR_SHIFT
+        );
+        assert_eq!(prepared.continuation().drive_id(), "rootfs");
+        assert_eq!(
+            prepared.continuation().retry(),
+            StorageRetryState::After {
+                remaining_nanos: 99
+            }
+        );
+        assert!(!format!("{prepared:?}").contains("root-selector"));
+    }
+}
+
+#[test]
+fn root_restore_plan_rejects_cross_region_and_cursor_mismatches() {
+    let mut cross_region = mmio_graph();
+    cross_region.record.virtio.queues[0].descriptor_table = GuestAddress::new(0xf800);
+    validate_graph(&cross_region).expect("cross-region graph should be structurally valid");
+    let memory = root_restore_memory(vec![
+        GuestMemoryRange::new(GuestAddress::new(0), 0x1_0000)
+            .expect("first restore region should validate"),
+        GuestMemoryRange::new(GuestAddress::new(0x1_0000), 0x3_0000)
+            .expect("second restore region should validate"),
+    ]);
+    assert_eq!(
+        SnapshotV2RootRestorePlan::prepare(cross_region, &memory, Instant::now())
+            .expect_err("one queue range spanning regions must fail"),
+        SnapshotV2RootRestorePlanError::QueueMemory
+    );
+
+    let mut memory = contiguous_root_restore_memory();
+    memory
+        .write_slice(&7_u16.to_le_bytes(), GuestAddress::new(0x2_0002))
+        .expect("available cursor mismatch should write");
+    assert_eq!(
+        SnapshotV2RootRestorePlan::prepare(mmio_graph(), &memory, Instant::now())
+            .expect_err("retry without one pending descriptor must fail"),
+        SnapshotV2RootRestorePlanError::QueueContinuation
+    );
+}
+
+#[test]
+fn root_restore_plan_rejects_backing_geometry_after_pure_validation() {
+    let memory = contiguous_root_restore_memory();
+    let plan = SnapshotV2RootRestorePlan::prepare(mmio_graph(), &memory, Instant::now())
+        .expect("root restore graph should prepare");
+    let file = TempFile::new("restore-root-wrong-size.img", 4096);
+    let (backing, _) = BlockFileBacking::open_snapshot_read_only(file.path())
+        .expect("wrong-size restore root backing should open");
+    assert_eq!(
+        plan.prepare_backing(backing)
+            .expect_err("wrong backing geometry must fail"),
+        SnapshotV2RootBackingError::GeometryMismatch
+    );
 }
 
 fn root_config(path: &Path) -> DriveConfig {

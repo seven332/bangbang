@@ -30,7 +30,7 @@ use crate::block::{
 };
 use crate::boot::{
     BootCommandLineError, BootSource, BootSourceConfig, BootSourceFiles, BootSourceLoadError,
-    LoadedBootSource,
+    LoadedBootSource, root_block_kernel_arguments,
 };
 use crate::entropy::{
     EntropyConfig, EntropyMmioDeviceRegistration, EntropyMmioLayout, EntropyMmioRegistrationError,
@@ -5877,24 +5877,23 @@ fn append_root_device_command_line(
 
     let root = root_drive
         .map(|root_drive| {
-            let root_arg = root_drive
-                .partuuid()
-                .map(|partuuid| format!("root=PARTUUID={partuuid}"))
-                .unwrap_or_else(|| "root=/dev/vda".to_string());
             let read_only = root_drive.is_read_only().unwrap_or_else(|| {
                 vhost_user_frontends
                     .get(root_drive.drive_id())
                     .is_some_and(PreparedVhostUserBlockFrontend::is_read_only)
             });
-            (root_arg, read_only)
+            root_block_kernel_arguments(root_drive.partuuid(), read_only)
         })
         .or_else(|| {
-            root_pmem
-                .map(|(index, root_pmem)| (format!("root=/dev/pmem{index}"), root_pmem.read_only()))
+            root_pmem.map(|(index, root_pmem)| {
+                (
+                    format!("root=/dev/pmem{index}"),
+                    if root_pmem.read_only() { "ro" } else { "rw" },
+                )
+            })
         });
 
-    if let Some((root_arg, read_only)) = root {
-        let mode_arg = if read_only { "ro" } else { "rw" };
+    if let Some((root_arg, mode_arg)) = root {
         loaded_boot_source.command_line = loaded_boot_source
             .command_line
             .with_appended_kernel_args([root_arg.as_str(), mode_arg])
