@@ -428,6 +428,14 @@ struct MmioRegistrationRecord {
     suspended_handler: Option<Box<dyn StoredMmioHandler>>,
 }
 
+struct MmioRegistrationPlan {
+    bus: MmioBus,
+    generation: u64,
+    next_generation: u64,
+    regions: Vec<MmioRegion>,
+    record_regions: Vec<MmioRegion>,
+}
+
 impl fmt::Debug for MmioRegistrationRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MmioRegistrationRecord")
@@ -514,6 +522,49 @@ impl MmioDispatcher {
         regions: &[MmioRegionRequest],
         handler: impl MmioHandler + 'static,
     ) -> Result<MmioRegistrationLease, MmioRegistrationError> {
+        let plan = self.plan_owned_handler(region_id, regions)?;
+        let handler: Box<dyn StoredMmioHandler> = Box::new(handler);
+
+        self.bus = plan.bus;
+        let replaced_handler = self.handlers.insert(region_id, handler);
+        debug_assert!(replaced_handler.is_none());
+        let replaced_registration = self.registrations.insert(
+            plan.generation,
+            MmioRegistrationRecord {
+                owner: Arc::clone(&owner.provenance),
+                region_id,
+                regions: plan.record_regions,
+                suspended_handler: None,
+            },
+        );
+        debug_assert!(replaced_registration.is_none());
+        self.next_registration_generation = plan.next_generation;
+
+        Ok(MmioRegistrationLease {
+            dispatcher: Arc::clone(&self.provenance),
+            owner: Arc::clone(&owner.provenance),
+            generation: plan.generation,
+            region_id,
+            regions: plan.regions,
+        })
+    }
+
+    /// Validate one exact owned handler registration without changing the
+    /// dispatcher.
+    pub fn validate_owned_handler(
+        &self,
+        region_id: MmioRegionId,
+        regions: &[MmioRegionRequest],
+    ) -> Result<(), MmioRegistrationError> {
+        self.plan_owned_handler(region_id, regions)?;
+        Ok(())
+    }
+
+    fn plan_owned_handler(
+        &self,
+        region_id: MmioRegionId,
+        regions: &[MmioRegionRequest],
+    ) -> Result<MmioRegistrationPlan, MmioRegistrationError> {
         if regions.is_empty() {
             return Err(MmioRegistrationError::EmptyRegionBatch);
         }
@@ -554,29 +605,12 @@ impl MmioDispatcher {
             .try_reserve_exact(registered_regions.len())
             .map_err(|_| MmioRegistrationError::RegionMetadataAllocation)?;
         record_regions.extend_from_slice(&registered_regions);
-        let handler: Box<dyn StoredMmioHandler> = Box::new(handler);
-
-        self.bus = candidate_bus;
-        let replaced_handler = self.handlers.insert(region_id, handler);
-        debug_assert!(replaced_handler.is_none());
-        let replaced_registration = self.registrations.insert(
+        Ok(MmioRegistrationPlan {
+            bus: candidate_bus,
             generation,
-            MmioRegistrationRecord {
-                owner: Arc::clone(&owner.provenance),
-                region_id,
-                regions: record_regions,
-                suspended_handler: None,
-            },
-        );
-        debug_assert!(replaced_registration.is_none());
-        self.next_registration_generation = next_generation;
-
-        Ok(MmioRegistrationLease {
-            dispatcher: Arc::clone(&self.provenance),
-            owner: Arc::clone(&owner.provenance),
-            generation,
-            region_id,
+            next_generation,
             regions: registered_regions,
+            record_regions,
         })
     }
 
@@ -2420,16 +2454,16 @@ mod tests {
         let owner = MmioRegistrationOwner::new();
         let mut dispatcher = MmioDispatcher::new();
         let (_state, handler) = ScriptedHandler::returning(&[0x5a]);
+        let requests = [
+            MmioRegionRequest::new(address(0x6000), 0x100),
+            MmioRegionRequest::new(address(0x4000), 0x100),
+        ];
+        dispatcher
+            .validate_owned_handler(id(40), &requests)
+            .expect("owned MMIO registration should preflight");
+        assert!(dispatcher.regions().is_empty());
         let lease = dispatcher
-            .register_owned_handler(
-                &owner,
-                id(40),
-                &[
-                    MmioRegionRequest::new(address(0x6000), 0x100),
-                    MmioRegionRequest::new(address(0x4000), 0x100),
-                ],
-                handler,
-            )
+            .register_owned_handler(&owner, id(40), &requests, handler)
             .expect("owned MMIO registration should succeed");
 
         assert_eq!(lease.region_id(), id(40));
@@ -2496,6 +2530,10 @@ mod tests {
         let (_state, handler) = ScriptedHandler::returning(&[0]);
 
         assert!(matches!(
+            dispatcher.validate_owned_handler(id(41), &[]),
+            Err(MmioRegistrationError::EmptyRegionBatch)
+        ));
+        assert!(matches!(
             dispatcher.register_owned_handler(&owner, id(41), &[], handler),
             Err(MmioRegistrationError::EmptyRegionBatch)
         ));
@@ -2515,17 +2553,18 @@ mod tests {
             .expect("existing MMIO region should insert");
         let before = dispatcher.regions().to_vec();
         let (_state, handler) = ScriptedHandler::returning(&[0]);
+        let requests = [
+            MmioRegionRequest::new(address(0x3000), 0x100),
+            MmioRegionRequest::new(address(0x5080), 0x100),
+        ];
 
         assert!(matches!(
-            dispatcher.register_owned_handler(
-                &owner,
-                id(42),
-                &[
-                    MmioRegionRequest::new(address(0x3000), 0x100),
-                    MmioRegionRequest::new(address(0x5080), 0x100),
-                ],
-                handler,
-            ),
+            dispatcher.validate_owned_handler(id(42), &requests),
+            Err(MmioRegistrationError::Region { index: 1, .. })
+        ));
+        assert_eq!(dispatcher.regions(), before);
+        assert!(matches!(
+            dispatcher.register_owned_handler(&owner, id(42), &requests, handler),
             Err(MmioRegistrationError::Region { index: 1, .. })
         ));
         assert_eq!(dispatcher.regions(), before);
@@ -2545,6 +2584,13 @@ mod tests {
             .expect("legacy handler should register");
         let (_state, owned_handler) = ScriptedHandler::returning(&[0]);
         assert!(matches!(
+            handler_dispatcher.validate_owned_handler(
+                id(43),
+                &[MmioRegionRequest::new(address(0x3000), 0x100)],
+            ),
+            Err(MmioRegistrationError::ExistingHandler { region_id }) if region_id == id(43)
+        ));
+        assert!(matches!(
             handler_dispatcher.register_owned_handler(
                 &owner,
                 id(43),
@@ -2559,6 +2605,13 @@ mod tests {
             .insert_region(id(44), address(0x3000), 0x100)
             .expect("legacy region should register");
         let (_state, handler) = ScriptedHandler::returning(&[0]);
+        assert!(matches!(
+            region_dispatcher.validate_owned_handler(
+                id(44),
+                &[MmioRegionRequest::new(address(0x5000), 0x100)],
+            ),
+            Err(MmioRegistrationError::ExistingRegionId { region_id }) if region_id == id(44)
+        ));
         assert!(matches!(
             region_dispatcher.register_owned_handler(
                 &owner,
