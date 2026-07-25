@@ -5,6 +5,7 @@ use std::fmt;
 
 use crc64::crc64;
 
+use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format::{SnapshotArchitecture, SnapshotFormatVersion, SnapshotIntegrity};
 
 pub(crate) const NATIVE_V2_ARM64_MAGIC: [u8; 8] = *b"BANGV2A\0";
@@ -91,6 +92,10 @@ const PRODUCTION_SEMANTIC_COMPONENTS: &[CatalogEntry] = &[
         id: NATIVE_V2_TIME_COMPONENT_KEY.kind,
         introduced_minor: 3,
     },
+    CatalogEntry {
+        id: NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind,
+        introduced_minor: 4,
+    },
 ];
 
 const _: () = assert!(catalog_is_canonical(PRODUCTION_REQUIRED_FEATURES));
@@ -166,6 +171,14 @@ pub const fn native_v2_vcpu_component_key(instance: u32) -> SnapshotV2ComponentK
 
 /// Canonical identity of singleton native-v2 time and clone-identity state.
 pub const NATIVE_V2_TIME_COMPONENT_KEY: SnapshotV2ComponentKey = SnapshotV2ComponentKey::new(6, 0);
+
+/// Canonical identity of the singleton native-v2 device graph.
+///
+/// This semantic component is available only in the exact native-v2 2.4
+/// compatibility profile. The advertised writer remains
+/// [`NATIVE_V2_SNAPSHOT_VERSION`] until the public device profile is activated.
+pub const NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY: SnapshotV2ComponentKey =
+    SnapshotV2ComponentKey::new(7, 0);
 
 impl fmt::Debug for SnapshotV2ComponentKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -530,6 +543,11 @@ impl std::error::Error for SnapshotV2DecodeError {}
 /// Native-v2 canonical encoding failure.
 #[derive(Debug)]
 pub enum SnapshotV2EncodeError {
+    /// The requested internal compatibility version is newer than this codec.
+    UnsupportedVersion {
+        requested: SnapshotFormatVersion,
+        maximum: SnapshotFormatVersion,
+    },
     /// A required-feature or component count exceeds writer policy.
     CountOutOfBounds { count: usize, maximum: usize },
     /// Required-feature inputs are zero, duplicated, or not canonical.
@@ -551,6 +569,10 @@ pub enum SnapshotV2EncodeError {
 impl fmt::Display for SnapshotV2EncodeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedVersion { requested, maximum } => write!(
+                formatter,
+                "native-v2 state version {requested} exceeds compatibility ceiling {maximum}"
+            ),
             Self::CountOutOfBounds { count, maximum } => write!(
                 formatter,
                 "native-v2 state metadata count {count} exceeds {maximum}"
@@ -594,9 +616,28 @@ impl std::error::Error for SnapshotV2EncodeError {
 pub fn decode_snapshot_v2_state(
     bytes: &[u8],
 ) -> Result<SnapshotV2State<'_>, SnapshotV2DecodeError> {
+    decode_snapshot_v2_state_with_compatibility_version(bytes, NATIVE_V2_SNAPSHOT_VERSION)
+}
+
+/// Decodes native-v2 state against one explicit known compatibility ceiling.
+///
+/// This cross-crate seam lets dormant compatibility work validate exact
+/// profiles without advancing [`decode_snapshot_v2_state`] or public
+/// native-family dispatch. Versions newer than the first device-graph profile
+/// are rejected rather than inheriting its catalog.
+pub fn decode_snapshot_v2_state_with_compatibility_version(
+    bytes: &[u8],
+    supported_version: SnapshotFormatVersion,
+) -> Result<SnapshotV2State<'_>, SnapshotV2DecodeError> {
+    if !is_known_compatibility_version(supported_version) {
+        return Err(SnapshotV2DecodeError::UnsupportedVersion {
+            found: supported_version,
+            supported: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        });
+    }
     decode_snapshot_v2_state_with_catalog(
         bytes,
-        NATIVE_V2_SNAPSHOT_VERSION,
+        supported_version,
         PRODUCTION_REQUIRED_FEATURES,
         PRODUCTION_SEMANTIC_COMPONENTS,
     )
@@ -607,14 +648,42 @@ pub fn encode_snapshot_v2_state(
     required_features: &[u32],
     components: &[SnapshotV2Component<'_>],
 ) -> Result<Vec<u8>, SnapshotV2EncodeError> {
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_SNAPSHOT_VERSION,
+        required_features,
+        components,
+    )
+}
+
+/// Encodes one explicit known native-v2 compatibility version canonically.
+///
+/// The default writer remains [`encode_snapshot_v2_state`] at
+/// [`NATIVE_V2_SNAPSHOT_VERSION`]. This seam rejects unknown future versions
+/// instead of treating them as the current device-graph profile.
+pub fn encode_snapshot_v2_state_with_compatibility_version(
+    version: SnapshotFormatVersion,
+    required_features: &[u32],
+    components: &[SnapshotV2Component<'_>],
+) -> Result<Vec<u8>, SnapshotV2EncodeError> {
+    if !is_known_compatibility_version(version) {
+        return Err(SnapshotV2EncodeError::UnsupportedVersion {
+            requested: version,
+            maximum: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        });
+    }
     encode_snapshot_v2_state_with_catalog_and_reserve(
         required_features,
         components,
-        NATIVE_V2_SNAPSHOT_VERSION,
+        version,
         PRODUCTION_REQUIRED_FEATURES,
         PRODUCTION_SEMANTIC_COMPONENTS,
         Vec::try_reserve_exact,
     )
+}
+
+fn is_known_compatibility_version(version: SnapshotFormatVersion) -> bool {
+    version.major() == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
+        && version.minor() <= NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor()
 }
 
 fn decode_snapshot_v2_state_with_catalog<'state>(

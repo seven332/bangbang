@@ -5,8 +5,16 @@ use crate::memory::{
     GuestMemoryRegionBacking, aarch64,
 };
 #[cfg(target_os = "macos")]
+use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+#[cfg(target_os = "macos")]
+use crate::snapshot_format_v2::{
+    NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
+    SnapshotV2DecodeError, encode_snapshot_v2_state_with_compatibility_version,
+};
+#[cfg(target_os = "macos")]
 use crate::snapshot_memory_v2::{
     encode_snapshot_v2_state_with_memory, write_snapshot_v2_memory_image,
+    write_snapshot_v2_memory_image_with_compatibility_version,
 };
 
 #[cfg(target_os = "macos")]
@@ -205,6 +213,43 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
         v1.into_v1_record().is_ok(),
         "v1 state should consume only through the v1 accessor"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn current_v2_artifact_boundary_rejects_dormant_minor_four() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("dormant minor-four memory should encode internally");
+    let binding_payload = binding
+        .encode()
+        .expect("dormant minor-four binding should encode");
+    let memory_component = SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &binding_payload,
+    );
+    let bytes = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &[memory_component],
+    )
+    .expect("dormant minor-four state should encode internally");
+
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_current_v2(bytes),
+        Err(NativeSnapshotArtifactStateError::Format(
+            NativeSnapshotFormatError::NativeV2(SnapshotV2DecodeError::UnsupportedVersion {
+                found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                supported: NATIVE_V2_SNAPSHOT_VERSION,
+            })
+        ))
+    ));
 }
 
 #[cfg(target_os = "macos")]

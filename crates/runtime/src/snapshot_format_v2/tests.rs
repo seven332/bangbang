@@ -200,6 +200,123 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
+fn device_graph_component_is_minor_four_only_without_advancing_public_dispatch() {
+    assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
+    assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
+    assert_eq!(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        SnapshotFormatVersion::new(2, 4, 0)
+    );
+    assert_eq!(
+        NATIVE_V2_SNAPSHOT_VERSION,
+        SnapshotFormatVersion::new(2, 3, 0)
+    );
+
+    let graph = SnapshotV2Component::new(
+        NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        b"device-graph",
+    );
+    assert!(matches!(
+        encode_snapshot_v2_state(&[], &[graph]),
+        Err(SnapshotV2EncodeError::UnknownSemanticComponent)
+    ));
+
+    let encoded = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &[graph],
+    )
+    .expect("minor-four graph component should encode internally");
+    let decoded = decode_snapshot_v2_state_with_compatibility_version(
+        &encoded,
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("minor-four graph component should decode internally");
+    assert_eq!(
+        decoded.metadata().version(),
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        decoded.component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY),
+        Some(graph)
+    );
+
+    assert_eq!(
+        decode_snapshot_v2_state(&encoded),
+        Err(SnapshotV2DecodeError::UnsupportedVersion {
+            found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_SNAPSHOT_VERSION,
+        })
+    );
+    assert!(matches!(
+        decode_native_snapshot_state(&encoded),
+        Err(NativeSnapshotFormatError::NativeV2(
+            SnapshotV2DecodeError::UnsupportedVersion {
+                found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                supported: NATIVE_V2_SNAPSHOT_VERSION,
+            }
+        ))
+    ));
+
+    let downgraded = with_u16_field_and_checksum(&encoded, VERSION_MINOR_OFFSET, 3);
+    assert_eq!(
+        decode_snapshot_v2_state_with_compatibility_version(
+            &downgraded,
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        ),
+        Err(SnapshotV2DecodeError::UnknownSemanticComponent)
+    );
+
+    let second_graph = SnapshotV2Component::new(
+        SnapshotV2ComponentKey::new(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 1),
+        SnapshotV2ComponentDisposition::Semantic,
+        b"second-device-graph",
+    );
+    let two_graphs = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &[graph, second_graph],
+    )
+    .expect("structural catalog should admit a second canonical kind-seven instance");
+    assert_eq!(
+        decode_snapshot_v2_state_with_compatibility_version(
+            &two_graphs,
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        )
+        .expect("two canonical graph instances should remain structurally valid")
+        .components()
+        .len(),
+        2
+    );
+
+    assert!(matches!(
+        encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &[1],
+            &[graph],
+        ),
+        Err(SnapshotV2EncodeError::UnknownRequiredFeature)
+    ));
+
+    let future = SnapshotFormatVersion::new(2, 5, 0);
+    assert!(matches!(
+        encode_snapshot_v2_state_with_compatibility_version(future, &[], &[]),
+        Err(SnapshotV2EncodeError::UnsupportedVersion {
+            requested,
+            maximum: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        }) if requested == future
+    ));
+    assert_eq!(
+        decode_snapshot_v2_state_with_compatibility_version(&EMPTY_V2_FIXTURE, future),
+        Err(SnapshotV2DecodeError::UnsupportedVersion {
+            found: future,
+            supported: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        })
+    );
+}
+
+#[test]
 fn family_dispatch_preserves_v1_recognizes_v2_and_rejects_firecracker() {
     let v1 =
         encode_snapshot_envelope(b"private-v1-state").expect("native-v1 fixture should encode");
