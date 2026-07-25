@@ -7204,6 +7204,202 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn native_v2_root_graph_converts_signed_mmio_and_pci_owners_canonically() {
+    use std::time::Instant;
+
+    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput, DriveIoEngine};
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pci::{
+        PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
+        PCI_SEGMENT_ZERO, PciSbdf,
+    };
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::snapshot_device_v2::{
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
+        SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
+    };
+    use bangbang_runtime::storage_capture::{CaptureReadyStorageConfigs, StorageDeviceOrigin};
+    use bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+
+    for (case, pci_enabled, expected_transport) in [
+        (
+            "native-v2-root-mmio",
+            false,
+            SnapshotV2DeviceTransportKind::Mmio,
+        ),
+        (
+            "native-v2-root-pci",
+            true,
+            SnapshotV2DeviceTransportKind::Pci,
+        ),
+    ] {
+        let kernel = TempFile::new(&format!("{case}-kernel"), &image)
+            .unwrap_or_else(|error| panic!("{case} kernel should create: {error}"));
+        let root = TempFile::new_len(&format!("{case}-backing"), 4096)
+            .unwrap_or_else(|error| panic!("{case} root should create: {error}"));
+        let mut controller = bangbang_runtime::VmmController::new(case, "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.path(),
+            )))
+            .unwrap_or_else(|error| panic!("{case} boot source should configure: {error}"));
+        controller
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                    .with_is_read_only(true)
+                    .with_io_engine(DriveIoEngine::Sync),
+            ))
+            .unwrap_or_else(|error| panic!("{case} root should configure: {error}"));
+
+        let block_layout =
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+        let mut session_config = HvfArm64BootSessionConfig::new(
+            block_layout,
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            test_rtc_mmio_layout(),
+        );
+        if pci_enabled {
+            session_config = session_config.with_pci_enabled();
+        }
+        let mut session = OwnedHvfArm64BootSession::new(&controller, session_config)
+            .unwrap_or_else(|error| panic!("{case} signed session should prepare: {error}"));
+        let configs =
+            CaptureReadyStorageConfigs::new(controller.drive_configs().to_vec(), Vec::new());
+        let guard = session
+            .quiesce_limiter_retry_wakeups()
+            .unwrap_or_else(|error| panic!("{case} retry publishers should quiesce: {error}"));
+        let first = session
+            .capture_ready_storage_state_at(&configs, &guard, Instant::now())
+            .unwrap_or_else(|error| panic!("{case} first root capture should succeed: {error}"));
+        let second = session
+            .capture_ready_storage_state_at(&configs, &guard, Instant::now())
+            .unwrap_or_else(|error| panic!("{case} second root capture should succeed: {error}"));
+        let [first_root] = first.block_devices() else {
+            panic!("{case} should retain exactly one captured root");
+        };
+        let [second_root] = second.block_devices() else {
+            panic!("{case} recapture should retain exactly one captured root");
+        };
+        assert!(first.pmem_devices().is_empty());
+        assert!(second.pmem_devices().is_empty());
+
+        let first_graph = SnapshotV2DeviceGraph::from_capture_ready_root(
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            first_root,
+        )
+        .unwrap_or_else(|error| panic!("{case} first graph should convert: {error}"));
+        let second_graph = SnapshotV2DeviceGraph::from_capture_ready_root(
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            second_root,
+        )
+        .unwrap_or_else(|error| panic!("{case} second graph should convert: {error}"));
+        assert_eq!(first_graph, second_graph);
+        assert_eq!(first_graph.transport_kind(), expected_transport);
+        assert!(first_graph.record_is_root());
+        assert_eq!(first_graph.record().config().drive_id(), "rootfs");
+        assert_eq!(
+            first_graph.record().config().selector(),
+            path_text(root.path())
+        );
+        assert!(first_graph.record().config().is_read_only());
+        assert_eq!(
+            first_graph.record().config().io_engine(),
+            DriveIoEngine::Sync
+        );
+        assert_eq!(first_graph.record().block().capacity_sectors(), 8);
+        assert!(first_graph.record().block().active_queue().is_none());
+        assert!(!first_graph.record().virtio().is_activated());
+        let [queue] = first_graph.record().virtio().queues() else {
+            panic!("{case} should retain one canonical inactive block queue");
+        };
+        assert_eq!(
+            queue.max_size(),
+            bangbang_runtime::block::VIRTIO_BLOCK_QUEUE_SIZE
+        );
+        assert!(!queue.ready());
+        assert!(
+            first_graph
+                .record()
+                .virtio()
+                .pending_notifications()
+                .is_empty()
+        );
+        assert!(first_graph.record().virtio().interrupt_intents().is_empty());
+        match first_graph.record().transport() {
+            SnapshotV2DeviceTransport::Mmio(mmio) => {
+                assert!(!pci_enabled);
+                assert_eq!(mmio.region().id(), block_layout.base_region_id());
+                assert_eq!(mmio.region().range().start(), block_layout.base_address());
+                assert_eq!(
+                    mmio.region().range().size(),
+                    bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+                );
+            }
+            SnapshotV2DeviceTransport::Pci(pci) => {
+                assert!(pci_enabled);
+                assert_eq!(pci.origin(), StorageDeviceOrigin::Startup);
+                assert_eq!(
+                    pci.sbdf(),
+                    PciSbdf::new(
+                        PCI_SEGMENT_ZERO,
+                        PCI_BUS_ZERO,
+                        PCI_FIRST_ENDPOINT_DEVICE,
+                        PCI_FUNCTION_ZERO,
+                    )
+                    .expect("root PCI identity should validate")
+                );
+                assert_eq!(
+                    pci.bar_range(),
+                    GuestMemoryRange::new(
+                        GuestAddress::new(PCI_BAR64_START),
+                        VIRTIO_PCI_CAPABILITY_BAR_SIZE,
+                    )
+                    .expect("root PCI BAR range should validate")
+                );
+            }
+        }
+
+        let first_bytes = first_graph
+            .encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+            .unwrap_or_else(|error| panic!("{case} graph should encode: {error}"));
+        let second_bytes = second_graph
+            .encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+            .unwrap_or_else(|error| panic!("{case} recaptured graph should encode: {error}"));
+        assert_eq!(first_bytes, second_bytes);
+        assert_eq!(
+            SnapshotV2DeviceGraph::decode(
+                NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                &first_bytes,
+            )
+            .unwrap_or_else(|error| panic!("{case} immutable graph should decode: {error}")),
+            first_graph
+        );
+        let diagnostics = format!("{first_graph:?} {:?}", first.block_devices());
+        assert!(!diagnostics.contains(&path_text(root.path())));
+        assert!(!diagnostics.contains("candidate-rootfs"));
+
+        drop(guard);
+        session
+            .shutdown()
+            .unwrap_or_else(|error| panic!("{case} signed session should shut down: {error}"));
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn capture_ready_network_traverses_signed_mmio_and_pci_owners() {
     use std::time::Instant;
 
@@ -9372,6 +9568,7 @@ fn prepares_owned_hvf_arm64_boot_session() {
 #[test]
 fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progress() {
     use std::fs::{File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -9392,9 +9589,13 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::pmem::PmemMmioLayout;
-    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
+    use bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+    use bangbang_runtime::snapshot_format_v2::{
+        NATIVE_V2_SNAPSHOT_VERSION, decode_snapshot_v2_state,
+    };
     use bangbang_runtime::snapshot_memory_v2::{
-        SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError, load_snapshot_v2_memory_file,
+        NATIVE_V2_MEMORY_HEADER_BYTES, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
+        load_snapshot_v2_memory_file,
     };
     use bangbang_runtime::startup::ARM64_BOOT_VMGENID_SIZE;
     use bangbang_runtime::vmclock::{VMCLOCK_ABI_SIZE, VmClockAbi};
@@ -9842,6 +10043,55 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     source
         .pause_for_snapshot_v2_capture()
         .expect("recovered cancelled source should pause again");
+    let exact_memory_artifact = TempFile::new_len("native-v2-platform-exact-2-4-memory", 0)
+        .expect("exact 2.4 memory artifact should create");
+    let mut exact_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(exact_memory_artifact.path())
+        .expect("exact 2.4 memory artifact should open");
+    let exact_capture = source
+        .capture_snapshot_v2_device_graph_platform_with_cancel(
+            capture_input.clone(),
+            &mut exact_writer,
+            |_| false,
+        )
+        .expect("exact 2.4 platform capture should succeed");
+    assert_eq!(
+        exact_capture.memory().version(),
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        exact_writer
+            .metadata()
+            .expect("exact 2.4 memory metadata should read")
+            .len(),
+        exact_capture.memory().file_length()
+    );
+    let encoded_binding = exact_capture
+        .memory()
+        .encode()
+        .expect("exact 2.4 memory binding should encode");
+    let mut image_header = [0_u8; NATIVE_V2_MEMORY_HEADER_BYTES];
+    exact_writer
+        .seek(SeekFrom::Start(0))
+        .expect("exact 2.4 memory image should rewind");
+    exact_writer
+        .read_exact(&mut image_header)
+        .expect("exact 2.4 memory image header should read");
+    assert_eq!(
+        image_header.as_slice(),
+        &encoded_binding[..NATIVE_V2_MEMORY_HEADER_BYTES]
+    );
+    let exact_debug = format!("{exact_capture:?}");
+    assert!(!exact_debug.contains(&path_text(kernel.path())));
+    drop(exact_writer);
+    source
+        .resume_after_snapshot_v2_capture()
+        .expect("exact 2.4 source coordinator should recover");
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("source should pause again after exact 2.4 capture");
     let first_memory_artifact = TempFile::new_len("native-v2-platform-first-memory", 0)
         .expect("first memory artifact should create");
     let mut first_writer = OpenOptions::new()
@@ -9852,6 +10102,7 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     let first_capture = source
         .capture_snapshot_v2_platform(capture_input.clone(), &mut first_writer)
         .expect("first paused platform capture should succeed");
+    assert_eq!(first_capture.memory().version(), NATIVE_V2_SNAPSHOT_VERSION);
     drop(first_writer);
     source
         .resume_after_snapshot_v2_capture()

@@ -88,8 +88,12 @@ use bangbang_runtime::serial::{
 use bangbang_runtime::snapshot_device::{
     SnapshotV1BlockRetryState, SnapshotV1DeviceState, SnapshotV1PlatformDeviceMetadata,
 };
+use bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
+use bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
 use bangbang_runtime::snapshot_memory_v2::{
-    SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError, write_snapshot_v2_memory_image_with_cancel,
+    SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
+    write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
 };
 use bangbang_runtime::startup::{
     ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonNotificationDispatch,
@@ -7279,6 +7283,25 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
         memory_writer: &mut (impl std::io::Write + std::io::Seek),
         is_cancelled: impl FnMut(SnapshotV2MemoryIoStage) -> bool,
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        self.capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_SNAPSHOT_VERSION,
+            is_cancelled,
+        )
+    }
+
+    fn capture_with_compatibility_version_and_cancel(
+        self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut (impl std::io::Write + std::io::Seek),
+        version: SnapshotFormatVersion,
+        is_cancelled: impl FnMut(SnapshotV2MemoryIoStage) -> bool,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        debug_assert!(
+            version == NATIVE_V2_SNAPSHOT_VERSION
+                || version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        );
         let (stable, captures, pvtime_capture) =
             self.runner
                 .capture_arm64_snapshot_v2_topology()
@@ -7432,9 +7455,13 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
                     source,
                 }
             })?;
-        let memory_binding =
-            write_snapshot_v2_memory_image_with_cancel(memory, memory_writer, is_cancelled)
-                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
+        let memory_binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+            memory,
+            memory_writer,
+            version,
+            is_cancelled,
+        )
+        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
         HvfSnapshotV2PlatformState::try_new(memory_binding, machine, global, stable, vcpus, time)
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
                 stage: HvfArm64BootSnapshotV2CaptureStage::Platform,
@@ -8526,6 +8553,34 @@ impl HvfArm64BootSession<'_> {
             gic: self.gic,
         }
         .capture_with_cancel(input, memory_writer, is_cancelled)
+    }
+
+    /// Capture the unpublished exact native-v2 2.4 platform for one required
+    /// device graph.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_device_graph_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
     }
 
     /// Complete a topology-wide pause without dispatching new guest work.
@@ -11024,6 +11079,34 @@ impl OwnedHvfArm64BootSession {
             gic: self.gic,
         }
         .capture_with_cancel(input, memory_writer, is_cancelled)
+    }
+
+    /// Capture the unpublished exact native-v2 2.4 platform for one required
+    /// device graph.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_device_graph_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: &self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
     }
 
     /// Complete a topology-wide pause without dispatching new guest work.

@@ -16,13 +16,21 @@ use crate::memory::GuestMemory;
 use crate::snapshot_commit::{SnapshotCommitError, SnapshotCommitRecord};
 #[cfg(target_os = "macos")]
 use crate::snapshot_commit::{decode_snapshot_commit_envelope, encode_snapshot_commit_envelope};
+use crate::snapshot_device_v2::{
+    NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
+    SnapshotV2DeviceGraphDecodeError,
+};
 #[cfg(target_os = "macos")]
 use crate::snapshot_format::NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES;
 use crate::snapshot_format::{
     NATIVE_V1_SNAPSHOT_VERSION, NativeSnapshotFormatError, NativeSnapshotState,
     SnapshotFormatVersion, decode_native_snapshot_state,
 };
-use crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
+use crate::snapshot_format_v2::{
+    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION,
+    SnapshotV2ComponentDisposition, SnapshotV2DecodeError,
+    decode_snapshot_v2_state_with_compatibility_version,
+};
 #[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES, decode_snapshot_v2_state};
 use crate::snapshot_memory::{
@@ -307,6 +315,163 @@ impl fmt::Debug for NativeSnapshotArtifactState {
             .field("state", &REDACTED)
             .field("memory_binding", &REDACTED)
             .finish()
+    }
+}
+
+/// One closed, non-publishable exact native-v2 2.4 candidate.
+///
+/// This value retains the state bytes, the memory commitment derived from
+/// those exact bytes, and the required validated device graph. It deliberately
+/// does not implement the private publication-state contract and cannot be
+/// converted into [`NativeSnapshotArtifactState`].
+pub struct NativeV2SnapshotCandidateState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: SnapshotV2DeviceGraph,
+}
+
+impl NativeV2SnapshotCandidateState {
+    /// Validate and retain one exact graph-bearing native-v2 2.4 state.
+    pub fn from_device_graph_v2_4(
+        bytes: Vec<u8>,
+    ) -> Result<Self, NativeV2SnapshotCandidateStateError> {
+        let state = decode_snapshot_v2_state_with_compatibility_version(
+            &bytes,
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        )
+        .map_err(NativeV2SnapshotCandidateStateError::Format)?;
+        let version = state.metadata().version();
+        if version != NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION {
+            return Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version });
+        }
+        let binding = decode_snapshot_v2_memory_binding(&state)
+            .map_err(NativeV2SnapshotCandidateStateError::Memory)?;
+        if binding.version() != version {
+            return Err(NativeV2SnapshotCandidateStateError::VersionMismatch {
+                state: version,
+                memory: binding.version(),
+            });
+        }
+        let graph = state
+            .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
+            .ok_or(NativeV2SnapshotCandidateStateError::MissingDeviceGraph)?;
+        if graph.disposition() != SnapshotV2ComponentDisposition::Semantic {
+            return Err(NativeV2SnapshotCandidateStateError::InvalidDeviceGraphComponent);
+        }
+        let device_graph = SnapshotV2DeviceGraph::decode(version, graph.payload())
+            .map_err(NativeV2SnapshotCandidateStateError::DeviceGraph)?;
+        Ok(Self {
+            bytes,
+            binding,
+            device_graph,
+        })
+    }
+
+    /// Return the exact candidate compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    }
+
+    /// Return the immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Return the memory commitment derived from the encoded state.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Return the required validated singleton device graph.
+    pub const fn device_graph(&self) -> &SnapshotV2DeviceGraph {
+        &self.device_graph
+    }
+}
+
+impl fmt::Debug for NativeV2SnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2SnapshotCandidateState")
+            .field("version", &self.version())
+            .field("state", &REDACTED)
+            .field("memory_binding", &REDACTED)
+            .field("device_graph", &REDACTED)
+            .finish()
+    }
+}
+
+/// Validation failure for one exact native-v2 2.4 candidate.
+#[derive(Debug)]
+pub enum NativeV2SnapshotCandidateStateError {
+    /// The bytes do not form a known compatible native-v2 state.
+    Format(SnapshotV2DecodeError),
+    /// The state does not use exact device-graph compatibility version 2.4.
+    UnexpectedVersion {
+        /// Version encoded by the state.
+        found: SnapshotFormatVersion,
+    },
+    /// The state does not contain one valid memory commitment.
+    Memory(SnapshotV2MemoryStateError),
+    /// State and memory compatibility versions disagree.
+    VersionMismatch {
+        /// Version encoded by the outer state.
+        state: SnapshotFormatVersion,
+        /// Version encoded by the memory commitment.
+        memory: SnapshotFormatVersion,
+    },
+    /// The exact 2.4 state omits its required device graph.
+    MissingDeviceGraph,
+    /// The required graph is not a semantic state component.
+    InvalidDeviceGraphComponent,
+    /// The required device-graph payload is invalid.
+    DeviceGraph(SnapshotV2DeviceGraphDecodeError),
+}
+
+impl fmt::Display for NativeV2SnapshotCandidateStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Format(source) => write!(formatter, "invalid native-v2 candidate: {source}"),
+            Self::UnexpectedVersion { found } => write!(
+                formatter,
+                "native-v2 candidate requires exact device-graph version; found {found}"
+            ),
+            Self::Memory(source) => {
+                write!(
+                    formatter,
+                    "invalid native-v2 candidate memory state: {source}"
+                )
+            }
+            Self::VersionMismatch { state, memory } => write!(
+                formatter,
+                "native-v2 candidate state version {state} does not match memory version {memory}"
+            ),
+            Self::MissingDeviceGraph => {
+                formatter.write_str("native-v2 candidate device graph is missing")
+            }
+            Self::InvalidDeviceGraphComponent => {
+                formatter.write_str("native-v2 candidate device graph component is invalid")
+            }
+            Self::DeviceGraph(source) => {
+                write!(
+                    formatter,
+                    "invalid native-v2 candidate device graph: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV2SnapshotCandidateStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Format(source) => Some(source),
+            Self::Memory(source) => Some(source),
+            Self::DeviceGraph(source) => Some(source),
+            Self::UnexpectedVersion { .. }
+            | Self::VersionMismatch { .. }
+            | Self::MissingDeviceGraph
+            | Self::InvalidDeviceGraphComponent => None,
+        }
     }
 }
 

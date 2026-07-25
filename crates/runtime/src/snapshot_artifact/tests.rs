@@ -5,11 +5,14 @@ use crate::memory::{
     GuestMemoryRegionBacking, aarch64,
 };
 #[cfg(target_os = "macos")]
-use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+use crate::snapshot_device_v2::{
+    NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceTransportKind,
+};
 #[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{
-    NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
-    SnapshotV2DecodeError, encode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component,
+    SnapshotV2ComponentDisposition, SnapshotV2DecodeError,
+    encode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory_v2::{
@@ -254,6 +257,160 @@ fn current_v2_artifact_boundary_rejects_dormant_minor_four() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn exact_minor_four_candidate_closes_memory_and_required_graph_without_publication() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("candidate memory should encode");
+    let binding_payload = binding.encode().expect("candidate binding should encode");
+    let graph_payload = fixture_bytes(include_str!("../snapshot_device_v2/fixtures/mmio.hex"));
+    let components = [
+        SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &graph_payload,
+        ),
+    ];
+    let bytes = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("candidate state should encode");
+    let candidate = NativeV2SnapshotCandidateState::from_device_graph_v2_4(bytes.clone())
+        .expect("exact candidate should close");
+
+    assert_eq!(
+        candidate.version(),
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    );
+    assert_eq!(candidate.bytes(), bytes);
+    assert_eq!(candidate.memory_binding(), &binding);
+    assert_eq!(
+        candidate.device_graph().transport_kind(),
+        SnapshotV2DeviceTransportKind::Mmio
+    );
+    let debug = format!("{candidate:?}");
+    assert!(debug.contains(REDACTED));
+    assert!(!debug.contains("/srv/guests/rootfs.ext4"));
+    assert!(!debug.contains("rootfs"));
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_current_v2(bytes),
+        Err(NativeSnapshotArtifactStateError::Format(
+            NativeSnapshotFormatError::NativeV2(SnapshotV2DecodeError::UnsupportedVersion {
+                found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                supported: NATIVE_V2_SNAPSHOT_VERSION,
+            })
+        ))
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_minor_four_candidate_rejects_missing_invalid_and_mismatched_graph_state() {
+    let memory = test_v2_memory();
+    let mut current_image = Cursor::new(Vec::new());
+    let current_binding = write_snapshot_v2_memory_image(&memory, &mut current_image)
+        .expect("current binding should encode");
+    let current_binding_payload = current_binding
+        .encode()
+        .expect("current binding payload should encode");
+    let current_memory = SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &current_binding_payload,
+    );
+    let graph_payload = fixture_bytes(include_str!("../snapshot_device_v2/fixtures/mmio.hex"));
+    let graph = SnapshotV2Component::new(
+        NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &graph_payload,
+    );
+    let mismatched = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &[current_memory, graph],
+    )
+    .expect("structural encoder should retain mismatched fixture");
+    assert!(matches!(
+        NativeV2SnapshotCandidateState::from_device_graph_v2_4(mismatched),
+        Err(NativeV2SnapshotCandidateStateError::VersionMismatch {
+            state: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            memory: NATIVE_V2_SNAPSHOT_VERSION,
+        })
+    ));
+
+    let mut candidate_image = Cursor::new(Vec::new());
+    let candidate_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut candidate_image,
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("candidate binding should encode");
+    let candidate_binding_payload = candidate_binding
+        .encode()
+        .expect("candidate binding payload should encode");
+    let candidate_memory = SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &candidate_binding_payload,
+    );
+    let missing = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &[candidate_memory],
+    )
+    .expect("structural encoder should retain missing graph fixture");
+    assert!(matches!(
+        NativeV2SnapshotCandidateState::from_device_graph_v2_4(missing),
+        Err(NativeV2SnapshotCandidateStateError::MissingDeviceGraph)
+    ));
+
+    let nonsemantic_graph = SnapshotV2Component::new(
+        NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::NonSemantic,
+        &graph_payload,
+    );
+    let nonsemantic = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &[candidate_memory, nonsemantic_graph],
+    )
+    .expect("structural encoder should retain nonsemantic graph fixture");
+    assert!(matches!(
+        NativeV2SnapshotCandidateState::from_device_graph_v2_4(nonsemantic),
+        Err(NativeV2SnapshotCandidateStateError::InvalidDeviceGraphComponent)
+    ));
+
+    let invalid_graph = [0_u8; 64];
+    let invalid = SnapshotV2Component::new(
+        NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &invalid_graph,
+    );
+    let invalid = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &[candidate_memory, invalid],
+    )
+    .expect("structural encoder should retain invalid graph fixture");
+    assert!(matches!(
+        NativeV2SnapshotCandidateState::from_device_graph_v2_4(invalid),
+        Err(NativeV2SnapshotCandidateStateError::DeviceGraph(_))
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn publishes_and_loads_same_directory_pair() {
     let directory = TestDirectory::new("same-directory");
     let paths = directory.paths("state.snap", "memory.snap");
@@ -298,6 +455,19 @@ fn publishes_and_loads_same_directory_pair() {
             .expect("native-family v1 load should retain its record"),
         outcome.record()
     );
+}
+
+#[cfg(target_os = "macos")]
+fn fixture_bytes(hex: &str) -> Vec<u8> {
+    let hex = hex.trim();
+    assert!(hex.len().is_multiple_of(2));
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
+            u8::from_str_radix(pair, 16).expect("fixture hex should decode")
+        })
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
