@@ -18175,6 +18175,24 @@ fn pci_all_virtio_gic_msi_configuration(
         config.entropy_device.is_some(),
         controller.memory_hotplug_config().is_some(),
     )?;
+    let configuration = pci_all_virtio_gic_msi_configuration_for_fixed_demand(fixed_demand)?;
+    debug_assert!(
+        usize::try_from(configuration.interrupt_count().get())
+            .ok()
+            .is_some_and(|routes| routes >= startup_demand.routes)
+    );
+    Ok(configuration)
+}
+
+pub(crate) fn pci_root_restore_gic_msi_configuration()
+-> Result<HvfGicMsiConfiguration, HvfArm64BootPciDataError> {
+    let fixed_demand = pci_all_virtio_resource_demand(0, 0, 0, None, false, false, false)?;
+    pci_all_virtio_gic_msi_configuration_for_fixed_demand(fixed_demand)
+}
+
+fn pci_all_virtio_gic_msi_configuration_for_fixed_demand(
+    fixed_demand: HvfArm64BootPciDataResourceDemand,
+) -> Result<HvfGicMsiConfiguration, HvfArm64BootPciDataError> {
     let dynamic_slots = PCI_ENDPOINT_SLOT_COUNT
         .checked_sub(fixed_demand.endpoints)
         .ok_or_else(|| {
@@ -18191,7 +18209,6 @@ fn pci_all_virtio_gic_msi_configuration(
         .ok_or_else(|| {
             HvfArm64BootPciDataError::new("PCI all-virtio hotplug route count overflowed")
         })?;
-    debug_assert!(routes >= startup_demand.routes);
     let routes = u32::try_from(routes.max(1)).map_err(|_| {
         HvfArm64BootPciDataError::new("PCI all-virtio MSI-X route count does not fit u32")
     })?;

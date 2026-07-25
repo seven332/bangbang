@@ -386,6 +386,11 @@ impl NativeV2SnapshotCandidateState {
     pub const fn device_graph(&self) -> &SnapshotV2DeviceGraph {
         &self.device_graph
     }
+
+    /// Consumes the closed candidate into its exact committed components.
+    pub fn into_parts(self) -> (Vec<u8>, SnapshotV2MemoryBinding, SnapshotV2DeviceGraph) {
+        (self.bytes, self.binding, self.device_graph)
+    }
 }
 
 impl fmt::Debug for NativeV2SnapshotCandidateState {

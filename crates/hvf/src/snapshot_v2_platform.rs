@@ -4,19 +4,32 @@ use std::fmt;
 use std::io::{Seek, Write};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use device_tree::{DeviceTree, Node};
 
+use bangbang_runtime::block::BlockMmioLayout;
+use bangbang_runtime::boot::canonical_process_root_block_command_line;
+use bangbang_runtime::fdt::ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET;
+use bangbang_runtime::interrupt::GuestInterruptLine;
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange, aarch64,
 };
-use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
+use bangbang_runtime::mmio::{MmioDispatcher, MmioRegion, MmioRegionId};
+use bangbang_runtime::pci::{
+    Arm64PciAddressPlan, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
+    PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable, PciSbdf,
+};
 use bangbang_runtime::pvtime::{
     ARM64_PVTIME_STOLEN_TIME_OFFSET, ARM64_PVTIME_STRUCTURE_SIZE, Arm64PvTimeLayout,
     Arm64PvTimeStAbi,
 };
 use bangbang_runtime::rtc::{RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use bangbang_runtime::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SharedSerialOutput};
+use bangbang_runtime::snapshot_device_v2::{
+    SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind, SnapshotV2RootRestorePlan,
+    SnapshotV2RootRestorePlanError,
+};
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, write_snapshot_v2_memory_image,
 };
@@ -25,6 +38,10 @@ use bangbang_runtime::startup::{
     Arm64BootVmClockDevice, Arm64BootVmGenIdDevice, PrepareArm64SnapshotTimeIdentityError,
     prepare_arm64_snapshot_time_identity, register_arm64_boot_rtc_mmio,
     register_arm64_boot_serial_mmio, replace_arm64_boot_vmgenid,
+};
+use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
+use bangbang_runtime::virtio_pci::{
+    VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE,
 };
 use bangbang_runtime::{BackendError, VmBackend};
 use crc64::crc64;
@@ -47,13 +64,13 @@ use crate::session_vcpu::{
 use crate::snapshot_bundle::HvfSnapshotV1CompatibilityState;
 use crate::snapshot_v2::{
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
-    HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
+    HvfSnapshotV2State, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
 };
 use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
-    capture_hvf_snapshot_v2_time_state, replace_vmgenid_and_signal_with,
-    update_vmclock_and_signal_with,
+    capture_hvf_snapshot_v2_time_state, pci_root_restore_gic_msi_configuration,
+    replace_vmgenid_and_signal_with, update_vmclock_and_signal_with,
 };
 use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
 use crate::vcpu::HvfArm64VcpuIdentificationRegisterState;
@@ -63,6 +80,243 @@ const PROCESS_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
 const PROCESS_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(20);
 const PROCESS_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
 const PROCESS_RTC_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(10);
+const PROCESS_PCI_ROOT_BAR_REGION_ID: MmioRegionId = MmioRegionId::new(4100);
+
+/// Destination process policy needed to verify the exact root allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfSnapshotV2RootProcessConfig {
+    block_mmio_layout: BlockMmioLayout,
+    pci_enabled: bool,
+}
+
+impl HvfSnapshotV2RootProcessConfig {
+    /// Creates one closed process-policy input without optional-device overrides.
+    pub const fn new(block_mmio_layout: BlockMmioLayout, pci_enabled: bool) -> Self {
+        Self {
+            block_mmio_layout,
+            pci_enabled,
+        }
+    }
+
+    /// Returns the configured root MMIO allocation sequence.
+    pub const fn block_mmio_layout(self) -> BlockMmioLayout {
+        self.block_mmio_layout
+    }
+
+    /// Returns whether the process selected the all-virtio PCI profile.
+    pub const fn pci_enabled(self) -> bool {
+        self.pci_enabled
+    }
+}
+
+/// Exact product allocation selected for the root transport.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2RootTransportPlan {
+    /// First virtio-mmio block window and SPI in startup order.
+    Mmio {
+        /// Exact dispatcher region.
+        region: MmioRegion,
+        /// Exact GIC SPI line.
+        interrupt_line: GuestInterruptLine,
+    },
+    /// First modern PCI endpoint and capability BAR.
+    Pci {
+        /// Exact bus/function identity.
+        sbdf: PciSbdf,
+        /// Destination dispatcher identity for the BAR owner.
+        bar_region_id: MmioRegionId,
+        /// Exact capability BAR range.
+        bar_range: GuestMemoryRange,
+        /// Retained GICv2m frame and route range.
+        msi: crate::gic::HvfGicMsiMetadata,
+    },
+}
+
+impl HvfSnapshotV2RootTransportPlan {
+    /// Returns the selected transport profile.
+    pub const fn kind(self) -> SnapshotV2DeviceTransportKind {
+        match self {
+            Self::Mmio { .. } => SnapshotV2DeviceTransportKind::Mmio,
+            Self::Pci { .. } => SnapshotV2DeviceTransportKind::Pci,
+        }
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2RootTransportPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2RootTransportPlan")
+            .field("kind", &self.kind())
+            .field("resources", &REDACTED)
+            .finish()
+    }
+}
+
+/// Deterministic root, UART, VMGenID, and VMClock destination plan.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfSnapshotV2RootResourcePlan {
+    transport: HvfSnapshotV2RootTransportPlan,
+    serial_interrupt: GuestInterruptLine,
+    vmgenid_interrupt: GuestInterruptLine,
+    vmclock_interrupt: GuestInterruptLine,
+}
+
+impl HvfSnapshotV2RootResourcePlan {
+    /// Returns the exact root transport allocation.
+    pub const fn transport(self) -> HvfSnapshotV2RootTransportPlan {
+        self.transport
+    }
+
+    /// Returns the canonical process UART interrupt.
+    pub const fn serial_interrupt(self) -> GuestInterruptLine {
+        self.serial_interrupt
+    }
+
+    /// Returns the canonical VMGenID interrupt.
+    pub const fn vmgenid_interrupt(self) -> GuestInterruptLine {
+        self.vmgenid_interrupt
+    }
+
+    /// Returns the canonical VMClock interrupt.
+    pub const fn vmclock_interrupt(self) -> GuestInterruptLine {
+        self.vmclock_interrupt
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2RootResourcePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2RootResourcePlan")
+            .field("transport", &self.transport.kind())
+            .field("resources", &REDACTED)
+            .finish()
+    }
+}
+
+/// Fully validated, pre-HVF root preparation with owned loaded memory.
+pub struct PreparedHvfSnapshotV2RootPlan {
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    root: SnapshotV2RootRestorePlan,
+    resources: HvfSnapshotV2RootResourcePlan,
+}
+
+impl PreparedHvfSnapshotV2RootPlan {
+    /// Returns the inert root selector for the destination authority layer.
+    pub fn selector(&self) -> &str {
+        self.root.selector()
+    }
+
+    /// Returns the path-shaped-data-free product allocation.
+    pub const fn resources(&self) -> HvfSnapshotV2RootResourcePlan {
+        self.resources
+    }
+
+    /// Returns the validated runtime root plan.
+    pub const fn root(&self) -> &SnapshotV2RootRestorePlan {
+        &self.root
+    }
+
+    /// Consumes the proof into still-unpublished platform resources.
+    pub fn into_parts(
+        self,
+    ) -> (
+        HvfSnapshotV2PlatformState,
+        GuestMemory,
+        SnapshotV2RootRestorePlan,
+        HvfSnapshotV2RootResourcePlan,
+    ) {
+        (self.platform, self.memory, self.root, self.resources)
+    }
+}
+
+impl fmt::Debug for PreparedHvfSnapshotV2RootPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedHvfSnapshotV2RootPlan")
+            .field("transport", &self.resources.transport.kind())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Redacted rejection from the pre-HVF root preparation boundary.
+pub enum PrepareHvfSnapshotV2RootPlanError {
+    /// Loaded memory does not exactly match the artifact binding.
+    MemoryTopology,
+    /// FDT bytes cannot be read or do not match their retained checksum.
+    Fdt(Box<HvfSnapshotV2PlatformRestoreFailure>),
+    /// Device-graph continuation does not agree with loaded memory.
+    Root(SnapshotV2RootRestorePlanError),
+    /// Process transport selection disagrees with the root graph.
+    TransportPolicy,
+    /// Retained placement is not the exact fresh product allocation.
+    ResourcePlan,
+    /// The retained GIC cannot supply the deterministic SPI sequence.
+    Interrupt(HvfInterruptLineAllocationError),
+    /// The retained FDT is not the exact root-bearing product shell.
+    ProcessFdt {
+        /// Value-free mismatch category.
+        mismatch: HvfSnapshotV2ProcessFdtMismatch,
+    },
+    /// Portable time/identity memory failed preflight.
+    TimeIdentity(Box<HvfSnapshotV2PlatformRestoreFailure>),
+}
+
+impl fmt::Debug for PrepareHvfSnapshotV2RootPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let category = match self {
+            Self::MemoryTopology => "memory topology",
+            Self::Fdt(_) => "FDT identity",
+            Self::Root(_) => "root continuation",
+            Self::TransportPolicy => "transport policy",
+            Self::ResourcePlan => "resource plan",
+            Self::Interrupt(_) => "interrupt plan",
+            Self::ProcessFdt { .. } => "process FDT",
+            Self::TimeIdentity(_) => "time identity",
+        };
+        let mismatch = match self {
+            Self::ProcessFdt { mismatch } => Some(mismatch),
+            _ => None,
+        };
+        formatter
+            .debug_struct("PrepareHvfSnapshotV2RootPlanError")
+            .field("category", &category)
+            .field("mismatch", &mismatch)
+            .field("source", &REDACTED)
+            .finish()
+    }
+}
+
+impl fmt::Display for PrepareHvfSnapshotV2RootPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let category = match self {
+            Self::MemoryTopology => "memory topology",
+            Self::Fdt(_) => "FDT identity",
+            Self::Root(_) => "root continuation",
+            Self::TransportPolicy => "transport policy",
+            Self::ResourcePlan => "resource plan",
+            Self::Interrupt(_) => "interrupt plan",
+            Self::ProcessFdt { .. } => "process FDT",
+            Self::TimeIdentity(_) => "time identity",
+        };
+        write!(formatter, "native-v2 root preparation {category} failed")
+    }
+}
+
+impl std::error::Error for PrepareHvfSnapshotV2RootPlanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fdt(source) | Self::TimeIdentity(source) => Some(source.as_ref()),
+            Self::Root(source) => Some(source),
+            Self::Interrupt(source) => Some(source),
+            Self::MemoryTopology
+            | Self::TransportPolicy
+            | Self::ResourcePlan
+            | Self::ProcessFdt { .. } => None,
+        }
+    }
+}
 
 /// Closed fresh-output shell accepted by native-v2 process reconstruction.
 pub struct HvfSnapshotV2DefaultProcessShell {
@@ -181,6 +435,10 @@ pub enum HvfSnapshotV2ProcessFdtMismatch {
     VmGenId,
     /// The retained FDT VM clock description does not match the admitted state.
     VmClock,
+    /// Root selection or the virtio-mmio node is inconsistent.
+    Root,
+    /// The PCI host or GICv2m child is inconsistent.
+    Pci,
 }
 
 impl fmt::Display for HvfSnapshotV2ProcessFdtMismatch {
@@ -198,6 +456,8 @@ impl fmt::Display for HvfSnapshotV2ProcessFdtMismatch {
             Self::Serial => "serial",
             Self::VmGenId => "VMGenID",
             Self::VmClock => "VMClock",
+            Self::Root => "root",
+            Self::Pci => "PCI",
         })
     }
 }
@@ -815,6 +1075,51 @@ impl Drop for RestoredHvfSnapshotV2Platform {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
+}
+
+/// Proves an exact 2.4 root graph and product shell before backing or HVF access.
+///
+/// This boundary constructs no backend, VM, dispatcher, transport endpoint, or
+/// scheduler. The returned owner still contains the inert selector solely so
+/// the destination authority layer can resolve one read-only backing.
+pub fn prepare_hvf_snapshot_v2_root_plan(
+    state: HvfSnapshotV2State,
+    memory: GuestMemory,
+    process: HvfSnapshotV2RootProcessConfig,
+    now: Instant,
+) -> Result<PreparedHvfSnapshotV2RootPlan, PrepareHvfSnapshotV2RootPlanError> {
+    let (platform, graph) = state.into_parts();
+    if !memory_matches_binding(&memory, platform.memory()) {
+        return Err(PrepareHvfSnapshotV2RootPlanError::MemoryTopology);
+    }
+    let fdt = verified_fdt_bytes(&memory, platform.machine())
+        .map_err(|source| PrepareHvfSnapshotV2RootPlanError::Fdt(Box::new(source)))?;
+    let root = SnapshotV2RootRestorePlan::prepare(graph, &memory, now)
+        .map_err(PrepareHvfSnapshotV2RootPlanError::Root)?;
+    let resources = prepare_root_resource_plan(&platform, &root, process)?;
+    validate_root_process_fdt(&fdt, &platform, &root, resources)
+        .map_err(|mismatch| PrepareHvfSnapshotV2RootPlanError::ProcessFdt { mismatch })?;
+
+    prepare_arm64_snapshot_time_identity(
+        &memory,
+        platform.time().vmgenid(),
+        platform.time().vmclock(),
+        platform.time().vmclock_abi(),
+    )
+    .map_err(|source| {
+        PrepareHvfSnapshotV2RootPlanError::TimeIdentity(Box::new(
+            HvfSnapshotV2PlatformRestoreFailure::TimePreparation(source),
+        ))
+    })?;
+    verify_snapshot_v2_pvtime_memory(&memory, platform.time())
+        .map_err(|source| PrepareHvfSnapshotV2RootPlanError::TimeIdentity(Box::new(source)))?;
+
+    Ok(PreparedHvfSnapshotV2RootPlan {
+        platform,
+        memory,
+        root,
+        resources,
+    })
 }
 
 /// Reconstruct one unpublished, initially paused native-v2 HVF platform.
@@ -1513,6 +1818,172 @@ fn memory_matches_binding(memory: &GuestMemory, binding: &SnapshotV2MemoryBindin
             .all(|(region, extent)| region.range() == extent.range())
 }
 
+fn prepare_root_resource_plan(
+    state: &HvfSnapshotV2PlatformState,
+    root: &SnapshotV2RootRestorePlan,
+    process: HvfSnapshotV2RootProcessConfig,
+) -> Result<HvfSnapshotV2RootResourcePlan, PrepareHvfSnapshotV2RootPlanError> {
+    let expected_kind = if process.pci_enabled {
+        SnapshotV2DeviceTransportKind::Pci
+    } else {
+        SnapshotV2DeviceTransportKind::Mmio
+    };
+    if root.transport_kind() != expected_kind
+        || state.time().rtc_layout()
+            != RtcMmioLayout::new(PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID)
+    {
+        return Err(PrepareHvfSnapshotV2RootPlanError::TransportPolicy);
+    }
+    if root_queue_ranges_conflict_with_platform(state, root) {
+        return Err(PrepareHvfSnapshotV2RootPlanError::ResourcePlan);
+    }
+
+    let gic = state.global().compatibility().gic_metadata();
+    let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
+        .map_err(PrepareHvfSnapshotV2RootPlanError::Interrupt)?;
+    let transport = match root.transport() {
+        SnapshotV2DeviceTransport::Mmio(mmio) => {
+            if gic.msi.is_some() {
+                return Err(PrepareHvfSnapshotV2RootPlanError::ResourcePlan);
+            }
+            let expected_region = MmioRegion::new(
+                process.block_mmio_layout.base_region_id(),
+                process.block_mmio_layout.base_address(),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .map_err(|_| PrepareHvfSnapshotV2RootPlanError::ResourcePlan)?;
+            let expected_interrupt = allocator
+                .allocate()
+                .map_err(PrepareHvfSnapshotV2RootPlanError::Interrupt)?;
+            if mmio.region() != expected_region || mmio.interrupt_line() != expected_interrupt {
+                return Err(PrepareHvfSnapshotV2RootPlanError::ResourcePlan);
+            }
+            HvfSnapshotV2RootTransportPlan::Mmio {
+                region: expected_region,
+                interrupt_line: expected_interrupt,
+            }
+        }
+        SnapshotV2DeviceTransport::Pci(pci) => {
+            let Some(msi) = gic.msi else {
+                return Err(PrepareHvfSnapshotV2RootPlanError::ResourcePlan);
+            };
+            let expected_msi = pci_root_restore_gic_msi_configuration()
+                .map_err(|_| PrepareHvfSnapshotV2RootPlanError::ResourcePlan)?;
+            if msi.interrupt_range.count != expected_msi.interrupt_count().get() {
+                return Err(PrepareHvfSnapshotV2RootPlanError::ResourcePlan);
+            }
+            let expected_sbdf = PciSbdf::new(
+                PCI_SEGMENT_ZERO,
+                PCI_BUS_ZERO,
+                PCI_FIRST_ENDPOINT_DEVICE,
+                PCI_FUNCTION_ZERO,
+            )
+            .map_err(|_| PrepareHvfSnapshotV2RootPlanError::ResourcePlan)?;
+            let address_plan = Arm64PciAddressPlan::firecracker_v1_16()
+                .map_err(|_| PrepareHvfSnapshotV2RootPlanError::ResourcePlan)?;
+            let expected_bar =
+                GuestMemoryRange::new(address_plan.bar64().start(), VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+                    .map_err(|_| PrepareHvfSnapshotV2RootPlanError::ResourcePlan)?;
+            if pci.sbdf() != expected_sbdf
+                || pci.bar_index() != VIRTIO_PCI_CAPABILITY_BAR_INDEX
+                || pci.bar_address_space() != PciBarAddressSpace::Memory64
+                || pci.bar_prefetchable() != PciBarPrefetchable::No
+                || pci.bar_range() != expected_bar
+                || !pci_msix_routes_match_gic(pci.msix(), msi)
+            {
+                return Err(PrepareHvfSnapshotV2RootPlanError::ResourcePlan);
+            }
+            HvfSnapshotV2RootTransportPlan::Pci {
+                sbdf: expected_sbdf,
+                bar_region_id: PROCESS_PCI_ROOT_BAR_REGION_ID,
+                bar_range: expected_bar,
+                msi,
+            }
+        }
+    };
+
+    let serial_interrupt = allocator
+        .allocate()
+        .map_err(PrepareHvfSnapshotV2RootPlanError::Interrupt)?;
+    let vmgenid_interrupt = allocator
+        .allocate()
+        .map_err(PrepareHvfSnapshotV2RootPlanError::Interrupt)?;
+    let vmclock_interrupt = allocator
+        .allocate()
+        .map_err(PrepareHvfSnapshotV2RootPlanError::Interrupt)?;
+    if state.time().vmgenid().interrupt_line() != vmgenid_interrupt
+        || state.time().vmclock().interrupt_line() != vmclock_interrupt
+    {
+        return Err(PrepareHvfSnapshotV2RootPlanError::ResourcePlan);
+    }
+
+    Ok(HvfSnapshotV2RootResourcePlan {
+        transport,
+        serial_interrupt,
+        vmgenid_interrupt,
+        vmclock_interrupt,
+    })
+}
+
+fn root_queue_ranges_conflict_with_platform(
+    state: &HvfSnapshotV2PlatformState,
+    root: &SnapshotV2RootRestorePlan,
+) -> bool {
+    let Some(queue_ranges) = root.queue_ranges() else {
+        return false;
+    };
+    let fdt = state.machine().fdt();
+    let Ok(fdt_range) = GuestMemoryRange::new(fdt.address(), u64::from(fdt.size())) else {
+        return true;
+    };
+    if queue_ranges.iter().any(|queue| {
+        [
+            fdt_range,
+            state.time().vmgenid().range(),
+            state.time().vmclock().range(),
+        ]
+        .into_iter()
+        .any(|reserved| queue.overlaps(reserved))
+    }) {
+        return true;
+    }
+    let Ok(pvtime_size) = u64::try_from(ARM64_PVTIME_STRUCTURE_SIZE) else {
+        return true;
+    };
+    state.time().pvtime_vcpus().iter().any(|record| {
+        GuestMemoryRange::new(record.record_ipa(), pvtime_size).map_or(true, |reserved| {
+            queue_ranges.iter().any(|queue| queue.overlaps(reserved))
+        })
+    })
+}
+
+fn pci_msix_routes_match_gic(
+    state: &bangbang_runtime::snapshot_device_v2::SnapshotV2PciMsixState,
+    msi: crate::gic::HvfGicMsiMetadata,
+) -> bool {
+    let Some(expected_address) = msi
+        .region
+        .base
+        .checked_add(ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET)
+    else {
+        return false;
+    };
+    let Some(interrupt_end) = msi
+        .interrupt_range
+        .base
+        .checked_add(msi.interrupt_range.count)
+    else {
+        return false;
+    };
+    state.entries().iter().all(|entry| {
+        let address = (u64::from(entry.message_address_high()) << 32)
+            | u64::from(entry.message_address_low());
+        address == expected_address
+            && entry.message_data() >= msi.interrupt_range.base
+            && entry.message_data() < interrupt_end
+    })
+}
+
 fn prepare_process_shell(
     shell: Option<HvfSnapshotV2DefaultProcessShell>,
     state: &HvfSnapshotV2PlatformState,
@@ -1567,7 +2038,30 @@ fn prepare_process_shell(
 fn validate_default_process_fdt(
     bytes: &[u8],
     state: &HvfSnapshotV2PlatformState,
-    serial_interrupt: bangbang_runtime::interrupt::GuestInterruptLine,
+    serial_interrupt: GuestInterruptLine,
+) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
+    validate_process_fdt(bytes, state, serial_interrupt, None)
+}
+
+fn validate_root_process_fdt(
+    bytes: &[u8],
+    state: &HvfSnapshotV2PlatformState,
+    root: &SnapshotV2RootRestorePlan,
+    resources: HvfSnapshotV2RootResourcePlan,
+) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
+    validate_process_fdt(
+        bytes,
+        state,
+        resources.serial_interrupt,
+        Some((root, resources.transport)),
+    )
+}
+
+fn validate_process_fdt(
+    bytes: &[u8],
+    state: &HvfSnapshotV2PlatformState,
+    serial_interrupt: GuestInterruptLine,
+    root: Option<(&SnapshotV2RootRestorePlan, HvfSnapshotV2RootTransportPlan)>,
 ) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
     let tree = DeviceTree::load(bytes).map_err(|_| HvfSnapshotV2ProcessFdtMismatch::Parse)?;
     let time = state.time();
@@ -1578,7 +2072,7 @@ fn validate_default_process_fdt(
         |name: &str| node_name_has_number(name, "rtc@", 16, PROCESS_RTC_MMIO_BASE.raw_value());
     let vmclock_name =
         |name: &str| node_name_has_number(name, "ptp@", 10, time.vmclock().fdt_region().base);
-    if tree.root.children.len() != 11
+    if tree.root.children.len() != 11 + usize::from(root.is_some())
         || [
             "cpus",
             "memory@ram",
@@ -1670,10 +2164,16 @@ fn validate_default_process_fdt(
     let Some(chosen) = child_named(&tree.root, "chosen") else {
         return Err(HvfSnapshotV2ProcessFdtMismatch::Boot);
     };
-    let Some(expected_boot_args) =
-        expected_process_boot_arguments(state.machine().boot().boot_arguments())
-    else {
-        return Err(HvfSnapshotV2ProcessFdtMismatch::Boot);
+    let expected_boot_args = match root {
+        Some((root, transport)) => canonical_process_root_block_command_line(
+            state.machine().boot().boot_arguments(),
+            matches!(transport, HvfSnapshotV2RootTransportPlan::Pci { .. }),
+            root.partuuid(),
+            true,
+        )
+        .map_err(|_| HvfSnapshotV2ProcessFdtMismatch::Boot)?,
+        None => expected_process_boot_arguments(state.machine().boot().boot_arguments())
+            .ok_or(HvfSnapshotV2ProcessFdtMismatch::Boot)?,
     };
     if !chosen
         .prop_str("bootargs")
@@ -1687,7 +2187,11 @@ fn validate_default_process_fdt(
     let Some(intc) = child_named(&tree.root, "intc") else {
         return Err(HvfSnapshotV2ProcessFdtMismatch::Gic);
     };
-    if !intc.children.is_empty()
+    let expected_gic_children = usize::from(matches!(
+        root,
+        Some((_, HvfSnapshotV2RootTransportPlan::Pci { .. }))
+    ));
+    if intc.children.len() != expected_gic_children
         || !intc
             .prop_str("compatible")
             .is_ok_and(|compatible| compatible == "arm,gic-v3")
@@ -1818,11 +2322,11 @@ fn validate_default_process_fdt(
     else {
         return Err(HvfSnapshotV2ProcessFdtMismatch::VmClock);
     };
-    if vmclock.children.is_empty()
-        && vmclock
+    if !vmclock.children.is_empty()
+        || !vmclock
             .prop_str("compatible")
             .is_ok_and(|compatible| compatible == "amazon,vmclock")
-        && property_u64_cells_equal(
+        || !property_u64_cells_equal(
             vmclock,
             "reg",
             &[
@@ -1830,12 +2334,169 @@ fn validate_default_process_fdt(
                 vmclock_metadata.fdt_region().size,
             ],
         )
-        && property_u32_cells_equal(vmclock, "interrupts", &[0, vmclock_interrupt_cell, 1])
+        || !property_u32_cells_equal(vmclock, "interrupts", &[0, vmclock_interrupt_cell, 1])
     {
-        Ok(())
-    } else {
-        Err(HvfSnapshotV2ProcessFdtMismatch::VmClock)
+        return Err(HvfSnapshotV2ProcessFdtMismatch::VmClock);
     }
+
+    validate_process_root_nodes(&tree.root, intc, root)
+}
+
+fn validate_process_root_nodes(
+    root_node: &Node,
+    intc: &Node,
+    root: Option<(&SnapshotV2RootRestorePlan, HvfSnapshotV2RootTransportPlan)>,
+) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
+    let Some((root, resources)) = root else {
+        return Ok(());
+    };
+    match (root.transport(), resources) {
+        (
+            SnapshotV2DeviceTransport::Mmio(graph),
+            HvfSnapshotV2RootTransportPlan::Mmio {
+                region,
+                interrupt_line,
+            },
+        ) => {
+            let node = child_matching(root_node, |node| {
+                node_name_has_number(
+                    &node.name,
+                    "virtio_mmio@",
+                    16,
+                    region.range().start().raw_value(),
+                )
+            })
+            .ok_or(HvfSnapshotV2ProcessFdtMismatch::Root)?;
+            let interrupt_cell = interrupt_line
+                .raw_value()
+                .checked_sub(32)
+                .ok_or(HvfSnapshotV2ProcessFdtMismatch::Root)?;
+            if graph.region() != region
+                || graph.interrupt_line() != interrupt_line
+                || !node.children.is_empty()
+                || !node
+                    .prop_str("compatible")
+                    .is_ok_and(|compatible| compatible == "virtio,mmio")
+                || !property_u64_cells_equal(
+                    node,
+                    "reg",
+                    &[region.range().start().raw_value(), region.range().size()],
+                )
+                || !property_u32_cells_equal(node, "interrupts", &[0, interrupt_cell, 1])
+                || !node
+                    .prop_u32("interrupt-parent")
+                    .is_ok_and(|phandle| phandle == 1)
+                || !property_is_null(node, "dma-coherent")
+            {
+                return Err(HvfSnapshotV2ProcessFdtMismatch::Root);
+            }
+            Ok(())
+        }
+        (
+            SnapshotV2DeviceTransport::Pci(graph),
+            HvfSnapshotV2RootTransportPlan::Pci {
+                sbdf,
+                bar_region_id,
+                bar_range,
+                msi,
+            },
+        ) => {
+            if graph.sbdf() != sbdf
+                || graph.bar_range() != bar_range
+                || bar_region_id != PROCESS_PCI_ROOT_BAR_REGION_ID
+                || !validate_process_pci_host(root_node)
+                || !validate_process_gic_msi(intc, msi)
+            {
+                return Err(HvfSnapshotV2ProcessFdtMismatch::Pci);
+            }
+            Ok(())
+        }
+        _ => Err(HvfSnapshotV2ProcessFdtMismatch::Root),
+    }
+}
+
+fn validate_process_gic_msi(intc: &Node, msi: crate::gic::HvfGicMsiMetadata) -> bool {
+    let Some(frame) = child_matching(intc, |node| {
+        node_name_has_number(&node.name, "v2m@", 16, msi.region.base)
+    }) else {
+        return false;
+    };
+    frame.children.is_empty()
+        && frame
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "arm,gic-v2m-frame")
+        && property_is_null(frame, "msi-controller")
+        && frame.prop_u32("phandle").is_ok_and(|phandle| phandle == 3)
+        && property_u64_cells_equal(frame, "reg", &[msi.region.base, msi.region.size])
+}
+
+fn validate_process_pci_host(root: &Node) -> bool {
+    let Ok(plan) = Arm64PciAddressPlan::firecracker_v1_16() else {
+        return false;
+    };
+    let Some(node) = child_matching(root, |node| {
+        node_name_has_number(&node.name, "pci@", 16, plan.ecam().start().raw_value())
+    }) else {
+        return false;
+    };
+    let ranges = [
+        0x0200_0000,
+        high_u32(plan.bar32().start().raw_value()),
+        low_u32(plan.bar32().start().raw_value()),
+        high_u32(plan.bar32().start().raw_value()),
+        low_u32(plan.bar32().start().raw_value()),
+        high_u32(plan.bar32().size()),
+        low_u32(plan.bar32().size()),
+        0x0300_0000,
+        high_u32(plan.bar64().start().raw_value()),
+        low_u32(plan.bar64().start().raw_value()),
+        high_u32(plan.bar64().start().raw_value()),
+        low_u32(plan.bar64().start().raw_value()),
+        high_u32(plan.bar64().size()),
+        low_u32(plan.bar64().size()),
+    ];
+    node.children.is_empty()
+        && node
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "pci-host-ecam-generic")
+        && node
+            .prop_str("device_type")
+            .is_ok_and(|device_type| device_type == "pci")
+        && property_u32_cells_equal(node, "ranges", &ranges)
+        && property_u32_cells_equal(node, "bus-range", &[0, 0])
+        && node
+            .prop_u32("linux,pci-domain")
+            .is_ok_and(|domain| domain == 0)
+        && node
+            .prop_u32("#address-cells")
+            .is_ok_and(|cells| cells == 3)
+        && node.prop_u32("#size-cells").is_ok_and(|cells| cells == 2)
+        && property_u64_cells_equal(
+            node,
+            "reg",
+            &[plan.ecam().start().raw_value(), plan.ecam().size()],
+        )
+        && node
+            .prop_u32("#interrupt-cells")
+            .is_ok_and(|cells| cells == 1)
+        && property_is_null(node, "interrupt-map")
+        && property_is_null(node, "interrupt-map-mask")
+        && property_is_null(node, "dma-coherent")
+        && node
+            .prop_u32("msi-parent")
+            .is_ok_and(|phandle| phandle == 3)
+}
+
+fn property_is_null(node: &Node, name: &str) -> bool {
+    node.prop_raw(name).is_some_and(Vec::is_empty)
+}
+
+const fn high_u32(value: u64) -> u32 {
+    (value >> 32) as u32
+}
+
+const fn low_u32(value: u64) -> u32 {
+    value as u32
 }
 
 fn child_named<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
@@ -2123,6 +2784,346 @@ fn restore_protocol_stages(vcpu_count: usize) -> Vec<HvfSnapshotV2PlatformRestor
 mod tests {
     use super::*;
 
+    fn root_restore_memory() -> GuestMemory {
+        let layout = bangbang_runtime::memory::GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), 0x4_0000)
+                .expect("root restore memory range should validate"),
+        ])
+        .expect("root restore memory layout should validate");
+        let mut memory =
+            GuestMemory::allocate(&layout).expect("root restore memory should allocate");
+        memory
+            .write_slice(&8_u16.to_le_bytes(), GuestAddress::new(0x2_0002))
+            .expect("root available cursor should write");
+        memory
+            .write_slice(&6_u16.to_le_bytes(), GuestAddress::new(0x3_0002))
+            .expect("root used cursor should write");
+        memory
+    }
+
+    fn readdress_root_graph(
+        graph: bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceGraph,
+        descriptor_table: GuestAddress,
+        driver_ring: GuestAddress,
+        device_ring: GuestAddress,
+    ) -> bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceGraph {
+        let queue = graph.record().virtio().queues()[0];
+        let mut bytes = graph
+            .encode(
+                bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            )
+            .expect("root graph should encode");
+        let mut old = Vec::with_capacity(24);
+        for address in [
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.device_ring(),
+        ] {
+            old.extend_from_slice(&address.raw_value().to_le_bytes());
+        }
+        let offsets = bytes
+            .windows(old.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == old).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            offsets.len(),
+            1,
+            "ordered queue addresses should occur exactly once"
+        );
+        let offset = offsets[0];
+        let mut replacement = Vec::with_capacity(24);
+        for address in [descriptor_table, driver_ring, device_ring] {
+            replacement.extend_from_slice(&address.raw_value().to_le_bytes());
+        }
+        bytes[offset..offset + replacement.len()].copy_from_slice(&replacement);
+        bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceGraph::decode(
+            bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &bytes,
+        )
+        .expect("readdressed root graph should decode")
+    }
+
+    fn root_restore_memory_for_platform(
+        platform: &HvfSnapshotV2PlatformState,
+        driver_ring: GuestAddress,
+        device_ring: GuestAddress,
+    ) -> GuestMemory {
+        let layout = bangbang_runtime::memory::GuestMemoryLayout::new(
+            platform
+                .memory()
+                .extents()
+                .iter()
+                .map(|extent| extent.range())
+                .collect(),
+        )
+        .expect("platform restore memory layout should validate");
+        let mut memory =
+            GuestMemory::allocate(&layout).expect("platform restore memory should allocate");
+        memory
+            .write_slice(
+                &8_u16.to_le_bytes(),
+                driver_ring
+                    .checked_add(2)
+                    .expect("available cursor address should fit"),
+            )
+            .expect("available cursor should write");
+        memory
+            .write_slice(
+                &6_u16.to_le_bytes(),
+                device_ring
+                    .checked_add(2)
+                    .expect("used cursor address should fit"),
+            )
+            .expect("used cursor should write");
+        memory
+    }
+
+    fn coherent_mmio_root_plan_fixture(
+        include_root_in_fdt: bool,
+    ) -> (
+        HvfSnapshotV2State,
+        GuestMemory,
+        HvfSnapshotV2RootProcessConfig,
+    ) {
+        let state = crate::snapshot_v2::tests::complete_state_fixture(
+            crate::snapshot_v2::tests::MMIO_GRAPH_FIXTURE_HEX,
+        );
+        let (platform, graph) = state.into_parts();
+        let platform = without_initrd(platform);
+        let descriptor_table = GuestAddress::new(aarch64::DRAM_MEM_START + 0x30_0000);
+        let driver_ring = GuestAddress::new(aarch64::DRAM_MEM_START + 0x34_0000);
+        let device_ring = GuestAddress::new(aarch64::DRAM_MEM_START + 0x38_0000);
+        let graph = readdress_root_graph(graph, descriptor_table, driver_ring, device_ring);
+        let mut memory = root_restore_memory_for_platform(&platform, driver_ring, device_ring);
+        let root = SnapshotV2RootRestorePlan::prepare(graph.clone(), &memory, Instant::now())
+            .expect("coherent MMIO root graph should prepare");
+        let SnapshotV2DeviceTransport::Mmio(mmio) = root.transport() else {
+            panic!("fixture root should use MMIO");
+        };
+        let process = HvfSnapshotV2RootProcessConfig::new(
+            BlockMmioLayout::new(mmio.region().range().start(), mmio.region().id()),
+            false,
+        );
+        let resources = prepare_root_resource_plan(&platform, &root, process)
+            .expect("coherent MMIO resources should prepare");
+
+        memory
+            .write_slice(
+                &platform.time().vmclock_abi().to_bytes(),
+                platform.time().vmclock().range().start(),
+            )
+            .expect("VMClock ABI should write");
+        for captured in platform.time().pvtime_vcpus() {
+            let mut bytes = Arm64PvTimeStAbi::initial().to_bytes();
+            bytes[ARM64_PVTIME_STOLEN_TIME_OFFSET..ARM64_PVTIME_STOLEN_TIME_OFFSET + 8]
+                .copy_from_slice(&captured.stolen_time_ns().to_le_bytes());
+            memory
+                .write_slice(&bytes, captured.record_ipa())
+                .expect("PVTime ABI should write");
+        }
+
+        let command_line = canonical_process_root_block_command_line(
+            platform.machine().boot().boot_arguments(),
+            false,
+            root.partuuid(),
+            true,
+        )
+        .expect("coherent MMIO root command line should normalize");
+        let HvfSnapshotV2RootTransportPlan::Mmio {
+            region,
+            interrupt_line,
+        } = resources.transport()
+        else {
+            panic!("coherent fixture resource plan should use MMIO");
+        };
+        let root_device = bangbang_runtime::fdt::Arm64FdtVirtioMmioDevice {
+            region: bangbang_runtime::fdt::Arm64FdtRegion {
+                base: region.range().start().raw_value(),
+                size: region.range().size(),
+            },
+            interrupt_line,
+        };
+        let root_devices = include_root_in_fdt
+            .then_some(root_device)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let fdt = build_process_fdt_fixture_with_profile(
+            &platform,
+            root_shell_devices(&platform, resources),
+            &root_devices,
+            &command_line,
+            None,
+        );
+        let fdt_address = platform.machine().fdt().address();
+        memory
+            .write_slice(&fdt, fdt_address)
+            .expect("coherent process FDT should write");
+
+        let mut image = std::io::Cursor::new(Vec::new());
+        let binding =
+            bangbang_runtime::snapshot_memory_v2::write_snapshot_v2_memory_image_with_compatibility_version(
+                &memory,
+                &mut image,
+                bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            )
+            .expect("coherent restore memory should encode");
+        let (_old_binding, machine, global, topology, vcpus, time) = platform.into_parts();
+        let fdt = crate::snapshot_v2::HvfSnapshotV2FdtState::try_new(
+            fdt_address,
+            fdt.len(),
+            crc64(0, &fdt),
+        )
+        .expect("coherent FDT identity should validate");
+        let machine = HvfSnapshotV2MachineState::try_new(
+            machine.machine(),
+            machine.boot().clone(),
+            fdt,
+            machine.cpu_template().cloned(),
+        )
+        .expect("coherent machine metadata should validate");
+        let platform =
+            HvfSnapshotV2PlatformState::try_new(binding, machine, global, topology, vcpus, time)
+                .expect("coherent platform should cross-validate");
+        let state = HvfSnapshotV2State::try_new(platform, graph)
+            .expect("coherent exact-2.4 state should cross-validate");
+        (state, memory, process)
+    }
+
+    fn without_initrd(platform: HvfSnapshotV2PlatformState) -> HvfSnapshotV2PlatformState {
+        let (memory, machine, global, topology, vcpus, time) = platform.into_parts();
+        let boot = crate::snapshot_v2::HvfSnapshotV2BootState::try_new(
+            machine.boot().kernel_path().clone(),
+            None,
+            machine.boot().boot_arguments(),
+        )
+        .expect("root fixture boot metadata should validate");
+        let machine = HvfSnapshotV2MachineState::try_new(
+            machine.machine(),
+            boot,
+            machine.fdt(),
+            machine.cpu_template().cloned(),
+        )
+        .expect("root fixture machine metadata should validate");
+        HvfSnapshotV2PlatformState::try_new(memory, machine, global, topology, vcpus, time)
+            .expect("root fixture platform should cross-validate")
+    }
+
+    fn mmio_root_plan_fixture() -> (
+        HvfSnapshotV2PlatformState,
+        SnapshotV2RootRestorePlan,
+        HvfSnapshotV2RootProcessConfig,
+    ) {
+        let state = crate::snapshot_v2::tests::complete_state_fixture(
+            crate::snapshot_v2::tests::MMIO_GRAPH_FIXTURE_HEX,
+        );
+        let (platform, graph) = state.into_parts();
+        let platform = without_initrd(platform);
+        let memory = root_restore_memory();
+        let root = SnapshotV2RootRestorePlan::prepare(graph, &memory, Instant::now())
+            .expect("MMIO root graph should prepare");
+        let SnapshotV2DeviceTransport::Mmio(mmio) = root.transport() else {
+            panic!("fixture root should use MMIO");
+        };
+        let process = HvfSnapshotV2RootProcessConfig::new(
+            BlockMmioLayout::new(mmio.region().range().start(), mmio.region().id()),
+            false,
+        );
+        (platform, root, process)
+    }
+
+    fn pci_root_plan_fixture() -> (
+        HvfSnapshotV2PlatformState,
+        SnapshotV2RootRestorePlan,
+        HvfSnapshotV2RootProcessConfig,
+    ) {
+        let state = crate::snapshot_v2::tests::complete_state_fixture(
+            crate::snapshot_v2::tests::PCI_GRAPH_FIXTURE_HEX,
+        );
+        let (platform, graph) = state.into_parts();
+        let SnapshotV2DeviceTransport::Pci(pci) = graph.record().transport() else {
+            panic!("fixture root should use PCI");
+        };
+        let message = pci.msix().entries()[0];
+        let message_address = (u64::from(message.message_address_high()) << 32)
+            | u64::from(message.message_address_low());
+        let msi_region_base = message_address
+            .checked_sub(ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET)
+            .expect("fixture MSI region base should fit");
+
+        let (memory, machine, global, topology, vcpus, time) = platform.into_parts();
+        let (compatibility, gic_device) = global.into_parts();
+        let expected_msi = pci_root_restore_gic_msi_configuration()
+            .expect("PCI root MSI demand should validate")
+            .interrupt_count()
+            .get();
+        let mut gic = compatibility.gic_metadata();
+        let legacy_count = 3;
+        let msi_base = gic
+            .spi_interrupt_range
+            .base
+            .checked_add(legacy_count)
+            .expect("fixture MSI interrupt base should fit");
+        gic.spi_interrupt_range.count = legacy_count;
+        gic.msi = Some(crate::gic::HvfGicMsiMetadata {
+            region: crate::gic::HvfGicRegion {
+                base: msi_region_base,
+                size: 0x1_0000,
+            },
+            interrupt_range: crate::gic::HvfGicInterruptRange {
+                base: msi_base,
+                count: expected_msi,
+            },
+        });
+        let compatibility = HvfSnapshotV1CompatibilityState::new(
+            compatibility.identification(),
+            compatibility.optional_sve_sme_identification(),
+            compatibility.cache_manifest(),
+            compatibility.primary_mpidr(),
+            gic,
+            compatibility.rtc_mmio_layout(),
+        );
+        let global = HvfSnapshotV2GlobalState::try_new(compatibility, gic_device)
+            .expect("PCI root global state should validate");
+
+        let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
+            .expect("PCI root legacy interrupt allocator should validate");
+        let _serial = allocator
+            .allocate()
+            .expect("PCI root serial interrupt should allocate");
+        let vmgenid_interrupt = allocator
+            .allocate()
+            .expect("PCI root VMGenID interrupt should allocate");
+        let vmclock_interrupt = allocator
+            .allocate()
+            .expect("PCI root VMClock interrupt should allocate");
+        let (rtc, vmgenid, vmclock, vmclock_abi, pvtime) = time.into_parts();
+        let vmgenid = bangbang_runtime::snapshot_device::SnapshotV1PlatformDeviceMetadata::new(
+            vmgenid.range(),
+            vmgenid.fdt_region(),
+            vmgenid_interrupt,
+        );
+        let vmclock = bangbang_runtime::snapshot_device::SnapshotV1PlatformDeviceMetadata::new(
+            vmclock.range(),
+            vmclock.fdt_region(),
+            vmclock_interrupt,
+        );
+        let time = HvfSnapshotV2TimeState::try_new(rtc, vmgenid, vmclock, vmclock_abi, pvtime)
+            .expect("PCI root time metadata should validate");
+        let platform =
+            HvfSnapshotV2PlatformState::try_new(memory, machine, global, topology, vcpus, time)
+                .expect("PCI root platform should cross-validate");
+        let platform = without_initrd(platform);
+        let root =
+            SnapshotV2RootRestorePlan::prepare(graph, &root_restore_memory(), Instant::now())
+                .expect("PCI root graph should prepare");
+        let process = HvfSnapshotV2RootProcessConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0xd000_0000), MmioRegionId::new(9)),
+            true,
+        );
+        (platform, root, process)
+    }
+
     fn process_platform_fixture() -> HvfSnapshotV2PlatformState {
         let state = crate::snapshot_v2::tests::platform_fixture(false);
         let gic = state.global().compatibility().gic_metadata();
@@ -2216,6 +3217,40 @@ mod tests {
         )
     }
 
+    fn root_shell_devices(
+        state: &HvfSnapshotV2PlatformState,
+        resources: HvfSnapshotV2RootResourcePlan,
+    ) -> (
+        bangbang_runtime::fdt::Arm64FdtSerialDevice,
+        bangbang_runtime::fdt::Arm64FdtRtcDevice,
+        bangbang_runtime::fdt::Arm64FdtVmGenIdDevice,
+        bangbang_runtime::fdt::Arm64FdtVmClockDevice,
+    ) {
+        (
+            bangbang_runtime::fdt::Arm64FdtSerialDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: PROCESS_SERIAL_MMIO_BASE.raw_value(),
+                    size: SERIAL_MMIO_DEVICE_WINDOW_SIZE,
+                },
+                interrupt_line: resources.serial_interrupt(),
+            },
+            bangbang_runtime::fdt::Arm64FdtRtcDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: PROCESS_RTC_MMIO_BASE.raw_value(),
+                    size: RTC_MMIO_DEVICE_WINDOW_SIZE,
+                },
+            },
+            bangbang_runtime::fdt::Arm64FdtVmGenIdDevice {
+                region: state.time().vmgenid().fdt_region(),
+                interrupt_line: resources.vmgenid_interrupt(),
+            },
+            bangbang_runtime::fdt::Arm64FdtVmClockDevice {
+                region: state.time().vmclock().fdt_region(),
+                interrupt_line: resources.vmclock_interrupt(),
+            },
+        )
+    }
+
     fn build_process_fdt_fixture(
         state: &HvfSnapshotV2PlatformState,
         serial: bangbang_runtime::fdt::Arm64FdtSerialDevice,
@@ -2224,6 +3259,30 @@ mod tests {
         vmclock: bangbang_runtime::fdt::Arm64FdtVmClockDevice,
         optional_devices: &[bangbang_runtime::fdt::Arm64FdtVirtioMmioDevice],
     ) -> Vec<u8> {
+        let command_line = expected_process_boot_arguments(state.machine().boot().boot_arguments())
+            .expect("fixture command line should normalize");
+        build_process_fdt_fixture_with_profile(
+            state,
+            (serial, rtc, vmgenid, vmclock),
+            optional_devices,
+            &command_line,
+            None,
+        )
+    }
+
+    fn build_process_fdt_fixture_with_profile(
+        state: &HvfSnapshotV2PlatformState,
+        shell: (
+            bangbang_runtime::fdt::Arm64FdtSerialDevice,
+            bangbang_runtime::fdt::Arm64FdtRtcDevice,
+            bangbang_runtime::fdt::Arm64FdtVmGenIdDevice,
+            bangbang_runtime::fdt::Arm64FdtVmClockDevice,
+        ),
+        optional_devices: &[bangbang_runtime::fdt::Arm64FdtVirtioMmioDevice],
+        command_line: &str,
+        pci: Option<bangbang_runtime::fdt::Arm64FdtPciHost>,
+    ) -> Vec<u8> {
+        let (serial, rtc, vmgenid, vmclock) = shell;
         let ranges = state
             .memory()
             .extents()
@@ -2250,22 +3309,22 @@ mod tests {
             .iter()
             .map(|member| member.mpidr())
             .collect::<Vec<_>>();
-        let command_line = expected_process_boot_arguments(state.machine().boot().boot_arguments())
-            .expect("fixture command line should normalize");
-        let initrd =
-            state
-                .machine()
-                .boot()
-                .initrd_path()
-                .map(|_| bangbang_runtime::boot::LoadedInitrd {
-                    address: GuestAddress::new(aarch64::DRAM_MEM_START + 0x1_0000),
-                    size: 4096,
-                });
+        let initrd = state.machine().boot().initrd_path().map(|_| {
+            let address = state.memory().extents()[0]
+                .range()
+                .start()
+                .checked_add(aarch64::SYSTEM_MEM_SIZE + 0x1_0000)
+                .expect("fixture initrd address should fit");
+            bangbang_runtime::boot::LoadedInitrd {
+                address,
+                size: 4096,
+            }
+        });
         let gic = state.global().compatibility().gic_metadata();
-        bangbang_runtime::fdt::build_arm64_fdt(&bangbang_runtime::fdt::Arm64FdtConfig {
+        let config = bangbang_runtime::fdt::Arm64FdtConfig {
             layout: &layout,
             boot: bangbang_runtime::fdt::Arm64FdtBootInfo {
-                command_line: &command_line,
+                command_line,
                 initrd,
             },
             vcpu_mpidrs: &mpidrs,
@@ -2279,8 +3338,267 @@ mod tests {
             vmgenid_device: Some(vmgenid),
             vmclock_device: Some(vmclock),
             virtio_mmio_devices: optional_devices,
-        })
+        };
+        match pci {
+            Some(pci) => bangbang_runtime::fdt::build_arm64_fdt_with_pci(&config, pci),
+            None => bangbang_runtime::fdt::build_arm64_fdt(&config),
+        }
         .expect("fixture FDT should build")
+    }
+
+    #[test]
+    fn mmio_root_resource_plan_matches_fresh_product_order() {
+        let (platform, root, process) = mmio_root_plan_fixture();
+        let resources = prepare_root_resource_plan(&platform, &root, process)
+            .expect("MMIO root resources should match product order");
+        let SnapshotV2DeviceTransport::Mmio(graph) = root.transport() else {
+            panic!("fixture root should use MMIO");
+        };
+        assert_eq!(
+            resources.transport(),
+            HvfSnapshotV2RootTransportPlan::Mmio {
+                region: graph.region(),
+                interrupt_line: graph.interrupt_line(),
+            }
+        );
+        assert_eq!(
+            resources.vmgenid_interrupt(),
+            platform.time().vmgenid().interrupt_line()
+        );
+        assert_eq!(
+            resources.vmclock_interrupt(),
+            platform.time().vmclock().interrupt_line()
+        );
+
+        let wrong_policy = HvfSnapshotV2RootProcessConfig::new(process.block_mmio_layout(), true);
+        assert!(matches!(
+            prepare_root_resource_plan(&platform, &root, wrong_policy),
+            Err(PrepareHvfSnapshotV2RootPlanError::TransportPolicy)
+        ));
+        let wrong_layout = HvfSnapshotV2RootProcessConfig::new(
+            BlockMmioLayout::new(
+                process
+                    .block_mmio_layout()
+                    .base_address()
+                    .checked_add(VIRTIO_MMIO_DEVICE_WINDOW_SIZE)
+                    .expect("wrong layout base should fit"),
+                process.block_mmio_layout().base_region_id(),
+            ),
+            false,
+        );
+        assert!(matches!(
+            prepare_root_resource_plan(&platform, &root, wrong_layout),
+            Err(PrepareHvfSnapshotV2RootPlanError::ResourcePlan)
+        ));
+    }
+
+    #[test]
+    fn root_resource_plan_rejects_queue_platform_collision() {
+        let state = crate::snapshot_v2::tests::complete_state_fixture(
+            crate::snapshot_v2::tests::MMIO_GRAPH_FIXTURE_HEX,
+        );
+        let (platform, graph) = state.into_parts();
+        let descriptor_table = platform.time().vmgenid().range().start();
+        let driver_ring = GuestAddress::new(aarch64::DRAM_MEM_START + 0x28_0000);
+        let device_ring = GuestAddress::new(aarch64::DRAM_MEM_START + 0x30_0000);
+        let graph = readdress_root_graph(graph, descriptor_table, driver_ring, device_ring);
+        let memory = root_restore_memory_for_platform(&platform, driver_ring, device_ring);
+        let root = SnapshotV2RootRestorePlan::prepare(graph, &memory, Instant::now())
+            .expect("colliding graph should pass device-local memory checks");
+        let SnapshotV2DeviceTransport::Mmio(mmio) = root.transport() else {
+            panic!("fixture root should use MMIO");
+        };
+        let process = HvfSnapshotV2RootProcessConfig::new(
+            BlockMmioLayout::new(mmio.region().range().start(), mmio.region().id()),
+            false,
+        );
+
+        assert!(matches!(
+            prepare_root_resource_plan(&platform, &root, process),
+            Err(PrepareHvfSnapshotV2RootPlanError::ResourcePlan)
+        ));
+    }
+
+    #[test]
+    fn exact_root_preparation_accepts_one_coherent_pathless_mmio_plan() {
+        let (state, memory, process) = coherent_mmio_root_plan_fixture(true);
+        let prepared = prepare_hvf_snapshot_v2_root_plan(state, memory, process, Instant::now())
+            .expect("coherent exact-2.4 root plan should prepare");
+
+        assert_eq!(
+            prepared.resources().transport().kind(),
+            SnapshotV2DeviceTransportKind::Mmio
+        );
+        assert_eq!(prepared.root().drive_id(), "rootfs");
+        assert_eq!(prepared.selector(), "root-selector");
+        assert!(!format!("{prepared:?}").contains(prepared.selector()));
+    }
+
+    #[test]
+    fn exact_root_preparation_rejects_hostile_fdt_before_backing() {
+        let (state, memory, process) = coherent_mmio_root_plan_fixture(false);
+
+        assert!(matches!(
+            prepare_hvf_snapshot_v2_root_plan(state, memory, process, Instant::now()),
+            Err(PrepareHvfSnapshotV2RootPlanError::ProcessFdt {
+                mismatch: HvfSnapshotV2ProcessFdtMismatch::RootInventory,
+            })
+        ));
+    }
+
+    #[test]
+    fn mmio_root_fdt_requires_exact_node_and_command_line() {
+        let (platform, root, process) = mmio_root_plan_fixture();
+        let resources = prepare_root_resource_plan(&platform, &root, process)
+            .expect("MMIO root resources should prepare");
+        let shell = root_shell_devices(&platform, resources);
+        let HvfSnapshotV2RootTransportPlan::Mmio {
+            region,
+            interrupt_line,
+        } = resources.transport()
+        else {
+            panic!("fixture resource plan should use MMIO");
+        };
+        let root_device = bangbang_runtime::fdt::Arm64FdtVirtioMmioDevice {
+            region: bangbang_runtime::fdt::Arm64FdtRegion {
+                base: region.range().start().raw_value(),
+                size: region.range().size(),
+            },
+            interrupt_line,
+        };
+        let command_line = canonical_process_root_block_command_line(
+            platform.machine().boot().boot_arguments(),
+            false,
+            root.partuuid(),
+            true,
+        )
+        .expect("MMIO root command line should normalize");
+        let valid = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &[root_device],
+            &command_line,
+            None,
+        );
+        assert_eq!(
+            validate_root_process_fdt(&valid, &platform, &root, resources),
+            Ok(())
+        );
+
+        let missing_root_command_line =
+            expected_process_boot_arguments(platform.machine().boot().boot_arguments())
+                .expect("device-free command line should normalize");
+        let missing_root = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &[root_device],
+            &missing_root_command_line,
+            None,
+        );
+        assert_eq!(
+            validate_root_process_fdt(&missing_root, &platform, &root, resources),
+            Err(HvfSnapshotV2ProcessFdtMismatch::Boot)
+        );
+
+        let optional = bangbang_runtime::fdt::Arm64FdtVirtioMmioDevice {
+            region: bangbang_runtime::fdt::Arm64FdtRegion {
+                base: region.range().end_exclusive().raw_value(),
+                size: region.range().size(),
+            },
+            interrupt_line: GuestInterruptLine::new(interrupt_line.raw_value() + 1)
+                .expect("optional interrupt should validate"),
+        };
+        let with_optional = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &[root_device, optional],
+            &command_line,
+            None,
+        );
+        assert_eq!(
+            validate_root_process_fdt(&with_optional, &platform, &root, resources),
+            Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory)
+        );
+    }
+
+    #[test]
+    fn pci_root_resource_and_fdt_plans_match_first_product_slot() {
+        let (platform, root, process) = pci_root_plan_fixture();
+        let resources = prepare_root_resource_plan(&platform, &root, process)
+            .expect("PCI root resources should match product order");
+        let HvfSnapshotV2RootTransportPlan::Pci {
+            sbdf,
+            bar_region_id,
+            bar_range,
+            msi,
+        } = resources.transport()
+        else {
+            panic!("fixture resource plan should use PCI");
+        };
+        assert_eq!(
+            sbdf,
+            PciSbdf::new(
+                PCI_SEGMENT_ZERO,
+                PCI_BUS_ZERO,
+                PCI_FIRST_ENDPOINT_DEVICE,
+                PCI_FUNCTION_ZERO,
+            )
+            .expect("first endpoint identity should validate")
+        );
+        assert_eq!(bar_region_id, PROCESS_PCI_ROOT_BAR_REGION_ID);
+        assert_eq!(
+            bar_range,
+            GuestMemoryRange::new(
+                Arm64PciAddressPlan::firecracker_v1_16()
+                    .expect("PCI address plan should validate")
+                    .bar64()
+                    .start(),
+                VIRTIO_PCI_CAPABILITY_BAR_SIZE,
+            )
+            .expect("first PCI BAR should validate")
+        );
+        assert_eq!(
+            msi.interrupt_range.count,
+            pci_root_restore_gic_msi_configuration()
+                .expect("PCI MSI demand should validate")
+                .interrupt_count()
+                .get()
+        );
+
+        let command_line = canonical_process_root_block_command_line(
+            platform.machine().boot().boot_arguments(),
+            true,
+            root.partuuid(),
+            true,
+        )
+        .expect("PCI root command line should normalize");
+        let pci_host = bangbang_runtime::fdt::Arm64FdtPciHost::from_address_plan(
+            Arm64PciAddressPlan::firecracker_v1_16()
+                .expect("PCI host address plan should validate"),
+        );
+        let valid = build_process_fdt_fixture_with_profile(
+            &platform,
+            root_shell_devices(&platform, resources),
+            &[],
+            &command_line,
+            Some(pci_host),
+        );
+        assert_eq!(
+            validate_root_process_fdt(&valid, &platform, &root, resources),
+            Ok(())
+        );
+
+        let missing_host = build_process_fdt_fixture_with_profile(
+            &platform,
+            root_shell_devices(&platform, resources),
+            &[],
+            &command_line,
+            None,
+        );
+        assert_eq!(
+            validate_root_process_fdt(&missing_host, &platform, &root, resources),
+            Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory)
+        );
     }
 
     #[test]
