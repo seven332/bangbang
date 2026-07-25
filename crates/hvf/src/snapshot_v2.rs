@@ -18,11 +18,18 @@ use bangbang_runtime::pvtime::{
 };
 use bangbang_runtime::rtc::{RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use bangbang_runtime::snapshot_device::SnapshotV1PlatformDeviceMetadata;
+use bangbang_runtime::snapshot_device_v2::{
+    NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
+    SnapshotV2DeviceGraphDecodeError, SnapshotV2DeviceGraphEncodeError,
+};
+use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::{
-    NATIVE_V2_GLOBAL_COMPONENT_KEY, NATIVE_V2_MACHINE_COMPONENT_KEY,
-    NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_TIME_COMPONENT_KEY, NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
-    SnapshotV2Component, SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
-    encode_snapshot_v2_state, native_v2_vcpu_component_key,
+    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_GLOBAL_COMPONENT_KEY,
+    NATIVE_V2_MACHINE_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION,
+    NATIVE_V2_TIME_COMPONENT_KEY, NATIVE_V2_TOPOLOGY_COMPONENT_KEY, SnapshotV2Component,
+    SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
+    encode_snapshot_v2_state, encode_snapshot_v2_state_with_compatibility_version,
+    native_v2_vcpu_component_key,
 };
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError, SnapshotV2MemoryStateError,
@@ -765,6 +772,61 @@ impl fmt::Debug for HvfSnapshotV2PlatformState {
     }
 }
 
+/// Complete exact native-v2 2.4 HVF state with one required device graph.
+///
+/// This checked composition is intentionally distinct from the advertised
+/// device-free 2.3 [`HvfSnapshotV2PlatformState`] path. Later capture and
+/// restore stages can retain the graph without changing public snapshot
+/// dispatch before activation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfSnapshotV2State {
+    platform: HvfSnapshotV2PlatformState,
+    device_graph: SnapshotV2DeviceGraph,
+}
+
+impl HvfSnapshotV2State {
+    /// Construct one exact 2.4 composition after validating version agreement.
+    pub fn try_new(
+        platform: HvfSnapshotV2PlatformState,
+        device_graph: SnapshotV2DeviceGraph,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        validate_platform(&platform)?;
+        if platform.memory().version() != NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            || device_graph.compatibility_version() != NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        {
+            return Err(HvfSnapshotV2BuildError::Version);
+        }
+        Ok(Self {
+            platform,
+            device_graph,
+        })
+    }
+
+    /// Return the complete platform state.
+    pub const fn platform(&self) -> &HvfSnapshotV2PlatformState {
+        &self.platform
+    }
+
+    /// Return the required singleton device graph.
+    pub const fn device_graph(&self) -> &SnapshotV2DeviceGraph {
+        &self.device_graph
+    }
+
+    /// Consume the complete state without discarding either owned graph.
+    pub fn into_parts(self) -> (HvfSnapshotV2PlatformState, SnapshotV2DeviceGraph) {
+        (self.platform, self.device_graph)
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfSnapshotV2State")
+            .field("vcpu_count", &self.platform.vcpus.len())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
 /// Value-free rejection while constructing a native-v2 platform graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfSnapshotV2BuildError {
@@ -792,6 +854,8 @@ pub enum HvfSnapshotV2BuildError {
     Optional,
     /// Time or clone-identity state is locally invalid.
     Time,
+    /// Outer, memory, or device-graph versions disagree.
+    Version,
     /// Two otherwise valid components disagree.
     CrossComponent,
 }
@@ -811,6 +875,7 @@ impl fmt::Display for HvfSnapshotV2BuildError {
             Self::Vcpu => "vCPU",
             Self::Optional => "optional state",
             Self::Time => "time and clone identity",
+            Self::Version => "snapshot version relationship",
             Self::CrossComponent => "cross-component relationship",
         };
         write!(f, "invalid native-v2 HVF platform {category}")
@@ -1296,6 +1361,8 @@ pub enum HvfSnapshotV2EncodeError {
     Build(HvfSnapshotV2BuildError),
     /// Memory binding encoding failed.
     Memory(SnapshotV2MemoryBindingError),
+    /// Device-graph encoding failed.
+    DeviceGraph(SnapshotV2DeviceGraphEncodeError),
     /// Nested mandatory-vCPU encoding failed.
     Mandatory(HvfSnapshotV1EncodeError),
     /// A bounded component allocation failed.
@@ -1317,6 +1384,7 @@ impl fmt::Display for HvfSnapshotV2EncodeError {
         match self {
             Self::Build(_) => f.write_str("native-v2 HVF platform graph is invalid"),
             Self::Memory(_) => f.write_str("native-v2 memory binding encoding failed"),
+            Self::DeviceGraph(_) => f.write_str("native-v2 device graph encoding failed"),
             Self::Mandatory(_) => f.write_str("native-v2 mandatory vCPU state encoding failed"),
             Self::Allocation(_) => f.write_str("native-v2 HVF component allocation failed"),
             Self::LengthOverflow => {
@@ -1332,6 +1400,7 @@ impl std::error::Error for HvfSnapshotV2EncodeError {
         match self {
             Self::Build(source) => Some(source),
             Self::Memory(source) => Some(source),
+            Self::DeviceGraph(source) => Some(source),
             Self::Mandatory(source) => Some(source),
             Self::Allocation(source) => Some(source),
             Self::Container(source) => Some(source),
@@ -1374,6 +1443,8 @@ pub enum HvfSnapshotV2DecodeError {
     Allocation(TryReserveError),
     /// Memory binding decoding failed.
     Memory(SnapshotV2MemoryStateError),
+    /// Device-graph decoding failed.
+    DeviceGraph(SnapshotV2DeviceGraphDecodeError),
     /// Nested mandatory-vCPU decoding failed.
     Mandatory(HvfSnapshotV1DecodeError),
     /// A complete locally valid graph failed cross-validation.
@@ -1405,6 +1476,7 @@ impl fmt::Display for HvfSnapshotV2DecodeError {
             Self::InvalidOptional => "native-v2 HVF optional registry is invalid",
             Self::Allocation(_) => "native-v2 HVF typed allocation failed",
             Self::Memory(_) => "native-v2 HVF memory binding is invalid",
+            Self::DeviceGraph(_) => "native-v2 HVF device graph is invalid",
             Self::Mandatory(_) => "native-v2 HVF mandatory vCPU state is invalid",
             Self::Build(_) => "native-v2 HVF platform graph is inconsistent",
         };
@@ -1417,6 +1489,7 @@ impl std::error::Error for HvfSnapshotV2DecodeError {
         match self {
             Self::Allocation(source) => Some(source),
             Self::Memory(source) => Some(source),
+            Self::DeviceGraph(source) => Some(source),
             Self::Mandatory(source) => Some(source),
             Self::Build(source) => Some(source),
             _ => None,
@@ -1428,7 +1501,42 @@ impl std::error::Error for HvfSnapshotV2DecodeError {
 pub fn encode_hvf_snapshot_v2_platform_state(
     state: &HvfSnapshotV2PlatformState,
 ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+    encode_hvf_snapshot_v2_components(state, NATIVE_V2_SNAPSHOT_VERSION, None)
+}
+
+/// Encode one complete exact native-v2 2.4 HVF state with its device graph.
+pub fn encode_hvf_snapshot_v2_state(
+    state: &HvfSnapshotV2State,
+) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+    encode_hvf_snapshot_v2_components(
+        state.platform(),
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        Some(state.device_graph()),
+    )
+}
+
+fn encode_hvf_snapshot_v2_components(
+    state: &HvfSnapshotV2PlatformState,
+    version: SnapshotFormatVersion,
+    device_graph: Option<&SnapshotV2DeviceGraph>,
+) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
     validate_platform(state).map_err(HvfSnapshotV2EncodeError::Build)?;
+    match device_graph {
+        Some(graph)
+            if version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+                && graph.compatibility_version() == version => {}
+        None if version == NATIVE_V2_SNAPSHOT_VERSION => {}
+        _ => {
+            return Err(HvfSnapshotV2EncodeError::Build(
+                HvfSnapshotV2BuildError::Version,
+            ));
+        }
+    }
+    if state.memory.version() != version {
+        return Err(HvfSnapshotV2EncodeError::Build(
+            HvfSnapshotV2BuildError::Version,
+        ));
+    }
     let memory = state
         .memory
         .encode()
@@ -1444,9 +1552,17 @@ pub fn encode_hvf_snapshot_v2_platform_state(
     for vcpu in &state.vcpus {
         vcpu_payloads.push(encode_platform_vcpu(vcpu)?);
     }
+    let device_graph = device_graph
+        .map(|graph| {
+            graph
+                .encode(version)
+                .map_err(HvfSnapshotV2EncodeError::DeviceGraph)
+        })
+        .transpose()?;
 
     let component_count = 5_usize
         .checked_add(vcpu_payloads.len())
+        .and_then(|count| count.checked_add(usize::from(device_graph.is_some())))
         .ok_or(HvfSnapshotV2EncodeError::LengthOverflow)?;
     let mut components = Vec::new();
     components
@@ -1478,7 +1594,17 @@ pub fn encode_hvf_snapshot_v2_platform_state(
         SnapshotV2ComponentDisposition::Semantic,
         &time,
     ));
-    encode_snapshot_v2_state(&[], &components).map_err(HvfSnapshotV2EncodeError::Container)
+    if let Some(device_graph) = device_graph.as_deref() {
+        components.push(SnapshotV2Component::new(
+            NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            device_graph,
+        ));
+        encode_snapshot_v2_state_with_compatibility_version(version, &[], &components)
+            .map_err(HvfSnapshotV2EncodeError::Container)
+    } else {
+        encode_snapshot_v2_state(&[], &components).map_err(HvfSnapshotV2EncodeError::Container)
+    }
 }
 
 /// Decode, own, and cross-validate one native-v2 HVF platform graph.
@@ -1488,9 +1614,45 @@ pub fn encode_hvf_snapshot_v2_platform_state(
 pub fn decode_hvf_snapshot_v2_platform_state(
     state: &SnapshotV2State<'_>,
 ) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
-    let vcpu_count = scan_component_profile(state)?;
+    let version = state.metadata().version();
+    if version.minor() < NATIVE_V2_SNAPSHOT_VERSION.minor() {
+        return Err(HvfSnapshotV2DecodeError::UnsupportedProfile);
+    }
+    if version.minor() != NATIVE_V2_SNAPSHOT_VERSION.minor() {
+        return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
+    }
+    let vcpu_count = scan_component_profile(state, false)?;
+    decode_hvf_snapshot_v2_platform_components(state, vcpu_count)
+}
+
+/// Decode and cross-validate one exact native-v2 2.4 HVF state.
+pub fn decode_hvf_snapshot_v2_state(
+    state: &SnapshotV2State<'_>,
+) -> Result<HvfSnapshotV2State, HvfSnapshotV2DecodeError> {
+    if state.metadata().version() != NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION {
+        return Err(HvfSnapshotV2DecodeError::UnsupportedProfile);
+    }
+    let vcpu_count = scan_component_profile(state, true)?;
+    let platform = decode_hvf_snapshot_v2_platform_components(state, vcpu_count)?;
+    let device_graph = SnapshotV2DeviceGraph::decode(
+        state.metadata().version(),
+        component_payload(state, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)?,
+    )
+    .map_err(HvfSnapshotV2DecodeError::DeviceGraph)?;
+    HvfSnapshotV2State::try_new(platform, device_graph).map_err(HvfSnapshotV2DecodeError::Build)
+}
+
+fn decode_hvf_snapshot_v2_platform_components(
+    state: &SnapshotV2State<'_>,
+    vcpu_count: usize,
+) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
     let memory =
         decode_snapshot_v2_memory_binding(state).map_err(HvfSnapshotV2DecodeError::Memory)?;
+    if memory.version() != state.metadata().version() {
+        return Err(HvfSnapshotV2DecodeError::Build(
+            HvfSnapshotV2BuildError::Version,
+        ));
+    }
     let machine = decode_machine(component_payload(state, NATIVE_V2_MACHINE_COMPONENT_KEY)?)?;
     let global = decode_global(component_payload(state, NATIVE_V2_GLOBAL_COMPONENT_KEY)?)?;
     let topology = decode_topology(component_payload(state, NATIVE_V2_TOPOLOGY_COMPONENT_KEY)?)?;
@@ -1510,17 +1672,31 @@ pub fn decode_hvf_snapshot_v2_platform_state(
         .map_err(HvfSnapshotV2DecodeError::Build)
 }
 
-fn scan_component_profile(state: &SnapshotV2State<'_>) -> Result<usize, HvfSnapshotV2DecodeError> {
-    if state.metadata().version().minor() < 3 {
-        return Err(HvfSnapshotV2DecodeError::UnsupportedProfile);
-    }
+fn scan_component_profile(
+    state: &SnapshotV2State<'_>,
+    includes_device_graph: bool,
+) -> Result<usize, HvfSnapshotV2DecodeError> {
     let count = usize::try_from(state.metadata().component_count())
         .map_err(|_| HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
-    let max_count = 5_usize + usize::from(MAX_SUPPORTED_VCPUS);
-    if !(6..=max_count).contains(&count) {
+    let fixed_count = 5_usize
+        .checked_add(usize::from(includes_device_graph))
+        .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+    let minimum_count = fixed_count
+        .checked_add(1)
+        .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+    let max_count = fixed_count
+        .checked_add(usize::from(MAX_SUPPORTED_VCPUS))
+        .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+    if !(minimum_count..=max_count).contains(&count) {
         return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
     }
-    let vcpu_count = count - 5;
+    let vcpu_count = count - fixed_count;
+    let time_position = 4_usize
+        .checked_add(vcpu_count)
+        .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
+    let graph_position = time_position
+        .checked_add(1)
+        .ok_or(HvfSnapshotV2DecodeError::InvalidComponentProfile)?;
     for (position, component) in state.components().enumerate() {
         if component.disposition() != SnapshotV2ComponentDisposition::Semantic {
             return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
@@ -1530,11 +1706,15 @@ fn scan_component_profile(state: &SnapshotV2State<'_>) -> Result<usize, HvfSnaps
             1 => NATIVE_V2_MACHINE_COMPONENT_KEY,
             2 => NATIVE_V2_GLOBAL_COMPONENT_KEY,
             3 => NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
-            position if position < 4 + vcpu_count => native_v2_vcpu_component_key(
+            position if position < time_position => native_v2_vcpu_component_key(
                 u32::try_from(position - 4)
                     .map_err(|_| HvfSnapshotV2DecodeError::InvalidComponentProfile)?,
             ),
-            _ => NATIVE_V2_TIME_COMPONENT_KEY,
+            position if position == time_position => NATIVE_V2_TIME_COMPONENT_KEY,
+            position if includes_device_graph && position == graph_position => {
+                NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY
+            }
+            _ => return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile),
         };
         if component.key() != expected {
             return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);

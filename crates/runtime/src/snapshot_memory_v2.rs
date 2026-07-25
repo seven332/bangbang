@@ -18,6 +18,7 @@ use crate::memory::{
     GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError, GuestMemoryBacking,
     GuestMemoryRange, aarch64,
 };
+use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::snapshot_format_v2::{
     NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2Component,
@@ -456,6 +457,24 @@ pub fn write_snapshot_v2_memory_image<W: Write + Seek>(
     write_snapshot_v2_memory_image_with_cancel(memory, writer, |_| false)
 }
 
+/// Streams one image for an explicit known native-v2 compatibility version.
+///
+/// The ordinary writer remains fixed to [`NATIVE_V2_SNAPSHOT_VERSION`]. This
+/// seam lets dormant profiles write a binding and image header at the same
+/// exact version without advancing public snapshot publication.
+pub fn write_snapshot_v2_memory_image_with_compatibility_version<W: Write + Seek>(
+    memory: &GuestMemory,
+    writer: &mut W,
+    version: SnapshotFormatVersion,
+) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryWriteError> {
+    write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+        memory,
+        writer,
+        version,
+        |_| false,
+    )
+}
+
 /// Streams one canonical image with cooperative bounded-stage cancellation.
 pub fn write_snapshot_v2_memory_image_with_cancel<W, C>(
     memory: &GuestMemory,
@@ -466,13 +485,59 @@ where
     W: Write + Seek,
     C: FnMut(SnapshotV2MemoryIoStage) -> bool,
 {
-    let image_id = generate_image_id()?;
-    write_snapshot_v2_memory_image_with_id_and_cancel(memory, writer, image_id, is_cancelled)
+    write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+        memory,
+        writer,
+        NATIVE_V2_SNAPSHOT_VERSION,
+        is_cancelled,
+    )
 }
 
+/// Streams one explicitly versioned image with bounded-stage cancellation.
+pub fn write_snapshot_v2_memory_image_with_compatibility_version_and_cancel<W, C>(
+    memory: &GuestMemory,
+    writer: &mut W,
+    version: SnapshotFormatVersion,
+    is_cancelled: C,
+) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryWriteError>
+where
+    W: Write + Seek,
+    C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+{
+    let image_id = generate_image_id()?;
+    write_snapshot_v2_memory_image_with_version_id_and_cancel(
+        memory,
+        writer,
+        version,
+        image_id,
+        is_cancelled,
+    )
+}
+
+#[cfg(test)]
 fn write_snapshot_v2_memory_image_with_id_and_cancel<W, C>(
     memory: &GuestMemory,
     writer: &mut W,
+    image_id: SnapshotV2MemoryImageId,
+    is_cancelled: C,
+) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryWriteError>
+where
+    W: Write + Seek,
+    C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+{
+    write_snapshot_v2_memory_image_with_version_id_and_cancel(
+        memory,
+        writer,
+        NATIVE_V2_SNAPSHOT_VERSION,
+        image_id,
+        is_cancelled,
+    )
+}
+
+fn write_snapshot_v2_memory_image_with_version_id_and_cancel<W, C>(
+    memory: &GuestMemory,
+    writer: &mut W,
+    version: SnapshotFormatVersion,
     image_id: SnapshotV2MemoryImageId,
     mut is_cancelled: C,
 ) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryWriteError>
@@ -482,7 +547,7 @@ where
 {
     check_cancelled(&mut is_cancelled, SnapshotV2MemoryIoStage::InitialPosition)?;
     preflight_empty_output(writer)?;
-    let binding = binding_from_memory(memory, image_id)?;
+    let binding = binding_from_memory_with_version(memory, version, image_id)?;
     let header = binding.image_header()?;
 
     check_cancelled(&mut is_cancelled, SnapshotV2MemoryIoStage::Header)?;
@@ -1032,8 +1097,9 @@ fn open_regular_final(path: &Path) -> Result<File, SnapshotV2MemoryLoadError> {
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
-fn binding_from_memory(
+fn binding_from_memory_with_version(
     memory: &GuestMemory,
+    version: SnapshotFormatVersion,
     image_id: SnapshotV2MemoryImageId,
 ) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError> {
     let count = memory.regions().len();
@@ -1066,15 +1132,7 @@ fn binding_from_memory(
         .file_offset()
         .checked_add(last.range().size())
         .ok_or(SnapshotV2MemoryBindingError::LengthOverflow)?;
-    build_binding(image_id, extents, file_length)
-}
-
-fn build_binding(
-    image_id: SnapshotV2MemoryImageId,
-    extents: Vec<SnapshotV2MemoryExtent>,
-    file_length: u64,
-) -> Result<SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError> {
-    build_binding_with_version(NATIVE_V2_SNAPSHOT_VERSION, image_id, extents, file_length)
+    build_binding_with_version(version, image_id, extents, file_length)
 }
 
 fn build_binding_with_version(
@@ -1228,8 +1286,8 @@ fn decode_binding(bytes: &[u8]) -> Result<SnapshotV2MemoryBinding, SnapshotV2Mem
 fn validate_memory_version(
     version: SnapshotFormatVersion,
 ) -> Result<(), SnapshotV2MemoryBindingError> {
-    if version.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
-        && (1..=NATIVE_V2_SNAPSHOT_VERSION.minor()).contains(&version.minor())
+    if version.major() == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
+        && (1..=NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor()).contains(&version.minor())
     {
         Ok(())
     } else {

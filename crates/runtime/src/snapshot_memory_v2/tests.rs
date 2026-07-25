@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRegionBacking};
 use crate::snapshot_format_v2::{
-    NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION, SnapshotV2ComponentKey, decode_snapshot_v2_state,
+    NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION, SnapshotV2ComponentKey, SnapshotV2DecodeError,
+    decode_snapshot_v2_state,
 };
 
 use super::*;
@@ -145,6 +146,87 @@ fn canonical_binding_state_and_image_round_trip() {
 }
 
 #[test]
+fn exact_minor_four_memory_image_is_dormant_while_default_writer_stays_minor_three() {
+    let memory = test_memory();
+    let mut output = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut output,
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("minor-four compatibility image should encode");
+    let image = output.into_inner();
+    assert_eq!(
+        binding.version(),
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        &image[VERSION_MAJOR_OFFSET..VERSION_PATCH_OFFSET + size_of::<u16>()],
+        &[
+            2_u16.to_le_bytes(),
+            4_u16.to_le_bytes(),
+            0_u16.to_le_bytes(),
+        ]
+        .concat()
+    );
+    let binding_bytes = binding.encode().expect("minor-four binding should encode");
+    assert_eq!(
+        &image[..NATIVE_V2_MEMORY_HEADER_BYTES],
+        &binding_bytes[..NATIVE_V2_MEMORY_HEADER_BYTES]
+    );
+
+    let component = SnapshotV2Component::new(
+        NATIVE_V2_MEMORY_COMPONENT_KEY,
+        SnapshotV2ComponentDisposition::Semantic,
+        &binding_bytes,
+    );
+    let state_bytes =
+        crate::snapshot_format_v2::encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &[],
+            &[component],
+        )
+        .expect("minor-four memory state should encode internally");
+    assert!(matches!(
+        decode_snapshot_v2_state(&state_bytes),
+        Err(SnapshotV2DecodeError::UnsupportedVersion {
+            found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_SNAPSHOT_VERSION,
+        })
+    ));
+    let state = crate::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version(
+        &state_bytes,
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("minor-four memory state should decode internally");
+    assert_eq!(
+        decode_snapshot_v2_memory_binding(&state).expect("minor-four memory binding should decode"),
+        binding
+    );
+
+    let (_, default_binding) = write_test_image(&memory, TEST_ID);
+    assert_eq!(default_binding.version(), NATIVE_V2_SNAPSHOT_VERSION);
+
+    for version in [
+        NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION,
+        SnapshotFormatVersion::new(2, 5, 0),
+        SnapshotFormatVersion::new(3, 4, 0),
+    ] {
+        let mut rejected = Cursor::new(Vec::new());
+        assert!(matches!(
+            write_snapshot_v2_memory_image_with_compatibility_version(
+                &memory,
+                &mut rejected,
+                version,
+            ),
+            Err(SnapshotV2MemoryWriteError::Binding(
+                SnapshotV2MemoryBindingError::UnsupportedVersion
+            ))
+        ));
+    }
+}
+
+#[test]
 fn foundation_and_invalid_typed_component_profiles_fail_closed() {
     let memory = test_memory();
     let (_, binding) = write_test_image(&memory, TEST_ID);
@@ -207,7 +289,7 @@ fn binding_mutations_reject_header_integrity_topology_and_trailing_bytes() {
     ));
 
     let mut invalid_version = encoded.clone();
-    replace_u16(&mut invalid_version, VERSION_MINOR_OFFSET, 4);
+    replace_u16(&mut invalid_version, VERSION_MINOR_OFFSET, 5);
     replace_binding_checksum(&mut invalid_version);
     assert!(matches!(
         decode_binding(&invalid_version),
