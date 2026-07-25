@@ -608,6 +608,9 @@ impl fmt::Debug for HvfGicMsiInterrupt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfGicMsiInterruptAllocationError {
     Exhausted,
+    ExactDuplicate,
+    ExactOutOfRange,
+    ExactOccupied,
     StatePoisoned,
     GenerationExhausted,
     MetadataAllocation,
@@ -617,6 +620,13 @@ impl fmt::Display for HvfGicMsiInterruptAllocationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Exhausted => f.write_str("HVF GIC MSI interrupt range is exhausted"),
+            Self::ExactDuplicate => {
+                f.write_str("exact HVF GIC MSI interrupt batch contains a duplicate")
+            }
+            Self::ExactOutOfRange => {
+                f.write_str("exact HVF GIC MSI interrupt is outside the configured range")
+            }
+            Self::ExactOccupied => f.write_str("exact HVF GIC MSI interrupt is already allocated"),
             Self::StatePoisoned => {
                 f.write_str("HVF GIC MSI interrupt allocator state is unavailable")
             }
@@ -740,6 +750,73 @@ impl HvfGicMsiInterruptAllocator {
                 generation: slot.generation,
                 provenance: Arc::clone(&self.provenance),
             });
+        }
+        Ok(interrupts)
+    }
+
+    /// Atomically allocate one caller-ordered exact INTID batch.
+    pub fn allocate_many_exact(
+        &self,
+        intids: &[u32],
+    ) -> Result<Vec<HvfGicMsiInterrupt>, HvfGicMsiInterruptAllocationError> {
+        if intids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut state = self
+            .provenance
+            .state
+            .lock()
+            .map_err(|_| HvfGicMsiInterruptAllocationError::StatePoisoned)?;
+        let mut indices = Vec::new();
+        indices
+            .try_reserve_exact(intids.len())
+            .map_err(|_| HvfGicMsiInterruptAllocationError::MetadataAllocation)?;
+        for intid in intids {
+            let index = intid
+                .checked_sub(self.range.base)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|index| *index < state.slots.len())
+                .ok_or(HvfGicMsiInterruptAllocationError::ExactOutOfRange)?;
+            if indices.contains(&index) {
+                return Err(HvfGicMsiInterruptAllocationError::ExactDuplicate);
+            }
+            indices.push(index);
+        }
+        for index in &indices {
+            let slot = state
+                .slots
+                .get(*index)
+                .ok_or(HvfGicMsiInterruptAllocationError::StatePoisoned)?;
+            if slot.live {
+                return Err(HvfGicMsiInterruptAllocationError::ExactOccupied);
+            }
+            if slot.generation == u64::MAX {
+                return Err(HvfGicMsiInterruptAllocationError::GenerationExhausted);
+            }
+        }
+
+        let mut interrupts = Vec::new();
+        interrupts
+            .try_reserve_exact(intids.len())
+            .map_err(|_| HvfGicMsiInterruptAllocationError::MetadataAllocation)?;
+        for (intid, index) in intids.iter().copied().zip(indices.iter().copied()) {
+            let slot = state
+                .slots
+                .get(index)
+                .ok_or(HvfGicMsiInterruptAllocationError::StatePoisoned)?;
+            interrupts.push(HvfGicMsiInterrupt {
+                intid,
+                generation: slot.generation + 1,
+                provenance: Arc::clone(&self.provenance),
+            });
+        }
+        for index in indices {
+            let slot = state
+                .slots
+                .get_mut(index)
+                .ok_or(HvfGicMsiInterruptAllocationError::StatePoisoned)?;
+            slot.generation += 1;
+            slot.live = true;
         }
         Ok(interrupts)
     }
@@ -1061,13 +1138,14 @@ impl fmt::Debug for HvfGicMsiSharedInterruptOwner {
     }
 }
 
-/// One independently revocable registry backed by a shared VM GICv2m pool.
+/// One independently revocable registry backed by a shared GICv2m lease batch.
 ///
 /// Linux assigns MSI messages according to the vectors that each driver
 /// actually requests, which can be fewer than a device's maximum MSI-X table
-/// size. Every PCI function therefore resolves against the complete VM pool
-/// instead of a host-predicted device subrange. Exact leases remain live until
-/// the last registry releases them.
+/// size. Fresh startup can therefore share the complete VM pool instead of a
+/// host-predicted device subrange, while retained restore can bind an exact
+/// caller-supplied batch. In either case the leases remain live until the last
+/// registry releases them.
 pub struct HvfGicMsiDeviceInterruptResources {
     owner: Arc<HvfGicMsiSharedInterruptOwner>,
     registry: GuestMessageInterruptRegistry,
@@ -1084,6 +1162,27 @@ impl HvfGicMsiDeviceInterruptResources {
         let interrupts = allocator
             .allocate_many(count)
             .map_err(|source| HvfGicMsiDeviceInterruptResourceError::Allocate { source })?;
+        Self::from_interrupts(signaler, allocator, interrupts)
+    }
+
+    /// Atomically allocate and bind one caller-ordered exact GICv2m INTID
+    /// batch.
+    pub fn allocate_exact(
+        signaler: &HvfGicMsiSignaler,
+        intids: &[u32],
+    ) -> Result<Self, HvfGicMsiDeviceInterruptResourceError> {
+        let allocator = signaler.allocator();
+        let interrupts = allocator
+            .allocate_many_exact(intids)
+            .map_err(|source| HvfGicMsiDeviceInterruptResourceError::Allocate { source })?;
+        Self::from_interrupts(signaler, allocator, interrupts)
+    }
+
+    fn from_interrupts(
+        signaler: &HvfGicMsiSignaler,
+        allocator: HvfGicMsiInterruptAllocator,
+        interrupts: Vec<HvfGicMsiInterrupt>,
+    ) -> Result<Self, HvfGicMsiDeviceInterruptResourceError> {
         let mut routes: Vec<Arc<dyn GuestMessageInterrupt>> = Vec::new();
         if routes.try_reserve_exact(interrupts.len()).is_err() {
             return Err(rollback_device_interrupts(
@@ -3606,12 +3705,12 @@ mod tests {
         HvfArm64GicIccRegisterState, HvfGicApi, HvfGicDeviceState, HvfGicError,
         HvfGicIccRegisterApi, HvfGicIccRegisterReader, HvfGicIccRegisterRestorer,
         HvfGicIccRegisterWriteApi, HvfGicInterruptLineAllocator, HvfGicInterruptRange,
-        HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiDeviceInterruptResources,
-        HvfGicMsiInterrupt, HvfGicMsiInterruptAllocationError, HvfGicMsiInterruptAllocator,
-        HvfGicMsiInterruptReleaseError, HvfGicMsiMetadata, HvfGicMsiParameters,
-        HvfGicMsiSignalError, HvfGicMsiSignaler, HvfGicParameters, HvfGicPpiPendingWriter,
-        HvfGicRegion, HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicStateApi,
-        HvfGicStateRestoreApi, HvfGicStateRestorer, HvfGicTimerInterrupts,
+        HvfGicMetadata, HvfGicMsiConfiguration, HvfGicMsiDeviceInterruptResourceError,
+        HvfGicMsiDeviceInterruptResources, HvfGicMsiInterrupt, HvfGicMsiInterruptAllocationError,
+        HvfGicMsiInterruptAllocator, HvfGicMsiInterruptReleaseError, HvfGicMsiMetadata,
+        HvfGicMsiParameters, HvfGicMsiSignalError, HvfGicMsiSignaler, HvfGicParameters,
+        HvfGicPpiPendingWriter, HvfGicRegion, HvfGicSpiSignalError, HvfGicSpiSignaler,
+        HvfGicStateApi, HvfGicStateRestoreApi, HvfGicStateRestorer, HvfGicTimerInterrupts,
         HvfInterruptLineAllocationError, capture_gic_device_state_with_api,
         capture_gic_device_state_with_api_bounded, create_gic_with_api, metadata_from_parameters,
         restore_arm64_gic_icc_register_state_with,
@@ -4408,6 +4507,165 @@ mod tests {
                 .raw_value(),
             127
         );
+    }
+
+    #[test]
+    fn msi_interrupt_allocator_reserves_exact_batches_atomically_in_caller_order() {
+        let metadata = metadata_from_parameters(parameters_with_msi(4))
+            .expect("valid MSI demand should produce metadata");
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            FakeGicApi::default(),
+        )
+        .expect("MSI metadata should produce a signaler");
+        let allocator = signaler.allocator();
+
+        let leases = allocator
+            .allocate_many_exact(&[127, 124, 126])
+            .expect("mixed-order exact INTIDs should allocate");
+        assert_eq!(
+            leases
+                .iter()
+                .map(HvfGicMsiInterrupt::raw_value)
+                .collect::<Vec<_>>(),
+            vec![127, 124, 126]
+        );
+        assert_eq!(allocator.remaining(), 1);
+        allocator
+            .release_many(&leases)
+            .expect("exact batch should release atomically");
+        assert_eq!(allocator.remaining(), 4);
+        let reused = allocator
+            .allocate_many_exact(&[127, 124, 126])
+            .expect("released exact batch should be immediately reusable");
+        assert_eq!(
+            reused
+                .iter()
+                .map(HvfGicMsiInterrupt::raw_value)
+                .collect::<Vec<_>>(),
+            vec![127, 124, 126]
+        );
+        allocator
+            .release_many(&reused)
+            .expect("reused exact batch should release atomically");
+        assert_eq!(allocator.remaining(), 4);
+    }
+
+    #[test]
+    fn exact_msi_batch_rejections_preserve_incumbents_and_other_slots() {
+        let metadata = metadata_from_parameters(parameters_with_msi(4))
+            .expect("valid MSI demand should produce metadata");
+        let api = FakeGicApi::default();
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            api.clone(),
+        )
+        .expect("MSI metadata should produce a signaler");
+        let allocator = signaler.allocator();
+        let incumbent = allocator
+            .allocate_many_exact(&[125])
+            .expect("incumbent exact vector should allocate")
+            .pop()
+            .expect("incumbent lease should exist");
+        let incumbent_message = GuestMessage::new(signaler.address, incumbent.raw_value());
+        let incumbent_route = signaler
+            .route(&incumbent)
+            .expect("incumbent route should remain live");
+
+        for (requested, expected) in [
+            (
+                vec![124, 124],
+                HvfGicMsiInterruptAllocationError::ExactDuplicate,
+            ),
+            (
+                vec![123],
+                HvfGicMsiInterruptAllocationError::ExactOutOfRange,
+            ),
+            (
+                vec![124, 125, 127],
+                HvfGicMsiInterruptAllocationError::ExactOccupied,
+            ),
+        ] {
+            assert_eq!(allocator.allocate_many_exact(&requested), Err(expected),);
+            assert_eq!(allocator.remaining(), 3);
+            incumbent_route
+                .signal(incumbent_message)
+                .expect("rejected batch must not disturb incumbent route");
+        }
+        assert_eq!(api.msi_signals().len(), 3);
+
+        {
+            let mut state = allocator.provenance.state.lock().unwrap();
+            state.slots[2].generation = u64::MAX;
+        }
+        assert_eq!(
+            allocator.allocate_many_exact(&[124, 126, 127]),
+            Err(HvfGicMsiInterruptAllocationError::GenerationExhausted)
+        );
+        assert_eq!(allocator.remaining(), 3);
+        {
+            let mut state = allocator.provenance.state.lock().unwrap();
+            state.slots[2].generation = 0;
+        }
+
+        let peers = allocator
+            .allocate_many_exact(&[124, 127, 126])
+            .expect("all non-incumbent slots should remain free");
+        allocator
+            .release_many(&peers)
+            .expect("peer exact leases should release");
+        allocator
+            .release(&incumbent)
+            .expect("incumbent should remain releasable");
+        assert_eq!(allocator.remaining(), 4);
+    }
+
+    #[test]
+    fn exact_msi_device_resources_bind_routes_release_and_drop() {
+        let metadata = metadata_from_parameters(parameters_with_msi(3))
+            .expect("valid MSI demand should produce metadata");
+        let signaler = HvfGicMsiSignaler::with_api(
+            metadata.msi.expect("MSI metadata should exist"),
+            FakeGicApi::default(),
+        )
+        .expect("MSI metadata should produce a signaler");
+        let allocator = signaler.allocator();
+        assert!(matches!(
+            HvfGicMsiDeviceInterruptResources::allocate_exact(&signaler, &[]),
+            Err(HvfGicMsiDeviceInterruptResourceError::Registry {
+                source: GuestMessageInterruptRegistryError::Empty
+            })
+        ));
+        assert_eq!(allocator.remaining(), 3);
+
+        let mut resources =
+            HvfGicMsiDeviceInterruptResources::allocate_exact(&signaler, &[127, 125])
+                .expect("exact route resources should allocate");
+        assert_eq!(resources.lease_count(), 2);
+        for intid in [127, 125] {
+            resources
+                .registry()
+                .signal(GuestMessage::new(signaler.address, intid))
+                .expect("exact registry route should signal");
+        }
+        resources
+            .release()
+            .expect("exact resources should release explicitly");
+        assert_eq!(allocator.remaining(), 3);
+
+        {
+            let _dropped =
+                HvfGicMsiDeviceInterruptResources::allocate_exact(&signaler, &[126, 125])
+                    .expect("exact resources should allocate for Drop");
+            assert_eq!(allocator.remaining(), 1);
+        }
+        assert_eq!(allocator.remaining(), 3);
+        let reused = allocator
+            .allocate_many_exact(&[126, 125])
+            .expect("dropped exact resources should be reusable");
+        allocator
+            .release_many(&reused)
+            .expect("reused exact resources should release");
     }
 
     #[test]

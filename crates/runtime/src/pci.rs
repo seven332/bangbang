@@ -233,10 +233,6 @@ impl PciBarAllocator {
         if size < PCI_BAR_MINIMUM_SIZE || !size.is_power_of_two() {
             return Err(PciBarAllocationError::InvalidSize { size });
         }
-        let next_generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or(PciBarAllocationError::GenerationExhausted)?;
 
         let mut selected = None;
         for range in self.free.iter().copied() {
@@ -256,7 +252,65 @@ impl PciBarAllocator {
         let Some((selected_free, allocation)) = selected else {
             return Err(PciBarAllocationError::Exhausted { size });
         };
+        let next_free = self.plan_reservation(selected_free, allocation)?;
+        self.commit_reservation(allocation, next_free)
+    }
 
+    /// Validate whether one exact BAR range can be reserved without changing
+    /// allocator state.
+    pub fn validate_exact_reservation(
+        &self,
+        allocation: GuestMemoryRange,
+    ) -> Result<(), PciBarAllocationError> {
+        let selected_free = self.validate_exact_range(allocation)?;
+        self.plan_reservation(selected_free, allocation)?;
+        Ok(())
+    }
+
+    /// Reserve one caller-supplied exact BAR range.
+    pub fn reserve_exact(
+        &mut self,
+        allocation: GuestMemoryRange,
+    ) -> Result<PciBarLease, PciBarAllocationError> {
+        let selected_free = self.validate_exact_range(allocation)?;
+        let next_free = self.plan_reservation(selected_free, allocation)?;
+        self.commit_reservation(allocation, next_free)
+    }
+
+    fn validate_exact_range(
+        &self,
+        allocation: GuestMemoryRange,
+    ) -> Result<GuestMemoryRange, PciBarAllocationError> {
+        let size = allocation.size();
+        if size < PCI_BAR_MINIMUM_SIZE || !size.is_power_of_two() {
+            return Err(PciBarAllocationError::InvalidSize { size });
+        }
+        if allocation.validate_alignment(size).is_err() {
+            return Err(PciBarAllocationError::UnalignedExactRange);
+        }
+        if allocation.start() < self.capacity.start()
+            || self.capacity.end_exclusive() < allocation.end_exclusive()
+        {
+            return Err(PciBarAllocationError::ExactRangeOutsideCapacity);
+        }
+        self.free
+            .iter()
+            .copied()
+            .find(|range| {
+                range.start() <= allocation.start()
+                    && allocation.end_exclusive() <= range.end_exclusive()
+            })
+            .ok_or(PciBarAllocationError::ExactRangeOccupied)
+    }
+
+    fn plan_reservation(
+        &self,
+        selected_free: GuestMemoryRange,
+        allocation: GuestMemoryRange,
+    ) -> Result<Vec<GuestMemoryRange>, PciBarAllocationError> {
+        self.next_generation
+            .checked_add(1)
+            .ok_or(PciBarAllocationError::GenerationExhausted)?;
         let mut next_free = Vec::new();
         next_free
             .try_reserve_exact(self.free.len().saturating_add(1))
@@ -280,7 +334,18 @@ impl PciBarAllocator {
             }
         }
         next_free.sort_by_key(|range| range.start());
+        Ok(next_free)
+    }
 
+    fn commit_reservation(
+        &mut self,
+        allocation: GuestMemoryRange,
+        next_free: Vec<GuestMemoryRange>,
+    ) -> Result<PciBarLease, PciBarAllocationError> {
+        let next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or(PciBarAllocationError::GenerationExhausted)?;
         let generation = self.next_generation;
         self.free = next_free;
         let replaced = self.allocations.insert(
@@ -344,6 +409,9 @@ pub enum PciBarAllocationError {
     InvalidSize { size: u64 },
     AddressOverflow,
     Exhausted { size: u64 },
+    UnalignedExactRange,
+    ExactRangeOutsideCapacity,
+    ExactRangeOccupied,
     GenerationExhausted,
     MetadataAllocation,
     InvalidRange { source: GuestMemoryError },
@@ -368,6 +436,13 @@ impl fmt::Display for PciBarAllocationError {
             Self::Exhausted { size } => {
                 write!(f, "PCI BAR address space cannot fit {size} bytes")
             }
+            Self::UnalignedExactRange => {
+                f.write_str("exact PCI BAR range is not aligned to its size")
+            }
+            Self::ExactRangeOutsideCapacity => {
+                f.write_str("exact PCI BAR range is outside allocator capacity")
+            }
+            Self::ExactRangeOccupied => f.write_str("exact PCI BAR range is already occupied"),
             Self::GenerationExhausted => f.write_str("PCI BAR lease generation is exhausted"),
             Self::MetadataAllocation => f.write_str("PCI BAR allocator metadata allocation failed"),
             Self::InvalidRange { source } => write!(f, "invalid PCI BAR range: {source}"),
@@ -382,6 +457,9 @@ impl std::error::Error for PciBarAllocationError {
             Self::InvalidSize { .. }
             | Self::AddressOverflow
             | Self::Exhausted { .. }
+            | Self::UnalignedExactRange
+            | Self::ExactRangeOutsideCapacity
+            | Self::ExactRangeOccupied
             | Self::GenerationExhausted
             | Self::MetadataAllocation => None,
         }
@@ -710,7 +788,7 @@ impl PciType0Configuration {
         self.install_bar_range(index, lease.range(), lease.address_space(), prefetchable)
     }
 
-    fn install_bar_range(
+    pub(crate) fn install_bar_range(
         &mut self,
         index: u8,
         range: GuestMemoryRange,
@@ -937,6 +1015,68 @@ impl PciType0Configuration {
             writable_bytes,
             bar_probes,
         })
+    }
+
+    /// Apply only the guest-owned portion of one checked type-0 profile.
+    ///
+    /// The target profile supplies every immutable field and writable mask.
+    /// A rejected value leaves this configuration unchanged.
+    pub(crate) fn apply_guest_state(
+        &mut self,
+        profile: &PciType0SnapshotProfile,
+        guest_state: &PciType0GuestState,
+    ) -> Result<(), PciType0SnapshotError> {
+        let expected = self.snapshot_guest_state(profile)?;
+        if expected.writable_bytes.len() != guest_state.writable_bytes.len()
+            || expected.bar_probes.len() != guest_state.bar_probes.len()
+        {
+            return Err(PciType0SnapshotError::ProfileMismatch);
+        }
+        for (expected, supplied) in expected
+            .writable_bytes
+            .iter()
+            .zip(&guest_state.writable_bytes)
+        {
+            if expected.offset != supplied.offset
+                || expected.writable_mask != supplied.writable_mask
+                || supplied.value & !supplied.writable_mask != 0
+            {
+                return Err(PciType0SnapshotError::ProfileMismatch);
+            }
+        }
+        for (expected, supplied) in expected.bar_probes.iter().zip(&guest_state.bar_probes) {
+            if expected.index != supplied.index {
+                return Err(PciType0SnapshotError::ProfileMismatch);
+            }
+        }
+
+        let mut candidate = self.clone();
+        for writable in &guest_state.writable_bytes {
+            let byte_offset = usize::from(writable.offset);
+            let register_index = byte_offset / PCI_CONFIG_REGISTER_SIZE;
+            let byte_index = byte_offset % PCI_CONFIG_REGISTER_SIZE;
+            let shift = u32::try_from(byte_index * 8)
+                .map_err(|_| PciType0SnapshotError::ProfileMismatch)?;
+            let mask = u32::from(writable.writable_mask) << shift;
+            let value = u32::from(writable.value) << shift;
+            let register = candidate
+                .registers
+                .get_mut(register_index)
+                .ok_or(PciType0SnapshotError::ProfileMismatch)?;
+            *register = (*register & !mask) | (value & mask);
+        }
+        for probe in &guest_state.bar_probes {
+            let bar = candidate
+                .bars
+                .get_mut(&probe.index)
+                .ok_or(PciType0SnapshotError::ProfileMismatch)?;
+            bar.probe_pending = probe.pending;
+        }
+        if candidate.snapshot_guest_state(profile)? != *guest_state {
+            return Err(PciType0SnapshotError::ProfileMismatch);
+        }
+        *self = candidate;
+        Ok(())
     }
 
     fn configuration_byte(&self, offset: usize) -> u8 {
@@ -1220,19 +1360,7 @@ impl PciSegment {
         sbdf: PciSbdf,
         function: impl PciConfigFunction + 'static,
     ) -> Result<PciFunctionLease, PciSegmentError> {
-        if sbdf.segment() != PCI_SEGMENT_ZERO
-            || sbdf.bus() != PCI_BUS_ZERO
-            || sbdf.function() != PCI_FUNCTION_ZERO
-            || !(PCI_FIRST_ENDPOINT_DEVICE..=PCI_LAST_ENDPOINT_DEVICE).contains(&sbdf.device())
-        {
-            return Err(PciSegmentError::UnsupportedIdentity { sbdf });
-        }
-        if self.functions.contains_key(&sbdf.device())
-            || self.suspended_functions.contains_key(&sbdf.device())
-            || self.records.contains_key(&sbdf.device())
-        {
-            return Err(PciSegmentError::DuplicateIdentity { sbdf });
-        }
+        self.validate_function_at(sbdf)?;
         let next_generation = self
             .next_generation
             .checked_add(1)
@@ -1250,6 +1378,33 @@ impl PciSegment {
             generation,
             sbdf,
         })
+    }
+
+    /// Validate whether one exact function identity can be published without
+    /// changing segment state.
+    pub fn validate_function_at(&self, sbdf: PciSbdf) -> Result<(), PciSegmentError> {
+        Self::validate_function_identity(sbdf)?;
+        if self.functions.contains_key(&sbdf.device())
+            || self.suspended_functions.contains_key(&sbdf.device())
+            || self.records.contains_key(&sbdf.device())
+        {
+            return Err(PciSegmentError::DuplicateIdentity { sbdf });
+        }
+        self.next_generation
+            .checked_add(1)
+            .map(|_| ())
+            .ok_or(PciSegmentError::GenerationExhausted)
+    }
+
+    pub(crate) fn validate_function_identity(sbdf: PciSbdf) -> Result<(), PciSegmentError> {
+        if sbdf.segment() != PCI_SEGMENT_ZERO
+            || sbdf.bus() != PCI_BUS_ZERO
+            || sbdf.function() != PCI_FUNCTION_ZERO
+            || !(PCI_FIRST_ENDPOINT_DEVICE..=PCI_LAST_ENDPOINT_DEVICE).contains(&sbdf.device())
+        {
+            return Err(PciSegmentError::UnsupportedIdentity { sbdf });
+        }
+        Ok(())
     }
 
     pub fn remove_function(
@@ -1756,6 +1911,92 @@ mod tests {
     }
 
     #[test]
+    fn bar_allocator_reserves_exact_ranges_and_reuses_them_after_release() {
+        let capacity = range(0x1000, 0x8000);
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, capacity);
+        let middle_range = range(0x4000, 0x1000);
+
+        allocator
+            .validate_exact_reservation(middle_range)
+            .expect("aligned free exact BAR should preflight");
+        assert_eq!(allocator.available_ranges(), &[capacity]);
+        let middle = allocator
+            .reserve_exact(middle_range)
+            .expect("middle exact BAR should reserve");
+        assert_eq!(middle.range(), middle_range);
+        assert_eq!(
+            allocator.available_ranges(),
+            &[range(0x1000, 0x3000), range(0x5000, 0x4000)]
+        );
+
+        let beginning = allocator
+            .reserve_exact(range(0x1000, 0x1000))
+            .expect("beginning exact BAR should reserve");
+        let end = allocator
+            .reserve_exact(range(0x8000, 0x1000))
+            .expect("end exact BAR should reserve");
+        allocator
+            .release(&middle)
+            .expect("middle exact BAR should release");
+        let reused = allocator
+            .reserve_exact(middle_range)
+            .expect("released middle exact BAR should be reusable");
+
+        for lease in [&beginning, &end, &reused] {
+            allocator
+                .release(lease)
+                .expect("exact BAR lease should release");
+        }
+        assert_eq!(allocator.available_ranges(), &[capacity]);
+    }
+
+    #[test]
+    fn exact_bar_rejections_are_deterministic_and_mutation_free() {
+        let capacity = range(0x2000, 0x4000);
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, capacity);
+        let incumbent = allocator
+            .reserve_exact(range(0x3000, 0x1000))
+            .expect("incumbent exact BAR should reserve");
+        let before = allocator.available_ranges().to_vec();
+
+        for (candidate, expected) in [
+            (
+                range(0x2000, 0x18),
+                PciBarAllocationError::InvalidSize { size: 0x18 },
+            ),
+            (
+                range(0x2800, 0x1000),
+                PciBarAllocationError::UnalignedExactRange,
+            ),
+            (
+                range(0x1000, 0x1000),
+                PciBarAllocationError::ExactRangeOutsideCapacity,
+            ),
+            (
+                range(0x6000, 0x1000),
+                PciBarAllocationError::ExactRangeOutsideCapacity,
+            ),
+            (incumbent.range(), PciBarAllocationError::ExactRangeOccupied),
+        ] {
+            assert_eq!(
+                allocator.validate_exact_reservation(candidate),
+                Err(expected.clone())
+            );
+            assert!(matches!(
+                allocator.reserve_exact(candidate),
+                Err(source) if source == expected
+            ));
+            assert_eq!(allocator.available_ranges(), before);
+            assert_eq!(allocator.allocations.len(), 1);
+        }
+
+        allocator
+            .release(&incumbent)
+            .expect("incumbent exact BAR should remain releasable");
+        assert_eq!(allocator.available_ranges(), &[capacity]);
+    }
+
+    #[test]
     fn bar_allocator_exhaustively_reuses_fragmented_small_ranges() {
         for start_offset in 0..16 {
             for size in [16, 32, 64] {
@@ -2140,6 +2381,77 @@ mod tests {
     }
 
     #[test]
+    fn type0_guest_state_application_is_exact_and_failure_atomic() {
+        let (mut configuration, profile) = snapshot_configuration_pair();
+        let mut profile = profile;
+        configuration.set_writable_configuration_byte(4, 0x0f);
+        profile
+            .configuration
+            .set_writable_configuration_byte(4, 0x0f);
+        let original = configuration.clone();
+        let mut desired = configuration
+            .snapshot_guest_state(&profile)
+            .expect("test profile should capture");
+        for (index, byte) in desired.writable_bytes.iter_mut().enumerate() {
+            byte.value = u8::try_from(index + 1).unwrap_or(u8::MAX) & byte.writable_mask;
+        }
+        for probe in &mut desired.bar_probes {
+            probe.pending = true;
+        }
+
+        configuration
+            .apply_guest_state(&profile, &desired)
+            .expect("checked guest state should apply");
+        assert_eq!(
+            configuration
+                .snapshot_guest_state(&profile)
+                .expect("applied guest state should recapture"),
+            desired
+        );
+        assert_eq!(
+            read_config_u32(&mut configuration, 0),
+            read_config_u32(&mut original.clone(), 0),
+            "immutable identity must remain host-derived"
+        );
+
+        let applied = configuration.clone();
+        let mut malformed = Vec::new();
+        let mut missing = desired.clone();
+        missing.writable_bytes.pop();
+        malformed.push(missing);
+        let mut duplicate = desired.clone();
+        duplicate.writable_bytes.push(desired.writable_bytes[0]);
+        malformed.push(duplicate);
+        let mut wrong_mask = desired.clone();
+        wrong_mask.writable_bytes[0].writable_mask ^= 1;
+        malformed.push(wrong_mask);
+        let mut outside_mask = desired.clone();
+        outside_mask.writable_bytes[0].value |= !outside_mask.writable_bytes[0].writable_mask;
+        malformed.push(outside_mask);
+        let mut wrong_offset = desired.clone();
+        wrong_offset.writable_bytes[0].offset =
+            wrong_offset.writable_bytes[0].offset.saturating_add(1);
+        malformed.push(wrong_offset);
+        let mut missing_probe = desired.clone();
+        missing_probe.bar_probes.pop();
+        malformed.push(missing_probe);
+        let mut extra_probe = desired.clone();
+        extra_probe.bar_probes.push(desired.bar_probes[0]);
+        malformed.push(extra_probe);
+        let mut wrong_probe = desired.clone();
+        wrong_probe.bar_probes[0].index = u8::MAX;
+        malformed.push(wrong_probe);
+
+        for state in malformed {
+            assert_eq!(
+                configuration.apply_guest_state(&profile, &state),
+                Err(PciType0SnapshotError::ProfileMismatch)
+            );
+            assert_eq!(configuration, applied);
+        }
+    }
+
+    #[test]
     fn type0_snapshot_view_rejects_every_private_profile_class() {
         let (configuration, profile) = snapshot_configuration_pair();
         let mut mismatches = Vec::new();
@@ -2285,6 +2597,10 @@ mod tests {
             u32::MAX
         );
         assert!(matches!(
+            segment.validate_function_at(sbdf),
+            Err(PciSegmentError::DuplicateIdentity { sbdf: duplicate }) if duplicate == sbdf
+        ));
+        assert!(matches!(
             segment.add_function_at(sbdf, endpoint(0x1af4, 0x10ff)),
             Err(PciSegmentError::DuplicateIdentity { sbdf: duplicate }) if duplicate == sbdf
         ));
@@ -2326,15 +2642,24 @@ mod tests {
         let mut first = PciSegment::new();
         let mut second = PciSegment::new();
         let sbdf = PciSbdf::new(0, 0, 1, 0).expect("test PCI SBDF should be valid");
+        assert!(first.validate_function_at(sbdf).is_ok());
         let lease = first
             .add_function_at(sbdf, endpoint(0x1af4, 0x10ff))
             .expect("test endpoint should insert");
 
         assert!(matches!(
+            first.validate_function_at(sbdf),
+            Err(PciSegmentError::DuplicateIdentity { sbdf: duplicate }) if duplicate == sbdf
+        ));
+        assert!(matches!(
             first.add_function_at(sbdf, endpoint(0x1af4, 0x10ff)),
             Err(PciSegmentError::DuplicateIdentity { sbdf: duplicate }) if duplicate == sbdf
         ));
         let unsupported = PciSbdf::new(1, 0, 2, 0).expect("test PCI SBDF should be valid");
+        assert!(matches!(
+            first.validate_function_at(unsupported),
+            Err(PciSegmentError::UnsupportedIdentity { sbdf: actual }) if actual == unsupported
+        ));
         assert!(matches!(
             first.add_function_at(unsupported, endpoint(0x1af4, 0x10ff)),
             Err(PciSegmentError::UnsupportedIdentity { sbdf: actual }) if actual == unsupported

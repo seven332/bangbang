@@ -134,6 +134,28 @@ impl GuestMessageInterruptRegistry {
             .map_err(|_| GuestMessageInterruptRegistryError::StatePoisoned)
     }
 
+    /// Validate that one message resolves to exactly one active opaque route
+    /// without delivering it.
+    pub(crate) fn validate_message(
+        &self,
+        message: GuestMessage,
+    ) -> Result<(), GuestMessageInterruptRegistryError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| GuestMessageInterruptRegistryError::StatePoisoned)?;
+        if state.phase != GuestMessageInterruptRegistryPhase::Active {
+            return Err(GuestMessageInterruptRegistryError::NotActive { phase: state.phase });
+        }
+        self.resolve_route(message)?;
+        Ok(())
+    }
+
+    pub(crate) fn is_same_registry(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Resolve and signal one tuple while holding an in-flight lifecycle guard.
     pub fn signal(&self, message: GuestMessage) -> Result<(), GuestMessageInterruptRegistryError> {
         let route = {
@@ -146,18 +168,7 @@ impl GuestMessageInterruptRegistry {
                 return Err(GuestMessageInterruptRegistryError::NotActive { phase: state.phase });
             }
 
-            let mut matches = self
-                .inner
-                .routes
-                .iter()
-                .filter(|route| route.matches(message));
-            let route = matches
-                .next()
-                .cloned()
-                .ok_or(GuestMessageInterruptRegistryError::UnknownMessage)?;
-            if matches.next().is_some() {
-                return Err(GuestMessageInterruptRegistryError::AmbiguousMessage);
-            }
+            let route = self.resolve_route(message)?;
             state.in_flight = state
                 .in_flight
                 .checked_add(1)
@@ -171,6 +182,25 @@ impl GuestMessageInterruptRegistry {
         route
             .signal(message)
             .map_err(|source| GuestMessageInterruptRegistryError::Signal { source })
+    }
+
+    fn resolve_route(
+        &self,
+        message: GuestMessage,
+    ) -> Result<Arc<dyn GuestMessageInterrupt>, GuestMessageInterruptRegistryError> {
+        let mut matches = self
+            .inner
+            .routes
+            .iter()
+            .filter(|route| route.matches(message));
+        let route = matches
+            .next()
+            .cloned()
+            .ok_or(GuestMessageInterruptRegistryError::UnknownMessage)?;
+        if matches.next().is_some() {
+            return Err(GuestMessageInterruptRegistryError::AmbiguousMessage);
+        }
+        Ok(route)
     }
 
     /// Close admission without waiting for already admitted sends.
@@ -492,6 +522,15 @@ mod tests {
         let registry = GuestMessageInterruptRegistry::new(vec![first_route, second_route])
             .expect("registry should build");
 
+        registry
+            .validate_message(second)
+            .expect("second route should validate without signaling");
+        assert!(
+            second_sent
+                .lock()
+                .expect("second lock should work")
+                .is_empty()
+        );
         registry.signal(second).expect("second route should signal");
 
         assert!(
@@ -503,6 +542,10 @@ mod tests {
         assert_eq!(
             *second_sent.lock().expect("second lock should work"),
             vec![second]
+        );
+        assert_eq!(
+            registry.validate_message(GuestMessage::new(0x1000, 34)),
+            Err(GuestMessageInterruptRegistryError::UnknownMessage)
         );
         assert_eq!(
             registry.signal(GuestMessage::new(0x1000, 34)),
@@ -519,9 +562,28 @@ mod tests {
             GuestMessageInterruptRegistry::new(vec![first, second]).expect("registry should build");
 
         assert_eq!(
+            registry.validate_message(message),
+            Err(GuestMessageInterruptRegistryError::AmbiguousMessage)
+        );
+        assert_eq!(
             registry.signal(message),
             Err(GuestMessageInterruptRegistryError::AmbiguousMessage)
         );
+    }
+
+    #[test]
+    fn registry_identity_matches_only_clones_of_the_same_authority() {
+        let message = GuestMessage::new(0x1000, 32);
+        let (_, first_route) = route(message);
+        let (_, second_route) = route(message);
+        let first =
+            GuestMessageInterruptRegistry::new(vec![first_route]).expect("registry should build");
+        let clone = first.clone();
+        let second =
+            GuestMessageInterruptRegistry::new(vec![second_route]).expect("registry should build");
+
+        assert!(first.is_same_registry(&clone));
+        assert!(!first.is_same_registry(&second));
     }
 
     #[test]
@@ -573,6 +635,12 @@ mod tests {
             GuestMessageInterruptRegistry::new(vec![route]).expect("registry should build");
 
         registry.begin_quiesce().expect("quiesce should start");
+        assert_eq!(
+            registry.validate_message(message),
+            Err(GuestMessageInterruptRegistryError::NotActive {
+                phase: GuestMessageInterruptRegistryPhase::Quiescing,
+            })
+        );
         assert_eq!(
             registry.signal(message),
             Err(GuestMessageInterruptRegistryError::NotActive {
