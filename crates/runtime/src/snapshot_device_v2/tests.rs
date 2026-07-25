@@ -710,6 +710,20 @@ fn invalid_utf8_and_noncanonical_string_presence_fail_closed() {
         SnapshotV2DeviceGraph::decode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, &bytes,),
         Err(SnapshotV2DeviceGraphDecodeError::InvalidString)
     );
+
+    let mut invalid = mmio_graph();
+    invalid.record.config.drive_id = "bad/id".to_string();
+    assert_eq!(
+        invalid.encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION),
+        Err(SnapshotV2DeviceGraphEncodeError::InvalidGraph)
+    );
+
+    let mut bytes = original;
+    bytes[config + CONFIG_FIXED_BYTES] = b'/';
+    assert_eq!(
+        SnapshotV2DeviceGraph::decode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, &bytes,),
+        Err(SnapshotV2DeviceGraphDecodeError::InvalidGraph)
+    );
 }
 
 #[test]
@@ -785,6 +799,13 @@ fn hostile_config_block_and_common_section_mutations_fail_closed() {
     cases.push(bytes);
     let mut bytes = original.clone();
     overwrite_u64(&mut bytes, block + 96, 0);
+    cases.push(bytes);
+    let mut bytes = original.clone();
+    overwrite_u16(
+        &mut bytes,
+        block + 40,
+        6_u16.wrapping_add(VIRTIO_BLOCK_QUEUE_SIZE).wrapping_add(1),
+    );
     cases.push(bytes);
 
     let mut bytes = original.clone();
@@ -865,7 +886,6 @@ fn hostile_mmio_and_pci_transport_section_mutations_fail_closed() {
         (pci + 2, 1),
         (pci + 3, 1),
         (pci + 4, 1),
-        (pci + 5, 1),
         (pci + 6, 1),
         (pci + 7, 1),
         (pci + 10, 1),
@@ -881,7 +901,6 @@ fn hostile_mmio_and_pci_transport_section_mutations_fail_closed() {
     }
     for (offset, value) in [
         (pci + 8, 1_u16),
-        (pci + 40, 1),
         (pci + 42, 3),
         (pci + 44, 1),
         (pci + 46, 1),
@@ -893,16 +912,9 @@ fn hostile_mmio_and_pci_transport_section_mutations_fail_closed() {
         overwrite_u16(&mut bytes, offset, value);
         pci_cases.push(bytes);
     }
-    for (offset, value) in [
-        (pci + 32, 2_u32),
-        (pci + 36, 2),
-        (pci + 52, 1),
-        (pci + 60, 3),
-    ] {
-        let mut bytes = pci_original.clone();
-        overwrite_u32(&mut bytes, offset, value);
-        pci_cases.push(bytes);
-    }
+    let mut bytes = pci_original.clone();
+    overwrite_u32(&mut bytes, pci + 52, 1);
+    pci_cases.push(bytes);
     for (offset, value) in [
         (pci + 16, PCI_BAR64_START + 1),
         (pci + 24, VIRTIO_PCI_CAPABILITY_BAR_SIZE - 1),
@@ -953,6 +965,15 @@ fn invalid_block_common_and_mmio_semantics_are_rejected_before_encode() {
     );
     let mut invalid = graph.clone();
     invalid.record.block.active_queue = Some(crate::block::VirtioBlockQueueState::new(7, 7));
+    assert_eq!(
+        invalid.encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION),
+        Err(SnapshotV2DeviceGraphEncodeError::InvalidGraph)
+    );
+    let mut invalid = graph.clone();
+    invalid.record.block.active_queue = Some(crate::block::VirtioBlockQueueState::new(
+        6_u16.wrapping_add(VIRTIO_BLOCK_QUEUE_SIZE).wrapping_add(1),
+        6,
+    ));
     assert_eq!(
         invalid.encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION),
         Err(SnapshotV2DeviceGraphEncodeError::InvalidGraph)
@@ -1025,7 +1046,7 @@ fn invalid_block_common_and_mmio_semantics_are_rejected_before_encode() {
 }
 
 #[test]
-fn invalid_pci_placement_configuration_and_msix_semantics_are_rejected() {
+fn invalid_pci_placement_and_msix_semantics_are_rejected() {
     let graph = pci_graph();
 
     let mut invalid = graph.clone();
@@ -1033,26 +1054,6 @@ fn invalid_pci_placement_configuration_and_msix_semantics_are_rejected() {
         panic!("fixture should use PCI");
     };
     pci.origin = StorageDeviceOrigin::Runtime;
-    assert_eq!(
-        invalid.encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION),
-        Err(SnapshotV2DeviceGraphEncodeError::InvalidGraph)
-    );
-
-    let mut invalid = graph.clone();
-    let SnapshotV2DeviceTransport::Pci(pci) = &mut invalid.record.transport else {
-        panic!("fixture should use PCI");
-    };
-    pci.device_feature_select = 2;
-    assert_eq!(
-        invalid.encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION),
-        Err(SnapshotV2DeviceGraphEncodeError::InvalidGraph)
-    );
-
-    let mut invalid = graph.clone();
-    let SnapshotV2DeviceTransport::Pci(pci) = &mut invalid.record.transport else {
-        panic!("fixture should use PCI");
-    };
-    pci.pci_cfg_length = 3;
     assert_eq!(
         invalid.encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION),
         Err(SnapshotV2DeviceGraphEncodeError::InvalidGraph)
@@ -1751,6 +1752,97 @@ fn real_pci_capture_uses_checked_configuration_profile_and_preserves_stable_id()
             .expect("converted PCI graph should decode")
         ),
         encoded(&graph)
+    );
+}
+
+#[test]
+fn real_pci_capture_preserves_inert_guest_selectors_exactly() {
+    let file = TempFile::new("pci-selectors.img", 8192);
+    let fixture = PciRuntimeFixture::new(file.path());
+    let mut bus = MmioBus::new();
+    bus.insert(
+        MmioRegionId::new(78),
+        fixture.bar.range().start(),
+        fixture.bar.range().size(),
+    )
+    .expect("test PCI BAR should register");
+    let mut handler = fixture.endpoint.bar_handler();
+    pci_bar_write(
+        &mut handler,
+        &bus,
+        &fixture.bar,
+        0x00,
+        &u32::MAX.to_le_bytes(),
+    );
+    pci_bar_write(
+        &mut handler,
+        &bus,
+        &fixture.bar,
+        0x08,
+        &0x8000_0002_u32.to_le_bytes(),
+    );
+    pci_bar_write(
+        &mut handler,
+        &bus,
+        &fixture.bar,
+        0x16,
+        &u16::MAX.to_le_bytes(),
+    );
+    drop(handler);
+
+    let pci_cfg_cap_offset = fixture
+        .endpoint
+        .transport_state()
+        .expect("test PCI transport should capture")
+        .pci_cfg_cap_offset();
+    let mut configuration = fixture.endpoint.config_function();
+    configuration
+        .write_config(
+            pci_cfg_cap_offset
+                .checked_add(4)
+                .expect("test PCI selector BAR should fit"),
+            &[5],
+        )
+        .expect("test PCI selector BAR should write");
+    configuration
+        .write_config(
+            pci_cfg_cap_offset
+                .checked_add(8)
+                .expect("test PCI selector offset should fit"),
+            &u32::MAX.to_le_bytes(),
+        )
+        .expect("test PCI selector offset should write");
+    configuration
+        .write_config(
+            pci_cfg_cap_offset
+                .checked_add(12)
+                .expect("test PCI selector length should fit"),
+            &3_u32.to_le_bytes(),
+        )
+        .expect("test PCI selector length should write");
+    drop(configuration);
+
+    let graph = SnapshotV2DeviceGraph::from_capture_ready_root(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &fixture.capture(),
+    )
+    .expect("reachable inert PCI selectors should convert");
+    let SnapshotV2DeviceTransport::Pci(pci) = graph.record().transport() else {
+        panic!("converted graph should retain PCI");
+    };
+    assert_eq!(pci.device_feature_select(), u32::MAX);
+    assert_eq!(pci.driver_feature_select(), 0x8000_0002);
+    assert_eq!(pci.queue_select(), u16::MAX);
+    assert_eq!(pci.pci_cfg_bar(), 5);
+    assert_eq!(pci.pci_cfg_offset(), u32::MAX);
+    assert_eq!(pci.pci_cfg_length(), 3);
+    assert_eq!(
+        SnapshotV2DeviceGraph::decode(
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &encoded(&graph),
+        )
+        .expect("reachable inert PCI selectors should decode"),
+        graph
     );
 }
 

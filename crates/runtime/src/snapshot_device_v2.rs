@@ -1507,6 +1507,12 @@ fn capture_pci_writable_bytes(
 fn capture_msix_state(
     state: &VirtioPciMsixState,
 ) -> Result<SnapshotV2PciMsixState, SnapshotV2DeviceGraphCaptureError> {
+    if state.entries().len() != 2
+        || state.pending_words().len() != 1
+        || state.queue_vectors().len() != 1
+    {
+        return Err(SnapshotV2DeviceGraphCaptureError::InvalidPciState);
+    }
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(state.entries().len())
@@ -1566,6 +1572,13 @@ fn validate_graph(graph: &SnapshotV2DeviceGraph) -> Result<(), GraphValidationEr
     if graph.record.block.active_queue.is_some() != graph.record.virtio.activated {
         return Err(GraphValidationError::Block);
     }
+    let queue = graph
+        .record
+        .virtio
+        .queues
+        .first()
+        .ok_or(GraphValidationError::Virtio)?;
+    validate_block_queue_cursors(&graph.record.block, queue)?;
     let placement = match &graph.record.transport {
         SnapshotV2DeviceTransport::Mmio(state) => {
             validate_mmio_state(state)?;
@@ -1576,12 +1589,6 @@ fn validate_graph(graph: &SnapshotV2DeviceGraph) -> Result<(), GraphValidationEr
             state.bar_range
         }
     };
-    let queue = graph
-        .record
-        .virtio
-        .queues
-        .first()
-        .ok_or(GraphValidationError::Virtio)?;
     if queue_ranges(queue)?
         .is_some_and(|ranges| ranges.iter().any(|range| range.overlaps(placement)))
     {
@@ -1593,6 +1600,13 @@ fn validate_graph(graph: &SnapshotV2DeviceGraph) -> Result<(), GraphValidationEr
 fn validate_root_config(config: &SnapshotV2RootBlockConfig) -> Result<(), GraphValidationError> {
     validate_nonempty_string(&config.drive_id, NATIVE_V2_DEVICE_GRAPH_MAX_DRIVE_ID_BYTES)
         .map_err(|_| GraphValidationError::Configuration)?;
+    if !config
+        .drive_id
+        .chars()
+        .all(|character| character == '_' || character.is_alphanumeric())
+    {
+        return Err(GraphValidationError::Configuration);
+    }
     if let Some(partuuid) = config.partuuid.as_deref() {
         validate_nonempty_string(partuuid, NATIVE_V2_DEVICE_GRAPH_MAX_PARTUUID_BYTES)
             .map_err(|_| GraphValidationError::Configuration)?;
@@ -1626,6 +1640,20 @@ fn validate_block_state(
         return Err(GraphValidationError::Block);
     }
     Ok(())
+}
+
+fn validate_block_queue_cursors(
+    block: &SnapshotV2BlockState,
+    queue: &SnapshotV2VirtioQueueState,
+) -> Result<(), GraphValidationError> {
+    if block
+        .active_queue
+        .is_some_and(|state| state.next_available().wrapping_sub(state.next_used()) > queue.size)
+    {
+        Err(GraphValidationError::Block)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_limiter_config(
@@ -1850,16 +1878,6 @@ fn validate_pci_state(state: &SnapshotV2PciDeviceState) -> Result<(), GraphValid
         || state.bar_range.start().raw_value() < PCI_BAR64_START
         || state.bar_range.end_exclusive().raw_value()
             > PCI_BAR64_START.saturating_add(PCI_BAR64_SIZE)
-        || state.device_feature_select > 1
-        || state.driver_feature_select > 1
-        || state.queue_select != 0
-        || state.pci_cfg_bar != state.bar_index
-        || !matches!(state.pci_cfg_length, 0 | 1 | 2 | 4)
-        || (state.pci_cfg_length == 0 && state.pci_cfg_offset != 0)
-        || (state.pci_cfg_length != 0
-            && u64::from(state.pci_cfg_offset)
-                .checked_add(u64::from(state.pci_cfg_length))
-                .is_none_or(|end| end > state.bar_range.size()))
         || state.writable_bytes.len() != PCI_GENERIC_WRITABLE_BYTES.len()
         || state.bar_probes.len() != 2
     {
