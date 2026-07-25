@@ -1186,6 +1186,7 @@ pub struct VirtioMmioTransportState {
     pending_notifications: Vec<bool>,
     interrupt_status: DeviceInterruptStatus,
     device_activated: bool,
+    requires_device_config_write_status: bool,
 }
 
 impl VirtioMmioTransportState {
@@ -1196,6 +1197,7 @@ impl VirtioMmioTransportState {
         pending_notifications: Vec<bool>,
         interrupt_status: DeviceInterruptStatus,
         device_activated: bool,
+        requires_device_config_write_status: bool,
     ) -> Self {
         Self {
             device,
@@ -1204,6 +1206,7 @@ impl VirtioMmioTransportState {
             pending_notifications,
             interrupt_status,
             device_activated,
+            requires_device_config_write_status,
         }
     }
 
@@ -1230,6 +1233,11 @@ impl VirtioMmioTransportState {
     pub const fn is_device_activated(&self) -> bool {
         self.device_activated
     }
+
+    /// Returns whether device-configuration writes require driver-ready status.
+    pub const fn requires_device_config_write_status(&self) -> bool {
+        self.requires_device_config_write_status
+    }
 }
 
 impl fmt::Debug for VirtioMmioTransportState {
@@ -1249,6 +1257,7 @@ pub(crate) enum VirtioMmioTransportStateError {
     MissingVersionOneDriverFeature,
     UnhealthyDeviceStatus,
     ActivationMismatch,
+    DeviceConfigWritePolicyMismatch,
     QueueCountMismatch,
     QueueSelectorOutOfBounds,
     QueueMaxSizeMismatch,
@@ -1283,6 +1292,9 @@ impl fmt::Display for VirtioMmioTransportStateError {
             }
             Self::ActivationMismatch => {
                 f.write_str("persisted virtio-mmio activation state is inconsistent")
+            }
+            Self::DeviceConfigWritePolicyMismatch => {
+                f.write_str("persisted virtio-mmio device-config write policy does not match")
             }
             Self::QueueCountMismatch => {
                 f.write_str("persisted virtio-mmio queue count does not match")
@@ -1885,6 +1897,7 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
             self.queue_notifications.pending_notifications.clone(),
             self.interrupts.pending_status,
             self.device_activated,
+            self.core.requires_device_config_write_status,
         )
     }
 
@@ -2956,6 +2969,10 @@ fn validate_transport_state<C, A>(
     {
         return Err(VirtioMmioTransportStateError::ActivationMismatch);
     }
+    if state.requires_device_config_write_status != handler.core.requires_device_config_write_status
+    {
+        return Err(VirtioMmioTransportStateError::DeviceConfigWritePolicyMismatch);
+    }
 
     if state.queues.len() != handler.queues.queues.len() {
         return Err(VirtioMmioTransportStateError::QueueCountMismatch);
@@ -3221,8 +3238,9 @@ mod tests {
     use std::error::Error as _;
 
     use super::{
-        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET,
-        VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FAILED,
+        UnsupportedVirtioMmioDeviceConfig, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FAILED,
         VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT,
         VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
         VIRTIO_MMIO_FEATURE_VERSION_1, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_NOTIFY_OFFSET,
@@ -5640,6 +5658,35 @@ mod tests {
                 .restore_transport_state(&invalid, false)
                 .expect_err("failed state should reject"),
             VirtioMmioTransportStateError::UnhealthyDeviceStatus
+        );
+        assert_eq!(target.transport_state(), before);
+    }
+
+    #[test]
+    fn transport_restore_rejects_device_config_write_policy_mismatch_without_mutation() {
+        let source =
+            VirtioMmioRegisterHandler::new(2, 0, &[256]).expect("source transport should build");
+        assert!(
+            !source
+                .transport_state()
+                .requires_device_config_write_status()
+        );
+        let state = source.transport_state();
+        let mut target = VirtioMmioRegisterHandler::with_device_config(
+            2,
+            0,
+            &[256],
+            UnsupportedVirtioMmioDeviceConfig,
+        )
+        .expect("device-config transport should build");
+        let before = target.transport_state();
+        assert!(before.requires_device_config_write_status());
+
+        assert_eq!(
+            target
+                .restore_transport_state(&state, false)
+                .expect_err("policy mismatch should reject"),
+            VirtioMmioTransportStateError::DeviceConfigWritePolicyMismatch
         );
         assert_eq!(target.transport_state(), before);
     }

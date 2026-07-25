@@ -809,6 +809,7 @@ fn validate_encode_transport(
         || transport.pending_notifications().len() != 1
         || queue.map(|queue| queue.max_size()) != Some(crate::block::VIRTIO_BLOCK_QUEUE_SIZE)
         || notification.copied() != Some(false)
+        || !transport.requires_device_config_write_status()
     {
         return Err(SnapshotV1DeviceEncodeError::InvalidState);
     }
@@ -1290,6 +1291,7 @@ fn decode_transport(
         pending_notifications,
         interrupt_status,
         device_activated,
+        true,
     );
     Ok((transport, active_queue))
 }
@@ -1660,6 +1662,7 @@ mod tests {
             vec![false],
             DeviceInterruptStatus::empty(),
             false,
+            true,
         );
         let runtime = VirtioBlockRuntimeState::new(
             transport,
@@ -1741,6 +1744,49 @@ mod tests {
     }
 
     #[test]
+    fn native_v1_codec_defaults_true_config_write_policy_and_rejects_lossy_false_state() {
+        let mut state = fixture();
+        let encoded = encode_snapshot_v1_device_state(&state)
+            .expect("canonical native-v1 state should encode");
+        let decoded = decode_snapshot_v1_device_state(&encoded)
+            .expect("canonical native-v1 bytes should decode");
+        assert!(
+            decoded
+                .root_block()
+                .runtime()
+                .transport()
+                .requires_device_config_write_status()
+        );
+        assert_eq!(
+            encode_snapshot_v1_device_state(&decoded)
+                .expect("decoded canonical native-v1 state should re-encode"),
+            encoded
+        );
+
+        let original = state.root_block.runtime();
+        let transport = original.transport();
+        let false_policy = VirtioMmioTransportState::from_parts(
+            *transport.device_registers(),
+            transport.queue_select(),
+            transport.queues().to_vec(),
+            transport.pending_notifications().to_vec(),
+            transport.interrupt_status(),
+            transport.is_device_activated(),
+            false,
+        );
+        state.root_block.runtime = VirtioBlockRuntimeState::new(
+            false_policy,
+            original.active_queue(),
+            original.rate_limiter(),
+        );
+        assert_eq!(
+            encode_snapshot_v1_device_state(&state)
+                .expect_err("unrepresentable native-v1 policy should reject"),
+            SnapshotV1DeviceEncodeError::InvalidState
+        );
+    }
+
+    #[test]
     fn native_v1_device_codec_retains_legacy_vmclock_page_policy() {
         let mut state = fixture();
         state.vmclock_abi = None;
@@ -1803,6 +1849,7 @@ mod tests {
             vec![queue],
             vec![false],
             interrupts,
+            true,
             true,
         );
         let bucket_config = DriveTokenBucketConfig::new(100, Some(10), 1000);

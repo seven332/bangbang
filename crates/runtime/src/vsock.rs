@@ -12742,6 +12742,7 @@ mod tests {
             original.pending_notifications().to_vec(),
             original.interrupt_status(),
             device_activated,
+            original.requires_device_config_write_status(),
         )
     }
 
