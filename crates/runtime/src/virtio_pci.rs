@@ -8,7 +8,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::memory::GuestAddress;
+use crate::memory::{GuestAddress, GuestMemoryRange};
 use crate::message_interrupt::{
     GuestMessage, GuestMessageInterruptRegistry, GuestMessageInterruptRegistryError,
     GuestMessageInterruptRegistryPhase, GuestMessageInterruptResources,
@@ -24,15 +24,16 @@ use crate::pci::{
     PciBarLease, PciBarPrefetchable, PciBarReleaseError, PciCapabilityError, PciCapabilityId,
     PciClassCode, PciConfigAccessError, PciConfigFunction, PciFunctionLease,
     PciFunctionReleaseError, PciSegmentError, PciSegmentLockError, PciType0Configuration,
-    SharedPciSegment,
+    PciType0GuestState, PciType0SnapshotError, PciType0SnapshotProfile, SharedPciSegment,
 };
 use crate::virtio::{
     VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK,
     VIRTIO_DEVICE_STATUS_FAILED, VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT,
     VirtioDeviceActivation, VirtioDeviceActivationHandler, VirtioDeviceConfigAccess,
     VirtioDeviceConfigError, VirtioDeviceConfigHandler, VirtioDeviceCore, VirtioDeviceResetError,
-    VirtioDeviceResetOutcome, VirtioDeviceType, VirtioDeviceWorkGuard, VirtioInterruptIntent,
-    VirtioQueueError, VirtioQueueNotificationError, VirtioQueueNotificationState, VirtioQueues,
+    VirtioDeviceResetOutcome, VirtioDeviceType, VirtioDeviceTypeError, VirtioDeviceWorkGuard,
+    VirtioInterruptIntent, VirtioQueueError, VirtioQueueNotificationError,
+    VirtioQueueNotificationState, VirtioQueues,
 };
 use crate::virtio_mmio::{
     VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError, VirtioMmioRegister,
@@ -229,6 +230,113 @@ impl VirtioPciTransportState {
 
     pub const fn msix_state(&self) -> &VirtioPciMsixState {
         &self.msix
+    }
+
+    pub(crate) fn checked_configuration_guest_state(
+        &self,
+        bar_range: GuestMemoryRange,
+    ) -> Result<PciType0GuestState, VirtioPciConfigurationSnapshotError> {
+        if bar_range.size() != VIRTIO_PCI_CAPABILITY_BAR_SIZE {
+            return Err(VirtioPciConfigurationSnapshotError::BarSize);
+        }
+        let device_type = VirtioDeviceType::new(self.device.device_id())
+            .map_err(VirtioPciConfigurationSnapshotError::DeviceType)?;
+        let (class_code, subclass) = pci_class(device_type);
+        let device_id = device_type.modern_pci_device_id();
+        let mut profile = PciType0SnapshotProfile::new(
+            VIRTIO_PCI_VENDOR_ID,
+            device_id,
+            VIRTIO_PCI_REVISION_ID,
+            class_code,
+            subclass,
+            0,
+            VIRTIO_PCI_VENDOR_ID,
+            device_id,
+        );
+        profile
+            .install_bar(
+                VIRTIO_PCI_CAPABILITY_BAR_INDEX,
+                bar_range,
+                PciBarAddressSpace::Memory64,
+                PciBarPrefetchable::No,
+            )
+            .map_err(VirtioPciConfigurationSnapshotError::Bar)?;
+        let (pci_cfg_cap_offset, msix_cap_offset) =
+            add_virtio_pci_snapshot_capabilities(&mut profile, self.msix.vector_count())?;
+        if self.pci_cfg_cap_offset != pci_cfg_cap_offset || self.msix_cap_offset != msix_cap_offset
+        {
+            return Err(VirtioPciConfigurationSnapshotError::CapabilityOffset);
+        }
+        self.configuration
+            .snapshot_guest_state(&profile)
+            .map_err(VirtioPciConfigurationSnapshotError::Configuration)
+    }
+}
+
+pub(crate) enum VirtioPciConfigurationSnapshotError {
+    DeviceType(VirtioDeviceTypeError),
+    BarSize,
+    Bar(PciBarConfigurationError),
+    TooManyVectors,
+    Capability(PciCapabilityError),
+    CapabilityOffset,
+    Configuration(PciType0SnapshotError),
+}
+
+impl fmt::Debug for VirtioPciConfigurationSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::DeviceType(_) => "DeviceType",
+            Self::BarSize => "BarSize",
+            Self::Bar(_) => "Bar",
+            Self::TooManyVectors => "TooManyVectors",
+            Self::Capability(_) => "Capability",
+            Self::CapabilityOffset => "CapabilityOffset",
+            Self::Configuration(_) => "Configuration",
+        };
+        formatter
+            .debug_struct("VirtioPciConfigurationSnapshotError")
+            .field("kind", &kind)
+            .field("detail", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for VirtioPciConfigurationSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceType(_) => {
+                formatter.write_str("virtio-pci snapshot device type is invalid")
+            }
+            Self::BarSize => {
+                formatter.write_str("virtio-pci snapshot capability BAR size is invalid")
+            }
+            Self::Bar(_) => formatter.write_str("virtio-pci snapshot BAR profile is invalid"),
+            Self::TooManyVectors => {
+                formatter.write_str("virtio-pci snapshot vector count is invalid")
+            }
+            Self::Capability(_) => {
+                formatter.write_str("virtio-pci snapshot capability profile is invalid")
+            }
+            Self::CapabilityOffset => {
+                formatter.write_str("virtio-pci snapshot capability offsets do not match")
+            }
+            Self::Configuration(_) => {
+                formatter.write_str("virtio-pci snapshot configuration profile does not match")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioPciConfigurationSnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DeviceType(source) => Some(source),
+            Self::Bar(source) => Some(source),
+            Self::Capability(source) => Some(source),
+            Self::Configuration(source) => Some(source),
+            Self::BarSize | Self::TooManyVectors | Self::CapabilityOffset => None,
+        }
     }
 }
 
@@ -976,43 +1084,53 @@ fn add_virtio_pci_capabilities(
     configuration: &mut PciType0Configuration,
     vector_count: usize,
 ) -> Result<(u16, u16), VirtioPciEndpointError> {
+    add_virtio_pci_capability_profile(
+        vector_count,
+        |id, body, writable_mask| {
+            configuration
+                .add_capability(id, body, writable_mask)
+                .map_err(|source| VirtioPciEndpointError::Capability { source })
+        },
+        || VirtioPciEndpointError::TooManyVectors { vector_count },
+    )
+}
+
+fn add_virtio_pci_capability_profile<E>(
+    vector_count: usize,
+    mut add: impl FnMut(PciCapabilityId, &[u8], &[u8]) -> Result<u8, E>,
+    mut too_many_vectors: impl FnMut() -> E,
+) -> Result<(u16, u16), E> {
     let empty_mask = [0_u8; 14];
-    configuration
-        .add_capability(
-            PciCapabilityId::VendorSpecific,
-            &virtio_capability_body(
-                VIRTIO_PCI_GENERIC_CAP_TOTAL_SIZE,
-                VIRTIO_PCI_CAP_COMMON,
-                VIRTIO_PCI_COMMON_CONFIG_OFFSET,
-                VIRTIO_PCI_COMMON_CONFIG_SIZE,
-            ),
-            &empty_mask,
-        )
-        .map_err(|source| VirtioPciEndpointError::Capability { source })?;
-    configuration
-        .add_capability(
-            PciCapabilityId::VendorSpecific,
-            &virtio_capability_body(
-                VIRTIO_PCI_GENERIC_CAP_TOTAL_SIZE,
-                VIRTIO_PCI_CAP_ISR,
-                VIRTIO_PCI_ISR_CONFIG_OFFSET,
-                VIRTIO_PCI_ISR_CONFIG_SIZE,
-            ),
-            &empty_mask,
-        )
-        .map_err(|source| VirtioPciEndpointError::Capability { source })?;
-    configuration
-        .add_capability(
-            PciCapabilityId::VendorSpecific,
-            &virtio_capability_body(
-                VIRTIO_PCI_GENERIC_CAP_TOTAL_SIZE,
-                VIRTIO_PCI_CAP_DEVICE,
-                VIRTIO_PCI_DEVICE_CONFIG_OFFSET,
-                VIRTIO_PCI_DEVICE_CONFIG_SIZE,
-            ),
-            &empty_mask,
-        )
-        .map_err(|source| VirtioPciEndpointError::Capability { source })?;
+    add(
+        PciCapabilityId::VendorSpecific,
+        &virtio_capability_body(
+            VIRTIO_PCI_GENERIC_CAP_TOTAL_SIZE,
+            VIRTIO_PCI_CAP_COMMON,
+            VIRTIO_PCI_COMMON_CONFIG_OFFSET,
+            VIRTIO_PCI_COMMON_CONFIG_SIZE,
+        ),
+        &empty_mask,
+    )?;
+    add(
+        PciCapabilityId::VendorSpecific,
+        &virtio_capability_body(
+            VIRTIO_PCI_GENERIC_CAP_TOTAL_SIZE,
+            VIRTIO_PCI_CAP_ISR,
+            VIRTIO_PCI_ISR_CONFIG_OFFSET,
+            VIRTIO_PCI_ISR_CONFIG_SIZE,
+        ),
+        &empty_mask,
+    )?;
+    add(
+        PciCapabilityId::VendorSpecific,
+        &virtio_capability_body(
+            VIRTIO_PCI_GENERIC_CAP_TOTAL_SIZE,
+            VIRTIO_PCI_CAP_DEVICE,
+            VIRTIO_PCI_DEVICE_CONFIG_OFFSET,
+            VIRTIO_PCI_DEVICE_CONFIG_SIZE,
+        ),
+        &empty_mask,
+    )?;
 
     let mut notify = virtio_capability_body(
         VIRTIO_PCI_NOTIFY_CAP_TOTAL_SIZE,
@@ -1021,9 +1139,7 @@ fn add_virtio_pci_capabilities(
         VIRTIO_PCI_NOTIFICATION_SIZE,
     );
     notify.extend_from_slice(&VIRTIO_PCI_NOTIFICATION_MULTIPLIER.to_le_bytes());
-    configuration
-        .add_capability(PciCapabilityId::VendorSpecific, &notify, &[0; 18])
-        .map_err(|source| VirtioPciEndpointError::Capability { source })?;
+    add(PciCapabilityId::VendorSpecific, &notify, &[0; 18])?;
 
     let mut pci_cfg =
         virtio_capability_body(VIRTIO_PCI_CFG_CAP_TOTAL_SIZE, VIRTIO_PCI_CAP_PCI_CFG, 0, 0);
@@ -1035,24 +1151,39 @@ fn add_virtio_pci_capabilities(
     if let Some(masks) = pci_cfg_mask.get_mut(6..18) {
         masks.fill(u8::MAX);
     }
-    let pci_cfg_cap_offset = configuration
-        .add_capability(PciCapabilityId::VendorSpecific, &pci_cfg, &pci_cfg_mask)
-        .map_err(|source| VirtioPciEndpointError::Capability { source })?;
+    let pci_cfg_cap_offset = add(PciCapabilityId::VendorSpecific, &pci_cfg, &pci_cfg_mask)?;
 
-    let table_size = u16::try_from(vector_count - 1)
-        .map_err(|_| VirtioPciEndpointError::TooManyVectors { vector_count })?;
+    let Some(table_size) = vector_count
+        .checked_sub(1)
+        .and_then(|value| u16::try_from(value).ok())
+    else {
+        return Err(too_many_vectors());
+    };
     let mut msix_body = Vec::with_capacity(10);
     msix_body.extend_from_slice(&(MSIX_ENABLE | table_size).to_le_bytes());
     msix_body.extend_from_slice(&(VIRTIO_PCI_MSIX_TABLE_OFFSET as u32).to_le_bytes());
     msix_body.extend_from_slice(&(VIRTIO_PCI_MSIX_PBA_OFFSET as u32).to_le_bytes());
-    let msix_cap_offset = configuration
-        .add_capability(
-            PciCapabilityId::MsiX,
-            &msix_body,
-            &[0, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0],
-        )
-        .map_err(|source| VirtioPciEndpointError::Capability { source })?;
+    let msix_cap_offset = add(
+        PciCapabilityId::MsiX,
+        &msix_body,
+        &[0, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0],
+    )?;
     Ok((u16::from(pci_cfg_cap_offset), u16::from(msix_cap_offset)))
+}
+
+fn add_virtio_pci_snapshot_capabilities(
+    profile: &mut PciType0SnapshotProfile,
+    vector_count: usize,
+) -> Result<(u16, u16), VirtioPciConfigurationSnapshotError> {
+    add_virtio_pci_capability_profile(
+        vector_count,
+        |id, body, writable_mask| {
+            profile
+                .add_capability(id, body, writable_mask)
+                .map_err(VirtioPciConfigurationSnapshotError::Capability)
+        },
+        || VirtioPciConfigurationSnapshotError::TooManyVectors,
+    )
 }
 
 fn virtio_capability_body(total_size: u8, kind: u8, offset: u64, length: u64) -> Vec<u8> {
@@ -3781,6 +3912,32 @@ mod tests {
         assert_eq!(debug, "VirtioPciTransportState { state: \"<redacted>\" }");
         assert!(!debug.contains("dead_beef"));
         assert!(!debug.contains("3735928559"));
+    }
+
+    #[test]
+    fn configuration_snapshot_errors_redact_private_detail() {
+        let fixture = fixture_for_identity(&[8], 4, 0b0101);
+        let state = fixture
+            .endpoint
+            .transport_state()
+            .expect("test PCI transport should capture");
+        let invalid_range = GuestMemoryRange::new(
+            fixture.bar.range().start(),
+            VIRTIO_PCI_CAPABILITY_BAR_SIZE / 2,
+        )
+        .expect("test invalid-size BAR range should be structurally valid");
+        let error = state
+            .checked_configuration_guest_state(invalid_range)
+            .expect_err("wrong BAR size should reject");
+        assert_eq!(
+            format!("{error:?}"),
+            "VirtioPciConfigurationSnapshotError { kind: \"BarSize\", detail: \"<redacted>\" }"
+        );
+        assert!(!format!("{error:?}").contains("262144"));
+        assert_eq!(
+            error.to_string(),
+            "virtio-pci snapshot capability BAR size is invalid"
+        );
     }
 
     #[test]

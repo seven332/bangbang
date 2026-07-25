@@ -494,6 +494,163 @@ impl fmt::Debug for PciType0Configuration {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PciType0SnapshotProfile {
+    configuration: PciType0Configuration,
+}
+
+impl fmt::Debug for PciType0SnapshotProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PciType0SnapshotProfile")
+            .field("profile", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PciType0SnapshotProfile {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        vendor_id: u16,
+        device_id: u16,
+        revision_id: u8,
+        class_code: PciClassCode,
+        subclass: u8,
+        programming_interface: u8,
+        subsystem_vendor_id: u16,
+        subsystem_id: u16,
+    ) -> Self {
+        Self {
+            configuration: PciType0Configuration::new(
+                vendor_id,
+                device_id,
+                revision_id,
+                class_code,
+                subclass,
+                programming_interface,
+                subsystem_vendor_id,
+                subsystem_id,
+            ),
+        }
+    }
+
+    pub(crate) fn install_bar(
+        &mut self,
+        index: u8,
+        range: GuestMemoryRange,
+        address_space: PciBarAddressSpace,
+        prefetchable: PciBarPrefetchable,
+    ) -> Result<(), PciBarConfigurationError> {
+        self.configuration
+            .install_bar_range(index, range, address_space, prefetchable)
+    }
+
+    pub(crate) fn add_capability(
+        &mut self,
+        id: PciCapabilityId,
+        body: &[u8],
+        body_writable_mask: &[u8],
+    ) -> Result<u8, PciCapabilityError> {
+        self.configuration
+            .add_capability(id, body, body_writable_mask)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PciType0GuestState {
+    writable_bytes: Vec<PciType0WritableByte>,
+    bar_probes: Vec<PciType0BarProbeState>,
+}
+
+impl PciType0GuestState {
+    pub(crate) fn writable_bytes(&self) -> &[PciType0WritableByte] {
+        &self.writable_bytes
+    }
+
+    pub(crate) fn bar_probes(&self) -> &[PciType0BarProbeState] {
+        &self.bar_probes
+    }
+}
+
+impl fmt::Debug for PciType0GuestState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PciType0GuestState")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PciType0WritableByte {
+    offset: u16,
+    value: u8,
+    writable_mask: u8,
+}
+
+impl PciType0WritableByte {
+    pub(crate) const fn offset(self) -> u16 {
+        self.offset
+    }
+
+    pub(crate) const fn value(self) -> u8 {
+        self.value
+    }
+
+    pub(crate) const fn writable_mask(self) -> u8 {
+        self.writable_mask
+    }
+}
+
+impl fmt::Debug for PciType0WritableByte {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PciType0WritableByte(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PciType0BarProbeState {
+    index: u8,
+    pending: bool,
+}
+
+impl PciType0BarProbeState {
+    pub(crate) const fn index(self) -> u8 {
+        self.index
+    }
+
+    pub(crate) const fn pending(self) -> bool {
+        self.pending
+    }
+}
+
+impl fmt::Debug for PciType0BarProbeState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PciType0BarProbeState(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PciType0SnapshotError {
+    ProfileMismatch,
+    Allocation,
+}
+
+impl fmt::Display for PciType0SnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProfileMismatch => {
+                formatter.write_str("PCI type-0 configuration profile does not match")
+            }
+            Self::Allocation => {
+                formatter.write_str("failed to allocate PCI type-0 guest-state snapshot")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PciType0SnapshotError {}
+
 impl PciType0Configuration {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -550,11 +707,20 @@ impl PciType0Configuration {
         lease: &PciBarLease,
         prefetchable: PciBarPrefetchable,
     ) -> Result<(), PciBarConfigurationError> {
+        self.install_bar_range(index, lease.range(), lease.address_space(), prefetchable)
+    }
+
+    fn install_bar_range(
+        &mut self,
+        index: u8,
+        range: GuestMemoryRange,
+        address_space: PciBarAddressSpace,
+        prefetchable: PciBarPrefetchable,
+    ) -> Result<(), PciBarConfigurationError> {
         if index >= PCI_BAR_REGISTER_COUNT {
             return Err(PciBarConfigurationError::InvalidIndex { index });
         }
-        let range = lease.range();
-        let type_bits = match lease.address_space() {
+        let type_bits = match address_space {
             PciBarAddressSpace::Memory32 => {
                 if range.end_exclusive().raw_value() > 1_u64 << 32 {
                     return Err(PciBarConfigurationError::AddressExceeds32Bit { range });
@@ -568,7 +734,7 @@ impl PciType0Configuration {
                 0b100
             }
         };
-        let occupied_registers = if lease.address_space() == PciBarAddressSpace::Memory64 {
+        let occupied_registers = if address_space == PciBarAddressSpace::Memory64 {
             2
         } else {
             1
@@ -593,7 +759,7 @@ impl PciType0Configuration {
                 probe_pending: false,
             },
         );
-        if lease.address_space() == PciBarAddressSpace::Memory64 {
+        if address_space == PciBarAddressSpace::Memory64 {
             self.bars.insert(
                 index + 1,
                 PciBarRegister {
@@ -680,6 +846,97 @@ impl PciType0Configuration {
             offset = self.configuration_byte(usize::from(offset) + 1);
         }
         count
+    }
+
+    pub(crate) fn snapshot_guest_state(
+        &self,
+        profile: &PciType0SnapshotProfile,
+    ) -> Result<PciType0GuestState, PciType0SnapshotError> {
+        let expected = &profile.configuration;
+        if self.registers.len() != expected.registers.len()
+            || self.writable_masks != expected.writable_masks
+            || self.bars.len() != expected.bars.len()
+            || self.last_capability != expected.last_capability
+        {
+            return Err(PciType0SnapshotError::ProfileMismatch);
+        }
+
+        for ((actual, expected), writable_mask) in self
+            .registers
+            .iter()
+            .copied()
+            .zip(expected.registers.iter().copied())
+            .zip(self.writable_masks.iter().copied())
+        {
+            if (actual ^ expected) & !writable_mask != 0 {
+                return Err(PciType0SnapshotError::ProfileMismatch);
+            }
+        }
+        for ((actual_index, actual), (expected_index, expected)) in
+            self.bars.iter().zip(expected.bars.iter())
+        {
+            if actual_index != expected_index
+                || actual.encoded_address != expected.encoded_address
+                || actual.encoded_size != expected.encoded_size
+            {
+                return Err(PciType0SnapshotError::ProfileMismatch);
+            }
+        }
+
+        let writable_count = self
+            .writable_masks
+            .iter()
+            .flat_map(|mask| mask.to_le_bytes())
+            .filter(|mask| *mask != 0)
+            .count();
+        let mut writable_bytes = Vec::new();
+        writable_bytes
+            .try_reserve_exact(writable_count)
+            .map_err(|_| PciType0SnapshotError::Allocation)?;
+        for (register_index, (register, writable_mask)) in self
+            .registers
+            .iter()
+            .copied()
+            .zip(self.writable_masks.iter().copied())
+            .enumerate()
+        {
+            for (byte_index, (value, mask)) in register
+                .to_le_bytes()
+                .into_iter()
+                .zip(writable_mask.to_le_bytes())
+                .enumerate()
+            {
+                if mask == 0 {
+                    continue;
+                }
+                let offset = register_index
+                    .checked_mul(PCI_CONFIG_REGISTER_SIZE)
+                    .and_then(|offset| offset.checked_add(byte_index))
+                    .and_then(|offset| u16::try_from(offset).ok())
+                    .ok_or(PciType0SnapshotError::ProfileMismatch)?;
+                writable_bytes.push(PciType0WritableByte {
+                    offset,
+                    value: value & mask,
+                    writable_mask: mask,
+                });
+            }
+        }
+
+        let mut bar_probes = Vec::new();
+        bar_probes
+            .try_reserve_exact(self.bars.len())
+            .map_err(|_| PciType0SnapshotError::Allocation)?;
+        for (index, bar) in &self.bars {
+            bar_probes.push(PciType0BarProbeState {
+                index: *index,
+                pending: bar.probe_pending,
+            });
+        }
+
+        Ok(PciType0GuestState {
+            writable_bytes,
+            bar_probes,
+        })
     }
 
     fn configuration_byte(&self, offset: usize) -> u8 {
@@ -1426,6 +1683,34 @@ mod tests {
         u32::from_le_bytes(bytes)
     }
 
+    fn snapshot_configuration_pair() -> (PciType0Configuration, PciType0SnapshotProfile) {
+        let mut configuration = endpoint(0x1af4, 0x1042);
+        let mut profile = PciType0SnapshotProfile::new(
+            0x1af4,
+            0x1042,
+            1,
+            PciClassCode::Unclassified,
+            0,
+            0,
+            0x1af4,
+            0x1042,
+        );
+        let bar = range(PCI_BAR64_START, 0x80000);
+        configuration
+            .install_bar_range(0, bar, PciBarAddressSpace::Memory64, PciBarPrefetchable::No)
+            .expect("test configuration BAR should install");
+        profile
+            .install_bar(0, bar, PciBarAddressSpace::Memory64, PciBarPrefetchable::No)
+            .expect("test profile BAR should install");
+        configuration
+            .add_capability(PciCapabilityId::VendorSpecific, &[0xaa, 0x55], &[0xff, 0])
+            .expect("test configuration capability should install");
+        profile
+            .add_capability(PciCapabilityId::VendorSpecific, &[0xaa, 0x55], &[0xff, 0])
+            .expect("test profile capability should install");
+        (configuration, profile)
+    }
+
     #[test]
     fn sbdf_validates_and_encodes_firecracker_identity() {
         let sbdf = PciSbdf::new(0, 0, 31, 7).expect("maximum PCI SBDF should be valid");
@@ -1790,6 +2075,117 @@ mod tests {
         assert_eq!(
             read_config_u32(&mut configuration, (PCI_CONFIG_SPACE_SIZE - 4) as u16),
             0
+        );
+    }
+
+    #[test]
+    fn type0_snapshot_view_checks_profile_and_returns_only_guest_state_without_side_effects() {
+        let (mut configuration, profile) = snapshot_configuration_pair();
+        configuration
+            .write_config(4, &[0x07, 0x80])
+            .expect("test command bytes should write");
+        configuration
+            .write_config(0x42, &[0x12])
+            .expect("test capability byte should write");
+        configuration
+            .write_config(0x10, &[u8::MAX; 4])
+            .expect("test BAR probe should arm");
+
+        let first = configuration
+            .snapshot_guest_state(&profile)
+            .expect("matching profile should snapshot");
+        let second = configuration
+            .snapshot_guest_state(&profile)
+            .expect("snapshot should be side-effect-free");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first
+                .writable_bytes()
+                .iter()
+                .map(|byte| (byte.offset(), byte.value(), byte.writable_mask()))
+                .collect::<Vec<_>>(),
+            [
+                (0x04, 0x07, 0xff),
+                (0x05, 0x80, 0xff),
+                (0x0c, 0x00, 0xff),
+                (0x3c, 0x00, 0xff),
+                (0x42, 0x12, 0xff),
+            ]
+        );
+        assert_eq!(
+            first
+                .bar_probes()
+                .iter()
+                .map(|probe| (probe.index(), probe.pending()))
+                .collect::<Vec<_>>(),
+            [(0, true), (1, false)]
+        );
+        assert_eq!(
+            format!("{profile:?}"),
+            "PciType0SnapshotProfile { profile: \"<redacted>\" }"
+        );
+        assert_eq!(
+            format!("{first:?}"),
+            "PciType0GuestState { state: \"<redacted>\" }"
+        );
+        assert_eq!(
+            format!("{:?}", first.writable_bytes()[0]),
+            "PciType0WritableByte(<redacted>)"
+        );
+        assert_eq!(
+            format!("{:?}", first.bar_probes()[0]),
+            "PciType0BarProbeState(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn type0_snapshot_view_rejects_every_private_profile_class() {
+        let (configuration, profile) = snapshot_configuration_pair();
+        let mut mismatches = Vec::new();
+
+        let mut mismatch = configuration.clone();
+        mismatch.registers[0] ^= 1;
+        mismatches.push(mismatch);
+
+        let mut mismatch = configuration.clone();
+        mismatch.registers[PCI_FIRST_CAPABILITY_OFFSET / PCI_CONFIG_REGISTER_SIZE] ^= 1 << 24;
+        mismatches.push(mismatch);
+
+        let mut mismatch = configuration.clone();
+        mismatch.writable_masks[1] ^= 1;
+        mismatches.push(mismatch);
+
+        let mut mismatch = configuration.clone();
+        mismatch
+            .bars
+            .get_mut(&0)
+            .expect("test BAR should exist")
+            .encoded_address ^= 0x10;
+        mismatches.push(mismatch);
+
+        let mut mismatch = configuration.clone();
+        mismatch.bars.remove(&1);
+        mismatches.push(mismatch);
+
+        let mut mismatch = configuration.clone();
+        mismatch.last_capability = None;
+        mismatches.push(mismatch);
+
+        let mut mismatch = configuration;
+        mismatch.registers[PCI_CONFIG_REGISTER_COUNT - 1] = 1;
+        mismatches.push(mismatch);
+
+        for (index, mismatch) in mismatches.iter().enumerate() {
+            assert_eq!(
+                mismatch.snapshot_guest_state(&profile),
+                Err(PciType0SnapshotError::ProfileMismatch),
+                "private profile mismatch {index} unexpectedly passed",
+            );
+        }
+        assert_eq!(
+            PciType0SnapshotError::ProfileMismatch.to_string(),
+            "PCI type-0 configuration profile does not match"
         );
     }
 
