@@ -303,6 +303,26 @@ fn native_v1_adapter_preserves_legacy_publication_bytes_and_outcome() {
         .expect("legacy loader should accept the native-v1 adapter output");
     load_native_snapshot_artifacts(&legacy_paths)
         .expect("native-family loader should accept the legacy output");
+
+    let prepared = prepare_native_snapshot_state_path(native_paths.state())
+        .expect("native-family state preparation should accept v1");
+    let prepared = prepared
+        .into_v1()
+        .expect("prepared v1 state should convert without re-encoding");
+    assert_eq!(prepared.record(), &record);
+
+    let loaded = load_native_snapshot_artifacts(&native_paths)
+        .expect("native-family pair should load through the shared dispatcher");
+    let loaded = loaded
+        .into_v1()
+        .expect("loaded v1 pair should convert without copying its guest memory");
+    assert_eq!(loaded.record(), &record);
+    let mut actual = vec![0; TEST_MEMORY_BYTES];
+    loaded
+        .memory()
+        .read_slice(&mut actual, GuestAddress::new(0x4000))
+        .expect("converted v1 guest memory should remain readable");
+    assert_eq!(actual, test_bytes());
 }
 
 #[cfg(target_os = "macos")]

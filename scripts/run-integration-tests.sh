@@ -511,20 +511,24 @@ for index in "${!signed_test_bins[@]}"; do
 done
 
 if contains native_v2_process "${selected_tests[@]}"; then
-  if [[ "${#test_args[@]}" -eq 0 ]]; then
-    "$native_v2_process_bin" \
-      --test-threads=1 \
-      --ignored \
-      --exact \
-      vmm::tests::signed_native_v2_process_publishes_recaptures_and_resumes_private_pair
-  else
-    "$native_v2_process_bin" \
-      --test-threads=1 \
-      --ignored \
-      --exact \
-      vmm::tests::signed_native_v2_process_publishes_recaptures_and_resumes_private_pair \
-      "${test_args[@]}"
-  fi
+  for signed_snapshot_test in \
+    vmm::tests::signed_native_v1_public_dispatch_restores_frozen_file_pair \
+    vmm::tests::signed_native_v2_process_publishes_recaptures_and_resumes_private_pair; do
+    if [[ "${#test_args[@]}" -eq 0 ]]; then
+      "$native_v2_process_bin" \
+        --test-threads=1 \
+        --ignored \
+        --exact \
+        "$signed_snapshot_test"
+    else
+      "$native_v2_process_bin" \
+        --test-threads=1 \
+        --ignored \
+        --exact \
+        "$signed_snapshot_test" \
+        "${test_args[@]}"
+    fi
+  done
 fi
 
 if contains app_sandbox "${selected_tests[@]}"; then

@@ -2279,6 +2279,10 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use bangbang_hvf::{
+        HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureInput,
+        HvfSnapshotV2EncodeError,
+    };
     use bangbang_runtime::balloon::{
         BalloonConfig, BalloonConfigInput, BalloonHintingCommandError, BalloonHintingStartInput,
         BalloonHintingStatus, BalloonHintingStatusError, BalloonOptionalStats, BalloonStats,
@@ -2287,6 +2291,7 @@ mod tests {
         VirtioBalloonStat,
     };
     use bangbang_runtime::block::{DriveLiveUpdateMode, DriveUpdateError};
+    use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
     use bangbang_runtime::memory::{
@@ -2301,12 +2306,20 @@ mod tests {
     };
     use bangbang_runtime::network::NetworkRuntimeMutationError;
     use bangbang_runtime::serial::SerialConfig;
-    use bangbang_runtime::snapshot::{SnapshotLoadInput, SnapshotV1ControllerCommit};
+    use bangbang_runtime::snapshot::{
+        SnapshotLoadInput, SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
+    };
     use bangbang_runtime::snapshot_artifact::{
-        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
+        LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactState,
+        NativeSnapshotPublicationOutcome, SnapshotArtifactPaths, SnapshotPublicationOutcome,
+        publish_native_snapshot_artifacts_with, publish_snapshot_artifacts_with,
     };
     use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
     use bangbang_runtime::snapshot_memory::write_snapshot_memory_image;
+    use bangbang_runtime::snapshot_memory_v2::{
+        SnapshotV2MemoryStateEncodeError, encode_snapshot_v2_state_with_memory,
+        write_snapshot_v2_memory_image_with_cancel,
+    };
     use bangbang_runtime::startup::Arm64BootResources;
     use bangbang_runtime::{BackendError, VmmActionError, VmmController};
 
@@ -2315,8 +2328,11 @@ mod tests {
         BlockBackingUpdate, InstanceStartError, InstanceStartExecutor,
         NativeV1SnapshotCaptureCancellation, NativeV1SnapshotLoadError,
         NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
-        SnapshotV1LoadSuccess,
+        NativeV2SnapshotCaptureCancellation, NativeV2SnapshotCaptureError,
+        NativeV2SnapshotLoadError, NativeV2SnapshotPublicationError,
+        NativeV2SnapshotPublicationProducerError, ProcessSessionDiagnostics,
+        ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority, SnapshotV1LoadSuccess,
+        SnapshotV2LoadSuccess,
     };
 
     use super::*;
@@ -2836,6 +2852,62 @@ mod tests {
             .map_err(NativeV1SnapshotPublicationError::Transaction)
         }
 
+        fn publish_snapshot_v2(
+            &mut self,
+            _session: &mut Self::Session,
+            _input: HvfArm64BootSnapshotV2CaptureInput,
+            _serial_config: SerialConfig,
+            paths: &SnapshotArtifactPaths,
+            cancellation: NativeV2SnapshotCaptureCancellation,
+        ) -> Result<NativeSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
+            if !self.snapshot_operations_succeed {
+                return Err(NativeV2SnapshotPublicationError::SessionUnavailable);
+            }
+            if let Some(snapshot_gate) = &self.snapshot_gate {
+                snapshot_gate.enter_and_wait(&cancellation);
+            }
+            let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+                .map_err(|_| NativeV2SnapshotPublicationError::ConfigurationUnavailable)?;
+            let layout = GuestMemoryLayout::new(vec![range])
+                .map_err(|_| NativeV2SnapshotPublicationError::ConfigurationUnavailable)?;
+            let memory = GuestMemory::allocate(&layout)
+                .map_err(|_| NativeV2SnapshotPublicationError::ConfigurationUnavailable)?;
+
+            publish_native_snapshot_artifacts_with(paths, |mut writer| {
+                let binding =
+                    write_snapshot_v2_memory_image_with_cancel(&memory, &mut writer, |_| {
+                        cancellation.is_cancelled()
+                    })
+                    .map_err(|source| {
+                        NativeV2SnapshotPublicationProducerError::Capture(
+                            NativeV2SnapshotCaptureError::Platform {
+                                source: HvfArm64BootSnapshotV2CaptureError::MemoryImage { source },
+                            },
+                        )
+                    })?;
+                let encoded = encode_snapshot_v2_state_with_memory(&binding).map_err(|source| {
+                    let source = match source {
+                        SnapshotV2MemoryStateEncodeError::Binding(source) => {
+                            HvfSnapshotV2EncodeError::Memory(source)
+                        }
+                        SnapshotV2MemoryStateEncodeError::State(source) => {
+                            HvfSnapshotV2EncodeError::Container(source)
+                        }
+                    };
+                    NativeV2SnapshotPublicationProducerError::Capture(
+                        NativeV2SnapshotCaptureError::Encode { source },
+                    )
+                })?;
+                NativeSnapshotArtifactState::from_current_v2(encoded).map_err(|source| {
+                    NativeV2SnapshotPublicationProducerError::Capture(
+                        NativeV2SnapshotCaptureError::ClosedState { source },
+                    )
+                })
+            })
+            .map_err(Box::new)
+            .map_err(NativeV2SnapshotPublicationError::Transaction)
+        }
+
         fn load_snapshot_v1(
             &mut self,
             _controller: &VmmController,
@@ -2863,6 +2935,34 @@ mod tests {
             )
             .map_err(NativeV1SnapshotLoadError::ControllerCommitAllocation)?;
             Ok(SnapshotV1LoadSuccess::new(
+                TestSession::without_boot_run_loop_status(),
+                commit,
+            ))
+        }
+
+        fn load_prepared_snapshot_v2(
+            &mut self,
+            input: &SnapshotLoadInput,
+            _artifacts: LoadedNativeSnapshotArtifacts,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            if !self.snapshot_operations_succeed {
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::InvalidState("test snapshot load failed"),
+                ));
+            }
+            let boot_source = BootSourceConfigInput::new("/private/fake-api-restored-vmlinux")
+                .validate()
+                .map_err(|_| {
+                    NativeV2SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                        "fake snapshot boot configuration failed",
+                    ))
+                })?;
+            let commit = SnapshotV2ControllerCommit::new(
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages()),
+                boot_source,
+                input.resume_vm(),
+            );
+            Ok(SnapshotV2LoadSuccess::new(
                 TestSession::without_boot_run_loop_status(),
                 commit,
             ))
@@ -2937,6 +3037,28 @@ mod tests {
             .expect("system clock should be after unix epoch")
             .as_nanos();
         env::temp_dir().join(format!("bb-{name}-{}-{nanos}.sock", std::process::id()))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_v2_snapshot_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let state_path = unique_socket_path(&format!("{name}-state")).with_extension("state");
+        let memory_path = unique_socket_path(&format!("{name}-memory")).with_extension("memory");
+        let paths = SnapshotArtifactPaths::new(&state_path, &memory_path);
+        let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+            .expect("native-v2 fixture range should validate");
+        let layout =
+            GuestMemoryLayout::new(vec![range]).expect("native-v2 fixture layout should validate");
+        let memory =
+            GuestMemory::allocate(&layout).expect("native-v2 fixture memory should allocate");
+        publish_native_snapshot_artifacts_with(&paths, |mut writer| {
+            let binding =
+                write_snapshot_v2_memory_image_with_cancel(&memory, &mut writer, |_| false)
+                    .map_err(|_| ())?;
+            let encoded = encode_snapshot_v2_state_with_memory(&binding).map_err(|_| ())?;
+            NativeSnapshotArtifactState::from_current_v2(encoded).map_err(|_| ())
+        })
+        .expect("native-v2 fixture should publish");
+        (state_path, memory_path)
     }
 
     fn request_over_socket(
@@ -7245,7 +7367,7 @@ mod tests {
                     "/snapshot/load",
                     r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"},"track_dirty_pages":true}"#,
                 ),
-                "Snapshot and restore are not supported.",
+                "failed to load snapshot: hypervisor error: snapshot state preparation failed: snapshot artifact load failed during state final open: filesystem operation failed with NotFound",
             ),
             (
                 "snapshot-create-bad",
@@ -7351,12 +7473,11 @@ mod tests {
         );
         assert!(
             paused_create_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
-            "paused snapshot create should still be unsupported: {paused_create_response}"
+            "paused snapshot create should report the unavailable test producer: {paused_create_response}"
         );
         assert!(
-            paused_create_response
-                .contains(r#"{"fault_message":"Snapshot and restore are not supported."}"#),
-            "paused snapshot create should reach snapshot unsupported fault: {paused_create_response}"
+            paused_create_response.contains(r#"{"fault_message":"failed to create snapshot:"#),
+            "paused snapshot create should reach the native-v2 publication fault: {paused_create_response}"
         );
         assert!(
             !paused_create_response.contains("vmstate")
@@ -7379,19 +7500,6 @@ mod tests {
                     "PUT",
                     "/boot-source",
                     r#"{"kernel_image_path":"/tmp/snapshot-vmlinux"}"#,
-                )
-                .as_bytes(),
-                &mut vmm,
-            )
-            .status(),
-            bangbang_api::http::StatusCode::NoContent
-        );
-        assert_eq!(
-            handle_request_bytes(
-                request_with_body(
-                    "PUT",
-                    "/drives/root",
-                    r#"{"drive_id":"root","path_on_host":"/tmp/snapshot-root","is_root_device":true,"is_read_only":true}"#,
                 )
                 .as_bytes(),
                 &mut vmm,
@@ -7474,17 +7582,24 @@ mod tests {
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn public_snapshot_load_commits_paused_and_honors_resume_and_deprecated_alias() {
+    fn public_native_v2_snapshot_load_commits_paused_and_honors_resume() {
+        let (paused_state, paused_memory) = native_v2_snapshot_fixture("public-load-paused");
         let mut paused = test_controller_with_starter(TestInstanceStarter::snapshot_success());
+        let paused_body = serde_json::json!({
+            "snapshot_path": paused_state,
+            "mem_backend": {
+                "backend_path": paused_memory,
+                "backend_type": "File",
+            },
+            "track_dirty_pages": true,
+        })
+        .to_string();
         let paused_response = request_over_socket(
             &mut paused,
             "slp",
-            &request_with_body(
-                "PUT",
-                "/snapshot/load",
-                r#"{"snapshot_path":"private-paused-state","mem_backend":{"backend_path":"private-paused-memory","backend_type":"File"},"track_dirty_pages":true}"#,
-            ),
+            &request_with_body("PUT", "/snapshot/load", &paused_body),
         );
         assert!(paused_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
@@ -7493,6 +7608,7 @@ mod tests {
         );
         assert!(paused.machine_config().track_dirty_pages());
 
+        let (resumed_state, resumed_memory) = native_v2_snapshot_fixture("public-load-resumed");
         let mut resumed = test_controller_with_starter(TestInstanceStarter::snapshot_success());
         let metrics_path = unique_socket_path("snapshot-public-load-metrics").with_extension("out");
         let metrics_body = serde_json::json!({"metrics_path": metrics_path}).to_string();
@@ -7504,14 +7620,20 @@ mod tests {
             .status(),
             bangbang_api::http::StatusCode::NoContent
         );
+        let resumed_body = serde_json::json!({
+            "snapshot_path": resumed_state,
+            "mem_backend": {
+                "backend_path": resumed_memory,
+                "backend_type": "File",
+            },
+            "track_dirty_pages": true,
+            "resume_vm": true,
+        })
+        .to_string();
         let resumed_response = request_over_socket(
             &mut resumed,
             "slr",
-            &request_with_body(
-                "PUT",
-                "/snapshot/load",
-                r#"{"snapshot_path":"private-resumed-state","mem_file_path":"private-resumed-memory","enable_diff_snapshots":true,"resume_vm":true}"#,
-            ),
+            &request_with_body("PUT", "/snapshot/load", &resumed_body),
         );
         assert!(resumed_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
@@ -7529,16 +7651,14 @@ mod tests {
             .map(|line| serde_json::from_str(line).expect("metrics line should be JSON"))
             .collect::<Vec<serde_json::Value>>();
         assert_eq!(metrics_lines.len(), 2);
-        assert_metric(
-            &metrics_lines[0],
-            "deprecated_api",
-            "deprecated_http_api_calls",
-            1,
-        );
         assert_latency_metric_present(&metrics_lines[0], "load_snapshot");
-        assert!(!raw_metrics.contains("private-resumed-state"));
-        assert!(!raw_metrics.contains("private-resumed-memory"));
+        assert!(!raw_metrics.contains(resumed_state.to_string_lossy().as_ref()));
+        assert!(!raw_metrics.contains(resumed_memory.to_string_lossy().as_ref()));
 
+        fs::remove_file(paused_state).expect("paused state fixture should clean up");
+        fs::remove_file(paused_memory).expect("paused memory fixture should clean up");
+        fs::remove_file(resumed_state).expect("resumed state fixture should clean up");
+        fs::remove_file(resumed_memory).expect("resumed memory fixture should clean up");
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
@@ -8953,14 +9073,16 @@ mod tests {
         );
         assert!(pause_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
-        for (socket_name, body) in [
+        for (socket_name, body, fault) in [
             (
                 "scf",
                 r#"{"snapshot_path":"private-full-state-1254","mem_file_path":"private-full-memory-1254"}"#,
+                "failed to create snapshot",
             ),
             (
                 "scd",
                 r#"{"snapshot_type":"Diff","snapshot_path":"private-diff-state-1254","mem_file_path":"private-diff-memory-1254"}"#,
+                "Snapshot and restore are not supported.",
             ),
         ] {
             let response = request_over_socket(
@@ -8969,7 +9091,7 @@ mod tests {
                 &request_with_body("PUT", "/snapshot/create", body),
             );
             assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-            assert!(response.contains("Snapshot and restore are not supported."));
+            assert!(response.contains(fault));
         }
 
         let flush_response = put_action_over_socket(&mut vmm, "scfl", "FlushMetrics");
@@ -9004,9 +9126,13 @@ mod tests {
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn configured_metrics_records_snapshot_load_latency_on_execution_fault() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let (state_path, memory_path) = native_v2_snapshot_fixture("metrics-load-fault");
+        let state_text = state_path.to_string_lossy().into_owned();
+        let memory_text = memory_path.to_string_lossy().into_owned();
         let metrics_path = unique_socket_path("sll").with_extension("metrics");
         let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
         assert_eq!(
@@ -9018,21 +9144,25 @@ mod tests {
             bangbang_api::http::StatusCode::NoContent
         );
 
+        let load_body = serde_json::json!({
+            "snapshot_path": state_path,
+            "mem_backend": {
+                "backend_path": memory_path,
+                "backend_type": "File",
+            },
+        })
+        .to_string();
         let response = request_over_socket(
             &mut vmm,
             "sl",
-            &request_with_body(
-                "PUT",
-                "/snapshot/load",
-                r#"{"snapshot_path":"private-load-state-1254","mem_backend":{"backend_path":"private-load-memory-1254","backend_type":"File"}}"#,
-            ),
+            &request_with_body("PUT", "/snapshot/load", &load_body),
         );
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(
-            "failed to load snapshot: hypervisor error: native-v1 process preparation failed"
+            "failed to load snapshot: hypervisor error: native-v2 process shell preparation failed"
         ));
-        assert!(!response.contains("private-load-state-1254"));
-        assert!(!response.contains("private-load-memory-1254"));
+        assert!(!response.contains(&state_text));
+        assert!(!response.contains(&memory_text));
 
         assert_eq!(
             handle_request_bytes(
@@ -9072,13 +9202,15 @@ mod tests {
         );
         let raw_metrics =
             fs::read_to_string(&metrics_path).expect("metrics should remain readable");
-        for private_value in ["private-load-state-1254", "private-load-memory-1254"] {
+        for private_value in [&state_text, &memory_text] {
             assert!(
                 !raw_metrics.contains(private_value),
                 "snapshot load metrics leaked {private_value:?}: {raw_metrics}"
             );
         }
 
+        fs::remove_file(state_path).expect("state fixture should clean up");
+        fs::remove_file(memory_path).expect("memory fixture should clean up");
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
@@ -10891,6 +11023,7 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn run_until_periodic_metrics_timeout_flushes_restored_paused_session() {
         let path = unique_socket_path("periodic-metrics");
@@ -10903,11 +11036,16 @@ mod tests {
             &metrics_path,
         )))
         .expect("metrics should configure");
-        let load_request = request_with_body(
-            "PUT",
-            "/snapshot/load",
-            r#"{"snapshot_path":"private-state","mem_backend":{"backend_path":"private-memory","backend_type":"File"}}"#,
-        );
+        let (state_path, memory_path) = native_v2_snapshot_fixture("periodic-restored");
+        let load_body = serde_json::json!({
+            "snapshot_path": state_path,
+            "mem_backend": {
+                "backend_path": memory_path,
+                "backend_type": "File",
+            },
+        })
+        .to_string();
+        let load_request = request_with_body("PUT", "/snapshot/load", &load_body);
         assert_eq!(
             handle_request_bytes(load_request.as_bytes(), &mut vmm).status(),
             bangbang_api::http::StatusCode::NoContent
@@ -10942,6 +11080,8 @@ mod tests {
                 serde_json::from_str(line).expect("metrics line should be JSON");
             assert_latency_metric_present(&metrics, "load_snapshot");
         }
+        fs::remove_file(state_path).expect("state fixture should clean up");
+        fs::remove_file(memory_path).expect("memory fixture should clean up");
         fs::remove_file(metrics_path).expect("fixture should clean up");
         drop(server);
         assert!(!path.exists());
@@ -11073,11 +11213,6 @@ mod tests {
             "/tmp/snapshot-serialization-vmlinux",
         )))
         .expect("boot source should configure");
-        vmm.handle_action(VmmAction::PutDrive(
-            DriveConfigInput::new("root", "root", "/tmp/snapshot-serialization-root", true)
-                .with_is_read_only(true),
-        ))
-        .expect("root drive should configure");
         vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
             &metrics_path,
         )))
@@ -11193,9 +11328,10 @@ mod tests {
             orchestrator.join().expect("orchestrator should not panic");
 
         assert!(
-            snapshot_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            snapshot_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
             "unexpected snapshot response: {snapshot_response}"
         );
+        assert!(snapshot_response.contains("failed to create snapshot"));
         assert!(
             mmds_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
             "unexpected MMDS response: {mmds_response}"
@@ -11214,11 +11350,9 @@ mod tests {
                 .expect("periodic metrics output should be readable")
                 .is_empty()
         );
-        assert!(state_path.is_file());
-        assert!(memory_path.is_file());
+        assert!(!state_path.exists());
+        assert!(!memory_path.exists());
 
-        fs::remove_file(state_path).expect("snapshot state fixture should clean up");
-        fs::remove_file(memory_path).expect("snapshot memory fixture should clean up");
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
         drop(server);
         assert!(!socket_path.exists());

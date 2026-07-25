@@ -30,14 +30,14 @@ owns per-interface packet I/O, metrics, teardown, and slot reuse. ARM PVTime now
 publishes per-vCPU stolen time from bounded owner-thread wall/execution samples,
 enables standard 64-bit SMCCC discovery when the HVF measurement primitive is
 available, and has signed Linux contention/idle/pause certification. PVTime
-serialization and clone restore are implemented in the unpublished native-v2
-platform profile. A private, non-dispatched process seam now publishes current
-native-v2 2.3 pairs from a strictly minimal paused production session and
-recovers that source for resume or recapture. The same private seam restores
-prepared File/COW pairs into fresh normal processes initially paused, with an
-exact minimal FDT/device shell, fresh destination serial output, and ordinary
-lifecycle resume. Public native-v2 activation/load and serialized/restorable
-pmem state remain explicit Wave 6 limits.
+serialization and clone restore are implemented in the public bangbang-native
+v2 profile. Public `Full` creation now writes current `2.3.0` state/memory pairs
+from a strictly minimal paused production session and recovers that source for
+resume or recapture. Public load classifies the opened state once: native-v2
+uses retained read-only File/COW memory in a fresh process, while frozen
+native-v1 remains available as a compatibility reader. Both families publish
+`Paused` before an optional ordinary lifecycle resume. Serialized/restorable
+pmem and other optional-device state remain explicit Wave 6 limits.
 Host discard never promises synchronous RSS or footprint
 reduction. See the
 [pinned remaining-device audit](docs/firecracker-compatibility.md#firecracker-v1160-remaining-device-audit)
@@ -83,8 +83,8 @@ MMDS-only or vmnet packet I/O,
 generation-safe metrics, and exact cleanup. Automatic guest hotplug
 notification, PCI snapshot persistence, external vmnet connectivity
 certification, and Firecracker's KVM ITS identity remain explicit limits.
-Native-v1 create runs the complete paused live-storage preflight and then
-rejects PCI before native-state capture or artifact work. Load keeps its
+Current native-v2 create runs the complete paused live-storage preflight and
+then rejects PCI before native-state capture or artifact work. Load keeps its
 pre-file/grant/controller/VM-mutation PCI rejection, while the default MMIO
 snapshot profile is unchanged.
 
@@ -324,10 +324,9 @@ publication. Import validates the complete source and proves every destination
 owner is never-run before mutation, allocates fresh destination-local power and
 runner transaction identities, constructs the destination already Paused, and
 rolls back installed suspend calls in reverse order before consuming a failed
-destination. Explicit resume starts generation 1. This is still a
-wire-format-neutral lifecycle foundation:
-native-v1 and native-v2 bytes are unchanged, and no public multi-vCPU snapshot
-create/load path is claimed.
+destination. Explicit resume starts generation 1. This wire-format-neutral
+lifecycle foundation is now consumed by the public native-v2 `Full` create/load
+path; native-v1 bytes remain unchanged.
 A native-v1 optional-state classifier fails closed for active SVE/SME and
 enabled hardware breakpoint/watchpoint state. Prepared boot sessions can also
 replace the 16-byte VMGenID buffer and retained metadata before first run, then
@@ -337,12 +336,14 @@ injecting its SPI. A separate no-handle query
 exposes the maximum SME streaming vector length used for the Z-, P-, and
 ZA-register allocations.
 
-These primitives back a deliberately narrow public native-v1 snapshot path on
+These primitives back a deliberately narrow public native-v2 snapshot path on
 macOS Apple Silicon. `PUT /snapshot/create` supports only `Full` snapshots from
-a paused VM with one vCPU, exactly one regular read-only root drive, default
-serial, and no optional devices or MMDS. It writes a bounded kind-2
-`BANGCMT\0` pair whose state file binds the complete memory image to an exact
-five-component `BANGHVF\0` payload and nested `BANGDEV\0` device profile.
+a paused 1–32-vCPU VM with a configured boot source, no drives or optional
+devices/MMDS/PCI/boot timer, default serial configuration, and a live UART that
+still exactly matches the canonical empty reset-compatible model. It writes a
+current `2.3.0` state/memory pair whose state binds the retained File/COW memory
+image and complete typed machine, GIC, topology, per-vCPU, and
+time/clone-identity graph.
 
 Create reserves one FIFO boot-worker transaction, then failure-atomically
 quiesces the block, PMEM, network, and entropy retry publishers. The same lease
@@ -376,40 +377,40 @@ recoverable tracked reset failure preserves the old conservative epoch; an
 incomplete rollback keeps the committed artifact result but latches terminal
 failure and prevents resume.
 
-`PUT /snapshot/load` accepts the matching committed pair only in a pristine
-fresh process, except that logger and metrics configuration are allowed. It
-supports a `File` memory backend (or the deprecated sole `mem_file_path` alias),
-constructs a fresh HVF VM/GIC/vCPU, restores the exact local native state,
-reconstructs PL031 from destination wall clock, replaces and signals VMGenID,
-then updates and signals the exact captured VMClock before first committing the
-session as `Paused`. New nested `BANGDEV\0` 1.1.0 state carries the validated
-112-byte VMClock ABI; legacy 1.0.0 loads recover it from the bound memory image.
-`track_dirty_pages: true` or deprecated `enable_diff_snapshots: true` installs
-tracking after the loaded memory baseline and before mapping, vCPU ownership,
-and either time/identity write; the destination request controls the restored
-setting independently of the source snapshot. A load failure after VMGenID or
-VMClock mutation is terminal even when cleanup succeeds, and no partially
-updated destination may resume.
+`PUT /snapshot/load` accepts a committed native pair only in a pristine fresh
+process, except that logger and metrics configuration are allowed. It opens and
+classifies state once, routes frozen native-v1 to its existing File/Uffd
+compatibility loader, and routes native-v2 only to retained read-only File/COW
+memory. The v2 path validates the complete typed graph and default FDT/UART
+shell before construction, creates the fresh HVF VM/GIC/vCPU topology,
+reconstructs PL031 from destination wall clock, restores PVTime, replaces and
+signals VMGenID, updates and signals VMClock, and only then commits the session
+as `Paused`. `track_dirty_pages: true` can install a clean destination epoch
+after the v2 memory baseline and before mapping, vCPU ownership, or identity
+writes. Deprecated fields remain a native-v1 compatibility surface. A load
+failure after identity/time mutation, session publication, or requested resume
+is terminal, and no partially updated destination may resume.
 `resume_vm: true` then uses the ordinary resume path; otherwise resume later
-with `PATCH /vm`. The external root backing must still match the captured
-regular-file identity. Snapshot files and guest state are untrusted and
-confidential, so keep artifacts and the API socket in operator-owned private
-directories.
+with `PATCH /vm`. Frozen native-v1 artifacts still require their captured
+external root backing to match. Snapshot files and guest state are untrusted
+and confidential, so keep artifacts and the API socket in operator-owned
+private directories.
 
-In the production bundle, contained describe/load inputs use exact read-only
-file grants and create outputs use retained `SnapshotOutputDirectory` anchors
-plus bounded UTF-8 child names. Load atomically adopts state, memory, and any
-grant-tagged persisted root backing after bounded state preinspection; no tag is
-reopened as a pathname. Create preserves the same anchor-relative no-clobber
-transaction and repeated output-directory authority. Direct mode keeps ordinary
-path behavior.
+In the production bundle, contained native-v2 describe/load inputs use exact
+read-only state and memory grants, and create outputs use retained
+`SnapshotOutputDirectory` anchors plus bounded UTF-8 child names. Load
+classifies a duplicate of the state descriptor, then atomically adopts the
+matching state/memory pair; no tag is reopened as a pathname. Legacy native-v1
+loads additionally adopt any persisted root grant required by that format.
+Create preserves the same anchor-relative no-clobber transaction and repeated
+output-directory authority. Direct mode keeps ordinary path behavior.
 
 The transaction stops bangbang-owned packet and stream access because the
 accepted profile excludes network and vsock devices and the transient vsock
 poller is joined before pause acknowledgement. It does not freeze or persist
 vmnet peers, vsock peers, or their host/kernel buffers. Native-v1 remains a
-one-vCPU baseline; optional devices and multi-vCPU snapshot artifacts are still
-outside this format.
+frozen one-vCPU compatibility format; native-v2 carries 1–32-vCPU state, while
+optional devices remain outside the current public profile.
 
 This is not Firecracker snapshot-file compatibility or a portable migration
 format. Machine `track_dirty_pages` now enables one shared guest-RAM epoch
@@ -419,13 +420,13 @@ keeps a separate write-protection overlay. A visibly committed Full snapshot
 re-protects guest-written pages before clearing and advancing the epoch while
 the source is still paused. Complete rollback keeps the old conservative epoch;
 incomplete rollback prevents resume and tears the VM down safely. `Diff`
-artifacts and merging, clock adjustment, restore overrides, writable or
-additional drives, serialized/restorable optional-device snapshot state,
-active SVE/SME/debug state, EL2 GIC CPU-interface state, and cross-host
-portability remain unsupported. Native-v1 `Uffd` is supported only on macOS
-Apple Silicon for the same narrow fixed-memory profile with dirty tracking
-disabled. Its `backend_path` names a `bangbang-pager-v1` Unix peer, not a Linux
-UFFD endpoint or memory image. The checked
+artifacts and merging, native-v2 `Uffd`, clock adjustment, restore overrides,
+drives, serialized/restorable optional-device snapshot state, general serial
+state, active SVE/SME/debug state, EL2 GIC CPU-interface state, and cross-host
+portability remain unsupported. Frozen native-v1 `Uffd` compatibility is
+supported only on macOS Apple Silicon with dirty tracking disabled. Its
+`backend_path` names a `bangbang-pager-v1` Unix peer, not a Linux UFFD endpoint
+or memory image. The checked
 [snapshot paging ledger](compat/firecracker/v1.16.0/snapshot-paging-contract.md)
 records the observable equivalent and completed #1555 signed certification;
 this is not Linux UFFD wire compatibility. The standalone
@@ -511,7 +512,7 @@ PVTime values, VMGenID/VMClock placement and notification metadata, and the
 complete VMClock ABI without persisting a source VMGenID, host pointer,
 `Instant`, or wall-clock anchor.
 
-The unpublished native-v2 reconstruction guard consumes this complete graph
+The native-v2 reconstruction guard consumes this complete graph
 and already-authorized memory, creates a fresh destination PL031 anchored to
 destination `SystemTime`, restores PVTime while excluding snapshot downtime,
 generates and signals a fresh VMGenID, applies Firecracker's saved-counter
@@ -530,15 +531,16 @@ one retained read-only `File` as writable `MAP_PRIVATE` regions, so pages arrive
 on demand and writes remain private. State and fixed memory metadata are
 CRC-protected, but guest bytes deliberately are not checksummed or
 authenticated and require an external artifact authentication/encryption
-policy. The internal normal-process adapter admits only pristine File/COW
+policy. The public normal-process adapter admits only pristine File/COW
 destinations, loads direct or contained pairs state-first, validates the exact
 default arm64 FDT, UART, RTC, and time/identity shell, installs fresh buffered
 or stdout-only output without stdin, and publishes a closed supervisor session
 initially `Paused`. The same immutable pair can restore into multiple fresh
 destinations; requested resume still passes through the ordinary lifecycle
-gate. No public create, load, describe, or version path emits or accepts v2
-yet, and recognizing a pinned Firecracker bitcode prefix reports
-incompatibility rather than claiming decode or translation. The exact wire,
+gate. `--snapshot-version` reports `v2.3.0`, and `--describe-snapshot` reports
+the actual validated native-v1 or native-v2 version. Recognizing a pinned
+Firecracker bitcode prefix reports incompatibility rather than claiming decode
+or translation. The exact wire,
 ownership, and compatibility contract is documented in
 [Snapshot Feasibility](docs/snapshot-feasibility.md#native-v2-structural-state-foundation).
 
@@ -583,11 +585,12 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
   `bangbang_runtime::vmm_action`, and `bangbang_runtime::boot_timer`.
 - `--no-api` requires `--config-file <PATH>`, starts from that configuration
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
-- `--snapshot-version` prints the supported bangbang-native snapshot envelope
-  version (`v1.0.0`) and exits before startup.
+- `--snapshot-version` prints the current bangbang-native writer version
+  (`v2.3.0`) and exits before startup.
 - `--describe-snapshot <PATH>` reads a bounded regular native state file,
-  validates its complete envelope and CRC, prints its embedded version, and
-  exits before startup. In contained mode an exact read-only
+  classifies and validates its complete native-v1 or native-v2 envelope and
+  CRC, prints its exact embedded version, and exits before startup. In
+  contained mode an exact read-only
   `SnapshotDescribeInput` grant is inspected without reopening its tag. It does
   not accept Firecracker state files.
 - `--help`, `-h`, `--version`, and `-V` are supported.
@@ -920,9 +923,10 @@ and open-timing behavior.
 
 Snapshot file inputs use the same exact `bangbang-grant:<GrantId>` grammar with
 distinct read-only roles. Describe inspects a duplicate of its exact descriptor.
-A `File` load preinspects state without consuming it, discovers any persisted
-root grant, then atomically takes all tagged state, memory, and read-only root
-backings and finishes from those opened identities. A native-v1 `Uffd` load
+A `File` load preinspects state without consuming it, classifies the native
+family once, then atomically takes the tagged state and memory descriptors.
+Native-v2 finishes from that retained File/COW pair; native-v1 also discovers
+and adopts any persisted read-only root grant. A native-v1 `Uffd` load
 preflights the exact pager grant before state access, prepares only the state
 and root inputs, then one-time claims the launcher-connected stream; the worker
 receives no snapshot-memory file grant. Input authority is one-time after its
@@ -1088,7 +1092,7 @@ duplicate network MACs remain global, and concurrent mutations serialize on
 the VM owner while live configuration stays success-authoritative. PCI state
 is still rejected by the native-v1 snapshot profile rather than persisted.
 
-Create a supported full native-v1 snapshot after the VM is paused:
+Create a supported full native-v2 snapshot after a minimal VM is paused:
 
 ```sh
 curl --unix-socket /tmp/bangbang.socket \
@@ -1116,8 +1120,9 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"state":"Resumed"}'
 ```
 
-The destination must be pristine apart from optional logger/metrics setup, and
-the captured read-only root backing must still satisfy the recorded identity.
+The destination must be pristine apart from optional logger/metrics setup.
+When loading a frozen native-v1 artifact, its captured read-only root backing
+must still satisfy the recorded identity.
 
 Record a pre-boot network interface:
 
@@ -1261,7 +1266,7 @@ identity cleanup; contained mode reserves the exact directory grant and
 session-bound broker endpoint, rolls both back before activation, and never
 falls back to an ambient path. A single-use process transaction transfers the
 resource only when runtime reconstruction consumes it and retains cleanup
-ownership for the active device. Public native-v1 records still do not encode
+ownership for the active device. Public native-v2 artifacts still do not encode
 or place vsock, and public load continues to reject overrides. The checked
 [vsock closure ledger](compat/firecracker/v1.16.0/vsock-contract.md) certifies
 the eight complete API/live records; the exact six encoding, public invocation,
@@ -1421,7 +1426,7 @@ for the support status and validation layer summary. The
 [v1.16.0 capability inventory](compat/firecracker/v1.16.0/README.md) is the
 mechanically checked scope authority for exhaustive compatibility work. Its 381
 generated source identities and 37 local semantic identities form a 418-record
-delivery overlay with 229 implemented-and-verified, 169 audit-required, three
+delivery overlay with 233 implemented-and-verified, 165 audit-required, three
 missing-platform-feasible, and 17 proven-platform-impossible outcomes. The
 [machine and lifecycle closure ledger](compat/firecracker/v1.16.0/machine-lifecycle-audit.md)
 records the completed Wave 2 subset and the explicit Wave 6 snapshot, Wave 7
@@ -1461,7 +1466,7 @@ bridge, ordered before/during/after removal, peer-failure propagation,
 complete consumer gates, native-v1 direct/contained restore, paused-host plus
 exact restored-guest demand, exact nested entitlement dictionaries, and
 cleanup are implemented and verified.
-The repository-wide disposition counts are 229/169/3/17.
+The repository-wide disposition counts are 233/165/3/17.
 
 ## Build And Test
 
@@ -1531,7 +1536,7 @@ pmem read/flush,
 guest console output through the transferred serial descriptor, terminal
 metrics, concurrent output-session isolation, preauthorized live block
 replacement, limiter-only backing retention, redacted failure atomicity, and
-granted native-v1 create/describe/state-memory-root restore, strict snapshot
+granted native-v2 create/describe/state-memory File/COW restore, strict snapshot
 staging cleanup after worker death, and real sandboxed HVF guests through
 `SYSTEM_OFF`. It also proves an
 outside-container client can use a granted API socket, and that a real guest
@@ -1549,8 +1554,9 @@ connection, descriptor/peer revalidation, page/zero/removal/shutdown,
 cancellation and peer terminal behavior, malformed/EOF/timeout failures, both
 process-death orders, repeated launch and cleanup, path redaction, signature
 inspection, and the unchanged entitlement floor. The normal production
-snapshot case additionally restores a real native-v1 guest through that
-connected pager without granting the worker the memory artifact. Abrupt
+snapshot case additionally restores one immutable native-v2 pair twice through
+retained state/memory descriptors after pathname replacement. The separate
+contained-pager probes do not make current native-v2 accept `Uffd`. Abrupt
 launcher-first and worker-first cases replace the
 granted API pathname before death and prove both surviving cleanup owners
 preserve the replacement while clearing the matching private namespace record.

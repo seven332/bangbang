@@ -81,8 +81,9 @@ terminal. The directly reviewed identities that do not change disposition are:
 | Boundary | Exact identities | Final disposition or owner |
 | --- | --- | --- |
 | Exported configuration | `api-operation:GET /vm/config`; `api-path:/vm/config`; `api-schema:FullVmConfiguration` | `audit-required`; Wave 8 owns final cross-capability certification after every exported device field has a terminal result. |
-| Snapshot API aggregates | `api-operation:PUT /snapshot/create`; `api-operation:PUT /snapshot/load`; `api-path:/snapshot/create`; `api-path:/snapshot/load`; `api-schema:SnapshotCreateParams`; `api-schema:SnapshotLoadParams` | `audit-required`; Wave 6 owns generalized Full/Diff artifacts, merge/restore, overrides, backends, and portability beyond the native-v1 baseline. |
-| Snapshot semantics | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `semantic.snapshot:full-create-load-and-public-lifecycle`; `semantic.snapshot:multi-vcpu-drives-devices-and-mmds`; `semantic.snapshot:network-vsock-overrides-portability-and-clones` | `audit-required`; Wave 6 owns their incomplete generalized artifact and profile outcomes. |
+| Snapshot API aggregates | `api-operation:PUT /snapshot/create`; `api-operation:PUT /snapshot/load`; `api-path:/snapshot/create`; `api-path:/snapshot/load`; `api-schema:SnapshotCreateParams`; `api-schema:SnapshotLoadParams` | `audit-required`; Wave 6 owns Diff artifacts, merge/restore, overrides, additional backends, optional-device schemas, and portability beyond the current native-v2 Full/File profile. |
+| Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; #1578 certifies the minimal native-v2 2.3 Full/File multi-vCPU public lifecycle plus frozen native-v1 reading. |
+| Remaining snapshot semantics | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `semantic.snapshot:multi-vcpu-drives-devices-and-mmds`; `semantic.snapshot:network-vsock-overrides-portability-and-clones` | `audit-required`; Wave 6 owns Diff/native-v2-Uffd, optional devices and general serial, overrides/tools, and broader portability. |
 | Snapshot tracking leaves | `api-property:SnapshotLoadParams.enable_diff_snapshots`; `api-property:SnapshotLoadParams.track_dirty_pages` | Already `implemented-and-verified`; they select complete destination dirty tracking but do not imply Diff artifact support. |
 | Broad specifications | `corpus:specification`; `semantic.specification:api-availability-stability-and-failure-information`; `semantic.specification:performance-resource-and-telemetry-outcomes` | `audit-required`; applicable repository-wide outcomes remain Wave 7 work after their producers stabilize. |
 | Cross-capability certification | `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | `audit-required`; Wave 8 owns the final interaction audit after the individual lifecycle, error, telemetry, security, device, network, and snapshot producers stabilize. |
@@ -90,11 +91,12 @@ terminal. The directly reviewed identities that do not change disposition are:
 
 Those exact identities establish the following non-overlapping handoffs:
 
-- Wave 6 owns generalized Full and Diff snapshot create/load artifacts,
-  multi-vCPU and optional-device state, dirty-image serialization and merging,
-  restore overrides, memory backends, portability, and schema evolution. The
-  terminal load tracking properties and complete dirty epochs are prerequisites,
-  not proof of those artifacts.
+- Wave 6 has terminal minimal native-v2 Full/File create/load and multi-vCPU
+  lifecycle evidence. It still owns Diff artifacts, optional-device/general
+  serial state, dirty-image serialization and merging, native-v2 Uffd, restore
+  overrides, tools, broader portability, and schema evolution. The terminal
+  load tracking properties and complete dirty epochs are prerequisites, not
+  proof of those remaining artifacts.
 - Wave 7 owns `cpu-template-helper`, host-side kernel/rootfs construction,
   heterogeneous-fleet CPU-template outcomes, and applicable repository-wide
   specification outcomes after producers stabilize.

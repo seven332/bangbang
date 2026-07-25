@@ -1423,11 +1423,9 @@ impl VmmController {
             .map_err(|_| VmmActionError::SnapshotUnsupported)
     }
 
-    /// Preflights the private native-v2 Full producer profile.
-    ///
-    /// This method does not dispatch a public action and does not grant path
-    /// authority.
-    pub fn preflight_create_snapshot_v2(
+    /// Preflights the native-v2 create state and request shape before live
+    /// capture-ready traversal or resource access.
+    pub fn preflight_create_snapshot_v2_request(
         &self,
         input: &snapshot::SnapshotCreateInput,
     ) -> Result<(), VmmActionError> {
@@ -1437,13 +1435,44 @@ impl VmmController {
                 state: self.instance_info.state,
             });
         }
-        snapshot::classify_v2_create_request(input)
-            .map_err(|_| VmmActionError::SnapshotUnsupported)?;
+        snapshot::classify_v2_create_request(input).map_err(|_| VmmActionError::SnapshotUnsupported)
+    }
+
+    /// Preflights the native-v2 producer profile after live capture-ready
+    /// traversal has completed.
+    pub fn preflight_create_snapshot_v2_profile(&self) -> Result<(), VmmActionError> {
         snapshot::classify_v2_create_profile(self.snapshot_v2_create_profile()?)
             .map_err(|_| VmmActionError::SnapshotUnsupported)
     }
 
+    /// Preflights the complete native-v2 Full producer request and profile.
+    ///
+    /// Process composition uses the split request/profile seams so live
+    /// capture-ready traversal remains observable before an unsupported broad
+    /// device profile is rejected.
+    pub fn preflight_create_snapshot_v2(
+        &self,
+        input: &snapshot::SnapshotCreateInput,
+    ) -> Result<(), VmmActionError> {
+        self.preflight_create_snapshot_v2_request(input)?;
+        self.preflight_create_snapshot_v2_profile()
+    }
+
     pub fn preflight_load_snapshot(
+        &self,
+        input: &snapshot::SnapshotLoadInput,
+    ) -> Result<(), VmmActionError> {
+        self.preflight_load_snapshot_destination(input)?;
+        snapshot::classify_v1_load_request(input).map_err(|_| VmmActionError::SnapshotUnsupported)
+    }
+
+    /// Preflights the family-neutral destination and request constraints that
+    /// must be rejected before any snapshot state path or grant is touched.
+    ///
+    /// Memory-backend, dirty-tracking, deprecated-field, and other
+    /// family-specific decisions remain deferred until after the state family
+    /// has been decoded exactly once.
+    pub fn preflight_load_snapshot_destination(
         &self,
         input: &snapshot::SnapshotLoadInput,
     ) -> Result<(), VmmActionError> {
@@ -1463,21 +1492,15 @@ impl VmmController {
         .map_err(|_| VmmActionError::SnapshotUnsupported)
     }
 
-    /// Preflights the private native-v2 File/COW destination profile.
+    /// Preflights the native-v2 File/COW destination profile.
     ///
-    /// This method neither dispatches the public load action nor grants path
-    /// authority.
+    /// This method grants no path authority; the process dispatcher invokes it
+    /// only after the already-opened state has selected the native-v2 family.
     pub fn preflight_load_snapshot_v2(
         &self,
         input: &snapshot::SnapshotLoadInput,
     ) -> Result<(), VmmActionError> {
-        if self.instance_info.state != InstanceState::NotStarted {
-            return Err(VmmActionError::UnsupportedState {
-                action: "LoadSnapshot",
-                state: self.instance_info.state,
-            });
-        }
-
+        self.preflight_load_snapshot_destination(input)?;
         snapshot::classify_v2_load_request(input)
             .map_err(|_| VmmActionError::SnapshotUnsupported)?;
         snapshot::classify_v2_load_eligibility(
