@@ -121,13 +121,32 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
     assert_eq!(owned_bytes, bytes);
     assert_eq!(owned_binding, binding);
 
-    let mut legacy = bytes;
-    let binding_offset = legacy
+    let binding_offset = bytes
         .windows(crate::snapshot_memory_v2::NATIVE_V2_MEMORY_MAGIC.len())
         .position(|window| window == crate::snapshot_memory_v2::NATIVE_V2_MEMORY_MAGIC)
         .expect("memory binding should occur in state");
     let binding_length = crate::snapshot_memory_v2::NATIVE_V2_MEMORY_HEADER_BYTES
         + crate::snapshot_memory_v2::NATIVE_V2_MEMORY_EXTENT_BYTES;
+
+    let mut mismatched = bytes.clone();
+    mismatched[binding_offset + 10..binding_offset + 12].copy_from_slice(&1_u16.to_le_bytes());
+    mismatched[binding_offset + 48..binding_offset + 56].fill(0);
+    let binding_checksum = crc64::crc64(
+        0,
+        &mismatched[binding_offset..binding_offset + binding_length],
+    );
+    mismatched[binding_offset + 48..binding_offset + 56]
+        .copy_from_slice(&binding_checksum.to_le_bytes());
+    let state_checksum_offset =
+        mismatched.len() - crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES;
+    let state_checksum = crc64::crc64(0, &mismatched[..state_checksum_offset]);
+    mismatched[state_checksum_offset..].copy_from_slice(&state_checksum.to_le_bytes());
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_current_v2(mismatched),
+        Err(NativeSnapshotArtifactStateError::V2VersionMismatch { .. })
+    ));
+
+    let mut legacy = bytes;
     legacy[10..12].copy_from_slice(&1_u16.to_le_bytes());
     legacy[binding_offset + 10..binding_offset + 12].copy_from_slice(&1_u16.to_le_bytes());
     legacy[binding_offset + 48..binding_offset + 56].fill(0);
@@ -234,6 +253,56 @@ fn publishes_and_loads_same_directory_pair() {
             .expect("native-family v1 load should retain its record"),
         outcome.record()
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_v1_adapter_preserves_legacy_publication_bytes_and_outcome() {
+    let directory = TestDirectory::new("native-v1-adapter");
+    let legacy_paths = directory.paths("legacy-state.snap", "legacy-memory.snap");
+    let native_paths = directory.paths("native-state.snap", "native-memory.snap");
+    let mut image = Cursor::new(Vec::new());
+    let binding =
+        write_snapshot_memory_image(&test_memory(), &mut image).expect("v1 memory should encode");
+    let image = image.into_inner();
+    let record = SnapshotCommitRecord::new(binding);
+
+    let legacy = publish_snapshot_artifacts_with(&legacy_paths, |mut writer| {
+        writer
+            .write_all(&image)
+            .expect("legacy adapter should write the fixture image");
+        Ok::<_, io::Error>(record.clone())
+    })
+    .expect("legacy adapter should publish");
+    let native = publish_native_snapshot_artifacts_with(&native_paths, |mut writer| {
+        writer
+            .write_all(&image)
+            .expect("native adapter should write the fixture image");
+        Ok::<_, io::Error>(NativeSnapshotArtifactState::from_v1(record.clone()))
+    })
+    .expect("native family adapter should publish v1");
+
+    assert_eq!(native.family(), NativeSnapshotArtifactFamily::V1);
+    assert_eq!(native.durability(), legacy.durability());
+    assert_eq!(
+        native
+            .state()
+            .v1_record()
+            .expect("native outcome should retain the exact v1 record"),
+        legacy.record()
+    );
+    assert_eq!(
+        fs::read(native_paths.state()).expect("native state should read"),
+        fs::read(legacy_paths.state()).expect("legacy state should read")
+    );
+    assert_eq!(
+        fs::read(native_paths.memory()).expect("native memory should read"),
+        fs::read(legacy_paths.memory()).expect("legacy memory should read")
+    );
+    load_snapshot_artifacts(&native_paths)
+        .expect("legacy loader should accept the native-v1 adapter output");
+    load_native_snapshot_artifacts(&legacy_paths)
+        .expect("native-family loader should accept the legacy output");
 }
 
 #[cfg(target_os = "macos")]
