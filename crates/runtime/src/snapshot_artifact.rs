@@ -1,5 +1,7 @@
 //! No-clobber native snapshot artifact publication and loading.
 
+#[cfg(target_os = "macos")]
+use std::borrow::Cow;
 use std::collections::TryReserveError;
 use std::fmt;
 use std::fs::File;
@@ -16,13 +18,297 @@ use crate::snapshot_commit::{SnapshotCommitError, SnapshotCommitRecord};
 use crate::snapshot_commit::{decode_snapshot_commit_envelope, encode_snapshot_commit_envelope};
 #[cfg(target_os = "macos")]
 use crate::snapshot_format::NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES;
+use crate::snapshot_format::{
+    NATIVE_V1_SNAPSHOT_VERSION, NativeSnapshotFormatError, NativeSnapshotState,
+    SnapshotFormatVersion, decode_native_snapshot_state,
+};
+use crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
+#[cfg(target_os = "macos")]
+use crate::snapshot_format_v2::{NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES, decode_snapshot_v2_state};
 use crate::snapshot_memory::{
     SnapshotMemoryLoadError, SnapshotMemoryWriteError, write_snapshot_memory_image,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_memory::{load_snapshot_memory_image, verify_snapshot_memory_image_output};
+use crate::snapshot_memory_v2::{
+    SnapshotV2MemoryBinding, SnapshotV2MemoryLoadError, SnapshotV2MemoryStateError,
+    decode_snapshot_v2_memory_binding,
+};
+#[cfg(target_os = "macos")]
+use crate::snapshot_memory_v2::{
+    load_snapshot_v2_memory_file, verify_snapshot_v2_memory_image_output,
+};
 
 const REDACTED: &str = "<redacted>";
+
+/// A validated bangbang-native snapshot artifact family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeSnapshotArtifactFamily {
+    /// Native-v1 state commit plus eagerly loaded memory.
+    V1,
+    /// Native-v2 structural state plus retained private-file memory.
+    V2,
+}
+
+impl fmt::Display for NativeSnapshotArtifactFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V1 => formatter.write_str("native-v1"),
+            Self::V2 => formatter.write_str("native-v2"),
+        }
+    }
+}
+
+/// Validation failure for one owned native snapshot artifact state.
+#[derive(Debug)]
+pub enum NativeSnapshotArtifactStateError {
+    /// The bytes do not form a supported native state family.
+    Format(NativeSnapshotFormatError),
+    /// A native-v1 envelope does not contain a valid commit record.
+    Commit(SnapshotCommitError),
+    /// A native-v2 state does not contain one valid memory binding.
+    Memory(SnapshotV2MemoryStateError),
+    /// A constructor expected a different already-valid native family.
+    UnexpectedFamily {
+        expected: NativeSnapshotArtifactFamily,
+        actual: NativeSnapshotArtifactFamily,
+    },
+    /// The native-v2 state and its embedded memory binding use different versions.
+    V2VersionMismatch {
+        state: SnapshotFormatVersion,
+        memory: SnapshotFormatVersion,
+    },
+    /// Publication accepts only the exact current native-v2 writer version.
+    NonCurrentV2Publication {
+        state: SnapshotFormatVersion,
+        memory: SnapshotFormatVersion,
+    },
+}
+
+impl fmt::Display for NativeSnapshotArtifactStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Format(source) => write!(formatter, "invalid native snapshot state: {source}"),
+            Self::Commit(source) => write!(formatter, "invalid native-v1 commit: {source}"),
+            Self::Memory(source) => write!(formatter, "invalid native-v2 memory state: {source}"),
+            Self::UnexpectedFamily { expected, actual } => {
+                write!(formatter, "expected {expected} state, found {actual}")
+            }
+            Self::V2VersionMismatch { state, memory } => write!(
+                formatter,
+                "native-v2 state version {state} does not match memory version {memory}"
+            ),
+            Self::NonCurrentV2Publication { state, memory } => write!(
+                formatter,
+                "native-v2 publication requires current state and memory versions; found state {state} and memory {memory}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeSnapshotArtifactStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Format(source) => Some(source),
+            Self::Commit(source) => Some(source),
+            Self::Memory(source) => Some(source),
+            Self::UnexpectedFamily { .. }
+            | Self::V2VersionMismatch { .. }
+            | Self::NonCurrentV2Publication { .. } => None,
+        }
+    }
+}
+
+enum NativeSnapshotArtifactStateInner {
+    V1(SnapshotCommitRecord),
+    V2 {
+        bytes: Vec<u8>,
+        version: SnapshotFormatVersion,
+        binding: SnapshotV2MemoryBinding,
+    },
+}
+
+/// An owned, closed state-to-memory commitment for one native artifact family.
+///
+/// Native-v2 callers supply only encoded state bytes. The memory binding is
+/// always derived from those exact bytes and cannot be substituted separately.
+pub struct NativeSnapshotArtifactState {
+    inner: NativeSnapshotArtifactStateInner,
+}
+
+impl NativeSnapshotArtifactState {
+    /// Retains one already validated native-v1 commit record.
+    pub const fn from_v1(record: SnapshotCommitRecord) -> Self {
+        Self {
+            inner: NativeSnapshotArtifactStateInner::V1(record),
+        }
+    }
+
+    /// Validates exact current-version native-v2 bytes for publication.
+    pub fn from_current_v2(bytes: Vec<u8>) -> Result<Self, NativeSnapshotArtifactStateError> {
+        let state = decode_native_snapshot_state(&bytes)
+            .map_err(NativeSnapshotArtifactStateError::Format)?;
+        let NativeSnapshotState::V2(state) = state else {
+            return Err(NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V2,
+                actual: NativeSnapshotArtifactFamily::V1,
+            });
+        };
+        let version = state.metadata().version();
+        let binding = decode_snapshot_v2_memory_binding(&state)
+            .map_err(NativeSnapshotArtifactStateError::Memory)?;
+        if version != binding.version() {
+            return Err(NativeSnapshotArtifactStateError::V2VersionMismatch {
+                state: version,
+                memory: binding.version(),
+            });
+        }
+        if version != NATIVE_V2_SNAPSHOT_VERSION || binding.version() != NATIVE_V2_SNAPSHOT_VERSION
+        {
+            return Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
+                state: version,
+                memory: binding.version(),
+            });
+        }
+        Ok(Self {
+            inner: NativeSnapshotArtifactStateInner::V2 {
+                bytes,
+                version,
+                binding,
+            },
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn from_compatible_bytes(bytes: Vec<u8>) -> Result<Self, NativeSnapshotArtifactStateError> {
+        match decode_native_snapshot_state(&bytes)
+            .map_err(NativeSnapshotArtifactStateError::Format)?
+        {
+            NativeSnapshotState::V1(_) => {
+                let record = decode_snapshot_commit_envelope(&bytes)
+                    .map_err(NativeSnapshotArtifactStateError::Commit)?;
+                Ok(Self::from_v1(record))
+            }
+            NativeSnapshotState::V2(state) => {
+                let version = state.metadata().version();
+                let binding = decode_snapshot_v2_memory_binding(&state)
+                    .map_err(NativeSnapshotArtifactStateError::Memory)?;
+                if version != binding.version() {
+                    return Err(NativeSnapshotArtifactStateError::V2VersionMismatch {
+                        state: version,
+                        memory: binding.version(),
+                    });
+                }
+                Ok(Self {
+                    inner: NativeSnapshotArtifactStateInner::V2 {
+                        bytes,
+                        version,
+                        binding,
+                    },
+                })
+            }
+        }
+    }
+
+    /// Returns the validated native artifact family.
+    pub const fn family(&self) -> NativeSnapshotArtifactFamily {
+        match &self.inner {
+            NativeSnapshotArtifactStateInner::V1(_) => NativeSnapshotArtifactFamily::V1,
+            NativeSnapshotArtifactStateInner::V2 { .. } => NativeSnapshotArtifactFamily::V2,
+        }
+    }
+
+    /// Returns the exact admitted state-format version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        match &self.inner {
+            NativeSnapshotArtifactStateInner::V1(_) => NATIVE_V1_SNAPSHOT_VERSION,
+            NativeSnapshotArtifactStateInner::V2 { version, .. } => *version,
+        }
+    }
+
+    /// Returns the native-v1 record when this value belongs to native-v1.
+    pub const fn v1_record(&self) -> Option<&SnapshotCommitRecord> {
+        match &self.inner {
+            NativeSnapshotArtifactStateInner::V1(record) => Some(record),
+            NativeSnapshotArtifactStateInner::V2 { .. } => None,
+        }
+    }
+
+    /// Returns the immutable encoded native-v2 state bytes.
+    pub fn v2_bytes(&self) -> Option<&[u8]> {
+        match &self.inner {
+            NativeSnapshotArtifactStateInner::V1(_) => None,
+            NativeSnapshotArtifactStateInner::V2 { bytes, .. } => Some(bytes),
+        }
+    }
+
+    /// Returns the binding derived from the immutable native-v2 state bytes.
+    pub const fn v2_memory_binding(&self) -> Option<&SnapshotV2MemoryBinding> {
+        match &self.inner {
+            NativeSnapshotArtifactStateInner::V1(_) => None,
+            NativeSnapshotArtifactStateInner::V2 { binding, .. } => Some(binding),
+        }
+    }
+
+    /// Consumes a native-v1 value into its exact commit record.
+    pub fn into_v1_record(self) -> Result<SnapshotCommitRecord, Self> {
+        match self.inner {
+            NativeSnapshotArtifactStateInner::V1(record) => Ok(record),
+            inner @ NativeSnapshotArtifactStateInner::V2 { .. } => Err(Self { inner }),
+        }
+    }
+
+    /// Consumes a native-v2 value into its exact bytes and derived binding.
+    pub fn into_v2_parts(self) -> Result<(Vec<u8>, SnapshotV2MemoryBinding), Self> {
+        match self.inner {
+            NativeSnapshotArtifactStateInner::V1(record) => Err(Self::from_v1(record)),
+            NativeSnapshotArtifactStateInner::V2 { bytes, binding, .. } => Ok((bytes, binding)),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn publication_bytes(&self) -> Result<Cow<'_, [u8]>, SnapshotCommitError> {
+        match &self.inner {
+            NativeSnapshotArtifactStateInner::V1(record) => {
+                encode_snapshot_commit_envelope(record).map(Cow::Owned)
+            }
+            NativeSnapshotArtifactStateInner::V2 { bytes, .. } => {
+                Ok(Cow::Borrowed(bytes.as_slice()))
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn validate_for_publication(&self) -> Result<(), NativeSnapshotArtifactStateError> {
+        let NativeSnapshotArtifactStateInner::V2 {
+            version, binding, ..
+        } = &self.inner
+        else {
+            return Ok(());
+        };
+        if *version == NATIVE_V2_SNAPSHOT_VERSION && binding.version() == NATIVE_V2_SNAPSHOT_VERSION
+        {
+            Ok(())
+        } else {
+            Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication {
+                state: *version,
+                memory: binding.version(),
+            })
+        }
+    }
+}
+
+impl fmt::Debug for NativeSnapshotArtifactState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeSnapshotArtifactState")
+            .field("family", &self.family())
+            .field("version", &self.version())
+            .field("state", &REDACTED)
+            .field("memory_binding", &REDACTED)
+            .finish()
+    }
+}
 
 /// The two independently supplied final paths in a native snapshot artifact pair.
 #[derive(Clone, PartialEq, Eq)]
@@ -439,6 +725,8 @@ pub enum SnapshotPublicationFailure {
     Io(io::ErrorKind),
     MemoryWrite(SnapshotMemoryWriteError),
     MemoryVerify(SnapshotMemoryLoadError),
+    MemoryV2Verify(SnapshotV2MemoryLoadError),
+    NativeState(NativeSnapshotArtifactStateError),
     Commit(SnapshotCommitError),
 }
 
@@ -471,6 +759,12 @@ impl fmt::Display for SnapshotPublicationFailure {
             Self::MemoryVerify(source) => {
                 write!(f, "snapshot memory staging verification failed: {source}")
             }
+            Self::MemoryV2Verify(source) => {
+                write!(f, "native-v2 memory staging verification failed: {source}")
+            }
+            Self::NativeState(source) => {
+                write!(f, "snapshot state cannot be published: {source}")
+            }
             Self::Commit(source) => write!(f, "snapshot commit encoding failed: {source}"),
         }
     }
@@ -481,6 +775,8 @@ impl std::error::Error for SnapshotPublicationFailure {
         match self {
             Self::MemoryWrite(source) => Some(source),
             Self::MemoryVerify(source) => Some(source),
+            Self::MemoryV2Verify(source) => Some(source),
+            Self::NativeState(source) => Some(source),
             Self::Commit(source) => Some(source),
             Self::UnsupportedPlatform
             | Self::InvalidFinalPath { .. }
@@ -683,6 +979,46 @@ pub enum SnapshotCommitDurability {
     Uncertain { kind: io::ErrorKind },
 }
 
+/// Successful or visibly committed native-family artifact publication.
+pub struct NativeSnapshotPublicationOutcome {
+    state: NativeSnapshotArtifactState,
+    durability: SnapshotCommitDurability,
+}
+
+impl NativeSnapshotPublicationOutcome {
+    /// Returns the closed state-to-memory commitment that was published.
+    pub const fn state(&self) -> &NativeSnapshotArtifactState {
+        &self.state
+    }
+
+    /// Returns the published native artifact family.
+    pub const fn family(&self) -> NativeSnapshotArtifactFamily {
+        self.state.family()
+    }
+
+    /// Returns the post-commit durability classification.
+    pub const fn durability(&self) -> SnapshotCommitDurability {
+        self.durability
+    }
+
+    /// Consumes the outcome into its state commitment and durability.
+    pub fn into_parts(self) -> (NativeSnapshotArtifactState, SnapshotCommitDurability) {
+        (self.state, self.durability)
+    }
+}
+
+impl fmt::Debug for NativeSnapshotPublicationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeSnapshotPublicationOutcome")
+            .field("family", &self.family())
+            .field("version", &self.state.version())
+            .field("state", &REDACTED)
+            .field("durability", &self.durability)
+            .finish()
+    }
+}
+
 /// Successful or visibly committed result of snapshot artifact publication.
 #[derive(Debug)]
 pub struct SnapshotPublicationOutcome {
@@ -753,6 +1089,8 @@ pub enum SnapshotArtifactLoadFailure {
     Io(io::ErrorKind),
     Commit(SnapshotCommitError),
     Memory(SnapshotMemoryLoadError),
+    NativeState(NativeSnapshotArtifactStateError),
+    MemoryV2(SnapshotV2MemoryLoadError),
 }
 
 impl fmt::Display for SnapshotArtifactLoadFailure {
@@ -778,6 +1116,10 @@ impl fmt::Display for SnapshotArtifactLoadFailure {
             Self::Io(kind) => write!(f, "filesystem operation failed with {kind:?}"),
             Self::Commit(source) => write!(f, "invalid snapshot commit: {source}"),
             Self::Memory(source) => write!(f, "invalid snapshot memory image: {source}"),
+            Self::NativeState(source) => write!(f, "invalid native snapshot state: {source}"),
+            Self::MemoryV2(source) => {
+                write!(f, "invalid native-v2 snapshot memory image: {source}")
+            }
         }
     }
 }
@@ -788,6 +1130,8 @@ impl std::error::Error for SnapshotArtifactLoadFailure {
             Self::AllocationFailed { source } => Some(source),
             Self::Commit(source) => Some(source),
             Self::Memory(source) => Some(source),
+            Self::NativeState(source) => Some(source),
+            Self::MemoryV2(source) => Some(source),
             Self::UnsupportedPlatform
             | Self::InvalidFinalPath { .. }
             | Self::NotRegularFile { .. }
@@ -830,6 +1174,85 @@ impl fmt::Display for SnapshotArtifactLoadError {
 impl std::error::Error for SnapshotArtifactLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.failure)
+    }
+}
+
+/// A fully validated native-family artifact pair loaded without constructing a VM.
+pub struct LoadedNativeSnapshotArtifacts {
+    state: NativeSnapshotArtifactState,
+    memory: GuestMemory,
+}
+
+impl LoadedNativeSnapshotArtifacts {
+    /// Returns the validated state-to-memory commitment.
+    pub const fn state(&self) -> &NativeSnapshotArtifactState {
+        &self.state
+    }
+
+    /// Returns the loaded native family.
+    pub const fn family(&self) -> NativeSnapshotArtifactFamily {
+        self.state.family()
+    }
+
+    /// Returns the loaded guest memory.
+    pub const fn memory(&self) -> &GuestMemory {
+        &self.memory
+    }
+
+    /// Consumes the result into its state commitment and guest memory.
+    pub fn into_parts(self) -> (NativeSnapshotArtifactState, GuestMemory) {
+        (self.state, self.memory)
+    }
+}
+
+impl fmt::Debug for LoadedNativeSnapshotArtifacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedNativeSnapshotArtifacts")
+            .field("family", &self.family())
+            .field("version", &self.state.version())
+            .field("state", &REDACTED)
+            .field("memory_range_count", &self.memory.regions().len())
+            .field("memory_bytes", &self.memory.total_size())
+            .finish()
+    }
+}
+
+/// A bounded native-family state retained for later exact memory adoption.
+pub struct PreparedNativeSnapshotState {
+    state: NativeSnapshotArtifactState,
+}
+
+impl PreparedNativeSnapshotState {
+    /// Retains one already validated closed state commitment.
+    pub const fn from_state(state: NativeSnapshotArtifactState) -> Self {
+        Self { state }
+    }
+
+    /// Returns the validated closed state commitment.
+    pub const fn state(&self) -> &NativeSnapshotArtifactState {
+        &self.state
+    }
+
+    /// Returns the prepared native family.
+    pub const fn family(&self) -> NativeSnapshotArtifactFamily {
+        self.state.family()
+    }
+
+    /// Consumes the prepared value into its state commitment.
+    pub fn into_state(self) -> NativeSnapshotArtifactState {
+        self.state
+    }
+}
+
+impl fmt::Debug for PreparedNativeSnapshotState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedNativeSnapshotState")
+            .field("family", &self.family())
+            .field("version", &self.state.version())
+            .field("state", &REDACTED)
+            .finish()
     }
 }
 
@@ -938,6 +1361,22 @@ where
     publish_snapshot_artifacts_to_with(&outputs, producer)
 }
 
+/// Publishes caller-produced native-v1 or native-v2 artifacts in one transaction.
+///
+/// The producer must return a closed state value whose memory commitment was
+/// derived from that state. Publication verifies the staged memory against the
+/// selected family before either final name becomes visible.
+pub fn publish_native_snapshot_artifacts_with<E, F>(
+    paths: &SnapshotArtifactPaths,
+    producer: F,
+) -> Result<NativeSnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<NativeSnapshotArtifactState, E>,
+{
+    let outputs = SnapshotArtifactOutputs::from_paths(paths);
+    publish_native_snapshot_artifacts_to_with(&outputs, producer)
+}
+
 /// Publishes through path-based or already-opened directory destinations.
 pub fn publish_snapshot_artifacts_to_with<E, F>(
     outputs: &SnapshotArtifactOutputs,
@@ -963,6 +1402,49 @@ where
     }
 }
 
+/// Publishes one closed native-family pair to path or anchored destinations.
+pub fn publish_native_snapshot_artifacts_to_with<E, F>(
+    outputs: &SnapshotArtifactOutputs,
+    producer: F,
+) -> Result<NativeSnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<NativeSnapshotArtifactState, E>,
+{
+    #[cfg(target_os = "macos")]
+    {
+        publish_native_snapshot_artifacts_macos_with(outputs, producer)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (outputs, producer);
+        Err(SnapshotPublicationTransactionError::Publication(
+            publication_error(
+                SnapshotPublicationStage::PlatformCheck,
+                SnapshotArtifactVisibility::NoFinalArtifact,
+                SnapshotPublicationFailure::UnsupportedPlatform,
+            ),
+        ))
+    }
+}
+
+/// Loads a validated native-v1 or native-v2 pair without constructing a VM.
+pub fn load_native_snapshot_artifacts(
+    paths: &SnapshotArtifactPaths,
+) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    #[cfg(target_os = "macos")]
+    {
+        load_native_snapshot_artifacts_macos(paths)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = paths;
+        Err(load_error(
+            SnapshotArtifactLoadStage::PlatformCheck,
+            SnapshotArtifactLoadFailure::UnsupportedPlatform,
+        ))
+    }
+}
+
 /// Loads a state-committed artifact pair without constructing or mutating a VM.
 pub fn load_snapshot_artifacts(
     paths: &SnapshotArtifactPaths,
@@ -974,6 +1456,24 @@ pub fn load_snapshot_artifacts(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = paths;
+        Err(load_error(
+            SnapshotArtifactLoadStage::PlatformCheck,
+            SnapshotArtifactLoadFailure::UnsupportedPlatform,
+        ))
+    }
+}
+
+/// Decodes one already-opened native-v1 or native-v2 state artifact.
+pub fn prepare_native_snapshot_state_file(
+    file: File,
+) -> Result<PreparedNativeSnapshotState, SnapshotArtifactLoadError> {
+    #[cfg(target_os = "macos")]
+    {
+        prepare_native_snapshot_state_file_macos(file)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
         Err(load_error(
             SnapshotArtifactLoadStage::PlatformCheck,
             SnapshotArtifactLoadFailure::UnsupportedPlatform,
@@ -999,6 +1499,24 @@ pub fn prepare_snapshot_state_file(
     }
 }
 
+/// Opens and decodes one native-family state artifact path.
+pub fn prepare_native_snapshot_state_path(
+    path: &Path,
+) -> Result<PreparedNativeSnapshotState, SnapshotArtifactLoadError> {
+    #[cfg(target_os = "macos")]
+    {
+        prepare_native_snapshot_state_path_macos(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err(load_error(
+            SnapshotArtifactLoadStage::PlatformCheck,
+            SnapshotArtifactLoadFailure::UnsupportedPlatform,
+        ))
+    }
+}
+
 /// Opens and decodes one state artifact path without loading guest memory.
 pub fn prepare_snapshot_state_path(
     path: &Path,
@@ -1010,6 +1528,25 @@ pub fn prepare_snapshot_state_path(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = path;
+        Err(load_error(
+            SnapshotArtifactLoadStage::PlatformCheck,
+            SnapshotArtifactLoadFailure::UnsupportedPlatform,
+        ))
+    }
+}
+
+/// Loads one opened memory artifact against prepared native-family state.
+pub fn load_prepared_native_snapshot_memory_file(
+    prepared: PreparedNativeSnapshotState,
+    file: File,
+) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    #[cfg(target_os = "macos")]
+    {
+        load_prepared_native_snapshot_memory_file_macos(prepared, file)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (prepared, file);
         Err(load_error(
             SnapshotArtifactLoadStage::PlatformCheck,
             SnapshotArtifactLoadFailure::UnsupportedPlatform,
@@ -1036,6 +1573,25 @@ pub fn load_prepared_snapshot_memory_file(
     }
 }
 
+/// Opens and loads memory against prepared native-family state.
+pub fn load_prepared_native_snapshot_memory_path(
+    prepared: PreparedNativeSnapshotState,
+    path: &Path,
+) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    #[cfg(target_os = "macos")]
+    {
+        load_prepared_native_snapshot_memory_path_macos(prepared, path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (prepared, path);
+        Err(load_error(
+            SnapshotArtifactLoadStage::PlatformCheck,
+            SnapshotArtifactLoadFailure::UnsupportedPlatform,
+        ))
+    }
+}
+
 /// Opens and loads one memory artifact path against a prepared state commit.
 pub fn load_prepared_snapshot_memory_path(
     prepared: PreparedSnapshotState,
@@ -1053,6 +1609,15 @@ pub fn load_prepared_snapshot_memory_path(
             SnapshotArtifactLoadFailure::UnsupportedPlatform,
         ))
     }
+}
+
+/// Loads opened native-family state and memory descriptors in state-first order.
+pub fn load_native_snapshot_artifact_files(
+    state: File,
+    memory: File,
+) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    let prepared = prepare_native_snapshot_state_file(state)?;
+    load_prepared_native_snapshot_memory_file(prepared, memory)
 }
 
 /// Loads an already-opened state/memory pair through the ordinary validation path.
@@ -1090,9 +1655,12 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 use macos::{
-    load_prepared_snapshot_memory_file_macos, load_prepared_snapshot_memory_path_macos,
-    load_snapshot_artifacts_macos, prepare_snapshot_state_file_macos,
-    prepare_snapshot_state_path_macos, publish_snapshot_artifacts_macos_with,
+    load_native_snapshot_artifacts_macos, load_prepared_native_snapshot_memory_file_macos,
+    load_prepared_native_snapshot_memory_path_macos, load_prepared_snapshot_memory_file_macos,
+    load_prepared_snapshot_memory_path_macos, load_snapshot_artifacts_macos,
+    prepare_native_snapshot_state_file_macos, prepare_native_snapshot_state_path_macos,
+    prepare_snapshot_state_file_macos, prepare_snapshot_state_path_macos,
+    publish_native_snapshot_artifacts_macos_with, publish_snapshot_artifacts_macos_with,
 };
 
 #[cfg(test)]

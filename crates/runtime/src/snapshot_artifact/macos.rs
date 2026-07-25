@@ -13,6 +13,12 @@ const MEMORY_STAGING_PREFIX: &[u8] = b".bangbang-snapshot-memory-";
 const STATE_STAGING_PREFIX: &[u8] = b".bangbang-snapshot-state-";
 const STAGING_RANDOM_BYTES: usize = 16;
 const STAGING_CREATE_ATTEMPTS: usize = 16;
+const NATIVE_SNAPSHOT_MAX_FILE_BYTES: usize =
+    if NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES > NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES {
+        NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES
+    } else {
+        NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES
+    };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
@@ -194,12 +200,96 @@ impl Drop for StagingFile<'_> {
     }
 }
 
+trait PublicationState: Sized {
+    type Outcome;
+
+    fn verify_memory_output(&self, file: &mut File) -> Result<(), SnapshotPublicationFailure>;
+
+    fn state_bytes(&self) -> Result<Cow<'_, [u8]>, SnapshotPublicationFailure>;
+
+    fn into_outcome(self, durability: SnapshotCommitDurability) -> Self::Outcome;
+}
+
+impl PublicationState for SnapshotCommitRecord {
+    type Outcome = SnapshotPublicationOutcome;
+
+    fn verify_memory_output(&self, file: &mut File) -> Result<(), SnapshotPublicationFailure> {
+        verify_snapshot_memory_image_output(self.memory_binding(), file)
+            .map_err(SnapshotPublicationFailure::MemoryVerify)
+    }
+
+    fn state_bytes(&self) -> Result<Cow<'_, [u8]>, SnapshotPublicationFailure> {
+        encode_snapshot_commit_envelope(self)
+            .map(Cow::Owned)
+            .map_err(SnapshotPublicationFailure::Commit)
+    }
+
+    fn into_outcome(self, durability: SnapshotCommitDurability) -> Self::Outcome {
+        SnapshotPublicationOutcome {
+            record: self,
+            durability,
+        }
+    }
+}
+
+impl PublicationState for NativeSnapshotArtifactState {
+    type Outcome = NativeSnapshotPublicationOutcome;
+
+    fn verify_memory_output(&self, file: &mut File) -> Result<(), SnapshotPublicationFailure> {
+        self.validate_for_publication()
+            .map_err(SnapshotPublicationFailure::NativeState)?;
+        match &self.inner {
+            NativeSnapshotArtifactStateInner::V1(record) => {
+                verify_snapshot_memory_image_output(record.memory_binding(), file)
+                    .map_err(SnapshotPublicationFailure::MemoryVerify)
+            }
+            NativeSnapshotArtifactStateInner::V2 { binding, .. } => {
+                verify_snapshot_v2_memory_image_output(binding, file)
+                    .map_err(SnapshotPublicationFailure::MemoryV2Verify)
+            }
+        }
+    }
+
+    fn state_bytes(&self) -> Result<Cow<'_, [u8]>, SnapshotPublicationFailure> {
+        self.publication_bytes()
+            .map_err(SnapshotPublicationFailure::Commit)
+    }
+
+    fn into_outcome(self, durability: SnapshotCommitDurability) -> Self::Outcome {
+        NativeSnapshotPublicationOutcome {
+            state: self,
+            durability,
+        }
+    }
+}
+
 pub(super) fn publish_snapshot_artifacts_macos_with<E, F>(
     outputs: &SnapshotArtifactOutputs,
     producer: F,
 ) -> Result<SnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
 where
     F: FnOnce(SnapshotMemoryStagingWriter) -> Result<SnapshotCommitRecord, E>,
+{
+    publish_artifacts_macos_with(outputs, producer)
+}
+
+pub(super) fn publish_native_snapshot_artifacts_macos_with<E, F>(
+    outputs: &SnapshotArtifactOutputs,
+    producer: F,
+) -> Result<NativeSnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<NativeSnapshotArtifactState, E>,
+{
+    publish_artifacts_macos_with(outputs, producer)
+}
+
+fn publish_artifacts_macos_with<E, F, S>(
+    outputs: &SnapshotArtifactOutputs,
+    producer: F,
+) -> Result<S::Outcome, SnapshotPublicationTransactionError<E>>
+where
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<S, E>,
+    S: PublicationState,
 {
     let state = open_artifact_output(
         outputs.state(),
@@ -389,15 +479,16 @@ fn open_anchored_final(
     })
 }
 
-fn publish_prepared_with<E, F>(
+fn publish_prepared_with<E, F, S>(
     memory_path: &OpenedFinalPath,
     state_path: &OpenedFinalPath,
     memory_staging: &mut StagingFile<'_>,
     state_staging: &mut StagingFile<'_>,
     producer: F,
-) -> Result<SnapshotPublicationOutcome, SnapshotPublicationTransactionError<E>>
+) -> Result<S::Outcome, SnapshotPublicationTransactionError<E>>
 where
-    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<SnapshotCommitRecord, E>,
+    F: FnOnce(SnapshotMemoryStagingWriter) -> Result<S, E>,
+    S: PublicationState,
 {
     stage_io(
         SnapshotPublicationStage::MemoryWrite,
@@ -412,7 +503,7 @@ where
     })?;
     let writer_closed = Arc::new(AtomicBool::new(false));
     let writer = SnapshotMemoryStagingWriter::new(writer_file, Arc::clone(&writer_closed));
-    let record = producer(writer).map_err(|source| {
+    let state = producer(writer).map_err(|source| {
         SnapshotPublicationTransactionError::Producer(SnapshotPublicationProducerError::new(source))
     })?;
 
@@ -433,12 +524,13 @@ where
         SnapshotPublicationStage::MemoryWriteVerify,
         SnapshotArtifactVisibility::NoFinalArtifact,
     )?;
-    verify_snapshot_memory_image_output(record.memory_binding(), &mut memory_staging.file)
-        .map_err(|source| {
+    state
+        .verify_memory_output(&mut memory_staging.file)
+        .map_err(|failure| {
             publication_error(
                 SnapshotPublicationStage::MemoryWriteVerify,
                 SnapshotArtifactVisibility::NoFinalArtifact,
-                SnapshotPublicationFailure::MemoryVerify(source),
+                failure,
             )
         })?;
 
@@ -446,11 +538,11 @@ where
         SnapshotPublicationStage::StateEncode,
         SnapshotArtifactVisibility::NoFinalArtifact,
     )?;
-    let state_bytes = encode_snapshot_commit_envelope(&record).map_err(|source| {
+    let state_bytes = state.state_bytes().map_err(|failure| {
         publication_error(
             SnapshotPublicationStage::StateEncode,
             SnapshotArtifactVisibility::NoFinalArtifact,
-            SnapshotPublicationFailure::Commit(source),
+            failure,
         )
     })?;
 
@@ -507,7 +599,7 @@ where
         },
         Err(kind) => SnapshotCommitDurability::Uncertain { kind },
     };
-    Ok(SnapshotPublicationOutcome { record, durability })
+    Ok(state.into_outcome(durability))
 }
 
 fn split_final_path(
@@ -933,6 +1025,54 @@ fn clean_staging_entry(
     }
 }
 
+pub(super) fn load_native_snapshot_artifacts_macos(
+    paths: &SnapshotArtifactPaths,
+) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    let state_split =
+        split_final_path(paths.state(), SnapshotArtifactKind::State).map_err(|_| {
+            load_error(
+                SnapshotArtifactLoadStage::StatePathValidation,
+                SnapshotArtifactLoadFailure::InvalidFinalPath {
+                    artifact: SnapshotArtifactKind::State,
+                },
+            )
+        })?;
+    let state_directory = open_load_directory(
+        &state_split.parent,
+        SnapshotArtifactLoadStage::StateDirectoryOpen,
+    )?;
+    let (state_file, _) = open_regular_final(
+        &state_directory,
+        &state_split.component,
+        SnapshotArtifactKind::State,
+        SnapshotArtifactLoadStage::StateOpen,
+        SnapshotArtifactLoadStage::StateTypeCheck,
+    )?;
+    let prepared = prepare_native_snapshot_state_file_macos(state_file)?;
+
+    let memory_split =
+        split_final_path(paths.memory(), SnapshotArtifactKind::Memory).map_err(|_| {
+            load_error(
+                SnapshotArtifactLoadStage::MemoryPathValidation,
+                SnapshotArtifactLoadFailure::InvalidFinalPath {
+                    artifact: SnapshotArtifactKind::Memory,
+                },
+            )
+        })?;
+    let memory_directory = open_load_directory(
+        &memory_split.parent,
+        SnapshotArtifactLoadStage::MemoryDirectoryOpen,
+    )?;
+    let (memory_file, _) = open_regular_final(
+        &memory_directory,
+        &memory_split.component,
+        SnapshotArtifactKind::Memory,
+        SnapshotArtifactLoadStage::MemoryOpen,
+        SnapshotArtifactLoadStage::MemoryTypeCheck,
+    )?;
+    load_prepared_native_snapshot_memory_file_macos(prepared, memory_file)
+}
+
 pub(super) fn load_snapshot_artifacts_macos(
     paths: &SnapshotArtifactPaths,
 ) -> Result<LoadedSnapshotArtifacts, SnapshotArtifactLoadError> {
@@ -979,6 +1119,82 @@ pub(super) fn load_snapshot_artifacts_macos(
         SnapshotArtifactLoadStage::MemoryTypeCheck,
     )?;
     load_prepared_snapshot_memory_file_macos(prepared, memory_file)
+}
+
+pub(super) fn prepare_native_snapshot_state_file_macos(
+    mut state_file: File,
+) -> Result<PreparedNativeSnapshotState, SnapshotArtifactLoadError> {
+    let state_length = supplied_regular_length(
+        &state_file,
+        SnapshotArtifactKind::State,
+        SnapshotArtifactLoadStage::StateTypeCheck,
+    )?;
+    let maximum = u64::try_from(NATIVE_SNAPSHOT_MAX_FILE_BYTES).map_err(|_| {
+        load_error(
+            SnapshotArtifactLoadStage::StateSizeCheck,
+            SnapshotArtifactLoadFailure::LengthOverflow,
+        )
+    })?;
+    if state_length > maximum {
+        return Err(load_error(
+            SnapshotArtifactLoadStage::StateSizeCheck,
+            SnapshotArtifactLoadFailure::StateTooLarge {
+                length: state_length,
+                maximum: NATIVE_SNAPSHOT_MAX_FILE_BYTES,
+            },
+        ));
+    }
+    let reserve = usize::try_from(state_length).map_err(|_| {
+        load_error(
+            SnapshotArtifactLoadStage::StateSizeCheck,
+            SnapshotArtifactLoadFailure::LengthOverflow,
+        )
+    })?;
+    let mut state_bytes = Vec::new();
+    state_bytes.try_reserve_exact(reserve).map_err(|source| {
+        load_error(
+            SnapshotArtifactLoadStage::StateRead,
+            SnapshotArtifactLoadFailure::AllocationFailed { source },
+        )
+    })?;
+    let read_limit = maximum.checked_add(1).ok_or_else(|| {
+        load_error(
+            SnapshotArtifactLoadStage::StateSizeCheck,
+            SnapshotArtifactLoadFailure::LengthOverflow,
+        )
+    })?;
+    state_file.seek(SeekFrom::Start(0)).map_err(|source| {
+        load_error(
+            SnapshotArtifactLoadStage::StateRead,
+            SnapshotArtifactLoadFailure::Io(source.kind()),
+        )
+    })?;
+    Read::by_ref(&mut state_file)
+        .take(read_limit)
+        .read_to_end(&mut state_bytes)
+        .map_err(|source| {
+            load_error(
+                SnapshotArtifactLoadStage::StateRead,
+                SnapshotArtifactLoadFailure::Io(source.kind()),
+            )
+        })?;
+    if state_bytes.len() > NATIVE_SNAPSHOT_MAX_FILE_BYTES {
+        return Err(load_error(
+            SnapshotArtifactLoadStage::StateSizeCheck,
+            SnapshotArtifactLoadFailure::StateTooLarge {
+                length: u64::try_from(state_bytes.len()).unwrap_or(u64::MAX),
+                maximum: NATIVE_SNAPSHOT_MAX_FILE_BYTES,
+            },
+        ));
+    }
+    let state =
+        NativeSnapshotArtifactState::from_compatible_bytes(state_bytes).map_err(|source| {
+            load_error(
+                SnapshotArtifactLoadStage::StateDecode,
+                SnapshotArtifactLoadFailure::NativeState(source),
+            )
+        })?;
+    Ok(PreparedNativeSnapshotState { state })
 }
 
 pub(super) fn prepare_snapshot_state_file_macos(
@@ -1056,6 +1272,29 @@ pub(super) fn prepare_snapshot_state_file_macos(
     Ok(PreparedSnapshotState { record })
 }
 
+pub(super) fn prepare_native_snapshot_state_path_macos(
+    path: &Path,
+) -> Result<PreparedNativeSnapshotState, SnapshotArtifactLoadError> {
+    let split = split_final_path(path, SnapshotArtifactKind::State).map_err(|_| {
+        load_error(
+            SnapshotArtifactLoadStage::StatePathValidation,
+            SnapshotArtifactLoadFailure::InvalidFinalPath {
+                artifact: SnapshotArtifactKind::State,
+            },
+        )
+    })?;
+    let directory =
+        open_load_directory(&split.parent, SnapshotArtifactLoadStage::StateDirectoryOpen)?;
+    let (file, _) = open_regular_final(
+        &directory,
+        &split.component,
+        SnapshotArtifactKind::State,
+        SnapshotArtifactLoadStage::StateOpen,
+        SnapshotArtifactLoadStage::StateTypeCheck,
+    )?;
+    prepare_native_snapshot_state_file_macos(file)
+}
+
 pub(super) fn prepare_snapshot_state_path_macos(
     path: &Path,
 ) -> Result<PreparedSnapshotState, SnapshotArtifactLoadError> {
@@ -1077,6 +1316,55 @@ pub(super) fn prepare_snapshot_state_path_macos(
         SnapshotArtifactLoadStage::StateTypeCheck,
     )?;
     prepare_snapshot_state_file_macos(file)
+}
+
+pub(super) fn load_prepared_native_snapshot_memory_file_macos(
+    prepared: PreparedNativeSnapshotState,
+    mut memory_file: File,
+) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    let state = prepared.state;
+    let memory = match &state.inner {
+        NativeSnapshotArtifactStateInner::V1(record) => {
+            supplied_regular_length(
+                &memory_file,
+                SnapshotArtifactKind::Memory,
+                SnapshotArtifactLoadStage::MemoryTypeCheck,
+            )?;
+            memory_file.seek(SeekFrom::Start(0)).map_err(|source| {
+                load_error(
+                    SnapshotArtifactLoadStage::MemoryLoad,
+                    SnapshotArtifactLoadFailure::Io(source.kind()),
+                )
+            })?;
+            load_snapshot_memory_image(record.memory_binding(), &mut memory_file).map_err(
+                |source| {
+                    load_error(
+                        SnapshotArtifactLoadStage::MemoryLoad,
+                        SnapshotArtifactLoadFailure::Memory(source),
+                    )
+                },
+            )?
+        }
+        NativeSnapshotArtifactStateInner::V2 { bytes, .. } => {
+            let decoded = decode_snapshot_v2_state(bytes).map_err(|source| {
+                load_error(
+                    SnapshotArtifactLoadStage::StateDecode,
+                    SnapshotArtifactLoadFailure::NativeState(
+                        NativeSnapshotArtifactStateError::Format(
+                            NativeSnapshotFormatError::NativeV2(source),
+                        ),
+                    ),
+                )
+            })?;
+            load_snapshot_v2_memory_file(&decoded, memory_file).map_err(|source| {
+                load_error(
+                    SnapshotArtifactLoadStage::MemoryLoad,
+                    SnapshotArtifactLoadFailure::MemoryV2(source),
+                )
+            })?
+        }
+    };
+    Ok(LoadedNativeSnapshotArtifacts { state, memory })
 }
 
 pub(super) fn load_prepared_snapshot_memory_file_macos(
@@ -1104,6 +1392,32 @@ pub(super) fn load_prepared_snapshot_memory_file_macos(
         },
     )?;
     Ok(LoadedSnapshotArtifacts { record, memory })
+}
+
+pub(super) fn load_prepared_native_snapshot_memory_path_macos(
+    prepared: PreparedNativeSnapshotState,
+    path: &Path,
+) -> Result<LoadedNativeSnapshotArtifacts, SnapshotArtifactLoadError> {
+    let split = split_final_path(path, SnapshotArtifactKind::Memory).map_err(|_| {
+        load_error(
+            SnapshotArtifactLoadStage::MemoryPathValidation,
+            SnapshotArtifactLoadFailure::InvalidFinalPath {
+                artifact: SnapshotArtifactKind::Memory,
+            },
+        )
+    })?;
+    let directory = open_load_directory(
+        &split.parent,
+        SnapshotArtifactLoadStage::MemoryDirectoryOpen,
+    )?;
+    let (file, _) = open_regular_final(
+        &directory,
+        &split.component,
+        SnapshotArtifactKind::Memory,
+        SnapshotArtifactLoadStage::MemoryOpen,
+        SnapshotArtifactLoadStage::MemoryTypeCheck,
+    )?;
+    load_prepared_native_snapshot_memory_file_macos(prepared, file)
 }
 
 pub(super) fn load_prepared_snapshot_memory_path_macos(

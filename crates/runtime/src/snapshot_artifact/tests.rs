@@ -1,6 +1,13 @@
 use super::*;
 #[cfg(target_os = "macos")]
-use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange};
+use crate::memory::{
+    GuestAddress, GuestMemoryBacking, GuestMemoryLayout, GuestMemoryRange,
+    GuestMemoryRegionBacking, aarch64,
+};
+#[cfg(target_os = "macos")]
+use crate::snapshot_memory_v2::{
+    encode_snapshot_v2_state_with_memory, write_snapshot_v2_memory_image,
+};
 
 #[cfg(target_os = "macos")]
 use std::fs;
@@ -68,6 +75,117 @@ fn generalized_publication_rejects_platform_without_invoking_producer() {
         SnapshotPublicationStage::PlatformCheck
     );
     assert!(error.producer().is_none());
+
+    let native_called = std::cell::Cell::new(false);
+    let native_error =
+        publish_native_snapshot_artifacts_with::<std::io::Error, _>(&paths, |_writer| {
+            native_called.set(true);
+            Err(std::io::Error::other("native producer must not run"))
+        })
+        .expect_err("non-macOS native publication should reject at platform preflight");
+    assert!(!native_called.get());
+    assert_eq!(
+        native_error
+            .publication()
+            .expect("native platform rejection should be a publication failure")
+            .stage(),
+        SnapshotPublicationStage::PlatformCheck
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding =
+        write_snapshot_v2_memory_image(&memory, &mut image).expect("v2 memory should encode");
+    let bytes =
+        encode_snapshot_v2_state_with_memory(&binding).expect("v2 state should encode canonically");
+    let state = NativeSnapshotArtifactState::from_current_v2(bytes.clone())
+        .expect("current v2 state should validate");
+
+    assert_eq!(state.family(), NativeSnapshotArtifactFamily::V2);
+    assert_eq!(state.version(), NATIVE_V2_SNAPSHOT_VERSION);
+    assert_eq!(state.v2_bytes(), Some(bytes.as_slice()));
+    assert_eq!(state.v2_memory_binding(), Some(&binding));
+    assert!(state.v1_record().is_none());
+    let debug = format!("{state:?}");
+    assert!(debug.contains(REDACTED));
+    assert!(!debug.contains("BANGV2A"));
+    assert!(!debug.contains("BANGM2A"));
+
+    let (owned_bytes, owned_binding) = state
+        .into_v2_parts()
+        .expect("v2 state should consume into its closed parts");
+    assert_eq!(owned_bytes, bytes);
+    assert_eq!(owned_binding, binding);
+
+    let mut legacy = bytes;
+    let binding_offset = legacy
+        .windows(crate::snapshot_memory_v2::NATIVE_V2_MEMORY_MAGIC.len())
+        .position(|window| window == crate::snapshot_memory_v2::NATIVE_V2_MEMORY_MAGIC)
+        .expect("memory binding should occur in state");
+    let binding_length = crate::snapshot_memory_v2::NATIVE_V2_MEMORY_HEADER_BYTES
+        + crate::snapshot_memory_v2::NATIVE_V2_MEMORY_EXTENT_BYTES;
+    legacy[10..12].copy_from_slice(&1_u16.to_le_bytes());
+    legacy[binding_offset + 10..binding_offset + 12].copy_from_slice(&1_u16.to_le_bytes());
+    legacy[binding_offset + 48..binding_offset + 56].fill(0);
+    let binding_checksum =
+        crc64::crc64(0, &legacy[binding_offset..binding_offset + binding_length]);
+    legacy[binding_offset + 48..binding_offset + 56]
+        .copy_from_slice(&binding_checksum.to_le_bytes());
+    let state_checksum_offset =
+        legacy.len() - crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES;
+    let state_checksum = crc64::crc64(0, &legacy[..state_checksum_offset]);
+    legacy[state_checksum_offset..].copy_from_slice(&state_checksum.to_le_bytes());
+
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_current_v2(legacy.clone()),
+        Err(NativeSnapshotArtifactStateError::NonCurrentV2Publication { .. })
+    ));
+    let compatible = NativeSnapshotArtifactState::from_compatible_bytes(legacy)
+        .expect("compatible older-minor v2 state should prepare");
+    assert_eq!(compatible.version(), SnapshotFormatVersion::new(2, 1, 0));
+
+    let mut legacy_image = image.into_inner();
+    let legacy_header = compatible
+        .v2_memory_binding()
+        .expect("compatible v2 state should retain a binding")
+        .encode()
+        .expect("compatible binding should re-encode");
+    legacy_image[..crate::snapshot_memory_v2::NATIVE_V2_MEMORY_HEADER_BYTES].copy_from_slice(
+        &legacy_header[..crate::snapshot_memory_v2::NATIVE_V2_MEMORY_HEADER_BYTES],
+    );
+    let directory = TestDirectory::new("legacy-v2-publish");
+    let paths = directory.paths("state.snap", "memory.snap");
+    let error = publish_native_snapshot_artifacts_with(&paths, |mut writer| {
+        writer
+            .write_all(&legacy_image)
+            .expect("compatible image fixture should write");
+        Ok::<_, io::Error>(compatible)
+    })
+    .expect_err("a compatible reader value must not bypass current-version publication");
+    assert!(matches!(
+        error
+            .publication()
+            .expect("version rejection should be a publication failure")
+            .failure(),
+        SnapshotPublicationFailure::NativeState(
+            NativeSnapshotArtifactStateError::NonCurrentV2Publication { .. }
+        )
+    ));
+    assert!(!paths.state().exists());
+    assert!(!paths.memory().exists());
+
+    let v1 = NativeSnapshotArtifactState::from_v1(test_memory_only_record());
+    assert_eq!(v1.family(), NativeSnapshotArtifactFamily::V1);
+    assert_eq!(v1.version(), NATIVE_V1_SNAPSHOT_VERSION);
+    assert!(v1.v2_bytes().is_none());
+    assert!(
+        v1.into_v1_record().is_ok(),
+        "v1 state should consume only through the v1 accessor"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -105,6 +223,132 @@ fn publishes_and_loads_same_directory_pair() {
         .read_slice(&mut actual, GuestAddress::new(0x4000))
         .expect("loaded memory should be readable");
     assert_eq!(actual, test_bytes());
+
+    let native =
+        load_native_snapshot_artifacts(&paths).expect("v1 pair should use native-family loader");
+    assert_eq!(native.family(), NativeSnapshotArtifactFamily::V1);
+    assert_eq!(
+        native
+            .state()
+            .v1_record()
+            .expect("native-family v1 load should retain its record"),
+        outcome.record()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn publishes_and_loads_native_v2_with_retained_private_cow_memory() {
+    let directory = TestDirectory::new("native-v2");
+    let paths = directory.paths("state.snap", "memory.snap");
+    let outcome = publish_test_v2(&paths);
+
+    assert_eq!(outcome.family(), NativeSnapshotArtifactFamily::V2);
+    assert_eq!(outcome.durability(), SnapshotCommitDurability::Durable);
+    assert_eq!(
+        fs::read(paths.state()).expect("published state should read"),
+        outcome
+            .state()
+            .v2_bytes()
+            .expect("v2 outcome should retain exact state bytes")
+    );
+    assert_no_staging(&directory.path);
+
+    let prepared = prepare_native_snapshot_state_path(paths.state())
+        .expect("native-v2 state should prepare independently");
+    assert_eq!(prepared.family(), NativeSnapshotArtifactFamily::V2);
+    let prepared_loaded = load_prepared_native_snapshot_memory_path(prepared, paths.memory())
+        .expect("prepared native-v2 state should load its memory independently");
+    assert_eq!(prepared_loaded.family(), NativeSnapshotArtifactFamily::V2);
+
+    let first =
+        load_native_snapshot_artifacts(&paths).expect("native-v2 pair should load directly");
+    let second =
+        load_native_snapshot_artifacts(&paths).expect("native-v2 pair should load repeatedly");
+    assert_eq!(first.family(), NativeSnapshotArtifactFamily::V2);
+    assert_eq!(first.memory().backing(), GuestMemoryBacking::Anonymous);
+    assert!(
+        first
+            .memory()
+            .regions()
+            .iter()
+            .all(|region| region.backing() == GuestMemoryRegionBacking::PrivateFile)
+    );
+    let (first_state, mut first_memory) = first.into_parts();
+    assert_eq!(first_state.family(), NativeSnapshotArtifactFamily::V2);
+
+    let address = GuestAddress::new(aarch64::DRAM_MEM_START);
+    let mut original = vec![0; TEST_MEMORY_BYTES];
+    first_memory
+        .read_slice(&mut original, address)
+        .expect("first v2 mapping should read");
+    assert_eq!(original, test_bytes());
+
+    let replacement = vec![0xa5; TEST_MEMORY_BYTES];
+    first_memory
+        .write_slice(&replacement, address)
+        .expect("first v2 mapping should accept private writes");
+    let mut observed = vec![0; TEST_MEMORY_BYTES];
+    second
+        .memory()
+        .read_slice(&mut observed, address)
+        .expect("second v2 mapping should remain isolated");
+    assert_eq!(observed, original);
+
+    let binding = outcome
+        .state()
+        .v2_memory_binding()
+        .expect("published v2 state should retain its binding");
+    let source = fs::read(paths.memory()).expect("source memory image should read");
+    let start = usize::try_from(binding.extents()[0].file_offset())
+        .expect("fixture file offset should fit usize");
+    assert_eq!(
+        source
+            .get(start..start + TEST_MEMORY_BYTES)
+            .expect("source guest bytes should exist"),
+        original
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_v2_opened_pair_survives_path_replacement_and_rejects_rw_memory() {
+    let directory = TestDirectory::new("v2-opened");
+    let paths = directory.paths("state.snap", "memory.snap");
+    publish_test_v2(&paths);
+    let state = File::open(paths.state()).expect("state should open");
+    let memory = File::open(paths.memory()).expect("memory should open");
+
+    let moved_state = directory.path.join("state-original.snap");
+    fs::rename(paths.state(), &moved_state).expect("state should move");
+    fs::write(paths.state(), b"replacement state").expect("replacement state should create");
+    let moved_memory = directory.path.join("memory-original.snap");
+    fs::rename(paths.memory(), &moved_memory).expect("memory should move");
+    fs::write(paths.memory(), b"replacement memory").expect("replacement memory should create");
+
+    let loaded = load_native_snapshot_artifact_files(state, memory)
+        .expect("opened v2 pair should retain original identities");
+    assert_eq!(loaded.family(), NativeSnapshotArtifactFamily::V2);
+    let mut bytes = vec![0; TEST_MEMORY_BYTES];
+    loaded
+        .memory()
+        .read_slice(&mut bytes, GuestAddress::new(aarch64::DRAM_MEM_START))
+        .expect("retained v2 memory should read");
+    assert_eq!(bytes, test_bytes());
+
+    let state = File::open(&moved_state).expect("original state should reopen");
+    let memory = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&moved_memory)
+        .expect("memory should open read-write");
+    let error = load_native_snapshot_artifact_files(state, memory)
+        .expect_err("v2 retained loader must reject read-write descriptors");
+    assert_eq!(error.stage(), SnapshotArtifactLoadStage::MemoryLoad);
+    assert!(matches!(
+        error.failure(),
+        SnapshotArtifactLoadFailure::MemoryV2(SnapshotV2MemoryLoadError::DescriptorNotReadOnly)
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -161,6 +405,24 @@ fn supplied_directory_anchors_publish_into_the_opened_identity() {
     assert!(moved.join("memory.snap").is_file());
     assert!(!directory.path.join("state.snap").exists());
     assert!(!directory.path.join("memory.snap").exists());
+
+    let v2_outputs = SnapshotArtifactOutputs::new(
+        SnapshotArtifactOutput::anchored(
+            File::open(&moved).expect("v2 state anchor should open"),
+            b"state-v2.snap".to_vec(),
+        ),
+        SnapshotArtifactOutput::anchored(
+            File::open(&moved).expect("v2 memory anchor should open"),
+            b"memory-v2.snap".to_vec(),
+        ),
+    );
+    let v2 = publish_native_snapshot_artifacts_to_with(&v2_outputs, produce_test_v2)
+        .expect("anchored native-v2 pair should publish");
+    assert_eq!(v2.family(), NativeSnapshotArtifactFamily::V2);
+    let v2_paths =
+        SnapshotArtifactPaths::new(moved.join("state-v2.snap"), moved.join("memory-v2.snap"));
+    load_native_snapshot_artifacts(&v2_paths).expect("anchored native-v2 pair should load");
+
     fs::remove_dir_all(moved).expect("opened directory should clean up");
 }
 
@@ -683,6 +945,40 @@ fn producer_output_mismatch_fails_before_any_final_publication() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_v2_state_from_another_image_fails_before_publication() {
+    let directory = TestDirectory::new("v2-mismatch");
+    let paths = directory.paths("state.snap", "memory.snap");
+    let error = publish_native_snapshot_artifacts_with(&paths, |mut writer| {
+        write_snapshot_v2_memory_image(&test_v2_memory(), &mut writer)
+            .map_err(|source| source.to_string())?;
+        let mut other_image = Cursor::new(Vec::new());
+        let other_binding = write_snapshot_v2_memory_image(&test_v2_memory(), &mut other_image)
+            .map_err(|source| source.to_string())?;
+        let other_state = encode_snapshot_v2_state_with_memory(&other_binding)
+            .map_err(|source| source.to_string())?;
+        NativeSnapshotArtifactState::from_current_v2(other_state)
+            .map_err(|source| source.to_string())
+    })
+    .expect_err("unrelated native-v2 state and memory must reject");
+
+    let publication = error
+        .publication()
+        .expect("binding mismatch should be a publication failure");
+    assert_eq!(
+        publication.stage(),
+        SnapshotPublicationStage::MemoryWriteVerify
+    );
+    assert!(matches!(
+        publication.failure(),
+        SnapshotPublicationFailure::MemoryV2Verify(SnapshotV2MemoryLoadError::MemoryHeaderMismatch)
+    ));
+    assert!(!paths.state().exists());
+    assert!(!paths.memory().exists());
+    assert_no_staging(&directory.path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn publishes_and_loads_across_directories() {
     let root = TestDirectory::new("cross-directory");
     let state_directory = root.path.join("state");
@@ -696,6 +992,13 @@ fn publishes_and_loads_across_directories() {
 
     publish_snapshot_artifacts(&paths, &test_memory()).expect("publish should succeed");
     load_snapshot_artifacts(&paths).expect("committed pair should load");
+
+    let v2_paths = SnapshotArtifactPaths::new(
+        state_directory.join("state-v2.snap"),
+        memory_directory.join("memory-v2.snap"),
+    );
+    publish_test_v2(&v2_paths);
+    load_native_snapshot_artifacts(&v2_paths).expect("cross-directory v2 pair should load");
     assert_no_staging(&state_directory);
     assert_no_staging(&memory_directory);
 }
@@ -1098,6 +1401,19 @@ fn successful_trace_orders_file_and_directory_barriers() {
         SnapshotPublicationStage::StatePublish,
         SnapshotPublicationStage::StateDirectorySync,
     );
+
+    let v2_directory = TestDirectory::new("trace-v2");
+    let v2_paths = v2_directory.paths("state.snap", "memory.snap");
+    let (v2_outcome, v2_order) = macos::with_publication_trace(|| publish_test_v2(&v2_paths));
+    assert_eq!(
+        v2_outcome.family(),
+        NativeSnapshotArtifactFamily::V2,
+        "the shared trace should still return the selected family"
+    );
+    assert_eq!(
+        v2_order, order,
+        "both family adapters must traverse the same transaction stages"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1484,6 +1800,34 @@ fn load_stops_at_absent_state_before_memory() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_family_load_rejects_firecracker_and_unknown_state_before_memory_open() {
+    let fixtures: [(&str, &[u8]); 2] = [
+        (
+            "firecracker",
+            &[0x00, 0x00, 0x00, 0xaa, 0xaa, 0x84, 0x19, 0x10, 0x07],
+        ),
+        ("unknown", b"not-a-native-snapshot"),
+    ];
+    for (name, state) in fixtures {
+        let directory = TestDirectory::new(name);
+        let paths = directory.paths("state.snap", "missing-memory.snap");
+        fs::write(paths.state(), state).expect("state fixture should write");
+
+        let error = load_native_snapshot_artifacts(&paths)
+            .expect_err("incompatible state must fail before memory open");
+        assert_eq!(error.stage(), SnapshotArtifactLoadStage::StateDecode);
+        assert!(matches!(
+            error.failure(),
+            SnapshotArtifactLoadFailure::NativeState(NativeSnapshotArtifactStateError::Format(
+                NativeSnapshotFormatError::IncompatibleFirecrackerFormat
+                    | NativeSnapshotFormatError::IncompatibleFormat
+            ))
+        ));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn load_rejects_corrupt_state_and_mismatched_memory() {
     let directory = TestDirectory::new("corruption");
     let paths = directory.paths("state.snap", "memory.snap");
@@ -1770,6 +2114,40 @@ fn test_memory() -> GuestMemory {
         .write_slice(&test_bytes(), GuestAddress::new(0x4000))
         .expect("fixture bytes should write");
     memory
+}
+
+#[cfg(target_os = "macos")]
+fn test_v2_memory() -> GuestMemory {
+    let layout = GuestMemoryLayout::new(vec![
+        GuestMemoryRange::new(
+            GuestAddress::new(aarch64::DRAM_MEM_START),
+            u64::try_from(TEST_MEMORY_BYTES).expect("fixture size should fit u64"),
+        )
+        .expect("native-v2 fixture range should be valid"),
+    ])
+    .expect("native-v2 fixture layout should be valid");
+    let mut memory = GuestMemory::allocate(&layout).expect("native-v2 memory should allocate");
+    memory
+        .write_slice(&test_bytes(), GuestAddress::new(aarch64::DRAM_MEM_START))
+        .expect("native-v2 fixture bytes should write");
+    memory
+}
+
+#[cfg(target_os = "macos")]
+fn produce_test_v2(
+    mut writer: SnapshotMemoryStagingWriter,
+) -> Result<NativeSnapshotArtifactState, String> {
+    let binding = write_snapshot_v2_memory_image(&test_v2_memory(), &mut writer)
+        .map_err(|source| source.to_string())?;
+    let state =
+        encode_snapshot_v2_state_with_memory(&binding).map_err(|source| source.to_string())?;
+    NativeSnapshotArtifactState::from_current_v2(state).map_err(|source| source.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn publish_test_v2(paths: &SnapshotArtifactPaths) -> NativeSnapshotPublicationOutcome {
+    publish_native_snapshot_artifacts_with(paths, produce_test_v2)
+        .expect("native-v2 pair should publish")
 }
 
 #[cfg(target_os = "macos")]

@@ -2824,8 +2824,11 @@ steal under controlled contention, unchanged idle accounting, and unchanged
 paused captures. This is not a claim of KVM's device attribute or PVTime
 artifact compatibility. #1481 certifies the live/capture-ready aggregate, and
 #1529 serializes its portable topology-ordered cumulative values in native-v2
-and restores destination accounting without charging snapshot downtime. Public
-artifact publication and broader cross-host portability remain Wave 6 work.
+and restores destination accounting without charging snapshot downtime. #1575
+adds VM-free current-v2 artifact publication and compatible native-v1/v2
+state-first loading through one no-clobber transaction; no public process action
+invokes the v2 path yet. Public lifecycle activation and broader cross-host
+portability remain Wave 6 work.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are
 not part of the minimal RTC device. The backend-neutral arm64 FDT builder emits
@@ -3961,10 +3964,12 @@ Their eventual support level should follow the endpoint matrix:
   ordered guest notifications/time observations, recapture-to-restore, timer
   PPI, secondary PSCI completion, and initially offline continuation. There is
   no public v2 create/load/describe dispatch, general device aggregate, or
-  production resource composition. Remaining work includes public
-  transactional artifacts, optional-device state, Diff artifacts, overrides,
-  Firecracker artifact compatibility, authentication, and broader cross-host
-  portability
+  production resource composition. A VM-free closed native-family handoff now
+  publishes current-v2 and prepares/loads compatible v1/v2 pairs through the
+  existing anchored no-clobber transaction without changing the public v1
+  surface. Remaining work includes public lifecycle routing, optional-device
+  state, Diff artifacts, overrides, Firecracker artifact compatibility,
+  authentication, and broader cross-host portability
 - balloon producers outside the implemented queue/discard/reporting activity
   and serialized/restored balloon state; live paired PFN accounting and
   capture-ready ownership are implemented, while absent guest statistics are
