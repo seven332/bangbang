@@ -622,8 +622,10 @@ real HVF.
 
 The same signed target contains the native-v2 platform completion gate. A
 three-vCPU bare guest reaches a paused runnable/suspended/offline graph, writes
-fresh canonical memory images, captures repeatedly to prove non-consuming
-source ownership, structurally decodes before construction, loads
+fresh canonical memory images, rejects a bounded memory-stage cancellation,
+recovers the inner coordinator without guest dispatch, and pauses/captures
+again to prove non-consuming source ownership. It structurally decodes before
+construction, loads
 already-authorized memory, destroys the source VM, and restores fresh focused
 platforms repeatedly from the same immutable graph. Before ordinary progress,
 the guest acknowledges VMGenID then VMClock and observes a fresh clone ID,
@@ -640,6 +642,22 @@ valid recapture, and clean shutdown. Run the focused proof with:
 scripts/run-integration-tests.sh --test hvf_lifecycle -- \
   --exact native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progress
 ```
+
+The private production-process composition has a separate signed group:
+
+```sh
+scripts/run-integration-tests.sh --test native_v2_process
+```
+
+The wrapper builds the `bangbang` binary unit-test harness, locates and signs
+that exact test executable, and runs only the ignored private-seam proof. Its
+minimal two-vCPU guest does not touch serial or optional devices. The test
+starts and pauses the real process-owned HVF supervisor, publishes and loads a
+current native-v2 pair, checks runnable-primary/offline-secondary topology,
+uses the ordinary process resume and pause actions, publishes a second fresh
+pair, and shuts down cleanly. This group is part of the default integration
+set and must run without `--allow-unsupported` on supported Apple Silicon. It
+adds no API, CLI, config-file, or environment activation for native-v2.
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,

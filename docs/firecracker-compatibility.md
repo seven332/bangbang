@@ -2826,8 +2826,13 @@ artifact compatibility. #1481 certifies the live/capture-ready aggregate, and
 #1529 serializes its portable topology-ordered cumulative values in native-v2
 and restores destination accounting without charging snapshot downtime. #1575
 adds VM-free current-v2 artifact publication and compatible native-v1/v2
-state-first loading through one no-clobber transaction; no public process action
-invokes the v2 path yet. Public lifecycle activation and broader cross-host
+state-first loading through one no-clobber transaction. #1576 privately
+composes that publisher with a strictly admitted paused production session,
+canonical default UART proof, cancellable topology/memory capture, exact 2.3
+encoding, inner-coordinator recovery, and repeat source publication. A signed
+two-vCPU process proof and the signed runnable/suspended/offline HVF proof cover
+the real owners. No public process action invokes the v2 path yet; public
+activation, v2 process restore, optional devices, and broader cross-host
 portability remain Wave 6 work.
 
 VMGenID/SysGenID and VMClock are supported-target device families, but they are

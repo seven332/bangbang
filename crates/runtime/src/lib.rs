@@ -1345,6 +1345,23 @@ impl VmmController {
         })
     }
 
+    fn snapshot_v2_create_profile(
+        &self,
+    ) -> Result<snapshot::SnapshotV2CreateProfile, VmmActionError> {
+        Ok(snapshot::SnapshotV2CreateProfile {
+            boot_source_configured: self.boot_source_config.is_some(),
+            drive_configured: !self.drive_configs.as_slice().is_empty(),
+            network_configured: !self.network_interface_configs.as_slice().is_empty(),
+            vsock_configured: self.vsock_config.is_some(),
+            pmem_configured: !self.pmem_configs.as_slice().is_empty(),
+            balloon_configured: self.balloon_config.is_some(),
+            memory_hotplug_configured: self.memory_hotplug_config.is_some(),
+            entropy_configured: self.entropy_config.is_some(),
+            mmds_configured: self.snapshot_mmds_configured()?,
+            serial_is_default: self.serial_config == serial::SerialConfig::default(),
+        })
+    }
+
     fn snapshot_v1_load_profile(&self) -> Result<snapshot::SnapshotV1LoadProfile, VmmActionError> {
         Ok(snapshot::SnapshotV1LoadProfile {
             machine_is_default: self.machine_config == machine::MachineConfig::default()
@@ -1386,6 +1403,26 @@ impl VmmController {
 
     pub fn preflight_create_snapshot_profile(&self) -> Result<(), VmmActionError> {
         snapshot::classify_v1_create_profile(self.snapshot_v1_vm_profile()?)
+            .map_err(|_| VmmActionError::SnapshotUnsupported)
+    }
+
+    /// Preflights the private native-v2 Full producer profile.
+    ///
+    /// This method does not dispatch a public action and does not grant path
+    /// authority.
+    pub fn preflight_create_snapshot_v2(
+        &self,
+        input: &snapshot::SnapshotCreateInput,
+    ) -> Result<(), VmmActionError> {
+        if self.instance_info.state != InstanceState::Paused {
+            return Err(VmmActionError::UnsupportedState {
+                action: "CreateSnapshot",
+                state: self.instance_info.state,
+            });
+        }
+        snapshot::classify_v2_create_request(input)
+            .map_err(|_| VmmActionError::SnapshotUnsupported)?;
+        snapshot::classify_v2_create_profile(self.snapshot_v2_create_profile()?)
             .map_err(|_| VmmActionError::SnapshotUnsupported)
     }
 
@@ -3389,6 +3426,134 @@ mod tests {
             controller
                 .handle_action(VmmAction::PutSerial(serial_input("/tmp/serial")))
                 .expect("serial config should be stored");
+        });
+    }
+
+    #[test]
+    fn controller_private_native_v2_create_profile_is_fail_closed() {
+        fn admitted() -> VmmController {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source should be stored");
+            controller.instance_info.state = InstanceState::Paused;
+            controller
+        }
+
+        fn rejected(configure: impl FnOnce(&mut VmmController)) {
+            let mut controller = admitted();
+            controller.instance_info.state = InstanceState::NotStarted;
+            configure(&mut controller);
+            controller.instance_info.state = InstanceState::Paused;
+            assert_eq!(
+                controller.preflight_create_snapshot_v2(&snapshot_create_input(SnapshotType::Full)),
+                Err(VmmActionError::SnapshotUnsupported)
+            );
+        }
+
+        let full = snapshot_create_input(SnapshotType::Full);
+        let mut supported = admitted();
+        assert_eq!(supported.preflight_create_snapshot_v2(&full), Ok(()));
+        supported.instance_info.state = InstanceState::Running;
+        assert_eq!(
+            supported.preflight_create_snapshot_v2(&full),
+            Err(VmmActionError::UnsupportedState {
+                action: "CreateSnapshot",
+                state: InstanceState::Running,
+            })
+        );
+        supported.instance_info.state = InstanceState::Paused;
+        assert_eq!(
+            supported.preflight_create_snapshot_v2(&snapshot_create_input(SnapshotType::Diff)),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+
+        let mut represented_machine = admitted();
+        represented_machine.instance_info.state = InstanceState::NotStarted;
+        represented_machine
+            .handle_action(VmmAction::PutMachineConfig(
+                MachineConfigInput::new(2, 128).with_track_dirty_pages(true),
+            ))
+            .expect("represented machine facts should be stored");
+        represented_machine
+            .handle_action(VmmAction::PutCpuConfig(supported_cpu_config_input()))
+            .expect("custom CPU template should be stored");
+        represented_machine.instance_info.state = InstanceState::Paused;
+        assert_eq!(
+            represented_machine.preflight_create_snapshot_v2(&full),
+            Ok(())
+        );
+
+        let mut missing_boot = VmmController::new("demo-1", "0.1.0", "bangbang");
+        missing_boot.instance_info.state = InstanceState::Paused;
+        assert_eq!(
+            missing_boot.preflight_create_snapshot_v2(&full),
+            Err(VmmActionError::SnapshotUnsupported)
+        );
+
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(drive_input(
+                    "root",
+                    "/tmp/rootfs",
+                    true,
+                )))
+                .expect("drive should be stored");
+        });
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(network_input(
+                    "eth0", "tap0",
+                )))
+                .expect("network should be stored");
+        });
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutVsock(vsock_input(
+                    MIN_GUEST_CID,
+                    "/tmp/vsock",
+                )))
+                .expect("vsock should be stored");
+        });
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem")))
+                .expect("pmem should be stored");
+        });
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutBalloon(balloon_input(64, false)))
+                .expect("balloon should be stored");
+        });
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
+                .expect("memory hotplug should be stored");
+        });
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                .expect("entropy should be stored");
+        });
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(network_input(
+                    "eth0", "tap0",
+                )))
+                .expect("MMDS network should be stored");
+            controller
+                .handle_action(VmmAction::PutMmdsConfig(mmds_config_input()))
+                .expect("MMDS config should be stored");
+        });
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutMmds(mmds_content_input()))
+                .expect("MMDS data should be stored");
+        });
+        rejected(|controller| {
+            controller
+                .handle_action(VmmAction::PutSerial(serial_input("/tmp/serial")))
+                .expect("custom serial should be stored");
         });
     }
 

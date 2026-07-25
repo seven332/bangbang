@@ -462,6 +462,35 @@ pub(crate) enum SnapshotV1Rejection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotV2CreateRejection {
+    CreateSnapshotType,
+    BootSource,
+    DriveDevice,
+    NetworkDevice,
+    VsockDevice,
+    PmemDevice,
+    BalloonDevice,
+    MemoryHotplugDevice,
+    EntropyDevice,
+    MmdsState,
+    SerialConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotV2CreateProfile {
+    pub(crate) boot_source_configured: bool,
+    pub(crate) drive_configured: bool,
+    pub(crate) network_configured: bool,
+    pub(crate) vsock_configured: bool,
+    pub(crate) pmem_configured: bool,
+    pub(crate) balloon_configured: bool,
+    pub(crate) memory_hotplug_configured: bool,
+    pub(crate) entropy_configured: bool,
+    pub(crate) mmds_configured: bool,
+    pub(crate) serial_is_default: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SnapshotV1VmProfile {
     pub(crate) machine_supported: bool,
     pub(crate) drive_supported: bool,
@@ -543,6 +572,60 @@ pub(crate) fn classify_v1_create_profile(
         return Err(SnapshotV1Rejection::SerialConfig);
     }
 
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn classify_v2_create(
+    input: &SnapshotCreateInput,
+    profile: SnapshotV2CreateProfile,
+) -> Result<(), SnapshotV2CreateRejection> {
+    classify_v2_create_request(input)?;
+    classify_v2_create_profile(profile)
+}
+
+pub(crate) fn classify_v2_create_request(
+    input: &SnapshotCreateInput,
+) -> Result<(), SnapshotV2CreateRejection> {
+    if input.snapshot_type != SnapshotType::Full {
+        return Err(SnapshotV2CreateRejection::CreateSnapshotType);
+    }
+    Ok(())
+}
+
+pub(crate) fn classify_v2_create_profile(
+    profile: SnapshotV2CreateProfile,
+) -> Result<(), SnapshotV2CreateRejection> {
+    if !profile.boot_source_configured {
+        return Err(SnapshotV2CreateRejection::BootSource);
+    }
+    if profile.drive_configured {
+        return Err(SnapshotV2CreateRejection::DriveDevice);
+    }
+    if profile.network_configured {
+        return Err(SnapshotV2CreateRejection::NetworkDevice);
+    }
+    if profile.vsock_configured {
+        return Err(SnapshotV2CreateRejection::VsockDevice);
+    }
+    if profile.pmem_configured {
+        return Err(SnapshotV2CreateRejection::PmemDevice);
+    }
+    if profile.balloon_configured {
+        return Err(SnapshotV2CreateRejection::BalloonDevice);
+    }
+    if profile.memory_hotplug_configured {
+        return Err(SnapshotV2CreateRejection::MemoryHotplugDevice);
+    }
+    if profile.entropy_configured {
+        return Err(SnapshotV2CreateRejection::EntropyDevice);
+    }
+    if profile.mmds_configured {
+        return Err(SnapshotV2CreateRejection::MmdsState);
+    }
+    if !profile.serial_is_default {
+        return Err(SnapshotV2CreateRejection::SerialConfig);
+    }
     Ok(())
 }
 
@@ -634,6 +717,21 @@ mod tests {
             entropy_configured: false,
             mmds_configured: false,
             serial_supported: true,
+        }
+    }
+
+    fn supported_v2_profile() -> SnapshotV2CreateProfile {
+        SnapshotV2CreateProfile {
+            boot_source_configured: true,
+            drive_configured: false,
+            network_configured: false,
+            vsock_configured: false,
+            pmem_configured: false,
+            balloon_configured: false,
+            memory_hotplug_configured: false,
+            entropy_configured: false,
+            mmds_configured: false,
+            serial_is_default: true,
         }
     }
 
@@ -854,6 +952,96 @@ mod tests {
 
         for (profile, expected) in cases {
             assert_eq!(classify_v1_create(&full, profile), Err(expected));
+        }
+    }
+
+    #[test]
+    fn native_v2_create_policy_accepts_machine_facts_and_rejects_unencoded_resources() {
+        let full = SnapshotCreateInput::new(SnapshotType::Full, "state", "memory");
+        assert_eq!(classify_v2_create(&full, supported_v2_profile()), Ok(()));
+        assert_eq!(
+            classify_v2_create(
+                &SnapshotCreateInput::new(SnapshotType::Diff, "state", "memory"),
+                supported_v2_profile(),
+            ),
+            Err(SnapshotV2CreateRejection::CreateSnapshotType)
+        );
+
+        let cases = [
+            (
+                SnapshotV2CreateProfile {
+                    boot_source_configured: false,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::BootSource,
+            ),
+            (
+                SnapshotV2CreateProfile {
+                    drive_configured: true,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::DriveDevice,
+            ),
+            (
+                SnapshotV2CreateProfile {
+                    network_configured: true,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::NetworkDevice,
+            ),
+            (
+                SnapshotV2CreateProfile {
+                    vsock_configured: true,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::VsockDevice,
+            ),
+            (
+                SnapshotV2CreateProfile {
+                    pmem_configured: true,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::PmemDevice,
+            ),
+            (
+                SnapshotV2CreateProfile {
+                    balloon_configured: true,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::BalloonDevice,
+            ),
+            (
+                SnapshotV2CreateProfile {
+                    memory_hotplug_configured: true,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::MemoryHotplugDevice,
+            ),
+            (
+                SnapshotV2CreateProfile {
+                    entropy_configured: true,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::EntropyDevice,
+            ),
+            (
+                SnapshotV2CreateProfile {
+                    mmds_configured: true,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::MmdsState,
+            ),
+            (
+                SnapshotV2CreateProfile {
+                    serial_is_default: false,
+                    ..supported_v2_profile()
+                },
+                SnapshotV2CreateRejection::SerialConfig,
+            ),
+        ];
+
+        for (profile, expected) in cases {
+            assert_eq!(classify_v2_create(&full, profile), Err(expected));
         }
     }
 
