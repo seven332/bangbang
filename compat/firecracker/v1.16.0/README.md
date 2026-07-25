@@ -431,9 +431,9 @@ publication boundary; committed bytes, partial or late rollback, post-commit
 discard, and owner cleanup remain distinct. Detached MMIO/PCI state validates
 feature negotiation, queue geometry and cursors, pending notification and
 interrupt state, compact plugged ranges, one exact shared reservation identity,
-guest owners, actual HVF maps, dirty tracking, epoch, and byte accounting. The
-native-v1 create path performs this paused preflight before publication without
-claiming a serialization format. The checked
+guest owners, actual HVF maps, dirty tracking, epoch, and byte accounting.
+Current public native-v2 create retains this paused preflight before
+optional-profile rejection without claiming a serialization format. The checked
 [`memory-hotplug-contract.md`](memory-hotplug-contract.md) promotes all 17 API
 operation/path/property/schema leaves. Exactly `corpus:memory-hotplug` and
 `semantic.memory-device:virtio-mem-lifecycle-accounting-and-state` remain
@@ -452,9 +452,10 @@ budget/burst/refill-origin state when a post-consumption host-memory or
 used-ring failure prevents publication. Detached MMIO/PCI state validates
 feature negotiation, activation, exact queue geometry/ranges/cursors, external
 limiter configuration, redacted bucket state, the pending descriptor, and
-host-time-free retry agreement with the quiesced HVF scheduler. The public
-native-v1 create path traverses this state before optional-profile rejection
-without claiming an encoding. Signed Linux guests prove marker-gated first and
+host-time-free retry agreement with the quiesced HVF scheduler. The
+capture-ready preflight retained by current public native-v2 create traverses
+this state before optional-profile rejection without claiming an encoding.
+Signed Linux guests prove marker-gated first and
 repeated `/dev/hwrng` reads, real throttling, pause/capture/resume, retry
 metrics, and cleanup over both selected transports. The checked
 [`entropy-contract.md`](entropy-contract.md) promotes all five API
@@ -476,8 +477,9 @@ Shared descriptor ownership restores original flags and terminal attributes
 only after the final endpoint drops. Detached state pairs exact external
 configuration with complete UART registers, RX bytes, status, and pending
 intents while excluding host descriptors, pipe buffers, and terminal state.
-The public native-v1 create path traverses this state before publication
-without claiming a new encoding. Signed direct processes prove default stdout,
+The capture-ready preflight retained by current public native-v2 create
+traverses this state before optional-profile rejection without claiming a new
+encoding. Signed direct processes prove default stdout,
 greater-than-FIFO stdin, configured-output exclusion, rate limiting,
 pause/capture/resume, EOF, concurrency isolation, metrics, and cleanup; the
 signed production bundle repeats the default stdio flow across the launcher
@@ -599,22 +601,26 @@ signed App Sandbox slice/raw/atomic/virtqueue/full-snapshot/removal chain.
 dirty tracking disabled. It adds state-bound pager sessions, exact
 layout/source-offset validation, bounded direct connection, one-time contained
 stream claim without a worker memory-file grant, rollback-owned host/guest
-lazy assembly, and signed direct plus production-bundle restore-to-shutdown
-evidence. At that checkpoint final certification remained open and the overlay
+lazy assembly, and focused public transaction plus signed pager/host/guest
+component evidence. At that checkpoint final certification remained open and the overlay
 was 228/169/4/17. #1555 adds live paused-host and exact
 restored-guest instruction/read/write observations, signed
 before/during/after removal and zero refault, multi-vCPU/failure/death/repeat
 cleanup, exact empty-launcher/two-key-worker entitlement dictionaries, and the
-full repository matrix. It promotes only `corpus:snapshot-page-faults`, so the
-current overlay is 229/169/3/17.
+full repository matrix. It promotes only `corpus:snapshot-page-faults`,
+producing 229/169/3/17 at that checkpoint.
 
 #1529 then advances the internal native-v2 writer to `2.3.0`, appends the
 portable time/clone-identity component, and reconstructs destination PL031,
 PVTime, VMGenID, and VMClock before paused publication. Signed three-vCPU
 evidence proves repeat immutable loads, notification order, destination time,
-PVTime continuity, and recapture-to-restore. The aggregate record remains
-`audit-required` only for public production composition and broader cross-host
-migration/clone portability, so the current overlay remains 229/169/3/17.
+PVTime continuity, and recapture-to-restore. #1575–#1578 then compose the
+native-family transaction, minimal producer/restorer, and matching public
+Full/File lifecycle. #1578 promotes the snapshot-version argument, complete
+instance/version-output semantic, aggregate run operation, and minimal Full
+public-lifecycle semantic. General devices, Diff, tools, Firecracker
+interoperability, and broad portability remain audited, so the current overlay
+is 233/165/3/17.
 
 ## Commands
 

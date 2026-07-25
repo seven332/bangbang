@@ -574,46 +574,46 @@ stage-one-walk forms first, then uses WnR plus an exact one-byte IPA ownership
 probe for that form; the protected-range handler still makes the final
 authority decision.
 
-Focused tests cover state-derived session bytes, lazy topology, profile/grant
-ordering, direct connector redaction, combined protected-memory borrows,
-ISV-clear data aborts, eager `File` regression, peer shutdown, and preparation/
-restore cleanup. Signed direct execution restores a paused destination from an
-externally owned memory image, resumes it, reaches guest `SYSTEM_OFF`, and
-observes orderly pager shutdown. The normal production bundle repeats that
-path through the exact launcher grant while omitting worker memory-file
-authority:
+Focused tests cover state-derived session bytes, lazy topology, public
+family-routing, profile/grant ordering, direct connector redaction, combined
+protected-memory borrows, ISV-clear data aborts, eager `File` regression, peer
+shutdown, and preparation/restore cleanup. Current signed evidence deliberately
+separates the frozen native-v1 public dispatcher, real host/guest fault planes,
+and production App Sandbox pager transport. The current native-v2 product path
+rejects `Uffd` before pager, memory, or HVF adoption:
 
 ```sh
 cargo test -p bangbang native_v1_uffd --all-features --locked
 cargo test -p bangbang-hvf --lib --all-features --locked snapshot_restore
-scripts/run-integration-tests.sh --test executable_hvf_e2e -- macos_arm64::signed_executable_creates_and_restores_native_v1_snapshot_across_processes --exact
-scripts/run-integration-tests.sh --test production_bundle -- normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore --exact
+scripts/run-integration-tests.sh --test native_v2_process
+scripts/run-integration-tests.sh --test hvf_lifecycle -- lazy_host_fault_integration::
+scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page
+scripts/run-integration-tests.sh --test production_bundle -- signed_pager_grant_
+scripts/run-integration-tests.sh --test production_bundle -- production_bundle_has_exact_nested_signing_contract --exact
 ```
 
 ## Final signed certification
 
-#1555 binds the previously independent owners at signed process boundaries
-without expanding the supported profile.
+#1555 bound the previously independent owners without expanding the supported
+profile. The maintained current-head evidence keeps those boundaries explicit:
 
-The test-only snapshot pager now publishes an explicit active-state report and
-exact region-relative `(offset, access)` observations. Both
-`signed_executable_creates_and_restores_native_v1_snapshot_across_processes`
-and
-`normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore`
-load a destination Paused, observe completed pager traffic while
-`SnapshotPagerTermination::Active`, and prove that three guest-only pages have
-not been touched. Because the vCPU has not resumed, those requests are direct
-host-side preparation evidence.
+- public unit/fault-injection tests route frozen native-v1 `Uffd` through the
+  one-open family dispatcher and validate state-bound session, topology,
+  transaction, Paused publication, shutdown, and redaction;
+- the signed
+  `signed_native_v1_public_dispatch_restores_frozen_file_pair` fixture proves
+  the same current public dispatcher still reaches the exact legacy restorer;
+- signed HVF lifecycle and guest-boot cases bind real execute/read/write faults,
+  population, permission publication, coalescing, removal, cancellation, and
+  teardown to the lazy coordinator; and
+- signed production pager probes prove the exact launcher-connected stream,
+  protocol failure/death/repeat behavior, App Sandbox execution, cleanup, and
+  unchanged empty-launcher/two-key-worker entitlement dictionaries.
 
-Each snapshot guest remains in its restored identity polling loop on the first
-kernel page. After the destination identity changes, it branches to an
-untouched host-page-aligned continuation, reads a separate untouched RAM page,
-writes another untouched RAM page, and reaches `SYSTEM_OFF`. The final pager
-report contains protocol Read for the continuation and read page, Write for the
-write page, more requests than the paused report, and orderly Shutdown. The
-signed `hvf_lazy_guest_faults_populate_execute_read_and_write_before_retry`
-case binds continuation-page protocol Read to an execute-class stage-two
-fault; the pager wire deliberately remains the coarser Read/Write protocol.
+This composed certification is specific to the frozen native-v1 compatibility
+reader and observable pager contract. It does not claim a native-v2 `Uffd`
+backend, Linux UFFD descriptor/wire compatibility, or a current public v1
+writer selector.
 
 Signed
 `task_local_lazy_fault_bridge_removal_generations_refault_zero_before_and_during_population`

@@ -161,7 +161,7 @@ Destination preparation resolves the captured selector and optional override
 before access, then produces a real direct or exact contained listener,
 connector, and cleanup owner for single-use reconstruction. No path, grant ID,
 child, session token, or serialized string substitutes for that authority.
-Public native-v1 state still contains no vsock optional-device bytes or
+Public native-v2 state still contains no vsock optional-device bytes or
 placement, and public load still rejects `vsock_override`.
 
 Therefore the six W6 rows remain open. #1490 must encode and place the state,

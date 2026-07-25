@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, TryReserveError};
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write as _;
@@ -114,13 +115,13 @@ use bangbang_runtime::snapshot::{
 use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
 use bangbang_runtime::snapshot_artifact::{
     LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactFamily, NativeSnapshotArtifactState,
-    NativeSnapshotArtifactStateError, NativeSnapshotPublicationOutcome, SnapshotArtifactLoadError,
-    SnapshotArtifactOutput, SnapshotArtifactOutputs, SnapshotArtifactPaths,
-    SnapshotCommitDurability, SnapshotMemoryStagingWriter, SnapshotPublicationOutcome,
-    SnapshotPublicationTransactionError, load_prepared_native_snapshot_memory_file,
-    load_prepared_native_snapshot_memory_path, load_snapshot_artifacts,
-    prepare_native_snapshot_state_file, prepare_native_snapshot_state_path,
-    prepare_snapshot_state_file, prepare_snapshot_state_path,
+    NativeSnapshotArtifactStateError, NativeSnapshotPublicationOutcome,
+    PreparedNativeSnapshotState, SnapshotArtifactLoadError, SnapshotArtifactOutput,
+    SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotCommitDurability,
+    SnapshotMemoryStagingWriter, SnapshotPublicationOutcome, SnapshotPublicationTransactionError,
+    load_prepared_native_snapshot_memory_file, load_prepared_native_snapshot_memory_path,
+    load_snapshot_artifacts, prepare_native_snapshot_state_file,
+    prepare_native_snapshot_state_path, prepare_snapshot_state_file, prepare_snapshot_state_path,
     publish_native_snapshot_artifacts_to_with, publish_native_snapshot_artifacts_with,
     publish_snapshot_artifacts_to_with, publish_snapshot_artifacts_with,
 };
@@ -152,7 +153,7 @@ use bangbang_runtime::{
 };
 #[cfg(target_os = "macos")]
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
-use bangbang_session::{GrantAccess, ResourceRole, SessionId, VmnetAuthority};
+use bangbang_session::{GrantAccess, GrantId, ResourceRole, SessionId, VmnetAuthority};
 
 #[cfg(target_os = "macos")]
 use crate::anchored_socket::{AnchoredSocketGuard, bind as bind_anchored_socket};
@@ -408,6 +409,16 @@ pub(crate) trait InstanceStartExecutor {
         Err(NativeV1SnapshotLoadError::Resource(GrantClaimError))
     }
 
+    fn load_prepared_snapshot_v2(
+        &mut self,
+        _input: &SnapshotLoadInput,
+        _artifacts: LoadedNativeSnapshotArtifacts,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        Err(NativeV2SnapshotLoadError::ProcessPreparation(
+            BackendError::InvalidState("native-v2 snapshot loading is unavailable"),
+        ))
+    }
+
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         MetricsDiagnostics::default()
     }
@@ -648,6 +659,91 @@ impl std::error::Error for NativeV2SnapshotPublicationProducerError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum SnapshotCaptureReadyPreflightError {
+    Storage(HvfArm64BootStorageCaptureError),
+    Balloon(HvfArm64BootBalloonCaptureError),
+    MemoryHotplug(HvfArm64BootMemoryHotplugCaptureError),
+    Entropy(HvfArm64BootEntropyCaptureError),
+    Serial(HvfArm64BootSerialCaptureError),
+    Network(ProcessCaptureReadyNetworkError),
+    Vsock(HvfArm64BootVsockCaptureError),
+    SessionUnavailable,
+}
+
+impl SnapshotCaptureReadyPreflightError {
+    fn into_native_v1(self) -> NativeV1SnapshotPublicationError {
+        match self {
+            Self::Storage(source) => NativeV1SnapshotPublicationError::StoragePreflight(source),
+            Self::Balloon(source) => NativeV1SnapshotPublicationError::BalloonPreflight(source),
+            Self::MemoryHotplug(source) => {
+                NativeV1SnapshotPublicationError::MemoryHotplugPreflight(source)
+            }
+            Self::Entropy(source) => NativeV1SnapshotPublicationError::EntropyPreflight(source),
+            Self::Serial(source) => NativeV1SnapshotPublicationError::SerialPreflight(source),
+            Self::Network(source) => NativeV1SnapshotPublicationError::NetworkPreflight(source),
+            Self::Vsock(source) => NativeV1SnapshotPublicationError::VsockPreflight(source),
+            Self::SessionUnavailable => NativeV1SnapshotPublicationError::SessionUnavailable,
+        }
+    }
+
+    fn into_native_v2(self) -> NativeV2SnapshotPublicationError {
+        match self {
+            Self::SessionUnavailable => NativeV2SnapshotPublicationError::SessionUnavailable,
+            source => NativeV2SnapshotPublicationError::CaptureReadyPreflight(source),
+        }
+    }
+}
+
+impl fmt::Display for SnapshotCaptureReadyPreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage(source) => {
+                write!(formatter, "snapshot storage preflight failed: {source}")
+            }
+            Self::Balloon(source) => {
+                write!(formatter, "snapshot balloon preflight failed: {source}")
+            }
+            Self::MemoryHotplug(source) => {
+                write!(
+                    formatter,
+                    "snapshot memory-hotplug preflight failed: {source}"
+                )
+            }
+            Self::Entropy(source) => {
+                write!(formatter, "snapshot entropy preflight failed: {source}")
+            }
+            Self::Serial(source) => {
+                write!(formatter, "snapshot serial preflight failed: {source}")
+            }
+            Self::Network(source) => {
+                write!(formatter, "snapshot network preflight failed: {source}")
+            }
+            Self::Vsock(source) => {
+                write!(formatter, "snapshot vsock preflight failed: {source}")
+            }
+            Self::SessionUnavailable => {
+                formatter.write_str("snapshot capture-ready session is unavailable")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotCaptureReadyPreflightError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Storage(source) => Some(source),
+            Self::Balloon(source) => Some(source),
+            Self::MemoryHotplug(source) => Some(source),
+            Self::Entropy(source) => Some(source),
+            Self::Serial(source) => Some(source),
+            Self::Network(source) => Some(source),
+            Self::Vsock(source) => Some(source),
+            Self::SessionUnavailable => None,
+        }
+    }
+}
+
 pub(crate) enum NativeV1SnapshotPublicationProducerError {
     Capture(NativeV1SnapshotCaptureError),
     NonCompositeCommit,
@@ -656,6 +752,7 @@ pub(crate) enum NativeV1SnapshotPublicationProducerError {
 #[derive(Debug)]
 pub(crate) enum NativeV2SnapshotPublicationError {
     Preflight(VmmActionError),
+    CaptureReadyPreflight(SnapshotCaptureReadyPreflightError),
     BootMetadata(HvfSnapshotV2BuildError),
     Resource(GrantClaimError),
     SessionUnavailable,
@@ -670,6 +767,12 @@ impl fmt::Display for NativeV2SnapshotPublicationError {
                 write!(
                     formatter,
                     "native-v2 publication preflight failed: {source}"
+                )
+            }
+            Self::CaptureReadyPreflight(source) => {
+                write!(
+                    formatter,
+                    "native-v2 capture-ready preflight failed: {source}"
                 )
             }
             Self::BootMetadata(source) => {
@@ -701,11 +804,21 @@ impl std::error::Error for NativeV2SnapshotPublicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Preflight(source) => Some(source),
+            Self::CaptureReadyPreflight(source) => Some(source),
             Self::BootMetadata(source) => Some(source),
             Self::Resource(source) => Some(source),
             Self::Transaction(source) => Some(source),
             Self::SessionUnavailable | Self::ConfigurationUnavailable => None,
         }
+    }
+}
+
+fn native_v2_snapshot_publication_action_error(
+    error: NativeV2SnapshotPublicationError,
+) -> VmmActionError {
+    match error {
+        NativeV2SnapshotPublicationError::Preflight(source) => source,
+        error => VmmActionError::SnapshotCreate(BackendError::Hypervisor(error.to_string())),
     }
 }
 
@@ -814,15 +927,6 @@ impl std::error::Error for NativeV1SnapshotPublicationError {
     }
 }
 
-fn native_v1_snapshot_publication_action_error(
-    error: NativeV1SnapshotPublicationError,
-) -> VmmActionError {
-    match error {
-        NativeV1SnapshotPublicationError::Preflight(source) => source,
-        error => VmmActionError::SnapshotCreate(BackendError::Hypervisor(error.to_string())),
-    }
-}
-
 pub(crate) struct SnapshotV1LoadSuccess<S> {
     session: S,
     controller_commit: SnapshotV1ControllerCommit,
@@ -852,7 +956,7 @@ impl<S> fmt::Debug for SnapshotV1LoadSuccess<S> {
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 pub(crate) struct SnapshotV2LoadSuccess<S> {
     session: S,
@@ -861,10 +965,10 @@ pub(crate) struct SnapshotV2LoadSuccess<S> {
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 impl<S> SnapshotV2LoadSuccess<S> {
-    const fn new(session: S, controller_commit: SnapshotV2ControllerCommit) -> Self {
+    pub(crate) const fn new(session: S, controller_commit: SnapshotV2ControllerCommit) -> Self {
         Self {
             session,
             controller_commit,
@@ -888,7 +992,7 @@ impl<S> fmt::Debug for SnapshotV2LoadSuccess<S> {
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 #[derive(Debug)]
 pub(crate) enum NativeV2SnapshotLoadError {
@@ -919,7 +1023,7 @@ pub(crate) enum NativeV2SnapshotLoadError {
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 impl NativeV2SnapshotLoadError {
     fn is_terminal(&self) -> bool {
@@ -1041,6 +1145,7 @@ pub(crate) enum NativeV1SnapshotLoadError {
     Preflight(VmmActionError),
     ProcessTerminal,
     Resource(GrantClaimError),
+    State(NativeSnapshotArtifactStateError),
     #[cfg(target_os = "macos")]
     VsockResource(VsockRestoreError),
     Artifact(SnapshotArtifactLoadError),
@@ -1078,6 +1183,7 @@ impl NativeV1SnapshotLoadError {
             }
             Self::Preflight(_)
             | Self::Resource(_)
+            | Self::State(_)
             | Self::Artifact(_)
             | Self::Prepare(_)
             | Self::PagerConnect(_)
@@ -1094,6 +1200,7 @@ impl fmt::Display for NativeV1SnapshotLoadError {
             Self::Preflight(source) => write!(f, "native-v1 load preflight failed: {source}"),
             Self::ProcessTerminal => f.write_str("native-v1 load process is terminal"),
             Self::Resource(source) => write!(f, "native-v1 resource adoption failed: {source}"),
+            Self::State(source) => write!(f, "native-v1 state adaptation failed: {source}"),
             #[cfg(target_os = "macos")]
             Self::VsockResource(source) => {
                 write!(f, "native-v1 vsock resource preparation failed: {source}")
@@ -1134,6 +1241,7 @@ impl std::error::Error for NativeV1SnapshotLoadError {
         match self {
             Self::Preflight(source) => Some(source),
             Self::Resource(source) => Some(source),
+            Self::State(source) => Some(source),
             #[cfg(target_os = "macos")]
             Self::VsockResource(source) => Some(source),
             Self::Artifact(source) => Some(source),
@@ -1151,10 +1259,90 @@ impl std::error::Error for NativeV1SnapshotLoadError {
     }
 }
 
-fn native_v1_snapshot_load_action_error(error: NativeV1SnapshotLoadError) -> VmmActionError {
+#[derive(Debug)]
+enum NativeSnapshotLoadError {
+    Preflight(VmmActionError),
+    ProcessTerminal,
+    Resource(GrantClaimError),
+    Artifact(SnapshotArtifactLoadError),
+    NativeV1(NativeV1SnapshotLoadError),
+    NativeV2(NativeV2SnapshotLoadError),
+}
+
+impl fmt::Display for NativeSnapshotLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preflight(source) => {
+                write!(formatter, "snapshot load preflight failed: {source}")
+            }
+            Self::ProcessTerminal => formatter.write_str("snapshot load process is terminal"),
+            Self::Resource(source) => {
+                write!(
+                    formatter,
+                    "snapshot load resource preparation failed: {source}"
+                )
+            }
+            Self::Artifact(source) => {
+                write!(formatter, "snapshot state preparation failed: {source}")
+            }
+            Self::NativeV1(source) => source.fmt(formatter),
+            Self::NativeV2(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for NativeSnapshotLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Preflight(source) => Some(source),
+            Self::Resource(source) => Some(source),
+            Self::Artifact(source) => Some(source),
+            Self::NativeV1(source) => Some(source),
+            Self::NativeV2(source) => Some(source),
+            Self::ProcessTerminal => None,
+        }
+    }
+}
+
+fn native_snapshot_load_action_error(error: NativeSnapshotLoadError) -> VmmActionError {
     match error {
-        NativeV1SnapshotLoadError::Preflight(source) => source,
+        NativeSnapshotLoadError::Preflight(source)
+        | NativeSnapshotLoadError::NativeV1(NativeV1SnapshotLoadError::Preflight(source))
+        | NativeSnapshotLoadError::NativeV2(NativeV2SnapshotLoadError::Preflight(source)) => source,
         error => VmmActionError::SnapshotLoad(BackendError::Hypervisor(error.to_string())),
+    }
+}
+
+struct PreparedNativeSnapshotLoad {
+    state: PreparedNativeSnapshotState,
+    state_id: Option<GrantId>,
+    memory_id: Option<GrantId>,
+}
+
+impl PreparedNativeSnapshotLoad {
+    const fn family(&self) -> NativeSnapshotArtifactFamily {
+        self.state.family()
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        PreparedNativeSnapshotState,
+        Option<GrantId>,
+        Option<GrantId>,
+    ) {
+        (self.state, self.state_id, self.memory_id)
+    }
+}
+
+impl fmt::Debug for PreparedNativeSnapshotLoad {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedNativeSnapshotLoad")
+            .field("family", &self.family())
+            .field("state", &"<redacted>")
+            .field("authority", &"<redacted>")
+            .finish()
     }
 }
 
@@ -3655,8 +3843,8 @@ where
     }
 
     fn create_snapshot(&mut self, input: SnapshotCreateInput) -> Result<VmmData, VmmActionError> {
-        self.publish_native_v1_snapshot(&input)
-            .map_err(native_v1_snapshot_publication_action_error)?;
+        self.publish_native_v2_snapshot(&input)
+            .map_err(native_v2_snapshot_publication_action_error)?;
         Ok(VmmData::Empty)
     }
 
@@ -3665,8 +3853,8 @@ where
             return Err(VmmActionError::SnapshotUnsupported);
         }
         let resume_requested = self
-            .restore_native_v1_snapshot(&input)
-            .map_err(native_v1_snapshot_load_action_error)?;
+            .restore_native_snapshot(&input)
+            .map_err(native_snapshot_load_action_error)?;
         if resume_requested {
             self.resume_instance()
                 .map_err(native_v1_snapshot_resume_action_error)?;
@@ -4137,6 +4325,412 @@ impl<S> ProcessVmm<S>
 where
     S: InstanceStartExecutor,
 {
+    #[cfg(target_os = "macos")]
+    fn duplicate_snapshot_state_input(&self, state_id: &GrantId) -> Result<File, GrantClaimError> {
+        let authority = self.grant_authority.as_ref().ok_or(GrantClaimError)?;
+        let mut files = authority
+            .duplicate_exact_files(&[(
+                state_id.clone(),
+                ResourceRole::SnapshotStateInput,
+                GrantAccess::ReadOnly,
+            )])?
+            .into_iter();
+        let file = files.next().ok_or(GrantClaimError)?;
+        debug_assert!(files.next().is_none());
+        Ok(file)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn duplicate_snapshot_state_input(&self, _state_id: &GrantId) -> Result<File, GrantClaimError> {
+        Err(GrantClaimError)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn take_snapshot_input_files(
+        &self,
+        state_id: Option<&GrantId>,
+        memory_id: Option<&GrantId>,
+    ) -> Result<Vec<File>, GrantClaimError> {
+        let mut requests = Vec::with_capacity(2);
+        if let Some(id) = state_id {
+            requests.push((
+                id.clone(),
+                ResourceRole::SnapshotStateInput,
+                GrantAccess::ReadOnly,
+            ));
+        }
+        if let Some(id) = memory_id {
+            requests.push((
+                id.clone(),
+                ResourceRole::SnapshotMemoryInput,
+                GrantAccess::ReadOnly,
+            ));
+        }
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.grant_authority
+            .as_ref()
+            .ok_or(GrantClaimError)?
+            .take_exact_files(&requests)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn take_snapshot_input_files(
+        &self,
+        state_id: Option<&GrantId>,
+        memory_id: Option<&GrantId>,
+    ) -> Result<Vec<File>, GrantClaimError> {
+        if state_id.is_some() || memory_id.is_some() {
+            Err(GrantClaimError)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn prepare_native_snapshot_load_state(
+        &self,
+        input: &SnapshotLoadInput,
+    ) -> Result<PreparedNativeSnapshotLoad, NativeSnapshotLoadError> {
+        if self.terminal_snapshot_load_failure || self.terminal_instance_start_failure {
+            return Err(NativeSnapshotLoadError::ProcessTerminal);
+        }
+        self.controller
+            .preflight_load_snapshot_destination(input)
+            .map_err(NativeSnapshotLoadError::Preflight)?;
+
+        let state_id =
+            grant_reference_id(input.snapshot_path()).map_err(NativeSnapshotLoadError::Resource)?;
+        let memory_id = grant_reference_id(input.mem_backend().backend_path())
+            .map_err(NativeSnapshotLoadError::Resource)?;
+        let state_file = state_id
+            .as_ref()
+            .map(|id| self.duplicate_snapshot_state_input(id))
+            .transpose()
+            .map_err(NativeSnapshotLoadError::Resource)?;
+        let state = match state_file {
+            Some(file) => prepare_native_snapshot_state_file(file),
+            None => prepare_native_snapshot_state_path(input.snapshot_path()),
+        }
+        .map_err(NativeSnapshotLoadError::Artifact)?;
+
+        Ok(PreparedNativeSnapshotLoad {
+            state,
+            state_id,
+            memory_id,
+        })
+    }
+
+    fn restore_native_snapshot(
+        &mut self,
+        input: &SnapshotLoadInput,
+    ) -> Result<bool, NativeSnapshotLoadError> {
+        let prepared = self.prepare_native_snapshot_load_state(input)?;
+        match prepared.family() {
+            NativeSnapshotArtifactFamily::V1 => {
+                let result = self.restore_prepared_native_v1_snapshot_once(input, prepared);
+                self.record_native_v1_snapshot_load_result(result)
+                    .map_err(NativeSnapshotLoadError::NativeV1)
+            }
+            NativeSnapshotArtifactFamily::V2 => {
+                let result = self
+                    .restore_prepared_native_v2_snapshot_once(input, prepared)
+                    .and_then(|resume_requested| {
+                        self.resume_native_v2_snapshot_if_requested(resume_requested)
+                    });
+                self.record_native_v2_snapshot_load_result(result)
+                    .map(|_| false)
+                    .map_err(NativeSnapshotLoadError::NativeV2)
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_file_snapshot_v1_load(
+        &self,
+        input: &SnapshotLoadInput,
+        prepared: PreparedNativeSnapshotLoad,
+    ) -> Result<PreparedHvfSnapshotV1Load, NativeV1SnapshotLoadError> {
+        let (state, state_id, memory_id) = prepared.into_parts();
+        let state = state.into_v1().map_err(NativeV1SnapshotLoadError::State)?;
+        let state = PreparedHvfSnapshotV1State::from_prepared_state(state)
+            .map_err(NativeV1SnapshotLoadError::Prepare)?;
+        let mut root_claim = self
+            .grant_authority
+            .as_ref()
+            .map(|authority| {
+                authority
+                    .prepare_drive_backing_claim(state.root_backing_path(), GrantAccess::ReadOnly)
+            })
+            .transpose()
+            .map_err(NativeV1SnapshotLoadError::Resource)?
+            .flatten();
+        let root = root_claim
+            .as_mut()
+            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
+            .transpose()
+            .map_err(NativeV1SnapshotLoadError::Resource)?;
+
+        let mut files = self
+            .take_snapshot_input_files(state_id.as_ref(), memory_id.as_ref())
+            .map_err(NativeV1SnapshotLoadError::Resource)?
+            .into_iter();
+        if state_id.is_some() {
+            drop(
+                files
+                    .next()
+                    .ok_or(NativeV1SnapshotLoadError::Resource(GrantClaimError))?,
+            );
+        }
+        let memory = memory_id
+            .as_ref()
+            .map(|_| files.next().ok_or(GrantClaimError))
+            .transpose()
+            .map_err(NativeV1SnapshotLoadError::Resource)?;
+        debug_assert!(files.next().is_none());
+
+        let prepared = match memory {
+            Some(file) => state.load_memory_file(file),
+            None => state.load_memory_path(input.mem_backend().backend_path()),
+        }
+        .map_err(NativeV1SnapshotLoadError::Artifact)?;
+        let prepared = prepared
+            .finish(root, Instant::now())
+            .map_err(NativeV1SnapshotLoadError::Prepare)?;
+        if let Some(claim) = root_claim {
+            claim.commit();
+        }
+        Ok(prepared)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn prepare_file_snapshot_v1_load(
+        &self,
+        _input: &SnapshotLoadInput,
+        _prepared: PreparedNativeSnapshotLoad,
+    ) -> Result<PreparedHvfSnapshotV1Load, NativeV1SnapshotLoadError> {
+        Err(NativeV1SnapshotLoadError::Preflight(
+            VmmActionError::SnapshotUnsupported,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_family_lazy_snapshot_v1_load(
+        &self,
+        input: &SnapshotLoadInput,
+        prepared: PreparedNativeSnapshotLoad,
+    ) -> Result<PreparedHvfSnapshotV1Load, NativeV1SnapshotLoadError> {
+        debug_assert_eq!(
+            input.mem_backend().backend_type(),
+            SnapshotMemoryBackendType::Uffd
+        );
+        let (state, state_id, _memory_id) = prepared.into_parts();
+        let mut state_claim = if state_id.is_some() {
+            self.grant_authority
+                .as_ref()
+                .ok_or(NativeV1SnapshotLoadError::Resource(GrantClaimError))?
+                .prepare_file_claim(
+                    input.snapshot_path(),
+                    ResourceRole::SnapshotStateInput,
+                    GrantAccess::ReadOnly,
+                )
+                .map_err(NativeV1SnapshotLoadError::Resource)?
+        } else {
+            None
+        };
+        if let Some(claim) = state_claim.as_mut() {
+            drop(
+                claim
+                    .take_file()
+                    .map_err(NativeV1SnapshotLoadError::Resource)?,
+            );
+        }
+
+        let state = state.into_v1().map_err(NativeV1SnapshotLoadError::State)?;
+        let state = PreparedHvfSnapshotV1State::from_prepared_state(state)
+            .map_err(NativeV1SnapshotLoadError::Prepare)?
+            .prepare_lazy()
+            .map_err(NativeV1SnapshotLoadError::Prepare)?;
+        let mut root_claim = match &self.grant_authority {
+            Some(authority) => authority
+                .prepare_drive_backing_claim(state.root_backing_path(), GrantAccess::ReadOnly)
+                .map_err(NativeV1SnapshotLoadError::Resource)?,
+            None => {
+                if grant_reference_id(state.root_backing_path())
+                    .map_err(NativeV1SnapshotLoadError::Resource)?
+                    .is_some()
+                {
+                    return Err(NativeV1SnapshotLoadError::Resource(GrantClaimError));
+                }
+                None
+            }
+        };
+        let root = root_claim
+            .as_mut()
+            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
+            .transpose()
+            .map_err(NativeV1SnapshotLoadError::Resource)?;
+        let state = state
+            .prepare_root_backing(root)
+            .map_err(NativeV1SnapshotLoadError::Prepare)?;
+
+        let pager_path = input.mem_backend().backend_path();
+        let stream = match &self.pager_grant_authority {
+            Some(authority) => authority
+                .claim(pager_path)
+                .map_err(NativeV1SnapshotLoadError::Resource)?
+                .ok_or(NativeV1SnapshotLoadError::Resource(GrantClaimError))?
+                .into_stream(),
+            None => direct_snapshot_pager::connect(pager_path, SNAPSHOT_PAGER_OPERATION_TIMEOUT)
+                .map_err(NativeV1SnapshotLoadError::PagerConnect)?,
+        };
+        stream.set_nonblocking(false).map_err(|source| {
+            NativeV1SnapshotLoadError::PagerSession(DirectSnapshotPagerConnectError::Io(
+                source.kind(),
+            ))
+        })?;
+        let prepared = state
+            .finish(stream, SNAPSHOT_PAGER_OPERATION_TIMEOUT, Instant::now())
+            .map_err(NativeV1SnapshotLoadError::LazyPrepare)?;
+        if let Some(claim) = state_claim {
+            claim.commit();
+        }
+        if let Some(claim) = root_claim {
+            claim.commit();
+        }
+        Ok(prepared)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn prepare_family_lazy_snapshot_v1_load(
+        &self,
+        _input: &SnapshotLoadInput,
+        _prepared: PreparedNativeSnapshotLoad,
+    ) -> Result<PreparedHvfSnapshotV1Load, NativeV1SnapshotLoadError> {
+        Err(NativeV1SnapshotLoadError::Preflight(
+            VmmActionError::SnapshotUnsupported,
+        ))
+    }
+
+    fn restore_prepared_native_v1_snapshot_once(
+        &mut self,
+        input: &SnapshotLoadInput,
+        prepared: PreparedNativeSnapshotLoad,
+    ) -> Result<bool, NativeV1SnapshotLoadError> {
+        self.controller
+            .preflight_load_snapshot(input)
+            .map_err(NativeV1SnapshotLoadError::Preflight)?;
+        self.preflight_native_v1_memory_backend(input)?;
+
+        #[cfg(target_os = "macos")]
+        if let Some(unintegrated) = self.prepare_snapshot_vsock_restore(None, input)? {
+            let _ = unintegrated
+                .abort()
+                .map_err(NativeV1SnapshotLoadError::VsockResource)?;
+            return Err(NativeV1SnapshotLoadError::ProcessTerminal);
+        }
+
+        let memory_backend = input.mem_backend().backend_type();
+        let prepared = match memory_backend {
+            SnapshotMemoryBackendType::File => {
+                self.prepare_file_snapshot_v1_load(input, prepared)?
+            }
+            SnapshotMemoryBackendType::Uffd => {
+                self.prepare_family_lazy_snapshot_v1_load(input, prepared)?
+            }
+        };
+        let result = self.starter.load_prepared_snapshot_v1(
+            &self.controller,
+            self.vmnet_authority,
+            input,
+            prepared,
+        );
+        let result = result.map_err(|source| match memory_backend {
+            SnapshotMemoryBackendType::File => source,
+            SnapshotMemoryBackendType::Uffd => NativeV1SnapshotLoadError::AfterPagerAdoption {
+                source: Box::new(source),
+            },
+        });
+        let restored = result?;
+        let (session, controller_commit) = restored.into_parts();
+        self.started_session = Some(session);
+        Ok(self.controller.commit_snapshot_v1_load(controller_commit))
+    }
+
+    fn restore_prepared_native_v2_snapshot_once(
+        &mut self,
+        input: &SnapshotLoadInput,
+        prepared: PreparedNativeSnapshotLoad,
+    ) -> Result<bool, NativeV2SnapshotLoadError> {
+        self.controller
+            .preflight_load_snapshot_v2(input)
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+        self.starter
+            .preflight_snapshot_v2_process()
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+
+        let (state, state_id, memory_id) = prepared.into_parts();
+        if state.family() != NativeSnapshotArtifactFamily::V2 {
+            return Err(NativeV2SnapshotLoadError::UnexpectedFamily(state.family()));
+        }
+        let resource_adopted = state_id.is_some() || memory_id.is_some();
+        let mut files = self
+            .take_snapshot_input_files(state_id.as_ref(), memory_id.as_ref())
+            .map_err(NativeV2SnapshotLoadError::Resource)?
+            .into_iter();
+        if state_id.is_some() {
+            drop(
+                files
+                    .next()
+                    .ok_or_else(|| NativeV2SnapshotLoadError::AfterResourceAdoption {
+                        source: Box::new(NativeV2SnapshotLoadError::Resource(GrantClaimError)),
+                    })?,
+            );
+        }
+        let memory = memory_id
+            .as_ref()
+            .map(|_| {
+                files
+                    .next()
+                    .ok_or_else(|| NativeV2SnapshotLoadError::AfterResourceAdoption {
+                        source: Box::new(NativeV2SnapshotLoadError::Resource(GrantClaimError)),
+                    })
+            })
+            .transpose()?;
+        debug_assert!(files.next().is_none());
+        let artifacts = match memory {
+            Some(file) => load_prepared_native_snapshot_memory_file(state, file),
+            None => {
+                load_prepared_native_snapshot_memory_path(state, input.mem_backend().backend_path())
+            }
+        }
+        .map_err(|source| {
+            let source = NativeV2SnapshotLoadError::Artifact(source);
+            if resource_adopted {
+                NativeV2SnapshotLoadError::AfterResourceAdoption {
+                    source: Box::new(source),
+                }
+            } else {
+                source
+            }
+        })?;
+        let restored = self
+            .starter
+            .load_prepared_snapshot_v2(input, artifacts)
+            .map_err(|source| {
+                if resource_adopted {
+                    NativeV2SnapshotLoadError::AfterResourceAdoption {
+                        source: Box::new(source),
+                    }
+                } else {
+                    source
+                }
+            })?;
+        let (session, controller_commit) = restored.into_parts();
+        self.started_session = Some(session);
+        Ok(self.controller.commit_snapshot_v2_load(controller_commit))
+    }
+
     fn preflight_native_v1_memory_backend(
         &self,
         input: &SnapshotLoadInput,
@@ -4500,7 +5094,7 @@ where
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 impl ProcessVmm<HvfInstanceStartExecutor> {
     fn prepare_direct_snapshot_v2_load(
@@ -4625,7 +5219,8 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
         Ok(None)
     }
 
-    /// Restores one admitted native-v2 pair and commits the focused session paused.
+    /// Restores one admitted native-v2 pair, commits the focused session paused,
+    /// and applies the optional ordinary resume action.
     pub(crate) fn restore_native_v2_snapshot(
         &mut self,
         input: &SnapshotLoadInput,
@@ -4734,6 +5329,61 @@ where
         Ok(None)
     }
 
+    fn preflight_snapshot_capture_ready(
+        &mut self,
+        cancellation: NativeV1SnapshotCaptureCancellation,
+    ) -> Result<(), SnapshotCaptureReadyPreflightError> {
+        let storage_configs = CaptureReadyStorageConfigs::new(
+            self.controller.drive_configs().to_vec(),
+            self.controller.pmem_configs().to_vec(),
+        );
+        let balloon_config = self.controller.balloon_config();
+        let memory_hotplug_config = self.controller.memory_hotplug_config();
+        let entropy_config = self.controller.entropy_config();
+        let serial_config = self.controller.serial_config().clone();
+        let network_configs = self.controller.network_interface_configs().to_vec();
+        let mmds_config = self.controller.mmds_config().map_err(|source| {
+            SnapshotCaptureReadyPreflightError::Network(
+                ProcessCaptureReadyNetworkError::MmdsState { source },
+            )
+        })?;
+        let mmds_state = self.controller.mmds_state_handle();
+        let vsock_config = self.controller.vsock_config().cloned();
+        let session = self
+            .started_session
+            .as_mut()
+            .ok_or(SnapshotCaptureReadyPreflightError::SessionUnavailable)?;
+
+        self.starter
+            .preflight_snapshot_v1_storage(session, storage_configs, cancellation.clone())
+            .map_err(SnapshotCaptureReadyPreflightError::Storage)?;
+        self.starter
+            .preflight_snapshot_v1_balloon(session, balloon_config)
+            .map_err(SnapshotCaptureReadyPreflightError::Balloon)?;
+        self.starter
+            .preflight_snapshot_v1_memory_hotplug(session, memory_hotplug_config)
+            .map_err(SnapshotCaptureReadyPreflightError::MemoryHotplug)?;
+        self.starter
+            .preflight_snapshot_v1_entropy(session, entropy_config)
+            .map_err(SnapshotCaptureReadyPreflightError::Entropy)?;
+        self.starter
+            .preflight_snapshot_v1_serial(session, serial_config)
+            .map_err(SnapshotCaptureReadyPreflightError::Serial)?;
+        self.starter
+            .preflight_snapshot_v1_network(
+                session,
+                self.vmnet_authority,
+                network_configs,
+                mmds_config,
+                mmds_state,
+            )
+            .map_err(SnapshotCaptureReadyPreflightError::Network)?;
+        self.starter
+            .preflight_snapshot_v1_vsock(session, vsock_config, cancellation)
+            .map_err(SnapshotCaptureReadyPreflightError::Vsock)?;
+        Ok(())
+    }
+
     /// Publishes one admitted paused source as a native-v1 composite pair.
     pub(crate) fn publish_native_v1_snapshot(
         &mut self,
@@ -4743,54 +5393,9 @@ where
             .preflight_create_snapshot_request(input)
             .map_err(NativeV1SnapshotPublicationError::Preflight)?;
 
-        let storage_configs = CaptureReadyStorageConfigs::new(
-            self.controller.drive_configs().to_vec(),
-            self.controller.pmem_configs().to_vec(),
-        );
         let cancellation = self.snapshot_capture_cancellation.clone();
-        let session = self
-            .started_session
-            .as_mut()
-            .ok_or(NativeV1SnapshotPublicationError::SessionUnavailable)?;
-        self.starter
-            .preflight_snapshot_v1_storage(session, storage_configs, cancellation.clone())
-            .map_err(NativeV1SnapshotPublicationError::StoragePreflight)?;
-        let balloon_config = self.controller.balloon_config();
-        self.starter
-            .preflight_snapshot_v1_balloon(session, balloon_config)
-            .map_err(NativeV1SnapshotPublicationError::BalloonPreflight)?;
-        let memory_hotplug_config = self.controller.memory_hotplug_config();
-        self.starter
-            .preflight_snapshot_v1_memory_hotplug(session, memory_hotplug_config)
-            .map_err(NativeV1SnapshotPublicationError::MemoryHotplugPreflight)?;
-        let entropy_config = self.controller.entropy_config();
-        self.starter
-            .preflight_snapshot_v1_entropy(session, entropy_config)
-            .map_err(NativeV1SnapshotPublicationError::EntropyPreflight)?;
-        let serial_config = self.controller.serial_config().clone();
-        self.starter
-            .preflight_snapshot_v1_serial(session, serial_config.clone())
-            .map_err(NativeV1SnapshotPublicationError::SerialPreflight)?;
-        let network_configs = self.controller.network_interface_configs().to_vec();
-        let mmds_config = self.controller.mmds_config().map_err(|source| {
-            NativeV1SnapshotPublicationError::NetworkPreflight(
-                ProcessCaptureReadyNetworkError::MmdsState { source },
-            )
-        })?;
-        let mmds_state = self.controller.mmds_state_handle();
-        self.starter
-            .preflight_snapshot_v1_network(
-                session,
-                self.vmnet_authority,
-                network_configs,
-                mmds_config,
-                mmds_state,
-            )
-            .map_err(NativeV1SnapshotPublicationError::NetworkPreflight)?;
-        let vsock_config = self.controller.vsock_config().cloned();
-        self.starter
-            .preflight_snapshot_v1_vsock(session, vsock_config, cancellation.clone())
-            .map_err(NativeV1SnapshotPublicationError::VsockPreflight)?;
+        self.preflight_snapshot_capture_ready(cancellation.clone())
+            .map_err(SnapshotCaptureReadyPreflightError::into_native_v1)?;
 
         self.controller
             .preflight_create_snapshot_profile()
@@ -4805,6 +5410,7 @@ where
             [drive_config] => drive_config.clone(),
             _ => return Err(NativeV1SnapshotPublicationError::ConfigurationUnavailable),
         };
+        let serial_config = self.controller.serial_config().clone();
         let paths = SnapshotArtifactPaths::new(input.snapshot_path(), input.mem_file_path());
         if self.started_session.is_none() {
             return Err(NativeV1SnapshotPublicationError::SessionUnavailable);
@@ -4861,13 +5467,19 @@ where
 
     /// Publishes one strictly admitted paused source as a native-v2 2.3 pair.
     ///
-    /// This seam is intentionally not reachable through `VmmAction`.
+    /// The public create action reaches this seam after request normalization.
     pub(crate) fn publish_native_v2_snapshot(
         &mut self,
         input: &SnapshotCreateInput,
     ) -> Result<SnapshotCommitDurability, NativeV2SnapshotPublicationError> {
         self.controller
-            .preflight_create_snapshot_v2(input)
+            .preflight_create_snapshot_v2_request(input)
+            .map_err(NativeV2SnapshotPublicationError::Preflight)?;
+        let cancellation = self.snapshot_capture_cancellation.clone();
+        self.preflight_snapshot_capture_ready(cancellation.clone())
+            .map_err(SnapshotCaptureReadyPreflightError::into_native_v2)?;
+        self.controller
+            .preflight_create_snapshot_v2_profile()
             .map_err(NativeV2SnapshotPublicationError::Preflight)?;
         self.starter
             .preflight_snapshot_v2_process()
@@ -4883,7 +5495,6 @@ where
 
         let capture_input = self.native_v2_capture_input()?;
         let serial_config = self.controller.serial_config().clone();
-        let cancellation = self.snapshot_capture_cancellation.clone();
         let paths = SnapshotArtifactPaths::new(input.snapshot_path(), input.mem_file_path());
         let outputs = self
             .prepare_contained_snapshot_outputs(input)
@@ -4916,13 +5527,21 @@ where
     }
 }
 
-// Keep the intentionally non-dispatched production seam type-checked until a
-// later lifecycle slice adds public activation.
+// Keep the frozen, intentionally non-dispatched native-v1 writer type-checked
+// for legacy fixture and compatibility coverage.
 const _: fn(
     &mut ProcessVmm<HvfInstanceStartExecutor>,
     &SnapshotCreateInput,
-) -> Result<SnapshotCommitDurability, NativeV2SnapshotPublicationError> =
-    ProcessVmm::<HvfInstanceStartExecutor>::publish_native_v2_snapshot;
+) -> Result<SnapshotCommitDurability, NativeV1SnapshotPublicationError> =
+    ProcessVmm::<HvfInstanceStartExecutor>::publish_native_v1_snapshot;
+
+// Keep the pre-dispatch native-v1 load seam type-checked for focused legacy
+// compatibility tests; public loads use the one-open family dispatcher.
+const _: fn(
+    &mut ProcessVmm<HvfInstanceStartExecutor>,
+    &SnapshotLoadInput,
+) -> Result<bool, NativeV1SnapshotLoadError> =
+    ProcessVmm::<HvfInstanceStartExecutor>::restore_native_v1_snapshot;
 
 impl<S> VmmRequestHandler for ProcessVmm<S>
 where
@@ -5119,7 +5738,7 @@ fn snapshot_destination_machine_config(
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 struct PreparedHvfSnapshotV2ProcessLoad {
     state: HvfSnapshotV2PlatformState,
@@ -5133,7 +5752,7 @@ struct PreparedHvfSnapshotV2ProcessLoad {
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 fn native_v2_boot_source_config(
     state: &HvfSnapshotV2BootState,
@@ -5151,7 +5770,7 @@ fn native_v2_boot_source_config(
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 impl HvfInstanceStartExecutor {
     fn prepare_snapshot_v2_process_load(
@@ -5613,6 +6232,15 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         ))
     }
 
+    fn load_prepared_snapshot_v2(
+        &mut self,
+        input: &SnapshotLoadInput,
+        artifacts: LoadedNativeSnapshotArtifacts,
+    ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+        let prepared = self.prepare_snapshot_v2_process_load(input, artifacts)?;
+        self.load_prepared_snapshot_v2_process(prepared)
+    }
+
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         self.active_serial_output
             .as_ref()
@@ -5629,7 +6257,7 @@ pub(crate) type HvfSnapshotV2RunLoopSupervisor = BootRunLoopSupervisor<ProcessHv
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 pub(crate) enum HvfProcessSession {
     Boot(HvfBootRunLoopSupervisor),
@@ -5699,7 +6327,7 @@ pub(crate) struct ProcessHvfSnapshotV2Control {
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 impl ProcessHvfSnapshotV2Control {
     fn new(vcpu: HvfVcpuRunControl) -> Self {
@@ -5761,7 +6389,7 @@ pub(crate) struct ProcessHvfSnapshotV2Session {
 
 #[allow(
     dead_code,
-    reason = "private native-v2 process restore is exercised by the signed integration group"
+    reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
 )]
 impl ProcessHvfSnapshotV2Session {
     fn new(
@@ -13114,16 +13742,17 @@ mod tests {
     };
     use bangbang_runtime::snapshot::{
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
-        SnapshotType, SnapshotV1ControllerCommit,
+        SnapshotType, SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
+    };
+    use bangbang_runtime::snapshot_artifact::{
+        LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactState,
+        NativeSnapshotPublicationOutcome, SnapshotArtifactOutputs, SnapshotArtifactPaths,
+        SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_artifact::{
         NativeSnapshotArtifactFamily, SnapshotArtifactOutput, SnapshotCommitDurability,
         load_native_snapshot_artifacts, load_snapshot_artifacts,
-    };
-    use bangbang_runtime::snapshot_artifact::{
-        NativeSnapshotArtifactState, NativeSnapshotPublicationOutcome, SnapshotArtifactOutputs,
-        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_snapshot_artifacts_with,
     };
     #[cfg(target_os = "macos")]
     use bangbang_runtime::snapshot_commit::SnapshotCommitKind;
@@ -13204,7 +13833,7 @@ mod tests {
         ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
         ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority,
         ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
-        SnapshotV1LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
         default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
         require_native_v1_composite_record, snapshot_destination_machine_config,
         vsock_capture_error_from_boot_run_loop_command,
@@ -14830,6 +15459,36 @@ mod tests {
                 }
             };
             Ok(SnapshotV1LoadSuccess::new(session, commit))
+        }
+
+        fn load_prepared_snapshot_v2(
+            &mut self,
+            input: &SnapshotLoadInput,
+            _artifacts: LoadedNativeSnapshotArtifacts,
+        ) -> Result<SnapshotV2LoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.result == FakeSnapshotLoadResult::Terminal {
+                return Err(NativeV2SnapshotLoadError::ProcessTerminal);
+            }
+
+            let boot_source = BootSourceConfigInput::new("/private/restored-vmlinux")
+                .validate()
+                .expect("fake restored boot source should validate");
+            let commit = SnapshotV2ControllerCommit::new(
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages()),
+                boot_source,
+                input.resume_vm(),
+            );
+            let session = match self.result {
+                FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
+                    77,
+                    BackendError::Hypervisor("private-resume-sentinel".to_owned()),
+                ),
+                FakeSnapshotLoadResult::Success | FakeSnapshotLoadResult::Terminal => {
+                    FakeSession::new(77)
+                }
+            };
+            Ok(SnapshotV2LoadSuccess::new(session, commit))
         }
     }
 
@@ -16910,12 +17569,82 @@ mod tests {
         ))
     }
 
+    fn private_native_v1_snapshot_create_action(
+        vmm: &mut ProcessVmm<FakeStarter>,
+        input: SnapshotCreateInput,
+    ) -> Result<VmmData, VmmActionError> {
+        vmm.publish_native_v1_snapshot(&input)
+            .map_err(|error| match error {
+                NativeV1SnapshotPublicationError::Preflight(source) => source,
+                error => {
+                    VmmActionError::SnapshotCreate(BackendError::Hypervisor(error.to_string()))
+                }
+            })?;
+        Ok(VmmData::Empty)
+    }
+
     fn snapshot_load_input(resume_vm: bool) -> SnapshotLoadInput {
         SnapshotLoadInput::new(
             "/private/state",
             SnapshotMemoryBackend::new("/private/memory", SnapshotMemoryBackendType::File),
         )
         .with_resume_vm(resume_vm)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_v2_snapshot_load_fixture(
+        name: &str,
+        resume_vm: bool,
+    ) -> (TempSnapshotDirectory, SnapshotLoadInput) {
+        let directory = TempSnapshotDirectory::new(name);
+        let paths = directory.paths();
+        let mut session = FakeSession::new(0);
+        publish_fake_native_v2_snapshot(
+            &mut session,
+            NativeV2SnapshotPublicationDestination::Paths(paths.clone()),
+        )
+        .expect("native-v2 load fixture should publish");
+        let input = SnapshotLoadInput::new(
+            paths.state().to_path_buf(),
+            SnapshotMemoryBackend::new(
+                paths.memory().to_path_buf(),
+                SnapshotMemoryBackendType::File,
+            ),
+        )
+        .with_resume_vm(resume_vm);
+        (directory, input)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_native_v1_snapshot_load_fixture(
+        name: &str,
+        resume_vm: bool,
+    ) -> (TempSnapshotDirectory, SnapshotLoadInput) {
+        let directory = TempSnapshotDirectory::new(name);
+        let paths = directory.paths();
+        let mut source = snapshot_profile_vmm(FakeStarter::success(191));
+        source
+            .handle_action(VmmAction::InstanceStart)
+            .expect("native-v1 compatibility source should start");
+        source
+            .handle_action(VmmAction::Pause)
+            .expect("native-v1 compatibility source should pause");
+        source
+            .publish_native_v1_snapshot(&SnapshotCreateInput::new(
+                SnapshotType::Full,
+                paths.state(),
+                paths.memory(),
+            ))
+            .expect("native-v1 compatibility fixture should publish");
+        let input = SnapshotLoadInput::new(
+            paths.state().to_path_buf(),
+            SnapshotMemoryBackend::new(
+                paths.memory().to_path_buf(),
+                SnapshotMemoryBackendType::File,
+            ),
+        )
+        .with_resume_vm(resume_vm);
+        (directory, input)
     }
 
     fn snapshot_uffd_load_input(
@@ -16976,7 +17705,7 @@ mod tests {
     }
 
     #[test]
-    fn pci_mode_runs_create_storage_preflight_before_rejecting_native_v1_pci() {
+    fn pci_mode_rejects_public_native_v2_before_publication() {
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
         let calls = starter.calls();
         let mut load_vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
@@ -16990,7 +17719,7 @@ mod tests {
         assert_eq!(load_vmm.instance_info().state, InstanceState::NotStarted);
         assert!(!load_vmm.has_started_session());
 
-        let mut create_vmm = snapshot_profile_vmm(FakeStarter::success(12));
+        let mut create_vmm = configured_vmm(FakeStarter::success(12));
         create_vmm.pci_enabled = true;
         create_vmm
             .handle_action(VmmAction::InstanceStart)
@@ -17004,24 +17733,14 @@ mod tests {
         );
         assert_eq!(create_vmm.starter.snapshot_storage_preflight_calls, 1);
         assert_eq!(create_vmm.starter.snapshot_balloon_preflight_calls, 1);
-        assert_eq!(create_vmm.starter.last_snapshot_balloon_config, Some(None));
         assert_eq!(
             create_vmm.starter.snapshot_memory_hotplug_preflight_calls,
             1
         );
         assert_eq!(create_vmm.starter.snapshot_entropy_preflight_calls, 1);
-        assert_eq!(create_vmm.starter.last_snapshot_entropy_config, Some(None));
         assert_eq!(create_vmm.starter.snapshot_serial_preflight_calls, 1);
-        assert_eq!(
-            create_vmm.starter.last_snapshot_serial_config,
-            Some(create_vmm.controller.serial_config().clone())
-        );
         assert_eq!(create_vmm.starter.snapshot_network_preflight_calls, 1);
-        assert_eq!(
-            create_vmm.starter.last_snapshot_network_configs,
-            Some(Vec::new())
-        );
-        assert_eq!(create_vmm.starter.last_snapshot_mmds_config, Some(None));
+        assert_eq!(create_vmm.starter.snapshot_vsock_preflight_calls, 1);
         let session = create_vmm
             .started_session
             .as_ref()
@@ -17067,9 +17786,38 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn public_native_v1_load_commits_one_paused_session() {
+    fn public_family_dispatch_routes_native_v1_before_legacy_validation() {
+        let (_snapshot, input) =
+            fake_native_v1_snapshot_load_fixture("public-native-v1-routing", false);
+        let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let calls = starter.calls();
+        let mut vmm =
+            ProcessVmm::with_starter("native-v1-public-destination", "0.1.0", "bangbang", starter);
+
+        let error = vmm
+            .handle_action(VmmAction::LoadSnapshot(input))
+            .expect_err("fake v1 payload should reach the frozen legacy decoder");
+        assert!(
+            matches!(
+                &error,
+                VmmActionError::SnapshotLoad(BackendError::Hypervisor(message))
+                    if message.starts_with("native-v1 preparation failed:")
+            ),
+            "public family dispatcher should preserve the native-v1 validation error: {error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_native_v2_load_commits_one_paused_session() {
         let metrics = TempFilePath::create("snapshot-load-paused-metrics");
+        let (_snapshot, tracked_load) =
+            native_v2_snapshot_load_fixture("public-load-paused", false);
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
         let calls = starter.calls();
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
@@ -17078,7 +17826,7 @@ mod tests {
         )))
         .expect("metrics should configure");
 
-        let tracked_load = snapshot_load_input(false).with_track_dirty_pages(true);
+        let tracked_load = tracked_load.with_track_dirty_pages(true);
         assert_eq!(
             vmm.handle_action(VmmAction::LoadSnapshot(tracked_load)),
             Ok(VmmData::Empty)
@@ -17096,7 +17844,8 @@ mod tests {
         assert_eq!(session.id, 77);
         assert_eq!(session.resume_count, 0);
         assert!(vmm.machine_config().track_dirty_pages());
-        assert_eq!(vmm.drive_configs()[0].drive_id(), "root");
+        assert!(vmm.drive_configs().is_empty());
+        assert!(vmm.controller.boot_source_config().is_some());
         vmm.handle_initial_metrics_flush();
         vmm.handle_initial_metrics_flush();
         assert_eq!(
@@ -17142,9 +17891,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn public_native_v1_load_resumes_only_after_paused_commit() {
+    fn public_native_v2_load_resumes_only_after_paused_commit() {
         let metrics = TempFilePath::create("snapshot-load-resumed-metrics");
+        let (_snapshot, load) = native_v2_snapshot_load_fixture("public-load-resumed", true);
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
         let calls = starter.calls();
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
@@ -17154,7 +17905,7 @@ mod tests {
         .expect("metrics should configure");
 
         assert_eq!(
-            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(true))),
+            vmm.handle_action(VmmAction::LoadSnapshot(load)),
             Ok(VmmData::Empty)
         );
 
@@ -17176,9 +17927,11 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn public_native_v1_resume_failure_returns_load_error_and_stays_paused() {
+    fn public_native_v2_resume_failure_returns_load_error_and_latches_process() {
         let metrics = TempFilePath::create("snapshot-load-resume-failure-metrics");
+        let (_snapshot, load) = native_v2_snapshot_load_fixture("public-load-resume-failure", true);
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::ResumeFailure);
         let calls = starter.calls();
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
@@ -17188,9 +17941,10 @@ mod tests {
         .expect("metrics should configure");
 
         assert_eq!(
-            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(true))),
+            vmm.handle_action(VmmAction::LoadSnapshot(load)),
             Err(VmmActionError::SnapshotLoad(BackendError::Hypervisor(
-                "private-resume-sentinel".to_owned()
+                "native-v2 restored process resume failed: hypervisor error: private-resume-sentinel"
+                    .to_owned()
             )))
         );
 
@@ -17204,7 +17958,10 @@ mod tests {
                 .resume_count,
             1
         );
-        assert_eq!(vmm.process_exit_status(), ProcessSessionExitStatus::Running);
+        assert_eq!(
+            vmm.process_exit_status(),
+            ProcessSessionExitStatus::Terminal
+        );
         vmm.handle_initial_metrics_flush();
         vmm.handle_initial_metrics_flush();
         assert_eq!(
@@ -17213,9 +17970,11 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn public_terminal_native_v1_load_error_latches_process() {
+    fn public_terminal_native_v2_load_error_latches_process() {
         let metrics = TempFilePath::create("snapshot-load-precommit-failure-metrics");
+        let (_snapshot, load) = native_v2_snapshot_load_fixture("public-load-terminal", false);
         let starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Terminal);
         let calls = starter.calls();
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
@@ -17225,9 +17984,9 @@ mod tests {
         .expect("metrics should configure");
 
         assert_eq!(
-            vmm.handle_action(VmmAction::LoadSnapshot(snapshot_load_input(false))),
+            vmm.handle_action(VmmAction::LoadSnapshot(load)),
             Err(VmmActionError::SnapshotLoad(BackendError::Hypervisor(
-                "native-v1 load process is terminal".to_owned()
+                "native-v2 load process is terminal".to_owned()
             )))
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -23876,7 +24635,7 @@ mod tests {
 
     #[test]
     fn runtime_snapshot_create_policy_rejects_without_session_barrier() {
-        let mut diff = snapshot_profile_vmm(FakeStarter::success(15));
+        let mut diff = configured_vmm(FakeStarter::success(15));
         diff.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
         diff.handle_action(VmmAction::Pause)
@@ -23894,6 +24653,14 @@ mod tests {
         );
 
         let mut unsupported_profile = configured_vmm(FakeStarter::success(16));
+        unsupported_profile
+            .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                "data",
+                "data",
+                "/private/data",
+                false,
+            )))
+            .expect("unsupported native-v2 drive should configure");
         unsupported_profile
             .handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
@@ -23969,13 +24736,11 @@ mod tests {
         vmm.handle_action(VmmAction::Pause)
             .expect("broad snapshot fake session should pause");
 
-        let error = vmm
-            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
-                SnapshotType::Full,
-                &state_path,
-                &memory_path,
-            )))
-            .expect_err("broad profile should reject only after live storage preflight");
+        let error = private_native_v1_snapshot_create_action(
+            &mut vmm,
+            SnapshotCreateInput::new(SnapshotType::Full, &state_path, &memory_path),
+        )
+        .expect_err("broad profile should reject only after live storage preflight");
 
         assert_eq!(error, VmmActionError::SnapshotUnsupported);
         assert_eq!(vmm.starter.snapshot_storage_preflight_calls, 1);
@@ -24173,8 +24938,7 @@ mod tests {
             let entropy_config = vmm.controller.entropy_config();
             let serial_config = vmm.controller.serial_config().clone();
             let input = SnapshotCreateInput::new(SnapshotType::Full, &state_path, &memory_path);
-            let error = vmm
-                .handle_action(VmmAction::CreateSnapshot(input.clone()))
+            let error = private_native_v1_snapshot_create_action(&mut vmm, input.clone())
                 .expect_err("injected aggregate preflight failure should be reported");
 
             assert!(
@@ -24207,8 +24971,7 @@ mod tests {
                 FailureStage::Vsock => vmm.starter.snapshot_vsock_preflight_failure = None,
             }
 
-            let retry_error = vmm
-                .handle_action(VmmAction::CreateSnapshot(input))
+            let retry_error = private_native_v1_snapshot_create_action(&mut vmm, input)
                 .expect_err("aggregate retry should traverse every owner before profile rejection");
             assert_eq!(retry_error, VmmActionError::SnapshotUnsupported);
             let mut expected_retry_trace = expected_failed_trace.to_vec();
@@ -24249,13 +25012,11 @@ mod tests {
         vmm.handle_action(VmmAction::Pause)
             .expect("balloon preflight fake session should pause");
 
-        let error = vmm
-            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
-                SnapshotType::Full,
-                &state_path,
-                &memory_path,
-            )))
-            .expect_err("balloon preflight failure should stop before publication");
+        let error = private_native_v1_snapshot_create_action(
+            &mut vmm,
+            SnapshotCreateInput::new(SnapshotType::Full, &state_path, &memory_path),
+        )
+        .expect_err("balloon preflight failure should stop before publication");
 
         assert_eq!(
             error,
@@ -24299,13 +25060,11 @@ mod tests {
         vmm.handle_action(VmmAction::Pause)
             .expect("memory-hotplug preflight fake session should pause");
 
-        let error = vmm
-            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
-                SnapshotType::Full,
-                &state_path,
-                &memory_path,
-            )))
-            .expect_err("memory-hotplug preflight failure should stop before publication");
+        let error = private_native_v1_snapshot_create_action(
+            &mut vmm,
+            SnapshotCreateInput::new(SnapshotType::Full, &state_path, &memory_path),
+        )
+        .expect_err("memory-hotplug preflight failure should stop before publication");
 
         assert_eq!(
             error,
@@ -24350,13 +25109,11 @@ mod tests {
         vmm.handle_action(VmmAction::Pause)
             .expect("entropy preflight fake session should pause");
 
-        let error = vmm
-            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
-                SnapshotType::Full,
-                &state_path,
-                &memory_path,
-            )))
-            .expect_err("entropy preflight failure should stop before publication");
+        let error = private_native_v1_snapshot_create_action(
+            &mut vmm,
+            SnapshotCreateInput::new(SnapshotType::Full, &state_path, &memory_path),
+        )
+        .expect_err("entropy preflight failure should stop before publication");
 
         assert_eq!(
             error,
@@ -24410,13 +25167,11 @@ mod tests {
         vmm.handle_action(VmmAction::Pause)
             .expect("serial preflight fake session should pause");
 
-        let error = vmm
-            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
-                SnapshotType::Full,
-                &state_path,
-                &memory_path,
-            )))
-            .expect_err("serial preflight failure should stop before publication");
+        let error = private_native_v1_snapshot_create_action(
+            &mut vmm,
+            SnapshotCreateInput::new(SnapshotType::Full, &state_path, &memory_path),
+        )
+        .expect_err("serial preflight failure should stop before publication");
 
         assert_eq!(
             error,
@@ -24469,13 +25224,11 @@ mod tests {
         vmm.handle_action(VmmAction::Pause)
             .expect("network preflight fake session should pause");
 
-        let error = vmm
-            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
-                SnapshotType::Full,
-                &state_path,
-                &memory_path,
-            )))
-            .expect_err("network preflight failure should stop before publication");
+        let error = private_native_v1_snapshot_create_action(
+            &mut vmm,
+            SnapshotCreateInput::new(SnapshotType::Full, &state_path, &memory_path),
+        )
+        .expect_err("network preflight failure should stop before publication");
 
         assert_eq!(
             error,
@@ -24538,13 +25291,11 @@ mod tests {
         vmm.handle_action(VmmAction::Pause)
             .expect("contained preflight fake session should pause");
 
-        let error = vmm
-            .handle_action(VmmAction::CreateSnapshot(SnapshotCreateInput::new(
-                SnapshotType::Full,
-                state_path,
-                memory_path,
-            )))
-            .expect_err("storage failure should stop before a contained directory claim");
+        let error = private_native_v1_snapshot_create_action(
+            &mut vmm,
+            SnapshotCreateInput::new(SnapshotType::Full, state_path, memory_path),
+        )
+        .expect_err("storage failure should stop before a contained directory claim");
 
         assert_eq!(
             error,
@@ -24576,8 +25327,7 @@ mod tests {
 
     #[test]
     fn runtime_snapshot_create_execution_failure_is_typed_and_keeps_paused_state() {
-        let mut vmm =
-            snapshot_profile_vmm(FakeStarter::success(17).with_snapshot_publication_failure());
+        let mut vmm = configured_vmm(FakeStarter::success(17).with_snapshot_publication_failure());
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
         vmm.handle_action(VmmAction::Pause)
@@ -24590,7 +25340,7 @@ mod tests {
         assert_eq!(
             err,
             VmmActionError::SnapshotCreate(BackendError::Hypervisor(
-                "native-v1 publication configuration is unavailable".to_owned()
+                "native-v2 publication configuration is unavailable".to_owned()
             ))
         );
         assert_eq!(vmm.instance_info().state, InstanceState::Paused);
@@ -24604,7 +25354,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn internal_native_v2_process_publication_is_loadable_repeatable_and_not_publicly_dispatched() {
+    fn public_native_v2_process_publication_is_loadable_and_repeatable() {
         let public_directory = TempSnapshotDirectory::new("native-v2-public-gate");
         let public_paths = public_directory.paths();
         let public_input = SnapshotCreateInput::new(
@@ -24617,16 +25367,20 @@ mod tests {
 
         assert_eq!(
             vmm.handle_action(VmmAction::CreateSnapshot(public_input)),
-            Err(VmmActionError::SnapshotUnsupported)
+            Ok(VmmData::Empty)
         );
         let session = vmm
             .started_session
             .as_ref()
-            .expect("public rejection should retain the paused source");
-        assert_eq!(session.native_snapshot_publication_count, 0);
-        assert_eq!(session.native_snapshot_producer_count, 0);
-        assert!(!public_paths.state().exists());
-        assert!(!public_paths.memory().exists());
+            .expect("public publication should retain the paused source");
+        assert_eq!(session.native_snapshot_publication_count, 1);
+        assert_eq!(session.native_snapshot_producer_count, 1);
+        assert_eq!(
+            load_native_snapshot_artifacts(&public_paths)
+                .expect("public native-v2 pair should load")
+                .family(),
+            NativeSnapshotArtifactFamily::V2
+        );
         public_directory.assert_no_staging();
 
         let first_directory = TempSnapshotDirectory::new("native-v2-process-first");
@@ -24671,8 +25425,8 @@ mod tests {
             .started_session
             .as_ref()
             .expect("successful publications should retain the source");
-        assert_eq!(session.native_snapshot_publication_count, 2);
-        assert_eq!(session.native_snapshot_producer_count, 2);
+        assert_eq!(session.native_snapshot_publication_count, 3);
+        assert_eq!(session.native_snapshot_producer_count, 3);
         assert_eq!(session.snapshot_create_barrier_count, 0);
         second_directory.assert_no_staging();
     }
@@ -24806,6 +25560,93 @@ mod tests {
             fs::read(paths.memory()).expect("replacement memory should remain"),
             b"replacement memory"
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires the signed native_v2_process integration group"]
+    fn signed_native_v1_public_dispatch_restores_frozen_file_pair() {
+        const ARM64_IMAGE_HEADER_SIZE: usize = 64;
+        const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
+        const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
+        const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+        const ARM64_BRANCH_TO_SELF: u32 = 0x1400_0000;
+
+        let mut image = vec![0_u8; ARM64_IMAGE_HEADER_SIZE];
+        image[..4].copy_from_slice(&ARM64_BRANCH_TO_SELF.to_le_bytes());
+        image[ARM64_IMAGE_SIZE_OFFSET..ARM64_IMAGE_SIZE_OFFSET + 8]
+            .copy_from_slice(&(ARM64_IMAGE_HEADER_SIZE as u64).to_le_bytes());
+        image[ARM64_IMAGE_MAGIC_OFFSET..ARM64_IMAGE_MAGIC_OFFSET + 4]
+            .copy_from_slice(&ARM64_IMAGE_MAGIC.to_le_bytes());
+        let kernel = TempFilePath::create_with_bytes("signed-native-v1-public-kernel", &image);
+        let root = TempFilePath::create_with_bytes("signed-native-v1-public-root", &[0; 512]);
+
+        let mut source = ProcessVmm::with_starter(
+            "native-v1-public-source",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        );
+        source
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(1, 16)))
+            .expect("native-v1 source machine should configure");
+        source
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.path(),
+            )))
+            .expect("native-v1 source boot metadata should configure");
+        source
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new("root", "root", root.path(), true).with_is_read_only(true),
+            ))
+            .expect("native-v1 source root should configure");
+        source
+            .handle_action(VmmAction::InstanceStart)
+            .expect("real native-v1 source should start");
+        source
+            .handle_action(VmmAction::Pause)
+            .expect("real native-v1 source should pause");
+
+        let directory = TempSnapshotDirectory::new("signed-native-v1-public");
+        let paths = directory.paths();
+        source
+            .publish_native_v1_snapshot(&SnapshotCreateInput::new(
+                SnapshotType::Full,
+                paths.state(),
+                paths.memory(),
+            ))
+            .expect("frozen native-v1 writer should publish");
+        assert_eq!(
+            load_native_snapshot_artifacts(&paths)
+                .expect("native-v1 compatibility pair should validate")
+                .family(),
+            NativeSnapshotArtifactFamily::V1
+        );
+        drop(source);
+
+        let mut destination = ProcessVmm::with_starter(
+            "native-v1-public-destination",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        );
+        assert_eq!(
+            destination.handle_action(VmmAction::LoadSnapshot(SnapshotLoadInput::new(
+                paths.state(),
+                SnapshotMemoryBackend::new(paths.memory(), SnapshotMemoryBackendType::File,),
+            ))),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(destination.instance_info().state, InstanceState::Paused);
+        assert_eq!(destination.drive_configs().len(), 1);
+        assert_eq!(destination.drive_configs()[0].drive_id(), "root");
+        destination
+            .handle_action(VmmAction::Resume)
+            .expect("legacy destination should resume through the ordinary lifecycle");
+        destination
+            .handle_action(VmmAction::Pause)
+            .expect("legacy destination should remain controllable");
+        directory.assert_no_staging();
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -25274,12 +26115,12 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn public_snapshot_create_publishes_composite_pair_without_legacy_barrier() {
+    fn public_snapshot_create_publishes_native_v2_pair_without_legacy_barrier() {
         let directory = TempSnapshotDirectory::new("public-create-success");
         let paths = directory.paths();
         let input = SnapshotCreateInput::new(SnapshotType::Full, paths.state(), paths.memory());
         let barrier_error = BackendError::Hypervisor("legacy-barrier-must-not-run".to_owned());
-        let mut vmm = snapshot_profile_vmm(FakeStarter::success_with_session(
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
             FakeSession::with_snapshot_create_barrier_result(22, barrier_error),
         ));
         vmm.handle_action(VmmAction::InstanceStart)
@@ -25298,8 +26139,9 @@ mod tests {
         assert_eq!(session.snapshot_create_barrier_count, 0);
         assert_eq!(session.native_snapshot_publication_count, 1);
         assert_eq!(session.native_snapshot_producer_count, 1);
-        let artifacts = load_snapshot_artifacts(&paths).expect("public pair should validate");
-        assert_eq!(artifacts.record().kind(), SnapshotCommitKind::Composite);
+        let artifacts =
+            load_native_snapshot_artifacts(&paths).expect("public pair should validate");
+        assert_eq!(artifacts.family(), NativeSnapshotArtifactFamily::V2);
         directory.assert_no_staging();
     }
 

@@ -24,6 +24,7 @@ use bangbang_runtime::snapshot_format::{
     NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES, NATIVE_V1_SNAPSHOT_VERSION, SNAPSHOT_ENVELOPE_HEADER_BYTES,
     SNAPSHOT_ENVELOPE_INTEGRITY_BYTES, encode_snapshot_envelope,
 };
+use bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
 use crc64::crc64;
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1055,7 +1056,7 @@ fn executable_accepts_enable_pci_after_host_preflight() {
 #[test]
 fn executable_reports_native_snapshot_versions_before_socket_publication() {
     let test_dir = TestDir::new();
-    let expected = format!("v{NATIVE_V1_SNAPSHOT_VERSION}\n");
+    let current_expected = format!("v{NATIVE_V2_SNAPSHOT_VERSION}\n");
 
     let version_socket = test_dir.path().join("snapshot-version.socket");
     let output = BangbangProcess::run_with_extra_args_expect_successful_exit(
@@ -1063,7 +1064,7 @@ fn executable_reports_native_snapshot_versions_before_socket_publication() {
         &test_dir.instance_id(),
         &["--snapshot-version"],
     );
-    assert_eq!(output.stdout, expected);
+    assert_eq!(output.stdout, current_expected);
     assert_eq!(output.stderr, "");
     assert!(!version_socket.exists());
 
@@ -1079,7 +1080,7 @@ fn executable_reports_native_snapshot_versions_before_socket_publication() {
         &test_dir.instance_id(),
         &["--describe-snapshot", path_text(&snapshot_path)],
     );
-    assert_eq!(output.stdout, expected);
+    assert_eq!(output.stdout, format!("v{NATIVE_V1_SNAPSHOT_VERSION}\n"));
     assert_eq!(output.stderr, "");
     assert!(!describe_socket.exists());
 }
@@ -1153,7 +1154,7 @@ fn executable_rejects_malformed_corrupt_and_incompatible_snapshot_files() {
         (
             "invalid-magic",
             invalid_magic,
-            "snapshot envelope magic is invalid",
+            "snapshot state format is incompatible",
         ),
         ("truncated", truncated, "snapshot envelope is truncated"),
         ("trailing", trailing, "snapshot envelope has trailing data"),

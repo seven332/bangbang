@@ -1203,6 +1203,21 @@ impl LoadedNativeSnapshotArtifacts {
     pub fn into_parts(self) -> (NativeSnapshotArtifactState, GuestMemory) {
         (self.state, self.memory)
     }
+
+    /// Consumes an already-validated native-v1 pair into the frozen legacy
+    /// loader representation without reopening or re-encoding either
+    /// artifact.
+    pub fn into_v1(self) -> Result<LoadedSnapshotArtifacts, NativeSnapshotArtifactStateError> {
+        let actual = self.family();
+        let (state, memory) = self.into_parts();
+        let record = state.into_v1_record().map_err(|_| {
+            NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V1,
+                actual,
+            }
+        })?;
+        Ok(LoadedSnapshotArtifacts { record, memory })
+    }
 }
 
 impl fmt::Debug for LoadedNativeSnapshotArtifacts {
@@ -1242,6 +1257,19 @@ impl PreparedNativeSnapshotState {
     /// Consumes the prepared value into its state commitment.
     pub fn into_state(self) -> NativeSnapshotArtifactState {
         self.state
+    }
+
+    /// Consumes already-decoded native-v1 state into the frozen legacy
+    /// prepared-state representation without reopening or re-encoding it.
+    pub fn into_v1(self) -> Result<PreparedSnapshotState, NativeSnapshotArtifactStateError> {
+        let actual = self.family();
+        let record = self.state.into_v1_record().map_err(|_| {
+            NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V1,
+                actual,
+            }
+        })?;
+        Ok(PreparedSnapshotState::from_record(record))
     }
 }
 

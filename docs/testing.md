@@ -1197,7 +1197,8 @@ moves one exact corpus record to #1527-owned
 `missing-platform-feasible`, making that checkpoint 228/169/4/17 without
 premature promotion. #1555 subsequently adds direct signed host/guest demand,
 removal-generation, exact entitlement, and full-matrix evidence and promotes
-only that record. The current overlay is 229/169/3/17.
+only that record. #1578 then promotes four public native-v2 process/snapshot
+records. The current overlay is 233/165/3/17.
 
 Snapshot paging feasibility, its standalone protocol/client, internal
 lazy-anonymous-memory coordinator, host/guest fault bridges, removal,
@@ -1303,25 +1304,24 @@ scripts/run-integration-tests.sh --test hvf_lifecycle -- hvf_lazy_guest_
 scripts/run-integration-tests.sh --test guest_boot -- --exact lazy_guest_boot_integration::boots_guest_entry_from_a_lazy_instruction_page
 ```
 
-Native-v1 restore tests keep `File` behavior as the eager regression path and
-cover `Uffd` profile ordering, state-derived pager-session identity, exact
-header-relative region offsets, invalid topology/limits/peer negotiation,
-transactional failure cleanup, and path/value redaction. The signed executable
-case runs an external peer that owns the committed memory image and restores a
-paused destination through direct `Uffd`. Before resume it proves host-side
-demand while three guest-only pages remain absent. After resume it observes
-exact continuation-instruction Read, guest-data Read, and guest-data Write
-pages, guest `SYSTEM_OFF`, and orderly pager shutdown. The production-bundle
-case repeats the same observations through the launcher-connected grant while
-deliberately omitting the worker's snapshot-memory input grant. Its signing
-test parses the entitlement plist and requires an empty launcher dictionary
-plus exactly Boolean-true App Sandbox and Hypervisor worker keys:
+Frozen native-v1 restore tests keep `File` behavior as the eager regression
+path and cover `Uffd` profile ordering, state-derived pager-session identity,
+exact header-relative region offsets, invalid topology/limits/peer negotiation,
+transactional failure cleanup, public family routing, and path/value
+redaction. Current native-v2 explicitly rejects `Uffd`. Signed host/guest fault
+tests still exercise exact execute/read/write demand, removal generations,
+coalescing, failure, and cleanup, while signed production pager probes exercise
+the launcher-connected stream, App Sandbox boundary, death orders, and exact
+entitlement floor without claiming that current native-v2 accepts the backend.
+The signed frozen-v1 public-dispatch fixture uses File; no production format
+selector or v1 writer is exposed:
 
 ```sh
 cargo test -p bangbang native_v1_uffd --all-features --locked
 cargo test -p bangbang-hvf --lib --all-features --locked snapshot_restore
-scripts/run-integration-tests.sh --test executable_hvf_e2e -- macos_arm64::signed_executable_creates_and_restores_native_v1_snapshot_across_processes --exact
-scripts/run-integration-tests.sh --test production_bundle -- normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore --exact
+scripts/run-integration-tests.sh --test native_v2_process
+scripts/run-integration-tests.sh --test hvf_lifecycle -- lazy_host_fault_integration::
+scripts/run-integration-tests.sh --test production_bundle -- signed_pager_grant_
 scripts/run-integration-tests.sh --test production_bundle -- production_bundle_has_exact_nested_signing_contract --exact
 ```
 
@@ -1534,12 +1534,12 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating a native-v1 pair into separate
+- exact external snapshot grants creating a native-v2 2.3 pair into separate
   output directories, reusing both retained directories for a second successful
   pair, preserving all finals on collision, and keeping same-GrantId concurrent
   source workers in their own directories; granted early description and two
-  fresh state/memory/root loads then prove explicit and automatic resume through
-  guest `SYSTEM_OFF`;
+  fresh state/memory File/COW loads then prove explicit and automatic resume
+  through guest `SYSTEM_OFF`;
 - source kernel/root/metrics and load state/memory pathnames replaced after the
   launcher opens them, with no tag reopen, no staging residue, redacted
   wrong-role output, and no extra private session namespace;
@@ -1693,12 +1693,14 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v1.0.0` output for `--snapshot-version` and a valid
-`--describe-snapshot`, plus missing, non-regular, oversized, malformed,
-truncated, trailing/inconsistent-length, corrupt, unsupported-version,
-incompatible-architecture, and incompatible-page-size files. Fixtures use
-unique temporary paths; failures must use the bad-configuration exit code,
-publish no API socket, and expose neither path nor payload sentinels.
+checks exact `v2.3.0` output for `--snapshot-version`, exact description of
+native-v1 and current/compatible native-v2 fixtures, and explicit pinned
+Firecracker/unknown incompatibility. It also covers missing, non-regular,
+oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
+unsupported-version, incompatible-architecture, and incompatible-page-size
+files. Fixtures use unique temporary paths; failures must use the
+bad-configuration exit code, publish no API socket, and expose neither path nor
+payload sentinels.
 The contained external-file variant belongs to the signed production-bundle
 target above because it requires lifecycle grant delivery, App Sandbox bookmark
 scope, and the fixed launcher/worker topology.
@@ -1737,25 +1739,27 @@ This target runs the dedicated `executable_hvf_e2e` Cargo test target. It builds
 and signs a temporary `bangbang` executable, prepares the pinned Firecracker
 kernel, deterministic tiny initrd, and generated direct-boot ext4 rootfs,
 starts `bangbang` as a child process, configures the VM through the Unix-socket
-API or a Firecracker-shaped config file depending on the scenario, and waits for
-the guest to write deterministic markers to host-observable outputs. The
-native-v1 snapshot scenario uses a test-only arm64 Image with a valid Linux
-header and no rootfs dependency for guest control flow. The guest saves both
-halves of VMGenID, the VMClock disruption/generation counters, and PL031 time,
-writes one UART readiness byte, and loops at the captured PC.
-The host polls public `FlushMetrics` until `uart.write_count` changes, pauses and
-creates through `/snapshot/create`, checks public collision/no-clobber
-redaction, and terminates the source. Two fresh signed processes load the same
-immutable pair: one remains paused until public `PATCH /vm`, and one uses
-`resume_vm: true`. Guest PSCI `SYSTEM_OFF` is reachable only after a changed
-VMGenID is observed, the VMClock sequence is stable and even with both counters
-changed, and destination RTC has not regressed. Clean process exit therefore
-proves the ordered time/identity updates and continuation from captured
-register/memory state without a fixed readiness sleep. Run just this proof with:
+API or a Firecracker-shaped config file depending on the scenario, and waits
+for the guest to write deterministic markers to host-observable outputs. The
+native-v2 snapshot scenario uses a test-only arm64 Image with a valid Linux
+header and no rootfs dependency for guest control flow. Its primary vCPU brings
+up a secondary vCPU; both reach distinct source memory checkpoints without
+mutating the canonical UART. The host pauses and creates through
+`/snapshot/create`, verifies the real CLI reports `v2.3.0`, checks
+collision/no-clobber redaction, and terminates the source. Fresh signed
+processes repeatedly load the same immutable pair: one remains paused until
+public `PATCH /vm`, and one uses `resume_vm: true`. Both vCPUs then execute
+distinct continuation pages, read and write distinct private COW pages, emit
+distinct destination UART markers, and reach PSCI shutdown. The state and
+memory artifacts remain byte-identical after both destinations. A third
+Paused destination closes the sole stdout reader before resume; deterministic
+guest UART output reaches the ordinary `BrokenPipe` terminal path without
+SIGPIPE killing the process, and the API socket is cleaned. Run just this proof
+with:
 
 ```sh
 scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
-  macos_arm64::signed_executable_creates_and_restores_native_v1_snapshot_across_processes \
+  macos_arm64::signed_executable_creates_and_restores_native_v2_snapshot_across_processes \
   --exact
 ```
 
@@ -1794,7 +1798,7 @@ MMIO and product PCI. Each configures both limiter buckets, checks that Linux
 selected `virtio_rng`, completes one nonempty `/dev/hwrng` read, and then waits
 on a scratch-sector host continuation marker. The host establishes a metrics
 baseline, releases the guest, waits for a new limiter throttle, pauses the VM,
-and invokes public native-v1 creation. The expected optional-profile rejection
+and invokes public native-v2 creation. The expected optional-profile rejection
 occurs only after capture-ready entropy traversal and creates no artifacts.
 After resume, the guest completes eight additional nonempty reads and publishes
 a terminal marker; the host requires a retry-event metric and clean shutdown.
@@ -2291,7 +2295,7 @@ pure captured/override selector resolution before resource access, owner-only
 stale-safe direct publication and exact cleanup, transactional contained
 directory/broker reservation with no ambient fallback, cancellation rollback,
 single-use runtime consumption, retryable preactivation failure, and terminal
-postactivation failure. Public native-v1 records still omit vsock
+postactivation failure. Public native-v2 artifacts still omit vsock
 encoding/placement and public load rejects overrides. The checked vsock ledger
 certifies the eight API/live records; the exact six aggregate invocation,
 restored acknowledgement/reconnect/override, clone/version, and portability

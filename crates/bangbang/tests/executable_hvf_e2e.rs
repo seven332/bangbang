@@ -9,8 +9,6 @@
 
 #[path = "../../../tests/support/macos_virtual_block.rs"]
 mod macos_virtual_block;
-#[path = "../../../tests/support/snapshot_pager.rs"]
-mod snapshot_pager;
 mod support;
 #[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
@@ -18,18 +16,18 @@ mod vhost_user_block;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos_arm64 {
     use std::fs;
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
     use std::net::Shutdown;
+    use std::os::fd::OwnedFd;
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::unix::process::ExitStatusExt as _;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
     use crate::macos_virtual_block::{
         MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize,
-    };
-    use crate::snapshot_pager::{
-        SnapshotPagerReport, SnapshotPagerServer, SnapshotPagerTermination,
     };
     use crate::support::{
         BangbangProcess, CompletedProcess, TestDir, assert_bad_request_response,
@@ -40,8 +38,6 @@ mod macos_arm64 {
     use crate::vhost_user_block::{
         VhostUserBlockBackend, VhostUserBlockBackendOptions, VhostUserBlockBackendReport,
     };
-    use bangbang_pager::PageAccess;
-
     const BANGBANG_GUEST_KERNEL_PATH_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
     const BANGBANG_GUEST_INITRD_PATH_ENV: &str = "BANGBANG_GUEST_INITRD_PATH";
     const BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV: &str = "BANGBANG_GUEST_EXT4_ROOTFS_PATH";
@@ -311,21 +307,38 @@ mod macos_arm64 {
     const PCI_ALL_VIRTIO_GUEST_TIMEOUT: Duration = Duration::from_secs(90);
     const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
     const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
-    const SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET: usize = 0x4000;
-    const SNAPSHOT_GUEST_CODE_OFFSET: u64 = 0x20_4000;
+    const SNAPSHOT_GUEST_PRIMARY_CONTINUATION_IMAGE_OFFSET: usize = 0x4000;
+    const SNAPSHOT_GUEST_SECONDARY_IMAGE_OFFSET: usize = 0x8000;
+    const SNAPSHOT_GUEST_SECONDARY_CONTINUATION_IMAGE_OFFSET: usize = 0xc000;
+    const SNAPSHOT_GUEST_PRIMARY_CODE_OFFSET: u64 = 0x20_4000;
+    const SNAPSHOT_GUEST_SECONDARY_OFFSET: u64 = 0x20_8000;
+    const SNAPSHOT_GUEST_SECONDARY_CODE_OFFSET: u64 = 0x20_c000;
     const SNAPSHOT_GUEST_READ_OFFSET: u64 = 0x1_0000;
     const SNAPSHOT_GUEST_WRITE_OFFSET: u64 = 0x2_0000;
-    const SNAPSHOT_GUEST_CODE_ADDRESS: u64 =
-        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_CODE_OFFSET;
+    const SNAPSHOT_GUEST_SECONDARY_READ_OFFSET: u64 = 0x1_4000;
+    const SNAPSHOT_GUEST_SECONDARY_WRITE_OFFSET: u64 = 0x2_4000;
+    const SNAPSHOT_GUEST_FLAGS_OFFSET: u64 = 0x3_0000;
+    const SNAPSHOT_GUEST_PRIMARY_CODE_ADDRESS: u64 =
+        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_PRIMARY_CODE_OFFSET;
+    const SNAPSHOT_GUEST_SECONDARY_ADDRESS: u64 =
+        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_SECONDARY_OFFSET;
+    const SNAPSHOT_GUEST_SECONDARY_CODE_ADDRESS: u64 =
+        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_SECONDARY_CODE_OFFSET;
     const SNAPSHOT_GUEST_READ_ADDRESS: u64 =
         bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_READ_OFFSET;
     const SNAPSHOT_GUEST_WRITE_ADDRESS: u64 =
         bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_WRITE_OFFSET;
-    const SNAPSHOT_GUEST_RTC_ADDRESS: u64 = 0x4000_1000;
+    const SNAPSHOT_GUEST_SECONDARY_READ_ADDRESS: u64 =
+        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_SECONDARY_READ_OFFSET;
+    const SNAPSHOT_GUEST_SECONDARY_WRITE_ADDRESS: u64 =
+        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_SECONDARY_WRITE_OFFSET;
+    const SNAPSHOT_GUEST_FLAGS_ADDRESS: u64 =
+        bangbang_runtime::memory::aarch64::SYSTEM_MEM_START + SNAPSHOT_GUEST_FLAGS_OFFSET;
+    const SNAPSHOT_GUEST_PRIMARY_READY_BYTE: u8 = 0x11;
+    const SNAPSHOT_GUEST_SECONDARY_READY_BYTE: u8 = 0x12;
+    const SNAPSHOT_GUEST_PRIMARY_RESTORED_BYTE: u8 = 0x13;
+    const SNAPSHOT_GUEST_SECONDARY_RESTORED_BYTE: u8 = 0x14;
     const SNAPSHOT_GUEST_UART_ADDRESS: u64 = 0x4000_2000;
-    const SNAPSHOT_GUEST_VMCLOCK_ADDRESS: u64 = bangbang_runtime::memory::aarch64::SYSTEM_MEM_START
-        + bangbang_runtime::memory::aarch64::SYSTEM_MEM_SIZE
-        - bangbang_runtime::fdt::ARM64_FDT_VMCLOCK_SIZE;
     const SNAPSHOT_GUEST_VMGENID_ADDRESS: u64 = bangbang_runtime::memory::aarch64::SYSTEM_MEM_START
         + bangbang_runtime::memory::aarch64::SYSTEM_MEM_SIZE
         - bangbang_runtime::fdt::ARM64_FDT_VMCLOCK_SIZE
@@ -1944,10 +1957,11 @@ mod macos_arm64 {
         assert!(!paused_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
         assert!(!paused_stdout.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
 
-        assert_capture_ready_snapshot_rejected_without_artifacts(
+        assert_snapshot_rejected_without_artifacts(
             &socket_path,
             test_dir.path(),
             "paused serial stdio capture preflight",
+            "failed to create snapshot",
         );
         let captured_stdout = bangbang.stdout_snapshot();
         assert!(!captured_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
@@ -2709,7 +2723,7 @@ mod macos_arm64 {
         assert_bad_request_response(&snapshot_create, "vhost-user snapshot create");
         assert_response_contains(
             &snapshot_create,
-            "native-v1 storage preflight failed: vhost-user block capture is unsupported",
+            "native-v2 capture-ready preflight failed: snapshot storage preflight failed: vhost-user block capture is unsupported",
             "vhost-user snapshot create",
         );
         for private_path in [
@@ -10994,13 +11008,13 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_creates_and_restores_native_v1_snapshot_across_processes() {
+    fn signed_executable_creates_and_restores_native_v2_snapshot_across_processes() {
         let test_dir = TestDir::new();
         let source_socket = test_dir.path().join("source.socket");
         let paused_socket = test_dir.path().join("paused.socket");
         let resumed_socket = test_dir.path().join("resumed.socket");
+        let terminal_socket = test_dir.path().join("terminal.socket");
         let kernel_path = test_dir.path().join("snapshot-guest.image");
-        let root_path = test_dir.path().join("snapshot-root.img");
         let state_path = test_dir.path().join("snapshot.state");
         let memory_path = test_dir.path().join("snapshot.memory");
         let source_metrics = test_dir.path().join("source.metrics");
@@ -11009,14 +11023,13 @@ mod macos_arm64 {
 
         fs::write(&kernel_path, snapshot_continuity_guest_image())
             .expect("snapshot continuity guest image should be written");
-        create_zeroed_block_backing(&root_path);
 
         let source =
             BangbangProcess::start(&source_socket, &format!("{instance_id}-snapshot-source"));
         let machine = http_put_json(
             &source_socket,
             "/machine-config",
-            r#"{"vcpu_count":1,"mem_size_mib":16,"track_dirty_pages":true}"#,
+            r#"{"vcpu_count":2,"mem_size_mib":16,"track_dirty_pages":true}"#,
         );
         assert_no_content_response(&machine, "PUT source /machine-config");
         let boot = http_put_json(
@@ -11028,15 +11041,6 @@ mod macos_arm64 {
             ),
         );
         assert_no_content_response(&boot, "PUT source /boot-source");
-        let drive = http_put_json(
-            &source_socket,
-            "/drives/root",
-            &format!(
-                r#"{{"drive_id":"root","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
-                json_string(path_text(&root_path))
-            ),
-        );
-        assert_no_content_response(&drive, "PUT source /drives/root");
         let metrics = http_put_json(
             &source_socket,
             "/metrics",
@@ -11056,9 +11060,9 @@ mod macos_arm64 {
         wait_for_uart_write_count(
             &source_socket,
             &source_metrics,
-            1,
+            2,
             GUEST_EXECUTION_TIMEOUT,
-            "source snapshot guest readiness",
+            "all source snapshot guest vCPUs ready",
         );
         let pause = http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#);
         assert_no_content_response(&pause, "PATCH source /vm Paused");
@@ -11081,6 +11085,19 @@ mod macos_arm64 {
         assert_no_snapshot_staging(test_dir.path());
         let state_before = fs::read(&state_path).expect("snapshot state should read");
         let memory_before = fs::read(&memory_path).expect("snapshot memory should read");
+        let described = BangbangProcess::run_with_args_expect_exit(
+            &[
+                std::ffi::OsStr::new("--describe-snapshot"),
+                state_path.as_os_str(),
+            ],
+            "native-v2 snapshot description",
+        );
+        assert!(
+            described.status.success(),
+            "native-v2 description should succeed; stderr:\n{}",
+            described.stderr
+        );
+        assert_eq!(described.stdout.trim(), "v2.3.0");
 
         let collision = http_json_with_io_timeout(
             &source_socket,
@@ -11119,6 +11136,20 @@ mod macos_arm64 {
         );
 
         let source_output = source.terminate();
+        assert!(
+            source_output
+                .stdout
+                .as_bytes()
+                .contains(&SNAPSHOT_GUEST_PRIMARY_READY_BYTE),
+            "primary vCPU should publish its source checkpoint"
+        );
+        assert!(
+            source_output
+                .stdout
+                .as_bytes()
+                .contains(&SNAPSHOT_GUEST_SECONDARY_READY_BYTE),
+            "secondary vCPU should publish its source checkpoint"
+        );
         assert_clean_shutdown(source_output, &source_socket, "snapshot source");
 
         let paused = BangbangProcess::start(
@@ -11135,15 +11166,14 @@ mod macos_arm64 {
         );
         assert_no_content_response(&metrics, "PUT paused destination /metrics");
 
-        let unsupported_state = test_dir.path().join("private-uffd-state");
-        let unsupported_memory = test_dir.path().join("private-uffd-memory");
+        let unsupported_memory = test_dir.path().join("private-v2-uffd.socket");
         let unsupported_load = http_json_with_io_timeout(
             &paused_socket,
             "PUT",
             "/snapshot/load",
             &format!(
                 r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"Uffd"}},"track_dirty_pages":true}}"#,
-                json_string(path_text(&unsupported_state)),
+                json_string(path_text(&state_path)),
                 json_string(path_text(&unsupported_memory))
             ),
             GUEST_EXECUTION_TIMEOUT,
@@ -11154,7 +11184,7 @@ mod macos_arm64 {
             "Snapshot and restore are not supported.",
             "unsupported UFFD snapshot load",
         );
-        assert!(!unsupported_load.contains(path_text(&unsupported_state)));
+        assert!(!unsupported_load.contains(path_text(&state_path)));
         assert!(!unsupported_load.contains(path_text(&unsupported_memory)));
 
         let missing_state = test_dir.path().join("private-missing-state");
@@ -11179,9 +11209,7 @@ mod macos_arm64 {
         assert!(!missing_load.contains(path_text(&missing_state)));
         assert!(!missing_load.contains(path_text(&missing_memory)));
 
-        let pager_path = test_dir.path().join("snapshot-pager.socket");
-        let pager = SnapshotPagerServer::start(&pager_path, &state_path, &memory_path);
-        let load_paused_body = snapshot_uffd_load_body(&state_path, &pager_path, false);
+        let load_paused_body = snapshot_load_body(&state_path, &memory_path, false);
         let load_paused = http_json_with_io_timeout(
             &paused_socket,
             "PUT",
@@ -11201,70 +11229,39 @@ mod macos_arm64 {
         assert_ok_response(&paused_machine, "GET tracked paused destination machine");
         assert_response_contains(
             &paused_machine,
-            r#""track_dirty_pages":false"#,
+            r#""vcpu_count":2"#,
             "GET tracked paused destination machine",
         );
-        let host_demand = pager.snapshot();
-        assert_eq!(
-            host_demand.termination,
-            SnapshotPagerTermination::Active,
-            "paused restore should retain an active external pager"
+        assert_response_contains(
+            &paused_machine,
+            r#""track_dirty_pages":true"#,
+            "GET tracked paused destination machine",
         );
-        assert!(
-            host_demand.page_data + host_demand.page_zero > 0,
-            "paused restore preparation should demand at least one host page"
-        );
-        for offset in [
-            SNAPSHOT_GUEST_CODE_OFFSET,
-            SNAPSHOT_GUEST_READ_OFFSET,
-            SNAPSHOT_GUEST_WRITE_OFFSET,
-        ] {
-            assert!(
-                !snapshot_pager_observed(&host_demand, offset, PageAccess::Read)
-                    && !snapshot_pager_observed(&host_demand, offset, PageAccess::Write),
-                "paused host preparation must not pre-access guest-only offset {offset:#x}: {host_demand:?}"
-            );
-        }
         let resume = http_json(&paused_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
         assert_no_content_response(&resume, "PATCH paused destination /vm Resumed");
         let paused_output = paused.wait_for_exit_with_timeout(
             GUEST_EXECUTION_TIMEOUT,
             "restored guest VMGenID change after explicit resume",
         );
+        assert!(
+            paused_output
+                .stdout
+                .as_bytes()
+                .contains(&SNAPSHOT_GUEST_PRIMARY_RESTORED_BYTE),
+            "primary vCPU should progress after explicit resume"
+        );
+        assert!(
+            paused_output
+                .stdout
+                .as_bytes()
+                .contains(&SNAPSHOT_GUEST_SECONDARY_RESTORED_BYTE),
+            "secondary vCPU should progress after explicit resume"
+        );
         assert_clean_shutdown(
             paused_output,
             &paused_socket,
             "explicitly resumed snapshot destination",
         );
-        let pager_report = pager.wait();
-        assert_eq!(pager_report.termination, SnapshotPagerTermination::Shutdown);
-        assert!(
-            pager_report.page_data + pager_report.page_zero
-                > host_demand.page_data + host_demand.page_zero,
-            "resumed guest should add demand beyond paused host preparation"
-        );
-        for (offset, access, context) in [
-            (
-                SNAPSHOT_GUEST_CODE_OFFSET,
-                PageAccess::Read,
-                "instruction-first code page",
-            ),
-            (
-                SNAPSHOT_GUEST_READ_OFFSET,
-                PageAccess::Read,
-                "read-first guest page",
-            ),
-            (
-                SNAPSHOT_GUEST_WRITE_OFFSET,
-                PageAccess::Write,
-                "write-first guest page",
-            ),
-        ] {
-            assert!(
-                snapshot_pager_observed(&pager_report, offset, access),
-                "restored guest should demand {context} at {offset:#x}: {pager_report:?}"
-            );
-        }
 
         let resumed = BangbangProcess::start(
             &resumed_socket,
@@ -11286,10 +11283,131 @@ mod macos_arm64 {
             GUEST_EXECUTION_TIMEOUT,
             "restored guest VMGenID change after automatic resume",
         );
+        assert!(
+            resumed_output
+                .stdout
+                .as_bytes()
+                .contains(&SNAPSHOT_GUEST_PRIMARY_RESTORED_BYTE),
+            "primary vCPU should progress after automatic resume"
+        );
+        assert!(
+            resumed_output
+                .stdout
+                .as_bytes()
+                .contains(&SNAPSHOT_GUEST_SECONDARY_RESTORED_BYTE),
+            "secondary vCPU should progress after automatic resume"
+        );
         assert_clean_shutdown(
             resumed_output,
             &resumed_socket,
             "automatically resumed snapshot destination",
+        );
+
+        let binary = std::env::var_os("BANGBANG_PROCESS_E2E_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_bangbang")));
+        let (stdout_reader, stdout_writer) =
+            UnixStream::pair().expect("terminal destination stdout pipe should create");
+        stdout_reader
+            .set_read_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+            .expect("terminal destination stdout timeout should configure");
+        let stdout_writer: OwnedFd = stdout_writer.into();
+        let mut terminal = Command::new(binary)
+            .arg("--api-sock")
+            .arg(&terminal_socket)
+            .arg("--id")
+            .arg(format!("{instance_id}-snapshot-terminal-destination"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout_writer))
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("terminal destination should start");
+        let mut stdout_reader = BufReader::new(stdout_reader);
+        let mut startup_output = String::new();
+        loop {
+            let mut line = String::new();
+            let read = stdout_reader
+                .read_line(&mut line)
+                .expect("terminal destination readiness should be readable");
+            assert_ne!(
+                read, 0,
+                "terminal destination should publish readiness; output:\n{startup_output}"
+            );
+            startup_output.push_str(&line);
+            if line.contains("status: API server listening") {
+                break;
+            }
+        }
+        let terminal_load = http_json_with_io_timeout(
+            &terminal_socket,
+            "PUT",
+            "/snapshot/load",
+            &snapshot_load_body(&state_path, &memory_path, false),
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert_no_content_response(
+            &terminal_load,
+            "PUT terminal destination /snapshot/load paused",
+        );
+        assert_response_contains(
+            &http_get(&terminal_socket, "/"),
+            r#""state":"Paused""#,
+            "GET terminal destination paused state",
+        );
+
+        drop(stdout_reader);
+        let terminal_resume = http_json_with_io_timeout(
+            &terminal_socket,
+            "PATCH",
+            "/vm",
+            r#"{"state":"Resumed"}"#,
+            GUEST_EXECUTION_TIMEOUT,
+        );
+        assert!(
+            terminal_resume.starts_with("HTTP/1.1 204 No Content\r\n")
+                || terminal_resume.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "real stdout failure may race the resume response but must remain HTTP-shaped: {terminal_resume}"
+        );
+        let deadline = Instant::now()
+            .checked_add(GUEST_EXECUTION_TIMEOUT)
+            .expect("terminal destination deadline should fit");
+        let terminal_status = loop {
+            if let Some(status) = terminal
+                .try_wait()
+                .expect("terminal destination status should remain observable")
+            {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal destination should exit after its stdout consumer closes"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut terminal_stderr = String::new();
+        terminal
+            .stderr
+            .take()
+            .expect("terminal destination stderr should be piped")
+            .read_to_string(&mut terminal_stderr)
+            .expect("terminal destination stderr should read");
+        assert!(
+            !terminal_status.success(),
+            "restored stdout failure should terminate the destination"
+        );
+        assert_ne!(
+            terminal_status.signal(),
+            Some(libc::SIGPIPE),
+            "SIGPIPE must be handled instead of killing the process directly"
+        );
+        assert!(
+            terminal_stderr
+                .contains("API server error: process-owned boot run loop exited with failure"),
+            "ordinary restored-device failure should reach the redacted process-terminal path; stderr:\n{terminal_stderr}"
+        );
+        assert!(
+            !terminal_socket.exists(),
+            "terminal restored process should remove its API socket"
         );
 
         assert_eq!(
@@ -11314,32 +11432,53 @@ mod macos_arm64 {
             u64::try_from(image.len()).expect("guest image length should fit u64")
         );
         assert_eq!(read_test_u32(&image, 56), SNAPSHOT_GUEST_IMAGE_MAGIC);
-        assert_eq!(read_test_u32(&image, 64 + (16 * 4)), aarch64_b_cond(-2, 0));
+        assert_eq!(read_test_u32(&image, 64 + (17 * 4)), 0xd400_0002);
+        assert_eq!(read_test_u32(&image, 64 + (20 * 4)), aarch64_cbz_w(5, -1));
+        assert_eq!(read_test_u32(&image, 64 + (29 * 4)), aarch64_br(21));
         assert_eq!(
-            read_test_u32(&image, 64 + (20 * 4)),
-            aarch64_tbnz_w(11, 0, -6)
-        );
-        assert_eq!(read_test_u32(&image, 64 + (37 * 4)), aarch64_br(21));
-        assert_eq!(
-            read_test_u32(&image, SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET + (2 * 4)),
+            read_test_u32(
+                &image,
+                SNAPSHOT_GUEST_PRIMARY_CONTINUATION_IMAGE_OFFSET + (2 * 4)
+            ),
             aarch64_ldr_x(19, 18, 0)
         );
         assert_eq!(
-            read_test_u32(&image, SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET + (5 * 4)),
+            read_test_u32(
+                &image,
+                SNAPSHOT_GUEST_PRIMARY_CONTINUATION_IMAGE_OFFSET + (5 * 4)
+            ),
             aarch64_str_x(19, 20, 0)
         );
         assert_eq!(
-            read_test_u32(&image, SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET + (10 * 4)),
+            read_test_u32(
+                &image,
+                SNAPSHOT_GUEST_PRIMARY_CONTINUATION_IMAGE_OFFSET + (18 * 4)
+            ),
             0xd400_0002
         );
         assert_eq!(
-            read_test_u32(&image, SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET + (11 * 4)),
+            read_test_u32(&image, SNAPSHOT_GUEST_SECONDARY_IMAGE_OFFSET + (17 * 4)),
+            aarch64_br(21)
+        );
+        assert_eq!(
+            read_test_u32(
+                &image,
+                SNAPSHOT_GUEST_SECONDARY_CONTINUATION_IMAGE_OFFSET + (16 * 4)
+            ),
+            0xd400_0002
+        );
+        assert_eq!(
+            read_test_u32(
+                &image,
+                SNAPSHOT_GUEST_SECONDARY_CONTINUATION_IMAGE_OFFSET + (17 * 4)
+            ),
             0x1400_0000
         );
         assert_eq!(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0x801f_eff0);
-        assert_eq!(SNAPSHOT_GUEST_VMCLOCK_ADDRESS, 0x801f_f000);
         assert!(SNAPSHOT_GUEST_READ_OFFSET.is_multiple_of(0x4000));
         assert!(SNAPSHOT_GUEST_WRITE_OFFSET.is_multiple_of(0x4000));
+        assert!(SNAPSHOT_GUEST_SECONDARY_READ_OFFSET.is_multiple_of(0x4000));
+        assert!(SNAPSHOT_GUEST_SECONDARY_WRITE_OFFSET.is_multiple_of(0x4000));
     }
 
     fn snapshot_load_body(state_path: &Path, memory_path: &Path, resume_vm: bool) -> String {
@@ -11348,24 +11487,6 @@ mod macos_arm64 {
             json_string(path_text(state_path)),
             json_string(path_text(memory_path))
         )
-    }
-
-    fn snapshot_uffd_load_body(state_path: &Path, pager_path: &Path, resume_vm: bool) -> String {
-        format!(
-            r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"Uffd"}},"track_dirty_pages":false,"resume_vm":{resume_vm}}}"#,
-            json_string(path_text(state_path)),
-            json_string(path_text(pager_path))
-        )
-    }
-
-    fn snapshot_pager_observed(
-        report: &SnapshotPagerReport,
-        offset: u64,
-        access: PageAccess,
-    ) -> bool {
-        report.requests.iter().any(|request| {
-            request.region.get() == 1 && request.offset == offset && request.access == access
-        })
     }
 
     fn flush_memory_hotplug_metrics(
@@ -11416,7 +11537,7 @@ mod macos_arm64 {
                     "{context} did not observe uart.write_count >= {expected} within {timeout:?}; metrics:\n{metrics}"
                 );
             }
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -11511,6 +11632,20 @@ mod macos_arm64 {
         directory: &Path,
         context: &str,
     ) {
+        assert_snapshot_rejected_without_artifacts(
+            socket_path,
+            directory,
+            context,
+            "Snapshot and restore are not supported.",
+        );
+    }
+
+    fn assert_snapshot_rejected_without_artifacts(
+        socket_path: &Path,
+        directory: &Path,
+        context: &str,
+        expected_error: &str,
+    ) {
         let state_path = directory.join("capture-ready-rejected.state");
         let memory_path = directory.join("capture-ready-rejected.memory");
         let response = http_json_with_io_timeout(
@@ -11526,11 +11661,7 @@ mod macos_arm64 {
         );
 
         assert_bad_request_response(&response, context);
-        assert_response_contains(
-            &response,
-            "Snapshot and restore are not supported.",
-            context,
-        );
+        assert_response_contains(&response, expected_error, context);
         assert!(!response.contains(path_text(&state_path)));
         assert!(!response.contains(path_text(&memory_path)));
         assert!(!state_path.exists());
@@ -11540,62 +11671,100 @@ mod macos_arm64 {
 
     fn snapshot_continuity_guest_image() -> Vec<u8> {
         assert_eq!(SNAPSHOT_GUEST_VMGENID_ADDRESS >> 32, 0);
-        assert_eq!(SNAPSHOT_GUEST_VMCLOCK_ADDRESS >> 32, 0);
-        assert_eq!(SNAPSHOT_GUEST_RTC_ADDRESS >> 32, 0);
         assert_eq!(SNAPSHOT_GUEST_UART_ADDRESS >> 32, 0);
-        let instructions = [
-            aarch64_movz_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0), 0),
-            aarch64_movk_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 16), 16),
-            aarch64_ldp_x(2, 3, 1),
-            aarch64_movz_x(8, low_u16(SNAPSHOT_GUEST_VMCLOCK_ADDRESS, 0), 0),
-            aarch64_movk_x(8, low_u16(SNAPSHOT_GUEST_VMCLOCK_ADDRESS, 16), 16),
-            aarch64_ldr_x(9, 8, 16),
-            aarch64_ldr_x(10, 8, 104),
-            aarch64_movz_x(15, low_u16(SNAPSHOT_GUEST_RTC_ADDRESS, 0), 0),
-            aarch64_movk_x(15, low_u16(SNAPSHOT_GUEST_RTC_ADDRESS, 16), 16),
-            aarch64_ldr_w(16, 15, 0),
+        let primary = [
+            aarch64_movz_x(19, low_u16(SNAPSHOT_GUEST_FLAGS_ADDRESS, 0), 0),
+            aarch64_movk_x(19, low_u16(SNAPSHOT_GUEST_FLAGS_ADDRESS, 16), 16),
+            aarch64_movz_x(8, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0), 0),
+            aarch64_movk_x(8, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 16), 16),
+            aarch64_ldp_x(2, 3, 8),
+            aarch64_str_x(2, 19, 0),
+            aarch64_str_x(3, 19, 8),
             aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
             aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
-            aarch64_movz_x(7, u16::from(b'R'), 0),
+            aarch64_movz_x(7, u16::from(SNAPSHOT_GUEST_PRIMARY_READY_BYTE), 0),
             aarch64_strb_w(7, 4),
-            aarch64_ldp_x(5, 6, 1),
-            aarch64_cmp_x(5, 2),
-            aarch64_b_cond(-2, 0), // b.eq poll
-            aarch64_cmp_x(6, 3),
-            aarch64_b_cond(-4, 0), // b.eq poll
-            aarch64_ldr_w(11, 8, 12),
-            aarch64_tbnz_w(11, 0, -6),
-            0xd503_39bf, // dmb ishld
-            aarch64_ldr_x(12, 8, 16),
-            aarch64_ldr_x(13, 8, 104),
-            0xd503_39bf, // dmb ishld
-            aarch64_ldr_w(14, 8, 12),
-            aarch64_cmp_w(14, 11),
-            aarch64_b_cond(-13, 1), // b.ne poll
-            aarch64_cmp_x(12, 9),
-            aarch64_b_cond(-15, 0), // b.eq poll
-            aarch64_cmp_x(13, 10),
-            aarch64_b_cond(-17, 0), // b.eq poll
-            aarch64_ldr_w(17, 15, 0),
-            aarch64_cmp_w(17, 16),
-            aarch64_b_cond(-20, 3), // b.lo poll
-            aarch64_movz_x(21, low_u16(SNAPSHOT_GUEST_CODE_ADDRESS, 0), 0),
-            aarch64_movk_x(21, low_u16(SNAPSHOT_GUEST_CODE_ADDRESS, 16), 16),
+            aarch64_movz_x(0, 0x0003, 0),
+            aarch64_movk_x(0, 0xc400, 16), // PSCI_CPU_ON64
+            aarch64_movz_x(1, 1, 0),
+            aarch64_movz_x(2, low_u16(SNAPSHOT_GUEST_SECONDARY_ADDRESS, 0), 0),
+            aarch64_movk_x(2, low_u16(SNAPSHOT_GUEST_SECONDARY_ADDRESS, 16), 16),
+            aarch64_mov_x(3, 19),
+            0xd400_0002, // hvc #0
+            aarch64_str_x(0, 19, 16),
+            aarch64_ldr_w(5, 19, 24),
+            aarch64_cbz_w(5, -1),
+            aarch64_ldp_x(9, 10, 19),
+            aarch64_ldp_x(5, 6, 8),
+            aarch64_cmp_x(5, 9),
+            aarch64_b_cond(3, 1), // b.ne primary continuation
+            aarch64_cmp_x(6, 10),
+            aarch64_b_cond(-4, 0), // b.eq VMGenID poll
+            aarch64_movz_x(21, low_u16(SNAPSHOT_GUEST_PRIMARY_CODE_ADDRESS, 0), 0),
+            aarch64_movk_x(21, low_u16(SNAPSHOT_GUEST_PRIMARY_CODE_ADDRESS, 16), 16),
             aarch64_br(21),
         ];
-        let continuation = [
+        let primary_continuation = [
             aarch64_movz_x(18, low_u16(SNAPSHOT_GUEST_READ_ADDRESS, 0), 0),
             aarch64_movk_x(18, low_u16(SNAPSHOT_GUEST_READ_ADDRESS, 16), 16),
             aarch64_ldr_x(19, 18, 0),
             aarch64_movz_x(20, low_u16(SNAPSHOT_GUEST_WRITE_ADDRESS, 0), 0),
             aarch64_movk_x(20, low_u16(SNAPSHOT_GUEST_WRITE_ADDRESS, 16), 16),
             aarch64_str_x(19, 20, 0),
-            aarch64_movz_x(7, u16::from(b'C'), 0),
+            aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
+            aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
+            aarch64_movz_x(7, u16::from(SNAPSHOT_GUEST_PRIMARY_RESTORED_BYTE), 0),
             aarch64_strb_w(7, 4),
+            aarch64_movz_x(5, 1, 0),
+            aarch64_movz_x(19, low_u16(SNAPSHOT_GUEST_FLAGS_ADDRESS, 0), 0),
+            aarch64_movk_x(19, low_u16(SNAPSHOT_GUEST_FLAGS_ADDRESS, 16), 16),
+            aarch64_str_w(5, 19, 28),
+            aarch64_ldr_w(6, 19, 32),
+            aarch64_cbz_w(6, -1),
             aarch64_movz_x(0, 0x0008, 0),
             aarch64_movk_x(0, 0x8400, 16),
             0xd400_0002, // hvc #0 (PSCI_SYSTEM_OFF)
             0x1400_0000, // b . if the host unexpectedly returns
+        ];
+        let secondary = [
+            aarch64_mov_x(19, 0),
+            aarch64_movz_x(8, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0), 0),
+            aarch64_movk_x(8, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 16), 16),
+            aarch64_ldp_x(9, 10, 19),
+            aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
+            aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
+            aarch64_movz_x(7, u16::from(SNAPSHOT_GUEST_SECONDARY_READY_BYTE), 0),
+            aarch64_strb_w(7, 4),
+            aarch64_movz_x(5, 1, 0),
+            aarch64_str_w(5, 19, 24),
+            aarch64_ldp_x(5, 6, 8),
+            aarch64_cmp_x(5, 9),
+            aarch64_b_cond(3, 1), // b.ne secondary continuation
+            aarch64_cmp_x(6, 10),
+            aarch64_b_cond(-4, 0), // b.eq VMGenID poll
+            aarch64_movz_x(21, low_u16(SNAPSHOT_GUEST_SECONDARY_CODE_ADDRESS, 0), 0),
+            aarch64_movk_x(21, low_u16(SNAPSHOT_GUEST_SECONDARY_CODE_ADDRESS, 16), 16),
+            aarch64_br(21),
+        ];
+        let secondary_continuation = [
+            aarch64_movz_x(18, low_u16(SNAPSHOT_GUEST_SECONDARY_READ_ADDRESS, 0), 0),
+            aarch64_movk_x(18, low_u16(SNAPSHOT_GUEST_SECONDARY_READ_ADDRESS, 16), 16),
+            aarch64_ldr_x(19, 18, 0),
+            aarch64_movz_x(20, low_u16(SNAPSHOT_GUEST_SECONDARY_WRITE_ADDRESS, 0), 0),
+            aarch64_movk_x(20, low_u16(SNAPSHOT_GUEST_SECONDARY_WRITE_ADDRESS, 16), 16),
+            aarch64_str_x(19, 20, 0),
+            aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
+            aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
+            aarch64_movz_x(7, u16::from(SNAPSHOT_GUEST_SECONDARY_RESTORED_BYTE), 0),
+            aarch64_strb_w(7, 4),
+            aarch64_movz_x(5, 1, 0),
+            aarch64_movz_x(19, low_u16(SNAPSHOT_GUEST_FLAGS_ADDRESS, 0), 0),
+            aarch64_movk_x(19, low_u16(SNAPSHOT_GUEST_FLAGS_ADDRESS, 16), 16),
+            aarch64_str_w(5, 19, 32),
+            aarch64_movz_x(0, 0x0002, 0),
+            aarch64_movk_x(0, 0x8400, 16), // PSCI_CPU_OFF
+            0xd400_0002,                   // hvc #0
+            0x1400_0000,                   // b . if the host unexpectedly returns
         ];
 
         let mut image = vec![0; SNAPSHOT_GUEST_IMAGE_HEADER_SIZE];
@@ -11603,9 +11772,17 @@ mod macos_arm64 {
         write_test_u32(&mut image, 4, 0xd503_201f); // nop
         write_test_u64(&mut image, 8, 0); // text_offset
         write_test_u32(&mut image, 56, SNAPSHOT_GUEST_IMAGE_MAGIC);
-        image.extend(instructions.into_iter().flat_map(u32::to_le_bytes));
-        image.resize(SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET, 0);
-        image.extend(continuation.into_iter().flat_map(u32::to_le_bytes));
+        image.extend(primary.into_iter().flat_map(u32::to_le_bytes));
+        image.resize(SNAPSHOT_GUEST_PRIMARY_CONTINUATION_IMAGE_OFFSET, 0);
+        image.extend(primary_continuation.into_iter().flat_map(u32::to_le_bytes));
+        image.resize(SNAPSHOT_GUEST_SECONDARY_IMAGE_OFFSET, 0);
+        image.extend(secondary.into_iter().flat_map(u32::to_le_bytes));
+        image.resize(SNAPSHOT_GUEST_SECONDARY_CONTINUATION_IMAGE_OFFSET, 0);
+        image.extend(
+            secondary_continuation
+                .into_iter()
+                .flat_map(u32::to_le_bytes),
+        );
         let image_size = u64::try_from(image.len()).expect("guest image length should fit u64");
         write_test_u64(&mut image, 16, image_size);
         image
@@ -11646,14 +11823,20 @@ mod macos_arm64 {
         0xf900_0000 | ((byte_offset / 8) << 10) | (base << 5) | source
     }
 
+    fn aarch64_str_w(source: u32, base: u32, byte_offset: u32) -> u32 {
+        assert!(source <= 30 && base <= 30);
+        assert!(byte_offset.is_multiple_of(4) && byte_offset / 4 <= 0xfff);
+        0xb900_0000 | ((byte_offset / 4) << 10) | (base << 5) | source
+    }
+
+    fn aarch64_mov_x(destination: u32, source: u32) -> u32 {
+        assert!(destination <= 30 && source <= 30);
+        0xaa00_03e0 | (source << 16) | destination
+    }
+
     fn aarch64_cmp_x(left: u32, right: u32) -> u32 {
         assert!(left <= 30 && right <= 30);
         0xeb00_001f | (right << 16) | (left << 5)
-    }
-
-    fn aarch64_cmp_w(left: u32, right: u32) -> u32 {
-        assert!(left <= 30 && right <= 30);
-        0x6b00_001f | (right << 16) | (left << 5)
     }
 
     fn aarch64_b_cond(instruction_offset: i32, condition: u32) -> u32 {
@@ -11663,11 +11846,11 @@ mod macos_arm64 {
         0x5400_0000 | (immediate << 5) | condition
     }
 
-    fn aarch64_tbnz_w(register: u32, bit: u32, instruction_offset: i32) -> u32 {
-        assert!(register <= 30 && bit <= 31);
-        assert!((-8192..8192).contains(&instruction_offset));
-        let immediate = instruction_offset.cast_unsigned() & 0x3fff;
-        0x3700_0000 | (bit << 19) | (immediate << 5) | register
+    fn aarch64_cbz_w(register: u32, instruction_offset: i32) -> u32 {
+        assert!(register <= 30);
+        assert!((-262_144..262_144).contains(&instruction_offset));
+        let immediate = instruction_offset.cast_unsigned() & 0x7_ffff;
+        0x3400_0000 | (immediate << 5) | register
     }
 
     fn aarch64_br(register: u32) -> u32 {

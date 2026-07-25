@@ -7,9 +7,6 @@
 
 #[path = "../../../tests/support/macos_virtual_block.rs"]
 mod macos_virtual_block;
-#[cfg(target_os = "macos")]
-#[path = "../../../tests/support/snapshot_pager.rs"]
-mod snapshot_pager;
 #[path = "../../../tests/support/vhost_user_block.rs"]
 mod vhost_user_block;
 
@@ -35,7 +32,7 @@ use bangbang_launcher::{
     OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 use bangbang_pager::{
-    PageAccess, PagerError, PagerFrameKind, PagerTransport, PeerSession, ReferencePeer,
+    PagerError, PagerFrameKind, PagerTransport, PeerSession, ReferencePeer,
     ReferencePeerTermination,
 };
 use bangbang_session::{
@@ -44,8 +41,6 @@ use bangbang_session::{
     encode_frame,
 };
 use macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize};
-#[cfg(target_os = "macos")]
-use snapshot_pager::{SnapshotPagerReport, SnapshotPagerServer, SnapshotPagerTermination};
 use vhost_user_block::{
     VhostUserBlockBackend, VhostUserBlockBackendOptions, VhostUserBlockBackendReport,
 };
@@ -157,7 +152,6 @@ const CONTAINED_VHOST_USER_HOST_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_HOST
 const CONTAINED_VHOST_USER_SUCCESS_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_ro_OK";
 const VHOST_CONFIG_RESIZED_MARKER: &[u8] = b"BANGBANG_VHOST_CONFIG_RESIZED";
 const SNAPSHOT_KERNEL_ID: &str = "grant-snapshot-kernel-1368";
-const SNAPSHOT_ROOT_ID: &str = "grant-snapshot-root-1368";
 const SNAPSHOT_METRICS_ID: &str = "grant-snapshot-metrics-1368";
 const SNAPSHOT_STATE_OUTPUT_ID: &str = "grant-snapshot-state-output-1368";
 const SNAPSHOT_MEMORY_OUTPUT_ID: &str = "grant-snapshot-memory-output-1368";
@@ -165,7 +159,6 @@ const SNAPSHOT_STATE_INPUT_ID: &str = "grant-snapshot-state-input-1368";
 const SNAPSHOT_MEMORY_INPUT_ID: &str = "grant-snapshot-memory-input-1368";
 const SNAPSHOT_DESCRIBE_INPUT_ID: &str = "grant-snapshot-describe-input-1368";
 const SNAPSHOT_KERNEL_REF: &str = "bangbang-grant:grant-snapshot-kernel-1368";
-const SNAPSHOT_ROOT_REF: &str = "bangbang-grant:grant-snapshot-root-1368";
 const SNAPSHOT_METRICS_REF: &str = "bangbang-grant:grant-snapshot-metrics-1368";
 const SNAPSHOT_STATE_OUTPUT_REF: &str =
     "bangbang-grant:grant-snapshot-state-output-1368/state-1368.snap";
@@ -1286,7 +1279,7 @@ fn normal_bundle_delays_boot_claim_until_api_and_keeps_opened_identity() {
 }
 
 #[test]
-fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
+fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restore() {
     let bundle = production_bundle();
     initialize_worker_container(&bundle);
     let baseline_sessions = session_entries();
@@ -1411,7 +1404,7 @@ fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
     assert_output_success(&describe_output, "granted snapshot description");
     assert_eq!(
         String::from_utf8_lossy(&describe_output.stdout).trim(),
-        "v1.0.0"
+        "v2.3.0"
     );
     assert_snapshot_output_redacted(&describe_output, &describe.sensitive_strings());
 
@@ -1425,15 +1418,6 @@ fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
     assert_snapshot_output_redacted(&mismatch_output, &mismatch.sensitive_strings());
     assert_eq!(session_entries(), baseline_sessions);
 
-    #[cfg(target_os = "macos")]
-    let pager_fixture = PagerGrantFixture::new("snapshot-restore");
-    #[cfg(target_os = "macos")]
-    let pager =
-        SnapshotPagerServer::start(&pager_fixture.socket, &artifacts.state, &artifacts.memory);
-    #[cfg(target_os = "macos")]
-    let paused_fixture =
-        SnapshotInputGrantFixture::new_with_pager("paused", artifacts, &pager_fixture.socket);
-    #[cfg(not(target_os = "macos"))]
     let paused_fixture = SnapshotInputGrantFixture::new("paused", artifacts);
     let mut paused = spawn_ready_snapshot_grant_api_launcher(
         &bundle,
@@ -1443,40 +1427,12 @@ fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
         false,
     );
     let next_artifacts = paused_fixture.replace_source_pathnames();
-    #[cfg(target_os = "macos")]
-    let paused_load_body = snapshot_uffd_load_body(false);
-    #[cfg(not(target_os = "macos"))]
     let paused_load_body = snapshot_load_body(false);
     let paused_load = http_put(&paused.socket, "/snapshot/load", &paused_load_body);
     assert_http_status(&paused_load, 204, "load granted snapshot paused");
     let paused_state = http_get(&paused.socket, "/");
     assert_http_status(&paused_state, 200, "read granted paused snapshot state");
     assert!(paused_state.contains(r#""state":"Paused""#));
-    #[cfg(target_os = "macos")]
-    let host_demand = {
-        let report = pager.snapshot();
-        assert_eq!(
-            report.termination,
-            SnapshotPagerTermination::Active,
-            "contained paused restore should retain an active external pager"
-        );
-        assert!(
-            report.page_data + report.page_zero > 0,
-            "contained paused restore preparation should demand host pages"
-        );
-        for offset in [
-            SNAPSHOT_GUEST_CODE_OFFSET,
-            SNAPSHOT_GUEST_READ_OFFSET,
-            SNAPSHOT_GUEST_WRITE_OFFSET,
-        ] {
-            assert!(
-                !snapshot_pager_observed(&report, offset, PageAccess::Read)
-                    && !snapshot_pager_observed(&report, offset, PageAccess::Write),
-                "contained paused host preparation must not pre-access guest-only offset {offset:#x}: {report:?}"
-            );
-        }
-        report
-    };
     assert_http_status(
         &http_request(&paused.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
         204,
@@ -1486,38 +1442,6 @@ fn normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore() {
         paused.wait("granted snapshot explicit resume").success(),
         "explicitly resumed granted snapshot should reach SYSTEM_OFF"
     );
-    #[cfg(target_os = "macos")]
-    {
-        let pager_report = pager.wait();
-        assert_eq!(pager_report.termination, SnapshotPagerTermination::Shutdown);
-        assert!(
-            pager_report.page_data + pager_report.page_zero
-                > host_demand.page_data + host_demand.page_zero,
-            "contained restored guest should add demand beyond paused host preparation"
-        );
-        for (offset, access, context) in [
-            (
-                SNAPSHOT_GUEST_CODE_OFFSET,
-                PageAccess::Read,
-                "instruction-first code page",
-            ),
-            (
-                SNAPSHOT_GUEST_READ_OFFSET,
-                PageAccess::Read,
-                "read-first guest page",
-            ),
-            (
-                SNAPSHOT_GUEST_WRITE_OFFSET,
-                PageAccess::Write,
-                "write-first guest page",
-            ),
-        ] {
-            assert!(
-                snapshot_pager_observed(&pager_report, offset, access),
-                "contained restored guest should demand {context} at {offset:#x}: {pager_report:?}"
-            );
-        }
-    }
     assert_eq!(session_entries(), baseline_sessions);
 
     let resumed_fixture = SnapshotInputGrantFixture::new("automatic", next_artifacts);
@@ -6426,7 +6350,6 @@ fn run_graceful_signal_case(signal: i32, name: &str) {
 struct SnapshotArtifactSet {
     state: PathBuf,
     memory: PathBuf,
-    root: PathBuf,
 }
 
 #[derive(Debug)]
@@ -6434,12 +6357,10 @@ struct SnapshotSourceGrantFixture {
     _root: TestDir,
     manifest: PathBuf,
     kernel: PathBuf,
-    root: PathBuf,
     metrics: PathBuf,
     state_directory: PathBuf,
     memory_directory: PathBuf,
     opened_kernel: PathBuf,
-    opened_root: PathBuf,
     opened_metrics: PathBuf,
     opened_state_directory: PathBuf,
     opened_memory_directory: PathBuf,
@@ -6452,19 +6373,16 @@ impl SnapshotSourceGrantFixture {
             fs::canonicalize(root.path()).expect("snapshot source root should canonicalize");
         let manifest = canonical_root.join("grant-manifest.json");
         let kernel = canonical_root.join("snapshot-kernel.image");
-        let root_backing = canonical_root.join("snapshot-root.img");
         let metrics = canonical_root.join("snapshot.metrics");
         let state_directory = canonical_root.join("state-output");
         let memory_directory = canonical_root.join("memory-output");
         let opened_kernel = canonical_root.join("opened-snapshot-kernel.image");
-        let opened_root = canonical_root.join("opened-snapshot-root.img");
         let opened_metrics = canonical_root.join("opened-snapshot.metrics");
         let opened_state_directory = canonical_root.join("opened-state-output");
         let opened_memory_directory = canonical_root.join("opened-memory-output");
 
         fs::write(&kernel, snapshot_continuity_guest_image())
             .expect("snapshot guest image should write");
-        create_sized_file(&root_backing, 512);
         fs::write(&metrics, b"").expect("snapshot metrics fixture should write");
         fs::create_dir(&state_directory).expect("state output directory should create");
         fs::create_dir(&memory_directory).expect("memory output directory should create");
@@ -6476,12 +6394,6 @@ impl SnapshotSourceGrantFixture {
                     "role": "kernel-image",
                     "access": "read-only",
                     "source": path_text(&kernel),
-                },
-                {
-                    "id": SNAPSHOT_ROOT_ID,
-                    "role": "drive-backing",
-                    "access": "read-only",
-                    "source": path_text(&root_backing),
                 },
                 {
                     "id": SNAPSHOT_METRICS_ID,
@@ -6513,12 +6425,10 @@ impl SnapshotSourceGrantFixture {
             _root: root,
             manifest,
             kernel,
-            root: root_backing,
             metrics,
             state_directory,
             memory_directory,
             opened_kernel,
-            opened_root,
             opened_metrics,
             opened_state_directory,
             opened_memory_directory,
@@ -6528,14 +6438,12 @@ impl SnapshotSourceGrantFixture {
     fn replace_source_file_pathnames(&self) {
         for (source, opened) in [
             (&self.kernel, &self.opened_kernel),
-            (&self.root, &self.opened_root),
             (&self.metrics, &self.opened_metrics),
         ] {
             fs::rename(source, opened).expect("launcher-opened snapshot file should move");
         }
         fs::write(&self.kernel, b"replacement kernel must not boot")
             .expect("replacement snapshot kernel should write");
-        create_sized_file(&self.root, 512);
         fs::write(&self.metrics, b"replacement metrics must remain unused\n")
             .expect("replacement metrics should write");
     }
@@ -6556,7 +6464,6 @@ impl SnapshotSourceGrantFixture {
         SnapshotArtifactSet {
             state: self.state_directory.join(state_child),
             memory: self.memory_directory.join(memory_child),
-            root: self.opened_root.clone(),
         }
     }
 
@@ -6564,22 +6471,18 @@ impl SnapshotSourceGrantFixture {
         [
             path_text(&self.manifest),
             path_text(&self.kernel),
-            path_text(&self.root),
             path_text(&self.metrics),
             path_text(&self.state_directory),
             path_text(&self.memory_directory),
             path_text(&self.opened_kernel),
-            path_text(&self.opened_root),
             path_text(&self.opened_metrics),
             path_text(&self.opened_state_directory),
             path_text(&self.opened_memory_directory),
             SNAPSHOT_KERNEL_ID,
-            SNAPSHOT_ROOT_ID,
             SNAPSHOT_METRICS_ID,
             SNAPSHOT_STATE_OUTPUT_ID,
             SNAPSHOT_MEMORY_OUTPUT_ID,
             SNAPSHOT_KERNEL_REF,
-            SNAPSHOT_ROOT_REF,
             SNAPSHOT_METRICS_REF,
             SNAPSHOT_STATE_OUTPUT_REF,
             SNAPSHOT_MEMORY_OUTPUT_REF,
@@ -6602,24 +6505,10 @@ struct SnapshotInputGrantFixture {
     manifest: PathBuf,
     sources: SnapshotArtifactSet,
     opened: SnapshotArtifactSet,
-    pager: Option<PathBuf>,
 }
 
 impl SnapshotInputGrantFixture {
     fn new(case: &str, sources: SnapshotArtifactSet) -> Self {
-        Self::new_with_optional_pager(case, sources, None)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn new_with_pager(case: &str, sources: SnapshotArtifactSet, pager: &Path) -> Self {
-        Self::new_with_optional_pager(case, sources, Some(pager))
-    }
-
-    fn new_with_optional_pager(
-        case: &str,
-        sources: SnapshotArtifactSet,
-        pager: Option<&Path>,
-    ) -> Self {
         let root = TestDir::new(&format!("snapshot-input-{case}"));
         let manifest = fs::canonicalize(root.path())
             .expect("snapshot input root should canonicalize")
@@ -6627,9 +6516,8 @@ impl SnapshotInputGrantFixture {
         let opened = SnapshotArtifactSet {
             state: replacement_opened_path(&sources.state, case),
             memory: replacement_opened_path(&sources.memory, case),
-            root: sources.root.clone(),
         };
-        let mut grants = vec![
+        let grants = vec![
             serde_json::json!({
                 "id": SNAPSHOT_STATE_INPUT_ID,
                 "role": "snapshot-state-input",
@@ -6637,29 +6525,12 @@ impl SnapshotInputGrantFixture {
                 "source": path_text(&sources.state),
             }),
             serde_json::json!({
-                "id": SNAPSHOT_ROOT_ID,
-                "role": "drive-backing",
+                "id": SNAPSHOT_MEMORY_INPUT_ID,
+                "role": "snapshot-memory-input",
                 "access": "read-only",
-                "source": path_text(&sources.root),
+                "source": path_text(&sources.memory),
             }),
         ];
-        match pager {
-            Some(pager) => grants.push(serde_json::json!({
-                "id": PAGER_GRANT_ID,
-                "role": "snapshot-pager-stream",
-                "access": "read-write",
-                "source": path_text(pager),
-            })),
-            None => grants.insert(
-                1,
-                serde_json::json!({
-                    "id": SNAPSHOT_MEMORY_INPUT_ID,
-                    "role": "snapshot-memory-input",
-                    "access": "read-only",
-                    "source": path_text(&sources.memory),
-                }),
-            ),
-        }
         let manifest_json = serde_json::json!({
             "version": 1,
             "grants": grants,
@@ -6674,7 +6545,6 @@ impl SnapshotInputGrantFixture {
             manifest,
             sources,
             opened,
-            pager: pager.map(Path::to_path_buf),
         }
     }
 
@@ -6693,32 +6563,20 @@ impl SnapshotInputGrantFixture {
     }
 
     fn sensitive_strings(&self) -> Vec<String> {
-        let mut sensitive = [
+        [
             path_text(&self.manifest),
             path_text(&self.sources.state),
             path_text(&self.sources.memory),
-            path_text(&self.sources.root),
             path_text(&self.opened.state),
             path_text(&self.opened.memory),
-            path_text(&self.opened.root),
             SNAPSHOT_STATE_INPUT_ID,
             SNAPSHOT_MEMORY_INPUT_ID,
-            SNAPSHOT_ROOT_ID,
             SNAPSHOT_STATE_INPUT_REF,
             SNAPSHOT_MEMORY_INPUT_REF,
-            SNAPSHOT_ROOT_REF,
         ]
         .into_iter()
         .map(str::to_owned)
-        .collect::<Vec<_>>();
-        if let Some(pager) = &self.pager {
-            sensitive.extend([
-                path_text(pager).to_owned(),
-                PAGER_GRANT_ID.to_owned(),
-                PAGER_GRANT_REF.to_owned(),
-            ]);
-        }
-        sensitive
+        .collect()
     }
 }
 
@@ -9083,16 +8941,6 @@ fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_pat
             serde_json::json!({"kernel_image_path": SNAPSHOT_KERNEL_REF}),
             "PUT snapshot boot source",
         ),
-        (
-            "/drives/root",
-            serde_json::json!({
-                "drive_id": "root",
-                "path_on_host": SNAPSHOT_ROOT_REF,
-                "is_root_device": true,
-                "is_read_only": true,
-            }),
-            "PUT snapshot root drive",
-        ),
     ] {
         assert_http_status(
             &http_put(
@@ -9186,20 +9034,6 @@ fn snapshot_load_body(resume_vm: bool) -> String {
         "resume_vm": resume_vm,
     }))
     .expect("snapshot load body should serialize")
-}
-
-#[cfg(target_os = "macos")]
-fn snapshot_uffd_load_body(resume_vm: bool) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "snapshot_path": SNAPSHOT_STATE_INPUT_REF,
-        "mem_backend": {
-            "backend_path": PAGER_GRANT_REF,
-            "backend_type": "Uffd",
-        },
-        "track_dirty_pages": false,
-        "resume_vm": resume_vm,
-    }))
-    .expect("snapshot Uffd load body should serialize")
 }
 
 fn assert_no_snapshot_staging(directory: &Path) {
@@ -10577,13 +10411,6 @@ fn copy_tree(source: &Path, destination: &Path) {
 
 fn path_text(path: &Path) -> &str {
     path.to_str().expect("test path should be UTF-8")
-}
-
-#[cfg(target_os = "macos")]
-fn snapshot_pager_observed(report: &SnapshotPagerReport, offset: u64, access: PageAccess) -> bool {
-    report.requests.iter().any(|request| {
-        request.region.get() == 1 && request.offset == offset && request.access == access
-    })
 }
 
 fn snapshot_continuity_guest_image() -> Vec<u8> {

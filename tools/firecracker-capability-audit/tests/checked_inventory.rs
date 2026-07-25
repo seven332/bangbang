@@ -197,15 +197,14 @@ fn snapshot_paging_terminal_policy_is_stable() {
         "file_offset - 48",
         "native_v1_uffd_dirty_tracking_rejects_before_artifact_or_starter_access",
         "native_v1_uffd_rejects_reserved_pager_reference_without_authority_before_state_open",
-        "normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore",
+        "scripts/run-integration-tests.sh --test production_bundle -- signed_pager_grant_",
         "BBPAGER\\0",
         "cargo test -p bangbang-pager",
         "classify_v1_load_request",
         "native_v1_load_policy_rejects_each_unsupported_dimension",
         "returns_fault_for_snapshot_endpoint",
-        "signed_executable_creates_and_restores_native_v1_snapshot_across_processes",
+        "signed_native_v1_public_dispatch_restores_frozen_file_pair",
         "https://github.com/seven332/bangbang/issues/1555",
-        "SnapshotPagerTermination::Active",
         "task_local_lazy_fault_bridge_removal_generations_refault_zero_before_and_during_population",
         "production_bundle_has_exact_nested_signing_contract",
         "229 `implemented-and-verified`",
@@ -546,8 +545,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 229);
-    assert_eq!(count(Disposition::AuditRequired), 169);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 233);
+    assert_eq!(count(Disposition::AuditRequired), 165);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -771,8 +770,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 229);
-    assert_eq!(count(Disposition::AuditRequired), 169);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 233);
+    assert_eq!(count(Disposition::AuditRequired), 165);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -983,8 +982,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 229);
-    assert_eq!(count(Disposition::AuditRequired), 169);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 233);
+    assert_eq!(count(Disposition::AuditRequired), 165);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -1253,8 +1252,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 229);
-    assert_eq!(count(Disposition::AuditRequired), 169);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 233);
+    assert_eq!(count(Disposition::AuditRequired), 165);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 

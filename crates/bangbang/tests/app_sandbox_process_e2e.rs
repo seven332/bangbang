@@ -91,6 +91,24 @@ fn sandboxed_bundle_prints_help() {
 }
 
 #[test]
+fn sandboxed_bundle_reports_current_native_v2_snapshot_version() {
+    let output = BangbangProcess::run_with_args_expect_exit(
+        &[OsStr::new("--snapshot-version")],
+        "sandboxed native snapshot version",
+    );
+
+    assert!(
+        output.status.success(),
+        "sandboxed snapshot version should succeed; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(output.stdout.trim(), "v2.3.0");
+    assert_eq!(output.stderr, "");
+}
+
+#[test]
 fn sandbox_denies_default_tmp_api_socket_without_leaking_path() {
     let output = BangbangProcess::run_with_args_expect_exit(&[], "default API socket denial");
     let stdout = output.stdout;

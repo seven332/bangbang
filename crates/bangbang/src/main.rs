@@ -57,8 +57,11 @@ use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics, SharedSignalMetrics};
 use bangbang_runtime::mmds::MmdsContentInput;
 use bangbang_runtime::snapshot_format::{
-    NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES, NATIVE_V1_SNAPSHOT_VERSION, SnapshotEnvelopeMetadata,
-    SnapshotFormatError, inspect_snapshot_envelope,
+    NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES, NativeSnapshotFormatError, SnapshotFormatVersion,
+    decode_native_snapshot_state,
+};
+use bangbang_runtime::snapshot_format_v2::{
+    NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES, NATIVE_V2_SNAPSHOT_VERSION,
 };
 use bangbang_runtime::{VmmAction, VmmActionError};
 use bangbang_session::ResourceRole;
@@ -68,6 +71,12 @@ const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
 const APP_NAME: &str = "bangbang";
 const CONFIG_FILE_MAX_BYTES: usize = 1024 * 1024;
 const METADATA_FILE_MAX_BYTES: usize = CONFIG_FILE_MAX_BYTES;
+const NATIVE_SNAPSHOT_MAX_FILE_BYTES: usize =
+    if NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES > NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES {
+        NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES
+    } else {
+        NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES
+    };
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const FIRECRACKER_DEFAULT_NOFILE_LIMIT: RawFd = 2048;
@@ -147,16 +156,16 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
             Ok(())
         }
         Command::SnapshotVersion => {
-            println!("v{NATIVE_V1_SNAPSHOT_VERSION}");
+            println!("v{NATIVE_V2_SNAPSHOT_VERSION}");
             Ok(())
         }
         Command::DescribeSnapshot(path) => {
             let grant_authority = contained
                 .as_ref()
                 .and_then(ContainedSession::grant_authority);
-            let metadata =
+            let version =
                 describe_snapshot_with_authority(path.as_str(), grant_authority.as_ref())?;
-            println!("v{}", metadata.version());
+            println!("v{version}");
             Ok(())
         }
         Command::Run(config) => {
@@ -1009,14 +1018,14 @@ fn metadata_content_input_with_authority(
 }
 
 #[cfg(test)]
-fn describe_snapshot(path: &str) -> Result<SnapshotEnvelopeMetadata, ProcessError> {
+fn describe_snapshot(path: &str) -> Result<SnapshotFormatVersion, ProcessError> {
     describe_snapshot_with_authority(path, None)
 }
 
 fn describe_snapshot_with_authority(
     path: &str,
     grant_authority: Option<&GrantAuthority>,
-) -> Result<SnapshotEnvelopeMetadata, ProcessError> {
+) -> Result<SnapshotFormatVersion, ProcessError> {
     let file = grant_authority
         .map(|authority| {
             authority.claim_read_only_file(
@@ -1028,8 +1037,8 @@ fn describe_snapshot_with_authority(
         .map_err(|_| ProcessError::SnapshotInspection(SnapshotInspectionError::Grant))?
         .flatten();
     let contents = match file {
-        Some(file) => read_limited_regular_open_file(file, NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES),
-        None => read_limited_regular_file(path, NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES),
+        Some(file) => read_limited_regular_open_file(file, NATIVE_SNAPSHOT_MAX_FILE_BYTES),
+        None => read_limited_regular_file(path, NATIVE_SNAPSHOT_MAX_FILE_BYTES),
     }
     .map_err(|err| match err {
         StartupFileReadError::Read(kind) => SnapshotInspectionError::Read(kind),
@@ -1039,7 +1048,8 @@ fn describe_snapshot_with_authority(
     })
     .map_err(ProcessError::SnapshotInspection)?;
 
-    inspect_snapshot_envelope(&contents)
+    decode_native_snapshot_state(&contents)
+        .map(|state| state.version())
         .map_err(SnapshotInspectionError::Format)
         .map_err(ProcessError::SnapshotInspection)
 }
@@ -1336,7 +1346,7 @@ enum SnapshotInspectionError {
     NotRegular,
     TooLarge,
     Grant,
-    Format(SnapshotFormatError),
+    Format(NativeSnapshotFormatError),
 }
 
 impl fmt::Display for SnapshotInspectionError {
@@ -1346,7 +1356,7 @@ impl fmt::Display for SnapshotInspectionError {
             Self::NotRegular => f.write_str("snapshot state file must be a regular file"),
             Self::TooLarge => write!(
                 f,
-                "snapshot state file exceeds {NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES} byte size limit"
+                "snapshot state file exceeds {NATIVE_SNAPSHOT_MAX_FILE_BYTES} byte size limit"
             ),
             Self::Grant => f.write_str("snapshot state resource grant failed"),
             Self::Format(err) => write!(f, "invalid snapshot state file: {err}"),
@@ -2380,9 +2390,9 @@ fn help_text() -> String {
             "      --show-level       Include level in minimal logger action lines\n",
             "      --show-log-origin  Include callsite origin in minimal logger action lines\n",
             "      --snapshot-version\n",
-            "                         Print the native snapshot data-format version\n",
+            "                         Print the current native snapshot writer version\n",
             "      --describe-snapshot <PATH>\n",
-            "                         Validate a native snapshot envelope and print its format version\n",
+            "                         Validate a native-v1 or native-v2 snapshot and print its format version\n",
             "      --start-time-us <MICROS>\n",
             "                         Process start wall-clock time for future metrics\n",
             "      --start-time-cpu-us <MICROS>\n",
@@ -2562,7 +2572,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::ffi::{CString, OsString};
     use std::fs;
-    use std::io::{ErrorKind, Read, Write};
+    use std::io::{Cursor, ErrorKind, Read, Write};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::{AsRawFd, RawFd};
@@ -2576,6 +2586,9 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
+    use bangbang_runtime::memory::{
+        GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
+    };
     use bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput;
     use bangbang_runtime::metrics::{
         MetricsConfigError, MetricsConfigInput, MetricsDiagnostics, MetricsFlushError,
@@ -2588,8 +2601,12 @@ mod tests {
     use bangbang_runtime::snapshot::SnapshotLoadInput;
     use bangbang_runtime::snapshot_artifact::{SnapshotArtifactPaths, SnapshotPublicationOutcome};
     use bangbang_runtime::snapshot_format::{
-        NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES, NATIVE_V1_SNAPSHOT_VERSION, SnapshotFormatError,
+        NATIVE_V1_SNAPSHOT_VERSION, NativeSnapshotFormatError, SnapshotFormatError,
         encode_snapshot_envelope,
+    };
+    use bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
+    use bangbang_runtime::snapshot_memory_v2::{
+        encode_snapshot_v2_state_with_memory, write_snapshot_v2_memory_image,
     };
     use bangbang_runtime::startup::Arm64BootResources;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
@@ -3325,11 +3342,56 @@ mod tests {
             encode_snapshot_envelope(b"opaque-state").expect("snapshot fixture should encode");
         fs::write(&snapshot_path, encoded).expect("snapshot fixture should be written");
 
-        let metadata = super::describe_snapshot(snapshot_path.to_str().expect("UTF-8 path"))
+        let version = super::describe_snapshot(snapshot_path.to_str().expect("UTF-8 path"))
             .expect("valid snapshot should inspect");
 
-        assert_eq!(metadata.version(), NATIVE_V1_SNAPSHOT_VERSION);
-        assert_eq!(metadata.payload_length(), 12);
+        assert_eq!(version, NATIVE_V1_SNAPSHOT_VERSION);
+        fs::remove_file(snapshot_path).expect("snapshot fixture should clean up");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snapshot_inspection_reports_exact_native_v2_version() {
+        let snapshot_path = unique_snapshot_path("valid-native-v2");
+        let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+            .expect("native-v2 fixture range should validate");
+        let layout =
+            GuestMemoryLayout::new(vec![range]).expect("native-v2 fixture layout should validate");
+        let memory =
+            GuestMemory::allocate(&layout).expect("native-v2 fixture memory should allocate");
+        let mut image = Cursor::new(Vec::new());
+        let binding = write_snapshot_v2_memory_image(&memory, &mut image)
+            .expect("native-v2 fixture memory should encode");
+        let encoded = encode_snapshot_v2_state_with_memory(&binding)
+            .expect("native-v2 fixture state should encode");
+        fs::write(&snapshot_path, encoded).expect("native-v2 fixture should be written");
+
+        let version = super::describe_snapshot(snapshot_path.to_str().expect("UTF-8 path"))
+            .expect("valid native-v2 snapshot should inspect");
+
+        assert_eq!(version, NATIVE_V2_SNAPSHOT_VERSION);
+        fs::remove_file(snapshot_path).expect("snapshot fixture should clean up");
+    }
+
+    #[test]
+    fn snapshot_inspection_rejects_firecracker_family_without_claiming_a_version() {
+        let snapshot_path = unique_snapshot_path("firecracker-prefix");
+        fs::write(
+            &snapshot_path,
+            [0x00, 0x00, 0x00, 0xaa, 0xaa, 0x84, 0x19, 0x10, 0x07],
+        )
+        .expect("Firecracker prefix fixture should be written");
+
+        let error = super::describe_snapshot(snapshot_path.to_str().expect("UTF-8 path"))
+            .expect_err("Firecracker bitcode must remain explicitly incompatible");
+
+        assert_eq!(
+            error,
+            ProcessError::SnapshotInspection(super::SnapshotInspectionError::Format(
+                NativeSnapshotFormatError::IncompatibleFirecrackerFormat
+            ))
+        );
+        assert!(!error.to_string().contains("firecracker-prefix"));
         fs::remove_file(snapshot_path).expect("snapshot fixture should clean up");
     }
 
@@ -3348,7 +3410,7 @@ mod tests {
         let oversized_path = unique_snapshot_path("oversized");
         let file = fs::File::create(&oversized_path).expect("snapshot fixture should be created");
         file.set_len(
-            u64::try_from(NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES)
+            u64::try_from(super::NATIVE_SNAPSHOT_MAX_FILE_BYTES)
                 .expect("snapshot file limit should fit u64")
                 + 1,
         )
@@ -3379,7 +3441,7 @@ mod tests {
         assert_eq!(
             err,
             ProcessError::SnapshotInspection(super::SnapshotInspectionError::Format(
-                SnapshotFormatError::IntegrityMismatch
+                NativeSnapshotFormatError::NativeV1(SnapshotFormatError::IntegrityMismatch)
             ))
         );
         assert!(!err.to_string().contains("private-guest-state"));
@@ -3648,8 +3710,12 @@ mod tests {
         assert!(help.contains("--show-level"));
         assert!(help.contains("--snapshot-version"));
         assert!(help.contains("--describe-snapshot <PATH>"));
-        assert!(help.contains("Print the native snapshot data-format version"));
-        assert!(help.contains("Validate a native snapshot envelope and print its format version"));
+        assert!(help.contains("Print the current native snapshot writer version"));
+        assert!(
+            help.contains(
+                "Validate a native-v1 or native-v2 snapshot and print its format version"
+            )
+        );
         assert!(help.contains("--start-time-us <MICROS>"));
         assert!(help.contains("--start-time-cpu-us <MICROS>"));
         assert!(help.contains("--parent-cpu-time-us <MICROS>"));

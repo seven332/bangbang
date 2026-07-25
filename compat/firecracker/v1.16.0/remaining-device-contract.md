@@ -95,7 +95,7 @@ proven-platform-impossible.
 - `T-SIGNED` —
   `signed_executable_exposes_rtc_to_direct_rootfs_guest`,
   `signed_executable_exposes_vmclock_to_direct_rootfs_guest`,
-  `signed_executable_creates_and_restores_native_v1_snapshot_across_processes`,
+  `signed_executable_creates_and_restores_native_v2_snapshot_across_processes`,
   `guest_boot::certifies_linux_pvtime_contention_idle_and_paused_accounting`,
   `hvf_lifecycle::native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progress`,
   and `AGG-SIGNED`.

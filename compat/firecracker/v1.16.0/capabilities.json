@@ -6519,7 +6519,7 @@
     {
       "id": "api-property:SnapshotLoadParams.track_dirty_pages",
       "family": "api-contract",
-      "summary": "Let the destination request independently select dirty tracking, install it after baseline image population and before mapping, owners, VMGenID replacement, or VMClock update, and commit that effective value to the restored controller.",
+      "summary": "Let the destination request independently select dirty tracking for native-v2 File/COW or frozen native-v1 File, install it after baseline image population and before mapping, owners, VMGenID replacement, or VMClock update, and commit that effective value to the restored controller. Native-v1 Uffd continues to require tracking disabled.",
       "source_refs": [
         "api-property:SnapshotLoadParams.track_dirty_pages"
       ],
@@ -6528,7 +6528,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/src/vmm.rs",
-          "anchor": "HvfInstanceStartExecutor::load_prepared_snapshot_v1"
+          "anchor": "HvfInstanceStartExecutor prepared native-v1 and native-v2 snapshot load"
         },
         {
           "kind": "local",
@@ -6538,7 +6538,7 @@
         {
           "kind": "local",
           "path": "crates/runtime/src/snapshot.rs",
-          "anchor": "classify_v1_load_request"
+          "anchor": "native-v1 and native-v2 load request classifiers"
         }
       ],
       "validation": [
@@ -6550,7 +6550,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
-          "anchor": "signed_executable_creates_and_restores_native_v1_snapshot_across_processes"
+          "anchor": "signed_executable_creates_and_restores_native_v2_snapshot_across_processes"
         },
         {
           "kind": "local",
@@ -9089,7 +9089,7 @@
     {
       "id": "corpus:snapshot-page-faults",
       "family": "snapshots",
-      "summary": "Public macOS APIs implement and verify the observable external demand-paging contract with a bounded offset-only bangbang-pager-v1 peer, coordinated private-anonymous memory, task-local Mach host faults, HVF stage-two guest faults, ordered generation-aware removal, first-terminal peer failure, and closed consumer gates. Native-v1 Uffd restores the narrow fixed-memory profile on macOS Apple Silicon with dirty tracking disabled: platform/profile/grant preflight precedes resource access, state-authenticated image metadata binds the pager session and layout, direct mode connects with a deadline, contained mode claims only the launcher-connected stream without worker memory-file authority, and the complete owner graph is transactional. Signed direct and production App Sandbox restores prove paused host demand followed by exact guest instruction/read/write-first pages, SYSTEM_OFF, and orderly shutdown; signed lifecycle and production cases cover multi-vCPU coalescing, removal before/during/after population, zero refault, peer failures, cancellation, death orders, repeat, exact entitlements, and cleanup. Unsupported shared/external/dirty profiles still reject before access. This is not Linux UFFD descriptor or wire compatibility.",
+      "summary": "The frozen native-v1 compatibility reader implements the observable macOS external demand-paging contract with a bounded offset-only bangbang-pager-v1 peer, coordinated private-anonymous memory, task-local Mach host faults, HVF stage-two guest faults, ordered generation-aware removal, first-terminal peer failure, and closed consumer gates. Native-v1 Uffd restores require macOS Apple Silicon and dirty tracking disabled: platform/profile/grant preflight precedes resource access, state-authenticated image metadata binds the pager session and layout, direct mode connects with a deadline, contained mode claims only the launcher-connected stream without worker memory-file authority, and the complete owner graph is transactional. Public family-routing tests preserve this exact path; signed instruction/read/write-first and before/during/after population host/guest fault cases, exact entitlements, removal, pager, App Sandbox, death-order, repeat, and cleanup cases certify its component and containment boundaries, while a signed frozen-v1 File fixture certifies current public v1 dispatch. Current native-v2 explicitly rejects Uffd before pager, memory, or HVF adoption. This is not Linux UFFD descriptor or wire compatibility.",
       "source_refs": [
         "corpus:snapshot-page-faults"
       ],
@@ -9135,7 +9135,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
-          "anchor": "signed native-v1 direct restore with paused host demand and exact guest instruction, read, and write pages"
+          "anchor": "native-v2 public Uffd rejection and terminal direct lifecycle evidence"
         },
         {
           "kind": "local",
@@ -9150,7 +9150,7 @@
         {
           "kind": "local",
           "path": "crates/launcher/tests/production_bundle_e2e.rs",
-          "anchor": "signed production App Sandbox restore, exact entitlement dictionaries, peer failure, death-order, repeat, and cleanup evidence"
+          "anchor": "signed production App Sandbox pager protocol, exact entitlement dictionaries, peer failure, death-order, repeat, and cleanup evidence"
         }
       ]
     },
@@ -9175,7 +9175,7 @@
     {
       "id": "corpus:snapshot-versioning",
       "family": "snapshots",
-      "summary": "Audit all applicable capability claims owned by the pinned snapshot-versioning source corpus.",
+      "summary": "Native-v2 provides bounded compatible-minor decoding, a current 2.3.0 public writer, exact CLI version/description output, immutable repeated File/COW loads, and explicit Firecracker incompatibility. Continue auditing editor/rebase tooling, general device-schema evolution, Firecracker artifact interoperability, and broad portability owned by the pinned snapshot-versioning corpus.",
       "source_refs": [
         "corpus:snapshot-versioning"
       ],
@@ -9290,7 +9290,7 @@
     {
       "id": "firecracker-argument:describe-snapshot",
       "family": "process",
-      "summary": "Provide bounded early --describe-snapshot inspection for the supported bangbang-native v1 envelope, with explicit Firecracker-artifact incompatibility.",
+      "summary": "Provide bounded early --describe-snapshot inspection that classifies and fully validates bangbang-native v1 or v2, reports the exact embedded version, and explicitly rejects pinned Firecracker or unknown artifacts without relabeling.",
       "source_refs": [
         "firecracker-argument:describe-snapshot"
       ],
@@ -9311,7 +9311,7 @@
         {
           "kind": "local",
           "path": "crates/launcher/tests/production_bundle_e2e.rs",
-          "anchor": "normal_bundle_adopts_snapshot_grants_for_create_describe_and_restore"
+          "anchor": "normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restore"
         }
       ]
     },
@@ -9809,11 +9809,30 @@
     {
       "id": "firecracker-argument:snapshot-version",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 executable argument --snapshot-version.",
+      "summary": "Report the current bangbang-native public writer version v2.3.0 through the early --snapshot-version command without claiming Firecracker v10 artifact compatibility.",
       "source_refs": [
         "firecracker-argument:snapshot-version"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "run snapshot_version early command"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/app_sandbox_process_e2e.rs",
+          "anchor": "sandboxed_bundle_reports_current_native_v2_snapshot_version"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "executable_reports_native_snapshot_versions_before_socket_publication"
+        }
+      ]
     },
     {
       "id": "firecracker-argument:start-time-cpu-us",
@@ -10611,12 +10630,36 @@
     {
       "id": "semantic.process:instance-identity-and-version-output",
       "family": "process",
-      "summary": "Audit instance identity validation plus help, version, snapshot-version, and snapshot-description output semantics.",
+      "summary": "Provide bounded Unicode instance identity plus complete help, product version, current native snapshot version, and exact native-v1/native-v2 description output, with explicit Firecracker artifact incompatibility.",
       "source_refs": [
         "corpus:getting-started",
         "corpus:specification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "instance identity, help, version, snapshot-version, and describe-snapshot process output"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/app_sandbox_process_e2e.rs",
+          "anchor": "signed App Sandbox current native-v2 version output"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "identity and early output process contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "granted exact native-v2 description output"
+        }
+      ]
     },
     {
       "id": "semantic.process:signals-exits-fd-and-cleanup",
@@ -10650,7 +10693,7 @@
     {
       "id": "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
       "family": "snapshots",
-      "summary": "Full/File snapshot load can activate a complete destination dirty epoch and Full commit resets an active source epoch. The narrow macOS Apple-Silicon native-v1 Uffd pager path is implemented only with dirty tracking disabled; Diff serialization/merge/restore, broader external-paging profiles, and final aggregate certification remain for Wave 6.",
+      "summary": "Current native-v2 Full/File uses retained read-only private COW memory, can activate a complete destination dirty epoch, and resets an active source epoch only after visible Full commit. Frozen native-v1 keeps eager File and the macOS Apple-Silicon Uffd compatibility path with dirty tracking disabled. Native-v2 Uffd, Diff serialization/merge/restore, broader external-paging profiles, and final aggregate certification remain for Wave 6.",
       "source_refs": [
         "corpus:snapshot-page-faults",
         "corpus:snapshot-support"
@@ -10669,17 +10712,46 @@
     {
       "id": "semantic.snapshot:full-create-load-and-public-lifecycle",
       "family": "snapshots",
-      "summary": "Audit Full snapshot create/load admission, quiescence, publication, validation, cleanup, resume, and guest continuation.",
+      "summary": "Implement and verify the minimal bangbang-native v2.3 Full/File public lifecycle: paused 1–32-vCPU canonical-default-serial creation, no-clobber paired publication, one-open family load, retained private File/COW memory, Paused commit, optional resume, immutable repeated destinations, terminal postcommit failure, direct/contained authority, cleanup, redaction, and frozen native-v1 reading.",
       "source_refs": [
         "corpus:snapshot-support",
         "corpus:snapshot-versioning"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "ProcessVmm public native-v2 create and prepared-family load dispatcher"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_artifact.rs",
+          "anchor": "closed native-v1/native-v2 prepared artifact ownership"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "signed_native_v1_public_dispatch_restores_frozen_file_pair"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_creates_and_restores_native_v2_snapshot_across_processes"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restore"
+        }
+      ]
     },
     {
       "id": "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
       "family": "snapshots",
-      "summary": "A complete internal live-owner handoff now captures startup/runtime MMIO/PCI regular and Async block plus pmem state, while vhost-user returns a typed pre-artifact unsupported result. Native-v1 serialization and restore remain unchanged. Continue auditing snapshot state and restore for multiple vCPUs, writable/multiple drives, optional devices, MMDS, interrupts, timers, and serial.",
+      "summary": "The current native-v2 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, and applied CPU evidence. It deliberately admits no drives, optional devices, MMDS, PCI, boot timer, or mutated/general serial state. Complete live-owner handoffs exist for many devices, but their encoding, placement, restore, resources, and guest outcomes remain under audit.",
       "source_refs": [
         "corpus:snapshot-support"
       ],
@@ -10688,7 +10760,7 @@
     {
       "id": "semantic.snapshot:network-vsock-overrides-portability-and-clones",
       "family": "snapshots",
-      "summary": "Network and vsock capture producers plus pre-access override/resource preparation exist, but Wave 6 https://github.com/seven332/bangbang/issues/1490 owns aggregate encoding and placement, public cross-process restore invocation, restored connectivity and acknowledgement, override behavior, clone identity/time rules, versioning, and artifact/host portability.",
+      "summary": "The public native-v2 minimal profile implements clone time/identity rules, compatible native version dispatch, and repeated isolated File/COW destinations. Network and vsock capture producers plus pre-access override/resource preparation exist, but Wave 6 https://github.com/seven332/bangbang/issues/1490 still owns their encoding/placement, public load invocation, restored connectivity and acknowledgement, override behavior, editing/version evolution, and broader artifact/host portability.",
       "source_refs": [
         "corpus:snapshot-network-clones",
         "corpus:snapshot-random-clones",
@@ -10787,7 +10859,7 @@
     {
       "id": "semantic.transport:pci-msi-and-coexistence",
       "family": "device-transport",
-      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and native-v1 create completes its live-storage handoff before rejecting PCI ahead of native-state capture and artifact mutation rather than omitting transport state; load retains its pre-VM-mutation rejection.",
+      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and current native-v2 create completes its live-storage handoff before rejecting PCI ahead of native-state capture and artifact mutation rather than omitting transport state; load retains its pre-VM-mutation rejection.",
       "source_refs": [
         "corpus:device-api",
         "corpus:device-hotplug"
@@ -11971,11 +12043,35 @@
     {
       "id": "tool-operation:firecracker/run",
       "family": "process",
-      "summary": "Audit the Firecracker v1.16 public tool operation firecracker/run.",
+      "summary": "Provide the complete checked bangbang process operation corresponding to Firecracker run: 21 implemented argument leaves, two terminal macOS seccomp exclusions, deterministic parsing/early output, readiness/socket ownership, process lifecycle, cleanup, PCI selection, and native snapshot version/description behavior.",
       "source_refs": [
         "tool-operation:firecracker/run"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "Args::parse and run process operation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/process-contract.md",
+          "anchor": "checked complete argument and composite process contract"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "complete process operation validation"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "signed production process and containment validation"
+        }
+      ]
     },
     {
       "id": "tool-operation:jailer/run",

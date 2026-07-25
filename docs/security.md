@@ -279,16 +279,18 @@ requires read-only and close-on-exec access, revalidates the same facts, and
 retains private File/COW mappings. None of these inert handoffs authorizes a VM,
 host endpoint, public API action, or production session.
 
-Native-v1 publication holds paused-worker admission, block/PMEM/network/entropy
-retry quiescence, and all four runner operation domains through non-memory
-encoding, complete memory streaming, artifact verification and synchronization,
-exclusive memory-first/state-last commit, and the successful-publication hook.
-Cancellation is checked between fixed stages and 1 MiB chunks and competes with
-one atomic commit seal. Before the seal it returns no binding or bundle,
-publishes no final state marker, and drops the consumed writer and auxiliary
-guard before admission release. After the seal, signal-triggered shutdown stays
-pending while publication finishes and retains its exact typed visibility and
-cleanup result.
+Native-family publication holds paused-worker admission,
+block/PMEM/network/entropy retry quiescence, and every required runner operation
+domain through non-memory encoding, complete memory streaming, artifact
+verification and synchronization, exclusive memory-first/state-last commit,
+and the successful-publication hook. The current public writer is native-v2
+2.3; the native-v1 publisher remains only as a frozen compatibility/fixture
+implementation. Cancellation is checked between fixed stages and 1 MiB chunks
+and competes with one atomic commit seal. Before the seal it returns no binding
+or bundle, publishes no final state marker, and drops the consumed writer and
+auxiliary guard before admission release. After the seal, signal-triggered
+shutdown stays pending while publication finishes and retains its exact typed
+visibility and cleanup result.
 
 Rust cannot forcibly preempt an arbitrary blocking `write`; the public request
 path therefore supplies only a publisher-owned regular staging file, never an
@@ -298,10 +300,11 @@ interpreted as committed state. Signal handlers only update lock-free atomics
 and the existing wakeup pipe; they do not allocate, lock, perform artifact I/O,
 or run cleanup in signal context.
 
-PL031 RTC is represented by fixed MMIO metadata and an explicit fresh-device
-policy. No mutable RTC register or alarm state is persisted, so no continuity
-claim is permitted. Active SVE/SME or breakpoint/watchpoint state is rejected
-rather than silently omitted, and optional devices remain outside the accepted
+Native-v2 represents PL031 through fixed MMIO metadata and an explicit
+destination-`SystemTime` fresh-device policy; no mutable alarm state is
+persisted. It also carries bounded PVTime and VMGenID/VMClock clone policies.
+Active unsupported SVE/SME or breakpoint/watchpoint state is rejected rather
+than silently omitted, and optional devices remain outside the accepted
 profile.
 
 The #1481 aggregate preflight traverses balloon, memory-hotplug, entropy,
@@ -313,14 +316,15 @@ do not authorize host endpoints, encode optional devices, or establish restore,
 clone, migration, or cross-host portability. Those responsibilities remain
 with Wave 6 #1490.
 
-The internal native-v1 device profile is untrusted input even when its outer
+The frozen native-v1 device profile is untrusted input even when its outer
 state file passed length and CRC checks; CRC detects accidental corruption and
 is not authentication. The standalone `BANGDEV\0` decoder caps the complete
 value at 16 KiB, bounds every string before allocation, requires exact schema
 and EOF, and keeps paths, IDs, stat identity, guest addresses, features,
 cursors, limiter values, and VMGenID bytes out of diagnostics.
 
-The supported root disk remains an operator-managed external resource. Capture
+For frozen native-v1 loads, the supported root disk remains an operator-managed
+external resource. Capture
 and load open the final path read-only with nonblocking, close-on-exec, and
 no-follow flags, require a regular file, derive identity from the opened
 descriptor, and compare device/inode, length, mode, mtime, and ctime. Load
@@ -338,7 +342,7 @@ as live handles; the supported serial policy creates a new empty buffer and
 metrics owner. Source VMGenID bytes are not encoded as reusable identity and
 must be replaced and signaled through the separate never-run restore stage.
 
-The native-v1 loader completes bundle, platform, memory, cache, root,
+The native-v1 compatibility loader completes bundle, platform, memory, cache, root,
 and baseline-device validation before creating an HVF VM. Runtime installation
 consumes the validated block and UART owners, creates a fresh RTC, and leaves
 the loaded guest bytes untouched; it does not reload a kernel, rewrite an FDT,
@@ -356,13 +360,24 @@ complete, while uncertain cleanup latches the private process load path as
 terminal. Errors expose stages and categories, not paths, register values,
 opaque bytes, identities, or guest contents.
 
+For native-v2, state family classification, retained File/COW memory binding,
+the exact FDT/default-UART shell, cache/platform state, topology, and every
+time/identity guest destination validate before HVF construction. The memory
+descriptor must remain read-only and close-on-exec; guest mappings are private,
+so destination writes do not mutate the pair. Recorded kernel/initrd paths are
+inert metadata and are never reopened. The focused restorer creates no drive or
+optional-device owner and installs fresh destination serial output without
+stdin authority.
+
 The restored session is handed to a worker whose pause gate is closed before it
 can receive the session. Controller and process ownership commit only after
 that handoff, always as `Paused`. Public `PUT /snapshot/load` reaches this
 transaction only after pristine-request and committed-pair validation;
-`resume_vm: true` then uses the ordinary resume path. Public create likewise
-uses the production publisher/capture transaction only after paused-profile and
-namespace preflight.
+`resume_vm: true` then uses the ordinary resume path. The public family
+dispatcher opens/decodes state once, routes native-v1 or native-v2 without
+fallback, and explicitly rejects pinned Firecracker and unknown formats. Public
+create likewise uses the native-v2 production publisher/capture transaction
+only after paused-profile and namespace preflight.
 
 ## macOS Isolation Design Boundaries
 
@@ -1197,7 +1212,7 @@ is resource-specific:
   interface IDs, host device names, and vsock paths even through enclosing
   request/action enums; action names, errors, logs, and metrics remain
   value-free. Unsupported request dimensions fail before storage work. Before
-  applying native-v1 profile exclusions, an admitted paused create traverses
+  applying native-v2 profile exclusions, an admitted paused create traverses
   every configured startup/runtime block and pmem owner across MMIO/PCI. It
   rejects live vhost-user first; otherwise it closes and drains every Async
   generation, publishes all completions, delivers their MMIO SPI or PCI MSI-X
@@ -1226,10 +1241,11 @@ is resource-specific:
   paths and restored guest/vCPU/device state as
   untrusted, preserve redaction, and prevent one process from cleaning up or
   overwriting another process's resources. In contained mode, state
-  preinspection is non-consuming and the eventual state/memory/persisted-root
-  claim is atomic; create uses only exact retained output anchors and validated
-  children. Direct mode retains ordinary path adapters. The current boundary is
-  documented in [Snapshot Feasibility](snapshot-feasibility.md).
+  preinspection is non-consuming and the eventual native-v2 state/memory claim
+  is atomic; frozen native-v1 additionally adopts any persisted-root grant.
+  Create uses only exact retained output anchors and validated children. Direct
+  mode retains ordinary path adapters. The current boundary is documented in
+  [Snapshot Feasibility](snapshot-feasibility.md).
 - Native snapshot inspection treats the entire state file as untrusted binary
   input. The process opens it nonblocking, accepts only a regular file, caps the
   complete read at 16 MiB plus the 40-byte envelope overhead, and rechecks the
@@ -1243,9 +1259,8 @@ is resource-specific:
   it is not authentication, and a party that can rewrite the file can recompute
   it. Future payload schemas must therefore stay memory-safe and fail closed
   even for checksum-valid attacker-controlled bytes.
-- Native-v2 state is currently a library-only data format with no public
-  lifecycle. Its
-  first pass treats all bytes as hostile, caps the complete file at 16 MiB,
+- Native-v2 state is the current public writer and Full/File lifecycle format.
+  Its first pass treats all bytes as hostile, caps the complete file at 16 MiB,
   caps feature and component counts before table traversal, uses checked
   conversions and arithmetic, requires canonical packed ranges and exact EOF,
   and validates the whole-state CRC before publishing a borrowed view. The pass
@@ -1314,9 +1329,10 @@ is resource-specific:
   diagnostics. The random image ID and CRC detect mismatched or accidentally
   corrupt pairs but do not authenticate an actor able to rewrite both files.
   The handle-level codec itself opens no path. The internal artifact layer can
-  compose it with either memory-only or composite commit kind. The private
-  process create seam composes complete capture with final publication, and the
-  admitted public snapshot paths invoke the production create/load transactions.
+  compose it with either memory-only or composite commit kind. The public
+  native-v2 process producer composes complete capture with final publication,
+  and admitted public snapshot paths invoke the production create/load
+  transactions.
   Contained load supplies the exact state/memory handles after one atomic claim;
   state decode is reused rather than rereading a selector.
 - Internal native snapshot publication treats both final paths and all existing
@@ -1684,8 +1700,9 @@ is resource-specific:
   ordered nontransactional write sequence. A failed apply may have changed the
   never-run destination; callers must retry the complete value with a fresh
   sample or discard it. Individual command admission is not a cross-step
-  restore lease. Public snapshot create/load use the aggregate native-v1
-  capture/restore commands rather than these raw standalone operations.
+  restore lease. Frozen native-v1 load and current native-v2 create/load use
+  their respective aggregate capture/restore commands rather than these raw
+  standalone operations.
   The retained virtual-timer wait foundation reads the same owner-local raw
   mask/offset/control/comparator state, converts only the comparator distance
   through the host Mach timebase, and publishes the configured timer PPI only
@@ -1803,8 +1820,8 @@ is resource-specific:
   identity-cleaned; contained publication reserves the exact directory grant
   and session-bound broker endpoint, rolls them back before activation, and has
   no ambient-path fallback. A single-use process transaction keeps cleanup
-  ownership through runtime adoption. Public native-v1 records still omit
-  vsock encoding and placement and public load rejects overrides. The checked
+  ownership through runtime adoption. Current public native-v2 records still
+  omit vsock encoding and placement and public load rejects overrides. The checked
   vsock ledger certifies the eight API/live records; the six aggregate
   encoding, invocation, restored-guest, clone/version, and portability outcomes
   remain #1490 work. The internal producer is not a public
@@ -1951,8 +1968,8 @@ PCI manager's manual rescan/removal lifecycle and capacity reuse; pmem adds
 exact direct-mapping/range reuse, while network adds packet-I/O/metrics teardown and
 real MMDS exchange without vmnet authority. This evidence does not prove
 interrupt remapping, external vmnet connectivity, or Firecracker's KVM ITS
-behavior. MSI-bearing GIC metadata is rejected by the native-v1 snapshot
-profile rather than silently omitted.
+behavior. MSI-bearing GIC metadata is rejected by the current native-v2
+snapshot profile rather than silently omitted.
 
 ## PCI Ownership Boundary
 
@@ -2005,9 +2022,10 @@ and opens no vmnet resource or extra host authority.
 The hidden selectors and redacted diagnostic views grant no arbitrary host
 resource authority. Public PCI supports the documented block, pmem, and network
 runtime transactions, but guest rescan/removal remains an explicit operator
-step and there is no automatic notification. Native-v1 create first captures
-the complete live storage handoff, then rejects the immutable PCI profile before
-native-state capture or artifact work. Load retains its pre-file/grant/
+step and there is no automatic notification. Current native-v2 create first
+captures the complete live storage handoff, then rejects the immutable PCI
+profile before native-state capture or artifact work. Load retains its
+pre-file/grant/
 controller/VM-mutation rejection. Neither path persists or silently drops PCI
 state.
 
@@ -2666,7 +2684,8 @@ The current scaffold does not implement:
 - general-purpose host resource brokering beyond the fixed granted-vsock
   port-only and contained vhost-user exact-child connection facets
 - broader snapshot profiles or Firecracker artifact compatibility beyond the
-  exact contained native-v1 describe/create/load resource boundary
+  exact contained native-v2 Full/File state-memory boundary and frozen
+  native-v1 reader
 - full containment for network, guest-visible MMDS, or vsock beyond the exact
   granted Unix-socket subset; the
   current network interface configuration path validates and stores
@@ -2775,7 +2794,7 @@ The current scaffold does not implement:
   optional override selectors before resource access, uses owner-only
   stale-safe direct publication or exact transactional contained authority,
   and transfers cleanup ownership through one single-use runtime adoption.
-  The checked ledger certifies all eight API/live records. Public native-v1
+  The checked ledger certifies all eight API/live records. Public native-v2
   encoding/placement and invocation, restored-guest acknowledgement/reconnect/
   override proof, clone/versioning, and portability remain #1490 work.
 - log rotation, syslog, journald, tracing, remote telemetry, or process-global
