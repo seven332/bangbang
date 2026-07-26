@@ -57,6 +57,16 @@ const GRANT_DELAY_OPTION: &str = "--bangbang-internal-grant-delay-v1";
 const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
 const GRANT_PROBE_MARKER: &str = "grant-integration-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
+const RESTORE_ROOT_ID: &str = "restore-root-1601";
+const RESTORE_VSOCK_ID: &str = "restore-vsock-1601";
+const RESTORE_ROOT_REF: &str = "bangbang-grant:restore-root-1601";
+const RESTORE_VSOCK_REF: &str = "bangbang-grant:restore-vsock-1601/restore-1601.sock";
+const RESTORE_SOCKET_CHILD: &str = "restore-1601.sock";
+const RESTORE_ROOT_MARKER: &[u8] = b"BANGBANG_RESTORE_TRANSACTION_ROOT_1601\n";
+const RESTORE_REPLACEMENT_MARKER: &[u8] = b"BANGBANG_RESTORE_REPLACEMENT_1601\n";
+const RESTORE_ACTIVE_READY: &str = "status: restore transaction active";
+const RESTORE_PREPARED_READY: &str = "status: restore transaction prepared";
+const RESTORE_REPLACE_READY: &str = "status: restore transaction awaiting replacement";
 const PAGER_GRANT_ID: &str = "probe-pager";
 const PAGER_GRANT_REF: &str = "bangbang-grant:probe-pager";
 const PAGER_PROBE_READY: &str = "status: pager integration probe ready";
@@ -5718,6 +5728,13 @@ fn normal_production_bundle_excludes_grant_probe_behavior() {
     assert_eq!(output.status.code(), Some(ARGUMENT_PARSING_EXIT_CODE));
     assert!(!String::from_utf8_lossy(&output.stdout).contains(GRANT_PROBE_READY));
     fixture.assert_unmodified();
+
+    let restore = RestoreTransactionGrantFixture::new("normal", RestoreGrantVariant::Exact);
+    let output = run_restore_probe(&bundle, &restore, "restore-success");
+    assert_eq!(output.status.code(), Some(ARGUMENT_PARSING_EXIT_CODE));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(RESTORE_ACTIVE_READY));
+    assert_restore_output_redacted(&output, &restore);
+    restore.assert_pristine();
 }
 
 #[test]
@@ -5728,6 +5745,248 @@ fn signed_grants_authorize_only_typed_read_write_and_directory_operations() {
     assert_output_success(&output, "signed resource grant probe");
     fixture.assert_completed();
     assert_grant_output_redacted(&output, &fixture);
+}
+
+#[test]
+fn signed_restore_transaction_covers_logical_abort_cancellation_and_commit_phases() {
+    let bundle = grant_test_bundle();
+    assert_exact_networkless_bundle_entitlements(&bundle);
+    recover_session_root(&bundle);
+
+    for (index, case) in [
+        "restore-logical-mismatch",
+        "restore-reservation-abort",
+        "restore-cancellation",
+        "restore-success",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = RestoreTransactionGrantFixture::new(
+            &format!("phase-{index}"),
+            RestoreGrantVariant::Exact,
+        );
+        let output = run_restore_probe(&bundle, &fixture, case);
+        assert_output_success(&output, &format!("signed {case} probe"));
+        assert_restore_output_redacted(&output, &fixture);
+        fixture.assert_pristine();
+        assert!(session_entries().is_empty());
+    }
+
+    let extra =
+        RestoreTransactionGrantFixture::new("extra-authority", RestoreGrantVariant::ExtraUnrelated);
+    let output = run_restore_probe(&bundle, &extra, "restore-success");
+    assert_output_success(&output, "signed restore with unrelated startup authority");
+    assert_restore_output_redacted(&output, &extra);
+    extra.assert_pristine();
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn signed_restore_transaction_authority_mismatches_fail_closed() {
+    let bundle = grant_test_bundle();
+    recover_session_root(&bundle);
+    for (index, variant) in [
+        RestoreGrantVariant::MissingRoot,
+        RestoreGrantVariant::MissingDirectory,
+        RestoreGrantVariant::WrongRootRole,
+        RestoreGrantVariant::WrongRootAccess,
+        RestoreGrantVariant::WrongRootKind,
+        RestoreGrantVariant::WrongDirectoryRole,
+        RestoreGrantVariant::WrongDirectoryAccess,
+        RestoreGrantVariant::WrongDirectoryKind,
+        RestoreGrantVariant::SubstitutedIds,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = RestoreTransactionGrantFixture::new(&format!("reject-{index}"), variant);
+        let output = run_restore_probe(&bundle, &fixture, "restore-success");
+        assert_eq!(
+            output.status.code(),
+            Some(PROCESS_FAILURE_EXIT_CODE),
+            "restore authority variant {variant:?} must fail closed"
+        );
+        assert_restore_output_redacted(&output, &fixture);
+        fixture.assert_pristine();
+        assert!(session_entries().is_empty());
+    }
+}
+
+#[test]
+fn signed_restore_transaction_uses_launcher_opened_root_after_path_replacement() {
+    let bundle = grant_test_bundle();
+    let fixture =
+        RestoreTransactionGrantFixture::new("root-replacement", RestoreGrantVariant::Exact);
+    let mut holding = spawn_holding_restore_probe(
+        &bundle,
+        &fixture,
+        "restore-wait-then-success",
+        RESTORE_REPLACE_READY,
+        true,
+    );
+    let retained = fixture.replace_root_source();
+    holding.release_stdin();
+    assert!(
+        holding.wait("restore root replacement").success(),
+        "restore root replacement probe should succeed"
+    );
+    fixture.assert_root_replacement_preserved(&retained);
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn signed_restore_transaction_active_boundary_has_no_helper_and_cleans_gracefully() {
+    let bundle = grant_test_bundle();
+    let fixture =
+        RestoreTransactionGrantFixture::new("active-boundary", RestoreGrantVariant::Exact);
+    let mut holding = spawn_holding_restore_probe(
+        &bundle,
+        &fixture,
+        "restore-hold-active",
+        RESTORE_ACTIVE_READY,
+        false,
+    );
+    assert!(is_socket_path(&fixture.socket()));
+    let worker = only_worker_pid(&holding.child);
+    assert!(
+        child_pids(worker).is_empty(),
+        "restore binder must be reaped before active readiness"
+    );
+    assert_exact_networkless_bundle_entitlements(&bundle);
+    holding.stop(libc::SIGTERM, "active restore transaction");
+    assert!(!fixture.socket().exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn signed_restore_transaction_cleans_both_independent_death_orders() {
+    let bundle = grant_test_bundle();
+    recover_session_root(&bundle);
+
+    let launcher_fixture =
+        RestoreTransactionGrantFixture::new("launcher-death", RestoreGrantVariant::Exact);
+    let mut launcher_first = spawn_holding_restore_probe(
+        &bundle,
+        &launcher_fixture,
+        "restore-hold-active",
+        RESTORE_ACTIVE_READY,
+        false,
+    );
+    let worker = only_worker_pid(&launcher_first.child);
+    let worker_exit = ProcessExitWatch::new(worker);
+    let launcher = i32::try_from(launcher_first.child.id()).expect("launcher PID should fit");
+    // SAFETY: The unreaped restore launcher owns this exact PID.
+    assert_eq!(unsafe { libc::kill(launcher, libc::SIGKILL) }, 0);
+    assert_eq!(
+        launcher_first.wait("restore launcher SIGKILL").signal(),
+        Some(libc::SIGKILL)
+    );
+    assert!(
+        worker_exit.wait(PROCESS_TIMEOUT),
+        "restore worker should observe launcher death"
+    );
+    assert!(!launcher_fixture.socket().exists());
+    assert!(session_entries().is_empty());
+
+    let worker_fixture =
+        RestoreTransactionGrantFixture::new("worker-death", RestoreGrantVariant::Exact);
+    let mut worker_first = spawn_holding_restore_probe(
+        &bundle,
+        &worker_fixture,
+        "restore-hold-active",
+        RESTORE_ACTIVE_READY,
+        false,
+    );
+    let worker = only_worker_pid(&worker_first.child);
+    // SAFETY: The worker is the sole live child of this unreaped launcher.
+    assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+    assert_eq!(
+        worker_first.wait("active restore worker SIGKILL").code(),
+        Some(128 + libc::SIGKILL)
+    );
+    assert!(!worker_fixture.socket().exists());
+    assert!(session_entries().is_empty());
+
+    let prepared_fixture =
+        RestoreTransactionGrantFixture::new("prepared-death", RestoreGrantVariant::Exact);
+    let mut prepared = spawn_holding_restore_probe(
+        &bundle,
+        &prepared_fixture,
+        "restore-hold-prepared",
+        RESTORE_PREPARED_READY,
+        false,
+    );
+    let worker = only_worker_pid(&prepared.child);
+    // SAFETY: The worker is the sole live child of this unreaped launcher.
+    assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+    assert_eq!(
+        prepared.wait("prepared restore worker SIGKILL").code(),
+        Some(128 + libc::SIGKILL)
+    );
+    assert!(!prepared_fixture.socket().exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn signed_restore_transaction_preserves_a_published_socket_replacement() {
+    let bundle = grant_test_bundle();
+    let fixture =
+        RestoreTransactionGrantFixture::new("socket-replacement", RestoreGrantVariant::Exact);
+    let mut holding = spawn_holding_restore_probe(
+        &bundle,
+        &fixture,
+        "restore-hold-active",
+        RESTORE_ACTIVE_READY,
+        false,
+    );
+    let socket = fixture.socket();
+    let retained = fixture._root.path().join("retained-owned.sock");
+    fs::rename(&socket, &retained).expect("owned restore socket should rename");
+    let replacement = UnixListener::bind(&socket).expect("replacement socket should bind");
+    holding.stop(libc::SIGTERM, "restore socket replacement");
+    assert!(
+        is_socket_path(&socket),
+        "identity cleanup must preserve the replacement socket"
+    );
+    assert!(is_socket_path(&retained));
+    drop(replacement);
+    fs::remove_file(&socket).expect("replacement socket should clean");
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn concurrent_signed_restore_transactions_keep_same_ids_noninterchangeable() {
+    let bundle = grant_test_bundle();
+    recover_session_root(&bundle);
+    let alpha = RestoreTransactionGrantFixture::new("concurrent-alpha", RestoreGrantVariant::Exact);
+    let beta = RestoreTransactionGrantFixture::new("concurrent-beta", RestoreGrantVariant::Exact);
+    let mut alpha_probe = spawn_holding_restore_probe(
+        &bundle,
+        &alpha,
+        "restore-hold-active",
+        RESTORE_ACTIVE_READY,
+        false,
+    );
+    let mut beta_probe = spawn_holding_restore_probe(
+        &bundle,
+        &beta,
+        "restore-hold-active",
+        RESTORE_ACTIVE_READY,
+        false,
+    );
+    assert!(is_socket_path(&alpha.socket()));
+    assert!(is_socket_path(&beta.socket()));
+    assert_eq!(session_entries().len(), 2);
+    alpha_probe.stop(libc::SIGTERM, "alpha restore transaction");
+    assert!(!alpha.socket().exists());
+    assert!(
+        is_socket_path(&beta.socket()),
+        "stopping alpha must preserve beta authority"
+    );
+    beta_probe.stop(libc::SIGTERM, "beta restore transaction");
+    assert!(!beta.socket().exists());
+    assert!(session_entries().is_empty());
 }
 
 #[test]
@@ -8172,6 +8431,353 @@ fn assert_pager_output_redacted(output: &Output, fixture: &PagerGrantFixture) {
             !combined.contains(&sensitive),
             "pager diagnostics must redact configured authority"
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreGrantVariant {
+    Exact,
+    ExtraUnrelated,
+    MissingRoot,
+    MissingDirectory,
+    WrongRootRole,
+    WrongRootAccess,
+    WrongRootKind,
+    WrongDirectoryRole,
+    WrongDirectoryAccess,
+    WrongDirectoryKind,
+    SubstitutedIds,
+}
+
+#[derive(Debug)]
+struct RestoreTransactionGrantFixture {
+    _root: TestDir,
+    root: PathBuf,
+    directory: PathBuf,
+    manifest: PathBuf,
+    extra: PathBuf,
+}
+
+impl RestoreTransactionGrantFixture {
+    fn new(case: &str, variant: RestoreGrantVariant) -> Self {
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let root = TestDir(
+            PathBuf::from("/private/tmp").join(format!("bbr-{}-{id}-{case}", std::process::id())),
+        );
+        fs::create_dir(root.path()).expect("short restore root should create");
+        let root_file = root.path().join("r.img");
+        let directory = root.path().join("d");
+        let manifest = root.path().join("m.json");
+        let extra = root.path().join("x.img");
+        fs::write(&root_file, RESTORE_ROOT_MARKER).expect("restore root marker should write");
+        fs::create_dir(&directory).expect("restore socket directory should create");
+        fs::write(&extra, b"unrelated-authority\n").expect("extra restore fixture should write");
+
+        let root_id = if variant == RestoreGrantVariant::SubstitutedIds {
+            "restore-substituted-root-1601"
+        } else {
+            RESTORE_ROOT_ID
+        };
+        let directory_id = if variant == RestoreGrantVariant::SubstitutedIds {
+            "restore-substituted-vsock-1601"
+        } else {
+            RESTORE_VSOCK_ID
+        };
+        let root_role = if variant == RestoreGrantVariant::WrongRootRole {
+            "kernel-image"
+        } else {
+            "drive-backing"
+        };
+        let root_access = if variant == RestoreGrantVariant::WrongRootAccess {
+            "read-write"
+        } else {
+            "read-only"
+        };
+        let root_source = if variant == RestoreGrantVariant::WrongRootKind {
+            &directory
+        } else {
+            &root_file
+        };
+        let directory_role = if variant == RestoreGrantVariant::WrongDirectoryRole {
+            "api-socket-directory"
+        } else {
+            "vsock-socket-directory"
+        };
+        let directory_access = if variant == RestoreGrantVariant::WrongDirectoryAccess {
+            "connect-children"
+        } else {
+            "create-children"
+        };
+        let directory_source = if variant == RestoreGrantVariant::WrongDirectoryKind {
+            &root_file
+        } else {
+            &directory
+        };
+
+        let mut grants = Vec::new();
+        if variant != RestoreGrantVariant::MissingRoot {
+            grants.push(serde_json::json!({
+                "id": root_id,
+                "role": root_role,
+                "access": root_access,
+                "source": path_text(root_source),
+            }));
+        }
+        if variant != RestoreGrantVariant::MissingDirectory {
+            grants.push(serde_json::json!({
+                "id": directory_id,
+                "role": directory_role,
+                "access": directory_access,
+                "source": path_text(directory_source),
+            }));
+        }
+        if variant == RestoreGrantVariant::ExtraUnrelated {
+            grants.push(serde_json::json!({
+                "id": "restore-unrelated-1601",
+                "role": "kernel-image",
+                "access": "read-only",
+                "source": path_text(&extra),
+            }));
+        }
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": grants,
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("restore manifest should serialize"),
+        )
+        .expect("restore manifest should write");
+
+        Self {
+            _root: root,
+            root: root_file,
+            directory,
+            manifest,
+            extra,
+        }
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.directory.join(RESTORE_SOCKET_CHILD)
+    }
+
+    fn replace_root_source(&self) -> PathBuf {
+        let retained = self._root.path().join("retained-root.img");
+        fs::rename(&self.root, &retained).expect("opened restore root should rename");
+        fs::write(&self.root, RESTORE_REPLACEMENT_MARKER)
+            .expect("restore root replacement should write");
+        retained
+    }
+
+    fn assert_pristine(&self) {
+        assert_eq!(
+            fs::read(&self.root).expect("restore root should remain readable"),
+            RESTORE_ROOT_MARKER
+        );
+        assert_eq!(
+            fs::read(&self.extra).expect("unrelated authority should remain readable"),
+            b"unrelated-authority\n"
+        );
+        assert!(!self.socket().exists());
+    }
+
+    fn assert_root_replacement_preserved(&self, retained: &Path) {
+        assert_eq!(
+            fs::read(retained).expect("retained opened root should remain readable"),
+            RESTORE_ROOT_MARKER
+        );
+        assert_eq!(
+            fs::read(&self.root).expect("planted root should remain readable"),
+            RESTORE_REPLACEMENT_MARKER
+        );
+        assert!(!self.socket().exists());
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(self._root.path()),
+            path_text(&self.root),
+            path_text(&self.directory),
+            path_text(&self.manifest),
+            path_text(&self.extra),
+            RESTORE_ROOT_ID,
+            RESTORE_VSOCK_ID,
+            RESTORE_ROOT_REF,
+            RESTORE_VSOCK_REF,
+            RESTORE_SOCKET_CHILD,
+            "restore-substituted-root-1601",
+            "restore-substituted-vsock-1601",
+            "restore-unrelated-1601",
+            "retained-root.img",
+            "retained-owned.sock",
+            "unrelated-authority",
+            std::str::from_utf8(RESTORE_ROOT_MARKER)
+                .expect("restore root marker should be UTF-8")
+                .trim_end(),
+            std::str::from_utf8(RESTORE_ROOT_MARKER).expect("restore root marker should be UTF-8"),
+            std::str::from_utf8(RESTORE_REPLACEMENT_MARKER)
+                .expect("restore replacement marker should be UTF-8")
+                .trim_end(),
+            std::str::from_utf8(RESTORE_REPLACEMENT_MARKER)
+                .expect("restore replacement marker should be UTF-8"),
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
+fn is_socket_path(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
+}
+
+fn restore_probe_command(
+    bundle: &Path,
+    fixture: &RestoreTransactionGrantFixture,
+    case: &str,
+) -> Command {
+    let mut command = Command::new(launcher(bundle));
+    command
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .arg(GRANT_PROBE_OPTION)
+        .arg(case);
+    command
+}
+
+fn run_restore_probe(
+    bundle: &Path,
+    fixture: &RestoreTransactionGrantFixture,
+    case: &str,
+) -> Output {
+    run_with_timeout(
+        &mut restore_probe_command(bundle, fixture, case),
+        PROCESS_TIMEOUT,
+        "signed restore transaction probe",
+    )
+}
+
+fn assert_restore_output_redacted(output: &Output, fixture: &RestoreTransactionGrantFixture) {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for sensitive in fixture.sensitive_strings() {
+        assert!(
+            !combined.contains(&sensitive),
+            "restore transaction diagnostics must redact configured authority"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct HoldingRestoreProbe {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout_reader: Option<JoinHandle<String>>,
+    stderr_reader: Option<JoinHandle<String>>,
+    sensitive: Vec<String>,
+    completed: bool,
+}
+
+impl HoldingRestoreProbe {
+    fn release_stdin(&mut self) {
+        let mut stdin = self
+            .stdin
+            .take()
+            .expect("replacement restore probe should retain stdin");
+        stdin
+            .write_all(b"x")
+            .expect("replacement restore probe should release");
+    }
+
+    fn wait(&mut self, context: &str) -> ExitStatus {
+        let status = if wait_for_child_exit(&self.child, PROCESS_TIMEOUT) {
+            self.child
+                .wait()
+                .expect("restore launcher wait should succeed")
+        } else {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+            panic!("timed out waiting for {context}");
+        };
+        self.completed = true;
+        let stdout = self
+            .stdout_reader
+            .take()
+            .expect("restore stdout reader should exist")
+            .join()
+            .expect("restore stdout should join");
+        let stderr = self
+            .stderr_reader
+            .take()
+            .expect("restore stderr reader should exist")
+            .join()
+            .expect("restore stderr should join");
+        let combined = format!("{stdout}{stderr}");
+        for sensitive in &self.sensitive {
+            assert!(
+                !combined.contains(sensitive),
+                "holding restore diagnostics must remain redacted"
+            );
+        }
+        status
+    }
+
+    fn stop(&mut self, signal: i32, context: &str) {
+        let pid = i32::try_from(self.child.id()).expect("restore launcher PID should fit");
+        // SAFETY: The unreaped launcher owns this PID and signal is fixed by the test.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+        let status = self.wait(context);
+        assert!(status.success(), "{context} should stop successfully");
+    }
+}
+
+impl Drop for HoldingRestoreProbe {
+    fn drop(&mut self) {
+        if !self.completed {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn spawn_holding_restore_probe(
+    bundle: &Path,
+    fixture: &RestoreTransactionGrantFixture,
+    case: &str,
+    ready_line: &'static str,
+    pipe_stdin: bool,
+) -> HoldingRestoreProbe {
+    let mut command = restore_probe_command(bundle, fixture, case);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    if pipe_stdin {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command.spawn().expect("holding restore probe should start");
+    let stdin = child.stdin.take();
+    let (ready, stdout_reader) = read_stdout_until_line(&mut child, ready_line);
+    let stderr_reader = read_stream(child.stderr.take().expect("restore stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("restore stdout should join");
+        let stderr = stderr_reader.join().expect("restore stderr should join");
+        panic!("restore probe should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    }
+    HoldingRestoreProbe {
+        child,
+        stdin,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive: fixture.sensitive_strings(),
+        completed: false,
     }
 }
 

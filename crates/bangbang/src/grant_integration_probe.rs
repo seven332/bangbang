@@ -1,8 +1,9 @@
 //! Test-bundle-only exercise of committed startup grant authority.
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
@@ -17,16 +18,33 @@ use bangbang_pager::{
     PagerSessionId, PagerTransport, PagerVmmState, REFERENCE_PAGE_BYTE, TerminalCode, VmmSession,
 };
 use bangbang_runtime::VmBackend;
-use bangbang_runtime::block::PreparedBlockDevice;
+use bangbang_runtime::block::{BlockFileBacking, PreparedBlockDevice};
 use bangbang_runtime::lazy_memory::{
     LazyGuestMemory, LazyGuestMemoryLimits, LazyGuestMemoryRegion,
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryBacking, aarch64};
+use bangbang_runtime::snapshot_device_v2::{
+    NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph, SnapshotV2DeviceKey,
+};
 use bangbang_runtime::snapshot_memory::write_snapshot_memory_image;
+use bangbang_runtime::snapshot_restore::{
+    SnapshotRestorePublicId, SnapshotRestoreResourceClass, SnapshotRestoreResourceKey,
+};
 use bangbang_runtime::virtio_queue::VirtqueueAvailableRing;
+use bangbang_runtime::vsock::VsockBackendSelector;
 use bangbang_session::{GrantAccess, GrantId, GrantObjectKind, ResourceRole};
 
-use crate::contained_session::{ContainedSession, ContainedSessionError};
+use crate::contained_session::{
+    ContainedSession, ContainedSessionError, ContainedSnapshotRestoreAuthority,
+    ContainedSnapshotRestoreErrorKind,
+};
+use crate::snapshot_restore_resources::{
+    PreparedSnapshotRootRestoreCompletion, RequestedSnapshotRestoreResource,
+    RequestedSnapshotRestoreResources,
+};
+use crate::vsock_restore::{
+    ActiveVsockRestoreGuard, PreparedVsockRestoreResource, RequestedVsockRestoreResource,
+};
 
 const OPTION: &str = "--bangbang-internal-grant-probe-v1";
 const READY_LINE: &str = "status: grant integration probe ready";
@@ -39,6 +57,14 @@ const BLOCK_CONTROL_INITIAL_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_INITIAL";
 const BLOCK_CONTROL_WRITTEN_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_WRITTEN";
 const BLOCK_CONTROL_WRITE_BLOCK: u64 = 8;
 const SNAPSHOT_STAGING_HOLD_OPTION: &str = "--bangbang-internal-snapshot-staging-hold-v1";
+const RESTORE_ROOT_ID: &str = "restore-root-1601";
+const RESTORE_VSOCK_ID: &str = "restore-vsock-1601";
+const RESTORE_ROOT_REF: &str = "bangbang-grant:restore-root-1601";
+const RESTORE_VSOCK_REF: &str = "bangbang-grant:restore-vsock-1601/restore-1601.sock";
+const RESTORE_ROOT_MARKER: &[u8] = b"BANGBANG_RESTORE_TRANSACTION_ROOT_1601\n";
+const RESTORE_ACTIVE_READY_LINE: &str = "status: restore transaction active";
+const RESTORE_PREPARED_READY_LINE: &str = "status: restore transaction prepared";
+const RESTORE_REPLACE_READY_LINE: &str = "status: restore transaction awaiting replacement";
 static SNAPSHOT_STAGING_HOLD: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn configure_snapshot_staging_hold(args: &mut Vec<OsString>) {
@@ -70,6 +96,10 @@ pub(crate) fn run(
     args: &[OsString],
 ) -> Result<(), ContainedSessionError> {
     let probe_args = probe_args(args).ok_or(ContainedSessionError)?;
+    if let Some(restore) = RestoreProbeCase::parse(probe_args)? {
+        session.verify_launch_policy(2048, None, false)?;
+        return verify_restore_transaction_in_containment(session, restore);
+    }
     if let Some(pager) = PagerProbeCase::parse(probe_args)? {
         session.verify_launch_policy(2048, None, false)?;
         return verify_pager_in_containment(session, pager);
@@ -703,6 +733,465 @@ fn trigger_file_size_enforcement(
     // failed or produced an unexpected recoverable result.
     let _ = unsafe { libc::pwrite(descriptor, b"x".as_ptr().cast(), 1, length) };
     Err(ContainedSessionError)
+}
+
+fn verify_restore_transaction_in_containment(
+    session: &ContainedSession,
+    probe: RestoreProbeCase,
+) -> Result<(), ContainedSessionError> {
+    let authority = session
+        .snapshot_restore_authority()?
+        .ok_or(ContainedSessionError)?;
+    match probe {
+        RestoreProbeCase::LogicalMismatch => {
+            verify_restore_logical_mismatch(&authority)?;
+        }
+        RestoreProbeCase::ReservationAbort => {
+            verify_restore_reservation_abort(&authority)?;
+        }
+        RestoreProbeCase::Cancellation => {
+            verify_restore_cancellation(&authority)?;
+        }
+        RestoreProbeCase::Success => {
+            let (backing, active_guard) = consume_restore_transaction(session, &authority)?;
+            drop(active_guard);
+            drop(backing);
+        }
+        RestoreProbeCase::HoldActive => {
+            let (backing, active_guard) = consume_restore_transaction(session, &authority)?;
+            println!("{RESTORE_ACTIVE_READY_LINE}");
+            std::io::stdout()
+                .flush()
+                .map_err(|_| ContainedSessionError)?;
+            let outcome = wait_for_restore_shutdown(session);
+            drop(active_guard);
+            drop(backing);
+            outcome?;
+        }
+        RestoreProbeCase::HoldPrepared => {
+            let prepared = exact_restore_request(RESTORE_ROOT_REF, RESTORE_VSOCK_REF)?
+                .prepare(Some(&authority), || session.was_cancelled())
+                .map_err(redacted_restore_resource_error)?;
+            println!("{RESTORE_PREPARED_READY_LINE}");
+            std::io::stdout()
+                .flush()
+                .map_err(|_| ContainedSessionError)?;
+            let outcome = wait_for_restore_shutdown(session);
+            drop(prepared);
+            outcome?;
+        }
+        RestoreProbeCase::WaitThenSuccess => {
+            println!("{RESTORE_REPLACE_READY_LINE}");
+            std::io::stdout()
+                .flush()
+                .map_err(|_| ContainedSessionError)?;
+            let mut release = [0_u8; 1];
+            std::io::stdin()
+                .read_exact(&mut release)
+                .map_err(|_| ContainedSessionError)?;
+            let (backing, active_guard) = consume_restore_transaction(session, &authority)?;
+            drop(active_guard);
+            drop(backing);
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_restore_shutdown(session: &ContainedSession) -> Result<(), ContainedSessionError> {
+    loop {
+        match session.shutdown_requested() {
+            Ok(false) => std::thread::park_timeout(Duration::from_millis(10)),
+            Ok(true) => return Ok(()),
+            Err(_) => return Err(ContainedSessionError),
+        }
+    }
+}
+
+fn consume_restore_transaction(
+    session: &ContainedSession,
+    authority: &ContainedSnapshotRestoreAuthority,
+) -> Result<(BlockFileBacking, ActiveVsockRestoreGuard), ContainedSessionError> {
+    let prepared = exact_restore_request(RESTORE_ROOT_REF, RESTORE_VSOCK_REF)?
+        .prepare(Some(authority), || session.was_cancelled())
+        .map_err(redacted_restore_resource_error)?;
+    let (root, vsock) = prepared
+        .into_root_and_optional_vsock()
+        .map_err(redacted_restore_resource_error)?;
+    let (backing, completion) = root.into_parts();
+    let Some(vsock) = vsock else {
+        drop(backing);
+        let _ = completion.abort();
+        return Err(ContainedSessionError);
+    };
+
+    let mut root_marker = vec![0_u8; RESTORE_ROOT_MARKER.len()];
+    if backing.read_at(0, &mut root_marker).is_err() || root_marker != RESTORE_ROOT_MARKER {
+        abort_taken_restore(backing, completion, Some(vsock));
+        return Err(ContainedSessionError);
+    }
+
+    let adoption = vsock.adopt(|resource| {
+        if resource.captured_selector().path() != Path::new(RESTORE_VSOCK_REF)
+            || resource.destination_selector().path() != Path::new(RESTORE_VSOCK_REF)
+        {
+            return Err(());
+        }
+        resource.consume_for_test().map_err(|_| ())
+    });
+    let active_guard = match adoption {
+        Ok(((), active_guard)) => active_guard,
+        Err(source) => {
+            let redacted = ensure_restore_diagnostic_redacted(&source);
+            drop(backing);
+            let _ = completion.abort();
+            redacted?;
+            return Err(ContainedSessionError);
+        }
+    };
+    if let Err(source) = completion.commit() {
+        let redacted = ensure_restore_diagnostic_redacted(&source);
+        drop(active_guard);
+        drop(backing);
+        redacted?;
+        return Err(ContainedSessionError);
+    }
+
+    match exact_restore_request(RESTORE_ROOT_REF, RESTORE_VSOCK_REF)?
+        .prepare(Some(authority), || false)
+    {
+        Err(source) => {
+            ensure_restore_diagnostic_redacted(&source)?;
+        }
+        Ok(unexpected) => {
+            drop(unexpected);
+            drop(active_guard);
+            drop(backing);
+            return Err(ContainedSessionError);
+        }
+    }
+    Ok((backing, active_guard))
+}
+
+fn abort_taken_restore(
+    backing: BlockFileBacking,
+    completion: PreparedSnapshotRootRestoreCompletion,
+    vsock: Option<PreparedVsockRestoreResource>,
+) {
+    if let Some(vsock) = vsock {
+        let _ = vsock.abort();
+    }
+    drop(backing);
+    let _ = completion.abort();
+}
+
+fn verify_restore_reservation_abort(
+    authority: &ContainedSnapshotRestoreAuthority,
+) -> Result<(), ContainedSessionError> {
+    for _ in 0..2 {
+        authority
+            .prepare(
+                Path::new(RESTORE_ROOT_REF),
+                Some(Path::new(RESTORE_VSOCK_REF)),
+                &|| false,
+            )
+            .map_err(redacted_contained_restore_error)?
+            .abort()
+            .map_err(redacted_contained_restore_error)?;
+    }
+    Ok(())
+}
+
+fn verify_restore_cancellation(
+    authority: &ContainedSnapshotRestoreAuthority,
+) -> Result<(), ContainedSessionError> {
+    for cancellation_check in 1..=9 {
+        let checks = Cell::new(0);
+        let result = authority.prepare(
+            Path::new(RESTORE_ROOT_REF),
+            Some(Path::new(RESTORE_VSOCK_REF)),
+            &|| {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next == cancellation_check
+            },
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(unexpected) => {
+                let _ = unexpected.abort();
+                return Err(ContainedSessionError);
+            }
+        };
+        ensure_restore_diagnostic_redacted(&error)?;
+        if error.kind() != ContainedSnapshotRestoreErrorKind::Cancelled
+            || error.is_terminal()
+            || error.cleanup_failed()
+        {
+            return Err(ContainedSessionError);
+        }
+    }
+    verify_restore_reservation_abort(authority)
+}
+
+fn verify_restore_logical_mismatch(
+    authority: &ContainedSnapshotRestoreAuthority,
+) -> Result<(), ContainedSessionError> {
+    let device_key = restore_device_key()?;
+    let root_key = restore_key(
+        device_key,
+        RESTORE_ROOT_ID,
+        SnapshotRestoreResourceClass::BlockBacking,
+    )?;
+    let vsock_key = restore_key(
+        device_key,
+        RESTORE_VSOCK_ID,
+        SnapshotRestoreResourceClass::VsockEndpoint,
+    )?;
+
+    let missing_root =
+        RequestedSnapshotRestoreResources::try_from_exact_requests(vec![restore_vsock_owner(
+            vsock_key.clone(),
+            RESTORE_VSOCK_REF,
+        )?]);
+    if missing_root.is_ok() {
+        return Err(ContainedSessionError);
+    }
+
+    let extra_root = RequestedSnapshotRestoreResources::try_from_exact_requests(vec![
+        restore_root_owner(root_key.clone(), RESTORE_ROOT_REF),
+        restore_root_owner(
+            restore_key(
+                device_key,
+                "restore-extra-1601",
+                SnapshotRestoreResourceClass::BlockBacking,
+            )?,
+            RESTORE_ROOT_REF,
+        ),
+        restore_vsock_owner(vsock_key.clone(), RESTORE_VSOCK_REF)?,
+    ]);
+    if extra_root.is_ok() {
+        return Err(ContainedSessionError);
+    }
+
+    let duplicate_vsock = RequestedSnapshotRestoreResources::try_from_exact_requests(vec![
+        restore_root_owner(root_key.clone(), RESTORE_ROOT_REF),
+        restore_vsock_owner(vsock_key.clone(), RESTORE_VSOCK_REF)?,
+        restore_vsock_owner(vsock_key.clone(), RESTORE_VSOCK_REF)?,
+    ]);
+    if duplicate_vsock.is_ok() {
+        return Err(ContainedSessionError);
+    }
+
+    let class_swap = RequestedSnapshotRestoreResources::try_from_exact_requests(vec![
+        restore_root_owner(
+            restore_key(
+                device_key,
+                RESTORE_ROOT_ID,
+                SnapshotRestoreResourceClass::VsockEndpoint,
+            )?,
+            RESTORE_ROOT_REF,
+        ),
+        restore_vsock_owner(
+            restore_key(
+                device_key,
+                RESTORE_VSOCK_ID,
+                SnapshotRestoreResourceClass::BlockBacking,
+            )?,
+            RESTORE_VSOCK_REF,
+        )?,
+    ]);
+    if class_swap.is_ok() {
+        return Err(ContainedSessionError);
+    }
+
+    let alias_root = restore_key(
+        device_key,
+        "restore-alias-1601",
+        SnapshotRestoreResourceClass::BlockBacking,
+    )?;
+    let alias_vsock = restore_key(
+        device_key,
+        "restore-alias-1601",
+        SnapshotRestoreResourceClass::VsockEndpoint,
+    )?;
+    let alias = RequestedSnapshotRestoreResources::try_from_exact_requests(vec![
+        restore_root_owner(alias_root, RESTORE_ROOT_REF),
+        restore_vsock_owner(alias_vsock, RESTORE_VSOCK_REF)?,
+    ]);
+    if alias.is_ok() {
+        return Err(ContainedSessionError);
+    }
+
+    let substituted = exact_restore_request(
+        "bangbang-grant:restore-substituted-root-1601",
+        "bangbang-grant:restore-substituted-vsock-1601/restore-substituted-1601.sock",
+    )?
+    .prepare(Some(authority), || false);
+    match substituted {
+        Err(source) => ensure_restore_diagnostic_redacted(&source)?,
+        Ok(unexpected) => {
+            drop(unexpected);
+            return Err(ContainedSessionError);
+        }
+    }
+
+    verify_restore_reservation_abort(authority)
+}
+
+fn exact_restore_request(
+    root_reference: &str,
+    vsock_reference: &str,
+) -> Result<RequestedSnapshotRestoreResources, ContainedSessionError> {
+    let device_key = restore_device_key()?;
+    let root = restore_root_owner(
+        restore_key(
+            device_key,
+            RESTORE_ROOT_ID,
+            SnapshotRestoreResourceClass::BlockBacking,
+        )?,
+        root_reference,
+    );
+    let vsock = restore_vsock_owner(
+        restore_key(
+            device_key,
+            RESTORE_VSOCK_ID,
+            SnapshotRestoreResourceClass::VsockEndpoint,
+        )?,
+        vsock_reference,
+    )?;
+    RequestedSnapshotRestoreResources::try_from_exact_requests(vec![root, vsock])
+        .map_err(redacted_restore_resource_error)
+}
+
+fn restore_root_owner(
+    key: SnapshotRestoreResourceKey,
+    reference: &str,
+) -> RequestedSnapshotRestoreResource {
+    RequestedSnapshotRestoreResource::Root {
+        key,
+        selector: Path::new(reference).to_path_buf(),
+    }
+}
+
+fn restore_vsock_owner(
+    key: SnapshotRestoreResourceKey,
+    reference: &str,
+) -> Result<RequestedSnapshotRestoreResource, ContainedSessionError> {
+    let selector = VsockBackendSelector::try_from_path(Path::new(reference))
+        .map_err(|_| ContainedSessionError)?;
+    let request = RequestedVsockRestoreResource::resolve(Some(&selector), None)
+        .map_err(|source| {
+            let _ = ensure_restore_diagnostic_redacted(&source);
+            ContainedSessionError
+        })?
+        .ok_or(ContainedSessionError)?;
+    Ok(RequestedSnapshotRestoreResource::Vsock { key, request })
+}
+
+fn restore_key(
+    device_key: SnapshotV2DeviceKey,
+    public_id: &str,
+    resource_class: SnapshotRestoreResourceClass,
+) -> Result<SnapshotRestoreResourceKey, ContainedSessionError> {
+    let public_id =
+        SnapshotRestorePublicId::try_from(public_id).map_err(|_| ContainedSessionError)?;
+    Ok(SnapshotRestoreResourceKey::new(
+        device_key,
+        public_id,
+        resource_class,
+    ))
+}
+
+fn restore_device_key() -> Result<SnapshotV2DeviceKey, ContainedSessionError> {
+    let fixture = include_str!("../../runtime/src/snapshot_device_v2/fixtures/mmio.hex");
+    let hex = fixture.trim().as_bytes();
+    if !hex.len().is_multiple_of(2) {
+        return Err(ContainedSessionError);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(hex.len() / 2)
+        .map_err(|_| ContainedSessionError)?;
+    for pair in hex.chunks_exact(2) {
+        let pair = std::str::from_utf8(pair).map_err(|_| ContainedSessionError)?;
+        bytes.push(u8::from_str_radix(pair, 16).map_err(|_| ContainedSessionError)?);
+    }
+    SnapshotV2DeviceGraph::decode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, &bytes)
+        .map(|graph| graph.root_key())
+        .map_err(|_| ContainedSessionError)
+}
+
+fn redacted_restore_resource_error(
+    source: crate::snapshot_restore_resources::SnapshotRestoreResourceError,
+) -> ContainedSessionError {
+    let _ = ensure_restore_diagnostic_redacted(&source);
+    ContainedSessionError
+}
+
+fn redacted_contained_restore_error(
+    source: crate::contained_session::ContainedSnapshotRestoreError,
+) -> ContainedSessionError {
+    let _ = ensure_restore_diagnostic_redacted(&source);
+    ContainedSessionError
+}
+
+fn ensure_restore_diagnostic_redacted(
+    source: &(impl std::fmt::Debug + std::fmt::Display),
+) -> Result<(), ContainedSessionError> {
+    let diagnostic = format!("{source:?} {source}");
+    let root_marker =
+        std::str::from_utf8(RESTORE_ROOT_MARKER).map_err(|_| ContainedSessionError)?;
+    for sensitive in [
+        RESTORE_ROOT_ID,
+        RESTORE_VSOCK_ID,
+        RESTORE_ROOT_REF,
+        RESTORE_VSOCK_REF,
+        "restore-1601.sock",
+        "restore-extra-1601",
+        "restore-alias-1601",
+        "restore-substituted-root-1601",
+        "restore-substituted-vsock-1601",
+        "restore-substituted-1601.sock",
+        root_marker,
+    ] {
+        if diagnostic.contains(sensitive) {
+            return Err(ContainedSessionError);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreProbeCase {
+    LogicalMismatch,
+    ReservationAbort,
+    Cancellation,
+    Success,
+    HoldActive,
+    HoldPrepared,
+    WaitThenSuccess,
+}
+
+impl RestoreProbeCase {
+    fn parse(args: &[OsString]) -> Result<Option<Self>, ContainedSessionError> {
+        let [option, value] = args else {
+            return Err(ContainedSessionError);
+        };
+        if option != OPTION {
+            return Err(ContainedSessionError);
+        }
+        Ok(match value.to_str() {
+            Some("restore-logical-mismatch") => Some(Self::LogicalMismatch),
+            Some("restore-reservation-abort") => Some(Self::ReservationAbort),
+            Some("restore-cancellation") => Some(Self::Cancellation),
+            Some("restore-success") => Some(Self::Success),
+            Some("restore-hold-active") => Some(Self::HoldActive),
+            Some("restore-hold-prepared") => Some(Self::HoldPrepared),
+            Some("restore-wait-then-success") => Some(Self::WaitThenSuccess),
+            Some(value) if value.starts_with("restore-") => return Err(ContainedSessionError),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

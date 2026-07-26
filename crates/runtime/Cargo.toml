@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "zeroize"] }
 bangbang-pager = { path = "../pager" }

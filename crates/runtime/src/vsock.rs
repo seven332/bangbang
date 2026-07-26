@@ -578,6 +578,31 @@ impl VirtioVsockReconstructionResource {
         self.listener.is_none()
     }
 
+    /// Consumes the supplied endpoint without exporting it to test code.
+    ///
+    /// This is available only to crate tests and explicitly feature-gated
+    /// integration probes. It mirrors the listener/connector adoption checks
+    /// performed by snapshot reconstruction, but deliberately constructs no
+    /// device and returns no authority-bearing value.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn consume_for_test(&mut self) -> Result<(), VirtioVsockReconstructionError> {
+        let prepared_listener = self
+            .listener
+            .as_ref()
+            .ok_or(VirtioVsockReconstructionError::ResourceConsumed)?;
+        if !prepared_listener.has_guest_connector() {
+            return Err(VirtioVsockReconstructionError::GuestConnectorMissing);
+        }
+        prepared_listener
+            .prepare_for_adoption()
+            .map_err(VirtioVsockReconstructionError::HostSocket)?;
+        drop(
+            self.take_listener()
+                .ok_or(VirtioVsockReconstructionError::ResourceConsumed)?,
+        );
+        Ok(())
+    }
+
     fn take_listener(&mut self) -> Option<SuppliedVsockListener> {
         self.listener.take()
     }
@@ -26521,6 +26546,51 @@ mod tests {
         drop(reconstructed);
         drop(source);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn reconstruction_test_support_consumes_once_without_exporting_authority() {
+        let selector_path = unique_socket_path("probe-consume-selector");
+        let selector = VsockBackendSelector::try_from_path(&selector_path)
+            .expect("test-support selector should validate");
+        let listener_path = unique_socket_path("probe-consume-listener");
+        let listener =
+            UnixListener::bind(&listener_path).expect("test-support listener should bind");
+        let mut incomplete = VirtioVsockReconstructionResource::new(
+            selector.clone(),
+            SuppliedVsockListener::new(listener),
+        );
+        let error = incomplete
+            .consume_for_test()
+            .expect_err("missing connector must fail before consumption");
+        assert!(matches!(
+            error,
+            VirtioVsockReconstructionError::GuestConnectorMissing
+        ));
+        assert!(!incomplete.is_consumed());
+        assert!(
+            !format!("{incomplete:?} {error:?} {error}")
+                .contains(selector_path.to_string_lossy().as_ref())
+        );
+        drop(incomplete);
+        fs::remove_file(&listener_path).expect("test-support listener path should clean");
+
+        let mut resource = reconstruction_resource(selector, "probe-consume");
+        resource
+            .consume_for_test()
+            .expect("test-support endpoint should consume once");
+        assert!(resource.is_consumed());
+        let error = resource
+            .consume_for_test()
+            .expect_err("test-support endpoint must reject repeated consumption");
+        assert!(matches!(
+            error,
+            VirtioVsockReconstructionError::ResourceConsumed
+        ));
+        assert!(
+            !format!("{resource:?} {error:?} {error}")
+                .contains(selector_path.to_string_lossy().as_ref())
+        );
     }
 
     #[test]

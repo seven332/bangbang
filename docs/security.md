@@ -690,6 +690,26 @@ at the same time, the external socket name and private ownership record can
 remain stale because Darwin has no unlink-on-final-close Unix socket; automatic
 later recovery removes only empty session namespaces.
 
+The internal snapshot restore-resource path composes these existing authorities
+through one session-bound generation rather than accepting separately assembled
+file, directory, broker, namespace, or wakeup facets. It validates the complete
+host-free root/vsock request before authority mutation; reserves the exact
+read-only root and create-children socket owners as one transaction; reverses
+both reservations on a prepublication abort; and permits typed take, socket
+adoption, and root completion only once. Postpublication failure is terminal
+even when identity-owned cleanup succeeds. No fallback opens a worker path.
+
+A disposable feature-gated signed bundle exercises the real launcher, sandboxed
+worker, grant channel, binder, broker, namespace, and lifecycle boundary. It
+proves all nine deterministic cancellation points, launcher-opened root
+authority after pathname replacement, clean prepared and active teardown,
+launcher-first and worker-first death, preservation of a replacement socket,
+same-ID concurrent-session isolation, fixed redacted output, unchanged
+entitlements, and no ready-state helper. The normal production bundle excludes
+the probe. This evidence does not add a public snapshot artifact or guest
+restore claim, and it cannot remove the simultaneous uncatchable launcher and
+worker death limit above.
+
 General dynamic post-Ready delivery, hard revocation, and cross-filesystem
 socket publication do not yet consume or extend their declared authority.
 
