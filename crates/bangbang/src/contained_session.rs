@@ -2925,8 +2925,9 @@ mod platform {
     #[cfg(test)]
     pub(crate) use tests::{
         TestDirectory as TestVhostDirectory, empty_grant_authority_for_vhost_test,
-        file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
-        vhost_directory_authority_for_test, vsock_directory_authority_for_test,
+        file_grant_authority_for_test, root_file_grant_authority_for_test,
+        snapshot_file_grant_authority_for_test, vhost_directory_authority_for_test,
+        vsock_directory_authority_for_test,
     };
 
     #[cfg(test)]
@@ -3232,6 +3233,49 @@ mod platform {
                 .registry
         }
 
+        fn root_file_registry(root_path: &Path) -> GrantRegistry {
+            let session = SessionId::from_bytes([35; 32]);
+            let batch = BatchId::from_bytes([36; 16]);
+            let mut staged = StagedGrantBatch::new(session);
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    0,
+                    GrantRecord::Begin {
+                        grant_count: 1,
+                        record_count: 3,
+                        bookmark_bytes: 0,
+                    },
+                    None,
+                ))
+                .expect("root grant begin should stage");
+            let (record, descriptor) = file_record(
+                "drive-ro",
+                ResourceRole::DriveBacking,
+                GrantAccess::ReadOnly,
+                root_path,
+            );
+            staged
+                .accept(received(session, batch, 1, record, Some(descriptor)))
+                .expect("root descriptor should stage");
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    2,
+                    GrantRecord::Commit {
+                        grant_count: 1,
+                        record_count: 3,
+                        bookmark_bytes: 0,
+                    },
+                    None,
+                ))
+                .expect("root grant commit should validate")
+                .expect("root grant commit should return a registry")
+                .registry
+        }
+
         fn directory_registry(id: &str, role: ResourceRole) -> (GrantRegistry, TestDirectory) {
             let directory = TestDirectory::new();
             let bookmark = create_implicit_bookmark(directory.path(), true)
@@ -3334,6 +3378,11 @@ mod platform {
 
         pub(crate) fn file_grant_authority_for_test() -> GrantAuthority {
             let mut registry = file_registry();
+            GrantAuthority::new(registry.take_file_registry())
+        }
+
+        pub(crate) fn root_file_grant_authority_for_test(root_path: &Path) -> GrantAuthority {
+            let mut registry = root_file_registry(root_path);
             GrantAuthority::new(registry.take_file_registry())
         }
 
@@ -4547,6 +4596,6 @@ pub(crate) use platform::{
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{
     TestVhostDirectory, empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
-    snapshot_file_grant_authority_for_test, vhost_directory_authority_for_test,
-    vsock_directory_authority_for_test,
+    root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
+    vhost_directory_authority_for_test, vsock_directory_authority_for_test,
 };

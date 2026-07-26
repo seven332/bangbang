@@ -1194,6 +1194,17 @@ fn root_restore_plan_prepares_pathless_mmio_and_pci_backings() {
         assert_eq!(plan.partuuid(), Some("1111-2222"));
         assert_eq!(plan.capacity_sectors(), 2048);
         assert!(!format!("{plan:?}").contains(plan.selector()));
+        let drive = plan
+            .drive_config()
+            .expect("validated root graph should reconstruct controller state");
+        assert_eq!(drive.drive_id(), "rootfs");
+        assert_eq!(drive.path_on_host(), Some(Path::new("root-selector")));
+        assert!(drive.is_root_device());
+        assert_eq!(drive.is_read_only(), Some(true));
+        assert_eq!(drive.partuuid(), Some("1111-2222"));
+        assert_eq!(drive.cache_type(), DriveCacheType::Writeback);
+        assert_eq!(drive.io_engine(), Some(DriveIoEngine::Sync));
+        assert_eq!(drive.rate_limiter(), fixture_config().rate_limiter());
 
         let file = TempFile::new("restore-root.img", 2048 << VIRTIO_BLOCK_SECTOR_SHIFT);
         let (backing, _) = BlockFileBacking::open_snapshot_read_only(file.path())
@@ -1219,6 +1230,69 @@ fn root_restore_plan_prepares_pathless_mmio_and_pci_backings() {
             }
         );
         assert!(!format!("{prepared:?}").contains("root-selector"));
+    }
+}
+
+#[test]
+fn prepared_root_transport_recaptures_exact_mmio_and_pci_state() {
+    for graph in [mmio_graph(), pci_graph()] {
+        let expected_virtio = graph.record.virtio.clone();
+        let expected_transport = graph.record.transport.clone();
+        let memory = contiguous_root_restore_memory();
+        let plan = SnapshotV2RootRestorePlan::prepare(graph, &memory, Instant::now())
+            .expect("root restore graph should prepare");
+        let file = TempFile::new(
+            "restore-root-transport.img",
+            2048 << VIRTIO_BLOCK_SECTOR_SHIFT,
+        );
+        let (backing, _) = BlockFileBacking::open_snapshot_read_only(file.path())
+            .expect("restore root backing should open");
+        let transport = plan
+            .prepare_backing(backing)
+            .expect("restore root backing should prepare")
+            .prepare_transport()
+            .expect("root transport should prepare");
+
+        match (transport, expected_transport) {
+            (
+                PreparedSnapshotV2RootTransport::Mmio(prepared),
+                SnapshotV2DeviceTransport::Mmio(expected),
+            ) => {
+                let (_, _, _, region, interrupt_line, handler) = prepared.into_parts();
+                let retained = handler.transport_state();
+                assert_eq!(
+                    capture_mmio_common(&retained, expected_virtio.available_features())
+                        .expect("restored MMIO common state should recapture"),
+                    expected_virtio
+                );
+                assert_eq!(
+                    capture_mmio_transport(region, interrupt_line, &retained)
+                        .expect("restored MMIO transport should recapture"),
+                    expected
+                );
+            }
+            (
+                PreparedSnapshotV2RootTransport::Pci(prepared),
+                SnapshotV2DeviceTransport::Pci(expected),
+            ) => {
+                assert_eq!(
+                    capture_pci_common(&prepared.retained, expected_virtio.available_features())
+                        .expect("restored PCI common state should recapture"),
+                    expected_virtio
+                );
+                assert_eq!(
+                    capture_pci_transport(
+                        prepared.origin,
+                        prepared.sbdf,
+                        prepared.bar_range,
+                        &prepared.retained,
+                    )
+                    .expect("restored PCI transport should recapture"),
+                    expected
+                );
+            }
+            _ => panic!("prepared root transport kind changed"),
+        }
     }
 }
 

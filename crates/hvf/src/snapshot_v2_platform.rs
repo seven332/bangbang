@@ -340,6 +340,15 @@ impl fmt::Debug for HvfSnapshotV2DefaultProcessShell {
     }
 }
 
+enum HvfSnapshotV2ProcessShellRestore {
+    DeviceFree(HvfSnapshotV2DefaultProcessShell),
+    Root {
+        shell: HvfSnapshotV2DefaultProcessShell,
+        resources: HvfSnapshotV2RootResourcePlan,
+        partuuid: Option<String>,
+    },
+}
+
 /// Ordered reconstruction stage for the unpublished native-v2 platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HvfSnapshotV2PlatformRestoreStage {
@@ -842,49 +851,72 @@ impl std::error::Error for HvfSnapshotV2PlatformShutdownError {
 /// actions, and path-based loading. The vCPU session is declared before the
 /// backend so owners are dropped before VM memory.
 pub struct RestoredHvfSnapshotV2Platform {
-    runner: HvfArm64BootVcpuSession<'static>,
-    backend: HvfBackend,
-    memory_binding: SnapshotV2MemoryBinding,
-    machine: HvfSnapshotV2MachineState,
-    compatibility: HvfSnapshotV1CompatibilityState,
-    rtc_device: Arm64BootRtcDevice,
-    serial_device: Option<Arm64BootSerialDevice>,
-    vmgenid_device: Arm64BootVmGenIdDevice,
-    vmclock_device: Arm64BootVmClockDevice,
-    pvtime_layout: Arm64PvTimeLayout,
+    parts: Option<RestoredHvfSnapshotV2PlatformParts>,
+}
+
+/// Crate-private consuming handoff into the complete product owner.
+pub(crate) struct RestoredHvfSnapshotV2PlatformParts {
+    pub(crate) runner: HvfArm64BootVcpuSession<'static>,
+    pub(crate) backend: HvfBackend,
+    pub(crate) mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    pub(crate) memory_binding: SnapshotV2MemoryBinding,
+    pub(crate) machine: HvfSnapshotV2MachineState,
+    pub(crate) compatibility: HvfSnapshotV1CompatibilityState,
+    pub(crate) rtc_device: Arm64BootRtcDevice,
+    pub(crate) serial_device: Option<Arm64BootSerialDevice>,
+    pub(crate) vmgenid_device: Arm64BootVmGenIdDevice,
+    pub(crate) vmclock_device: Arm64BootVmClockDevice,
+    pub(crate) pvtime_layout: Arm64PvTimeLayout,
 }
 
 impl RestoredHvfSnapshotV2Platform {
+    fn parts(&self) -> &RestoredHvfSnapshotV2PlatformParts {
+        match self.parts.as_ref() {
+            Some(parts) => parts,
+            None => std::process::abort(),
+        }
+    }
+
+    fn parts_mut(&mut self) -> &mut RestoredHvfSnapshotV2PlatformParts {
+        match self.parts.as_mut() {
+            Some(parts) => parts,
+            None => std::process::abort(),
+        }
+    }
+
     /// Return the complete destination vCPU count.
     pub fn vcpu_count(&self) -> usize {
-        self.runner.member_count()
+        self.parts().runner.member_count()
     }
 
     /// Return owner-thread-verified canonical MPIDRs.
     pub fn vcpu_mpidrs(&self) -> &[u64] {
-        self.runner.mpidrs()
+        self.parts().runner.mpidrs()
     }
 
     /// Return the retained exact memory-image binding.
-    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
-        &self.memory_binding
+    pub fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.parts().memory_binding
     }
 
     /// Return retained logical machine, boot, FDT, and CPU-template facts.
-    pub const fn machine(&self) -> &HvfSnapshotV2MachineState {
-        &self.machine
+    pub fn machine(&self) -> &HvfSnapshotV2MachineState {
+        &self.parts().machine
     }
 
     /// Return the destination-validated common compatibility facts.
-    pub const fn compatibility(&self) -> &HvfSnapshotV1CompatibilityState {
-        &self.compatibility
+    pub fn compatibility(&self) -> &HvfSnapshotV1CompatibilityState {
+        &self.parts().compatibility
     }
 
     /// Borrow the fresh process UART output when this owner was reconstructed
     /// through the closed process shell.
     #[doc(hidden)]
     pub fn serial_output(&self) -> Option<&SharedSerialOutput> {
-        self.serial_device.as_ref().map(|device| &device.output)
+        self.parts()
+            .serial_device
+            .as_ref()
+            .map(|device| &device.output)
     }
 
     /// Reobserve the complete paused lifecycle graph.
@@ -894,7 +926,7 @@ impl RestoredHvfSnapshotV2Platform {
         crate::paused_topology::HvfArm64StablePausedTopologyState,
         HvfArm64StablePausedTopologyCaptureError,
     > {
-        self.runner.capture_stable_paused_topology()
+        self.parts_mut().runner.capture_stable_paused_topology()
     }
 
     /// Recapture the complete reconstructed platform while it remains paused.
@@ -906,23 +938,25 @@ impl RestoredHvfSnapshotV2Platform {
         &mut self,
         memory_writer: &mut W,
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
-        let (stable, captures, pvtime_capture) =
-            self.runner
-                .capture_arm64_snapshot_v2_topology()
-                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
-        let memory = self
+        let parts = self.parts_mut();
+        let (stable, captures, pvtime_capture) = parts
+            .runner
+            .capture_arm64_snapshot_v2_topology()
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Topology { source })?;
+        let memory = parts
             .backend
             .mapped_guest_memory()
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::GuestMemory { source })?;
-        verify_capture_fdt_identity(memory, &self.machine)?;
+        verify_capture_fdt_identity(memory, &parts.machine)?;
         if captures.len() != stable.members().len() {
             return Err(HvfArm64BootSnapshotV2CaptureError::CompatibilityMismatch {
                 index: captures.len(),
             });
         }
 
-        let expected_identification = self.compatibility.identification();
-        let expected_optional_identification = self.compatibility.optional_sve_sme_identification();
+        let expected_identification = parts.compatibility.identification();
+        let expected_optional_identification =
+            parts.compatibility.optional_sve_sme_identification();
         let mut vcpus = Vec::new();
         vcpus
             .try_reserve_exact(captures.len())
@@ -978,21 +1012,21 @@ impl RestoredHvfSnapshotV2Platform {
         }
         let global_gic =
             global_gic.ok_or(HvfArm64BootSnapshotV2CaptureError::GlobalGicShape { index: 0 })?;
-        let global = HvfSnapshotV2GlobalState::try_new(self.compatibility.clone(), global_gic)
+        let global = HvfSnapshotV2GlobalState::try_new(parts.compatibility.clone(), global_gic)
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
                 stage: HvfArm64BootSnapshotV2CaptureStage::GlobalGic,
                 source,
             })?;
         let rtc_layout = RtcMmioLayout::new(
-            self.rtc_device.region.range().start(),
-            self.rtc_device.region.id(),
+            parts.rtc_device.region.range().start(),
+            parts.rtc_device.region.id(),
         );
         let time = capture_hvf_snapshot_v2_time_state(
             memory,
             rtc_layout,
-            &self.vmgenid_device,
-            &self.vmclock_device,
-            Some(&self.pvtime_layout),
+            &parts.vmgenid_device,
+            &parts.vmclock_device,
+            Some(&parts.pvtime_layout),
             &pvtime_capture,
         )
         .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
@@ -1000,7 +1034,7 @@ impl RestoredHvfSnapshotV2Platform {
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
         HvfSnapshotV2PlatformState::try_new(
             memory_binding,
-            self.machine.clone(),
+            parts.machine.clone(),
             global,
             stable,
             vcpus,
@@ -1015,13 +1049,13 @@ impl RestoredHvfSnapshotV2Platform {
     /// Begin execution only after the fully restored platform was published.
     #[doc(hidden)]
     pub fn resume(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
-        self.runner.resume()
+        self.parts_mut().runner.resume()
     }
 
     /// Return the post-publication topology control capability.
     #[doc(hidden)]
     pub fn control(&self) -> HvfVcpuRunControl {
-        self.runner.control()
+        self.parts().runner.control()
     }
 
     /// Run one post-publication boot-session step.
@@ -1030,19 +1064,35 @@ impl RestoredHvfSnapshotV2Platform {
         &mut self,
         entry_is_valid: impl FnMut(u64) -> bool,
     ) -> Result<HvfVcpuRunStepOutcome, HvfArm64BootVcpuError> {
-        self.runner.run_step(entry_is_valid)
+        self.parts_mut().runner.run_step(entry_is_valid)
     }
 
     /// Set the last stepped member's PPI pending bit.
     #[doc(hidden)]
     pub fn set_last_step_ppi_pending(&self, intid: u32) -> Result<(), HvfArm64BootVcpuError> {
-        self.runner.set_last_step_ppi_pending(intid)
+        self.parts().runner.set_last_step_ppi_pending(intid)
     }
 
     /// Borrow already-authorized destination guest memory.
     #[doc(hidden)]
     pub fn guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
-        self.backend.mapped_guest_memory_for_public_access()
+        self.parts().backend.mapped_guest_memory_for_public_access()
+    }
+
+    pub(crate) fn backend(&self) -> &HvfBackend {
+        &self.parts().backend
+    }
+
+    pub(crate) fn mmio_dispatcher(&self) -> &Arc<Mutex<MmioDispatcher>> {
+        &self.parts().mmio_dispatcher
+    }
+
+    /// Transfers the complete unpublished platform into a root-bearing owner.
+    pub(crate) fn into_parts(mut self) -> RestoredHvfSnapshotV2PlatformParts {
+        match self.parts.take() {
+            Some(parts) => parts,
+            None => std::process::abort(),
+        }
     }
 
     /// Shut down vCPU owners before unmapping memory and destroying the VM.
@@ -1054,10 +1104,14 @@ impl RestoredHvfSnapshotV2Platform {
                 HvfSnapshotV2PlatformCleanupStage::Backend,
             ]
         );
-        self.runner
+        let Some(parts) = self.parts.as_mut() else {
+            return Ok(());
+        };
+        parts
+            .runner
             .shutdown()
             .map_err(HvfSnapshotV2PlatformShutdownError::Vcpu)?;
-        <HvfBackend as VmBackend>::destroy_vm(&mut self.backend)
+        <HvfBackend as VmBackend>::destroy_vm(&mut parts.backend)
             .map_err(HvfSnapshotV2PlatformShutdownError::Backend)
     }
 }
@@ -1143,13 +1197,35 @@ pub fn restore_hvf_snapshot_v2_process_platform(
     memory: GuestMemory,
     shell: HvfSnapshotV2DefaultProcessShell,
 ) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
-    restore_hvf_snapshot_v2_platform_with_shell(state, memory, Some(shell))
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::DeviceFree(shell)),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_root_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2DefaultProcessShell,
+    resources: HvfSnapshotV2RootResourcePlan,
+    partuuid: Option<String>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::Root {
+            shell,
+            resources,
+            partuuid,
+        }),
+    )
 }
 
 fn restore_hvf_snapshot_v2_platform_with_shell(
     state: HvfSnapshotV2PlatformState,
     memory: GuestMemory,
-    process_shell: Option<HvfSnapshotV2DefaultProcessShell>,
+    process_shell: Option<HvfSnapshotV2ProcessShellRestore>,
 ) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
     debug_assert!(cleanup_sequence(RestoreOwnership::Empty).is_empty());
     let mut cleanup = Vec::new();
@@ -1555,7 +1631,7 @@ fn restore_hvf_snapshot_v2_platform_with_shell(
     let runner = match HvfArm64BootVcpuSession::from_stable_paused_topology(
         raw_topology,
         &stable,
-        dispatcher,
+        Arc::clone(&dispatcher),
         stable.virtual_timer_intid(),
     ) {
         Ok(runner) => runner,
@@ -1571,16 +1647,19 @@ fn restore_hvf_snapshot_v2_platform_with_shell(
     };
 
     Ok(RestoredHvfSnapshotV2Platform {
-        runner,
-        backend,
-        memory_binding,
-        machine,
-        compatibility,
-        rtc_device,
-        serial_device,
-        vmgenid_device,
-        vmclock_device,
-        pvtime_layout,
+        parts: Some(RestoredHvfSnapshotV2PlatformParts {
+            runner,
+            backend,
+            mmio_dispatcher: dispatcher,
+            memory_binding,
+            machine,
+            compatibility,
+            rtc_device,
+            serial_device,
+            vmgenid_device,
+            vmclock_device,
+            pvtime_layout,
+        }),
     })
 }
 
@@ -1977,7 +2056,18 @@ fn pci_msix_routes_match_gic(
     else {
         return false;
     };
-    state.entries().iter().all(|entry| {
+    state.entries().iter().enumerate().all(|(index, entry)| {
+        let Ok(vector) = u16::try_from(index) else {
+            return false;
+        };
+        let referenced = state.config_vector() == vector || state.queue_vectors().contains(&vector);
+        let pending = state
+            .pending_words()
+            .get(index / u64::BITS as usize)
+            .is_some_and(|word| word & (1_u64 << (index % u64::BITS as usize)) != 0);
+        if entry.vector_control() & 1 != 0 || (!referenced && !pending) {
+            return true;
+        }
         let address = (u64::from(entry.message_address_high()) << 32)
             | u64::from(entry.message_address_low());
         address == expected_address
@@ -1987,19 +2077,18 @@ fn pci_msix_routes_match_gic(
 }
 
 fn prepare_process_shell(
-    shell: Option<HvfSnapshotV2DefaultProcessShell>,
+    shell: Option<HvfSnapshotV2ProcessShellRestore>,
     state: &HvfSnapshotV2PlatformState,
     fdt_bytes: &[u8],
 ) -> Result<(MmioDispatcher, Option<Arm64BootSerialDevice>), HvfSnapshotV2PlatformRestoreFailure> {
     let mut dispatcher = MmioDispatcher::new();
-    let Some(shell) = shell else {
+    let Some(shell_restore) = shell else {
         return Ok((dispatcher, None));
     };
 
     let gic = state.global().compatibility().gic_metadata();
-    if gic.msi.is_some()
-        || state.time().rtc_layout()
-            != RtcMmioLayout::new(PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID)
+    if state.time().rtc_layout()
+        != RtcMmioLayout::new(PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID)
     {
         return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
             mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
@@ -2007,6 +2096,44 @@ fn prepare_process_shell(
     }
     let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
         .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
+    let (shell, root) = match shell_restore {
+        HvfSnapshotV2ProcessShellRestore::DeviceFree(shell) => {
+            if gic.msi.is_some() {
+                return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                    mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                });
+            }
+            (shell, None)
+        }
+        HvfSnapshotV2ProcessShellRestore::Root {
+            shell,
+            resources,
+            partuuid,
+        } => {
+            match resources.transport() {
+                HvfSnapshotV2RootTransportPlan::Mmio { interrupt_line, .. } => {
+                    if gic.msi.is_some()
+                        || allocator
+                            .allocate()
+                            .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                            != interrupt_line
+                    {
+                        return Err(
+                            HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                        );
+                    }
+                }
+                HvfSnapshotV2RootTransportPlan::Pci { msi, .. } => {
+                    if gic.msi != Some(msi) {
+                        return Err(
+                            HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                        );
+                    }
+                }
+            }
+            (shell, Some((partuuid, resources.transport())))
+        }
+    };
     let serial_interrupt = allocator
         .allocate()
         .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
@@ -2021,8 +2148,14 @@ fn prepare_process_shell(
     {
         return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
     }
-    validate_default_process_fdt(fdt_bytes, state, serial_interrupt)
-        .map_err(|mismatch| HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt { mismatch })?;
+    validate_process_fdt(
+        fdt_bytes,
+        state,
+        serial_interrupt,
+        root.as_ref()
+            .map(|(partuuid, transport)| (partuuid.as_deref(), *transport)),
+    )
+    .map_err(|mismatch| HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt { mismatch })?;
 
     let serial = register_arm64_boot_serial_mmio(
         &mut dispatcher,
@@ -2037,6 +2170,7 @@ fn prepare_process_shell(
     Ok((dispatcher, Some(serial)))
 }
 
+#[cfg(test)]
 fn validate_default_process_fdt(
     bytes: &[u8],
     state: &HvfSnapshotV2PlatformState,
@@ -2051,11 +2185,14 @@ fn validate_root_process_fdt(
     root: &SnapshotV2RootRestorePlan,
     resources: HvfSnapshotV2RootResourcePlan,
 ) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
+    if root.transport().kind() != resources.transport().kind() {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Root);
+    }
     validate_process_fdt(
         bytes,
         state,
         resources.serial_interrupt,
-        Some((root, resources.transport)),
+        Some((root.partuuid(), resources.transport)),
     )
 }
 
@@ -2063,7 +2200,7 @@ fn validate_process_fdt(
     bytes: &[u8],
     state: &HvfSnapshotV2PlatformState,
     serial_interrupt: GuestInterruptLine,
-    root: Option<(&SnapshotV2RootRestorePlan, HvfSnapshotV2RootTransportPlan)>,
+    root: Option<(Option<&str>, HvfSnapshotV2RootTransportPlan)>,
 ) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
     let tree = DeviceTree::load(bytes).map_err(|_| HvfSnapshotV2ProcessFdtMismatch::Parse)?;
     let time = state.time();
@@ -2167,10 +2304,10 @@ fn validate_process_fdt(
         return Err(HvfSnapshotV2ProcessFdtMismatch::Boot);
     };
     let expected_boot_args = match root {
-        Some((root, transport)) => canonical_process_root_block_command_line(
+        Some((partuuid, transport)) => canonical_process_root_block_command_line(
             state.machine().boot().boot_arguments(),
             matches!(transport, HvfSnapshotV2RootTransportPlan::Pci { .. }),
-            root.partuuid(),
+            partuuid,
             true,
         )
         .map_err(|_| HvfSnapshotV2ProcessFdtMismatch::Boot)?,
@@ -2347,19 +2484,16 @@ fn validate_process_fdt(
 fn validate_process_root_nodes(
     root_node: &Node,
     intc: &Node,
-    root: Option<(&SnapshotV2RootRestorePlan, HvfSnapshotV2RootTransportPlan)>,
+    root: Option<(Option<&str>, HvfSnapshotV2RootTransportPlan)>,
 ) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
-    let Some((root, resources)) = root else {
+    let Some((_partuuid, resources)) = root else {
         return Ok(());
     };
-    match (root.transport(), resources) {
-        (
-            SnapshotV2DeviceTransport::Mmio(graph),
-            HvfSnapshotV2RootTransportPlan::Mmio {
-                region,
-                interrupt_line,
-            },
-        ) => {
+    match resources {
+        HvfSnapshotV2RootTransportPlan::Mmio {
+            region,
+            interrupt_line,
+        } => {
             let node = child_matching(root_node, |node| {
                 node_name_has_number(
                     &node.name,
@@ -2373,9 +2507,7 @@ fn validate_process_root_nodes(
                 .raw_value()
                 .checked_sub(32)
                 .ok_or(HvfSnapshotV2ProcessFdtMismatch::Root)?;
-            if graph.region() != region
-                || graph.interrupt_line() != interrupt_line
-                || !node.children.is_empty()
+            if !node.children.is_empty()
                 || !node
                     .prop_str("compatible")
                     .is_ok_and(|compatible| compatible == "virtio,mmio")
@@ -2394,18 +2526,13 @@ fn validate_process_root_nodes(
             }
             Ok(())
         }
-        (
-            SnapshotV2DeviceTransport::Pci(graph),
-            HvfSnapshotV2RootTransportPlan::Pci {
-                sbdf,
-                bar_region_id,
-                bar_range,
-                msi,
-            },
-        ) => {
-            if graph.sbdf() != sbdf
-                || graph.bar_range() != bar_range
-                || pci_root_restore_bar_region_id().ok() != Some(bar_region_id)
+        HvfSnapshotV2RootTransportPlan::Pci {
+            sbdf: _,
+            bar_region_id,
+            bar_range: _,
+            msi,
+        } => {
+            if pci_root_restore_bar_region_id().ok() != Some(bar_region_id)
                 || !validate_process_pci_host(root_node)
                 || !validate_process_gic_msi(intc, msi)
             {
@@ -2413,7 +2540,6 @@ fn validate_process_root_nodes(
             }
             Ok(())
         }
-        _ => Err(HvfSnapshotV2ProcessFdtMismatch::Root),
     }
 }
 
@@ -3940,6 +4066,38 @@ mod tests {
                 .to_string()
                 .contains("after destination identity committed")
         );
+    }
+
+    #[test]
+    fn root_restore_is_terminal_when_nested_platform_cleanup_is_incomplete() {
+        let clean = crate::startup::HvfSnapshotV2RootRestoreError::platform(
+            HvfSnapshotV2PlatformRestoreError::new(
+                HvfSnapshotV2PlatformRestoreStage::Memory,
+                HvfSnapshotV2PlatformRestoreFailure::MemoryTopology,
+                Vec::new(),
+            ),
+        );
+        assert!(!clean.is_committed());
+        assert!(!clean.has_incomplete_cleanup());
+        assert!(!clean.is_terminal());
+
+        let incomplete = crate::startup::HvfSnapshotV2RootRestoreError::platform(
+            HvfSnapshotV2PlatformRestoreError::new(
+                HvfSnapshotV2PlatformRestoreStage::Memory,
+                HvfSnapshotV2PlatformRestoreFailure::MemoryTopology,
+                vec![HvfSnapshotV2PlatformCleanupFailure {
+                    stage: HvfSnapshotV2PlatformCleanupStage::Backend,
+                    source: Box::new(Injected),
+                }],
+            ),
+        );
+        assert!(!incomplete.is_committed());
+        assert!(
+            incomplete.cleanup_failures().is_empty(),
+            "nested platform cleanup stays attached to its platform failure"
+        );
+        assert!(incomplete.has_incomplete_cleanup());
+        assert!(incomplete.is_terminal());
     }
 
     #[test]

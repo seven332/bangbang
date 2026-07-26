@@ -3495,6 +3495,32 @@ mod tests {
     }
 
     #[test]
+    fn private_native_v2_root_controller_commit_publishes_one_exact_drive() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let machine = MachineConfigInput::new(2, 256)
+            .validate()
+            .expect("restored machine fixture should validate");
+        let boot = BootSourceConfigInput::new("/inert/source/kernel")
+            .with_boot_args("console=ttyS0")
+            .validate()
+            .expect("inert boot metadata should validate");
+        let root = DriveConfigInput::new("rootfs", "rootfs", "root-selector", true)
+            .with_is_read_only(true)
+            .with_io_engine(DriveIoEngine::Sync)
+            .with_partuuid("1111-2222")
+            .validate()
+            .expect("restored root configuration should validate");
+        let commit =
+            SnapshotV2ControllerCommit::try_new_with_root(machine, boot, root.clone(), false)
+                .expect("root controller state should preallocate");
+        assert!(!format!("{commit:?}").contains("root-selector"));
+
+        assert!(!controller.commit_snapshot_v2_load(commit));
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert_eq!(controller.drive_configs(), &[root]);
+    }
+
+    #[test]
     fn controller_native_v1_create_profile_is_fail_closed() {
         let input = snapshot_create_input(SnapshotType::Full);
         let mut supported = supported_snapshot_controller();

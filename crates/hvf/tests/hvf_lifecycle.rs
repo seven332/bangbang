@@ -7205,11 +7205,20 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn native_v2_root_graph_converts_signed_mmio_and_pci_owners_canonically() {
+    use std::fs::{File, OpenOptions};
     use std::time::Instant;
 
-    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+    use bangbang_hvf::{
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState,
+        HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2NativePath, HvfSnapshotV2RootProcessConfig,
+        HvfSnapshotV2State, OwnedHvfArm64BootSession, decode_hvf_snapshot_v2_state,
+        encode_hvf_snapshot_v2_state, prepare_hvf_snapshot_v2_root_plan,
+    };
     use bangbang_runtime::VmmAction;
-    use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput, DriveIoEngine};
+    use bangbang_runtime::block::{
+        BlockFileBacking, BlockMmioLayout, DriveConfigInput, DriveIoEngine,
+    };
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
     use bangbang_runtime::mmio::MmioRegionId;
@@ -7219,10 +7228,14 @@ fn native_v2_root_graph_converts_signed_mmio_and_pci_owners_canonically() {
         PCI_SEGMENT_ZERO, PciSbdf,
     };
     use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::rtc::RtcMmioLayout;
+    use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::snapshot_device_v2::{
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
         SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
     };
+    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version;
+    use bangbang_runtime::snapshot_memory_v2::load_snapshot_v2_memory_file;
     use bangbang_runtime::storage_capture::{CaptureReadyStorageConfigs, StorageDeviceOrigin};
     use bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE;
     use bangbang_runtime::vsock::VsockMmioLayout;
@@ -7264,13 +7277,19 @@ fn native_v2_root_graph_converts_signed_mmio_and_pci_owners_canonically() {
 
         let block_layout =
             BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+        let source_serial = SharedSerialOutputBuffer::default();
         let mut session_config = HvfArm64BootSessionConfig::new(
             block_layout,
             PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
             NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
             VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
-            test_rtc_mmio_layout(),
-        );
+            RtcMmioLayout::new(GuestAddress::new(0x4000_1000), MmioRegionId::new(10)),
+        )
+        .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+            MmioRegionId::new(20),
+            GuestAddress::new(0x4000_2000),
+            SharedSerialOutput::from(source_serial),
+        ));
         if pci_enabled {
             session_config = session_config.with_pci_enabled();
         }
@@ -7391,10 +7410,125 @@ fn native_v2_root_graph_converts_signed_mmio_and_pci_owners_canonically() {
         assert!(!diagnostics.contains(&path_text(root.path())));
         assert!(!diagnostics.contains("candidate-rootfs"));
 
+        session
+            .pause_for_snapshot_v2_capture()
+            .unwrap_or_else(|error| panic!("{case} source should pause: {error}"));
+        let boot = HvfSnapshotV2BootState::try_new(
+            HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+                .unwrap_or_else(|error| panic!("{case} kernel path should validate: {error}")),
+            None,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{case} boot metadata should validate: {error}"));
+        let capture_input = HvfArm64BootSnapshotV2CaptureInput::new(boot);
+        let memory_artifact = TempFile::new_len(&format!("{case}-root-owner-memory"), 0)
+            .unwrap_or_else(|error| panic!("{case} memory artifact should create: {error}"));
+        let mut memory_writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(memory_artifact.path())
+            .unwrap_or_else(|error| panic!("{case} memory artifact should open: {error}"));
+        let source_platform = session
+            .capture_snapshot_v2_device_graph_platform_with_cancel(
+                capture_input.clone(),
+                &mut memory_writer,
+                |_| false,
+            )
+            .unwrap_or_else(|error| panic!("{case} exact platform should capture: {error}"));
+        let source_state =
+            HvfSnapshotV2State::try_new(source_platform.clone(), first_graph.clone())
+                .unwrap_or_else(|error| panic!("{case} complete state should validate: {error}"));
+        let encoded = encode_hvf_snapshot_v2_state(&source_state)
+            .unwrap_or_else(|error| panic!("{case} complete state should encode: {error}"));
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &encoded,
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("{case} complete state should decode: {error}"));
+        let decoded = decode_hvf_snapshot_v2_state(&structural)
+            .unwrap_or_else(|error| panic!("{case} typed state should decode: {error}"));
+        drop(memory_writer);
         drop(guard);
         session
             .shutdown()
             .unwrap_or_else(|error| panic!("{case} signed session should shut down: {error}"));
+
+        let restored_memory = load_snapshot_v2_memory_file(
+            &structural,
+            File::open(memory_artifact.path())
+                .unwrap_or_else(|error| panic!("{case} memory artifact should reopen: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("{case} memory should load: {error}"));
+        let process = HvfSnapshotV2RootProcessConfig::new(block_layout, pci_enabled);
+        let prepared =
+            prepare_hvf_snapshot_v2_root_plan(decoded, restored_memory, process, Instant::now())
+                .unwrap_or_else(|error| panic!("{case} root plan should prepare: {error}"));
+        let (platform, memory, root_plan, resources) = prepared.into_parts();
+        let (backing, _identity) = BlockFileBacking::open_snapshot_read_only(root.path())
+            .unwrap_or_else(|error| panic!("{case} root backing should reopen: {error}"));
+        let prepared_root = root_plan
+            .prepare_backing(backing)
+            .unwrap_or_else(|error| panic!("{case} root backing should validate: {error}"));
+        let restored_serial = SharedSerialOutputBuffer::default();
+        let shell =
+            HvfSnapshotV2DefaultProcessShell::new(SharedSerialOutput::from(restored_serial));
+        let mut restored = OwnedHvfArm64BootSession::restore_snapshot_v2_root(
+            platform,
+            memory,
+            shell,
+            prepared_root,
+            resources,
+        )
+        .unwrap_or_else(|error| panic!("{case} complete root owner should restore: {error:?}"));
+        assert_eq!(restored.uses_pci_data_devices(), pci_enabled);
+        assert!(restored.restored_snapshot_v2_memory_binding().is_some());
+        assert_eq!(
+            restored.restored_snapshot_v2_machine(),
+            Some(source_platform.machine())
+        );
+        let restored_topology = restored
+            .capture_stable_paused_vcpu_topology()
+            .unwrap_or_else(|error| panic!("{case} paused topology should recapture: {error}"));
+        assert_eq!(restored_topology, *source_platform.topology());
+
+        let restored_guard = restored
+            .quiesce_limiter_retry_wakeups()
+            .unwrap_or_else(|error| {
+                panic!("{case} restored retry publishers should quiesce: {error}")
+            });
+        let restored_storage = restored
+            .capture_ready_storage_state_at(&configs, &restored_guard, Instant::now())
+            .unwrap_or_else(|error| panic!("{case} restored root should recapture: {error}"));
+        let [restored_root] = restored_storage.block_devices() else {
+            panic!("{case} restored owner should retain exactly one root");
+        };
+        let restored_graph = SnapshotV2DeviceGraph::from_capture_ready_root(
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            restored_root,
+        )
+        .unwrap_or_else(|error| panic!("{case} restored graph should convert: {error}"));
+        assert_eq!(restored_graph, first_graph);
+
+        let recaptured_memory = TempFile::new_len(&format!("{case}-root-owner-recapture"), 0)
+            .unwrap_or_else(|error| panic!("{case} recapture artifact should create: {error}"));
+        let mut recaptured_writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(recaptured_memory.path())
+            .unwrap_or_else(|error| panic!("{case} recapture artifact should open: {error}"));
+        let recaptured_platform = restored
+            .capture_snapshot_v2_device_graph_platform_with_cancel(
+                capture_input,
+                &mut recaptured_writer,
+                |_| false,
+            )
+            .unwrap_or_else(|error| panic!("{case} restored platform should recapture: {error}"));
+        assert_native_v2_platform_recapture_equivalent(&source_platform, &recaptured_platform);
+
+        drop(restored_guard);
+        restored
+            .shutdown()
+            .unwrap_or_else(|error| panic!("{case} restored owner should shut down: {error}"));
     }
 }
 

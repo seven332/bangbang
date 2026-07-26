@@ -2681,20 +2681,28 @@ impl VirtioBlockRuntimeState {
             rate_limiter,
             input.has_retry,
         );
-        let activation_is_active = device.is_activated();
-        let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
-            VIRTIO_BLOCK_DEVICE_ID,
-            input.config_space.available_features(),
-            &VIRTIO_BLOCK_QUEUE_SIZES,
-            input.config_space,
-            device,
-        )
-        .map_err(|_| VirtioBlockRuntimeStateError::HandlerBuild)?;
-        handler
-            .restore_transport_state(&self.transport, activation_is_active)
-            .map_err(|_| VirtioBlockRuntimeStateError::Transport)?;
-        Ok(handler)
+        restore_prepared_block_mmio_handler(input.config_space, device, &self.transport)
     }
+}
+
+pub(crate) fn restore_prepared_block_mmio_handler(
+    config_space: VirtioBlockConfigSpace,
+    device: VirtioBlockDevice,
+    transport: &VirtioMmioTransportState,
+) -> Result<VirtioBlockMmioHandler, VirtioBlockRuntimeStateError> {
+    let activation_is_active = device.is_activated();
+    let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
+        VIRTIO_BLOCK_DEVICE_ID,
+        config_space.available_features(),
+        &VIRTIO_BLOCK_QUEUE_SIZES,
+        config_space,
+        device,
+    )
+    .map_err(|_| VirtioBlockRuntimeStateError::HandlerBuild)?;
+    handler
+        .restore_transport_state(transport, activation_is_active)
+        .map_err(|_| VirtioBlockRuntimeStateError::Transport)?;
+    Ok(handler)
 }
 
 impl fmt::Debug for VirtioBlockRuntimeState {
@@ -7413,7 +7421,10 @@ pub struct BlockMmioDeviceRegistration {
 }
 
 impl BlockMmioDeviceRegistration {
-    pub(crate) fn from_restored(index: usize, drive_id: String, region: MmioRegion) -> Self {
+    /// Reconstructs registration metadata for an already installed retained
+    /// MMIO handler.
+    #[doc(hidden)]
+    pub fn from_restored(index: usize, drive_id: String, region: MmioRegion) -> Self {
         Self {
             index,
             drive_id,

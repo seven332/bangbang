@@ -641,6 +641,16 @@ pub(crate) struct PciType0GuestState {
 }
 
 impl PciType0GuestState {
+    pub(crate) fn from_parts(
+        writable_bytes: Vec<PciType0WritableByte>,
+        bar_probes: Vec<PciType0BarProbeState>,
+    ) -> Self {
+        Self {
+            writable_bytes,
+            bar_probes,
+        }
+    }
+
     pub(crate) fn writable_bytes(&self) -> &[PciType0WritableByte] {
         &self.writable_bytes
     }
@@ -678,6 +688,14 @@ impl PciType0WritableByte {
     pub(crate) const fn writable_mask(self) -> u8 {
         self.writable_mask
     }
+
+    pub(crate) fn with_value(mut self, value: u8) -> Result<Self, PciType0SnapshotError> {
+        if value & !self.writable_mask != 0 {
+            return Err(PciType0SnapshotError::ProfileMismatch);
+        }
+        self.value = value;
+        Ok(self)
+    }
 }
 
 impl fmt::Debug for PciType0WritableByte {
@@ -699,6 +717,11 @@ impl PciType0BarProbeState {
 
     pub(crate) const fn pending(self) -> bool {
         self.pending
+    }
+
+    pub(crate) const fn with_pending(mut self, pending: bool) -> Self {
+        self.pending = pending;
+        self
     }
 }
 
