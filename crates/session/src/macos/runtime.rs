@@ -248,6 +248,21 @@ impl fmt::Debug for WorkerSocketNamespace {
 }
 
 impl WorkerSocketNamespace {
+    /// Constructs an anchored namespace from a test-owned directory.
+    ///
+    /// This bypasses production session naming and locking and is available
+    /// only to repository test targets.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_directory_for_test(path: &Path) -> Result<Self, RuntimeError> {
+        let directory = open_directory(path)?;
+        let identity = validate_directory(directory.as_raw_fd())?;
+        Ok(Self {
+            directory,
+            identity,
+        })
+    }
+
     /// Duplicates the validated namespace anchor with close-on-exec ownership.
     pub fn try_clone(&self) -> Result<Self, RuntimeError> {
         Ok(Self {

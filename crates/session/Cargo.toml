@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 getrandom = "0.3"
 libc = "0.2"
