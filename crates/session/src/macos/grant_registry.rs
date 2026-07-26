@@ -36,6 +36,39 @@ impl From<BookmarkError> for GrantRegistryError {
     }
 }
 
+/// Redacted live observation of one exact regular-file grant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ExactRegularFileGrantObservation {
+    identity: ObjectIdentity,
+    len: u64,
+}
+
+impl ExactRegularFileGrantObservation {
+    /// Returns the descriptor-derived identity for alias checks.
+    #[must_use]
+    pub const fn identity(self) -> ObjectIdentity {
+        self.identity
+    }
+
+    /// Returns the exact descriptor byte length.
+    #[must_use]
+    pub const fn len(self) -> u64 {
+        self.len
+    }
+
+    /// Returns whether the observed file is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+impl fmt::Debug for ExactRegularFileGrantObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ExactRegularFileGrantObservation(<redacted>)")
+    }
+}
+
 /// Atomically committed grant batch and acknowledgment values.
 #[derive(Debug)]
 pub struct CommittedGrantBatch {
@@ -251,6 +284,21 @@ impl FileGrantRegistry {
         identities: &mut Vec<ObjectIdentity>,
     ) -> Result<(), GrantRegistryError> {
         inspect_exact_files_into(&self.entries, requests, identities)
+    }
+
+    /// Live-inspects exact regular-file grants into caller-preallocated
+    /// observation storage.
+    ///
+    /// Unlike the generic stored-fact inspection, this operation revalidates
+    /// every live descriptor's close-on-exec flag, access, kind, identity,
+    /// status flags, and byte length before any descriptor is duplicated or
+    /// adopted.
+    pub fn inspect_exact_regular_files_into(
+        &self,
+        requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+        observations: &mut Vec<ExactRegularFileGrantObservation>,
+    ) -> Result<(), GrantRegistryError> {
+        inspect_exact_regular_files_into(&self.entries, requests, observations)
     }
 
     /// Duplicates exact file grants after complete in-memory validation.
@@ -817,6 +865,61 @@ fn inspect_exact_files_into(
     );
     if inspected.len() != requests.len() {
         inspected.clear();
+        return Err(GrantRegistryError);
+    }
+    Ok(())
+}
+
+fn inspect_exact_regular_files_into(
+    entries: &HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+    observations: &mut Vec<ExactRegularFileGrantObservation>,
+) -> Result<(), GrantRegistryError> {
+    if !observations.is_empty()
+        || observations.capacity() < requests.len()
+        || requests
+            .iter()
+            .any(|(_, _, _, kind)| *kind != GrantObjectKind::RegularFile)
+    {
+        return Err(GrantRegistryError);
+    }
+    validate_exact_files(entries, requests)?;
+    for (id, _, _, _) in requests {
+        let file = entries.get(id).ok_or(GrantRegistryError)?;
+        if validate_descriptor(
+            file.descriptor.as_raw_fd(),
+            file.kind,
+            file.access,
+            file.identity,
+            Some(file.status_flags),
+            file.block_device,
+        )
+        .is_err()
+        {
+            observations.clear();
+            return Err(GrantRegistryError);
+        }
+        let stat = match descriptor_stat(file.descriptor.as_raw_fd()) {
+            Ok(stat) => stat,
+            Err(source) => {
+                observations.clear();
+                return Err(source);
+            }
+        };
+        let len = match u64::try_from(stat.st_size) {
+            Ok(len) => len,
+            Err(_) => {
+                observations.clear();
+                return Err(GrantRegistryError);
+            }
+        };
+        observations.push(ExactRegularFileGrantObservation {
+            identity: file.identity,
+            len,
+        });
+    }
+    if observations.len() != requests.len() {
+        observations.clear();
         return Err(GrantRegistryError);
     }
     Ok(())
@@ -2610,6 +2713,52 @@ mod tests {
                 },
             ]
         );
+        let mut observations = Vec::with_capacity(exact.len());
+        files
+            .inspect_exact_regular_files_into(&exact, &mut observations)
+            .expect("live exact inspection should preserve request order");
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].identity(), identities[0]);
+        assert_eq!(observations[1].identity(), identities[1]);
+        assert_eq!(
+            observations[0].len(),
+            u64::try_from(kernel_stat.st_size).expect("kernel fixture length should fit")
+        );
+        assert_eq!(
+            observations[1].len(),
+            u64::try_from(initrd_stat.st_size).expect("initrd fixture length should fit")
+        );
+        let kernel_descriptor = files
+            .entries
+            .get(&kernel_id)
+            .expect("kernel grant should remain")
+            .descriptor
+            .as_raw_fd();
+        // SAFETY: F_GETFL and F_SETFL inspect and update the live test
+        // descriptor while the registry continues to own it.
+        let kernel_flags = unsafe { libc::fcntl(kernel_descriptor, libc::F_GETFL) };
+        assert!(kernel_flags >= 0);
+        // SAFETY: The descriptor remains live and O_NONBLOCK is a mutable
+        // status flag.
+        let set_nonblocking = unsafe {
+            libc::fcntl(
+                kernel_descriptor,
+                libc::F_SETFL,
+                kernel_flags | libc::O_NONBLOCK,
+            )
+        };
+        assert!(set_nonblocking >= 0);
+        let mut changed = Vec::with_capacity(exact.len());
+        assert!(
+            files
+                .inspect_exact_regular_files_into(&exact, &mut changed)
+                .is_err()
+        );
+        assert!(changed.is_empty());
+        // SAFETY: Restore the original status flags on the same live test
+        // descriptor before subsequent registry assertions.
+        let restore_flags = unsafe { libc::fcntl(kernel_descriptor, libc::F_SETFL, kernel_flags) };
+        assert!(restore_flags >= 0);
         assert_eq!(files.len(), 2);
         for invalid in [
             vec![(
@@ -2627,6 +2776,13 @@ mod tests {
             vec![exact[0].clone(), exact[0].clone()],
         ] {
             assert!(files.inspect_exact_files(&invalid).is_err());
+            let mut observations = Vec::with_capacity(invalid.len());
+            assert!(
+                files
+                    .inspect_exact_regular_files_into(&invalid, &mut observations)
+                    .is_err()
+            );
+            assert!(observations.is_empty());
             assert!(files.duplicate_exact_files(&invalid).is_err());
             assert!(files.take_exact_files(&invalid).is_err());
             assert_eq!(files.len(), 2);
@@ -2653,6 +2809,13 @@ mod tests {
             .expect("initrd grant should remain")
             .identity = kernel_identity;
         assert!(files.inspect_exact_files(&exact).is_err());
+        let mut observations = Vec::with_capacity(exact.len());
+        assert!(
+            files
+                .inspect_exact_regular_files_into(&exact, &mut observations)
+                .is_err()
+        );
+        assert!(observations.is_empty());
         assert_eq!(files.len(), 2);
         files
             .entries
