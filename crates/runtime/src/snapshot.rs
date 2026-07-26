@@ -83,6 +83,23 @@ impl SnapshotV2ControllerCommit {
         }
     }
 
+    /// Retains one already-validated exact-2.4 root configuration for atomic
+    /// publication with the reconstructed complete owner.
+    pub fn try_new_with_root(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        drive_config: DriveConfig,
+        resume_requested: bool,
+    ) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::from_validated_single(drive_config)?,
+            serial_config: SerialConfig::default(),
+            resume_requested,
+        })
+    }
+
     pub const fn resume_requested(&self) -> bool {
         self.resume_requested
     }

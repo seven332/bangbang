@@ -532,6 +532,13 @@ impl VirtioMmioQueueRegisters {
         })
     }
 
+    pub(crate) fn from_parts(queue_select: u32, queues: Vec<VirtioMmioQueueState>) -> Self {
+        Self {
+            queue_select,
+            queues,
+        }
+    }
+
     pub const fn queue_select(&self) -> u32 {
         self.queue_select
     }
@@ -974,6 +981,12 @@ impl VirtioMmioQueueNotificationRegisters {
         Ok(Self {
             pending_notifications: vec![false; queue_count],
         })
+    }
+
+    pub(crate) fn from_parts(pending_notifications: Vec<bool>) -> Self {
+        Self {
+            pending_notifications,
+        }
     }
 
     pub fn queue_count(&self) -> usize {

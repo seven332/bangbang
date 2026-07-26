@@ -330,6 +330,15 @@ impl Arm64BootPvTimeState {
         }
     }
 
+    /// Rebuild the already-advertised retained-memory PVTime owner.
+    #[doc(hidden)]
+    pub fn restored(layout: Arm64PvTimeLayout) -> Self {
+        Self {
+            layout: Some(layout),
+            advertised: true,
+        }
+    }
+
     /// Return the topology-ordered hidden record layout, when boot initialized it.
     pub const fn layout(&self) -> Option<&Arm64PvTimeLayout> {
         self.layout.as_ref()
@@ -644,6 +653,10 @@ pub struct Arm64BootRuntimeResources {
     pub machine_config: MachineConfig,
     pub layout: GuestMemoryLayout,
     pub boot_origin: Option<Arm64BootOriginMetadata>,
+    /// Retained FDT placement for a restored owner that must not recreate boot
+    /// payload ownership or rewrite guest memory.
+    #[doc(hidden)]
+    pub retained_fdt: Option<Arm64FdtGuestMemoryWrite>,
     pub rtc_device: Option<Arm64BootRtcDevice>,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub vmgenid_device: Arm64BootVmGenIdDevice,
@@ -1515,6 +1528,7 @@ pub fn install_snapshot_v1_runtime_with_memory_owner<MemoryOwner>(
         machine_config,
         layout,
         boot_origin: None,
+        retained_fdt: None,
         rtc_device: Some(rtc_device),
         serial_device: Some(serial_device),
         vmgenid_device,
@@ -5617,6 +5631,7 @@ impl Arm64BootResources {
                     loaded_boot_source: self.loaded_boot_source,
                     fdt: self.fdt,
                 }),
+                retained_fdt: None,
                 rtc_device: self.rtc_device,
                 serial_device: self.serial_device,
                 vmgenid_device: self.vmgenid_device,
@@ -5696,6 +5711,19 @@ fn prepare_pci_validation(
         },
         Arm64FdtPciHost::from_address_plan(plan),
     ))
+}
+
+/// Installs the retained all-virtio PCI host resources without producing or
+/// rewriting FDT metadata.
+#[doc(hidden)]
+pub fn prepare_restored_pci_validation(
+    dispatcher: &mut MmioDispatcher,
+) -> Result<Arm64BootPciValidationResources, Arm64BootResourceError> {
+    prepare_pci_validation(
+        dispatcher,
+        Arm64BootPciValidationConfig::all_virtio_devices(),
+    )
+    .map(|(resources, _fdt)| resources)
 }
 
 fn memory_size_bytes(config: MachineConfig) -> Result<u64, Arm64BootResourceError> {

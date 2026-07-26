@@ -22,11 +22,12 @@ use bangbang_runtime::balloon::{
 };
 use bangbang_runtime::block::async_executor::{BlockAsyncRuntimeError, SharedBlockAsyncRuntime};
 use bangbang_runtime::block::{
-    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveIoEngine, DriveLiveUpdateMode,
-    DriveRateLimiterConfig, DriveRuntimeMutationError, DriveUpdateError, PreparedBlockDevice,
-    RuntimeBlockDeviceResource, VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_QUEUE_SIZES,
-    VhostUserBlockConfigSignalError, VirtioBlockBackendKind, VirtioBlockConfigSpace,
-    VirtioBlockDevice, VirtioBlockDeviceNotificationError, VirtioBlockLiveUpdateError,
+    BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, DriveConfig, DriveIoEngine,
+    DriveLiveUpdateMode, DriveRateLimiterConfig, DriveRuntimeMutationError, DriveUpdateError,
+    PreparedBlockDevice, RuntimeBlockDeviceResource, VIRTIO_BLOCK_DEVICE_ID,
+    VIRTIO_BLOCK_QUEUE_SIZES, VhostUserBlockConfigSignalError, VirtioBlockBackendKind,
+    VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceNotificationError,
+    VirtioBlockLiveUpdateError,
 };
 use bangbang_runtime::boot::BootSourceFiles;
 use bangbang_runtime::boot_timer::{
@@ -38,12 +39,16 @@ use bangbang_runtime::entropy::{
     VirtioRngEntropySourceError, VirtioRngMmioCaptureState, VirtioRngOsEntropySource,
     VirtioRngPciCaptureError, VirtioRngPciCaptureState, VirtioRngRetryCaptureState,
 };
-use bangbang_runtime::fdt::{Arm64FdtCacheHierarchy, Arm64FdtError};
+use bangbang_runtime::fdt::{
+    Arm64FdtCacheHierarchy, Arm64FdtError, Arm64FdtGuestMemoryWrite, Arm64FdtRegion,
+    Arm64FdtVirtioMmioDevice,
+};
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
 use bangbang_runtime::memory::{
-    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryRange,
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryBacking, GuestMemoryLayout,
+    GuestMemoryRange,
 };
 use bangbang_runtime::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
@@ -53,12 +58,15 @@ use bangbang_runtime::memory_hotplug::{
 };
 use bangbang_runtime::message_interrupt::GuestMessageInterruptResources;
 use bangbang_runtime::metrics::{
-    BlockDeviceMetricsLease, NetworkInterfaceMetricsLease, PmemDeviceMetricsLease,
-    SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-    SharedMemoryHotplugDeviceMetrics, SharedNetworkInterfaceMetricsRegistry,
-    SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedVsockDeviceMetrics,
+    BlockDeviceMetricsLease, BlockDeviceMetricsRegistryError, NetworkInterfaceMetricsLease,
+    PmemDeviceMetricsLease, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+    SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
+    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
+    SharedVsockDeviceMetrics,
 };
-use bangbang_runtime::mmio::{MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId};
+use bangbang_runtime::mmio::{
+    MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
+};
 use bangbang_runtime::network::{
     NetworkDeviceProfile, NetworkInterfaceConfig, NetworkInterfaceUpdate,
     NetworkInterfaceUpdateError, NetworkMmioLayout, NetworkRuntimeMutationError,
@@ -88,19 +96,23 @@ use bangbang_runtime::serial::{
 use bangbang_runtime::snapshot_device::{
     SnapshotV1BlockRetryState, SnapshotV1DeviceState, SnapshotV1PlatformDeviceMetadata,
 };
-use bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+use bangbang_runtime::snapshot_device_v2::{
+    NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, PreparedSnapshotV2PciRoot,
+    PreparedSnapshotV2RootBlock, PreparedSnapshotV2RootTransport,
+    SnapshotV2RootTransportRestoreError,
+};
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
 use bangbang_runtime::snapshot_memory_v2::{
-    SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
+    SnapshotV2MemoryBinding, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
     write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
 };
 use bangbang_runtime::startup::{
     ARM64_BOOT_VMGENID_SIZE, Arm64BootBalloonNotificationDispatch,
     Arm64BootBalloonNotificationDispatchError, Arm64BootBalloonNotificationDispatches,
-    Arm64BootBlockNotificationDispatch, Arm64BootBlockNotificationDispatchError,
-    Arm64BootBlockNotificationDispatches, Arm64BootBlockWakeupFdsError,
-    Arm64BootEntropyCaptureError,
+    Arm64BootBlockDevice, Arm64BootBlockNotificationDispatch,
+    Arm64BootBlockNotificationDispatchError, Arm64BootBlockNotificationDispatches,
+    Arm64BootBlockWakeupFdsError, Arm64BootEntropyCaptureError,
     Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
@@ -112,8 +124,8 @@ use bangbang_runtime::startup::{
     Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
     Arm64BootPciValidationConfig, Arm64BootPciValidationResources, Arm64BootPmemFlushProvider,
     Arm64BootPmemNotificationDispatch, Arm64BootPmemNotificationDispatchError,
-    Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
-    Arm64BootResourceParts, Arm64BootResources,
+    Arm64BootPmemNotificationDispatches, Arm64BootPvTimeState, Arm64BootResourceConfig,
+    Arm64BootResourceError, Arm64BootResourceParts, Arm64BootResources,
     Arm64BootRtcDeviceConfig as RuntimeArm64BootRtcDeviceConfig, Arm64BootRuntimeResources,
     Arm64BootSerialCaptureError, Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootSerialRuntimeError, Arm64BootVmClockDevice, Arm64BootVmGenIdDevice,
@@ -127,8 +139,8 @@ use bangbang_runtime::startup::{
     capture_memory_hotplug_state_for_device, capture_network_state_for_device_at,
     capture_ready_serial_state_for_device, capture_vsock_state_for_device,
     inject_serial_receive_bytes_for_device, memory_hotplug_status_for_device,
-    pending_serial_interrupt_intent_for_device, prepare_vsock_transport_reset_for_device,
-    record_serial_host_input_error_for_device,
+    pending_serial_interrupt_intent_for_device, prepare_restored_pci_validation,
+    prepare_vsock_transport_reset_for_device, record_serial_host_input_error_for_device,
     refresh_vhost_user_block_config_for_devices_with_signal, replace_arm64_boot_vmgenid,
     serial_receive_capacity_for_device, take_serial_input_ready_intent_for_device,
     take_serial_interrupt_intent_for_device, update_live_block_device_for_devices_with_opened,
@@ -200,6 +212,12 @@ use crate::snapshot_v2::{
     HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2FdtState,
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
     HvfSnapshotV2PvTimeVcpuState, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
+};
+use crate::snapshot_v2_platform::{
+    HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2PlatformRestoreError,
+    HvfSnapshotV2PlatformShutdownError, HvfSnapshotV2RootResourcePlan,
+    HvfSnapshotV2RootTransportPlan, RestoredHvfSnapshotV2Platform,
+    restore_hvf_snapshot_v2_root_process_platform,
 };
 use crate::topology::{HvfVcpuTopologyError, prepare_ordered_mpidrs};
 use crate::vcpu::{
@@ -3235,6 +3253,8 @@ pub struct OwnedHvfArm64BootSession {
     backend: HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    restored_snapshot_v2_memory_binding: Option<SnapshotV2MemoryBinding>,
+    restored_snapshot_v2_machine: Option<HvfSnapshotV2MachineState>,
     cpu_template_application: Option<crate::cpu_template::HvfArm64CpuTemplateApplicationState>,
     pci_validation_endpoint: Option<HvfArm64BootPciValidationEndpoint>,
     pci_data_devices: Option<HvfArm64BootPciDataDevices>,
@@ -3340,6 +3360,260 @@ impl fmt::Debug for RestoredHvfArm64BootSession {
             .field("profile", &"native-v1")
             .field("resources", &"<redacted>")
             .finish()
+    }
+}
+
+/// Stage at which complete native-v2 root-owner reconstruction stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2RootRestoreStage {
+    Transport,
+    Platform,
+    MemoryLayout,
+    Metrics,
+    MmioRegion,
+    MmioHandler,
+    PciHost,
+    PciRoutes,
+    PciEndpoint,
+    RetryScheduler,
+}
+
+/// Primary failure from complete native-v2 root-owner reconstruction.
+pub enum HvfSnapshotV2RootRestoreFailure {
+    Transport(SnapshotV2RootTransportRestoreError),
+    Platform(Box<HvfSnapshotV2PlatformRestoreError>),
+    Allocation,
+    MemoryLayout,
+    Metrics(BlockDeviceMetricsRegistryError),
+    DispatcherUnavailable,
+    MmioRegion(MmioBusError),
+    MmioHandler(MmioDispatchError),
+    PciHost(Arm64BootResourceError),
+    PciData(HvfArm64BootPciDataError),
+    PciEndpoint(SnapshotV2RootTransportRestoreError),
+    PciPublication(VirtioPciPublicationError),
+    RetryScheduler(io::ErrorKind),
+    ResourcePlan,
+}
+
+impl fmt::Debug for HvfSnapshotV2RootRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Transport(_) => "transport",
+            Self::Platform(_) => "platform",
+            Self::Allocation => "allocation",
+            Self::MemoryLayout => "memory-layout",
+            Self::Metrics(_) => "metrics",
+            Self::DispatcherUnavailable => "dispatcher",
+            Self::MmioRegion(_) => "mmio-region",
+            Self::MmioHandler(_) => "mmio-handler",
+            Self::PciHost(_) => "pci-host",
+            Self::PciData(_) => "pci-data",
+            Self::PciEndpoint(_) => "pci-endpoint",
+            Self::PciPublication(_) => "pci-publication",
+            Self::RetryScheduler(_) => "retry-scheduler",
+            Self::ResourcePlan => "resource-plan",
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2RootRestoreFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2RootRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(_) => formatter.write_str("root transport reconstruction failed"),
+            Self::Platform(_) => formatter.write_str("HVF platform reconstruction failed"),
+            Self::Allocation => formatter.write_str("root owner allocation failed"),
+            Self::MemoryLayout => formatter.write_str("restored memory layout is invalid"),
+            Self::Metrics(_) => formatter.write_str("root metrics ownership failed"),
+            Self::DispatcherUnavailable => {
+                formatter.write_str("root MMIO dispatcher is unavailable")
+            }
+            Self::MmioRegion(_) => formatter.write_str("root MMIO region publication failed"),
+            Self::MmioHandler(_) => formatter.write_str("root MMIO handler publication failed"),
+            Self::PciHost(_) => formatter.write_str("PCI host reconstruction failed"),
+            Self::PciData(_) => formatter.write_str("PCI owner reconstruction failed"),
+            Self::PciEndpoint(_) => formatter.write_str("PCI endpoint reconstruction failed"),
+            Self::PciPublication(_) => formatter.write_str("PCI endpoint publication failed"),
+            Self::RetryScheduler(kind) => {
+                write!(formatter, "block retry scheduler startup failed: {kind:?}")
+            }
+            Self::ResourcePlan => formatter.write_str("retained root resource plan diverged"),
+        }
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2RootRestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(source) => Some(source),
+            Self::Platform(source) => Some(source.as_ref()),
+            Self::Metrics(source) => Some(source),
+            Self::MmioRegion(source) => Some(source),
+            Self::MmioHandler(source) => Some(source),
+            Self::PciHost(source) => Some(source),
+            Self::PciData(source) => Some(source),
+            Self::PciEndpoint(source) => Some(source),
+            Self::PciPublication(source) => Some(source),
+            Self::Allocation
+            | Self::MemoryLayout
+            | Self::DispatcherUnavailable
+            | Self::RetryScheduler(_)
+            | Self::ResourcePlan => None,
+        }
+    }
+}
+
+/// Cleanup failure retained after a root-owner reconstruction error.
+pub enum HvfSnapshotV2RootRestoreCleanupFailure {
+    Pci(HvfArm64BootPciDataError),
+    Platform(HvfSnapshotV2PlatformShutdownError),
+}
+
+impl fmt::Debug for HvfSnapshotV2RootRestoreCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Pci(_) => "pci",
+            Self::Platform(_) => "platform",
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2RootRestoreCleanupFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2RootRestoreCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pci(_) => formatter.write_str("PCI root cleanup failed"),
+            Self::Platform(_) => formatter.write_str("HVF platform cleanup failed"),
+        }
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2RootRestoreCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pci(source) => Some(source),
+            Self::Platform(source) => Some(source),
+        }
+    }
+}
+
+/// Redacted complete-owner failure with publication and cleanup disposition.
+pub struct HvfSnapshotV2RootRestoreError {
+    stage: HvfSnapshotV2RootRestoreStage,
+    failure: Box<HvfSnapshotV2RootRestoreFailure>,
+    committed: bool,
+    cleanup: Vec<HvfSnapshotV2RootRestoreCleanupFailure>,
+}
+
+impl fmt::Debug for HvfSnapshotV2RootRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2RootRestoreError")
+            .field("stage", &self.stage)
+            .field("committed", &self.committed)
+            .field("failure", &"<redacted>")
+            .field("cleanup_count", &self.cleanup.len())
+            .finish()
+    }
+}
+
+impl HvfSnapshotV2RootRestoreError {
+    fn preflight(
+        stage: HvfSnapshotV2RootRestoreStage,
+        failure: HvfSnapshotV2RootRestoreFailure,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: false,
+            cleanup: Vec::new(),
+        }
+    }
+
+    pub(crate) fn platform(source: HvfSnapshotV2PlatformRestoreError) -> Self {
+        let committed = source.is_committed();
+        Self {
+            stage: HvfSnapshotV2RootRestoreStage::Platform,
+            failure: Box::new(HvfSnapshotV2RootRestoreFailure::Platform(Box::new(source))),
+            committed,
+            cleanup: Vec::new(),
+        }
+    }
+
+    fn after_platform(
+        stage: HvfSnapshotV2RootRestoreStage,
+        failure: HvfSnapshotV2RootRestoreFailure,
+        cleanup: Vec<HvfSnapshotV2RootRestoreCleanupFailure>,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: true,
+            cleanup,
+        }
+    }
+
+    pub const fn stage(&self) -> HvfSnapshotV2RootRestoreStage {
+        self.stage
+    }
+
+    /// Returns whether platform identity publication makes retry ambiguous.
+    pub const fn is_committed(&self) -> bool {
+        self.committed
+    }
+
+    /// Returns ordered cleanup failures, if cleanup was incomplete.
+    pub fn cleanup_failures(&self) -> &[HvfSnapshotV2RootRestoreCleanupFailure] {
+        &self.cleanup
+    }
+
+    /// Returns whether this transaction or its nested platform transaction
+    /// retained evidence that reverse cleanup did not complete.
+    pub fn has_incomplete_cleanup(&self) -> bool {
+        !self.cleanup.is_empty()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2RootRestoreFailure::Platform(source)
+                    if !source.cleanup_failures().is_empty()
+            )
+    }
+
+    /// Returns whether retrying this destination would be ambiguous or unsafe.
+    pub fn is_terminal(&self) -> bool {
+        self.is_committed() || self.has_incomplete_cleanup()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2RootRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "native-v2 root owner reconstruction failed at {:?}: {}",
+            self.stage, self.failure
+        )?;
+        if !self.cleanup.is_empty() {
+            write!(
+                formatter,
+                "; {} cleanup failure(s) retained",
+                self.cleanup.len()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2RootRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.failure.as_ref())
     }
 }
 
@@ -7312,10 +7586,12 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::GuestMemory { source })?;
         let boot = input.into_boot();
 
-        let boot_origin = self
+        let fdt_write = self
             .runtime_resources
             .boot_origin
             .as_ref()
+            .map(|origin| origin.fdt)
+            .or(self.runtime_resources.retained_fdt)
             .ok_or(HvfArm64BootSnapshotV2CaptureError::MissingBootOrigin)?;
         let rtc = self
             .runtime_resources
@@ -7324,21 +7600,18 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
             .ok_or(HvfArm64BootSnapshotV2CaptureError::MissingRtc)?;
         let mut fdt_bytes = Vec::new();
         fdt_bytes
-            .try_reserve_exact(boot_origin.fdt.size)
+            .try_reserve_exact(fdt_write.size)
             .map_err(|_| HvfArm64BootSnapshotV2CaptureError::FdtAllocation)?;
-        fdt_bytes.resize(boot_origin.fdt.size, 0);
+        fdt_bytes.resize(fdt_write.size, 0);
         memory
-            .read_slice(&mut fdt_bytes, boot_origin.fdt.address)
+            .read_slice(&mut fdt_bytes, fdt_write.address)
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::FdtRead { source })?;
-        let fdt = HvfSnapshotV2FdtState::try_new(
-            boot_origin.fdt.address,
-            boot_origin.fdt.size,
-            crc64(0, &fdt_bytes),
-        )
-        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
-            stage: HvfArm64BootSnapshotV2CaptureStage::Machine,
-            source,
-        })?;
+        let fdt =
+            HvfSnapshotV2FdtState::try_new(fdt_write.address, fdt_write.size, crc64(0, &fdt_bytes))
+                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
+                    stage: HvfArm64BootSnapshotV2CaptureStage::Machine,
+                    source,
+                })?;
 
         let primary = captures
             .first()
@@ -10114,6 +10387,252 @@ impl Drop for HvfArm64BootSession<'_> {
     }
 }
 
+fn validate_snapshot_v2_root_resource_plan(
+    transport: &PreparedSnapshotV2RootTransport,
+    resources: HvfSnapshotV2RootResourcePlan,
+) -> Result<(), HvfSnapshotV2RootRestoreError> {
+    let matches = match (transport, resources.transport()) {
+        (
+            PreparedSnapshotV2RootTransport::Mmio(root),
+            HvfSnapshotV2RootTransportPlan::Mmio {
+                region,
+                interrupt_line,
+            },
+        ) => root.region() == region && root.interrupt_line() == interrupt_line,
+        (
+            PreparedSnapshotV2RootTransport::Pci(root),
+            HvfSnapshotV2RootTransportPlan::Pci {
+                sbdf, bar_range, ..
+            },
+        ) => root.sbdf() == sbdf && root.bar_range() == bar_range,
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(HvfSnapshotV2RootRestoreError::preflight(
+            HvfSnapshotV2RootRestoreStage::Transport,
+            HvfSnapshotV2RootRestoreFailure::ResourcePlan,
+        ))
+    }
+}
+
+fn snapshot_v2_root_identity_and_retry_deadline(
+    transport: &PreparedSnapshotV2RootTransport,
+) -> (&str, Option<Instant>) {
+    let drive_id = match transport {
+        PreparedSnapshotV2RootTransport::Mmio(root) => root.drive_id(),
+        PreparedSnapshotV2RootTransport::Pci(root) => root.drive_id(),
+    };
+    (drive_id, transport.retry_deadline())
+}
+
+fn install_snapshot_v2_mmio_root(
+    platform: &RestoredHvfSnapshotV2Platform,
+    root: bangbang_runtime::snapshot_device_v2::PreparedSnapshotV2MmioRoot,
+) -> Result<Arm64BootBlockDevice, HvfSnapshotV2RootRestoreFailure> {
+    let (drive_id, _partuuid, _retry, region, interrupt_line, handler) = root.into_parts();
+    let mut dispatcher = platform
+        .mmio_dispatcher()
+        .lock()
+        .map_err(|_| HvfSnapshotV2RootRestoreFailure::DispatcherUnavailable)?;
+    let installed = dispatcher
+        .insert_region(region.id(), region.range().start(), region.range().size())
+        .map_err(HvfSnapshotV2RootRestoreFailure::MmioRegion)?;
+    dispatcher
+        .register_handler(installed.id(), handler)
+        .map_err(HvfSnapshotV2RootRestoreFailure::MmioHandler)?;
+    Ok(Arm64BootBlockDevice {
+        registration: BlockMmioDeviceRegistration::from_restored(0, drive_id, installed),
+        fdt_device: Arm64FdtVirtioMmioDevice {
+            region: Arm64FdtRegion {
+                base: installed.range().start().raw_value(),
+                size: installed.range().size(),
+            },
+            interrupt_line,
+        },
+    })
+}
+
+fn prepare_snapshot_v2_pci_root_owner(
+    platform: &RestoredHvfSnapshotV2Platform,
+    root: PreparedSnapshotV2PciRoot,
+    resources: HvfSnapshotV2RootResourcePlan,
+    layout: &GuestMemoryLayout,
+    block_device_metrics: &SharedBlockDeviceMetricsRegistry,
+    retry_deadline: Option<Instant>,
+    pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
+) -> Result<(), HvfSnapshotV2RootRestoreFailure> {
+    let HvfSnapshotV2RootTransportPlan::Pci {
+        bar_region_id, msi, ..
+    } = resources.transport()
+    else {
+        return Err(HvfSnapshotV2RootRestoreFailure::ResourcePlan);
+    };
+
+    let validation = {
+        let mut dispatcher = platform
+            .mmio_dispatcher()
+            .lock()
+            .map_err(|_| HvfSnapshotV2RootRestoreFailure::DispatcherUnavailable)?;
+        prepare_restored_pci_validation(&mut dispatcher)
+            .map_err(HvfSnapshotV2RootRestoreFailure::PciHost)?
+    };
+    let available_slots = validation
+        .segment()
+        .with_segment(|segment| segment.available_endpoint_slots())
+        .map_err(|source| {
+            HvfSnapshotV2RootRestoreFailure::PciData(HvfArm64BootPciDataError::new(format!(
+                "failed to inspect restored PCI endpoint capacity: {source}"
+            )))
+        })?;
+    if available_slots < PCI_ENDPOINT_SLOT_COUNT {
+        return Err(HvfSnapshotV2RootRestoreFailure::PciData(
+            HvfArm64BootPciDataError::new(
+                "restored PCI segment cannot retain complete endpoint headroom",
+            ),
+        ));
+    }
+    if pci_data_available_bar_count(validation.bar_allocator())
+        .map_err(HvfSnapshotV2RootRestoreFailure::PciData)?
+        < PCI_ENDPOINT_SLOT_COUNT
+    {
+        return Err(HvfSnapshotV2RootRestoreFailure::PciData(
+            HvfArm64BootPciDataError::new(
+                "restored PCI BAR allocator cannot retain complete endpoint headroom",
+            ),
+        ));
+    }
+    let bar_plan = pci_data_bar_plan(validation.bar_allocator(), PCI_ENDPOINT_SLOT_COUNT)
+        .map_err(HvfSnapshotV2RootRestoreFailure::PciData)?;
+    {
+        let dispatcher = platform
+            .mmio_dispatcher()
+            .lock()
+            .map_err(|_| HvfSnapshotV2RootRestoreFailure::DispatcherUnavailable)?;
+        preflight_pci_data_dispatcher(&dispatcher, &bar_plan)
+            .map_err(HvfSnapshotV2RootRestoreFailure::PciData)?;
+    }
+
+    let mut pmem_static_reserved_ranges = Vec::new();
+    pmem_static_reserved_ranges
+        .try_reserve_exact(layout.ranges().len())
+        .map_err(|_| HvfSnapshotV2RootRestoreFailure::Allocation)?;
+    pmem_static_reserved_ranges.extend(layout.ranges().iter().copied());
+    let mut block = Vec::new();
+    block
+        .try_reserve_exact(PCI_ENDPOINT_SLOT_COUNT)
+        .map_err(|_| HvfSnapshotV2RootRestoreFailure::Allocation)?;
+    let mut network = Vec::new();
+    network
+        .try_reserve_exact(PCI_ENDPOINT_SLOT_COUNT)
+        .map_err(|_| HvfSnapshotV2RootRestoreFailure::Allocation)?;
+    let mut pmem = Vec::new();
+    pmem.try_reserve_exact(PCI_ENDPOINT_SLOT_COUNT)
+        .map_err(|_| HvfSnapshotV2RootRestoreFailure::Allocation)?;
+
+    let route_count = usize::try_from(msi.interrupt_range.count)
+        .map_err(|_| HvfSnapshotV2RootRestoreFailure::Allocation)?;
+    let mut exact_intids = Vec::new();
+    exact_intids
+        .try_reserve_exact(route_count)
+        .map_err(|_| HvfSnapshotV2RootRestoreFailure::Allocation)?;
+    for offset in 0..msi.interrupt_range.count {
+        exact_intids.push(
+            msi.interrupt_range
+                .base
+                .checked_add(offset)
+                .ok_or(HvfSnapshotV2RootRestoreFailure::ResourcePlan)?,
+        );
+    }
+    let signaler = platform.backend().gic_msi_signaler().ok_or_else(|| {
+        HvfSnapshotV2RootRestoreFailure::PciData(HvfArm64BootPciDataError::new(
+            "restored PCI root requires a GICv2m MSI signaler",
+        ))
+    })?;
+    let msi_interrupts = HvfGicMsiDeviceInterruptResources::allocate_exact(signaler, &exact_intids)
+        .map_err(|source| {
+            HvfSnapshotV2RootRestoreFailure::PciData(HvfArm64BootPciDataError::new(format!(
+                "failed to allocate exact restored PCI routes: {source}"
+            )))
+        })?;
+
+    *pci_data_devices = Some(HvfArm64BootPciDataDevices {
+        validation,
+        dispatcher: Arc::clone(platform.mmio_dispatcher()),
+        msi_interrupts: Some(msi_interrupts),
+        balloon: None,
+        block,
+        network,
+        pmem,
+        vsock: None,
+        entropy: None,
+        memory_hotplug: None,
+        pmem_static_reserved_ranges,
+        runtime_hotplug: true,
+    });
+    let Some(manager) = pci_data_devices.as_mut() else {
+        return Err(HvfSnapshotV2RootRestoreFailure::ResourcePlan);
+    };
+
+    let interrupts = manager
+        .shared_msi_registry()
+        .map_err(HvfSnapshotV2RootRestoreFailure::PciData)?;
+    let endpoint = root
+        .prepare_endpoint(bar_region_id, interrupts.registry())
+        .map_err(HvfSnapshotV2RootRestoreFailure::PciEndpoint)?;
+    let (drive_id, _partuuid, _retry, origin, endpoint) = endpoint.into_parts();
+    let metrics_lease = block_device_metrics
+        .claim_drive_lease(&drive_id)
+        .map_err(HvfSnapshotV2RootRestoreFailure::Metrics)?;
+    let segment = manager.validation.segment().clone();
+    let published = {
+        let mut dispatcher = manager
+            .dispatcher
+            .lock()
+            .map_err(|_| HvfSnapshotV2RootRestoreFailure::DispatcherUnavailable)?;
+        endpoint
+            .publish(
+                manager.validation.bar_allocator_mut(),
+                segment,
+                &mut dispatcher,
+                interrupts,
+            )
+            .map_err(HvfSnapshotV2RootRestoreFailure::PciPublication)?
+    };
+    manager.block.push(HvfArm64BootPciBlockDevice {
+        drive_id,
+        is_root_device: true,
+        origin,
+        published,
+        queue_deliveries: 0,
+        retry_deadline,
+        _metrics_lease: Some(metrics_lease),
+    });
+    Ok(())
+}
+
+fn failed_snapshot_v2_root_after_platform(
+    mut platform: RestoredHvfSnapshotV2Platform,
+    stage: HvfSnapshotV2RootRestoreStage,
+    failure: HvfSnapshotV2RootRestoreFailure,
+    pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
+) -> HvfSnapshotV2RootRestoreError {
+    let mut cleanup = Vec::with_capacity(2);
+    if let Some(devices) = pci_data_devices.as_mut() {
+        match devices.teardown() {
+            Ok(()) => {
+                pci_data_devices.take();
+            }
+            Err(source) => cleanup.push(HvfSnapshotV2RootRestoreCleanupFailure::Pci(source)),
+        }
+    }
+    if let Err(source) = platform.shutdown() {
+        cleanup.push(HvfSnapshotV2RootRestoreCleanupFailure::Platform(source));
+    }
+    HvfSnapshotV2RootRestoreError::after_platform(stage, failure, cleanup)
+}
+
 fn failed_snapshot_v1_restore(
     stage: HvfSnapshotV1RestoreStage,
     failure: HvfSnapshotV1RestoreFailure,
@@ -10203,6 +10722,8 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            restored_snapshot_v2_memory_binding: None,
+            restored_snapshot_v2_machine: None,
             cpu_template_application: prepared.cpu_template_application,
             pci_validation_endpoint: prepared.pci_validation_endpoint,
             pci_data_devices: prepared.pci_data_devices,
@@ -10250,6 +10771,260 @@ impl OwnedHvfArm64BootSession {
     /// Restores cancellation semantics when paused-worker publication fails.
     pub fn abort_snapshot_v1_page_source_commit(&mut self) {
         self.backend.cancel_lazy_page_source_on_drop();
+    }
+
+    /// Reconstructs one exact native-v2 root-bearing destination and transfers
+    /// it directly from the unpublished platform transaction into the complete
+    /// product boot-session owner.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_root(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2DefaultProcessShell,
+        root: PreparedSnapshotV2RootBlock,
+        resources: HvfSnapshotV2RootResourcePlan,
+    ) -> Result<Self, HvfSnapshotV2RootRestoreError> {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(memory.regions().len())
+            .map_err(|_| {
+                HvfSnapshotV2RootRestoreError::preflight(
+                    HvfSnapshotV2RootRestoreStage::MemoryLayout,
+                    HvfSnapshotV2RootRestoreFailure::Allocation,
+                )
+            })?;
+        ranges.extend(memory.regions().iter().map(|region| region.range()));
+        let layout = GuestMemoryLayout::new(ranges).map_err(|_| {
+            HvfSnapshotV2RootRestoreError::preflight(
+                HvfSnapshotV2RootRestoreStage::MemoryLayout,
+                HvfSnapshotV2RootRestoreFailure::MemoryLayout,
+            )
+        })?;
+        let source_fdt = state.machine().fdt();
+        let retained_fdt = Arm64FdtGuestMemoryWrite {
+            address: source_fdt.address(),
+            size: usize::try_from(source_fdt.size()).map_err(|_| {
+                HvfSnapshotV2RootRestoreError::preflight(
+                    HvfSnapshotV2RootRestoreStage::MemoryLayout,
+                    HvfSnapshotV2RootRestoreFailure::Allocation,
+                )
+            })?,
+        };
+        let transport = root.prepare_transport().map_err(|source| {
+            HvfSnapshotV2RootRestoreError::preflight(
+                HvfSnapshotV2RootRestoreStage::Transport,
+                HvfSnapshotV2RootRestoreFailure::Transport(source),
+            )
+        })?;
+        validate_snapshot_v2_root_resource_plan(&transport, resources)?;
+        let (drive_id, retry_deadline) = snapshot_v2_root_identity_and_retry_deadline(&transport);
+        let partuuid = match &transport {
+            PreparedSnapshotV2RootTransport::Mmio(root) => root.partuuid(),
+            PreparedSnapshotV2RootTransport::Pci(root) => root.partuuid(),
+        }
+        .map(str::to_owned);
+        let metrics_capacity = match &transport {
+            PreparedSnapshotV2RootTransport::Mmio(_) => 1,
+            PreparedSnapshotV2RootTransport::Pci(_) => PCI_ENDPOINT_SLOT_COUNT,
+        };
+        let block_device_metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(
+            [drive_id],
+            metrics_capacity,
+        )
+        .map_err(|source| {
+            HvfSnapshotV2RootRestoreError::preflight(
+                HvfSnapshotV2RootRestoreStage::Metrics,
+                HvfSnapshotV2RootRestoreFailure::Metrics(source),
+            )
+        })?;
+        let mut block_devices = Vec::new();
+        let mut block_interrupt_lines = Vec::new();
+        if matches!(&transport, PreparedSnapshotV2RootTransport::Mmio(_)) {
+            block_devices.try_reserve_exact(1).map_err(|_| {
+                HvfSnapshotV2RootRestoreError::preflight(
+                    HvfSnapshotV2RootRestoreStage::Transport,
+                    HvfSnapshotV2RootRestoreFailure::Allocation,
+                )
+            })?;
+            block_interrupt_lines.try_reserve_exact(1).map_err(|_| {
+                HvfSnapshotV2RootRestoreError::preflight(
+                    HvfSnapshotV2RootRestoreStage::Transport,
+                    HvfSnapshotV2RootRestoreFailure::Allocation,
+                )
+            })?;
+        }
+
+        let platform = restore_hvf_snapshot_v2_root_process_platform(
+            state,
+            memory,
+            process_shell,
+            resources,
+            partuuid,
+        )
+        .map_err(HvfSnapshotV2RootRestoreError::platform)?;
+        let mut pci_data_devices = None;
+        match transport {
+            PreparedSnapshotV2RootTransport::Mmio(root) => {
+                let interrupt_line = root.interrupt_line();
+                let device = match install_snapshot_v2_mmio_root(&platform, root) {
+                    Ok(device) => device,
+                    Err(failure) => {
+                        let stage = match &failure {
+                            HvfSnapshotV2RootRestoreFailure::MmioRegion(_) => {
+                                HvfSnapshotV2RootRestoreStage::MmioRegion
+                            }
+                            _ => HvfSnapshotV2RootRestoreStage::MmioHandler,
+                        };
+                        return Err(failed_snapshot_v2_root_after_platform(
+                            platform,
+                            stage,
+                            failure,
+                            &mut pci_data_devices,
+                        ));
+                    }
+                };
+                block_devices.push(device);
+                block_interrupt_lines.push(interrupt_line);
+            }
+            PreparedSnapshotV2RootTransport::Pci(root) => {
+                if let Err(failure) = prepare_snapshot_v2_pci_root_owner(
+                    &platform,
+                    root,
+                    resources,
+                    &layout,
+                    &block_device_metrics,
+                    retry_deadline,
+                    &mut pci_data_devices,
+                ) {
+                    let stage = match &failure {
+                        HvfSnapshotV2RootRestoreFailure::PciHost(_) => {
+                            HvfSnapshotV2RootRestoreStage::PciHost
+                        }
+                        HvfSnapshotV2RootRestoreFailure::PciEndpoint(_)
+                        | HvfSnapshotV2RootRestoreFailure::PciPublication(_) => {
+                            HvfSnapshotV2RootRestoreStage::PciEndpoint
+                        }
+                        _ => HvfSnapshotV2RootRestoreStage::PciRoutes,
+                    };
+                    return Err(failed_snapshot_v2_root_after_platform(
+                        platform,
+                        stage,
+                        failure,
+                        &mut pci_data_devices,
+                    ));
+                }
+            }
+        }
+
+        let block_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let vcpu_control = platform.control();
+        let block_retry_wakeup_scheduler =
+            match HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                BLOCK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                block_retry_wakeup.clone(),
+                move || vcpu_control.request_wakeup(),
+            ) {
+                Ok(scheduler) => scheduler,
+                Err(source) => {
+                    return Err(failed_snapshot_v2_root_after_platform(
+                        platform,
+                        HvfSnapshotV2RootRestoreStage::RetryScheduler,
+                        HvfSnapshotV2RootRestoreFailure::RetryScheduler(source.kind()),
+                        &mut pci_data_devices,
+                    ));
+                }
+            };
+        block_retry_wakeup_scheduler.schedule_deadline(retry_deadline);
+
+        let parts = platform.into_parts();
+        let machine_config = parts.machine.machine();
+        let cpu_template_application = parts.machine.cpu_template().cloned();
+        let cache_source = crate::vcpu_config::HvfArm64VcpuCacheFdtSource::new(
+            parts.compatibility.identification().id_aa64mmfr2_el1(),
+            parts.compatibility.cache_manifest(),
+        );
+        let gic = parts.compatibility.gic_metadata();
+        let serial_interrupt_line = parts
+            .serial_device
+            .as_ref()
+            .map(|device| device.fdt_device.interrupt_line);
+        let vmgenid_interrupt_line = parts.vmgenid_device.fdt_device.interrupt_line;
+        let vmclock_interrupt_line = parts.vmclock_device.fdt_device.interrupt_line;
+        let runtime_resources = Arm64BootRuntimeResources {
+            machine_config,
+            layout,
+            boot_origin: None,
+            retained_fdt: Some(retained_fdt),
+            rtc_device: Some(parts.rtc_device),
+            serial_device: parts.serial_device,
+            vmgenid_device: parts.vmgenid_device,
+            vmclock_device: parts.vmclock_device,
+            pvtime_state: Arm64BootPvTimeState::restored(parts.pvtime_layout),
+            block_devices,
+            block_async_runtime: SharedBlockAsyncRuntime::new(),
+            pci_block_devices: Vec::new(),
+            pmem_devices: Vec::new(),
+            pmem_mmio_devices: Vec::new(),
+            network_devices: Vec::new(),
+            pci_network_devices: Vec::new(),
+            vsock_device: None,
+            pci_vsock_device: None,
+            balloon_device: None,
+            pci_balloon_device: None,
+            memory_hotplug_device: None,
+            pci_memory_hotplug_device: None,
+            entropy_device: None,
+            pci_entropy_device: None,
+            pci_validation: None,
+        };
+        let pmem_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+
+        Ok(Self {
+            runner: parts.runner,
+            backend: parts.backend,
+            mmio_dispatcher: parts.mmio_dispatcher,
+            runtime_resources,
+            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            restored_snapshot_v2_machine: Some(parts.machine),
+            cpu_template_application,
+            pci_validation_endpoint: None,
+            pci_data_devices,
+            cache_source,
+            cache_hierarchy: None,
+            control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
+            run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
+            block_retry_wakeup,
+            block_retry_wakeup_scheduler,
+            pmem_retry_wakeup,
+            pmem_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            network_retry_wakeup,
+            network_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            entropy_retry_wakeup,
+            entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            entropy_source: VirtioRngOsEntropySource::new(),
+            block_device_metrics,
+            pmem_device_metrics: SharedPmemDeviceMetricsRegistry::default(),
+            balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+            memory_hotplug_device_metrics: None,
+            network_interface_metrics: SharedNetworkInterfaceMetricsRegistry::default(),
+            vsock_device_metrics: SharedVsockDeviceMetrics::default(),
+            entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
+            gic,
+            block_interrupt_lines,
+            pmem_interrupt_lines: Vec::new(),
+            network_interrupt_lines: Vec::new(),
+            vsock_interrupt_line: None,
+            balloon_interrupt_line: None,
+            entropy_interrupt_line: None,
+            memory_hotplug_interrupt_line: None,
+            serial_interrupt_line,
+            serial_input: None,
+            vmgenid_interrupt_line,
+            vmclock_interrupt_line,
+            boot_registers: None,
+        })
     }
 
     /// Construct and completely restore one never-run native-v1 destination.
@@ -10546,6 +11321,8 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher,
             runtime_resources,
+            restored_snapshot_v2_memory_binding: None,
+            restored_snapshot_v2_machine: None,
             cpu_template_application: None,
             pci_validation_endpoint: None,
             pci_data_devices: None,
@@ -11019,6 +11796,20 @@ impl OwnedHvfArm64BootSession {
         &self,
     ) -> Option<&crate::cpu_template::HvfArm64CpuTemplateApplicationState> {
         self.cpu_template_application.as_ref()
+    }
+
+    /// Returns the source memory binding retained by a native-v2 restored
+    /// owner until the next complete recapture replaces it.
+    #[doc(hidden)]
+    pub const fn restored_snapshot_v2_memory_binding(&self) -> Option<&SnapshotV2MemoryBinding> {
+        self.restored_snapshot_v2_memory_binding.as_ref()
+    }
+
+    /// Returns the inert source machine component retained by a native-v2
+    /// restored owner.
+    #[doc(hidden)]
+    pub const fn restored_snapshot_v2_machine(&self) -> Option<&HvfSnapshotV2MachineState> {
+        self.restored_snapshot_v2_machine.as_ref()
     }
 
     /// Publish and capture topology-ordered PVTime values after a pause barrier.
@@ -30152,6 +30943,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn native_v2_root_restore_errors_preserve_terminality_and_redact_sources() {
+        let retryable = super::HvfSnapshotV2RootRestoreError::preflight(
+            super::HvfSnapshotV2RootRestoreStage::Transport,
+            super::HvfSnapshotV2RootRestoreFailure::ResourcePlan,
+        );
+        assert!(!retryable.is_committed());
+        assert!(!retryable.has_incomplete_cleanup());
+        assert!(!retryable.is_terminal());
+
+        let committed = super::HvfSnapshotV2RootRestoreError::after_platform(
+            super::HvfSnapshotV2RootRestoreStage::MmioHandler,
+            super::HvfSnapshotV2RootRestoreFailure::ResourcePlan,
+            Vec::new(),
+        );
+        assert!(committed.is_committed());
+        assert!(committed.is_terminal());
+
+        let incomplete = super::HvfSnapshotV2RootRestoreError {
+            stage: super::HvfSnapshotV2RootRestoreStage::PciEndpoint,
+            failure: Box::new(super::HvfSnapshotV2RootRestoreFailure::PciData(
+                super::HvfArm64BootPciDataError::new("secret-primary/path"),
+            )),
+            committed: false,
+            cleanup: vec![super::HvfSnapshotV2RootRestoreCleanupFailure::Pci(
+                super::HvfArm64BootPciDataError::new("secret-cleanup/path"),
+            )],
+        };
+        assert!(!incomplete.is_committed());
+        assert!(incomplete.has_incomplete_cleanup());
+        assert!(incomplete.is_terminal());
+        let debug = format!("{incomplete:?}");
+        let cleanup_debug = format!("{:?}", incomplete.cleanup_failures());
+        assert!(debug.contains("<redacted>"));
+        assert!(cleanup_debug.contains("<redacted>"));
+        for diagnostics in [debug, incomplete.to_string(), cleanup_debug] {
+            assert!(!diagnostics.contains("secret-primary"));
+            assert!(!diagnostics.contains("secret-cleanup"));
+        }
     }
 
     #[test]

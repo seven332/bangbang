@@ -2,19 +2,22 @@
 
 use std::fmt;
 use std::mem::size_of;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::block::{
-    BlockCaptureIoEngine, BlockFileBacking, DriveCacheType, DriveConfig, DriveIoEngine,
-    DriveRateLimiterConfig, DriveTokenBucketConfig, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE,
-    VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_SIZE,
-    VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC,
-    VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceId, VirtioBlockQueue,
-    VirtioBlockRateLimiter, VirtioBlockRateLimiterState, VirtioBlockTokenBucketState,
+    BlockCaptureIoEngine, BlockFileBacking, DriveCacheType, DriveConfig, DriveConfigError,
+    DriveConfigInput, DriveIoEngine, DriveRateLimiterConfig, DriveTokenBucketConfig,
+    VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_ID_BYTES,
+    VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_SECTOR_SHIFT,
+    VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace,
+    VirtioBlockDevice, VirtioBlockDeviceId, VirtioBlockMmioHandler, VirtioBlockQueue,
+    VirtioBlockRateLimiter, VirtioBlockRateLimiterState, VirtioBlockRuntimeStateError,
+    VirtioBlockTokenBucketState, restore_prepared_block_mmio_handler,
 };
-use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
+use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatus, GuestInterruptLine};
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
-use crate::mmio::MmioRegion;
+use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_SIZE, PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
     PCI_LAST_ENDPOINT_DEVICE, PCI_SEGMENT_ZERO, PciBarAddressSpace, PciBarPrefetchable, PciSbdf,
@@ -27,15 +30,17 @@ use crate::storage_capture::{
 use crate::virtio::{
     VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET,
     VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FAILED,
-    VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT, VirtioInterruptIntent,
+    VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT, VirtioDeviceType,
+    VirtioDeviceTypeError, VirtioInterruptIntent,
 };
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION_1_FEATURE,
     VirtioMmioDeviceRegisters, VirtioMmioQueueState, VirtioMmioTransportState,
 };
 use crate::virtio_pci::{
-    VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE, VIRTIO_PCI_MAX_MSIX_VECTORS,
-    VIRTIO_PCI_NO_VECTOR, VirtioPciEndpointPhase, VirtioPciMsixState, VirtioPciTransportState,
+    PreparedVirtioPciEndpoint, VIRTIO_PCI_CAPABILITY_BAR_INDEX, VIRTIO_PCI_CAPABILITY_BAR_SIZE,
+    VIRTIO_PCI_MAX_MSIX_VECTORS, VIRTIO_PCI_NO_VECTOR, VirtioPciEndpointError,
+    VirtioPciEndpointPhase, VirtioPciIdentity, VirtioPciMsixState, VirtioPciTransportState,
 };
 
 /// Exact outer native-v2 version understood by the first device-graph codec.
@@ -852,12 +857,14 @@ pub struct SnapshotV2RootRestorePlan {
     drive_id: String,
     partuuid: Option<String>,
     cache_type: DriveCacheType,
+    rate_limiter_config: Option<DriveRateLimiterConfig>,
     capacity_sectors: u64,
     device_id: VirtioBlockDeviceId,
     queue_ranges: Option<[GuestMemoryRange; 3]>,
     active_queue: Option<VirtioBlockQueue>,
     rate_limiter: Option<VirtioBlockRateLimiter>,
     retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
     virtio: SnapshotV2VirtioState,
     transport: SnapshotV2DeviceTransport,
 }
@@ -941,22 +948,26 @@ impl SnapshotV2RootRestorePlan {
             })
             .transpose()?;
 
-        let limiter = persisted_limiter_state(rate_limiter, limiter)?;
+        let rate_limiter_config = rate_limiter;
+        let limiter = persisted_limiter_state(rate_limiter_config, limiter)?;
         let rate_limiter =
-            VirtioBlockRateLimiter::from_persisted_state_at(rate_limiter, limiter, now)
+            VirtioBlockRateLimiter::from_persisted_state_at(rate_limiter_config, limiter, now)
                 .map_err(|_| SnapshotV2RootRestorePlanError::RateLimiter)?;
+        let retry_deadline = restored_retry_deadline_at(retry, now);
 
         Ok(Self {
             selector,
             drive_id,
             partuuid,
             cache_type,
+            rate_limiter_config,
             capacity_sectors,
             device_id,
             queue_ranges,
             active_queue,
             rate_limiter,
             retry,
+            retry_deadline,
             virtio,
             transport,
         })
@@ -965,6 +976,27 @@ impl SnapshotV2RootRestorePlan {
     /// Returns the inert, untrusted backing selector.
     pub fn selector(&self) -> &str {
         &self.selector
+    }
+
+    /// Reconstructs the validated public controller projection before backing
+    /// authority consumes the inert selector.
+    pub fn drive_config(&self) -> Result<DriveConfig, DriveConfigError> {
+        let mut input = DriveConfigInput::new(
+            self.drive_id.clone(),
+            self.drive_id.clone(),
+            self.selector.clone(),
+            true,
+        )
+        .with_is_read_only(true)
+        .with_cache_type(self.cache_type)
+        .with_io_engine(DriveIoEngine::Sync);
+        if let Some(partuuid) = &self.partuuid {
+            input = input.with_partuuid(partuuid.clone());
+        }
+        if let Some(rate_limiter) = self.rate_limiter_config {
+            input = input.with_rate_limiter(rate_limiter);
+        }
+        input.validate()
     }
 
     /// Returns the stable public drive identifier.
@@ -1030,6 +1062,7 @@ impl SnapshotV2RootRestorePlan {
         Ok(PreparedSnapshotV2RootBlock {
             config_space,
             device,
+            retry_deadline: self.retry_deadline,
             continuation: SnapshotV2RootContinuation {
                 drive_id: self.drive_id,
                 partuuid: self.partuuid,
@@ -1047,6 +1080,7 @@ redacted_debug!(SnapshotV2RootRestorePlan, "SnapshotV2RootRestorePlan");
 pub struct PreparedSnapshotV2RootBlock {
     config_space: VirtioBlockConfigSpace,
     device: VirtioBlockDevice,
+    retry_deadline: Option<Instant>,
     continuation: SnapshotV2RootContinuation,
 }
 
@@ -1066,19 +1100,395 @@ impl PreparedSnapshotV2RootBlock {
         &self.continuation
     }
 
-    /// Separates the prepared device from its value-only continuation.
+    /// Returns the absolute destination retry deadline computed from the
+    /// restore plan's monotonic-time baseline.
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    /// Separates the prepared device, retry deadline, and value-only
+    /// continuation.
     pub fn into_parts(
         self,
     ) -> (
         VirtioBlockConfigSpace,
         VirtioBlockDevice,
+        Option<Instant>,
         SnapshotV2RootContinuation,
     ) {
-        (self.config_space, self.device, self.continuation)
+        (
+            self.config_space,
+            self.device,
+            self.retry_deadline,
+            self.continuation,
+        )
+    }
+
+    /// Reconstructs the retained transport without publishing any live bus,
+    /// interrupt, BAR, or function resource.
+    pub fn prepare_transport(
+        self,
+    ) -> Result<PreparedSnapshotV2RootTransport, SnapshotV2RootTransportRestoreError> {
+        let (config_space, device, retry_deadline, continuation) = self.into_parts();
+        let SnapshotV2RootContinuation {
+            drive_id,
+            partuuid,
+            retry,
+            virtio,
+            transport,
+        } = continuation;
+        match transport {
+            SnapshotV2DeviceTransport::Mmio(mmio) => {
+                let retained = restore_mmio_transport_state(&virtio, &mmio)?;
+                let handler = restore_prepared_block_mmio_handler(config_space, device, &retained)
+                    .map_err(SnapshotV2RootTransportRestoreError::Mmio)?;
+                Ok(PreparedSnapshotV2RootTransport::Mmio(
+                    PreparedSnapshotV2MmioRoot {
+                        drive_id,
+                        partuuid,
+                        retry,
+                        retry_deadline,
+                        region: mmio.region(),
+                        interrupt_line: mmio.interrupt_line(),
+                        handler,
+                    },
+                ))
+            }
+            SnapshotV2DeviceTransport::Pci(pci) => {
+                let device_type = VirtioDeviceType::new(VIRTIO_BLOCK_DEVICE_ID)
+                    .map_err(SnapshotV2RootTransportRestoreError::DeviceType)?;
+                let identity = VirtioPciIdentity::new(device_type, virtio.available_features())
+                    .with_config_generation(virtio.config_generation());
+                let retained =
+                    VirtioPciTransportState::from_snapshot_v2_parts(identity, &virtio, &pci, false)
+                        .map_err(SnapshotV2RootTransportRestoreError::Pci)?;
+                Ok(PreparedSnapshotV2RootTransport::Pci(
+                    PreparedSnapshotV2PciRoot {
+                        drive_id,
+                        partuuid,
+                        retry,
+                        retry_deadline,
+                        origin: pci.origin(),
+                        sbdf: pci.sbdf(),
+                        bar_range: pci.bar_range(),
+                        config_space,
+                        device,
+                        identity,
+                        retained,
+                    },
+                ))
+            }
+        }
     }
 }
 
 redacted_debug!(PreparedSnapshotV2RootBlock, "PreparedSnapshotV2RootBlock");
+
+/// One fully reconstructed, still-unpublished exact root transport.
+pub enum PreparedSnapshotV2RootTransport {
+    /// Checked virtio-mmio handler with exact placement and SPI metadata.
+    Mmio(PreparedSnapshotV2MmioRoot),
+    /// Checked retained virtio-pci state awaiting live route publication.
+    Pci(PreparedSnapshotV2PciRoot),
+}
+
+impl PreparedSnapshotV2RootTransport {
+    /// Returns the selected transport kind.
+    pub const fn kind(&self) -> SnapshotV2DeviceTransportKind {
+        match self {
+            Self::Mmio(_) => SnapshotV2DeviceTransportKind::Mmio,
+            Self::Pci(_) => SnapshotV2DeviceTransportKind::Pci,
+        }
+    }
+
+    /// Returns the absolute destination retry deadline computed from the
+    /// restore plan's monotonic-time baseline.
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Mmio(root) => root.retry_deadline,
+            Self::Pci(root) => root.retry_deadline,
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2RootTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2RootTransport")
+            .field("kind", &self.kind())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Exact unpublished MMIO root handler and owner metadata.
+pub struct PreparedSnapshotV2MmioRoot {
+    drive_id: String,
+    partuuid: Option<String>,
+    retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+    handler: VirtioBlockMmioHandler,
+}
+
+impl PreparedSnapshotV2MmioRoot {
+    /// Returns the stable drive identifier.
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    /// Returns the optional root partition identifier.
+    pub fn partuuid(&self) -> Option<&str> {
+        self.partuuid.as_deref()
+    }
+
+    /// Returns the retained retry disposition.
+    pub const fn retry(&self) -> StorageRetryState {
+        self.retry
+    }
+
+    /// Returns the exact MMIO placement.
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    /// Returns the exact guest interrupt line.
+    pub const fn interrupt_line(&self) -> GuestInterruptLine {
+        self.interrupt_line
+    }
+
+    /// Consumes the unpublished handler and metadata.
+    pub fn into_parts(
+        self,
+    ) -> (
+        String,
+        Option<String>,
+        StorageRetryState,
+        MmioRegion,
+        GuestInterruptLine,
+        VirtioBlockMmioHandler,
+    ) {
+        (
+            self.drive_id,
+            self.partuuid,
+            self.retry,
+            self.region,
+            self.interrupt_line,
+            self.handler,
+        )
+    }
+}
+
+redacted_debug!(PreparedSnapshotV2MmioRoot, "PreparedSnapshotV2MmioRoot");
+
+/// Exact unpublished PCI root state awaiting destination-owned resources.
+pub struct PreparedSnapshotV2PciRoot {
+    drive_id: String,
+    partuuid: Option<String>,
+    retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
+    origin: StorageDeviceOrigin,
+    sbdf: PciSbdf,
+    bar_range: GuestMemoryRange,
+    config_space: VirtioBlockConfigSpace,
+    device: VirtioBlockDevice,
+    identity: VirtioPciIdentity,
+    retained: VirtioPciTransportState,
+}
+
+impl PreparedSnapshotV2PciRoot {
+    /// Returns the stable drive identifier.
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    /// Returns the optional root partition identifier.
+    pub fn partuuid(&self) -> Option<&str> {
+        self.partuuid.as_deref()
+    }
+
+    /// Returns the retained retry disposition.
+    pub const fn retry(&self) -> StorageRetryState {
+        self.retry
+    }
+
+    /// Returns the retained startup/runtime origin.
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    /// Returns the exact PCI function identity.
+    pub const fn sbdf(&self) -> PciSbdf {
+        self.sbdf
+    }
+
+    /// Returns the exact capability BAR range.
+    pub const fn bar_range(&self) -> GuestMemoryRange {
+        self.bar_range
+    }
+
+    /// Completes checked endpoint preparation against one live route registry.
+    pub fn prepare_endpoint(
+        self,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+    ) -> Result<PreparedSnapshotV2PciRootEndpoint, SnapshotV2RootTransportRestoreError> {
+        let endpoint = PreparedVirtioPciEndpoint::new(
+            self.identity,
+            &VIRTIO_BLOCK_QUEUE_SIZES,
+            self.config_space,
+            self.device,
+            self.retained.is_device_activated(),
+            false,
+            &self.retained,
+            self.sbdf,
+            self.bar_range,
+            region_id,
+            messages,
+        )
+        .map_err(SnapshotV2RootTransportRestoreError::Pci)?;
+        Ok(PreparedSnapshotV2PciRootEndpoint {
+            drive_id: self.drive_id,
+            partuuid: self.partuuid,
+            retry: self.retry,
+            origin: self.origin,
+            endpoint,
+        })
+    }
+}
+
+redacted_debug!(PreparedSnapshotV2PciRoot, "PreparedSnapshotV2PciRoot");
+
+/// Checked root endpoint plus process-visible owner metadata.
+pub struct PreparedSnapshotV2PciRootEndpoint {
+    drive_id: String,
+    partuuid: Option<String>,
+    retry: StorageRetryState,
+    origin: StorageDeviceOrigin,
+    endpoint: PreparedVirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice>,
+}
+
+impl PreparedSnapshotV2PciRootEndpoint {
+    /// Consumes the endpoint and owner metadata.
+    pub fn into_parts(
+        self,
+    ) -> (
+        String,
+        Option<String>,
+        StorageRetryState,
+        StorageDeviceOrigin,
+        PreparedVirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice>,
+    ) {
+        (
+            self.drive_id,
+            self.partuuid,
+            self.retry,
+            self.origin,
+            self.endpoint,
+        )
+    }
+}
+
+redacted_debug!(
+    PreparedSnapshotV2PciRootEndpoint,
+    "PreparedSnapshotV2PciRootEndpoint"
+);
+
+/// Failure while converting exact stable root state into a runtime transport.
+#[derive(Debug)]
+pub enum SnapshotV2RootTransportRestoreError {
+    /// Allocation failed while rebuilding bounded transport state.
+    Allocation,
+    /// The fixed virtio-block device identity could not be represented.
+    DeviceType(VirtioDeviceTypeError),
+    /// The checked MMIO handler rejected retained state.
+    Mmio(VirtioBlockRuntimeStateError),
+    /// The checked PCI retained-state path rejected retained state.
+    Pci(VirtioPciEndpointError),
+}
+
+impl fmt::Display for SnapshotV2RootTransportRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Allocation => formatter.write_str("native-v2 root transport allocation failed"),
+            Self::DeviceType(_) => {
+                formatter.write_str("native-v2 root transport device identity is invalid")
+            }
+            Self::Mmio(_) => formatter.write_str("native-v2 MMIO root reconstruction failed"),
+            Self::Pci(_) => formatter.write_str("native-v2 PCI root reconstruction failed"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotV2RootTransportRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DeviceType(source) => Some(source),
+            Self::Mmio(source) => Some(source),
+            Self::Pci(source) => Some(source),
+            Self::Allocation => None,
+        }
+    }
+}
+
+fn restore_mmio_transport_state(
+    common: &SnapshotV2VirtioState,
+    mmio: &SnapshotV2MmioDeviceState,
+) -> Result<VirtioMmioTransportState, SnapshotV2RootTransportRestoreError> {
+    let device = VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(
+        VIRTIO_BLOCK_DEVICE_ID,
+        VIRTIO_MMIO_VENDOR_ID,
+        common.available_features(),
+        common.config_generation(),
+    )
+    .with_runtime_state(
+        [mmio.device_feature_select(), mmio.driver_feature_select()],
+        common.driver_features(),
+        common.status(),
+    );
+    let mut queues = Vec::new();
+    queues
+        .try_reserve_exact(common.queues().len())
+        .map_err(|_| SnapshotV2RootTransportRestoreError::Allocation)?;
+    for queue in common.queues() {
+        queues.push(VirtioMmioQueueState::from_parts(
+            queue.max_size(),
+            queue.size(),
+            queue.ready(),
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.device_ring(),
+        ));
+    }
+    let mut pending_notifications = Vec::new();
+    pending_notifications
+        .try_reserve_exact(common.queues().len())
+        .map_err(|_| SnapshotV2RootTransportRestoreError::Allocation)?;
+    pending_notifications.resize(common.queues().len(), false);
+    for queue_index in common.pending_notifications().iter().copied() {
+        let pending = pending_notifications
+            .get_mut(usize::from(queue_index))
+            .ok_or(SnapshotV2RootTransportRestoreError::Allocation)?;
+        *pending = true;
+    }
+    let mut interrupt_status = DeviceInterruptStatus::empty();
+    for intent in common.interrupt_intents() {
+        interrupt_status.insert(match intent {
+            SnapshotV2InterruptIntent::Queue { .. } => DeviceInterruptKind::Queue,
+            SnapshotV2InterruptIntent::Configuration => DeviceInterruptKind::Config,
+        });
+    }
+    Ok(VirtioMmioTransportState::from_parts(
+        device,
+        mmio.queue_select(),
+        queues,
+        pending_notifications,
+        interrupt_status,
+        common.is_activated(),
+        true,
+    ))
+}
 
 /// Pathless value state needed to reconstruct the root transport owner.
 #[derive(Clone, PartialEq, Eq)]
@@ -2182,6 +2592,17 @@ fn range_is_wholly_contained(memory: &GuestMemory, range: GuestMemoryRange) -> b
 
 const fn feature_enabled(features: u64, feature: u32) -> bool {
     features & (1_u64 << feature) != 0
+}
+
+fn restored_retry_deadline_at(retry: StorageRetryState, now: Instant) -> Option<Instant> {
+    match retry {
+        StorageRetryState::None => None,
+        StorageRetryState::Immediate => Some(now),
+        StorageRetryState::After { remaining_nanos } => Some(
+            now.checked_add(Duration::from_nanos(remaining_nanos))
+                .unwrap_or(now),
+        ),
+    }
 }
 
 fn persisted_limiter_state(

@@ -27,6 +27,9 @@ use crate::pci::{
     PciType0Configuration, PciType0GuestState, PciType0SnapshotError, PciType0SnapshotProfile,
     SharedPciSegment,
 };
+use crate::snapshot_device_v2::{
+    SnapshotV2InterruptIntent, SnapshotV2PciDeviceState, SnapshotV2VirtioState,
+};
 use crate::virtio::{
     VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK,
     VIRTIO_DEVICE_STATUS_FAILED, VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT,
@@ -165,6 +168,211 @@ pub struct VirtioPciTransportState {
 }
 
 impl VirtioPciTransportState {
+    pub(crate) fn from_snapshot_v2_parts(
+        identity: VirtioPciIdentity,
+        common: &SnapshotV2VirtioState,
+        pci: &SnapshotV2PciDeviceState,
+        requires_device_config_write_status: bool,
+    ) -> Result<Self, VirtioPciEndpointError> {
+        let vector_count = pci.msix().entries().len();
+        let (profile, profile_pci_cfg_offset, profile_msix_offset) =
+            build_pci_snapshot_profile(identity.device_type, pci.bar_range(), vector_count)
+                .map_err(|_| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        let (mut configuration, pci_cfg_cap_offset, msix_cap_offset) = build_pci_configuration(
+            identity,
+            pci.bar_range(),
+            pci.bar_address_space(),
+            vector_count,
+        )?;
+        if profile_pci_cfg_offset != pci_cfg_cap_offset || profile_msix_offset != msix_cap_offset {
+            return Err(retained_error(VirtioPciRetainedStateError::Configuration));
+        }
+
+        let expected = configuration
+            .snapshot_guest_state(&profile)
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        let selector_bar_offset = pci_cfg_cap_offset
+            .checked_add(4)
+            .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        let selector_offset_start = pci_cfg_cap_offset
+            .checked_add(8)
+            .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        let selector_length_start = pci_cfg_cap_offset
+            .checked_add(12)
+            .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        let data_start = pci_cfg_cap_offset
+            .checked_add(16)
+            .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        let data_end = data_start
+            .checked_add(4)
+            .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        let msix_control_high = msix_cap_offset
+            .checked_add(3)
+            .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        let selector_offset = pci.pci_cfg_offset().to_le_bytes();
+        let selector_length = pci.pci_cfg_length().to_le_bytes();
+
+        let mut writable_bytes = Vec::new();
+        writable_bytes
+            .try_reserve_exact(expected.writable_bytes().len())
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        for writable in expected.writable_bytes().iter().copied() {
+            let offset = writable.offset();
+            let value = if offset == selector_bar_offset {
+                pci.pci_cfg_bar()
+            } else if (selector_offset_start..selector_length_start).contains(&offset) {
+                selector_offset
+                    .get(usize::from(offset - selector_offset_start))
+                    .copied()
+                    .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?
+            } else if (selector_length_start..data_start).contains(&offset) {
+                selector_length
+                    .get(usize::from(offset - selector_length_start))
+                    .copied()
+                    .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?
+            } else if (data_start..data_end).contains(&offset) {
+                writable.value()
+            } else if offset == msix_control_high {
+                (u8::from(pci.msix().enabled()) << 7)
+                    | (u8::from(pci.msix().function_masked()) << 6)
+            } else {
+                pci.writable_bytes()
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.offset() == offset)
+                    .map(|candidate| candidate.value())
+                    .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?
+            };
+            writable_bytes.push(
+                writable
+                    .with_value(value)
+                    .map_err(|_| retained_error(VirtioPciRetainedStateError::Configuration))?,
+            );
+        }
+
+        let mut bar_probes = Vec::new();
+        bar_probes
+            .try_reserve_exact(expected.bar_probes().len())
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::Configuration))?;
+        for probe in expected.bar_probes().iter().copied() {
+            let pending = pci
+                .bar_probes()
+                .iter()
+                .copied()
+                .find(|candidate| candidate.index() == probe.index())
+                .map(|candidate| candidate.pending())
+                .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Configuration))?;
+            bar_probes.push(probe.with_pending(pending));
+        }
+        let guest_state = PciType0GuestState::from_parts(writable_bytes, bar_probes);
+        configuration
+            .apply_guest_state(&profile, &guest_state)
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::Configuration))?;
+
+        let device = VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(
+            identity.device_type.raw_value(),
+            0,
+            common.available_features(),
+            common.config_generation(),
+        )
+        .with_runtime_state(
+            [pci.device_feature_select(), pci.driver_feature_select()],
+            common.driver_features(),
+            common.status(),
+        );
+        let mut queue_states = Vec::new();
+        queue_states
+            .try_reserve_exact(common.queues().len())
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::Queue))?;
+        for queue in common.queues() {
+            queue_states.push(crate::virtio::VirtioQueueState::from_parts(
+                queue.max_size(),
+                queue.size(),
+                queue.ready(),
+                queue.descriptor_table(),
+                queue.driver_ring(),
+                queue.device_ring(),
+            ));
+        }
+        let queues = VirtioQueues::from_parts(u32::from(pci.queue_select()), queue_states);
+        let mut pending_notifications = Vec::new();
+        pending_notifications
+            .try_reserve_exact(common.queues().len())
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::Notification))?;
+        pending_notifications.resize(common.queues().len(), false);
+        for queue_index in common.pending_notifications().iter().copied() {
+            let pending = pending_notifications
+                .get_mut(usize::from(queue_index))
+                .ok_or_else(|| retained_error(VirtioPciRetainedStateError::Notification))?;
+            *pending = true;
+        }
+        let queue_notifications = VirtioQueueNotificationState::from_parts(pending_notifications);
+        let mut interrupt_intents = Vec::new();
+        interrupt_intents
+            .try_reserve_exact(common.interrupt_intents().len())
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::InterruptIntent))?;
+        for intent in common.interrupt_intents() {
+            interrupt_intents.push(match *intent {
+                SnapshotV2InterruptIntent::Queue { queue_index } => {
+                    VirtioInterruptIntent::Queue { queue_index }
+                }
+                SnapshotV2InterruptIntent::Configuration => VirtioInterruptIntent::Configuration,
+            });
+        }
+        let mut msix_entries = Vec::new();
+        msix_entries
+            .try_reserve_exact(pci.msix().entries().len())
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::Msix))?;
+        for entry in pci.msix().entries() {
+            msix_entries.push(VirtioPciMsixTableEntry::from_parts(
+                entry.message_address_low(),
+                entry.message_address_high(),
+                entry.message_data(),
+                entry.vector_control(),
+            ));
+        }
+        let mut pending_words = Vec::new();
+        pending_words
+            .try_reserve_exact(pci.msix().pending_words().len())
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::Msix))?;
+        pending_words.extend_from_slice(pci.msix().pending_words());
+        let mut queue_vectors = Vec::new();
+        queue_vectors
+            .try_reserve_exact(pci.msix().queue_vectors().len())
+            .map_err(|_| retained_error(VirtioPciRetainedStateError::Msix))?;
+        queue_vectors.extend_from_slice(pci.msix().queue_vectors());
+        let msix = VirtioPciMsixState::from_parts(
+            msix_entries,
+            pending_words,
+            pci.msix().enabled(),
+            pci.msix().function_masked(),
+            pci.msix().config_vector(),
+            queue_vectors,
+            pci.msix().pending_transition_observed(),
+        );
+
+        let retained = Self {
+            phase: pci.phase(),
+            configuration,
+            pci_cfg_cap_offset,
+            msix_cap_offset,
+            pci_cfg_bar: pci.pci_cfg_bar(),
+            pci_cfg_offset: pci.pci_cfg_offset(),
+            pci_cfg_length: pci.pci_cfg_length(),
+            device_feature_select: pci.device_feature_select(),
+            driver_feature_select: pci.driver_feature_select(),
+            queue_select: pci.queue_select(),
+            device,
+            queues,
+            queue_notifications,
+            device_activated: common.is_activated(),
+            requires_device_config_write_status,
+            interrupt_intents,
+            msix,
+        };
+        Ok(retained)
+    }
+
     pub const fn phase(&self) -> VirtioPciEndpointPhase {
         self.phase
     }
@@ -1734,6 +1942,20 @@ impl Default for VirtioPciMsixTableEntry {
 }
 
 impl VirtioPciMsixTableEntry {
+    pub(crate) const fn from_parts(
+        message_address_low: u32,
+        message_address_high: u32,
+        message_data: u32,
+        vector_control: u32,
+    ) -> Self {
+        Self {
+            message_address_low,
+            message_address_high,
+            message_data,
+            vector_control,
+        }
+    }
+
     pub const fn message_address_low(self) -> u32 {
         self.message_address_low
     }
@@ -1792,6 +2014,27 @@ impl VirtioPciMsixState {
             config_vector: VIRTIO_PCI_NO_VECTOR,
             queue_vectors: vec![VIRTIO_PCI_NO_VECTOR; queue_count],
             pending_transition_observed: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        entries: Vec<VirtioPciMsixTableEntry>,
+        pending: Vec<u64>,
+        enabled: bool,
+        function_masked: bool,
+        config_vector: u16,
+        queue_vectors: Vec<u16>,
+        pending_transition_observed: bool,
+    ) -> Self {
+        Self {
+            entries,
+            pending,
+            enabled,
+            function_masked,
+            config_vector,
+            queue_vectors,
+            pending_transition_observed,
         }
     }
 
