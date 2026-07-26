@@ -4,13 +4,20 @@ use std::collections::{HashSet, TryReserveError};
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use bangbang_runtime::block::async_executor::BlockAsyncRuntimeError;
 use bangbang_runtime::block::{
     BlockFileBacking, BlockFileBackingIdentity, DriveConfigs, SnapshotBlockFileBackingError,
     SnapshotBlockFileBackingReservation,
 };
+use bangbang_runtime::memory::GuestMemory;
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceGraph;
-use bangbang_runtime::snapshot_device_v2_5::SnapshotV2MultiBlockDeviceGraph;
+use bangbang_runtime::snapshot_device_v2_5::{
+    PreparedSnapshotV2MultiBlockBundle, SnapshotV2MultiBlockBundleError,
+    SnapshotV2MultiBlockCleanupError, SnapshotV2MultiBlockDeviceGraph,
+    SnapshotV2MultiBlockRestorePlan, SnapshotV2MultiBlockRestorePlanError,
+};
 use bangbang_runtime::snapshot_restore::{
     PreparedSnapshotRestoreBindings, SnapshotRestoreBindingAllocationError,
     SnapshotRestoreBindingRejectionReason, SnapshotRestoreBindings, SnapshotRestoreManifest,
@@ -1634,6 +1641,198 @@ impl std::error::Error for PreparedSnapshotDriveRestoreCompletionError {
     }
 }
 
+/// Process-owned composition of one pathless block bundle and its aggregate
+/// provisional backing authority.
+pub(crate) struct PreparedSnapshotV2MultiBlockRestoreBundle {
+    bundle: Option<PreparedSnapshotV2MultiBlockBundle>,
+    completion: Option<PreparedSnapshotDriveRestoreCompletion>,
+}
+
+impl PreparedSnapshotV2MultiBlockRestoreBundle {
+    pub(crate) const fn bundle(&self) -> Option<&PreparedSnapshotV2MultiBlockBundle> {
+        self.bundle.as_ref()
+    }
+
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<PreparedSnapshotV2MultiBlockBundle, PreparedSnapshotV2MultiBlockRestoreCommitError>
+    {
+        let completion = self
+            .completion
+            .take()
+            .ok_or(PreparedSnapshotV2MultiBlockRestoreCommitError::InvalidState)?;
+        completion
+            .commit()
+            .map_err(PreparedSnapshotV2MultiBlockRestoreCommitError::Completion)?;
+        self.bundle
+            .take()
+            .ok_or(PreparedSnapshotV2MultiBlockRestoreCommitError::InvalidState)
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), PreparedSnapshotV2MultiBlockRestoreAbortError> {
+        let bundle = self.bundle.take().and_then(|bundle| bundle.abort().err());
+        let completion = self
+            .completion
+            .take()
+            .and_then(|completion| completion.abort().err());
+        if bundle.is_some() || completion.is_some() {
+            Err(PreparedSnapshotV2MultiBlockRestoreAbortError { bundle, completion })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for PreparedSnapshotV2MultiBlockRestoreBundle {
+    fn drop(&mut self) {
+        if let Some(bundle) = self.bundle.take() {
+            let _ = bundle.abort();
+        }
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.abort();
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MultiBlockRestoreBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MultiBlockRestoreBundle")
+            .field(
+                "drive_count",
+                &self
+                    .bundle
+                    .as_ref()
+                    .map_or(0, |bundle| bundle.records().len()),
+            )
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum PreparedSnapshotV2MultiBlockRestoreCommitError {
+    InvalidState,
+    Completion(PreparedSnapshotDriveRestoreCompletionError),
+}
+
+impl fmt::Display for PreparedSnapshotV2MultiBlockRestoreCommitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidState => "snapshot multi-block restore commit state is invalid",
+            Self::Completion(_) => "snapshot multi-block restore completion commit failed",
+        })
+    }
+}
+
+impl std::error::Error for PreparedSnapshotV2MultiBlockRestoreCommitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Completion(source) => Some(source),
+            Self::InvalidState => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedSnapshotV2MultiBlockRestoreAbortError {
+    bundle: Option<SnapshotV2MultiBlockCleanupError>,
+    completion: Option<PreparedSnapshotDriveRestoreCompletionError>,
+}
+
+impl fmt::Display for PreparedSnapshotV2MultiBlockRestoreAbortError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("snapshot multi-block restore bundle cleanup failed")
+    }
+}
+
+impl std::error::Error for PreparedSnapshotV2MultiBlockRestoreAbortError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.bundle
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.completion
+                    .as_ref()
+                    .map(|source| source as &(dyn std::error::Error + 'static))
+            })
+    }
+}
+
+pub(crate) enum SnapshotV2MultiBlockRestoreBundleError {
+    Resources(SnapshotRestoreResourceError),
+    Plan(SnapshotV2MultiBlockRestorePlanError),
+    Bundle {
+        source: SnapshotV2MultiBlockBundleError,
+        completion_abort: Option<PreparedSnapshotDriveRestoreCompletionError>,
+    },
+}
+
+impl SnapshotV2MultiBlockRestoreBundleError {
+    pub(crate) const fn disposition(&self) -> SnapshotRestoreResourceDisposition {
+        match self {
+            Self::Resources(source) => source.disposition(),
+            Self::Plan(SnapshotV2MultiBlockRestorePlanError::Allocation) => {
+                SnapshotRestoreResourceDisposition::Retryable
+            }
+            Self::Plan(_) => SnapshotRestoreResourceDisposition::Terminal,
+            Self::Bundle {
+                completion_abort: Some(_),
+                ..
+            } => SnapshotRestoreResourceDisposition::Terminal,
+            Self::Bundle {
+                source:
+                    SnapshotV2MultiBlockBundleError::Allocation
+                    | SnapshotV2MultiBlockBundleError::AsyncBinding {
+                        source:
+                            BlockAsyncRuntimeError::MetadataAllocation
+                            | BlockAsyncRuntimeError::BuildExecutor(_)
+                            | BlockAsyncRuntimeError::DriveBuild(_),
+                        cleanup: None,
+                    },
+                completion_abort: None,
+            } => SnapshotRestoreResourceDisposition::Retryable,
+            Self::Bundle { .. } => SnapshotRestoreResourceDisposition::Terminal,
+        }
+    }
+}
+
+impl fmt::Debug for SnapshotV2MultiBlockRestoreBundleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Resources(_) => "Resources",
+            Self::Plan(_) => "Plan",
+            Self::Bundle { .. } => "Bundle",
+        };
+        formatter
+            .debug_struct("SnapshotV2MultiBlockRestoreBundleError")
+            .field("kind", &kind)
+            .field("disposition", &self.disposition())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2MultiBlockRestoreBundleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "snapshot multi-block restore bundle preparation failed ({:?})",
+            self.disposition()
+        )
+    }
+}
+
+impl std::error::Error for SnapshotV2MultiBlockRestoreBundleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Resources(source) => Some(source),
+            Self::Plan(source) => Some(source),
+            Self::Bundle { source, .. } => Some(source),
+        }
+    }
+}
+
 pub(crate) enum RequestedSnapshotRestoreResource {
     Root {
         key: SnapshotRestoreResourceKey,
@@ -1712,6 +1911,78 @@ enum SnapshotRestoreReservationSource<'a> {
 }
 
 impl RequestedSnapshotRestoreResources {
+    /// Dormant profile-2 pathless bundle producer. It performs pure loaded-
+    /// memory planning before opening or taking one backing and retains the
+    /// aggregate completion without publishing controller or VM state.
+    pub(crate) fn prepare_native_v2_multi_block_restore_bundle<F>(
+        graph: SnapshotV2MultiBlockDeviceGraph,
+        memory: &GuestMemory,
+        now: Instant,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: F,
+    ) -> Result<PreparedSnapshotV2MultiBlockRestoreBundle, SnapshotV2MultiBlockRestoreBundleError>
+    where
+        F: Fn() -> bool,
+    {
+        // Keep the complete dormant ownership contract type-checked before
+        // later profile-2 activation consumes it.
+        let _bundle = PreparedSnapshotV2MultiBlockRestoreBundle::bundle;
+        let _commit = PreparedSnapshotV2MultiBlockRestoreBundle::commit;
+        let _abort = PreparedSnapshotV2MultiBlockRestoreBundle::abort;
+        Self::prepare_native_v2_multi_block_restore_bundle_with(
+            graph,
+            memory,
+            now,
+            authority,
+            cancelled,
+            SnapshotV2MultiBlockRestorePlan::prepare_backings,
+        )
+    }
+
+    fn prepare_native_v2_multi_block_restore_bundle_with<F, B>(
+        graph: SnapshotV2MultiBlockDeviceGraph,
+        memory: &GuestMemory,
+        now: Instant,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: F,
+        build_bundle: B,
+    ) -> Result<PreparedSnapshotV2MultiBlockRestoreBundle, SnapshotV2MultiBlockRestoreBundleError>
+    where
+        F: Fn() -> bool,
+        B: FnOnce(
+            SnapshotV2MultiBlockRestorePlan,
+            DriveConfigs,
+            Vec<BlockFileBacking>,
+        )
+            -> Result<PreparedSnapshotV2MultiBlockBundle, SnapshotV2MultiBlockBundleError>,
+    {
+        let requested =
+            RequestedSnapshotMultiDriveRestoreResources::try_from_native_v2_multi_block_device_graph(
+                &graph,
+            )
+            .map_err(SnapshotV2MultiBlockRestoreBundleError::Resources)?;
+        let plan = SnapshotV2MultiBlockRestorePlan::prepare(graph, memory, now)
+            .map_err(SnapshotV2MultiBlockRestoreBundleError::Plan)?;
+        let batch = requested
+            .prepare(authority, cancelled)
+            .and_then(PreparedSnapshotMultiDriveRestoreResources::into_drive_batch)
+            .map_err(SnapshotV2MultiBlockRestoreBundleError::Resources)?;
+        let (drive_configs, backings, completion) = batch.into_parts();
+        match build_bundle(plan, drive_configs, backings) {
+            Ok(bundle) => Ok(PreparedSnapshotV2MultiBlockRestoreBundle {
+                bundle: Some(bundle),
+                completion: Some(completion),
+            }),
+            Err(source) => {
+                let completion_abort = completion.abort().err();
+                Err(SnapshotV2MultiBlockRestoreBundleError::Bundle {
+                    source,
+                    completion_abort,
+                })
+            }
+        }
+    }
+
     /// Dormant typed profile-2 resource producer. Public native-v2 dispatch
     /// remains exact 2.4 until the later activation slice.
     pub(crate) fn prepare_native_v2_multi_block_device_graph<F>(
@@ -1741,6 +2012,8 @@ impl RequestedSnapshotRestoreResources {
         // Keep the dormant typed producer linked without admitting profile 2
         // to public dispatch.
         let _profile_2_producer = Self::prepare_native_v2_multi_block_device_graph::<fn() -> bool>;
+        let _profile_2_bundle_producer =
+            Self::prepare_native_v2_multi_block_restore_bundle::<fn() -> bool>;
         Self::try_from_native_v2_device_graph_and_vsock(graph, None)
     }
 
@@ -2714,6 +2987,46 @@ mod tests {
         .expect("profile-2 fixture graph should decode")
     }
 
+    fn multi_restore_memory(graph: &SnapshotV2MultiBlockDeviceGraph) -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), 0x80_0000)
+                .expect("profile-2 restore memory range should validate"),
+        ])
+        .expect("profile-2 restore memory layout should validate");
+        let mut memory =
+            GuestMemory::allocate(&layout).expect("profile-2 restore memory should allocate");
+        for record in graph.records() {
+            let Some(cursor) = record.block().continuation().active_queue() else {
+                continue;
+            };
+            let queue = record
+                .virtio()
+                .queues()
+                .first()
+                .expect("profile-2 fixture queue should exist");
+            let available_index = if record.block().continuation().retry()
+                == bangbang_runtime::storage_capture::StorageRetryState::None
+            {
+                cursor.next_available()
+            } else {
+                cursor.next_available().wrapping_add(1)
+            };
+            memory
+                .write_slice(
+                    &available_index.to_le_bytes(),
+                    GuestAddress::new(queue.driver_ring().raw_value() + 2),
+                )
+                .expect("profile-2 available cursor should write");
+            memory
+                .write_slice(
+                    &cursor.next_used().to_le_bytes(),
+                    GuestAddress::new(queue.device_ring().raw_value() + 2),
+                )
+                .expect("profile-2 used cursor should write");
+        }
+        memory
+    }
+
     fn requested() -> RequestedSnapshotRestoreResources {
         RequestedSnapshotRestoreResources::try_from_native_v2_device_graph(&fixture_graph(
             SnapshotV2DeviceTransportKind::Mmio,
@@ -3137,6 +3450,120 @@ mod tests {
         completion
             .commit()
             .expect("direct batch completion should commit once");
+    }
+
+    #[test]
+    fn profile_2_process_bundle_retains_completion_until_explicit_commit() {
+        let template = multi_fixture_graph(None, None);
+        let first_path = unique_short_path();
+        let second_path = unique_short_path();
+        let first = TempRoot::new_at(
+            first_path,
+            &vec![
+                0x31;
+                usize::try_from(template.records()[0].block().backing_bytes())
+                    .expect("fixture length should fit")
+            ],
+        );
+        let second = TempRoot::new_at(
+            second_path,
+            &vec![
+                0x32;
+                usize::try_from(template.records()[1].block().backing_bytes())
+                    .expect("fixture length should fit")
+            ],
+        );
+        let graph = multi_fixture_graph(Some(first.path()), Some(second.path()));
+        let expected_configs = graph
+            .project_drive_configs()
+            .expect("profile-2 configs should project");
+        let memory = multi_restore_memory(&graph);
+        let prepared =
+            RequestedSnapshotRestoreResources::prepare_native_v2_multi_block_restore_bundle(
+                graph,
+                &memory,
+                Instant::now(),
+                None,
+                || false,
+            )
+            .expect("profile-2 process bundle should prepare");
+        let retained = prepared
+            .bundle()
+            .expect("prepared process owner should retain its bundle");
+        assert_eq!(retained.drive_configs(), &expected_configs);
+        assert_eq!(retained.records().len(), 2);
+        assert_eq!(retained.retry_projection().len(), 2);
+        assert_eq!(
+            retained
+                .async_runtime()
+                .expect("mixed profile should own one runtime")
+                .generation_count()
+                .expect("runtime should lock"),
+            1
+        );
+        let diagnostics = format!("{prepared:?}");
+        for private in [
+            first.path().to_string_lossy(),
+            second.path().to_string_lossy(),
+        ] {
+            assert!(!diagnostics.contains(private.as_ref()));
+        }
+
+        let bundle = prepared
+            .commit()
+            .expect("direct aggregate completion should commit");
+        assert_eq!(bundle.drive_configs(), &expected_configs);
+        bundle
+            .abort()
+            .expect("fresh Async generation should release cleanly");
+    }
+
+    #[test]
+    fn profile_2_process_bundle_failure_aborts_aggregate_completion() {
+        let template = multi_fixture_graph(None, None);
+        let first_path = unique_short_path();
+        let second_path = unique_short_path();
+        let first = TempRoot::new_at(
+            first_path,
+            &vec![
+                0x41;
+                usize::try_from(template.records()[0].block().backing_bytes())
+                    .expect("fixture length should fit")
+            ],
+        );
+        let second = TempRoot::new_at(
+            second_path,
+            &vec![
+                0x42;
+                usize::try_from(template.records()[1].block().backing_bytes())
+                    .expect("fixture length should fit")
+            ],
+        );
+        let graph = multi_fixture_graph(Some(first.path()), Some(second.path()));
+        let memory = multi_restore_memory(&graph);
+        let error =
+            RequestedSnapshotRestoreResources::prepare_native_v2_multi_block_restore_bundle_with(
+                graph,
+                &memory,
+                Instant::now(),
+                None,
+                || false,
+                |_plan, _configs, _backings| Err(SnapshotV2MultiBlockBundleError::Allocation),
+            )
+            .expect_err("injected bundle construction should fail");
+        assert_eq!(
+            error.disposition(),
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert!(matches!(
+            error,
+            SnapshotV2MultiBlockRestoreBundleError::Bundle {
+                completion_abort: None,
+                ..
+            }
+        ));
+        assert!(first.path().is_file());
+        assert!(second.path().is_file());
     }
 
     #[test]
