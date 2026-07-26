@@ -3,6 +3,7 @@ use std::io::Cursor;
 use bangbang_runtime::machine::MachineConfigInput;
 use bangbang_runtime::memory::{GuestMemory, aarch64};
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
+use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_BYTES;
 use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_COMPONENT_DIRECTORY_ENTRY_BYTES, NATIVE_V2_LEGACY_PLATFORM_VERSION,
     NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES, NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES,
@@ -1805,33 +1806,77 @@ fn bounds_inert_metadata_global_state_and_debug_output() {
 fn admitted_component_maxima_fit_the_structural_file_budget() {
     let mandatory_bytes =
         encode_vcpu(platform_fixture(false).vcpus()[0].mandatory()).expect("vCPU should encode");
-    let maximum_component_count = 5 + usize::from(MAX_SUPPORTED_VCPUS);
-    let maximum_machine = MACHINE_HEADER_BYTES
-        + HVF_SNAPSHOT_V2_MAX_PATH_BYTES * 2
-        + HVF_SNAPSHOT_V2_MAX_BOOT_ARGUMENT_BYTES
-        + HVF_ARM64_CPU_TEMPLATE_APPLICATION_MAX_ENTRIES * MACHINE_CPU_ENTRY_BYTES;
-    let maximum_global = GLOBAL_HEADER_BYTES
-        + GLOBAL_COMPATIBILITY_BYTES
-        + HVF_SNAPSHOT_V2_GIC_DEVICE_STATE_MAX_BYTES;
-    let maximum_topology =
-        TOPOLOGY_HEADER_BYTES + usize::from(MAX_SUPPORTED_VCPUS) * TOPOLOGY_MEMBER_BYTES;
-    let maximum_vcpus = usize::from(MAX_SUPPORTED_VCPUS)
-        * (VCPU_HEADER_BYTES
-            + mandatory_bytes.len()
-            + VCPU_INTERRUPT_BYTES
-            + OPTIONAL_HEADER_BYTES
-            + OPTIONAL_MAX_REGISTRY_BYTES);
-    let maximum_file = bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_HEADER_BYTES
-        + maximum_component_count
-            * bangbang_runtime::snapshot_format_v2::NATIVE_V2_COMPONENT_DIRECTORY_ENTRY_BYTES
-        + maximum_machine
-        + maximum_global
-        + maximum_topology
-        + maximum_vcpus
-        + bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES
-        + bangbang_runtime::snapshot_memory_v2::NATIVE_V2_MEMORY_HEADER_BYTES
-        + bangbang_runtime::snapshot_memory_v2::NATIVE_V2_MEMORY_MAX_EXTENTS
-            * bangbang_runtime::snapshot_memory_v2::NATIVE_V2_MEMORY_EXTENT_BYTES;
+    let maximum_vcpu_count = usize::from(MAX_SUPPORTED_VCPUS);
+    let maximum_component_count = 6_usize
+        .checked_add(maximum_vcpu_count)
+        .expect("component count should fit");
+    let maximum_paths = HVF_SNAPSHOT_V2_MAX_PATH_BYTES
+        .checked_mul(2)
+        .expect("maximum path pair should fit");
+    let maximum_cpu_entries = HVF_ARM64_CPU_TEMPLATE_APPLICATION_MAX_ENTRIES
+        .checked_mul(MACHINE_CPU_ENTRY_BYTES)
+        .expect("maximum CPU template entries should fit");
+    let maximum_machine = [
+        MACHINE_HEADER_BYTES,
+        maximum_paths,
+        HVF_SNAPSHOT_V2_MAX_BOOT_ARGUMENT_BYTES,
+        maximum_cpu_entries,
+    ]
+    .into_iter()
+    .try_fold(0_usize, usize::checked_add)
+    .expect("maximum machine should fit");
+    let maximum_global = [
+        GLOBAL_HEADER_BYTES,
+        GLOBAL_COMPATIBILITY_BYTES,
+        HVF_SNAPSHOT_V2_GIC_DEVICE_STATE_MAX_BYTES,
+    ]
+    .into_iter()
+    .try_fold(0_usize, usize::checked_add)
+    .expect("maximum global state should fit");
+    let maximum_topology = maximum_vcpu_count
+        .checked_mul(TOPOLOGY_MEMBER_BYTES)
+        .and_then(|members| TOPOLOGY_HEADER_BYTES.checked_add(members))
+        .expect("maximum topology should fit");
+    let maximum_vcpu = [
+        VCPU_HEADER_BYTES,
+        mandatory_bytes.len(),
+        VCPU_INTERRUPT_BYTES,
+        OPTIONAL_HEADER_BYTES,
+        OPTIONAL_MAX_REGISTRY_BYTES,
+    ]
+    .into_iter()
+    .try_fold(0_usize, usize::checked_add)
+    .expect("maximum vCPU should fit");
+    let maximum_vcpus = maximum_vcpu_count
+        .checked_mul(maximum_vcpu)
+        .expect("maximum vCPU vector should fit");
+    let maximum_time = maximum_vcpu_count
+        .checked_mul(TIME_PVTIME_ENTRY_BYTES)
+        .and_then(|entries| TIME_HEADER_BYTES.checked_add(entries))
+        .expect("maximum time state should fit");
+    let maximum_directories = maximum_component_count
+        .checked_mul(NATIVE_V2_COMPONENT_DIRECTORY_ENTRY_BYTES)
+        .expect("maximum component directory should fit");
+    let maximum_memory_extents = bangbang_runtime::snapshot_memory_v2::NATIVE_V2_MEMORY_MAX_EXTENTS
+        .checked_mul(bangbang_runtime::snapshot_memory_v2::NATIVE_V2_MEMORY_EXTENT_BYTES)
+        .expect("maximum memory extents should fit");
+    let maximum_file = [
+        bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_HEADER_BYTES,
+        maximum_directories,
+        maximum_machine,
+        maximum_global,
+        maximum_topology,
+        maximum_vcpus,
+        maximum_time,
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_BYTES,
+        NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES,
+        bangbang_runtime::snapshot_memory_v2::NATIVE_V2_MEMORY_HEADER_BYTES,
+        maximum_memory_extents,
+    ]
+    .into_iter()
+    .try_fold(0_usize, usize::checked_add)
+    .expect("complete maximum snapshot profile should fit usize");
+    assert_eq!(maximum_file, 16_427_575);
     assert!(
         maximum_file <= NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES,
         "profile maxima require {maximum_file} bytes"
