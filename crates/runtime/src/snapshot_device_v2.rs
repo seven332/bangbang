@@ -178,6 +178,13 @@ pub struct SnapshotV2DeviceKey {
 }
 
 impl SnapshotV2DeviceKey {
+    pub(crate) const fn block(instance: u32) -> Self {
+        Self {
+            kind: DEVICE_KIND_BLOCK,
+            instance,
+        }
+    }
+
     /// Returns the stable record kind.
     pub const fn kind(self) -> u32 {
         self.kind
@@ -281,6 +288,14 @@ pub struct SnapshotV2BlockBucketState {
 }
 
 impl SnapshotV2BlockBucketState {
+    pub(crate) const fn from_parts(budget: u64, remaining_burst: u64, age_nanos: u64) -> Self {
+        Self {
+            budget,
+            remaining_burst,
+            age_nanos,
+        }
+    }
+
     /// Returns the current ordinary-token budget.
     pub const fn budget(self) -> u64 {
         self.budget
@@ -307,6 +322,13 @@ pub struct SnapshotV2BlockLimiterState {
 }
 
 impl SnapshotV2BlockLimiterState {
+    pub(crate) const fn from_parts(
+        bandwidth: Option<SnapshotV2BlockBucketState>,
+        ops: Option<SnapshotV2BlockBucketState>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
     /// Returns the live bandwidth bucket.
     pub const fn bandwidth(self) -> Option<SnapshotV2BlockBucketState> {
         self.bandwidth
@@ -336,6 +358,22 @@ pub struct SnapshotV2BlockState {
 }
 
 impl SnapshotV2BlockState {
+    pub(crate) const fn from_parts(
+        capacity_sectors: u64,
+        device_id: VirtioBlockDeviceId,
+        active_queue: Option<crate::block::VirtioBlockQueueState>,
+        limiter: SnapshotV2BlockLimiterState,
+        retry: StorageRetryState,
+    ) -> Self {
+        Self {
+            capacity_sectors,
+            device_id,
+            active_queue,
+            limiter,
+            retry,
+        }
+    }
+
     /// Returns the guest-visible capacity in 512-byte sectors.
     pub const fn capacity_sectors(&self) -> u64 {
         self.capacity_sectors
@@ -376,6 +414,24 @@ pub struct SnapshotV2VirtioQueueState {
 }
 
 impl SnapshotV2VirtioQueueState {
+    pub(crate) const fn from_parts(
+        max_size: u16,
+        size: u16,
+        ready: bool,
+        descriptor_table: GuestAddress,
+        driver_ring: GuestAddress,
+        device_ring: GuestAddress,
+    ) -> Self {
+        Self {
+            max_size,
+            size,
+            ready,
+            descriptor_table,
+            driver_ring,
+            device_ring,
+        }
+    }
+
     /// Returns the device queue maximum.
     pub const fn max_size(self) -> u16 {
         self.max_size
@@ -422,7 +478,33 @@ pub struct SnapshotV2VirtioState {
     interrupt_intents: Vec<SnapshotV2InterruptIntent>,
 }
 
+pub(crate) struct SnapshotV2VirtioStateParts {
+    pub(crate) available_features: u64,
+    pub(crate) driver_features: u64,
+    pub(crate) config_generation: u32,
+    pub(crate) status: u32,
+    pub(crate) activated: bool,
+    pub(crate) queues: Vec<SnapshotV2VirtioQueueState>,
+    pub(crate) pending_notifications: Vec<u16>,
+    pub(crate) interrupt_intents: Vec<SnapshotV2InterruptIntent>,
+}
+
+redacted_debug!(SnapshotV2VirtioStateParts, "SnapshotV2VirtioStateParts");
+
 impl SnapshotV2VirtioState {
+    pub(crate) fn from_parts(parts: SnapshotV2VirtioStateParts) -> Self {
+        Self {
+            available_features: parts.available_features,
+            driver_features: parts.driver_features,
+            config_generation: parts.config_generation,
+            status: parts.status,
+            activated: parts.activated,
+            queues: parts.queues,
+            pending_notifications: parts.pending_notifications,
+            interrupt_intents: parts.interrupt_intents,
+        }
+    }
+
     /// Returns available virtio features.
     pub const fn available_features(&self) -> u64 {
         self.available_features
@@ -477,6 +559,22 @@ pub struct SnapshotV2MmioDeviceState {
 }
 
 impl SnapshotV2MmioDeviceState {
+    pub(crate) const fn from_parts(
+        device_feature_select: u32,
+        driver_feature_select: u32,
+        queue_select: u32,
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+    ) -> Self {
+        Self {
+            device_feature_select,
+            driver_feature_select,
+            queue_select,
+            region,
+            interrupt_line,
+        }
+    }
+
     /// Returns the selected device feature word.
     pub const fn device_feature_select(&self) -> u32 {
         self.device_feature_select
@@ -513,6 +611,10 @@ pub struct SnapshotV2PciWritableByte {
 }
 
 impl SnapshotV2PciWritableByte {
+    pub(crate) const fn from_parts(offset: u16, value: u8) -> Self {
+        Self { offset, value }
+    }
+
     /// Returns the PCI configuration-space byte offset.
     pub const fn offset(self) -> u16 {
         self.offset
@@ -534,6 +636,10 @@ pub struct SnapshotV2PciBarProbeState {
 }
 
 impl SnapshotV2PciBarProbeState {
+    pub(crate) const fn from_parts(index: u8, pending: bool) -> Self {
+        Self { index, pending }
+    }
+
     /// Returns the BAR register index.
     pub const fn index(self) -> u8 {
         self.index
@@ -557,6 +663,20 @@ pub struct SnapshotV2PciMsixTableEntry {
 }
 
 impl SnapshotV2PciMsixTableEntry {
+    pub(crate) const fn from_parts(
+        message_address_low: u32,
+        message_address_high: u32,
+        message_data: u32,
+        vector_control: u32,
+    ) -> Self {
+        Self {
+            message_address_low,
+            message_address_high,
+            message_data,
+            vector_control,
+        }
+    }
+
     /// Returns the low message-address word.
     pub const fn message_address_low(self) -> u32 {
         self.message_address_low
@@ -592,7 +712,31 @@ pub struct SnapshotV2PciMsixState {
     pending_transition_observed: bool,
 }
 
+pub(crate) struct SnapshotV2PciMsixStateParts {
+    pub(crate) entries: Vec<SnapshotV2PciMsixTableEntry>,
+    pub(crate) pending_words: Vec<u64>,
+    pub(crate) enabled: bool,
+    pub(crate) function_masked: bool,
+    pub(crate) config_vector: u16,
+    pub(crate) queue_vectors: Vec<u16>,
+    pub(crate) pending_transition_observed: bool,
+}
+
+redacted_debug!(SnapshotV2PciMsixStateParts, "SnapshotV2PciMsixStateParts");
+
 impl SnapshotV2PciMsixState {
+    pub(crate) fn from_parts(parts: SnapshotV2PciMsixStateParts) -> Self {
+        Self {
+            entries: parts.entries,
+            pending_words: parts.pending_words,
+            enabled: parts.enabled,
+            function_masked: parts.function_masked,
+            config_vector: parts.config_vector,
+            queue_vectors: parts.queue_vectors,
+            pending_transition_observed: parts.pending_transition_observed,
+        }
+    }
+
     /// Returns canonical MSI-X table entries.
     pub fn entries(&self) -> &[SnapshotV2PciMsixTableEntry] {
         &self.entries
@@ -652,7 +796,52 @@ pub struct SnapshotV2PciDeviceState {
     msix: SnapshotV2PciMsixState,
 }
 
+pub(crate) struct SnapshotV2PciDeviceStateParts {
+    pub(crate) phase: VirtioPciEndpointPhase,
+    pub(crate) origin: StorageDeviceOrigin,
+    pub(crate) sbdf: PciSbdf,
+    pub(crate) bar_index: u8,
+    pub(crate) bar_address_space: PciBarAddressSpace,
+    pub(crate) bar_prefetchable: PciBarPrefetchable,
+    pub(crate) bar_range: GuestMemoryRange,
+    pub(crate) device_feature_select: u32,
+    pub(crate) driver_feature_select: u32,
+    pub(crate) queue_select: u16,
+    pub(crate) pci_cfg_bar: u8,
+    pub(crate) pci_cfg_offset: u32,
+    pub(crate) pci_cfg_length: u32,
+    pub(crate) writable_bytes: Vec<SnapshotV2PciWritableByte>,
+    pub(crate) bar_probes: Vec<SnapshotV2PciBarProbeState>,
+    pub(crate) msix: SnapshotV2PciMsixState,
+}
+
+redacted_debug!(
+    SnapshotV2PciDeviceStateParts,
+    "SnapshotV2PciDeviceStateParts"
+);
+
 impl SnapshotV2PciDeviceState {
+    pub(crate) fn from_parts(parts: SnapshotV2PciDeviceStateParts) -> Self {
+        Self {
+            phase: parts.phase,
+            origin: parts.origin,
+            sbdf: parts.sbdf,
+            bar_index: parts.bar_index,
+            bar_address_space: parts.bar_address_space,
+            bar_prefetchable: parts.bar_prefetchable,
+            bar_range: parts.bar_range,
+            device_feature_select: parts.device_feature_select,
+            driver_feature_select: parts.driver_feature_select,
+            queue_select: parts.queue_select,
+            pci_cfg_bar: parts.pci_cfg_bar,
+            pci_cfg_offset: parts.pci_cfg_offset,
+            pci_cfg_length: parts.pci_cfg_length,
+            writable_bytes: parts.writable_bytes,
+            bar_probes: parts.bar_probes,
+            msix: parts.msix,
+        }
+    }
+
     /// Returns the retained endpoint phase.
     pub const fn phase(&self) -> VirtioPciEndpointPhase {
         self.phase

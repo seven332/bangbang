@@ -38,6 +38,7 @@ pub mod snapshot_artifact;
 pub mod snapshot_commit;
 pub mod snapshot_device;
 pub mod snapshot_device_v2;
+pub mod snapshot_device_v2_5;
 pub mod snapshot_format;
 pub mod snapshot_format_v2;
 pub mod snapshot_memory;
