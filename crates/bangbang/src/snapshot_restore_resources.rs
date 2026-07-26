@@ -27,7 +27,7 @@ use crate::contained_session::{DirectoryGrantAuthority, SocketBrokerAuthority};
 use crate::vsock_restore::{
     LocallyPreparedVsockRestoreResource, PreparedVsockRestoreResource,
     RequestedVsockRestoreResource, ReservedVsockRestoreResource, VsockRestoreDisposition,
-    VsockRestoreError,
+    VsockRestoreError, VsockRestoreStage,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,7 +272,7 @@ fn snapshot_vsock_error(source: VsockRestoreError) -> SnapshotRestoreResourceErr
         stage: SnapshotRestoreResourceStage::VsockPreparation,
         kind: SnapshotRestoreResourceErrorKind::Vsock(source),
         disposition,
-        cleanup_failed: false,
+        cleanup_failed: source.stage() == VsockRestoreStage::Cleanup,
     }
 }
 
@@ -1920,6 +1920,46 @@ mod tests {
             })
             .expect_err("broker invalidation during outer cancellation must be terminal");
         assert_eq!(error.stage, SnapshotRestoreResourceStage::Cancellation);
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+        assert!(error.cleanup_failed);
+        assert_coherent_root_claim_restored(&fixture);
+        let directory = fixture
+            .directories()
+            .prepare_socket_directory(
+                Path::new("bangbang-grant:vsock-directory/restored.sock"),
+                bangbang_session::ResourceRole::VsockSocketDirectory,
+            )
+            .expect("directory restoration should still be attempted")
+            .expect("directory reference should remain contained");
+        directory
+            .abort()
+            .expect("restored directory should remain reusable");
+    }
+
+    #[test]
+    fn coherent_contained_local_cancellation_preserves_cleanup_failure_evidence() {
+        let root = TempRoot::new("coherent-vsock-local-broker-loss", b"root");
+        let fixture = contained_restore_authority_for_test(root.path(), true);
+        let contained_vsock = selector(Path::new("bangbang-grant:vsock-directory/restored.sock"));
+        let (request, _, _) =
+            composed_request(Path::new(ROOT_REFERENCE), &contained_vsock, None, false);
+        let checks = Cell::new(0);
+        let error = request
+            .prepare(Some(fixture.authority()), || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                if next == 12 {
+                    fixture.invalidate_broker();
+                    true
+                } else {
+                    false
+                }
+            })
+            .expect_err("local cancellation must preserve broker cleanup failure evidence");
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::VsockPreparation);
         assert_eq!(
             error.disposition,
             SnapshotRestoreResourceDisposition::Terminal
