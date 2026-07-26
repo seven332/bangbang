@@ -1657,7 +1657,9 @@ fn temporary_virtual_block_traverses_async_flush_and_capture_ready_owner() {
     use std::time::Instant;
 
     use crate::macos_virtual_block::{MacosVirtualBlock, MacosVirtualBlockAccess};
-    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+    use bangbang_hvf::{
+        HvfArm64BootSessionConfig, HvfArm64BootStorageCaptureErrorKind, OwnedHvfArm64BootSession,
+    };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::async_executor::{
         BlockAsyncApplyOutcome, BlockAsyncCompletionDisposition, BlockAsyncDrive,
@@ -1841,6 +1843,14 @@ fn temporary_virtual_block_traverses_async_flush_and_capture_ready_owner() {
     let retry_guard = session
         .quiesce_limiter_retry_wakeups()
         .expect("block capture retry publishers should quiesce");
+    let profile_error = session
+        .capture_snapshot_v2_multi_block_device_graph_at(&configs, &retry_guard, Instant::now())
+        .expect_err("block-special backing must fail profile preflight");
+    assert_eq!(
+        profile_error.kind(),
+        HvfArm64BootStorageCaptureErrorKind::ProfilePreflight
+    );
+    assert!(!profile_error.terminal());
     let first = session
         .capture_ready_storage_state_at(&configs, &retry_guard, Instant::now())
         .expect("real block drive should become capture-ready");
@@ -6887,7 +6897,9 @@ fn prepares_internal_hvf_arm64_boot_session() {
 fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
     use std::time::Instant;
 
-    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+    use bangbang_hvf::{
+        HvfArm64BootSessionConfig, HvfArm64BootStorageCaptureErrorKind, OwnedHvfArm64BootSession,
+    };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::{
         BlockCaptureIoEngine, BlockMmioLayout, DriveCacheType, DriveConfigInput, DriveIoEngine,
@@ -6961,6 +6973,14 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
     let mmio_guard = mmio_session
         .quiesce_limiter_retry_wakeups()
         .expect("MMIO retry publishers should quiesce");
+    let profile_error = mmio_session
+        .capture_snapshot_v2_multi_block_device_graph_at(&mmio_configs, &mmio_guard, Instant::now())
+        .expect_err("pmem inventory must fail multi-block profile preflight");
+    assert_eq!(
+        profile_error.kind(),
+        HvfArm64BootStorageCaptureErrorKind::ProfilePreflight
+    );
+    assert!(!profile_error.terminal());
     let mmio_first = mmio_session
         .capture_ready_storage_state_at(&mmio_configs, &mmio_guard, Instant::now())
         .expect("signed MMIO storage should become capture-ready");
@@ -7200,6 +7220,256 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
     pci_session
         .shutdown()
         .expect("signed PCI storage session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_v2_multi_block_graph_is_durable_and_recoverable_for_mmio_and_pci() {
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootSessionConfig, HvfArm64BootStorageCaptureErrorKind,
+        HvfArm64BootStorageCaptureStage, OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::{
+        BlockMmioLayout, DriveCacheType, DriveConfigInput, DriveIoEngine, PreparedBlockDevice,
+    };
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::snapshot_device_v2::{
+        SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
+    };
+    use bangbang_runtime::snapshot_device_v2_5::{
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
+    };
+    use bangbang_runtime::storage_capture::{CaptureReadyStorageConfigs, StorageDeviceOrigin};
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+
+    for (case, pci_enabled, expected_transport) in [
+        (
+            "native-v2-multi-block-mmio",
+            false,
+            SnapshotV2DeviceTransportKind::Mmio,
+        ),
+        (
+            "native-v2-multi-block-pci",
+            true,
+            SnapshotV2DeviceTransportKind::Pci,
+        ),
+    ] {
+        let kernel = TempFile::new(&format!("{case}-kernel"), &image)
+            .unwrap_or_else(|error| panic!("{case} kernel should create: {error}"));
+        let root = TempFile::new_len(&format!("{case}-root"), 4096)
+            .unwrap_or_else(|error| panic!("{case} root should create: {error}"));
+        let sync = TempFile::new_len(&format!("{case}-sync"), 8193)
+            .unwrap_or_else(|error| panic!("{case} Sync backing should create: {error}"));
+        let asynchronous = TempFile::new_len(&format!("{case}-async"), 12_288)
+            .unwrap_or_else(|error| panic!("{case} Async backing should create: {error}"));
+        let mut controller = bangbang_runtime::VmmController::new(case, "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.path(),
+            )))
+            .unwrap_or_else(|error| panic!("{case} boot source should configure: {error}"));
+        controller
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                    .with_is_read_only(true)
+                    .with_cache_type(DriveCacheType::Writeback)
+                    .with_io_engine(DriveIoEngine::Sync),
+            ))
+            .unwrap_or_else(|error| panic!("{case} root should configure: {error}"));
+        controller
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new("data_sync", "data_sync", sync.path(), false)
+                    .with_is_read_only(false)
+                    .with_cache_type(DriveCacheType::Unsafe)
+                    .with_io_engine(DriveIoEngine::Sync),
+            ))
+            .unwrap_or_else(|error| panic!("{case} Sync data should configure: {error}"));
+        if !pci_enabled {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("data_async", "data_async", asynchronous.path(), false)
+                        .with_is_read_only(false)
+                        .with_cache_type(DriveCacheType::Writeback)
+                        .with_io_engine(DriveIoEngine::Async),
+                ))
+                .unwrap_or_else(|error| panic!("{case} Async data should configure: {error}"));
+        }
+
+        let mut session_config = HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            test_rtc_mmio_layout(),
+        );
+        if pci_enabled {
+            session_config = session_config.with_pci_enabled();
+        }
+        let mut session = OwnedHvfArm64BootSession::new(&controller, session_config)
+            .unwrap_or_else(|error| panic!("{case} signed session should prepare: {error}"));
+
+        if pci_enabled {
+            let input =
+                DriveConfigInput::new("data_async", "data_async", asynchronous.path(), false)
+                    .with_is_read_only(false)
+                    .with_cache_type(DriveCacheType::Writeback)
+                    .with_io_engine(DriveIoEngine::Async);
+            let config = input.clone().validate().unwrap_or_else(|error| {
+                panic!("{case} runtime Async config should validate: {error}")
+            });
+            controller
+                .handle_action(VmmAction::PutDrive(input))
+                .unwrap_or_else(|error| {
+                    panic!("{case} runtime Async config should publish: {error}")
+                });
+            session
+                .insert_runtime_block_device(
+                    PreparedBlockDevice::from_config_with_backing(&config, None).unwrap_or_else(
+                        |error| panic!("{case} runtime Async device should prepare: {error}"),
+                    ),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{case} runtime Async device should insert: {error}")
+                });
+        }
+
+        let configs =
+            CaptureReadyStorageConfigs::new(controller.drive_configs().to_vec(), Vec::new());
+        let guard = session
+            .quiesce_limiter_retry_wakeups()
+            .unwrap_or_else(|error| panic!("{case} retry publishers should quiesce: {error}"));
+
+        for cancelled_stage in [
+            HvfArm64BootStorageCaptureStage::Persist,
+            HvfArm64BootStorageCaptureStage::ComposeGraph,
+        ] {
+            let result = session.capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
+                &configs,
+                &guard,
+                Instant::now(),
+                |stage| stage == cancelled_stage,
+            );
+            let error = match result {
+                Ok(_) => panic!("{case} cancellation at {cancelled_stage:?} returned a graph"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), HvfArm64BootStorageCaptureErrorKind::Cancelled);
+            assert!(!error.cleanup_failed());
+            assert!(!error.terminal());
+        }
+
+        let mut observed_stages = Vec::new();
+        let first = session
+            .capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
+                &configs,
+                &guard,
+                Instant::now(),
+                |stage| {
+                    observed_stages.push(stage);
+                    false
+                },
+            )
+            .unwrap_or_else(|error| panic!("{case} first graph should capture: {error}"));
+        let last_drain = observed_stages
+            .iter()
+            .rposition(|stage| *stage == HvfArm64BootStorageCaptureStage::DrainAsync)
+            .expect("profile capture should observe an Async drain boundary");
+        let first_persist = observed_stages
+            .iter()
+            .position(|stage| *stage == HvfArm64BootStorageCaptureStage::Persist)
+            .expect("profile capture should observe a persistence boundary");
+        let first_publication = observed_stages
+            .iter()
+            .position(|stage| *stage == HvfArm64BootStorageCaptureStage::PublishAsync)
+            .expect("profile capture should observe a publication boundary");
+        let first_capture = observed_stages
+            .iter()
+            .position(|stage| *stage == HvfArm64BootStorageCaptureStage::Capture)
+            .expect("profile capture should observe a live-state capture boundary");
+        let first_composition = observed_stages
+            .iter()
+            .position(|stage| *stage == HvfArm64BootStorageCaptureStage::ComposeGraph)
+            .expect("profile capture should observe a graph-composition boundary");
+        assert!(last_drain < first_persist);
+        assert!(first_persist < first_publication);
+        assert!(first_publication < first_capture);
+        assert!(first_capture < first_composition);
+        let second = session
+            .capture_snapshot_v2_multi_block_device_graph_at(&configs, &guard, Instant::now())
+            .unwrap_or_else(|error| panic!("{case} second graph should capture: {error}"));
+        assert_eq!(first, second);
+        assert_eq!(first.transport_kind(), expected_transport);
+        assert_eq!(first.records().len(), 3);
+        assert_eq!(first.root_key(), Some(first.records()[0].key()));
+        assert_eq!(first.records()[0].config().drive_id(), "rootfs");
+        assert!(first.records()[0].config().is_read_only());
+        assert_eq!(first.records()[0].config().io_engine(), DriveIoEngine::Sync);
+        assert_eq!(first.records()[1].config().drive_id(), "data_sync");
+        assert!(!first.records()[1].config().is_read_only());
+        assert_eq!(first.records()[1].config().io_engine(), DriveIoEngine::Sync);
+        assert_eq!(
+            first.records()[1].config().cache_type(),
+            DriveCacheType::Unsafe
+        );
+        assert_eq!(first.records()[1].block().backing_bytes(), 8193);
+        assert_eq!(first.records()[2].config().drive_id(), "data_async");
+        assert_eq!(
+            first.records()[2].config().io_engine(),
+            DriveIoEngine::Async
+        );
+        assert_eq!(
+            first.records()[2].config().cache_type(),
+            DriveCacheType::Writeback
+        );
+        match first.records()[2].transport() {
+            SnapshotV2DeviceTransport::Mmio(_) => assert!(!pci_enabled),
+            SnapshotV2DeviceTransport::Pci(state) => {
+                assert!(pci_enabled);
+                assert_eq!(state.origin(), StorageDeviceOrigin::Runtime);
+            }
+        }
+
+        let bytes = first
+            .encode(NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+            .unwrap_or_else(|error| panic!("{case} graph should encode: {error}"));
+        let decoded = SnapshotV2MultiBlockDeviceGraph::decode(
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &bytes,
+        )
+        .unwrap_or_else(|error| panic!("{case} graph should decode: {error}"));
+        assert_eq!(decoded, first);
+        assert_eq!(
+            decoded
+                .encode(NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                .unwrap_or_else(|error| panic!("{case} decoded graph should re-encode: {error}")),
+            bytes
+        );
+        let diagnostics = format!("{first:?} {:?}", first.records());
+        for private in [
+            path_text(root.path()),
+            path_text(sync.path()),
+            path_text(asynchronous.path()),
+        ] {
+            assert!(!diagnostics.contains(&private));
+        }
+
+        drop(guard);
+        session
+            .shutdown()
+            .unwrap_or_else(|error| panic!("{case} session should shut down: {error}"));
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

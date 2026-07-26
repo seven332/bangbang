@@ -2497,6 +2497,107 @@ pub enum BlockCaptureIoEngine {
     Async(BlockAsyncGenerationCaptureState),
 }
 
+/// Validated live regular-file binding for one snapshot persistence phase.
+#[derive(Clone)]
+pub struct VirtioBlockSnapshotPersistenceBinding {
+    is_read_only: bool,
+    io_engine: DriveIoEngine,
+    async_binding: Option<(SharedBlockAsyncRuntime, BlockAsyncDriveGeneration)>,
+}
+
+impl VirtioBlockSnapshotPersistenceBinding {
+    pub const fn is_read_only(&self) -> bool {
+        self.is_read_only
+    }
+
+    pub const fn io_engine(&self) -> DriveIoEngine {
+        self.io_engine
+    }
+
+    pub fn async_binding(&self) -> Option<(SharedBlockAsyncRuntime, BlockAsyncDriveGeneration)> {
+        self.async_binding.clone()
+    }
+}
+
+impl fmt::Debug for VirtioBlockSnapshotPersistenceBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioBlockSnapshotPersistenceBinding")
+            .field("is_read_only", &self.is_read_only)
+            .field("io_engine", &self.io_engine)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Value-redacted failure while validating or persisting one live block owner.
+pub enum VirtioBlockSnapshotPersistenceError {
+    UnsupportedBackend,
+    UnsupportedBacking,
+    ConfigurationMismatch,
+    ReadOnly,
+    Identity {
+        source: SnapshotBlockFileBackingError,
+    },
+    Backing {
+        source: BlockFileBackingError,
+    },
+    Async {
+        source: BlockAsyncRuntimeError,
+    },
+}
+
+impl fmt::Debug for VirtioBlockSnapshotPersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::UnsupportedBackend => "UnsupportedBackend",
+            Self::UnsupportedBacking => "UnsupportedBacking",
+            Self::ConfigurationMismatch => "ConfigurationMismatch",
+            Self::ReadOnly => "ReadOnly",
+            Self::Identity { .. } => "Identity",
+            Self::Backing { .. } => "Backing",
+            Self::Async { .. } => "Async",
+        };
+        formatter
+            .debug_struct("VirtioBlockSnapshotPersistenceError")
+            .field("kind", &kind)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for VirtioBlockSnapshotPersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedBackend => "snapshot persistence requires a local block backing",
+            Self::UnsupportedBacking => {
+                "snapshot persistence requires a regular-file block backing"
+            }
+            Self::ConfigurationMismatch => {
+                "snapshot persistence binding does not match block configuration"
+            }
+            Self::ReadOnly => "snapshot persistence cannot write a read-only block backing",
+            Self::Identity { .. } => "snapshot block backing identity validation failed",
+            Self::Backing { .. } => "snapshot block backing persistence failed",
+            Self::Async { .. } => "snapshot Async block persistence failed",
+        })
+    }
+}
+
+impl std::error::Error for VirtioBlockSnapshotPersistenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Identity { source } => Some(source),
+            Self::Backing { source } => Some(source),
+            Self::Async { source } => Some(source),
+            Self::UnsupportedBackend
+            | Self::UnsupportedBacking
+            | Self::ConfigurationMismatch
+            | Self::ReadOnly => None,
+        }
+    }
+}
+
 /// Detached, value-redacted block state retained for later persistence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct VirtioBlockDeviceCaptureState {
@@ -2602,6 +2703,44 @@ impl std::error::Error for VirtioBlockPciCaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Device(source) => Some(source),
+            Self::Endpoint(source) => Some(source),
+        }
+    }
+}
+
+/// Value-redacted failure while validating or persisting a PCI block owner.
+pub enum VirtioBlockPciSnapshotPersistenceError {
+    Persistence(VirtioBlockSnapshotPersistenceError),
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Debug for VirtioBlockPciSnapshotPersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Persistence(_) => "Persistence",
+            Self::Endpoint(_) => "Endpoint",
+        };
+        formatter
+            .debug_struct("VirtioBlockPciSnapshotPersistenceError")
+            .field("kind", &kind)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for VirtioBlockPciSnapshotPersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Persistence(_) => formatter.write_str("PCI block persistence failed"),
+            Self::Endpoint(_) => formatter.write_str("PCI block endpoint access failed"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockPciSnapshotPersistenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Persistence(source) => Some(source),
             Self::Endpoint(source) => Some(source),
         }
     }
@@ -5923,6 +6062,79 @@ impl VirtioBlockDevice {
         }
     }
 
+    /// Validates one live regular-file owner before snapshot source mutation.
+    pub fn snapshot_persistence_binding(
+        &self,
+        config_space: VirtioBlockConfigSpace,
+        config: &DriveConfig,
+    ) -> Result<VirtioBlockSnapshotPersistenceBinding, VirtioBlockSnapshotPersistenceError> {
+        let VirtioBlockBackend::File {
+            backing, io_engine, ..
+        } = &self.backend
+        else {
+            return Err(VirtioBlockSnapshotPersistenceError::UnsupportedBackend);
+        };
+        if config.is_vhost_user()
+            || !backing.snapshot_device_id_is_compatible(config.drive_id(), self.device_id)
+            || config.is_read_only() != Some(backing.is_read_only())
+            || config_space != VirtioBlockConfigSpace::from_backing(backing, config.cache_type())
+        {
+            return Err(VirtioBlockSnapshotPersistenceError::ConfigurationMismatch);
+        }
+        let identity = backing
+            .snapshot_identity()
+            .map_err(|source| VirtioBlockSnapshotPersistenceError::Identity { source })?;
+        if !identity.kind().is_regular_file() {
+            return Err(VirtioBlockSnapshotPersistenceError::UnsupportedBacking);
+        }
+        let (io_engine, async_binding) = match io_engine {
+            VirtioBlockFileIoEngine::Sync if config.io_engine() == Some(DriveIoEngine::Sync) => {
+                (DriveIoEngine::Sync, None)
+            }
+            VirtioBlockFileIoEngine::Async {
+                runtime,
+                generation,
+                cache_type,
+                terminal: false,
+            } if config.io_engine() == Some(DriveIoEngine::Async)
+                && *cache_type == config.cache_type() =>
+            {
+                (DriveIoEngine::Async, Some((runtime.clone(), *generation)))
+            }
+            VirtioBlockFileIoEngine::Sync | VirtioBlockFileIoEngine::Async { .. } => {
+                return Err(VirtioBlockSnapshotPersistenceError::ConfigurationMismatch);
+            }
+        };
+        Ok(VirtioBlockSnapshotPersistenceBinding {
+            is_read_only: backing.is_read_only(),
+            io_engine,
+            async_binding,
+        })
+    }
+
+    /// Persists one exact writable regular-file owner after all Async drains.
+    pub fn persist_snapshot_backing(
+        &self,
+        config_space: VirtioBlockConfigSpace,
+        config: &DriveConfig,
+    ) -> Result<(), VirtioBlockSnapshotPersistenceError> {
+        let binding = self.snapshot_persistence_binding(config_space, config)?;
+        if binding.is_read_only() {
+            return Err(VirtioBlockSnapshotPersistenceError::ReadOnly);
+        }
+        if let Some((runtime, generation)) = binding.async_binding() {
+            return runtime
+                .persist_drained_generation(generation)
+                .map_err(|source| VirtioBlockSnapshotPersistenceError::Async { source });
+        }
+        let VirtioBlockBackend::File { backing, .. } = &self.backend else {
+            return Err(VirtioBlockSnapshotPersistenceError::UnsupportedBackend);
+        };
+        backing
+            .flush()
+            .map_err(|source| VirtioBlockSnapshotPersistenceError::Backing { source })
+    }
+
     /// Captures a regular-file device after any Async generation is drained.
     pub fn capture_state_at(
         &self,
@@ -7797,6 +8009,22 @@ impl VirtioBlockMmioHandler {
         self.activation_handler().backend_kind()
     }
 
+    pub fn block_snapshot_persistence_binding(
+        &self,
+        config: &DriveConfig,
+    ) -> Result<VirtioBlockSnapshotPersistenceBinding, VirtioBlockSnapshotPersistenceError> {
+        self.activation_handler()
+            .snapshot_persistence_binding(*self.device_config_handler(), config)
+    }
+
+    pub fn persist_block_snapshot_backing(
+        &self,
+        config: &DriveConfig,
+    ) -> Result<(), VirtioBlockSnapshotPersistenceError> {
+        self.activation_handler()
+            .persist_snapshot_backing(*self.device_config_handler(), config)
+    }
+
     pub fn block_async_binding(
         &self,
     ) -> Option<(SharedBlockAsyncRuntime, BlockAsyncDriveGeneration)> {
@@ -7817,6 +8045,36 @@ impl VirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice> {
     pub fn block_backend_kind(&self) -> Result<VirtioBlockBackendKind, VirtioPciEndpointError> {
         let work = self.admit_device_work()?;
         work.with_core_mut(|core| core.activation.backend_kind())
+    }
+
+    pub fn block_snapshot_persistence_binding(
+        &self,
+        config: &DriveConfig,
+    ) -> Result<VirtioBlockSnapshotPersistenceBinding, VirtioBlockPciSnapshotPersistenceError> {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioBlockPciSnapshotPersistenceError::Endpoint)?;
+        work.with_core_mut(|core| {
+            core.activation
+                .snapshot_persistence_binding(core.device_config, config)
+        })
+        .map_err(VirtioBlockPciSnapshotPersistenceError::Endpoint)?
+        .map_err(VirtioBlockPciSnapshotPersistenceError::Persistence)
+    }
+
+    pub fn persist_block_snapshot_backing(
+        &self,
+        config: &DriveConfig,
+    ) -> Result<(), VirtioBlockPciSnapshotPersistenceError> {
+        let work = self
+            .admit_device_work()
+            .map_err(VirtioBlockPciSnapshotPersistenceError::Endpoint)?;
+        work.with_core_mut(|core| {
+            core.activation
+                .persist_snapshot_backing(core.device_config, config)
+        })
+        .map_err(VirtioBlockPciSnapshotPersistenceError::Endpoint)?
+        .map_err(VirtioBlockPciSnapshotPersistenceError::Persistence)
     }
 
     pub fn block_async_binding(
@@ -8586,7 +8844,8 @@ mod tests {
         VirtioBlockQueueBuildError, VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError,
         VirtioBlockQueueSnapshotError, VirtioBlockRateLimiter, VirtioBlockRequest,
         VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
-        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
+        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType,
+        VirtioBlockSnapshotPersistenceError, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -11344,6 +11603,116 @@ mod tests {
             runtime
                 .shutdown_if_idle()
                 .expect("idle Async runtime should stop")
+        );
+    }
+
+    #[test]
+    fn snapshot_persistence_binding_revalidates_sync_async_and_read_only_owners() {
+        let sync_file = temp_file("snapshot-persist-sync.img", &[0; 512]);
+        let sync_config = DriveConfigInput::new("sync", "sync", sync_file.as_path(), false)
+            .with_cache_type(DriveCacheType::Unsafe)
+            .with_io_engine(DriveIoEngine::Sync)
+            .validate()
+            .expect("snapshot Sync config should validate");
+        let sync = PreparedBlockDevice::from_config_with_backing(&sync_config, None)
+            .expect("snapshot Sync device should prepare");
+        let sync_binding = sync
+            .device()
+            .snapshot_persistence_binding(sync.config_space(), &sync_config)
+            .expect("writable Sync owner should preflight");
+        assert!(!sync_binding.is_read_only());
+        assert_eq!(sync_binding.io_engine(), DriveIoEngine::Sync);
+        assert!(sync_binding.async_binding().is_none());
+        sync.device()
+            .backing()
+            .expect("Sync device should retain its backing")
+            .write_at(0, b"durable")
+            .expect("Sync backing should accept test bytes");
+        sync.device()
+            .persist_snapshot_backing(sync.config_space(), &sync_config)
+            .expect("writable Sync owner should persist");
+        assert_eq!(
+            &fs::read(sync_file.as_path()).expect("persisted Sync backing should reopen")[..7],
+            b"durable"
+        );
+
+        let read_only_file = temp_file("snapshot-persist-read-only.img", &[0; 512]);
+        let read_only_config =
+            DriveConfigInput::new("readonly", "readonly", read_only_file.as_path(), false)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync)
+                .validate()
+                .expect("snapshot read-only config should validate");
+        let read_only = PreparedBlockDevice::from_config_with_backing(&read_only_config, None)
+            .expect("snapshot read-only device should prepare");
+        assert!(
+            read_only
+                .device()
+                .snapshot_persistence_binding(read_only.config_space(), &read_only_config)
+                .expect("read-only owner should preflight")
+                .is_read_only()
+        );
+        assert!(matches!(
+            read_only
+                .device()
+                .persist_snapshot_backing(read_only.config_space(), &read_only_config),
+            Err(VirtioBlockSnapshotPersistenceError::ReadOnly)
+        ));
+
+        let async_file = temp_file("snapshot-persist-async.img", &[0; 512]);
+        let async_config = DriveConfigInput::new("async", "async", async_file.as_path(), false)
+            .with_cache_type(DriveCacheType::Writeback)
+            .with_io_engine(DriveIoEngine::Async)
+            .validate()
+            .expect("snapshot Async config should validate");
+        let mut asynchronous = PreparedBlockDevice::from_config_with_backing(&async_config, None)
+            .expect("snapshot Async device should prepare");
+        let runtime = SharedBlockAsyncRuntime::new();
+        let generation = asynchronous
+            .bind_async_runtime(runtime.clone())
+            .expect("snapshot Async runtime should bind")
+            .expect("snapshot Async config should own a generation");
+        let async_binding = asynchronous
+            .device()
+            .snapshot_persistence_binding(asynchronous.config_space(), &async_config)
+            .expect("snapshot Async owner should preflight");
+        assert_eq!(async_binding.io_engine(), DriveIoEngine::Async);
+        assert_eq!(
+            async_binding
+                .async_binding()
+                .expect("snapshot Async binding should exist")
+                .1,
+            generation
+        );
+        assert!(matches!(
+            asynchronous
+                .device()
+                .persist_snapshot_backing(asynchronous.config_space(), &async_config),
+            Err(VirtioBlockSnapshotPersistenceError::Async {
+                source: BlockAsyncRuntimeError::AdmissionNotStopped
+            })
+        ));
+        let mut memory = request_memory();
+        runtime
+            .stop_generations(&[generation])
+            .expect("snapshot Async admission should stop");
+        runtime
+            .drain_stopped_generation(generation, &mut memory)
+            .expect("snapshot Async owner should drain without persistence");
+        asynchronous
+            .device()
+            .persist_snapshot_backing(asynchronous.config_space(), &async_config)
+            .expect("snapshot Async owner should persist through its exact generation");
+        runtime
+            .capture_quiesced_generation(generation)
+            .expect("persisted Async owner should remain capture-ready");
+        runtime
+            .unbind_quiesced(generation)
+            .expect("persisted Async owner should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("snapshot Async executor should stop")
         );
     }
 

@@ -2892,6 +2892,32 @@ impl SharedBlockAsyncRuntime {
         self.lock()?.quiesce_generation(generation, memory)
     }
 
+    /// Drains one generation whose admission was stopped by an aggregate preflight.
+    ///
+    /// Unlike [`Self::quiesce_generation`], this does not inject a final
+    /// Writeback flush. Callers that require a whole-vector persistence phase
+    /// can therefore drain every selected generation before synchronizing any
+    /// backing.
+    pub fn drain_stopped_generation(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+        memory: &mut GuestMemory,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.lock()?.drain_stopped_generation(generation, memory)
+    }
+
+    /// Persists the backing owned by one exact stopped and drained generation.
+    ///
+    /// Final guest completions may remain queued for later transport
+    /// publication. No operation is admitted and continuation counters remain
+    /// unchanged.
+    pub fn persist_drained_generation(
+        &self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        self.lock()?.persist_drained_generation(generation)
+    }
+
     /// Captures one stopped generation after host and guest completion queues drain.
     pub fn capture_quiesced_generation(
         &self,
@@ -3352,6 +3378,33 @@ impl BlockAsyncRuntime {
             .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
             .coordinator
             .stop_admission();
+        self.drain_generation(generation, memory, needs_final_flush)
+    }
+
+    fn drain_stopped_generation(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+        memory: &mut GuestMemory,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let index = self.drive_index(generation)?;
+        if self
+            .drives
+            .get(index)
+            .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?
+            .coordinator
+            .is_accepting()
+        {
+            return Err(BlockAsyncRuntimeError::AdmissionNotStopped);
+        }
+        self.drain_generation(generation, memory, false)
+    }
+
+    fn drain_generation(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+        memory: &mut GuestMemory,
+        needs_final_flush: bool,
+    ) -> Result<(), BlockAsyncRuntimeError> {
         let mut final_flush_started = false;
         loop {
             let mut made_progress = self.route_parked_completions(memory)?;
@@ -3406,6 +3459,35 @@ impl BlockAsyncRuntime {
         }
 
         self.reconcile_quiesced_notification(generation, memory)
+    }
+
+    fn persist_drained_generation(
+        &mut self,
+        generation: BlockAsyncDriveGeneration,
+    ) -> Result<(), BlockAsyncRuntimeError> {
+        let index = self.drive_index(generation)?;
+        let parked = self
+            .parked
+            .iter()
+            .filter(|completion| completion.key.operation.generation() == generation)
+            .count();
+        let drive = self
+            .drives
+            .get(index)
+            .ok_or(BlockAsyncRuntimeError::UnknownGeneration)?;
+        if drive.coordinator.is_accepting() {
+            return Err(BlockAsyncRuntimeError::AdmissionNotStopped);
+        }
+        if !drive.coordinator.is_drained() {
+            return Err(BlockAsyncRuntimeError::OutstandingOperations);
+        }
+        if parked != 0 {
+            return Err(BlockAsyncRuntimeError::ParkedCompletionInvariant);
+        }
+        let backing = Arc::clone(&drive.backing);
+        let host = Arc::clone(&self.host);
+        host.flush(&backing)
+            .map_err(|_| BlockAsyncRuntimeError::BackingPersistence { generation })
     }
 
     fn route_parked_completions(
@@ -4082,6 +4164,180 @@ mod tests {
             runtime
                 .shutdown_if_idle()
                 .expect("idle executor should stop")
+        );
+    }
+
+    #[test]
+    fn snapshot_drain_defers_writeback_persistence_until_the_explicit_barrier() {
+        let host = Arc::new(FlushHost {
+            flushes: AtomicUsize::new(0),
+            fail: false,
+        });
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 1, 1, 4, 4),
+            Arc::clone(&host) as Arc<dyn BlockAsyncHostIo>,
+        );
+        let (_temporary, backing) = temporary_backing(&[]);
+        let generation = runtime
+            .bind_drive(backing, DriveCacheType::Writeback)
+            .expect("snapshot drive should bind");
+        assert!(matches!(
+            runtime.drain_stopped_generation(generation, &mut guest_memory()),
+            Err(BlockAsyncRuntimeError::AdmissionNotStopped)
+        ));
+        assert!(matches!(
+            runtime.persist_drained_generation(generation),
+            Err(BlockAsyncRuntimeError::AdmissionNotStopped)
+        ));
+
+        runtime
+            .stop_generations(&[generation])
+            .expect("snapshot admission should stop");
+        let mut memory = guest_memory();
+        runtime
+            .drain_stopped_generation(generation, &mut memory)
+            .expect("snapshot drain should complete without an injected flush");
+        assert_eq!(host.flushes.load(Ordering::Acquire), 0);
+        let before_persistence = runtime
+            .capture_quiesced_generation(generation)
+            .expect("drained generation should capture before persistence");
+        runtime
+            .persist_drained_generation(generation)
+            .expect("explicit snapshot barrier should persist");
+        assert_eq!(host.flushes.load(Ordering::Acquire), 1);
+        let after_persistence = runtime
+            .capture_quiesced_generation(generation)
+            .expect("persisted generation should remain capture-ready");
+        assert_eq!(after_persistence, before_persistence);
+        runtime
+            .resume_quiesced_generation(generation)
+            .expect("persisted generation should reopen");
+
+        runtime
+            .stop_generations(&[generation])
+            .expect("reopened generation should stop");
+        runtime
+            .quiesce_generation(generation, &mut memory)
+            .expect("generic quiescence should retain its final Writeback flush");
+        assert_eq!(host.flushes.load(Ordering::Acquire), 2);
+        runtime
+            .unbind_quiesced(generation)
+            .expect("snapshot generation should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("idle snapshot executor should stop")
+        );
+    }
+
+    #[test]
+    fn snapshot_persistence_allows_an_unpublished_guest_flush_completion() {
+        let host = Arc::new(FlushHost {
+            flushes: AtomicUsize::new(0),
+            fail: false,
+        });
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 1, 1, 4, 4),
+            Arc::clone(&host) as Arc<dyn BlockAsyncHostIo>,
+        );
+        let (_temporary, backing) = temporary_backing(&[]);
+        let generation = runtime
+            .bind_drive(backing, DriveCacheType::Unsafe)
+            .expect("guest-flush snapshot drive should bind");
+        runtime
+            .admit_preflighted(generation, BlockAsyncOperation::flush(identity(97)))
+            .expect("guest flush should admit before the snapshot stop");
+        runtime
+            .stop_generations(&[generation])
+            .expect("guest-flush snapshot admission should stop");
+        let mut memory = guest_memory();
+        runtime
+            .drain_stopped_generation(generation, &mut memory)
+            .expect("already-admitted guest flush should drain as ordinary work");
+        assert_eq!(host.flushes.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            runtime.capture_quiesced_generation(generation),
+            Err(BlockAsyncRuntimeError::OutstandingCompletions)
+        ));
+
+        runtime
+            .persist_drained_generation(generation)
+            .expect("snapshot barrier should tolerate the unpublished guest completion");
+        assert_eq!(host.flushes.load(Ordering::Acquire), 2);
+        let completion = runtime
+            .pop_completion(generation)
+            .expect("guest flush completion lookup should succeed")
+            .expect("guest flush completion should remain queued through persistence");
+        assert_eq!(completion.kind(), BlockAsyncOperationKind::Flush);
+        assert_eq!(completion.status(), BlockAsyncOperationStatus::Success);
+        runtime
+            .capture_quiesced_generation(generation)
+            .expect("published guest flush should leave a capture-ready generation");
+        runtime
+            .resume_quiesced_generation(generation)
+            .expect("guest-flush snapshot generation should reopen");
+
+        runtime
+            .stop_generations(&[generation])
+            .expect("guest-flush generation should stop for cleanup");
+        runtime
+            .drain_stopped_generation(generation, &mut memory)
+            .expect("guest-flush generation should drain for cleanup");
+        runtime
+            .unbind_quiesced(generation)
+            .expect("guest-flush generation should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("guest-flush executor should stop")
+        );
+    }
+
+    #[test]
+    fn snapshot_persistence_failure_is_typed_and_does_not_prevent_reopen() {
+        let host = Arc::new(FlushHost {
+            flushes: AtomicUsize::new(0),
+            fail: true,
+        });
+        let runtime = SharedBlockAsyncRuntime::with_config_and_host(
+            test_config(1, 1, 1, 4, 4),
+            Arc::clone(&host) as Arc<dyn BlockAsyncHostIo>,
+        );
+        let (_temporary, backing) = temporary_backing(&[]);
+        let generation = runtime
+            .bind_drive(backing, DriveCacheType::Unsafe)
+            .expect("failing snapshot drive should bind");
+        runtime
+            .stop_generations(&[generation])
+            .expect("failing snapshot admission should stop");
+        let mut memory = guest_memory();
+        runtime
+            .drain_stopped_generation(generation, &mut memory)
+            .expect("failing snapshot drive should drain before persistence");
+        assert!(matches!(
+            runtime.persist_drained_generation(generation),
+            Err(BlockAsyncRuntimeError::BackingPersistence {
+                generation: failed
+            }) if failed == generation
+        ));
+        assert_eq!(host.flushes.load(Ordering::Acquire), 1);
+        runtime
+            .resume_quiesced_generation(generation)
+            .expect("failed persistence should leave exact reverse recovery available");
+
+        runtime
+            .stop_generations(&[generation])
+            .expect("recovered generation should stop for cleanup");
+        runtime
+            .drain_stopped_generation(generation, &mut memory)
+            .expect("recovered generation should drain for cleanup");
+        runtime
+            .unbind_quiesced(generation)
+            .expect("recovered generation should unbind");
+        assert!(
+            runtime
+                .shutdown_if_idle()
+                .expect("idle failing executor should stop")
         );
     }
 

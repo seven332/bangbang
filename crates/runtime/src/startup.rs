@@ -27,6 +27,7 @@ use crate::block::{
     VirtioBlockConfigSpace, VirtioBlockDeviceNotificationDispatch,
     VirtioBlockDeviceNotificationError, VirtioBlockLiveUpdateError, VirtioBlockMmioHandler,
     VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError, VirtioBlockRuntimeRestoreInput,
+    VirtioBlockSnapshotPersistenceBinding,
 };
 use crate::boot::{
     BootCommandLineError, BootSource, BootSourceConfig, BootSourceFiles, BootSourceLoadError,
@@ -3121,6 +3122,8 @@ pub enum Arm64BootStorageCaptureError {
     BlockInventory,
     BlockMetadata,
     BlockHandler,
+    BlockPersistencePreflight,
+    BlockPersistence,
     BlockCapture,
     BlockCompletion(VirtioBlockQueueDispatchError),
     PmemInventory,
@@ -3136,6 +3139,8 @@ impl fmt::Debug for Arm64BootStorageCaptureError {
             Self::BlockInventory => "BlockInventory",
             Self::BlockMetadata => "BlockMetadata",
             Self::BlockHandler => "BlockHandler",
+            Self::BlockPersistencePreflight => "BlockPersistencePreflight",
+            Self::BlockPersistence => "BlockPersistence",
             Self::BlockCapture => "BlockCapture",
             Self::BlockCompletion(_) => "BlockCompletion",
             Self::PmemInventory => "PmemInventory",
@@ -3159,6 +3164,8 @@ impl Arm64BootStorageCaptureError {
             Self::BlockInventory
             | Self::BlockMetadata
             | Self::BlockHandler
+            | Self::BlockPersistencePreflight
+            | Self::BlockPersistence
             | Self::BlockCapture
             | Self::PmemInventory
             | Self::PmemMetadata
@@ -3177,6 +3184,12 @@ impl fmt::Display for Arm64BootStorageCaptureError {
             }
             Self::BlockMetadata => formatter.write_str("live MMIO block metadata is inconsistent"),
             Self::BlockHandler => formatter.write_str("live MMIO block handler is unavailable"),
+            Self::BlockPersistencePreflight => {
+                formatter.write_str("live MMIO block persistence preflight failed")
+            }
+            Self::BlockPersistence => {
+                formatter.write_str("live MMIO block backing persistence failed")
+            }
             Self::BlockCapture => formatter.write_str("live MMIO block capture failed"),
             Self::BlockCompletion(_) => {
                 formatter.write_str("live MMIO block completion publication failed")
@@ -3298,6 +3311,37 @@ impl Arm64BootRuntimeResources {
             .handler_mut::<VirtioBlockMmioHandler>(device.registration.region_id())
             .map_err(|_| Arm64BootStorageCaptureError::BlockHandler)
             .map(|handler| handler.block_async_binding())
+    }
+
+    pub fn capture_ready_mmio_block_snapshot_persistence_binding(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        config: &DriveConfig,
+    ) -> Result<VirtioBlockSnapshotPersistenceBinding, Arm64BootStorageCaptureError> {
+        let device = unique_mmio_block_device(&self.block_devices, config.drive_id())?;
+        validate_mmio_storage_metadata(
+            device.registration.region(),
+            device.fdt_device,
+            Arm64BootStorageCaptureError::BlockMetadata,
+        )?;
+        mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(device.registration.region_id())
+            .map_err(|_| Arm64BootStorageCaptureError::BlockHandler)?
+            .block_snapshot_persistence_binding(config)
+            .map_err(|_| Arm64BootStorageCaptureError::BlockPersistencePreflight)
+    }
+
+    pub fn persist_capture_ready_mmio_block_snapshot_backing(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        config: &DriveConfig,
+    ) -> Result<(), Arm64BootStorageCaptureError> {
+        let device = unique_mmio_block_device(&self.block_devices, config.drive_id())?;
+        mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(device.registration.region_id())
+            .map_err(|_| Arm64BootStorageCaptureError::BlockHandler)?
+            .persist_block_snapshot_backing(config)
+            .map_err(|_| Arm64BootStorageCaptureError::BlockPersistence)
     }
 
     pub fn publish_capture_ready_mmio_block_completions(

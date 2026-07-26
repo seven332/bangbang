@@ -1400,6 +1400,10 @@ fn diagnostics_and_source_ownership_are_value_redacted() {
     assert!(rendered.contains("<redacted>"));
 
     let model_source = include_str!("../snapshot_device_v2_5.rs");
+    let capture_source = include_str!("capture.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .expect("capture source should have a production prefix");
     let codec_source = include_str!("codec.rs");
     for forbidden in [
         "CaptureReadyBlockDeviceState",
@@ -1411,5 +1415,20 @@ fn diagnostics_and_source_ownership_are_value_redacted() {
     ] {
         assert!(!model_source.contains(forbidden));
         assert!(!codec_source.contains(forbidden));
+    }
+    for forbidden in [
+        "async_state.generation()",
+        "next_operation_id()",
+        "next_sequence()",
+        "pressure_pending()",
+        "BlockFileBackingIdentity",
+        "SharedBlockAsyncRuntime",
+        "OwnedFd",
+        "RawFd",
+    ] {
+        assert!(
+            !capture_source.contains(forbidden),
+            "live conversion retained forbidden authority field {forbidden}",
+        );
     }
 }

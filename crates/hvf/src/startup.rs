@@ -27,7 +27,7 @@ use bangbang_runtime::block::{
     PreparedBlockDevice, RuntimeBlockDeviceResource, VIRTIO_BLOCK_DEVICE_ID,
     VIRTIO_BLOCK_QUEUE_SIZES, VhostUserBlockConfigSignalError, VirtioBlockBackendKind,
     VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceNotificationError,
-    VirtioBlockLiveUpdateError,
+    VirtioBlockLiveUpdateError, VirtioBlockSnapshotPersistenceBinding,
 };
 use bangbang_runtime::boot::BootSourceFiles;
 use bangbang_runtime::boot_timer::{
@@ -100,6 +100,9 @@ use bangbang_runtime::snapshot_device_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, PreparedSnapshotV2PciRoot,
     PreparedSnapshotV2RootBlock, PreparedSnapshotV2RootTransport,
     SnapshotV2RootTransportRestoreError,
+};
+use bangbang_runtime::snapshot_device_v2_5::{
+    NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
 };
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
@@ -4011,8 +4014,10 @@ pub enum HvfArm64BootStorageCaptureStage {
     Inventory,
     StopAsync,
     DrainAsync,
+    Persist,
     PublishAsync,
     Capture,
+    ComposeGraph,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4026,13 +4031,16 @@ pub enum HvfArm64BootStorageCaptureErrorKind {
     Allocation,
     InventoryMismatch,
     VhostUserUnsupported,
+    ProfilePreflight,
     AsyncPreparation,
     AsyncDrain,
+    Persistence,
     AsyncResume,
     CompletionPublication,
     BlockCapture,
     PmemCapture,
     PciPlacement,
+    GraphComposition,
     Cancelled,
 }
 
@@ -4121,11 +4129,17 @@ impl fmt::Display for HvfArm64BootStorageCaptureError {
             HvfArm64BootStorageCaptureErrorKind::VhostUserUnsupported => {
                 formatter.write_str("vhost-user block capture is unsupported")
             }
+            HvfArm64BootStorageCaptureErrorKind::ProfilePreflight => {
+                formatter.write_str("multi-block snapshot profile preflight failed")
+            }
             HvfArm64BootStorageCaptureErrorKind::AsyncPreparation => {
                 formatter.write_str("Async storage capture preparation failed")
             }
             HvfArm64BootStorageCaptureErrorKind::AsyncDrain => {
                 formatter.write_str("Async storage capture drain failed")
+            }
+            HvfArm64BootStorageCaptureErrorKind::Persistence => {
+                formatter.write_str("snapshot block backing persistence failed")
             }
             HvfArm64BootStorageCaptureErrorKind::AsyncResume => {
                 formatter.write_str("Async storage capture resume failed")
@@ -4141,6 +4155,9 @@ impl fmt::Display for HvfArm64BootStorageCaptureError {
             }
             HvfArm64BootStorageCaptureErrorKind::PciPlacement => {
                 formatter.write_str("live PCI storage placement is unavailable")
+            }
+            HvfArm64BootStorageCaptureErrorKind::GraphComposition => {
+                formatter.write_str("multi-block snapshot graph composition failed")
             }
             HvfArm64BootStorageCaptureErrorKind::Cancelled => {
                 formatter.write_str("storage capture was cancelled")
@@ -5026,6 +5043,31 @@ enum CaptureReadyPmemOwner {
         index: usize,
         retry: StorageRetryState,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureReadyStorageMode {
+    Diagnostic,
+    SnapshotV2MultiBlock,
+}
+
+enum CaptureReadyStorageResult {
+    Diagnostic(CaptureReadyStorageState),
+    SnapshotV2MultiBlock(SnapshotV2MultiBlockDeviceGraph),
+}
+
+impl fmt::Debug for CaptureReadyStorageResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Diagnostic(_) => "Diagnostic",
+            Self::SnapshotV2MultiBlock(_) => "SnapshotV2MultiBlock",
+        };
+        formatter
+            .debug_struct("CaptureReadyStorageResult")
+            .field("kind", &kind)
+            .field("state", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6714,8 +6756,87 @@ fn capture_ready_storage_state_at_with_cancel(
     configs: &CaptureReadyStorageConfigs,
     guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
     now: Instant,
-    mut is_cancelled: impl FnMut(HvfArm64BootStorageCaptureStage) -> bool,
+    is_cancelled: impl FnMut(HvfArm64BootStorageCaptureStage) -> bool,
 ) -> Result<CaptureReadyStorageState, HvfArm64BootStorageCaptureError> {
+    match capture_ready_storage_transaction_at_with_cancel(
+        backend,
+        mmio_dispatcher,
+        runtime_resources,
+        pci_data_devices,
+        block_device_metrics,
+        gic,
+        block_retry_wakeup_scheduler,
+        pmem_retry_wakeup_scheduler,
+        configs,
+        guard,
+        now,
+        CaptureReadyStorageMode::Diagnostic,
+        is_cancelled,
+    )? {
+        CaptureReadyStorageResult::Diagnostic(state) => Ok(state),
+        CaptureReadyStorageResult::SnapshotV2MultiBlock(_) => {
+            Err(HvfArm64BootStorageCaptureError::new(
+                HvfArm64BootStorageCaptureErrorKind::InventoryMismatch,
+                false,
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
+    backend: &mut HvfBackend,
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &Arm64BootRuntimeResources,
+    pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
+    block_device_metrics: &SharedBlockDeviceMetricsRegistry,
+    gic: &HvfGicMetadata,
+    block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    pmem_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    configs: &CaptureReadyStorageConfigs,
+    guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    now: Instant,
+    is_cancelled: impl FnMut(HvfArm64BootStorageCaptureStage) -> bool,
+) -> Result<SnapshotV2MultiBlockDeviceGraph, HvfArm64BootStorageCaptureError> {
+    match capture_ready_storage_transaction_at_with_cancel(
+        backend,
+        mmio_dispatcher,
+        runtime_resources,
+        pci_data_devices,
+        block_device_metrics,
+        gic,
+        block_retry_wakeup_scheduler,
+        pmem_retry_wakeup_scheduler,
+        configs,
+        guard,
+        now,
+        CaptureReadyStorageMode::SnapshotV2MultiBlock,
+        is_cancelled,
+    )? {
+        CaptureReadyStorageResult::SnapshotV2MultiBlock(graph) => Ok(graph),
+        CaptureReadyStorageResult::Diagnostic(_) => Err(HvfArm64BootStorageCaptureError::new(
+            HvfArm64BootStorageCaptureErrorKind::InventoryMismatch,
+            false,
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_ready_storage_transaction_at_with_cancel(
+    backend: &mut HvfBackend,
+    mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &Arm64BootRuntimeResources,
+    pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
+    block_device_metrics: &SharedBlockDeviceMetricsRegistry,
+    gic: &HvfGicMetadata,
+    block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    pmem_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
+    configs: &CaptureReadyStorageConfigs,
+    guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+    now: Instant,
+    mode: CaptureReadyStorageMode,
+    mut is_cancelled: impl FnMut(HvfArm64BootStorageCaptureStage) -> bool,
+) -> Result<CaptureReadyStorageResult, HvfArm64BootStorageCaptureError> {
     if !Arc::ptr_eq(&guard.block.shared, &block_retry_wakeup_scheduler.shared)
         || !Arc::ptr_eq(&guard.pmem.shared, &pmem_retry_wakeup_scheduler.shared)
     {
@@ -6795,6 +6916,25 @@ fn capture_ready_storage_state_at_with_cancel(
         }
     }
 
+    if mode == CaptureReadyStorageMode::SnapshotV2MultiBlock
+        && (!configs.pmem().is_empty()
+            || !runtime_resources.pmem_devices.is_empty()
+            || !runtime_resources.pmem_mmio_devices.is_empty()
+            || pci_data_devices
+                .as_ref()
+                .is_some_and(|devices| !devices.pmem.is_empty())
+            || SnapshotV2MultiBlockDeviceGraph::preflight_capture_configs(
+                NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                configs.drives(),
+            )
+            .is_err())
+    {
+        return Err(HvfArm64BootStorageCaptureError::new(
+            HvfArm64BootStorageCaptureErrorKind::ProfilePreflight,
+            false,
+        ));
+    }
+
     let pci_block_count = pci_data_devices
         .as_ref()
         .map_or(0, |devices| devices.block.len());
@@ -6827,6 +6967,12 @@ fn capture_ready_storage_state_at_with_cancel(
     async_owners
         .try_reserve_exact(configs.drives().len())
         .map_err(allocation_error)?;
+    let mut persistence_bindings: Vec<VirtioBlockSnapshotPersistenceBinding> = Vec::new();
+    if mode == CaptureReadyStorageMode::SnapshotV2MultiBlock {
+        persistence_bindings
+            .try_reserve_exact(configs.drives().len())
+            .map_err(allocation_error)?;
+    }
     let mut mmio_block_interrupts = Vec::new();
     mmio_block_interrupts
         .try_reserve_exact(configs.drives().len())
@@ -6896,6 +7042,29 @@ fn capture_ready_storage_state_at_with_cancel(
         block_owners.push(owner);
     }
 
+    if mode == CaptureReadyStorageMode::SnapshotV2MultiBlock {
+        let uniform_transport = block_owners.first().is_some_and(|first| {
+            block_owners.iter().all(|owner| {
+                matches!(
+                    (first, owner),
+                    (
+                        CaptureReadyBlockOwner::Mmio { .. },
+                        CaptureReadyBlockOwner::Mmio { .. }
+                    ) | (
+                        CaptureReadyBlockOwner::Pci { .. },
+                        CaptureReadyBlockOwner::Pci { .. }
+                    )
+                )
+            })
+        });
+        if !uniform_transport {
+            return Err(HvfArm64BootStorageCaptureError::new(
+                HvfArm64BootStorageCaptureErrorKind::ProfilePreflight,
+                false,
+            ));
+        }
+    }
+
     for config in configs.pmem() {
         let mut mmio_matches = runtime_resources
             .pmem_mmio_devices
@@ -6945,36 +7114,79 @@ fn capture_ready_storage_state_at_with_cancel(
         .zip(block_owners.iter().copied())
         .enumerate()
     {
-        let binding = match owner {
-            CaptureReadyBlockOwner::Mmio { .. } => runtime_resources
-                .capture_ready_mmio_block_async_binding(
-                    &mut mmio_dispatcher_guard,
-                    config.drive_id(),
-                )
-                .map_err(|_| {
-                    HvfArm64BootStorageCaptureError::new(
-                        HvfArm64BootStorageCaptureErrorKind::AsyncPreparation,
-                        false,
+        let binding = if mode == CaptureReadyStorageMode::SnapshotV2MultiBlock {
+            let persistence = match owner {
+                CaptureReadyBlockOwner::Mmio { .. } => runtime_resources
+                    .capture_ready_mmio_block_snapshot_persistence_binding(
+                        &mut mmio_dispatcher_guard,
+                        config,
                     )
-                })?,
-            CaptureReadyBlockOwner::Pci { index, .. } => pci_data_devices
-                .as_ref()
-                .and_then(|devices| devices.block.get(index))
-                .ok_or_else(|| {
-                    HvfArm64BootStorageCaptureError::new(
-                        HvfArm64BootStorageCaptureErrorKind::InventoryMismatch,
-                        false,
+                    .map_err(|_| {
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::ProfilePreflight,
+                            false,
+                        )
+                    })?,
+                CaptureReadyBlockOwner::Pci { index, .. } => pci_data_devices
+                    .as_ref()
+                    .and_then(|devices| devices.block.get(index))
+                    .ok_or_else(|| {
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::InventoryMismatch,
+                            false,
+                        )
+                    })?
+                    .published
+                    .endpoint()
+                    .block_snapshot_persistence_binding(config)
+                    .map_err(|_| {
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::ProfilePreflight,
+                            false,
+                        )
+                    })?,
+            };
+            if Some(persistence.io_engine()) != config.io_engine() {
+                return Err(HvfArm64BootStorageCaptureError::new(
+                    HvfArm64BootStorageCaptureErrorKind::ProfilePreflight,
+                    false,
+                ));
+            }
+            let binding = persistence.async_binding();
+            persistence_bindings.push(persistence);
+            binding
+        } else {
+            match owner {
+                CaptureReadyBlockOwner::Mmio { .. } => runtime_resources
+                    .capture_ready_mmio_block_async_binding(
+                        &mut mmio_dispatcher_guard,
+                        config.drive_id(),
                     )
-                })?
-                .published
-                .endpoint()
-                .block_async_binding()
-                .map_err(|_| {
-                    HvfArm64BootStorageCaptureError::new(
-                        HvfArm64BootStorageCaptureErrorKind::AsyncPreparation,
-                        false,
-                    )
-                })?,
+                    .map_err(|_| {
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::AsyncPreparation,
+                            false,
+                        )
+                    })?,
+                CaptureReadyBlockOwner::Pci { index, .. } => pci_data_devices
+                    .as_ref()
+                    .and_then(|devices| devices.block.get(index))
+                    .ok_or_else(|| {
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::InventoryMismatch,
+                            false,
+                        )
+                    })?
+                    .published
+                    .endpoint()
+                    .block_async_binding()
+                    .map_err(|_| {
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::AsyncPreparation,
+                            false,
+                        )
+                    })?,
+            }
         };
         match (config.io_engine(), binding) {
             (Some(DriveIoEngine::Sync), None) => {}
@@ -7028,11 +7240,15 @@ fn capture_ready_storage_state_at_with_cancel(
 
     let mut primary = None;
     for generation in generations.iter().copied() {
-        if runtime_resources
-            .block_async_runtime
-            .quiesce_generation(generation, memory)
-            .is_err()
-        {
+        let drained = match mode {
+            CaptureReadyStorageMode::Diagnostic => runtime_resources
+                .block_async_runtime
+                .quiesce_generation(generation, memory),
+            CaptureReadyStorageMode::SnapshotV2MultiBlock => runtime_resources
+                .block_async_runtime
+                .drain_stopped_generation(generation, memory),
+        };
+        if drained.is_err() {
             retain_storage_capture_error(
                 &mut primary,
                 HvfArm64BootStorageCaptureError::new(
@@ -7049,6 +7265,92 @@ fn capture_ready_storage_state_at_with_cancel(
                     false,
                 ),
             );
+        }
+    }
+
+    if mode == CaptureReadyStorageMode::SnapshotV2MultiBlock {
+        if primary.is_none() && is_cancelled(HvfArm64BootStorageCaptureStage::Persist) {
+            retain_storage_capture_error(
+                &mut primary,
+                HvfArm64BootStorageCaptureError::new(
+                    HvfArm64BootStorageCaptureErrorKind::Cancelled,
+                    false,
+                ),
+            );
+        }
+        if primary.is_none() && persistence_bindings.len() != configs.drives().len() {
+            retain_storage_capture_error(
+                &mut primary,
+                HvfArm64BootStorageCaptureError::new(
+                    HvfArm64BootStorageCaptureErrorKind::ProfilePreflight,
+                    false,
+                ),
+            );
+        }
+        if primary.is_none() {
+            for ((config, owner), persistence) in configs
+                .drives()
+                .iter()
+                .zip(block_owners.iter().copied())
+                .zip(persistence_bindings.iter())
+            {
+                if !persistence.is_read_only() {
+                    let persisted = match owner {
+                        CaptureReadyBlockOwner::Mmio { .. } => runtime_resources
+                            .persist_capture_ready_mmio_block_snapshot_backing(
+                                &mut mmio_dispatcher_guard,
+                                config,
+                            )
+                            .map_err(|_| {
+                                HvfArm64BootStorageCaptureError::new(
+                                    HvfArm64BootStorageCaptureErrorKind::Persistence,
+                                    false,
+                                )
+                            }),
+                        CaptureReadyBlockOwner::Pci { index, .. } => pci_data_devices
+                            .as_ref()
+                            .and_then(|devices| devices.block.get(index))
+                            .ok_or_else(|| {
+                                HvfArm64BootStorageCaptureError::new(
+                                    HvfArm64BootStorageCaptureErrorKind::InventoryMismatch,
+                                    false,
+                                )
+                            })
+                            .and_then(|device| {
+                                device
+                                    .published
+                                    .endpoint()
+                                    .persist_block_snapshot_backing(config)
+                                    .map_err(|_| {
+                                        HvfArm64BootStorageCaptureError::new(
+                                            HvfArm64BootStorageCaptureErrorKind::Persistence,
+                                            false,
+                                        )
+                                    })
+                            }),
+                    };
+                    if persisted.is_err() {
+                        retain_storage_capture_error(
+                            &mut primary,
+                            HvfArm64BootStorageCaptureError::new(
+                                HvfArm64BootStorageCaptureErrorKind::Persistence,
+                                false,
+                            ),
+                        );
+                        break;
+                    }
+                }
+                if is_cancelled(HvfArm64BootStorageCaptureStage::Persist) {
+                    retain_storage_capture_error(
+                        &mut primary,
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::Cancelled,
+                            false,
+                        ),
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -7313,12 +7615,57 @@ fn capture_ready_storage_state_at_with_cancel(
         }
     }
     if primary.is_none() {
-        captured = Some(CaptureReadyStorageState::new(
-            block_states,
-            pmem_states,
-            shared_block_retry,
-            shared_pmem_retry,
-        ));
+        match mode {
+            CaptureReadyStorageMode::Diagnostic => {
+                captured = Some(CaptureReadyStorageResult::Diagnostic(
+                    CaptureReadyStorageState::new(
+                        block_states,
+                        pmem_states,
+                        shared_block_retry,
+                        shared_pmem_retry,
+                    ),
+                ));
+            }
+            CaptureReadyStorageMode::SnapshotV2MultiBlock => {
+                if is_cancelled(HvfArm64BootStorageCaptureStage::ComposeGraph) {
+                    retain_storage_capture_error(
+                        &mut primary,
+                        HvfArm64BootStorageCaptureError::new(
+                            HvfArm64BootStorageCaptureErrorKind::Cancelled,
+                            false,
+                        ),
+                    );
+                }
+                if primary.is_none() {
+                    match SnapshotV2MultiBlockDeviceGraph::from_capture_ready_blocks(
+                        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                        &block_states,
+                    ) {
+                        Ok(graph) => {
+                            if is_cancelled(HvfArm64BootStorageCaptureStage::ComposeGraph) {
+                                retain_storage_capture_error(
+                                    &mut primary,
+                                    HvfArm64BootStorageCaptureError::new(
+                                        HvfArm64BootStorageCaptureErrorKind::Cancelled,
+                                        false,
+                                    ),
+                                );
+                            } else {
+                                captured =
+                                    Some(CaptureReadyStorageResult::SnapshotV2MultiBlock(graph));
+                            }
+                        }
+                        Err(_) => retain_storage_capture_error(
+                            &mut primary,
+                            HvfArm64BootStorageCaptureError::new(
+                                HvfArm64BootStorageCaptureErrorKind::GraphComposition,
+                                false,
+                            ),
+                        ),
+                    }
+                }
+            }
+        }
     }
 
     let mut cleanup_failed = false;
@@ -8538,6 +8885,44 @@ impl HvfArm64BootSession<'_> {
         is_cancelled: impl FnMut(HvfArm64BootStorageCaptureStage) -> bool,
     ) -> Result<CaptureReadyStorageState, HvfArm64BootStorageCaptureError> {
         capture_ready_storage_state_at_with_cancel(
+            self.backend,
+            &self.mmio_dispatcher,
+            &self.runtime_resources,
+            &mut self.pci_data_devices,
+            &self.block_device_metrics,
+            &self.gic,
+            &self.block_retry_wakeup_scheduler,
+            &self.pmem_retry_wakeup_scheduler,
+            configs,
+            guard,
+            now,
+            is_cancelled,
+        )
+    }
+
+    /// Produces only a detached, durable profile-2 block graph.
+    pub fn capture_snapshot_v2_multi_block_device_graph_at(
+        &mut self,
+        configs: &CaptureReadyStorageConfigs,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<SnapshotV2MultiBlockDeviceGraph, HvfArm64BootStorageCaptureError> {
+        self.capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
+            configs,
+            guard,
+            now,
+            |_| false,
+        )
+    }
+
+    pub fn capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
+        &mut self,
+        configs: &CaptureReadyStorageConfigs,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+        is_cancelled: impl FnMut(HvfArm64BootStorageCaptureStage) -> bool,
+    ) -> Result<SnapshotV2MultiBlockDeviceGraph, HvfArm64BootStorageCaptureError> {
+        capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
             self.backend,
             &self.mmio_dispatcher,
             &self.runtime_resources,
@@ -11545,6 +11930,44 @@ impl OwnedHvfArm64BootSession {
         is_cancelled: impl FnMut(HvfArm64BootStorageCaptureStage) -> bool,
     ) -> Result<CaptureReadyStorageState, HvfArm64BootStorageCaptureError> {
         capture_ready_storage_state_at_with_cancel(
+            &mut self.backend,
+            &self.mmio_dispatcher,
+            &self.runtime_resources,
+            &mut self.pci_data_devices,
+            &self.block_device_metrics,
+            &self.gic,
+            &self.block_retry_wakeup_scheduler,
+            &self.pmem_retry_wakeup_scheduler,
+            configs,
+            guard,
+            now,
+            is_cancelled,
+        )
+    }
+
+    /// Produces only a detached, durable profile-2 block graph.
+    pub fn capture_snapshot_v2_multi_block_device_graph_at(
+        &mut self,
+        configs: &CaptureReadyStorageConfigs,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+    ) -> Result<SnapshotV2MultiBlockDeviceGraph, HvfArm64BootStorageCaptureError> {
+        self.capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
+            configs,
+            guard,
+            now,
+            |_| false,
+        )
+    }
+
+    pub fn capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
+        &mut self,
+        configs: &CaptureReadyStorageConfigs,
+        guard: &HvfArm64BootLimiterRetryWakeupQuiescenceGuard,
+        now: Instant,
+        is_cancelled: impl FnMut(HvfArm64BootStorageCaptureStage) -> bool,
+    ) -> Result<SnapshotV2MultiBlockDeviceGraph, HvfArm64BootStorageCaptureError> {
+        capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
             &mut self.backend,
             &self.mmio_dispatcher,
             &self.runtime_resources,

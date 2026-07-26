@@ -2074,7 +2074,7 @@ fn capture_block_state(
     })
 }
 
-fn capture_limiter_state(
+pub(crate) fn capture_limiter_state(
     config: Option<DriveRateLimiterConfig>,
     state: VirtioBlockRateLimiterState,
 ) -> Result<SnapshotV2BlockLimiterState, ()> {
@@ -2112,7 +2112,7 @@ fn capture_bucket_state(
     }
 }
 
-fn capture_mmio_common(
+pub(crate) fn capture_mmio_common(
     state: &VirtioMmioTransportState,
     expected_features: u64,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
@@ -2145,7 +2145,7 @@ fn capture_mmio_common(
     )
 }
 
-fn capture_pci_common(
+pub(crate) fn capture_pci_common(
     state: &VirtioPciTransportState,
     expected_features: u64,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
@@ -2299,7 +2299,7 @@ fn capture_common_state_from_owned_queues(
     Ok(state)
 }
 
-fn capture_mmio_transport(
+pub(crate) fn capture_mmio_transport(
     region: MmioRegion,
     interrupt_line: GuestInterruptLine,
     state: &VirtioMmioTransportState,
@@ -2317,6 +2317,17 @@ fn capture_mmio_transport(
 }
 
 fn capture_pci_transport(
+    origin: StorageDeviceOrigin,
+    sbdf: PciSbdf,
+    bar_range: GuestMemoryRange,
+    state: &VirtioPciTransportState,
+) -> Result<SnapshotV2PciDeviceState, SnapshotV2DeviceGraphCaptureError> {
+    let pci = capture_pci_transport_parts(origin, sbdf, bar_range, state)?;
+    validate_pci_state(&pci).map_err(|_| SnapshotV2DeviceGraphCaptureError::InvalidPciState)?;
+    Ok(pci)
+}
+
+pub(crate) fn capture_pci_transport_parts(
     origin: StorageDeviceOrigin,
     sbdf: PciSbdf,
     bar_range: GuestMemoryRange,
@@ -2355,7 +2366,6 @@ fn capture_pci_transport(
         bar_probes,
         msix,
     };
-    validate_pci_state(&pci).map_err(|_| SnapshotV2DeviceGraphCaptureError::InvalidPciState)?;
     Ok(pci)
 }
 
@@ -2941,7 +2951,7 @@ fn validate_compatibility_version(version: SnapshotFormatVersion) -> Result<(), 
     }
 }
 
-fn expected_block_features(cache_type: DriveCacheType) -> u64 {
+pub(crate) fn expected_block_features(cache_type: DriveCacheType) -> u64 {
     crate::block::VirtioBlockConfigSpace::new(0, true, cache_type).available_features()
 }
 
