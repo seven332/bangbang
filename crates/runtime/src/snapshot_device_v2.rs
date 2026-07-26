@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::mem::size_of;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::block::{
     BlockCaptureIoEngine, BlockFileBacking, DriveCacheType, DriveConfig, DriveConfigError,
@@ -864,6 +864,7 @@ pub struct SnapshotV2RootRestorePlan {
     active_queue: Option<VirtioBlockQueue>,
     rate_limiter: Option<VirtioBlockRateLimiter>,
     retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
     virtio: SnapshotV2VirtioState,
     transport: SnapshotV2DeviceTransport,
 }
@@ -952,6 +953,7 @@ impl SnapshotV2RootRestorePlan {
         let rate_limiter =
             VirtioBlockRateLimiter::from_persisted_state_at(rate_limiter_config, limiter, now)
                 .map_err(|_| SnapshotV2RootRestorePlanError::RateLimiter)?;
+        let retry_deadline = restored_retry_deadline_at(retry, now);
 
         Ok(Self {
             selector,
@@ -965,6 +967,7 @@ impl SnapshotV2RootRestorePlan {
             active_queue,
             rate_limiter,
             retry,
+            retry_deadline,
             virtio,
             transport,
         })
@@ -1059,6 +1062,7 @@ impl SnapshotV2RootRestorePlan {
         Ok(PreparedSnapshotV2RootBlock {
             config_space,
             device,
+            retry_deadline: self.retry_deadline,
             continuation: SnapshotV2RootContinuation {
                 drive_id: self.drive_id,
                 partuuid: self.partuuid,
@@ -1076,6 +1080,7 @@ redacted_debug!(SnapshotV2RootRestorePlan, "SnapshotV2RootRestorePlan");
 pub struct PreparedSnapshotV2RootBlock {
     config_space: VirtioBlockConfigSpace,
     device: VirtioBlockDevice,
+    retry_deadline: Option<Instant>,
     continuation: SnapshotV2RootContinuation,
 }
 
@@ -1095,15 +1100,28 @@ impl PreparedSnapshotV2RootBlock {
         &self.continuation
     }
 
-    /// Separates the prepared device from its value-only continuation.
+    /// Returns the absolute destination retry deadline computed from the
+    /// restore plan's monotonic-time baseline.
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    /// Separates the prepared device, retry deadline, and value-only
+    /// continuation.
     pub fn into_parts(
         self,
     ) -> (
         VirtioBlockConfigSpace,
         VirtioBlockDevice,
+        Option<Instant>,
         SnapshotV2RootContinuation,
     ) {
-        (self.config_space, self.device, self.continuation)
+        (
+            self.config_space,
+            self.device,
+            self.retry_deadline,
+            self.continuation,
+        )
     }
 
     /// Reconstructs the retained transport without publishing any live bus,
@@ -1111,7 +1129,7 @@ impl PreparedSnapshotV2RootBlock {
     pub fn prepare_transport(
         self,
     ) -> Result<PreparedSnapshotV2RootTransport, SnapshotV2RootTransportRestoreError> {
-        let (config_space, device, continuation) = self.into_parts();
+        let (config_space, device, retry_deadline, continuation) = self.into_parts();
         let SnapshotV2RootContinuation {
             drive_id,
             partuuid,
@@ -1129,6 +1147,7 @@ impl PreparedSnapshotV2RootBlock {
                         drive_id,
                         partuuid,
                         retry,
+                        retry_deadline,
                         region: mmio.region(),
                         interrupt_line: mmio.interrupt_line(),
                         handler,
@@ -1148,6 +1167,7 @@ impl PreparedSnapshotV2RootBlock {
                         drive_id,
                         partuuid,
                         retry,
+                        retry_deadline,
                         origin: pci.origin(),
                         sbdf: pci.sbdf(),
                         bar_range: pci.bar_range(),
@@ -1180,6 +1200,15 @@ impl PreparedSnapshotV2RootTransport {
             Self::Pci(_) => SnapshotV2DeviceTransportKind::Pci,
         }
     }
+
+    /// Returns the absolute destination retry deadline computed from the
+    /// restore plan's monotonic-time baseline.
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Mmio(root) => root.retry_deadline,
+            Self::Pci(root) => root.retry_deadline,
+        }
+    }
 }
 
 impl fmt::Debug for PreparedSnapshotV2RootTransport {
@@ -1197,6 +1226,7 @@ pub struct PreparedSnapshotV2MmioRoot {
     drive_id: String,
     partuuid: Option<String>,
     retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
     region: MmioRegion,
     interrupt_line: GuestInterruptLine,
     handler: VirtioBlockMmioHandler,
@@ -1257,6 +1287,7 @@ pub struct PreparedSnapshotV2PciRoot {
     drive_id: String,
     partuuid: Option<String>,
     retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
     origin: StorageDeviceOrigin,
     sbdf: PciSbdf,
     bar_range: GuestMemoryRange,
@@ -2561,6 +2592,17 @@ fn range_is_wholly_contained(memory: &GuestMemory, range: GuestMemoryRange) -> b
 
 const fn feature_enabled(features: u64, feature: u32) -> bool {
     features & (1_u64 << feature) != 0
+}
+
+fn restored_retry_deadline_at(retry: StorageRetryState, now: Instant) -> Option<Instant> {
+    match retry {
+        StorageRetryState::None => None,
+        StorageRetryState::Immediate => Some(now),
+        StorageRetryState::After { remaining_nanos } => Some(
+            now.checked_add(Duration::from_nanos(remaining_nanos))
+                .unwrap_or(now),
+        ),
+    }
 }
 
 fn persisted_limiter_state(

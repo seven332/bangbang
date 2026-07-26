@@ -10417,27 +10417,14 @@ fn validate_snapshot_v2_root_resource_plan(
     }
 }
 
-fn snapshot_v2_root_identity(
+fn snapshot_v2_root_identity_and_retry_deadline(
     transport: &PreparedSnapshotV2RootTransport,
-) -> (&str, StorageRetryState) {
-    match transport {
-        PreparedSnapshotV2RootTransport::Mmio(root) => (root.drive_id(), root.retry()),
-        PreparedSnapshotV2RootTransport::Pci(root) => (root.drive_id(), root.retry()),
-    }
-}
-
-fn snapshot_v2_root_retry_deadline(retry: StorageRetryState) -> Option<Instant> {
-    match retry {
-        StorageRetryState::None => None,
-        StorageRetryState::Immediate => Some(Instant::now()),
-        StorageRetryState::After { remaining_nanos } => {
-            let now = Instant::now();
-            Some(
-                now.checked_add(Duration::from_nanos(remaining_nanos))
-                    .unwrap_or(now),
-            )
-        }
-    }
+) -> (&str, Option<Instant>) {
+    let drive_id = match transport {
+        PreparedSnapshotV2RootTransport::Mmio(root) => root.drive_id(),
+        PreparedSnapshotV2RootTransport::Pci(root) => root.drive_id(),
+    };
+    (drive_id, transport.retry_deadline())
 }
 
 fn install_snapshot_v2_mmio_root(
@@ -10830,7 +10817,7 @@ impl OwnedHvfArm64BootSession {
             )
         })?;
         validate_snapshot_v2_root_resource_plan(&transport, resources)?;
-        let (drive_id, retry) = snapshot_v2_root_identity(&transport);
+        let (drive_id, retry_deadline) = snapshot_v2_root_identity_and_retry_deadline(&transport);
         let partuuid = match &transport {
             PreparedSnapshotV2RootTransport::Mmio(root) => root.partuuid(),
             PreparedSnapshotV2RootTransport::Pci(root) => root.partuuid(),
@@ -10875,7 +10862,6 @@ impl OwnedHvfArm64BootSession {
             partuuid,
         )
         .map_err(HvfSnapshotV2RootRestoreError::platform)?;
-        let retry_deadline = snapshot_v2_root_retry_deadline(retry);
         let mut pci_data_devices = None;
         match transport {
             PreparedSnapshotV2RootTransport::Mmio(root) => {

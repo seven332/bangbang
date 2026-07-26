@@ -1187,7 +1187,8 @@ fn contiguous_root_restore_memory() -> GuestMemory {
 fn root_restore_plan_prepares_pathless_mmio_and_pci_backings() {
     for graph in [mmio_graph(), pci_graph()] {
         let memory = contiguous_root_restore_memory();
-        let plan = SnapshotV2RootRestorePlan::prepare(graph, &memory, Instant::now())
+        let now = Instant::now();
+        let plan = SnapshotV2RootRestorePlan::prepare(graph, &memory, now)
             .expect("root restore graph should prepare");
         assert_eq!(plan.selector(), "root-selector");
         assert_eq!(plan.drive_id(), "rootfs");
@@ -1228,6 +1229,10 @@ fn root_restore_plan_prepares_pathless_mmio_and_pci_backings() {
             StorageRetryState::After {
                 remaining_nanos: 99
             }
+        );
+        assert_eq!(
+            prepared.retry_deadline(),
+            now.checked_add(std::time::Duration::from_nanos(99))
         );
         assert!(!format!("{prepared:?}").contains("root-selector"));
     }
