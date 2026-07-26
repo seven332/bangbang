@@ -7,8 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRegionBacking};
 use crate::snapshot_format_v2::{
-    NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION, SnapshotV2ComponentKey, SnapshotV2DecodeError,
-    decode_snapshot_v2_state,
+    NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION, SnapshotV2ComponentKey, decode_snapshot_v2_state,
 };
 
 use super::*;
@@ -146,7 +145,7 @@ fn canonical_binding_state_and_image_round_trip() {
 }
 
 #[test]
-fn exact_minor_four_memory_image_is_dormant_while_default_writer_stays_minor_three() {
+fn current_minor_four_memory_image_and_structural_state_round_trip() {
     let memory = test_memory();
     let mut output = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -187,13 +186,7 @@ fn exact_minor_four_memory_image_is_dormant_while_default_writer_stays_minor_thr
             &[component],
         )
         .expect("minor-four memory state should encode internally");
-    assert!(matches!(
-        decode_snapshot_v2_state(&state_bytes),
-        Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-            supported: NATIVE_V2_SNAPSHOT_VERSION,
-        })
-    ));
+    assert!(decode_snapshot_v2_state(&state_bytes).is_ok());
     let state = crate::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version(
         &state_bytes,
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,

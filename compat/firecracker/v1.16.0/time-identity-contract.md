@@ -5,11 +5,13 @@ the delivered aarch64 PL031 RTC, VMGenID, VMClock, public live/capture-ready
 PVTime, and focused native-v2 portable time/clone restore portions of exactly
 one aggregate identity:
 `semantic.device:rtc-vmclock-vmgenid-and-pvtime`. That identity remains
-`audit-required` because public native-v2 lifecycle composition and broader
-cross-host time-source portability remain under
+`audit-required` because optional-device composition and broader cross-host
+time-source portability remain under
 [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). #1529
 therefore advances the checked contract without changing the inventory
-disposition or global count.
+disposition or global count. #1578 later activates the device-free public
+lifecycle, and #1589 carries this unchanged time component into the current
+single-root native-v2 `2.4.0` lifecycle.
 
 ## Evidence keys
 
@@ -90,7 +92,7 @@ disposition or global count.
 
 | Identity | Current disposition | Exact contract and remaining handoff |
 | --- | --- | --- |
-| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, public per-vCPU PVTime measurement/accounting/publication/discovery, and native-v2 `2.3.0` portable encoding, repeated immutable clone restore, recapture, failure classification, redaction, and signed multi-vCPU guest observation are implemented and verified. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** retains public v2 lifecycle/production composition, broader cross-host time-source migration/clone portability, and terminal disposition. |
+| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, public per-vCPU PVTime measurement/accounting/publication/discovery, native-v2 `2.3.0` introduction plus unchanged `2.4.0` carriage, repeated immutable clone restore, recapture, failure classification, redaction, and signed multi-vCPU guest observation are implemented and verified. The narrow public device-free 2.3 and single-root 2.4 lifecycle/production compositions are implemented. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** retains optional-device composition, broader cross-host time-source migration/clone portability, and terminal disposition. |
 
 ## VMClock state and version contract
 
@@ -112,8 +114,10 @@ disposition or global count.
   vCPU execution and auxiliary publishers are quiesced.
 - Native-v2 `2.3.0` stores the same exact ABI inside `BANGTM2\0`, together with
   portable placement, notification, policy, and per-vCPU PVTime state.
-  Structural readers still admit valid `2.2.x` containers, but the complete
-  typed HVF platform decoder requires kind 6 and therefore minor 3.
+  Current `2.4.0` retains that exact component before mandatory root-device
+  kind 7. Structural readers still admit valid `2.2.x` containers, but the
+  complete typed HVF platform decoder requires kind 6 and therefore at least
+  minor 3.
 
 ## Restore ordering and terminality
 

@@ -9725,7 +9725,7 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     use bangbang_runtime::pmem::PmemMmioLayout;
     use bangbang_runtime::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
     use bangbang_runtime::snapshot_format_v2::{
-        NATIVE_V2_SNAPSHOT_VERSION, decode_snapshot_v2_state,
+        NATIVE_V2_LEGACY_PLATFORM_VERSION, decode_snapshot_v2_state,
     };
     use bangbang_runtime::snapshot_memory_v2::{
         NATIVE_V2_MEMORY_HEADER_BYTES, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
@@ -10236,7 +10236,10 @@ fn native_v2_three_vcpu_platform_round_trip_preserves_paused_lifecycle_and_progr
     let first_capture = source
         .capture_snapshot_v2_platform(capture_input.clone(), &mut first_writer)
         .expect("first paused platform capture should succeed");
-    assert_eq!(first_capture.memory().version(), NATIVE_V2_SNAPSHOT_VERSION);
+    assert_eq!(
+        first_capture.memory().version(),
+        NATIVE_V2_LEGACY_PLATFORM_VERSION
+    );
     drop(first_writer);
     source
         .resume_after_snapshot_v2_capture()

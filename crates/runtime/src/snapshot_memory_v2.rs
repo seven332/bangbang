@@ -460,8 +460,8 @@ pub fn write_snapshot_v2_memory_image<W: Write + Seek>(
 /// Streams one image for an explicit known native-v2 compatibility version.
 ///
 /// The ordinary writer remains fixed to [`NATIVE_V2_SNAPSHOT_VERSION`]. This
-/// seam lets dormant profiles write a binding and image header at the same
-/// exact version without advancing public snapshot publication.
+/// seam lets retained legacy profiles write a binding and image header at
+/// their exact version without changing current public snapshot publication.
 pub fn write_snapshot_v2_memory_image_with_compatibility_version<W: Write + Seek>(
     memory: &GuestMemory,
     writer: &mut W,

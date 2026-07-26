@@ -4,14 +4,14 @@ use bangbang_runtime::machine::MachineConfigInput;
 use bangbang_runtime::memory::{GuestMemory, aarch64};
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
 use bangbang_runtime::snapshot_format_v2::{
-    NATIVE_V2_COMPONENT_DIRECTORY_ENTRY_BYTES, NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES,
-    NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES, NATIVE_V2_VCPU_COMPONENT_KIND, SnapshotV2ComponentKey,
-    SnapshotV2DecodeError, decode_snapshot_v2_state,
-    decode_snapshot_v2_state_with_compatibility_version,
+    NATIVE_V2_COMPONENT_DIRECTORY_ENTRY_BYTES, NATIVE_V2_LEGACY_PLATFORM_VERSION,
+    NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES, NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES,
+    NATIVE_V2_VCPU_COMPONENT_KIND, SnapshotV2ComponentKey, SnapshotV2DecodeError,
+    decode_snapshot_v2_state, decode_snapshot_v2_state_with_compatibility_version,
     encode_snapshot_v2_state_with_compatibility_version,
 };
 use bangbang_runtime::snapshot_memory_v2::{
-    decode_snapshot_v2_memory_binding, write_snapshot_v2_memory_image,
+    decode_snapshot_v2_memory_binding, write_snapshot_v2_memory_image_with_compatibility_version,
 };
 
 use super::*;
@@ -24,8 +24,8 @@ pub(crate) const PCI_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2/fixtures/pci.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
-    (4_887, 15_711_029_289_777_926_910),
-    (4_983, 6_483_643_659_118_063_762),
+    (4_887, 10_136_861_786_457_474_800),
+    (4_983, 7_169_128_621_506_763_529),
 ];
 
 pub(crate) fn platform_fixture(with_sme: bool) -> HvfSnapshotV2PlatformState {
@@ -78,8 +78,12 @@ fn platform_fixture_with_count(vcpu_count: u8, with_sme: bool) -> HvfSnapshotV2P
     let memory_bytes = FIXTURE_MEMORY_MIB * MIB;
     let layout = aarch64::dram_layout(memory_bytes).expect("fixture memory layout should validate");
     let memory = GuestMemory::allocate(&layout).expect("fixture guest memory should allocate");
-    let memory_binding = write_snapshot_v2_memory_image(&memory, &mut Cursor::new(Vec::new()))
-        .expect("fixture memory image should encode");
+    let memory_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut Cursor::new(Vec::new()),
+        NATIVE_V2_LEGACY_PLATFORM_VERSION,
+    )
+    .expect("fixture memory image should encode");
     let boot = HvfSnapshotV2BootState::try_new(
         HvfSnapshotV2NativePath::try_from_bytes(b"/fixture/kernel")
             .expect("fixture kernel path should validate"),
@@ -297,6 +301,13 @@ pub(crate) fn fixture_bytes(hex: &str) -> Vec<u8> {
 
 pub(crate) fn deterministic_minor_four_platform_fixture() -> HvfSnapshotV2PlatformState {
     let mut platform = platform_fixture(false);
+    let legacy_fdt = platform.machine.fdt();
+    platform.machine.fdt = HvfSnapshotV2FdtState::try_new_product_process_profile(
+        legacy_fdt.address(),
+        usize::try_from(legacy_fdt.size()).expect("fixture FDT size should fit"),
+        legacy_fdt.checksum(),
+    )
+    .expect("minor-four product FDT profile should validate");
     let mut binding = platform
         .memory()
         .encode()
@@ -383,7 +394,12 @@ where
         .iter()
         .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
         .collect::<Vec<_>>();
-    encode_snapshot_v2_state(&[], &components).expect("mutated components should re-encode")
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_LEGACY_PLATFORM_VERSION,
+        &[],
+        &components,
+    )
+    .expect("mutated components should re-encode")
 }
 
 fn rebuild_without_component(encoded: &[u8], excluded: SnapshotV2ComponentKey) -> Vec<u8> {
@@ -403,7 +419,12 @@ fn rebuild_without_component(encoded: &[u8], excluded: SnapshotV2ComponentKey) -
         .iter()
         .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
         .collect::<Vec<_>>();
-    encode_snapshot_v2_state(&[], &components).expect("reduced components should re-encode")
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_LEGACY_PLATFORM_VERSION,
+        &[],
+        &components,
+    )
+    .expect("reduced components should re-encode")
 }
 
 fn rebuild_complete_components<F>(encoded: &[u8], mut transform: F) -> Vec<u8>
@@ -600,13 +621,7 @@ fn exact_minor_four_mmio_and_pci_states_are_complete_immutable_fixtures() {
                 .payload(),
             fixture_bytes(graph_hex)
         );
-        assert!(matches!(
-            decode_snapshot_v2_state(&encoded),
-            Err(SnapshotV2DecodeError::UnsupportedVersion {
-                found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-                supported: NATIVE_V2_SNAPSHOT_VERSION,
-            })
-        ));
+        assert!(decode_snapshot_v2_state(&encoded).is_ok());
         assert!(matches!(
             decode_hvf_snapshot_v2_platform_state(&structural),
             Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
@@ -636,6 +651,16 @@ fn exact_minor_four_profile_rejects_missing_duplicate_wrong_and_disagreeing_grap
     let original = complete_state_fixture(MMIO_GRAPH_FIXTURE_HEX);
     let encoded =
         encode_hvf_snapshot_v2_state(&original).expect("complete minor-four state should encode");
+
+    let missing_product_fdt_profile = rebuild_complete_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_MACHINE_COMPONENT_KEY {
+            payload[72..80].fill(0);
+        }
+    });
+    assert!(matches!(
+        decode_complete_state(&missing_product_fdt_profile),
+        Err(HvfSnapshotV2DecodeError::InvalidMachine)
+    ));
 
     let missing =
         rebuild_complete_without_component(&encoded, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY);
@@ -742,7 +767,7 @@ fn exact_minor_four_profile_rejects_missing_duplicate_wrong_and_disagreeing_grap
     );
 
     let mut downgraded = encoded.clone();
-    downgraded[10..12].copy_from_slice(&NATIVE_V2_SNAPSHOT_VERSION.minor().to_le_bytes());
+    downgraded[10..12].copy_from_slice(&NATIVE_V2_LEGACY_PLATFORM_VERSION.minor().to_le_bytes());
     replace_state_checksum(&mut downgraded);
     assert_eq!(
         decode_snapshot_v2_state_with_compatibility_version(
@@ -760,7 +785,9 @@ fn exact_minor_four_profile_rejects_missing_duplicate_wrong_and_disagreeing_grap
         .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
         .expect("complete fixture should contain graph")
         .payload();
-    assert!(SnapshotV2DeviceGraph::decode(NATIVE_V2_SNAPSHOT_VERSION, graph_payload).is_err());
+    assert!(
+        SnapshotV2DeviceGraph::decode(NATIVE_V2_LEGACY_PLATFORM_VERSION, graph_payload).is_err()
+    );
 
     let components = structural.components().collect::<Vec<_>>();
     assert!(matches!(
@@ -1024,8 +1051,12 @@ fn rejects_minor_one_memory_only_state_as_hvf_profile_before_payload_decode() {
     let memory = state
         .component(NATIVE_V2_MEMORY_COMPONENT_KEY)
         .expect("fixture memory component should exist");
-    let mut memory_only = encode_snapshot_v2_state(&[], &[memory])
-        .expect("minor-two memory-only state should encode");
+    let mut memory_only = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_LEGACY_PLATFORM_VERSION,
+        &[],
+        &[memory],
+    )
+    .expect("minor-two memory-only state should encode");
     memory_only[10..12].copy_from_slice(&1_u16.to_le_bytes());
     let checksum_offset = memory_only.len()
         - bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES;

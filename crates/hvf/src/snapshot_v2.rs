@@ -25,11 +25,10 @@ use bangbang_runtime::snapshot_device_v2::{
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_GLOBAL_COMPONENT_KEY,
-    NATIVE_V2_MACHINE_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION,
-    NATIVE_V2_TIME_COMPONENT_KEY, NATIVE_V2_TOPOLOGY_COMPONENT_KEY, SnapshotV2Component,
-    SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
-    encode_snapshot_v2_state, encode_snapshot_v2_state_with_compatibility_version,
-    native_v2_vcpu_component_key,
+    NATIVE_V2_LEGACY_PLATFORM_VERSION, NATIVE_V2_MACHINE_COMPONENT_KEY,
+    NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_TIME_COMPONENT_KEY, NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
+    SnapshotV2Component, SnapshotV2ComponentDisposition, SnapshotV2EncodeError, SnapshotV2State,
+    encode_snapshot_v2_state_with_compatibility_version, native_v2_vcpu_component_key,
 };
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryBindingError, SnapshotV2MemoryStateError,
@@ -113,6 +112,8 @@ const OPTIONAL_TAG_SME_ZA: u16 = 148;
 const OPTIONAL_TAG_SME_ZT0: u16 = 149;
 const OPTIONAL_DISPOSITION_EXPLICIT: u8 = 0;
 const OPTIONAL_DISPOSITION_DESTINATION_DEFAULT: u8 = 1;
+const MACHINE_FDT_PROFILE_LEGACY: u64 = 0;
+const MACHINE_FDT_PROFILE_PRODUCT: u64 = 1;
 
 /// Maximum inert native path bytes admitted by the native-v2 platform profile.
 pub const HVF_SNAPSHOT_V2_MAX_PATH_BYTES: usize = 4096;
@@ -221,16 +222,17 @@ impl fmt::Debug for HvfSnapshotV2BootState {
     }
 }
 
-/// Stable FDT placement and redacted content identity.
+/// Stable live-FDT placement/content identity plus source-profile evidence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct HvfSnapshotV2FdtState {
     address: GuestAddress,
     size: u32,
     checksum: u64,
+    product_process_profile: bool,
 }
 
 impl HvfSnapshotV2FdtState {
-    /// Construct one locally bounded FDT fact.
+    /// Construct one locally bounded legacy FDT fact.
     pub fn try_new(
         address: GuestAddress,
         size: usize,
@@ -244,7 +246,20 @@ impl HvfSnapshotV2FdtState {
             address,
             size,
             checksum,
+            product_process_profile: false,
         })
+    }
+
+    /// Construct one bounded FDT fact whose source used the canonical product shell.
+    #[doc(hidden)]
+    pub fn try_new_product_process_profile(
+        address: GuestAddress,
+        size: usize,
+        checksum: u64,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        let mut state = Self::try_new(address, size, checksum)?;
+        state.product_process_profile = true;
+        Ok(state)
     }
 
     /// Return the guest-physical FDT address.
@@ -261,6 +276,12 @@ impl HvfSnapshotV2FdtState {
     pub const fn checksum(self) -> u64 {
         self.checksum
     }
+
+    /// Return whether source admission proved the canonical product FDT shell.
+    #[doc(hidden)]
+    pub const fn is_product_process_profile(self) -> bool {
+        self.product_process_profile
+    }
 }
 
 impl fmt::Debug for HvfSnapshotV2FdtState {
@@ -268,6 +289,14 @@ impl fmt::Debug for HvfSnapshotV2FdtState {
         f.debug_struct("HvfSnapshotV2FdtState")
             .field("placement", &REDACTED)
             .field("checksum", &REDACTED)
+            .field(
+                "profile",
+                &if self.product_process_profile {
+                    "product"
+                } else {
+                    "legacy"
+                },
+            )
             .finish()
     }
 }
@@ -940,6 +969,12 @@ fn validate_platform(state: &HvfSnapshotV2PlatformState) -> Result<(), HvfSnapsh
     validate_machine_config(state.machine.machine)?;
     validate_compatibility(&state.global.compatibility)?;
     validate_time(&state.time)?;
+    match state.memory.version() {
+        NATIVE_V2_LEGACY_PLATFORM_VERSION if !state.machine.fdt.is_product_process_profile() => {}
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            if state.machine.fdt.is_product_process_profile() => {}
+        _ => return Err(HvfSnapshotV2BuildError::Version),
+    }
     if state.global.gic_device.is_empty()
         || state.global.gic_device.len() > HVF_SNAPSHOT_V2_GIC_DEVICE_STATE_MAX_BYTES
     {
@@ -1501,7 +1536,7 @@ impl std::error::Error for HvfSnapshotV2DecodeError {
 pub fn encode_hvf_snapshot_v2_platform_state(
     state: &HvfSnapshotV2PlatformState,
 ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
-    encode_hvf_snapshot_v2_components(state, NATIVE_V2_SNAPSHOT_VERSION, None)
+    encode_hvf_snapshot_v2_components(state, NATIVE_V2_LEGACY_PLATFORM_VERSION, None)
 }
 
 /// Encode one complete exact native-v2 2.4 HVF state with its device graph.
@@ -1524,8 +1559,10 @@ fn encode_hvf_snapshot_v2_components(
     match device_graph {
         Some(graph)
             if version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
-                && graph.compatibility_version() == version => {}
-        None if version == NATIVE_V2_SNAPSHOT_VERSION => {}
+                && graph.compatibility_version() == version
+                && state.machine().fdt().is_product_process_profile() => {}
+        None if version == NATIVE_V2_LEGACY_PLATFORM_VERSION
+            && !state.machine().fdt().is_product_process_profile() => {}
         _ => {
             return Err(HvfSnapshotV2EncodeError::Build(
                 HvfSnapshotV2BuildError::Version,
@@ -1600,11 +1637,9 @@ fn encode_hvf_snapshot_v2_components(
             SnapshotV2ComponentDisposition::Semantic,
             device_graph,
         ));
-        encode_snapshot_v2_state_with_compatibility_version(version, &[], &components)
-            .map_err(HvfSnapshotV2EncodeError::Container)
-    } else {
-        encode_snapshot_v2_state(&[], &components).map_err(HvfSnapshotV2EncodeError::Container)
     }
+    encode_snapshot_v2_state_with_compatibility_version(version, &[], &components)
+        .map_err(HvfSnapshotV2EncodeError::Container)
 }
 
 /// Decode, own, and cross-validate one native-v2 HVF platform graph.
@@ -1615,14 +1650,14 @@ pub fn decode_hvf_snapshot_v2_platform_state(
     state: &SnapshotV2State<'_>,
 ) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
     let version = state.metadata().version();
-    if version.minor() < NATIVE_V2_SNAPSHOT_VERSION.minor() {
+    if version.minor() < NATIVE_V2_LEGACY_PLATFORM_VERSION.minor() {
         return Err(HvfSnapshotV2DecodeError::UnsupportedProfile);
     }
-    if version.minor() != NATIVE_V2_SNAPSHOT_VERSION.minor() {
+    if version != NATIVE_V2_LEGACY_PLATFORM_VERSION {
         return Err(HvfSnapshotV2DecodeError::InvalidComponentProfile);
     }
     let vcpu_count = scan_component_profile(state, false)?;
-    decode_hvf_snapshot_v2_platform_components(state, vcpu_count)
+    decode_hvf_snapshot_v2_platform_components(state, vcpu_count, false)
 }
 
 /// Decode and cross-validate one exact native-v2 2.4 HVF state.
@@ -1633,7 +1668,7 @@ pub fn decode_hvf_snapshot_v2_state(
         return Err(HvfSnapshotV2DecodeError::UnsupportedProfile);
     }
     let vcpu_count = scan_component_profile(state, true)?;
-    let platform = decode_hvf_snapshot_v2_platform_components(state, vcpu_count)?;
+    let platform = decode_hvf_snapshot_v2_platform_components(state, vcpu_count, true)?;
     let device_graph = SnapshotV2DeviceGraph::decode(
         state.metadata().version(),
         component_payload(state, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)?,
@@ -1645,6 +1680,7 @@ pub fn decode_hvf_snapshot_v2_state(
 fn decode_hvf_snapshot_v2_platform_components(
     state: &SnapshotV2State<'_>,
     vcpu_count: usize,
+    product_process_profile: bool,
 ) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
     let memory =
         decode_snapshot_v2_memory_binding(state).map_err(HvfSnapshotV2DecodeError::Memory)?;
@@ -1653,7 +1689,10 @@ fn decode_hvf_snapshot_v2_platform_components(
             HvfSnapshotV2BuildError::Version,
         ));
     }
-    let machine = decode_machine(component_payload(state, NATIVE_V2_MACHINE_COMPONENT_KEY)?)?;
+    let machine = decode_machine(
+        component_payload(state, NATIVE_V2_MACHINE_COMPONENT_KEY)?,
+        product_process_profile,
+    )?;
     let global = decode_global(component_payload(state, NATIVE_V2_GLOBAL_COMPONENT_KEY)?)?;
     let topology = decode_topology(component_payload(state, NATIVE_V2_TOPOLOGY_COMPONENT_KEY)?)?;
     let time = decode_time(component_payload(state, NATIVE_V2_TIME_COMPONENT_KEY)?)?;
@@ -1801,7 +1840,11 @@ fn encode_machine(state: &HvfSnapshotV2MachineState) -> Result<Vec<u8>, HvfSnaps
     encoder.u32(state.fdt.size);
     encoder.u32(0);
     encoder.u64(state.fdt.checksum);
-    encoder.u64(0);
+    encoder.u64(if state.fdt.product_process_profile {
+        MACHINE_FDT_PROFILE_PRODUCT
+    } else {
+        MACHINE_FDT_PROFILE_LEGACY
+    });
     debug_assert_eq!(encoder.len(), MACHINE_HEADER_BYTES);
     encoder.bytes(kernel);
     if let Some(initrd) = initrd {
@@ -1832,7 +1875,10 @@ fn encode_machine(state: &HvfSnapshotV2MachineState) -> Result<Vec<u8>, HvfSnaps
     Ok(encoder.finish())
 }
 
-fn decode_machine(payload: &[u8]) -> Result<HvfSnapshotV2MachineState, HvfSnapshotV2DecodeError> {
+fn decode_machine(
+    payload: &[u8],
+    product_process_profile: bool,
+) -> Result<HvfSnapshotV2MachineState, HvfSnapshotV2DecodeError> {
     if payload.len() < MACHINE_HEADER_BYTES {
         return Err(HvfSnapshotV2DecodeError::Truncated);
     }
@@ -1885,7 +1931,14 @@ fn decode_machine(payload: &[u8]) -> Result<HvfSnapshotV2MachineState, HvfSnapsh
         usize::try_from(decoder.u32()?).map_err(|_| HvfSnapshotV2DecodeError::InvalidLength)?;
     decoder.zeroes(4)?;
     let fdt_checksum = decoder.u64()?;
-    decoder.zeroes(8)?;
+    let expected_fdt_profile = if product_process_profile {
+        MACHINE_FDT_PROFILE_PRODUCT
+    } else {
+        MACHINE_FDT_PROFILE_LEGACY
+    };
+    if decoder.u64()? != expected_fdt_profile {
+        return Err(HvfSnapshotV2DecodeError::InvalidMachine);
+    }
     debug_assert_eq!(decoder.position, MACHINE_HEADER_BYTES);
 
     let cpu_bytes = cpu_count
@@ -1966,8 +2019,12 @@ fn decode_machine(payload: &[u8]) -> Result<HvfSnapshotV2MachineState, HvfSnapsh
     let machine = machine
         .validate()
         .map_err(|_| HvfSnapshotV2DecodeError::InvalidMachine)?;
-    let fdt = HvfSnapshotV2FdtState::try_new(fdt_address, fdt_size, fdt_checksum)
-        .map_err(|_| HvfSnapshotV2DecodeError::InvalidMachine)?;
+    let fdt = if product_process_profile {
+        HvfSnapshotV2FdtState::try_new_product_process_profile(fdt_address, fdt_size, fdt_checksum)
+    } else {
+        HvfSnapshotV2FdtState::try_new(fdt_address, fdt_size, fdt_checksum)
+    }
+    .map_err(|_| HvfSnapshotV2DecodeError::InvalidMachine)?;
     HvfSnapshotV2MachineState::try_new(machine, boot, fdt, application)
         .map_err(|_| HvfSnapshotV2DecodeError::InvalidMachine)
 }

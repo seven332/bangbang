@@ -26,6 +26,12 @@ mod macos_arm64 {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    use bangbang_hvf::decode_hvf_snapshot_v2_state;
+    use bangbang_runtime::snapshot_device_v2::{
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
+    };
+    use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version;
+
     use crate::macos_virtual_block::{
         MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize,
     };
@@ -287,6 +293,7 @@ mod macos_arm64 {
     const SMP_HOTPLUG_DONE_MARKER: &[u8] = b"BBHOTDONE";
     const DIRECT_ROOTFS_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
+    const DIRECT_ROOTFS_NATIVE_V2_ROOT_SNAPSHOT_BOOT_ARGS: &str = "console=null reboot=k panic=0 quiet loglevel=1 root=/dev/vda ro rootwait init=/bangbang-direct-rootfs-init bangbang.native-v2-root-snapshot=1";
     const ROOTFS_BOOT_TIMER_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 nomodule swiotlb=noforce init=/usr/local/bin/init";
     const DIRECT_ROOTFS_ENTROPY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-read=1";
@@ -1957,11 +1964,10 @@ mod macos_arm64 {
         assert!(!paused_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
         assert!(!paused_stdout.contains(GUEST_SERIAL_RX_FAILURE_MARKER));
 
-        assert_snapshot_rejected_without_artifacts(
+        assert_capture_ready_snapshot_rejected_without_artifacts(
             &socket_path,
             test_dir.path(),
             "paused serial stdio capture preflight",
-            "failed to create snapshot",
         );
         let captured_stdout = bangbang.stdout_snapshot();
         assert!(!captured_stdout.contains(GUEST_SERIAL_RX_SUCCESS_MARKER));
@@ -11015,6 +11021,7 @@ mod macos_arm64 {
         let resumed_socket = test_dir.path().join("resumed.socket");
         let terminal_socket = test_dir.path().join("terminal.socket");
         let kernel_path = test_dir.path().join("snapshot-guest.image");
+        let root_path = test_dir.path().join("snapshot-root.img");
         let state_path = test_dir.path().join("snapshot.state");
         let memory_path = test_dir.path().join("snapshot.memory");
         let source_metrics = test_dir.path().join("source.metrics");
@@ -11023,6 +11030,7 @@ mod macos_arm64 {
 
         fs::write(&kernel_path, snapshot_continuity_guest_image())
             .expect("snapshot continuity guest image should be written");
+        fs::write(&root_path, vec![0_u8; 4096]).expect("snapshot root backing should be written");
 
         let source =
             BangbangProcess::start(&source_socket, &format!("{instance_id}-snapshot-source"));
@@ -11041,6 +11049,15 @@ mod macos_arm64 {
             ),
         );
         assert_no_content_response(&boot, "PUT source /boot-source");
+        let root = http_put_json(
+            &source_socket,
+            "/drives/rootfs",
+            &format!(
+                r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true,"io_engine":"Sync"}}"#,
+                json_string(path_text(&root_path))
+            ),
+        );
+        assert_no_content_response(&root, "PUT source read-only Sync rootfs");
         let metrics = http_put_json(
             &source_socket,
             "/metrics",
@@ -11097,7 +11114,7 @@ mod macos_arm64 {
             "native-v2 description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.3.0");
+        assert_eq!(described.stdout.trim(), "v2.4.0");
 
         let collision = http_json_with_io_timeout(
             &source_socket,
@@ -11237,6 +11254,16 @@ mod macos_arm64 {
             r#""track_dirty_pages":true"#,
             "GET tracked paused destination machine",
         );
+        let paused_root = http_get(&paused_socket, "/vm/config");
+        assert_ok_response(&paused_root, "GET restored paused VM config");
+        for expected in [
+            r#""drive_id":"rootfs""#,
+            r#""is_root_device":true"#,
+            r#""is_read_only":true"#,
+            r#""io_engine":"Sync""#,
+        ] {
+            assert_response_contains(&paused_root, expected, "GET restored paused VM config");
+        }
         let resume = http_json(&paused_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
         assert_no_content_response(&resume, "PATCH paused destination /vm Resumed");
         let paused_output = paused.wait_for_exit_with_timeout(
@@ -11422,6 +11449,255 @@ mod macos_arm64 {
     }
 
     #[test]
+    fn signed_executable_restores_native_v2_root_io_over_mmio_and_pci() {
+        let test_dir = TestDir::new();
+        let instance_id = test_dir.instance_id();
+
+        for enable_pci in [false, true] {
+            run_native_v2_root_io_restore_case(test_dir.path(), &instance_id, enable_pci);
+        }
+    }
+
+    fn run_native_v2_root_io_restore_case(test_root: &Path, instance_id: &str, enable_pci: bool) {
+        let transport = if enable_pci { "pci" } else { "mmio" };
+        let source_socket = test_root.join(format!("nvr-{transport}-s.sock"));
+        let paused_socket = test_root.join(format!("nvr-{transport}-p.sock"));
+        let resumed_socket = test_root.join(format!("nvr-{transport}-r.sock"));
+        let state_path = test_root.join(format!("nvr-{transport}.state"));
+        let memory_path = test_root.join(format!("nvr-{transport}.memory"));
+        let recaptured_state_path = test_root.join(format!("nvr-{transport}-recaptured.state"));
+        let recaptured_memory_path = test_root.join(format!("nvr-{transport}-recaptured.memory"));
+        let metrics_path = test_root.join(format!("nvr-{transport}.metrics"));
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let root_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let process_args: &[&str] = if enable_pci { &["--enable-pci"] } else { &[] };
+
+        let source = BangbangProcess::start_with_extra_args(
+            &source_socket,
+            &format!("{instance_id}-native-v2-root-{transport}-source"),
+            process_args,
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT native-v2 root source /machine-config",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/boot-source",
+                &format!(
+                    r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+                    json_string(path_text(&kernel_path)),
+                    json_string(DIRECT_ROOTFS_NATIVE_V2_ROOT_SNAPSHOT_BOOT_ARGS)
+                ),
+            ),
+            "PUT native-v2 root source /boot-source",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/drives/rootfs",
+                &format!(
+                    r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true,"io_engine":"Sync"}}"#,
+                    json_string(path_text(&root_path))
+                ),
+            ),
+            "PUT native-v2 root source read-only Sync rootfs",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/metrics",
+                &format!(
+                    r#"{{"metrics_path":{}}}"#,
+                    json_string(path_text(&metrics_path))
+                ),
+            ),
+            "PUT native-v2 root source /metrics",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "PUT native-v2 root source InstanceStart",
+        );
+        wait_for_block_root_read_count(
+            &source_socket,
+            &metrics_path,
+            1,
+            GUEST_EXECUTION_TIMEOUT,
+            "native-v2 root source pre-snapshot I/O",
+        );
+        assert_no_content_response(
+            &http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "PATCH native-v2 root source /vm Paused",
+        );
+
+        let create_body = format!(
+            r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+            json_string(path_text(&state_path)),
+            json_string(path_text(&memory_path))
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &source_socket,
+                "PUT",
+                "/snapshot/create",
+                &create_body,
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            "PUT native-v2 root source /snapshot/create",
+        );
+        let state_before = fs::read(&state_path).expect("native-v2 root state should read");
+        let memory_before = fs::read(&memory_path).expect("native-v2 root memory should read");
+        let graph_before = native_v2_device_graph(&state_path);
+        let described = BangbangProcess::run_with_args_expect_exit(
+            &[
+                std::ffi::OsStr::new("--describe-snapshot"),
+                state_path.as_os_str(),
+            ],
+            "native-v2 root snapshot description",
+        );
+        assert!(
+            described.status.success(),
+            "{transport} native-v2 root description should succeed; stderr:\n{}",
+            described.stderr
+        );
+        assert_eq!(described.stdout.trim(), "v2.4.0");
+        let source_output = source.terminate();
+        assert_clean_shutdown(
+            source_output,
+            &source_socket,
+            &format!("{transport} native-v2 root snapshot source"),
+        );
+
+        let paused = BangbangProcess::start_with_extra_args(
+            &paused_socket,
+            &format!("{instance_id}-native-v2-root-{transport}-paused"),
+            process_args,
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &paused_socket,
+                "PUT",
+                "/snapshot/load",
+                &snapshot_root_load_body(&state_path, &memory_path, false),
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            "PUT native-v2 root paused destination /snapshot/load",
+        );
+        assert_response_contains(
+            &http_get(&paused_socket, "/"),
+            r#""state":"Paused""#,
+            "GET native-v2 root paused destination state",
+        );
+        let paused_root = http_get(&paused_socket, "/vm/config");
+        assert_ok_response(&paused_root, "GET restored native-v2 VM config");
+        for expected in [
+            r#""drive_id":"rootfs""#,
+            r#""is_root_device":true"#,
+            r#""is_read_only":true"#,
+            r#""io_engine":"Sync""#,
+        ] {
+            assert_response_contains(&paused_root, expected, "GET restored native-v2 VM config");
+        }
+        let recapture_body = format!(
+            r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+            json_string(path_text(&recaptured_state_path)),
+            json_string(path_text(&recaptured_memory_path))
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &paused_socket,
+                "PUT",
+                "/snapshot/create",
+                &recapture_body,
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            "PUT restored native-v2 root destination /snapshot/create",
+        );
+        assert_eq!(
+            native_v2_device_graph(&recaptured_state_path),
+            graph_before,
+            "restored {transport} root must recapture identical stable device state"
+        );
+        assert_no_content_response(
+            &http_json(&paused_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "PATCH native-v2 root paused destination /vm Resumed",
+        );
+        let paused_output = paused.wait_for_exit_with_timeout(
+            GUEST_EXECUTION_TIMEOUT,
+            &format!("{transport} explicitly resumed native-v2 root guest poweroff"),
+        );
+        assert_clean_shutdown(
+            paused_output,
+            &paused_socket,
+            &format!("{transport} explicitly resumed native-v2 root destination"),
+        );
+
+        let resumed = BangbangProcess::start_with_extra_args(
+            &resumed_socket,
+            &format!("{instance_id}-native-v2-root-{transport}-automatic"),
+            process_args,
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &resumed_socket,
+                "PUT",
+                "/snapshot/load",
+                &snapshot_root_load_body(&state_path, &memory_path, true),
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            "PUT native-v2 root automatic destination /snapshot/load",
+        );
+        let resumed_output = resumed.wait_for_exit_with_timeout(
+            GUEST_EXECUTION_TIMEOUT,
+            &format!("{transport} automatically resumed native-v2 root guest poweroff"),
+        );
+        assert_clean_shutdown(
+            resumed_output,
+            &resumed_socket,
+            &format!("{transport} automatically resumed native-v2 root destination"),
+        );
+
+        assert_eq!(
+            fs::read(&state_path).expect("final native-v2 root state should read"),
+            state_before,
+            "repeated loads must not mutate {transport} state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("final native-v2 root memory should read"),
+            memory_before,
+            "repeated loads must not mutate {transport} memory"
+        );
+        assert_no_snapshot_staging(test_root);
+    }
+
+    fn native_v2_device_graph(state_path: &Path) -> SnapshotV2DeviceGraph {
+        let bytes = fs::read(state_path).unwrap_or_else(|error| {
+            panic!(
+                "native-v2 state {} should read: {error}",
+                state_path.display()
+            )
+        });
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &bytes,
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        )
+        .expect("native-v2 state should decode structurally");
+        decode_hvf_snapshot_v2_state(&structural)
+            .expect("native-v2 state should decode semantically")
+            .device_graph()
+            .clone()
+    }
+
+    #[test]
     fn snapshot_continuity_guest_image_has_expected_header_and_control_flow() {
         let image = snapshot_continuity_guest_image();
         assert_eq!(read_test_u32(&image, 0), 0x1400_0010);
@@ -11489,6 +11765,14 @@ mod macos_arm64 {
         )
     }
 
+    fn snapshot_root_load_body(state_path: &Path, memory_path: &Path, resume_vm: bool) -> String {
+        format!(
+            r#"{{"snapshot_path":{},"mem_backend":{{"backend_path":{},"backend_type":"File"}},"resume_vm":{resume_vm}}}"#,
+            json_string(path_text(state_path)),
+            json_string(path_text(memory_path))
+        )
+    }
+
     fn flush_memory_hotplug_metrics(
         socket_path: &Path,
         metrics_path: &Path,
@@ -11550,6 +11834,60 @@ mod macos_arm64 {
                 .get("write_count")?
                 .as_u64()
         })
+    }
+
+    fn wait_for_block_root_read_count(
+        socket_path: &Path,
+        metrics_path: &Path,
+        expected: u64,
+        timeout: Duration,
+        context: &str,
+    ) {
+        let deadline = Instant::now() + timeout;
+        let mut last_count = 0;
+        let mut stable_since = None;
+        loop {
+            let flush = http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
+            assert_no_content_response(&flush, context);
+            let count = total_block_root_read_count(metrics_path);
+            let now = Instant::now();
+            if count >= expected {
+                if count != last_count {
+                    last_count = count;
+                    stable_since = Some(now);
+                } else if stable_since.is_some_and(|started| {
+                    now.duration_since(started) >= Duration::from_millis(500)
+                }) {
+                    return;
+                }
+            }
+            if now >= deadline {
+                let metrics = fs::read_to_string(metrics_path)
+                    .unwrap_or_else(|err| format!("<metrics unavailable: {err}>"));
+                panic!(
+                    "{context} did not observe block_rootfs.read_count >= {expected} within {timeout:?}; metrics:\n{metrics}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn total_block_root_read_count(path: &Path) -> u64 {
+        fs::read_to_string(path)
+            .ok()
+            .map(|output| {
+                output
+                    .lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .ok()?
+                            .get("block_rootfs")?
+                            .get("read_count")?
+                            .as_u64()
+                    })
+                    .fold(0, u64::saturating_add)
+            })
+            .unwrap_or(0)
     }
 
     fn metrics_line_count(path: &Path) -> usize {

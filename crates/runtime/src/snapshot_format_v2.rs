@@ -40,7 +40,20 @@ pub const NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION: SnapshotFormatVersion =
     SnapshotFormatVersion::new(2, 0, 0);
 
 /// Semantic version emitted by the current native-v2 writer.
-pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 3, 0);
+pub const NATIVE_V2_SNAPSHOT_VERSION: SnapshotFormatVersion = SnapshotFormatVersion::new(2, 4, 0);
+
+/// Exact native-v2 version of the complete legacy device-free platform profile.
+///
+/// This identity stays separate from [`NATIVE_V2_SNAPSHOT_VERSION`] so advancing
+/// the current writer cannot reinterpret graphless platform state as a newer
+/// device profile.
+pub const NATIVE_V2_LEGACY_PLATFORM_VERSION: SnapshotFormatVersion =
+    SnapshotFormatVersion::new(2, 3, 0);
+
+const _: () = assert!(
+    NATIVE_V2_LEGACY_PLATFORM_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
+        && NATIVE_V2_LEGACY_PLATFORM_VERSION.minor() < NATIVE_V2_SNAPSHOT_VERSION.minor()
+);
 
 /// Fixed native-v2 state header size.
 pub const NATIVE_V2_SNAPSHOT_HEADER_BYTES: usize = 64;
@@ -174,9 +187,8 @@ pub const NATIVE_V2_TIME_COMPONENT_KEY: SnapshotV2ComponentKey = SnapshotV2Compo
 
 /// Canonical identity of the singleton native-v2 device graph.
 ///
-/// This semantic component is available only in the exact native-v2 2.4
-/// compatibility profile. The advertised writer remains
-/// [`NATIVE_V2_SNAPSHOT_VERSION`] until the public device profile is activated.
+/// This semantic component is required by the exact current native-v2 2.4
+/// profile.
 pub const NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY: SnapshotV2ComponentKey =
     SnapshotV2ComponentKey::new(7, 0);
 
@@ -621,10 +633,10 @@ pub fn decode_snapshot_v2_state(
 
 /// Decodes native-v2 state against one explicit known compatibility ceiling.
 ///
-/// This cross-crate seam lets dormant compatibility work validate exact
-/// profiles without advancing [`decode_snapshot_v2_state`] or public
-/// native-family dispatch. Versions newer than the first device-graph profile
-/// are rejected rather than inheriting its catalog.
+/// This cross-crate seam lets retained legacy and exact-profile consumers
+/// validate their own version without changing [`decode_snapshot_v2_state`].
+/// Versions newer than the first device-graph profile are rejected rather than
+/// inheriting its catalog.
 pub fn decode_snapshot_v2_state_with_compatibility_version(
     bytes: &[u8],
     supported_version: SnapshotFormatVersion,

@@ -102,7 +102,7 @@ use bangbang_runtime::snapshot_device_v2::{
     SnapshotV2RootTransportRestoreError,
 };
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
-use bangbang_runtime::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
+use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
 use bangbang_runtime::snapshot_memory_v2::{
     SnapshotV2MemoryBinding, SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError,
     write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
@@ -7560,7 +7560,7 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
         self.capture_with_compatibility_version_and_cancel(
             input,
             memory_writer,
-            NATIVE_V2_SNAPSHOT_VERSION,
+            NATIVE_V2_LEGACY_PLATFORM_VERSION,
             is_cancelled,
         )
     }
@@ -7573,7 +7573,7 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
         is_cancelled: impl FnMut(SnapshotV2MemoryIoStage) -> bool,
     ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
         debug_assert!(
-            version == NATIVE_V2_SNAPSHOT_VERSION
+            version == NATIVE_V2_LEGACY_PLATFORM_VERSION
                 || version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
         );
         let (stable, captures, pvtime_capture) =
@@ -7606,12 +7606,20 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
         memory
             .read_slice(&mut fdt_bytes, fdt_write.address)
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::FdtRead { source })?;
-        let fdt =
-            HvfSnapshotV2FdtState::try_new(fdt_write.address, fdt_write.size, crc64(0, &fdt_bytes))
-                .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
-                    stage: HvfArm64BootSnapshotV2CaptureStage::Machine,
-                    source,
-                })?;
+        let fdt_checksum = crc64(0, &fdt_bytes);
+        let fdt = if version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION {
+            HvfSnapshotV2FdtState::try_new_product_process_profile(
+                fdt_write.address,
+                fdt_write.size,
+                fdt_checksum,
+            )
+        } else {
+            HvfSnapshotV2FdtState::try_new(fdt_write.address, fdt_write.size, fdt_checksum)
+        }
+        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Build {
+            stage: HvfArm64BootSnapshotV2CaptureStage::Machine,
+            source,
+        })?;
 
         let primary = captures
             .first()

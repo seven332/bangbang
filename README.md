@@ -31,11 +31,13 @@ publishes per-vCPU stolen time from bounded owner-thread wall/execution samples,
 enables standard 64-bit SMCCC discovery when the HVF measurement primitive is
 available, and has signed Linux contention/idle/pause certification. PVTime
 serialization and clone restore are implemented in the public bangbang-native
-v2 profile. Public `Full` creation now writes current `2.3.0` state/memory pairs
-from a strictly minimal paused production session and recovers that source for
-resume or recapture. Public load classifies the opened state once: native-v2
-uses retained read-only File/COW memory in a fresh process, while frozen
-native-v1 remains available as a compatibility reader. Both families publish
+v2 profile. Public `Full` creation now writes current `2.4.0` state/memory pairs
+from a strictly bounded paused production session with one read-only File/Sync
+root over MMIO or PCI, and recovers that source for resume or recapture. Public
+load classifies the opened state once: current native-v2 reconstructs the exact
+root graph with a newly authorized retained backing and read-only File/COW
+memory in a fresh process, while legacy device-free native-v2 `2.3.0` and frozen
+native-v1 remain available as compatibility readers. Both families publish
 `Paused` before an optional ordinary lifecycle resume. Serialized/restorable
 pmem and other optional-device state remain explicit Wave 6 limits.
 Host discard never promises synchronous RSS or footprint
@@ -84,9 +86,10 @@ generation-safe metrics, and exact cleanup. Automatic guest hotplug
 notification, PCI snapshot persistence, external vmnet connectivity
 certification, and Firecracker's KVM ITS identity remain explicit limits.
 Current native-v2 create runs the complete paused live-storage preflight and
-then rejects PCI before native-state capture or artifact work. Load keeps its
-pre-file/grant/controller/VM-mutation PCI rejection, while the default MMIO
-snapshot profile is unchanged.
+then admits the exact singleton read-only File/Sync root over the process's
+selected MMIO or PCI transport. Load validates and reconstructs that same
+transport before root backing, controller, or VM publication; a destination
+transport mismatch still fails before mutation.
 
 File-backed drives accept an existing regular file or, on macOS, one exact
 block-special descriptor over MMIO and PCI with omitted/default `Sync` or
@@ -338,12 +341,18 @@ ZA-register allocations.
 
 These primitives back a deliberately narrow public native-v2 snapshot path on
 macOS Apple Silicon. `PUT /snapshot/create` supports only `Full` snapshots from
-a paused 1–32-vCPU VM with a configured boot source, no drives or optional
-devices/MMDS/PCI/boot timer, default serial configuration, and a live UART that
-still exactly matches the canonical empty reset-compatible model. It writes a
-current `2.3.0` state/memory pair whose state binds the retained File/COW memory
-image and complete typed machine, GIC, topology, per-vCPU, and
-time/clone-identity graph.
+a paused 1–32-vCPU VM with a configured boot source, exactly one read-only
+File/Sync root drive, no optional devices/MMDS/boot timer, default serial
+configuration, and a live UART that still exactly matches the canonical empty
+reset-compatible model. The root may use the process-selected MMIO or PCI
+transport. It writes a current `2.4.0` state/memory pair whose state binds the
+retained File/COW memory image, complete typed machine, GIC, topology, per-vCPU,
+and time/clone-identity graph, plus the exact root configuration, block runtime
+state, common virtio state, and MMIO or PCI transport state.
+The normal process-standard-stream binding is destination-local rather than
+serialized: create still requires the default backend-neutral serial
+configuration and canonical UART state, and each restored process binds that
+state to its own standard output.
 
 Create reserves one FIFO boot-worker transaction, then failure-atomically
 quiesces the block, PMEM, network, and entropy retry publishers. The same lease
@@ -381,11 +390,15 @@ failure and prevents resume.
 process, except that logger and metrics configuration are allowed. It opens and
 classifies state once, routes frozen native-v1 to its existing File/Uffd
 compatibility loader, and routes native-v2 only to retained read-only File/COW
-memory. The v2 path validates the complete typed graph and default FDT/UART
-shell before construction, creates the fresh HVF VM/GIC/vCPU topology,
+memory. The v2 path validates the complete typed graph and default UART shell
+before construction, creates the fresh HVF VM/GIC/vCPU topology,
 reconstructs PL031 from destination wall clock, restores PVTime, replaces and
 signals VMGenID, updates and signals VMClock, and only then commits the session
-as `Paused`. `track_dirty_pages: true` can install a clean destination epoch
+as `Paused`. Legacy 2.3 parses the retained default FDT shell. Current 2.4
+instead verifies the retained live FDT address, length, and CRC, then requires
+versioned source-product evidence and reconstructs the root shell from the
+typed machine/device graph; Linux may already have consumed or reclaimed the
+original FDT bytes. `track_dirty_pages: true` can install a clean destination epoch
 after the v2 memory baseline and before mapping, vCPU ownership, or identity
 writes. Deprecated fields remain a native-v1 compatibility surface. A load
 failure after identity/time mutation, session publication, or requested resume
@@ -505,12 +518,15 @@ state and lazy-memory slice. The immutable empty `2.0.0` fixture remains
 readable, and `2.1.x` memory-only state remains readable with its exact paired
 image version. Minor `2.2.x` adds a permanent typed HVF graph with singleton
 memory, machine, global, and topology components followed by contiguous
-per-vCPU components for up to 32 vCPUs. The current `2.3.0` writer appends one
-singleton time component after those vCPU components. It retains portable
+per-vCPU components for up to 32 vCPUs. Legacy `2.3.0` appends one singleton
+time component after those vCPU components. It retains portable
 PL031 placement and destination-reset policy, topology-ordered cumulative
 PVTime values, VMGenID/VMClock placement and notification metadata, and the
 complete VMClock ABI without persisting a source VMGenID, host pointer,
-`Instant`, or wall-clock anchor.
+`Instant`, or wall-clock anchor. Current `2.4.0` appends the mandatory singleton
+device-graph component. Its first active profile contains exactly one read-only
+File/Sync root and carries closed configuration, block, common virtio, and
+MMIO-or-PCI transport sections.
 
 The native-v2 reconstruction guard consumes this complete graph
 and already-authorized memory, creates a fresh destination PL031 anchored to
@@ -532,12 +548,13 @@ on demand and writes remain private. State and fixed memory metadata are
 CRC-protected, but guest bytes deliberately are not checksummed or
 authenticated and require an external artifact authentication/encryption
 policy. The public normal-process adapter admits only pristine File/COW
-destinations, loads direct or contained pairs state-first, validates the exact
-default arm64 FDT, UART, RTC, and time/identity shell, installs fresh buffered
-or stdout-only output without stdin, and publishes a closed supervisor session
-initially `Paused`. The same immutable pair can restore into multiple fresh
+destinations and loads direct or contained pairs state-first. Legacy 2.3
+validates the exact default arm64 FDT/UART/RTC/time shell; current 2.4 validates
+the live-FDT identity plus versioned typed root product. It installs fresh
+buffered or stdout-only output without stdin and publishes a closed supervisor
+session initially `Paused`. The same immutable pair can restore into multiple fresh
 destinations; requested resume still passes through the ordinary lifecycle
-gate. `--snapshot-version` reports `v2.3.0`, and `--describe-snapshot` reports
+gate. `--snapshot-version` reports `v2.4.0`, and `--describe-snapshot` reports
 the actual validated native-v1 or native-v2 version. Recognizing a pinned
 Firecracker bitcode prefix reports incompatibility rather than claiming decode
 or translation. The exact wire,
@@ -586,7 +603,7 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
 - `--no-api` requires `--config-file <PATH>`, starts from that configuration
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
 - `--snapshot-version` prints the current bangbang-native writer version
-  (`v2.3.0`) and exits before startup.
+  (`v2.4.0`) and exits before startup.
 - `--describe-snapshot <PATH>` reads a bounded regular native state file,
   classifies and validates its complete native-v1 or native-v2 envelope and
   CRC, prints its exact embedded version, and exits before startup. In
