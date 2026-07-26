@@ -168,7 +168,22 @@ impl KernelCommandLine {
     }
 }
 
-/// Builds the canonical process command line for one read-only root block.
+/// Builds the canonical process command line for a block transport.
+///
+/// MMIO-only processes append `pci=off`. Linux init arguments, when present,
+/// remain after the canonical ` -- ` separator.
+pub fn canonical_process_block_command_line(
+    boot_args: Option<&str>,
+    pci_enabled: bool,
+) -> Result<String, BootCommandLineError> {
+    let mut command_line = validate_command_line_text(boot_args)?;
+    if !pci_enabled {
+        command_line = command_line.with_appended_kernel_args(["pci=off"])?;
+    }
+    Ok(command_line.text)
+}
+
+/// Builds the canonical process command line for one root block.
 ///
 /// Transport policy is inserted before root selection while Linux init
 /// arguments, when present, remain after the canonical ` -- ` separator.
@@ -178,10 +193,9 @@ pub fn canonical_process_root_block_command_line(
     partuuid: Option<&str>,
     read_only: bool,
 ) -> Result<String, BootCommandLineError> {
-    let mut command_line = validate_command_line_text(boot_args)?;
-    if !pci_enabled {
-        command_line = command_line.with_appended_kernel_args(["pci=off"])?;
-    }
+    let mut command_line = validate_command_line_text(Some(
+        &canonical_process_block_command_line(boot_args, pci_enabled)?,
+    ))?;
     let (root, mode) = root_block_kernel_arguments(partuuid, read_only);
     command_line = command_line.with_appended_kernel_args([root.as_str(), mode])?;
     Ok(command_line.text)
@@ -1242,6 +1256,7 @@ mod tests {
         ARM64_IMAGE_TEXT_OFFSET_OFFSET, ARM64_LEGACY_TEXT_OFFSET, BootCommandLineError,
         BootPayloadKind, BootSource, BootSourceConfigError, BootSourceConfigInput, BootSourceFiles,
         BootSourceLoadError, DEFAULT_KERNEL_COMMAND_LINE, INIT_ARGS_SEPARATOR, KernelImageError,
+        canonical_process_block_command_line, canonical_process_root_block_command_line,
         validate_command_line_text,
     };
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, aarch64};
@@ -1763,6 +1778,27 @@ mod tests {
         assert_eq!(
             updated.as_bytes_with_nul(),
             b"console=ttyS0 root=/dev/vda ro -- /init\0"
+        );
+    }
+
+    #[test]
+    fn canonical_process_block_arguments_preserve_rootless_transport_policy() {
+        assert_eq!(
+            canonical_process_block_command_line(Some("console=ttyS0 -- /init"), false),
+            Ok("console=ttyS0 pci=off -- /init".to_string())
+        );
+        assert_eq!(
+            canonical_process_block_command_line(Some("console=ttyS0 -- /init"), true),
+            Ok("console=ttyS0 -- /init".to_string())
+        );
+        assert_eq!(
+            canonical_process_root_block_command_line(
+                Some("console=ttyS0 -- /init"),
+                false,
+                Some("1111-2222"),
+                false,
+            ),
+            Ok("console=ttyS0 pci=off root=PARTUUID=1111-2222 rw -- /init".to_string())
         );
     }
 

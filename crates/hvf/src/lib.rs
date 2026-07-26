@@ -25,6 +25,7 @@ mod snapshot;
 mod snapshot_bundle;
 mod snapshot_restore;
 mod snapshot_v2;
+mod snapshot_v2_multi_block_platform;
 mod snapshot_v2_platform;
 mod startup;
 mod topology;
@@ -141,6 +142,13 @@ pub use snapshot_v2::{
     HvfSnapshotV2NativePath, HvfSnapshotV2PlatformState, HvfSnapshotV2State,
     HvfSnapshotV2VcpuState, decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_state,
     encode_hvf_snapshot_v2_platform_state, encode_hvf_snapshot_v2_state,
+};
+pub use snapshot_v2_multi_block_platform::{
+    HvfSnapshotV2MultiBlockMmioRecordPlan, HvfSnapshotV2MultiBlockPciPlan,
+    HvfSnapshotV2MultiBlockPciRecordPlan, HvfSnapshotV2MultiBlockPlatformPlan,
+    HvfSnapshotV2MultiBlockProcessConfig, HvfSnapshotV2MultiBlockRetryPlan,
+    HvfSnapshotV2MultiBlockTransportPlan, PrepareHvfSnapshotV2MultiBlockPlatformPlanError,
+    prepare_hvf_snapshot_v2_multi_block_platform_plan,
 };
 pub use snapshot_v2_platform::{
     HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2PlatformCleanupFailure,

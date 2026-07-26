@@ -7747,6 +7747,12 @@ impl BlockMmioLayout {
         self
     }
 
+    /// Computes one canonical device region without registering a handler.
+    pub fn region_at(self, index: usize) -> Result<MmioRegion, BlockMmioRegistrationError> {
+        self.validate()?;
+        self.placement(index).map(|placement| placement.region)
+    }
+
     fn validate(self) -> Result<(), BlockMmioRegistrationError> {
         if self.address_stride < VIRTIO_MMIO_DEVICE_WINDOW_SIZE {
             return Err(BlockMmioRegistrationError::AddressStrideTooSmall {
@@ -8990,7 +8996,7 @@ mod tests {
     use crate::metrics::{BlockDeviceMetrics, SharedBlockDeviceMetrics};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioHandler, MmioOperation,
-        MmioRegionId,
+        MmioRegion, MmioRegionId,
     };
     use crate::pci::{PciBarAddressSpace, PciBarAllocator};
     use crate::virtio::VirtioDeviceType;
@@ -12507,6 +12513,39 @@ mod tests {
             devices.registrations()[1].address(),
             GuestAddress::new(TEST_MMIO_BASE + VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2),
         );
+    }
+
+    #[test]
+    fn block_mmio_layout_projects_checked_regions_without_registration() {
+        let layout = BlockMmioLayout::new(GuestAddress::new(TEST_MMIO_BASE), MmioRegionId::new(20))
+            .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2)
+            .with_region_id_stride(3);
+
+        assert_eq!(
+            layout.region_at(1).expect("second region should project"),
+            MmioRegion::new(
+                MmioRegionId::new(23),
+                GuestAddress::new(TEST_MMIO_BASE + VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .expect("expected region should validate")
+        );
+        assert!(matches!(
+            layout.with_region_id_stride(0).region_at(0),
+            Err(BlockMmioRegistrationError::DuplicateRegionIdStride { .. })
+        ));
+        assert!(matches!(
+            layout.with_address_stride(u64::MAX).region_at(1),
+            Err(BlockMmioRegistrationError::AddressOverflow { .. })
+        ));
+        assert!(matches!(
+            BlockMmioLayout::new(
+                GuestAddress::new(TEST_MMIO_BASE),
+                MmioRegionId::new(u64::MAX),
+            )
+            .region_at(1),
+            Err(BlockMmioRegistrationError::RegionIdOverflow { .. })
+        ));
     }
 
     #[test]

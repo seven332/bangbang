@@ -78,10 +78,10 @@ use crate::topology::{HvfVcpuTopology, HvfVcpuTopologyError};
 use crate::vcpu::HvfArm64VcpuIdentificationRegisterState;
 
 const REDACTED: &str = "<redacted>";
-const PROCESS_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
-const PROCESS_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(20);
-const PROCESS_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
-const PROCESS_RTC_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(10);
+pub(crate) const PROCESS_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
+pub(crate) const PROCESS_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(20);
+pub(crate) const PROCESS_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
+pub(crate) const PROCESS_RTC_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(10);
 
 /// Destination process policy needed to verify the exact root allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2053,7 +2053,7 @@ fn root_queue_ranges_conflict_with_platform(
     })
 }
 
-fn pci_msix_routes_match_gic(
+pub(crate) fn pci_msix_routes_match_gic(
     state: &bangbang_runtime::snapshot_device_v2::SnapshotV2PciMsixState,
     msi: crate::gic::HvfGicMsiMetadata,
 ) -> bool {
@@ -2957,7 +2957,7 @@ fn restore_protocol_stages(vcpu_count: usize) -> Vec<HvfSnapshotV2PlatformRestor
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use bangbang_runtime::snapshot_memory_v2::write_snapshot_v2_memory_image;
 
     use super::*;
@@ -3181,7 +3181,7 @@ mod tests {
             .expect("root fixture platform should cross-validate")
     }
 
-    fn mmio_root_plan_fixture() -> (
+    pub(crate) fn mmio_root_plan_fixture() -> (
         HvfSnapshotV2PlatformState,
         SnapshotV2RootRestorePlan,
         HvfSnapshotV2RootProcessConfig,
@@ -3204,7 +3204,7 @@ mod tests {
         (platform, root, process)
     }
 
-    fn pci_root_plan_fixture() -> (
+    pub(crate) fn pci_root_plan_fixture() -> (
         HvfSnapshotV2PlatformState,
         SnapshotV2RootRestorePlan,
         HvfSnapshotV2RootProcessConfig,
@@ -3296,7 +3296,7 @@ mod tests {
         (platform, root, process)
     }
 
-    fn process_platform_fixture() -> HvfSnapshotV2PlatformState {
+    pub(crate) fn process_platform_fixture() -> HvfSnapshotV2PlatformState {
         let state = crate::snapshot_v2::tests::platform_fixture(false);
         let gic = state.global().compatibility().gic_metadata();
         let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
