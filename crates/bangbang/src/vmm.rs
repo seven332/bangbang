@@ -11,8 +11,6 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-#[cfg(target_os = "macos")]
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
@@ -57,8 +55,6 @@ use bangbang_runtime::balloon::{
     BalloonHintingStatus, BalloonHintingStatusError, BalloonStats, BalloonStatsError,
     BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
 };
-#[cfg(target_os = "macos")]
-use bangbang_runtime::block::SnapshotBlockFileBackingError;
 use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveBackendConfig, DriveConfig, DriveConfigError,
     DriveConfigInput, DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig,
@@ -200,6 +196,12 @@ use crate::host_network::vmnet::{
     VmnetInterfaceStartDisposition, VmnetInterfaceStartError, VmnetMode, VmnetPacketIoBackend,
 };
 #[cfg(target_os = "macos")]
+use crate::snapshot_restore_resources::{
+    PreparedSnapshotRootBackingLease, PreparedSnapshotRootRestoreCompletion,
+    RequestedSnapshotRestoreResources, SnapshotRestoreResourceDisposition,
+    SnapshotRestoreResourceError, SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
+};
+#[cfg(target_os = "macos")]
 use crate::vsock_restore::{
     PreparedVsockRestoreResource, VsockRestoreDisposition, VsockRestoreError,
     prepare_vsock_restore_resource,
@@ -315,28 +317,7 @@ pub(crate) struct ProcessSnapshotV2RootLoadRequest<'a> {
     pub(crate) input: &'a SnapshotLoadInput,
     pub(crate) candidate: NativeV2SnapshotCandidateState,
     pub(crate) memory: GuestMemory,
-}
-
-impl<'a> ProcessSnapshotV2RootLoadRequest<'a> {
-    const fn new(
-        controller: &'a VmmController,
-        vmnet_authority: ProcessVmnetAuthority,
-        grant_authority: Option<&'a GrantAuthority>,
-        pci_enabled: bool,
-        input: &'a SnapshotLoadInput,
-        candidate: NativeV2SnapshotCandidateState,
-        memory: GuestMemory,
-    ) -> Self {
-        Self {
-            controller,
-            vmnet_authority,
-            grant_authority,
-            pci_enabled,
-            input,
-            candidate,
-            memory,
-        }
-    }
+    pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
 pub(crate) trait InstanceStartExecutor {
@@ -1279,40 +1260,80 @@ impl<S> fmt::Debug for ProcessSnapshotV2RootLoadSuccess<S> {
     }
 }
 
+#[cfg(not(test))]
 pub(crate) struct ProcessSnapshotV2RootLoadCompletion {
     #[cfg(target_os = "macos")]
-    root_lease: Option<PreparedSnapshotRootBackingLease>,
+    root_completion: PreparedSnapshotRootRestoreCompletion,
     #[cfg(target_os = "macos")]
-    serial_output: Option<SharedSerialOutput>,
+    serial_output: SharedSerialOutput,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(test)]
+pub(crate) enum ProcessSnapshotV2RootLoadCompletion {
+    #[cfg(target_os = "macos")]
+    Prepared(Box<ProcessSnapshotV2RootLoadCompletionResources>),
+    Empty,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) struct ProcessSnapshotV2RootLoadCompletionResources {
+    root_completion: PreparedSnapshotRootRestoreCompletion,
+    serial_output: SharedSerialOutput,
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
 impl ProcessSnapshotV2RootLoadCompletion {
     const fn new(
-        root_lease: PreparedSnapshotRootBackingLease,
+        root_completion: PreparedSnapshotRootRestoreCompletion,
         serial_output: SharedSerialOutput,
     ) -> Self {
         Self {
-            root_lease: Some(root_lease),
-            serial_output: Some(serial_output),
+            root_completion,
+            serial_output,
         }
     }
 
-    #[cfg(test)]
+    fn abort(self) -> Result<(), GrantClaimError> {
+        let Self {
+            root_completion,
+            serial_output,
+        } = self;
+        drop(serial_output);
+        root_completion.abort()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl ProcessSnapshotV2RootLoadCompletion {
+    fn new(
+        root_completion: PreparedSnapshotRootRestoreCompletion,
+        serial_output: SharedSerialOutput,
+    ) -> Self {
+        Self::Prepared(Box::new(ProcessSnapshotV2RootLoadCompletionResources {
+            root_completion,
+            serial_output,
+        }))
+    }
+
+    fn abort(self) -> Result<(), GrantClaimError> {
+        match self {
+            Self::Prepared(resources) => {
+                let ProcessSnapshotV2RootLoadCompletionResources {
+                    root_completion,
+                    serial_output,
+                } = *resources;
+                drop(serial_output);
+                root_completion.abort()
+            }
+            Self::Empty => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ProcessSnapshotV2RootLoadCompletion {
     pub(crate) const fn empty_for_test() -> Self {
-        Self {
-            root_lease: None,
-            serial_output: None,
-        }
-    }
-
-    fn into_parts(
-        self,
-    ) -> (
-        Option<PreparedSnapshotRootBackingLease>,
-        Option<SharedSerialOutput>,
-    ) {
-        (self.root_lease, self.serial_output)
+        Self::Empty
     }
 }
 
@@ -1325,6 +1346,27 @@ impl fmt::Debug for ProcessSnapshotV2RootLoadCompletion {
     }
 }
 
+fn native_v2_error_after_process_root_completion_abort(
+    source: NativeV2SnapshotLoadError,
+    completion: ProcessSnapshotV2RootLoadCompletion,
+) -> NativeV2SnapshotLoadError {
+    #[cfg(target_os = "macos")]
+    {
+        match completion.abort() {
+            Ok(()) => source,
+            Err(cleanup) => NativeV2SnapshotLoadError::RootResourceCleanup {
+                source: Box::new(source),
+                cleanup,
+            },
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = completion;
+        source
+    }
+}
+
 #[allow(
     dead_code,
     reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
@@ -1333,9 +1375,17 @@ impl fmt::Debug for ProcessSnapshotV2RootLoadCompletion {
 pub(crate) enum NativeV2SnapshotLoadError {
     Preflight(VmmActionError),
     ProcessTerminal,
+    Cancelled,
     Resource(GrantClaimError),
+    #[cfg(target_os = "macos")]
+    RestoreResources(SnapshotRestoreResourceError),
     AfterResourceAdoption {
         source: Box<NativeV2SnapshotLoadError>,
+    },
+    #[cfg(target_os = "macos")]
+    RootResourceCleanup {
+        source: Box<NativeV2SnapshotLoadError>,
+        cleanup: GrantClaimError,
     },
     Artifact(SnapshotArtifactLoadError),
     ArtifactState(NativeSnapshotArtifactStateError),
@@ -1377,12 +1427,14 @@ impl NativeV2SnapshotLoadError {
             | Self::AfterResourceAdoption { .. }
             | Self::RunReady { .. }
             | Self::WorkerStart { .. }
-            | Self::ControllerCommit(_)
             | Self::Resume(_) => true,
+            #[cfg(target_os = "macos")]
+            Self::RootResourceCleanup { .. } => true,
             Self::Restore(source) => source.is_committed() || !source.cleanup_failures().is_empty(),
             Self::RootRestore(source) => source.is_terminal(),
             Self::Preflight(_)
             | Self::Resource(_)
+            | Self::Cancelled
             | Self::Artifact(_)
             | Self::ArtifactState(_)
             | Self::UnexpectedFamily(_)
@@ -1395,9 +1447,14 @@ impl NativeV2SnapshotLoadError {
             | Self::RootBundle(_)
             | Self::BootMetadata(_)
             | Self::Allocation(_)
-            | Self::ProcessPreparation(_) => false,
+            | Self::ProcessPreparation(_)
+            | Self::ControllerCommit(_) => false,
             #[cfg(target_os = "macos")]
             Self::RootBacking(_) => false,
+            #[cfg(target_os = "macos")]
+            Self::RestoreResources(source) => {
+                source.disposition() == SnapshotRestoreResourceDisposition::Terminal
+            }
         }
     }
 }
@@ -1409,13 +1466,28 @@ impl fmt::Display for NativeV2SnapshotLoadError {
                 write!(formatter, "native-v2 load preflight failed: {source}")
             }
             Self::ProcessTerminal => formatter.write_str("native-v2 load process is terminal"),
+            Self::Cancelled => formatter.write_str("native-v2 load was cancelled"),
             Self::Resource(source) => {
                 write!(formatter, "native-v2 resource adoption failed: {source}")
+            }
+            #[cfg(target_os = "macos")]
+            Self::RestoreResources(source) => {
+                write!(
+                    formatter,
+                    "native-v2 restore resource preparation failed: {source}"
+                )
             }
             Self::AfterResourceAdoption { source } => {
                 write!(
                     formatter,
                     "native-v2 load failed after resource adoption: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::RootResourceCleanup { source, .. } => {
+                write!(
+                    formatter,
+                    "native-v2 load failed and root authority cleanup was incomplete: {source}"
                 )
             }
             Self::Artifact(source) => write!(formatter, "native-v2 artifact load failed: {source}"),
@@ -1522,7 +1594,11 @@ impl std::error::Error for NativeV2SnapshotLoadError {
         match self {
             Self::Preflight(source) => Some(source),
             Self::Resource(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::RestoreResources(source) => Some(source),
             Self::AfterResourceAdoption { source } => Some(source.as_ref()),
+            #[cfg(target_os = "macos")]
+            Self::RootResourceCleanup { source, .. } => Some(source.as_ref()),
             Self::Artifact(source) => Some(source),
             Self::ArtifactState(source) => Some(source),
             Self::State(source) => Some(source),
@@ -1542,8 +1618,25 @@ impl std::error::Error for NativeV2SnapshotLoadError {
             Self::WorkerStart { source, .. } => Some(source),
             Self::ControllerCommit(source) => Some(source),
             Self::Resume(source) => Some(source),
-            Self::ProcessTerminal | Self::UnexpectedFamily(_) | Self::CandidateMismatch => None,
+            Self::ProcessTerminal
+            | Self::Cancelled
+            | Self::UnexpectedFamily(_)
+            | Self::CandidateMismatch => None,
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_v2_error_after_root_resource_abort(
+    source: NativeV2SnapshotLoadError,
+    completion: PreparedSnapshotRootRestoreCompletion,
+) -> NativeV2SnapshotLoadError {
+    match completion.abort() {
+        Ok(()) => source,
+        Err(cleanup) => NativeV2SnapshotLoadError::RootResourceCleanup {
+            source: Box::new(source),
+            cleanup,
+        },
     }
 }
 
@@ -1750,137 +1843,6 @@ impl fmt::Debug for PreparedNativeSnapshotLoad {
             .field("state", &"<redacted>")
             .field("authority", &"<redacted>")
             .finish()
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotRootSelectorPolicy {
-    TreatAsPath,
-    RejectGrantReference,
-    RequireGrantWhenContained,
-}
-
-#[cfg(target_os = "macos")]
-struct PreparedSnapshotRootBackingLease {
-    selector: Option<PathBuf>,
-    claim: Option<PreparedDriveBackingClaim>,
-    consumed: bool,
-}
-
-#[cfg(target_os = "macos")]
-impl PreparedSnapshotRootBackingLease {
-    fn prepare(
-        selector: &Path,
-        authority: Option<&GrantAuthority>,
-        selector_policy: SnapshotRootSelectorPolicy,
-    ) -> Result<Self, GrantClaimError> {
-        let claim = match authority {
-            Some(authority) => {
-                match authority.prepare_drive_backing_claim(selector, GrantAccess::ReadOnly)? {
-                    Some(claim) => Some(claim),
-                    None if selector_policy
-                        == SnapshotRootSelectorPolicy::RequireGrantWhenContained =>
-                    {
-                        return Err(GrantClaimError);
-                    }
-                    None => None,
-                }
-            }
-            None => {
-                if selector_policy == SnapshotRootSelectorPolicy::RejectGrantReference
-                    && grant_reference_id(selector)?.is_some()
-                {
-                    return Err(GrantClaimError);
-                }
-                None
-            }
-        };
-        Ok(Self {
-            selector: Some(selector.to_path_buf()),
-            claim,
-            consumed: false,
-        })
-    }
-
-    fn take_snapshot_read_only_file(&mut self) -> Result<Option<File>, GrantClaimError> {
-        let (_selector, file) = self.consume()?;
-        Ok(file)
-    }
-
-    fn consume(&mut self) -> Result<(PathBuf, Option<File>), GrantClaimError> {
-        if self.consumed {
-            return Err(GrantClaimError);
-        }
-        self.consumed = true;
-        let selector = self.selector.take().ok_or(GrantClaimError)?;
-        let file = self
-            .claim
-            .as_mut()
-            .map(PreparedDriveBackingClaim::take_snapshot_read_only_file)
-            .transpose()?;
-        Ok((selector, file))
-    }
-
-    fn open_snapshot_read_only(
-        &mut self,
-    ) -> Result<BlockFileBacking, SnapshotRootBackingLeaseError> {
-        let (selector, file) = self
-            .consume()
-            .map_err(SnapshotRootBackingLeaseError::Grant)?;
-        match file {
-            Some(file) => BlockFileBacking::from_snapshot_read_only_file(file)
-                .map(|(backing, _identity)| backing)
-                .map_err(SnapshotRootBackingLeaseError::Backing),
-            None => BlockFileBacking::open_snapshot_read_only(&selector)
-                .map(|(backing, _identity)| backing)
-                .map_err(SnapshotRootBackingLeaseError::Backing),
-        }
-    }
-
-    fn commit(self) {
-        if let Some(claim) = self.claim {
-            claim.commit();
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl fmt::Debug for PreparedSnapshotRootBackingLease {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PreparedSnapshotRootBackingLease")
-            .field("selector", &self.selector.as_ref().map(|_| "<redacted>"))
-            .field("claim", &self.claim.as_ref().map(|_| "<provisional>"))
-            .field("consumed", &self.consumed)
-            .finish()
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-pub(crate) enum SnapshotRootBackingLeaseError {
-    Grant(GrantClaimError),
-    Backing(SnapshotBlockFileBackingError),
-}
-
-#[cfg(target_os = "macos")]
-impl fmt::Display for SnapshotRootBackingLeaseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Grant(_) => formatter.write_str("snapshot root authority validation failed"),
-            Self::Backing(_) => formatter.write_str("snapshot root backing validation failed"),
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl std::error::Error for SnapshotRootBackingLeaseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Grant(source) => Some(source),
-            Self::Backing(source) => Some(source),
-        }
     }
 }
 
@@ -5185,6 +5147,9 @@ where
             self.starter
                 .preflight_snapshot_v2_root_process(self.pci_enabled)
                 .map_err(NativeV2SnapshotLoadError::Preflight)?;
+            if !self.snapshot_capture_cancellation.begin_operation() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
         } else {
             self.starter
                 .preflight_snapshot_v2_process()
@@ -5251,15 +5216,16 @@ where
                 })?;
             let restored = self
                 .starter
-                .load_prepared_snapshot_v2_root(ProcessSnapshotV2RootLoadRequest::new(
-                    &self.controller,
-                    self.vmnet_authority,
-                    self.grant_authority.as_ref(),
-                    self.pci_enabled,
+                .load_prepared_snapshot_v2_root(ProcessSnapshotV2RootLoadRequest {
+                    controller: &self.controller,
+                    vmnet_authority: self.vmnet_authority,
+                    grant_authority: self.grant_authority.as_ref(),
+                    pci_enabled: self.pci_enabled,
                     input,
                     candidate,
                     memory,
-                ))
+                    cancellation: self.snapshot_capture_cancellation.clone(),
+                })
                 .map_err(|source| {
                     if resource_adopted {
                         NativeV2SnapshotLoadError::AfterResourceAdoption {
@@ -5270,6 +5236,20 @@ where
                     }
                 })?;
             let (session, controller_commit, completion) = restored.into_parts();
+            if !self.snapshot_capture_cancellation.try_seal_commit() {
+                drop(session);
+                let source = native_v2_error_after_process_root_completion_abort(
+                    NativeV2SnapshotLoadError::Cancelled,
+                    completion,
+                );
+                return Err(if resource_adopted {
+                    NativeV2SnapshotLoadError::AfterResourceAdoption {
+                        source: Box::new(source),
+                    }
+                } else {
+                    source
+                });
+            }
             self.started_session = Some(session);
             let resume_requested = self.controller.commit_snapshot_v2_load(controller_commit);
             self.starter
@@ -6143,6 +6123,9 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
         self.starter
             .preflight_snapshot_v2_root_process(self.pci_enabled)
             .map_err(NativeV2SnapshotLoadError::Preflight)?;
+        if !self.snapshot_capture_cancellation.begin_operation() {
+            return Err(NativeV2SnapshotLoadError::Cancelled);
+        }
         prepare_hvf_native_v2_root_candidate_load(
             &self.starter,
             self.grant_authority.as_ref(),
@@ -6150,6 +6133,7 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
             input,
             candidate,
             memory,
+            self.snapshot_capture_cancellation.clone(),
         )
     }
 
@@ -6182,18 +6166,29 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
             self.vmnet_authority,
             prepared,
         )?;
-        let (session, controller_commit, root_lease, serial_output) = restored.into_parts();
+        let (session, controller_commit, root_completion, serial_output) = restored.into_parts();
         if let Err(source) = before_controller_commit() {
-            // Dropping the still-unpublished paused supervisor stops its
-            // worker and tears down the complete root/platform owner. The
-            // provisional backing claim is released when `root_lease` drops.
             drop(session);
-            return Err(NativeV2SnapshotLoadError::ControllerCommit(source));
+            drop(serial_output);
+            drop(controller_commit);
+            return Err(native_v2_error_after_root_resource_abort(
+                NativeV2SnapshotLoadError::ControllerCommit(source),
+                root_completion,
+            ));
+        }
+        if !self.snapshot_capture_cancellation.try_seal_commit() {
+            drop(session);
+            drop(serial_output);
+            drop(controller_commit);
+            return Err(native_v2_error_after_root_resource_abort(
+                NativeV2SnapshotLoadError::Cancelled,
+                root_completion,
+            ));
         }
         self.starter.active_serial_output = Some(serial_output);
         self.started_session = Some(session);
         let resume_requested = self.controller.commit_snapshot_v2_load(controller_commit);
-        root_lease.commit();
+        root_completion.commit();
         Ok(resume_requested)
     }
 
@@ -6479,11 +6474,12 @@ struct PreparedHvfSnapshotV2RootProcessLoad {
     memory: GuestMemory,
     root: PreparedSnapshotV2RootBlock,
     resources: HvfSnapshotV2RootResourcePlan,
-    root_lease: PreparedSnapshotRootBackingLease,
+    root_completion: PreparedSnapshotRootRestoreCompletion,
     controller_commit: SnapshotV2ControllerCommit,
     serial_output: SharedSerialOutput,
     guest_ranges: Vec<GuestMemoryRange>,
     virtual_timer_intid: u32,
+    cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
 #[cfg(target_os = "macos")]
@@ -6505,11 +6501,12 @@ impl PreparedHvfSnapshotV2RootProcessLoad {
             memory: self.memory,
             root: self.root,
             resources: self.resources,
-            root_lease: self.root_lease,
+            root_completion: self.root_completion,
             controller_commit: self.controller_commit,
             serial_output: self.serial_output,
             guest_ranges: self.guest_ranges,
             virtual_timer_intid: self.virtual_timer_intid,
+            cancellation: self.cancellation,
         }
     }
 }
@@ -6520,18 +6517,19 @@ struct PreparedHvfSnapshotV2RootProcessLoadParts {
     memory: GuestMemory,
     root: PreparedSnapshotV2RootBlock,
     resources: HvfSnapshotV2RootResourcePlan,
-    root_lease: PreparedSnapshotRootBackingLease,
+    root_completion: PreparedSnapshotRootRestoreCompletion,
     controller_commit: SnapshotV2ControllerCommit,
     serial_output: SharedSerialOutput,
     guest_ranges: Vec<GuestMemoryRange>,
     virtual_timer_intid: u32,
+    cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
 #[cfg(target_os = "macos")]
 struct SnapshotV2RootLoadSuccess {
     session: HvfProcessSession,
     controller_commit: SnapshotV2ControllerCommit,
-    root_lease: PreparedSnapshotRootBackingLease,
+    root_completion: PreparedSnapshotRootRestoreCompletion,
     serial_output: SharedSerialOutput,
 }
 
@@ -6542,13 +6540,13 @@ impl SnapshotV2RootLoadSuccess {
     ) -> (
         HvfProcessSession,
         SnapshotV2ControllerCommit,
-        PreparedSnapshotRootBackingLease,
+        PreparedSnapshotRootRestoreCompletion,
         SharedSerialOutput,
     ) {
         (
             self.session,
             self.controller_commit,
-            self.root_lease,
+            self.root_completion,
             self.serial_output,
         )
     }
@@ -6604,6 +6602,7 @@ fn prepare_hvf_native_v2_root_candidate_load(
     input: &SnapshotLoadInput,
     candidate: NativeV2SnapshotCandidateState,
     memory: GuestMemory,
+    cancellation: NativeV2SnapshotCaptureCancellation,
 ) -> Result<PreparedHvfSnapshotV2RootProcessLoad, NativeV2SnapshotLoadError> {
     let (bytes, binding, graph) = candidate.into_parts();
     let structural = decode_snapshot_v2_state_with_compatibility_version(
@@ -6616,6 +6615,9 @@ fn prepare_hvf_native_v2_root_candidate_load(
     if state.platform().memory() != &binding || state.device_graph() != &graph {
         return Err(NativeV2SnapshotLoadError::CandidateMismatch);
     }
+    let requested_resources =
+        RequestedSnapshotRestoreResources::try_from_native_v2_device_graph(&graph)
+            .map_err(NativeV2SnapshotLoadError::RestoreResources)?;
 
     let boot_source_config = native_v2_boot_source_config(state.platform().machine().boot())
         .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
@@ -6660,32 +6662,39 @@ fn prepare_hvf_native_v2_root_candidate_load(
         SharedSerialOutput::with_rate_limiter(starter.serial_output.clone(), rate_limiter)
     };
 
-    let mut root_lease = PreparedSnapshotRootBackingLease::prepare(
-        Path::new(prepared.selector()),
-        grant_authority,
-        SnapshotRootSelectorPolicy::RequireGrantWhenContained,
-    )
-    .map_err(|source| {
-        NativeV2SnapshotLoadError::RootBacking(SnapshotRootBackingLeaseError::Grant(source))
-    })?;
+    let prepared_resources = requested_resources
+        .prepare_root(grant_authority, || cancellation.is_cancelled())
+        .map_err(NativeV2SnapshotLoadError::RestoreResources)?;
+    let root_resource = prepared_resources
+        .into_root()
+        .map_err(NativeV2SnapshotLoadError::RestoreResources)?;
+    let (backing, root_completion) = root_resource.into_parts();
     let (platform, memory, root, resources) = prepared.into_parts();
-    let backing = root_lease
-        .open_snapshot_read_only()
-        .map_err(NativeV2SnapshotLoadError::RootBacking)?;
-    let root = root
-        .prepare_backing(backing)
-        .map_err(NativeV2SnapshotLoadError::RootBundle)?;
+    let root = match root.prepare_backing(backing) {
+        Ok(root) => root,
+        Err(source) => {
+            drop(platform);
+            drop(memory);
+            drop(controller_commit);
+            drop(serial_output);
+            return Err(native_v2_error_after_root_resource_abort(
+                NativeV2SnapshotLoadError::RootBundle(source),
+                root_completion,
+            ));
+        }
+    };
 
     Ok(PreparedHvfSnapshotV2RootProcessLoad {
         platform,
         memory,
         root,
         resources,
-        root_lease,
+        root_completion,
         controller_commit,
         serial_output,
         guest_ranges,
         virtual_timer_intid,
+        cancellation,
     })
 }
 
@@ -6706,35 +6715,66 @@ impl HvfInstanceStartExecutor {
             memory,
             root,
             resources,
-            root_lease,
+            root_completion,
             controller_commit,
             serial_output,
             guest_ranges: _guest_ranges,
             virtual_timer_intid: _virtual_timer_intid,
+            cancellation,
         } = prepared.into_parts();
         let (packet_io, mmds_metrics) =
-            ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority).map_err(
-                |source| {
-                    NativeV2SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(
-                        format!("failed to build native-v2 network packet I/O provider: {source}"),
-                    ))
-                },
-            )?;
+            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
+                Ok(prepared) => prepared,
+                Err(source) => {
+                    drop(root);
+                    drop(platform);
+                    drop(memory);
+                    drop(controller_commit);
+                    drop(serial_output);
+                    return Err(native_v2_error_after_root_resource_abort(
+                        NativeV2SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(
+                            format!(
+                                "failed to build native-v2 network packet I/O provider: {source}"
+                            ),
+                        )),
+                        root_completion,
+                    ));
+                }
+            };
         let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone());
-        let mut session = OwnedHvfArm64BootSession::restore_snapshot_v2_root(
+        let mut session = match OwnedHvfArm64BootSession::restore_snapshot_v2_root(
             platform,
             memory,
             process_shell,
             root,
             resources,
-        )
-        .map_err(NativeV2SnapshotLoadError::RootRestore)?;
+        ) {
+            Ok(session) => session,
+            Err(source) => {
+                drop(packet_io);
+                drop(mmds_metrics);
+                drop(controller_commit);
+                drop(serial_output);
+                return Err(native_v2_error_after_root_resource_abort(
+                    NativeV2SnapshotLoadError::RootRestore(source),
+                    root_completion,
+                ));
+            }
+        };
         if let Err(source) = session.resume_after_snapshot_v2_capture() {
             let cleanup = session
                 .shutdown()
                 .err()
                 .map(|source| BackendError::Hypervisor(source.to_string()));
-            return Err(NativeV2SnapshotLoadError::RunReady { source, cleanup });
+            drop(session);
+            drop(packet_io);
+            drop(mmds_metrics);
+            drop(controller_commit);
+            drop(serial_output);
+            return Err(native_v2_error_after_root_resource_abort(
+                NativeV2SnapshotLoadError::RunReady { source, cleanup },
+                root_completion,
+            ));
         }
         let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
             session,
@@ -6754,14 +6794,29 @@ impl HvfInstanceStartExecutor {
                     .shutdown()
                     .err()
                     .map(|source| BackendError::Hypervisor(source.to_string()));
-                return Err(NativeV2SnapshotLoadError::WorkerStart { source, cleanup });
+                drop(failed_session);
+                drop(controller_commit);
+                drop(serial_output);
+                return Err(native_v2_error_after_root_resource_abort(
+                    NativeV2SnapshotLoadError::WorkerStart { source, cleanup },
+                    root_completion,
+                ));
             }
         };
+        if cancellation.is_cancelled() {
+            drop(supervisor);
+            drop(controller_commit);
+            drop(serial_output);
+            return Err(native_v2_error_after_root_resource_abort(
+                NativeV2SnapshotLoadError::Cancelled,
+                root_completion,
+            ));
+        }
 
         Ok(SnapshotV2RootLoadSuccess {
             session: HvfProcessSession::Boot(supervisor),
             controller_commit,
-            root_lease,
+            root_completion,
             serial_output,
         })
     }
@@ -7279,6 +7334,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             input,
             candidate,
             memory,
+            cancellation,
         } = request;
         self.preflight_snapshot_v2_root_process(pci_enabled)
             .map_err(NativeV2SnapshotLoadError::Preflight)?;
@@ -7289,14 +7345,15 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             input,
             candidate,
             memory,
+            cancellation,
         )?;
         let restored =
             self.load_prepared_snapshot_v2_root_process(controller, vmnet_authority, prepared)?;
-        let (session, controller_commit, root_lease, serial_output) = restored.into_parts();
+        let (session, controller_commit, root_completion, serial_output) = restored.into_parts();
         Ok(ProcessSnapshotV2RootLoadSuccess::new(
             session,
             controller_commit,
-            ProcessSnapshotV2RootLoadCompletion::new(root_lease, serial_output),
+            ProcessSnapshotV2RootLoadCompletion::new(root_completion, serial_output),
         ))
     }
 
@@ -7305,13 +7362,29 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         &mut self,
         completion: ProcessSnapshotV2RootLoadCompletion,
     ) {
-        let (root_lease, serial_output) = completion.into_parts();
-        let (Some(root_lease), Some(serial_output)) = (root_lease, serial_output) else {
-            debug_assert!(false, "HVF root-load completion must own both resources");
-            return;
-        };
-        self.active_serial_output = Some(serial_output);
-        root_lease.commit();
+        #[cfg(not(test))]
+        {
+            let ProcessSnapshotV2RootLoadCompletion {
+                root_completion,
+                serial_output,
+            } = completion;
+            self.active_serial_output = Some(serial_output);
+            root_completion.commit();
+        }
+        #[cfg(test)]
+        match completion {
+            ProcessSnapshotV2RootLoadCompletion::Prepared(resources) => {
+                let ProcessSnapshotV2RootLoadCompletionResources {
+                    root_completion,
+                    serial_output,
+                } = *resources;
+                self.active_serial_output = Some(serial_output);
+                root_completion.commit();
+            }
+            ProcessSnapshotV2RootLoadCompletion::Empty => {
+                debug_assert!(false, "HVF root-load completion must own both resources");
+            }
+        }
     }
 
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
@@ -15629,12 +15702,16 @@ mod tests {
         assert!(backing.kind().is_regular_file());
         assert!(backing.is_read_only());
         drop(backing);
-        drop(cancelled);
+        cancelled
+            .abort()
+            .expect("cancelled lease should explicitly restore its claim");
         let restored = observer
             .prepare_drive_backing_claim(Path::new(ROOT), GrantAccess::ReadOnly)
             .expect("cancelled lease should restore exact grant")
             .expect("restored grant should reserve again");
-        drop(restored);
+        restored
+            .abort()
+            .expect("observed restored claim should return to authority");
 
         let authority = file_grant_authority_for_test();
         let observer = authority.clone();
@@ -17003,6 +17080,7 @@ mod tests {
                 input,
                 candidate,
                 memory: _,
+                cancellation: _,
             } = request;
             let expected_transport = if pci_enabled {
                 SnapshotV2DeviceTransportKind::Pci
@@ -27905,7 +27983,7 @@ mod tests {
                     &error,
                     NativeV2SnapshotLoadError::ControllerCommit(_)
                 ));
-                assert!(error.is_terminal());
+                assert!(!error.is_terminal());
                 assert!(!failed.has_started_session());
                 assert!(failed.starter.active_serial_output.is_none());
                 assert_eq!(failed.instance_info().state, InstanceState::NotStarted);
@@ -27914,7 +27992,34 @@ mod tests {
                     .prepare_drive_backing_claim(Path::new(ROOT_REFERENCE), GrantAccess::ReadOnly)
                     .expect("failed controller checkpoint should restore the root grant")
                     .expect("restored root grant should be claimable");
-                drop(restored_claim);
+                restored_claim
+                    .abort()
+                    .expect("observed checkpoint claim should restore for the retry");
+                assert!(
+                    !failed
+                        .restore_native_v2_root_candidate_once(
+                            &input,
+                            NativeV2SnapshotCandidateState::from_device_graph_v2_4(
+                                candidate_bytes.clone(),
+                            )
+                            .expect("checkpoint retry candidate should validate"),
+                            load_memory(),
+                        )
+                        .expect("clean controller checkpoint should remain retryable")
+                );
+                assert_eq!(failed.instance_info().state, InstanceState::Paused);
+                assert!(failed.has_started_session());
+                assert!(failed.starter.active_serial_output.is_some());
+                assert_eq!(failed.drive_configs().len(), 1);
+                assert!(
+                    failed_observer
+                        .prepare_drive_backing_claim(
+                            Path::new(ROOT_REFERENCE),
+                            GrantAccess::ReadOnly,
+                        )
+                        .is_err(),
+                    "successful retry must consume the restored root claim"
+                );
                 drop(failed);
             }
 

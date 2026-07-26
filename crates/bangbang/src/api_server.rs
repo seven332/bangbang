@@ -2975,6 +2975,7 @@ mod tests {
                 input,
                 candidate: _,
                 memory: _,
+                cancellation: _,
             } = request;
             if !self.snapshot_operations_succeed {
                 return Err(NativeV2SnapshotLoadError::ProcessPreparation(

@@ -22,6 +22,8 @@ mod grant_integration_probe;
 #[cfg(target_os = "macos")]
 pub mod host_network;
 mod periodic_metrics;
+#[cfg(target_os = "macos")]
+mod snapshot_restore_resources;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
