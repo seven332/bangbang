@@ -354,6 +354,43 @@ fn semantic_accessors_and_debug_output_are_stable_and_redacted() {
 }
 
 #[test]
+fn restore_manifest_derives_the_complete_current_graph_resource() {
+    use crate::snapshot_restore::{
+        SnapshotRestoreManifest, SnapshotRestoreManifestError, SnapshotRestoreResourceClass,
+        SnapshotRestoreResourceKey,
+    };
+
+    let graph = mmio_graph();
+    let manifest = SnapshotRestoreManifest::try_from_native_v2_device_graph(&graph, Vec::new())
+        .expect("validated current graph should derive one restore resource");
+    assert_eq!(manifest.len(), NATIVE_V2_DEVICE_GRAPH_MAX_RECORDS as usize);
+    let resource = manifest
+        .resources()
+        .first()
+        .expect("current graph should require one root resource");
+    assert_eq!(resource.device_key(), graph.root_key());
+    assert_eq!(resource.public_id().as_str(), "rootfs");
+    assert_eq!(
+        resource.resource_class(),
+        SnapshotRestoreResourceClass::BlockBacking
+    );
+
+    assert!(matches!(
+        SnapshotRestoreManifest::try_from_native_v2_device_graph(&graph, vec![resource.clone()]),
+        Err(SnapshotRestoreManifestError::UnsupportedOverrideClass)
+    ));
+    let wrong_class = SnapshotRestoreResourceKey::new(
+        resource.device_key(),
+        resource.public_id().clone(),
+        SnapshotRestoreResourceClass::VsockEndpoint,
+    );
+    assert!(matches!(
+        SnapshotRestoreManifest::try_from_native_v2_device_graph(&graph, vec![wrong_class]),
+        Err(SnapshotRestoreManifestError::OverrideClassMismatch)
+    ));
+}
+
+#[test]
 fn exact_current_outer_version_is_required() {
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,

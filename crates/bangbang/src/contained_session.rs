@@ -11,6 +11,10 @@ use bangbang_session::{
 use bangbang_session::{Readiness, TerminalCategory};
 
 const GRANT_REFERENCE_PREFIX: &str = "bangbang-grant:";
+const _: () = assert!(
+    bangbang_runtime::snapshot_restore::MAX_SNAPSHOT_RESTORE_RESOURCES
+        == bangbang_session::MAX_GRANTS as usize
+);
 
 fn started_vmnet_session_authority(
     policy: WorkerPolicy,

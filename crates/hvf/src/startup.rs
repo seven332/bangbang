@@ -249,6 +249,9 @@ const PCI_VALIDATION_VIRTIO_RNG_ENTROPY_BYTE: u8 = 0xa5;
 const PCI_DATA_DEVICE_BAR_REGION_ID_BASE: u64 = 4100;
 const PCI_ENDPOINT_SLOT_COUNT: usize =
     (PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1) as usize;
+const _: () = assert!(
+    bangbang_runtime::snapshot_restore::MAX_SNAPSHOT_RESTORE_RESOURCES >= PCI_ENDPOINT_SLOT_COUNT
+);
 
 fn pci_data_endpoint_count(
     block_count: usize,
