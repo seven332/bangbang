@@ -3,8 +3,9 @@
 use std::fmt;
 
 use crate::block::{
-    DriveCacheType, DriveIoEngine, DriveRateLimiterConfig, DriveTokenBucketConfig,
-    VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_QUEUE_SIZE, VirtioBlockConfigSpace,
+    DriveCacheType, DriveConfigInput, DriveConfigs, DriveIoEngine, DriveRateLimiterConfig,
+    DriveTokenBucketConfig, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_QUEUE_SIZE,
+    VirtioBlockConfigSpace,
 };
 use crate::memory::{GuestMemoryError, GuestMemoryRange};
 use crate::pci::{
@@ -301,6 +302,55 @@ impl SnapshotV2MultiBlockDeviceGraph {
         &self.records
     }
 
+    /// Builds the exact controller projection without mutating a live
+    /// controller or consuming any restore authority.
+    pub fn project_drive_configs(
+        &self,
+    ) -> Result<DriveConfigs, SnapshotV2MultiBlockDriveConfigsError> {
+        let mut configs = DriveConfigs::new();
+        for record in &self.records {
+            let config = record.config();
+            let mut input = DriveConfigInput::new(
+                config.drive_id(),
+                config.drive_id(),
+                config.selector(),
+                config.is_root(),
+            )
+            .with_is_read_only(config.is_read_only())
+            .with_cache_type(config.cache_type())
+            .with_io_engine(config.io_engine());
+            if let Some(partuuid) = config.partuuid() {
+                input = input.with_partuuid(partuuid);
+            }
+            if let Some(rate_limiter) = config.rate_limiter() {
+                input = input.with_rate_limiter(rate_limiter);
+            }
+            configs
+                .insert(input)
+                .map_err(|_| SnapshotV2MultiBlockDriveConfigsError)?;
+        }
+        if configs.as_slice().len() != self.records.len()
+            || configs
+                .as_slice()
+                .iter()
+                .zip(&self.records)
+                .any(|(config, record)| {
+                    config.drive_id() != record.config().drive_id()
+                        || config.is_root_device() != record.is_root()
+                        || config.is_read_only() != Some(record.config().is_read_only())
+                        || config.partuuid() != record.config().partuuid()
+                        || config.cache_type() != record.config().cache_type()
+                        || config.io_engine() != Some(record.config().io_engine())
+                        || config.rate_limiter() != record.config().rate_limiter()
+                        || config.path_on_host().and_then(|path| path.to_str())
+                            != Some(record.config().selector())
+                })
+        {
+            return Err(SnapshotV2MultiBlockDriveConfigsError);
+        }
+        Ok(configs)
+    }
+
     /// Consumes a trusted record vector only after complete graph validation.
     pub(crate) fn try_from_parts(
         root_key: Option<SnapshotV2DeviceKey>,
@@ -333,6 +383,19 @@ impl SnapshotV2MultiBlockDeviceGraph {
         codec::decode(compatibility_version, bytes)
     }
 }
+
+/// Failure while projecting a validated profile-2 graph into controller
+/// configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotV2MultiBlockDriveConfigsError;
+
+impl fmt::Display for SnapshotV2MultiBlockDriveConfigsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("native-v2 multi-block drive projection is invalid")
+    }
+}
+
+impl std::error::Error for SnapshotV2MultiBlockDriveConfigsError {}
 
 impl fmt::Debug for SnapshotV2MultiBlockDeviceGraph {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

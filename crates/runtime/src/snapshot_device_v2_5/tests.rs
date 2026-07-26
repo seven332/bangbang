@@ -1,6 +1,8 @@
 use super::codec::{self, ReservePolicy};
 use super::*;
 
+use std::path::Path;
+
 use crate::block::{VIRTIO_BLOCK_ID_BYTES, VirtioBlockDeviceId, VirtioBlockQueueState};
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::GuestAddress;
@@ -430,6 +432,49 @@ fn fixture_matrix_covers_required_semantic_variants() {
             .continuation()
             .active_queue()
             .is_none()
+    );
+}
+
+#[test]
+fn drive_config_projection_is_complete_ordered_and_all_or_nothing() {
+    for with_root in [false, true] {
+        let graph = fixture_graph(SnapshotV2DeviceTransportKind::Mmio, with_root);
+        let configs = graph
+            .project_drive_configs()
+            .expect("validated graph should project");
+        assert_eq!(configs.as_slice().len(), graph.records().len());
+        assert_eq!(configs.has_root_device(), with_root);
+        for (config, record) in configs.as_slice().iter().zip(graph.records()) {
+            let expected = record.config();
+            assert_eq!(config.drive_id(), expected.drive_id());
+            assert_eq!(config.path_on_host(), Some(Path::new(expected.selector())));
+            assert_eq!(config.is_root_device(), expected.is_root());
+            assert_eq!(config.is_read_only(), Some(expected.is_read_only()));
+            assert_eq!(config.partuuid(), expected.partuuid());
+            assert_eq!(config.cache_type(), expected.cache_type());
+            assert_eq!(config.io_engine(), Some(expected.io_engine()));
+            assert_eq!(config.rate_limiter(), expected.rate_limiter());
+        }
+    }
+
+    let maximum = boundary_graph(
+        usize::from(NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_RECORDS),
+        true,
+    );
+    let configs = maximum
+        .project_drive_configs()
+        .expect("maximum graph should project");
+    assert_eq!(
+        configs.as_slice().len(),
+        usize::from(NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_RECORDS)
+    );
+    assert!(configs.as_slice()[0].is_root_device());
+    assert!(
+        configs
+            .as_slice()
+            .iter()
+            .skip(1)
+            .all(|config| !config.is_root_device())
     );
 }
 

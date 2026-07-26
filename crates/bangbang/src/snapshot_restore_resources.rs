@@ -1,12 +1,16 @@
 //! Process-owned destination resources for native-v2 snapshot restore.
 
-use std::collections::TryReserveError;
+use std::collections::{HashSet, TryReserveError};
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use bangbang_runtime::block::{BlockFileBacking, SnapshotBlockFileBackingError};
+use bangbang_runtime::block::{
+    BlockFileBacking, BlockFileBackingIdentity, DriveConfigs, SnapshotBlockFileBackingError,
+    SnapshotBlockFileBackingReservation,
+};
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceGraph;
+use bangbang_runtime::snapshot_device_v2_5::SnapshotV2MultiBlockDeviceGraph;
 use bangbang_runtime::snapshot_restore::{
     PreparedSnapshotRestoreBindings, SnapshotRestoreBindingAllocationError,
     SnapshotRestoreBindingRejectionReason, SnapshotRestoreBindings, SnapshotRestoreManifest,
@@ -14,13 +18,12 @@ use bangbang_runtime::snapshot_restore::{
     SnapshotRestoreResourceKey, SnapshotRestoreTakeError,
 };
 use bangbang_session::GrantAccess;
-#[cfg(test)]
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
 
 use crate::contained_session::{
-    ContainedSnapshotRestoreAuthority, ContainedSnapshotRestoreError,
-    ContainedSnapshotRestoreTransaction, GrantAuthority, GrantClaimError,
-    PreparedDriveBackingClaim, grant_reference_id,
+    ContainedSnapshotRestoreAuthority, ContainedSnapshotRestoreDriveRequest,
+    ContainedSnapshotRestoreError, ContainedSnapshotRestoreTransaction, GrantAuthority,
+    GrantClaimError, PreparedDriveBackingClaim, grant_reference_id,
 };
 #[cfg(test)]
 use crate::contained_session::{DirectoryGrantAuthority, SocketBrokerAuthority};
@@ -42,6 +45,8 @@ pub(crate) enum SnapshotRestoreResourceStage {
     BindingAllocation,
     Cancellation,
     ContainedReservation,
+    DrivePreflight,
+    DrivePreparation,
     RootPreparation,
     VsockPreparation,
     Binding,
@@ -55,12 +60,15 @@ pub(crate) enum SnapshotRestoreResourceErrorKind {
     BindingAllocation(SnapshotRestoreBindingAllocationError),
     Contained(ContainedSnapshotRestoreError),
     RootBacking(SnapshotRootBackingLeaseError),
+    DriveBacking(SnapshotDriveBackingPreparationError),
     Vsock(VsockRestoreError),
     Binding(SnapshotRestoreBindingRejectionReason),
     Incomplete { missing_count: usize },
     Take(SnapshotRestoreTakeError),
     Unconsumed { unconsumed_count: usize },
     OwnerClassMismatch,
+    InvalidDriveSet,
+    DriveProjection,
     Cancelled,
 }
 
@@ -81,6 +89,10 @@ impl fmt::Debug for SnapshotRestoreResourceErrorKind {
                 .finish(),
             Self::RootBacking(source) => formatter
                 .debug_tuple("SnapshotRestoreResourceErrorKind::RootBacking")
+                .field(source)
+                .finish(),
+            Self::DriveBacking(source) => formatter
+                .debug_tuple("SnapshotRestoreResourceErrorKind::DriveBacking")
                 .field(source)
                 .finish(),
             Self::Vsock(source) => formatter
@@ -106,6 +118,12 @@ impl fmt::Debug for SnapshotRestoreResourceErrorKind {
             Self::OwnerClassMismatch => {
                 formatter.write_str("SnapshotRestoreResourceErrorKind::OwnerClassMismatch")
             }
+            Self::InvalidDriveSet => {
+                formatter.write_str("SnapshotRestoreResourceErrorKind::InvalidDriveSet")
+            }
+            Self::DriveProjection => {
+                formatter.write_str("SnapshotRestoreResourceErrorKind::DriveProjection")
+            }
             Self::Cancelled => formatter.write_str("SnapshotRestoreResourceErrorKind::Cancelled"),
         }
     }
@@ -118,6 +136,7 @@ impl fmt::Display for SnapshotRestoreResourceErrorKind {
             Self::BindingAllocation(source) => source.fmt(formatter),
             Self::Contained(source) => source.fmt(formatter),
             Self::RootBacking(source) => source.fmt(formatter),
+            Self::DriveBacking(source) => source.fmt(formatter),
             Self::Vsock(source) => source.fmt(formatter),
             Self::Binding(reason) => reason.fmt(formatter),
             Self::Incomplete { .. } => {
@@ -129,6 +148,12 @@ impl fmt::Display for SnapshotRestoreResourceErrorKind {
             }
             Self::OwnerClassMismatch => {
                 formatter.write_str("snapshot restore owner has the wrong resource class")
+            }
+            Self::InvalidDriveSet => {
+                formatter.write_str("snapshot restore drive resource set is invalid")
+            }
+            Self::DriveProjection => {
+                formatter.write_str("snapshot restore drive projection is invalid")
             }
             Self::Cancelled => {
                 formatter.write_str("snapshot restore resource preparation cancelled")
@@ -217,12 +242,15 @@ impl std::error::Error for SnapshotRestoreResourceError {
             SnapshotRestoreResourceErrorKind::BindingAllocation(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Contained(source) => Some(source),
             SnapshotRestoreResourceErrorKind::RootBacking(source) => Some(source),
+            SnapshotRestoreResourceErrorKind::DriveBacking(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Vsock(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Take(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Binding(_)
             | SnapshotRestoreResourceErrorKind::Incomplete { .. }
             | SnapshotRestoreResourceErrorKind::Unconsumed { .. }
             | SnapshotRestoreResourceErrorKind::OwnerClassMismatch
+            | SnapshotRestoreResourceErrorKind::InvalidDriveSet
+            | SnapshotRestoreResourceErrorKind::DriveProjection
             | SnapshotRestoreResourceErrorKind::Cancelled => None,
         }
     }
@@ -438,6 +466,34 @@ impl std::error::Error for SnapshotRootBackingLeaseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Grant(source) => Some(source),
+            Self::Backing(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SnapshotDriveBackingPreparationError {
+    Authority(GrantClaimError),
+    Backing(SnapshotBlockFileBackingError),
+}
+
+impl fmt::Display for SnapshotDriveBackingPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authority(_) => {
+                formatter.write_str("snapshot drive backing authority validation failed")
+            }
+            Self::Backing(_) => {
+                formatter.write_str("snapshot drive backing descriptor validation failed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotDriveBackingPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Authority(source) => Some(source),
             Self::Backing(source) => Some(source),
         }
     }
@@ -695,6 +751,889 @@ impl fmt::Debug for PreparedSnapshotRestoreResource {
     }
 }
 
+struct RequestedSnapshotDriveRestoreResource {
+    key: SnapshotRestoreResourceKey,
+    selector: PathBuf,
+    is_read_only: bool,
+    expected_len: u64,
+}
+
+impl fmt::Debug for RequestedSnapshotDriveRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestedSnapshotDriveRestoreResource")
+            .field("class", &SnapshotRestoreResourceClass::BlockBacking)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+struct PreparedSnapshotDriveRestoreResource {
+    key: SnapshotRestoreResourceKey,
+    backing: BlockFileBacking,
+    claim: Option<PreparedDriveBackingClaim>,
+}
+
+impl PreparedSnapshotDriveRestoreResource {
+    fn abort(self) -> SnapshotRestoreAbortOutcome {
+        let Self {
+            key: _,
+            backing,
+            claim,
+        } = self;
+        drop(backing);
+        match claim {
+            Some(claim) => {
+                if claim.abort().is_err() {
+                    SnapshotRestoreAbortOutcome::terminal(true)
+                } else {
+                    SnapshotRestoreAbortOutcome::retryable()
+                }
+            }
+            None => SnapshotRestoreAbortOutcome::retryable(),
+        }
+    }
+}
+
+struct ReservedDirectSnapshotDriveRestoreResource {
+    key: SnapshotRestoreResourceKey,
+    reservation: SnapshotBlockFileBackingReservation,
+}
+
+impl fmt::Debug for PreparedSnapshotDriveRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotDriveRestoreResource")
+            .field("backing", &"<owned>")
+            .field("claim", &self.claim.as_ref().map(|_| "<provisional>"))
+            .finish()
+    }
+}
+
+/// Complete profile-2 block resource request before host authority is touched.
+pub(crate) struct RequestedSnapshotMultiDriveRestoreResources {
+    drives: Vec<RequestedSnapshotDriveRestoreResource>,
+    drive_keys: Vec<SnapshotRestoreResourceKey>,
+    drive_configs: DriveConfigs,
+    bindings: SnapshotRestoreBindings<PreparedSnapshotDriveRestoreResource>,
+}
+
+impl RequestedSnapshotMultiDriveRestoreResources {
+    pub(crate) fn try_from_native_v2_multi_block_device_graph(
+        graph: &SnapshotV2MultiBlockDeviceGraph,
+    ) -> Result<Self, SnapshotRestoreResourceError> {
+        let drive_configs = graph.project_drive_configs().map_err(|_| {
+            SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::DrivePreflight,
+                SnapshotRestoreResourceErrorKind::DriveProjection,
+            )
+        })?;
+        let mut drives = Vec::new();
+        let mut drive_keys = Vec::new();
+        let mut resources = Vec::new();
+        drives
+            .try_reserve_exact(graph.records().len())
+            .map_err(manifest_allocation_error)?;
+        drive_keys
+            .try_reserve_exact(graph.records().len())
+            .map_err(manifest_allocation_error)?;
+        resources
+            .try_reserve_exact(graph.records().len())
+            .map_err(manifest_allocation_error)?;
+        for record in graph.records() {
+            let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id()).map_err(
+                |source| {
+                    SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::Manifest,
+                        SnapshotRestoreResourceErrorKind::Manifest(
+                            SnapshotRestoreManifestError::PublicId { source },
+                        ),
+                    )
+                },
+            )?;
+            let key = SnapshotRestoreResourceKey::new(
+                record.key(),
+                public_id,
+                SnapshotRestoreResourceClass::BlockBacking,
+            );
+            drives.push(RequestedSnapshotDriveRestoreResource {
+                key: key.clone(),
+                selector: PathBuf::from(record.config().selector()),
+                is_read_only: record.config().is_read_only(),
+                expected_len: record.block().backing_bytes(),
+            });
+            drive_keys.push(key.clone());
+            resources.push(key);
+        }
+        let manifest =
+            SnapshotRestoreManifest::try_new(resources, Vec::new()).map_err(|source| {
+                SnapshotRestoreResourceError::retryable(
+                    SnapshotRestoreResourceStage::Manifest,
+                    SnapshotRestoreResourceErrorKind::Manifest(source),
+                )
+            })?;
+        if manifest.len() != drives.len()
+            || drives.is_empty()
+            || drive_configs.as_slice().len() != drives.len()
+            || drives
+                .iter()
+                .zip(graph.records())
+                .zip(drive_configs.as_slice())
+                .any(|((drive, record), config)| {
+                    drive.key.device_key() != record.key()
+                        || drive.key.public_id().as_str() != record.config().drive_id()
+                        || drive.selector != Path::new(record.config().selector())
+                        || drive.is_read_only != record.config().is_read_only()
+                        || drive.expected_len != record.block().backing_bytes()
+                        || config.drive_id() != record.config().drive_id()
+                })
+        {
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::DrivePreflight,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            ));
+        }
+        let bindings = manifest.try_into_bindings().map_err(|source| {
+            SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::BindingAllocation,
+                SnapshotRestoreResourceErrorKind::BindingAllocation(source),
+            )
+        })?;
+        Ok(Self {
+            drives,
+            drive_keys,
+            drive_configs,
+            bindings,
+        })
+    }
+
+    pub(crate) fn prepare(
+        self,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PreparedSnapshotMultiDriveRestoreResources, SnapshotRestoreResourceError> {
+        let Self {
+            drives,
+            drive_keys,
+            drive_configs,
+            mut bindings,
+        } = self;
+        if cancelled() {
+            return Err(cancelled_batch_error());
+        }
+
+        let (prepared, contained_transaction) = match authority {
+            Some(authority) => {
+                let mut requests = Vec::new();
+                requests
+                    .try_reserve_exact(drives.len())
+                    .map_err(manifest_allocation_error)?;
+                for drive in &drives {
+                    requests.push(ContainedSnapshotRestoreDriveRequest::new(
+                        &drive.selector,
+                        if drive.is_read_only {
+                            GrantAccess::ReadOnly
+                        } else {
+                            GrantAccess::ReadWrite
+                        },
+                        Some(drive.expected_len),
+                    ));
+                }
+                let reserved = authority
+                    .prepare_drives(&requests, None, &cancelled)
+                    .map_err(snapshot_contained_error)?;
+                let (claims, vsock, transaction) = reserved
+                    .into_drive_parts()
+                    .map_err(snapshot_contained_error)?;
+                if vsock.is_some() || claims.len() != drives.len() {
+                    let outcome = abort_contained_vsock_facets(vsock)
+                        .merge(abort_prepared_drive_claims(claims))
+                        .merge(abort_contained_transaction(Some(transaction)));
+                    return Err(SnapshotRestoreResourceError::terminal(
+                        SnapshotRestoreResourceStage::DrivePreflight,
+                        SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                    )
+                    .with_abort_outcome(outcome));
+                }
+                let prepared = match prepare_contained_drives(&drives, claims, &cancelled) {
+                    Ok(prepared) => prepared,
+                    Err(failure) => {
+                        let (source, resources, claims) = *failure;
+                        return Err(source.with_abort_outcome(
+                            abort_prepared_drive_claims(claims)
+                                .merge(abort_prepared_drive_resources(resources))
+                                .merge(abort_contained_transaction(Some(transaction))),
+                        ));
+                    }
+                };
+                (prepared, Some(transaction))
+            }
+            None => (prepare_direct_drives(&drives, &cancelled)?, None),
+        };
+
+        if cancelled() {
+            let outcome = abort_prepared_drive_resources(prepared)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(cancelled_batch_error().with_abort_outcome(outcome));
+        }
+        if prepared.len() != drive_keys.len()
+            || prepared
+                .iter()
+                .zip(&drive_keys)
+                .any(|(owner, key)| owner.key != *key)
+        {
+            let outcome = abort_prepared_drive_resources(prepared)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Binding,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        let mut prepared = prepared.into_iter();
+        for key in &drive_keys {
+            let Some(owner) = prepared.next() else {
+                let outcome = abort_prepared_drive_resource_iter(prepared)
+                    .merge(abort_drive_bindings(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Binding,
+                    SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                )
+                .with_abort_outcome(outcome));
+            };
+            if owner.key != *key {
+                let outcome = abort_prepared_drive_resource_iter(prepared)
+                    .merge(owner.abort())
+                    .merge(abort_drive_bindings(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Binding,
+                    SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                )
+                .with_abort_outcome(outcome));
+            }
+            if let Err(rejection) = bindings.bind(key, owner) {
+                let reason = rejection.reason();
+                let outcome = abort_prepared_drive_resource_iter(prepared)
+                    .merge(rejection.into_value().abort())
+                    .merge(abort_drive_bindings(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Binding,
+                    SnapshotRestoreResourceErrorKind::Binding(reason),
+                )
+                .with_abort_outcome(outcome));
+            }
+        }
+        if let Some(extra) = prepared.next() {
+            let outcome =
+                abort_prepared_drive_resource_iter(std::iter::once(extra).chain(prepared))
+                    .merge(abort_drive_bindings(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Binding,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        let bindings = match bindings.complete() {
+            Ok(bindings) => bindings,
+            Err(incomplete) => {
+                let missing_count = incomplete.missing_count();
+                let outcome = abort_drive_bindings(incomplete.into_bindings().into_values())
+                    .merge(abort_contained_transaction(contained_transaction));
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Completion,
+                    SnapshotRestoreResourceErrorKind::Incomplete { missing_count },
+                )
+                .with_abort_outcome(outcome));
+            }
+        };
+        let prepared = PreparedSnapshotMultiDriveRestoreResources {
+            drive_keys,
+            drive_configs,
+            bindings,
+            contained_transaction,
+        };
+        if cancelled() {
+            let outcome = prepared.abort();
+            return Err(cancelled_batch_error().with_abort_outcome(outcome));
+        }
+        Ok(prepared)
+    }
+}
+
+impl fmt::Debug for RequestedSnapshotMultiDriveRestoreResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestedSnapshotMultiDriveRestoreResources")
+            .field("resource_count", &self.drives.len())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+type ContainedDrivePreparationFailure = Box<(
+    SnapshotRestoreResourceError,
+    Vec<PreparedSnapshotDriveRestoreResource>,
+    Vec<PreparedDriveBackingClaim>,
+)>;
+
+fn prepare_direct_drives(
+    drives: &[RequestedSnapshotDriveRestoreResource],
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<PreparedSnapshotDriveRestoreResource>, SnapshotRestoreResourceError> {
+    let mut reservations = Vec::new();
+    let mut identities = HashSet::new();
+    reservations
+        .try_reserve_exact(drives.len())
+        .map_err(manifest_allocation_error)?;
+    identities.try_reserve(drives.len()).map_err(|_| {
+        SnapshotRestoreResourceError::retryable(
+            SnapshotRestoreResourceStage::DrivePreflight,
+            SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+        )
+    })?;
+    for drive in drives {
+        if cancelled() {
+            return Err(cancelled_batch_error());
+        }
+        if grant_reference_id(&drive.selector)
+            .map_err(|source| {
+                SnapshotRestoreResourceError::retryable(
+                    SnapshotRestoreResourceStage::DrivePreflight,
+                    SnapshotRestoreResourceErrorKind::DriveBacking(
+                        SnapshotDriveBackingPreparationError::Authority(source),
+                    ),
+                )
+            })?
+            .is_some()
+        {
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::DrivePreflight,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            ));
+        }
+        let reservation =
+            match SnapshotBlockFileBackingReservation::open(&drive.selector, drive.is_read_only) {
+                Ok(reservation) => reservation,
+                Err(source) => {
+                    return Err(SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::DrivePreparation,
+                        SnapshotRestoreResourceErrorKind::DriveBacking(
+                            SnapshotDriveBackingPreparationError::Backing(source),
+                        ),
+                    ));
+                }
+            };
+        let identity = reservation.identity();
+        if !snapshot_drive_reservation_matches(drive, &reservation)
+            || !identities.insert((identity.device(), identity.inode()))
+        {
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::DrivePreflight,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            ));
+        }
+        reservations.push(ReservedDirectSnapshotDriveRestoreResource {
+            key: drive.key.clone(),
+            reservation,
+        });
+    }
+
+    if cancelled() {
+        return Err(cancelled_batch_error());
+    }
+    let mut prepared = Vec::new();
+    prepared
+        .try_reserve_exact(drives.len())
+        .map_err(manifest_allocation_error)?;
+    let mut reservations = reservations.into_iter();
+    for drive in drives {
+        if cancelled() {
+            return Err(cancelled_batch_error()
+                .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+        }
+        let Some(reserved) = reservations.next() else {
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::DrivePreparation,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            )
+            .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+        };
+        if reserved.key != drive.key {
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::DrivePreparation,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            )
+            .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+        }
+        let (backing, identity) = match reserved.reservation.into_backing() {
+            Ok(parts) => parts,
+            Err(source) => {
+                return Err(SnapshotRestoreResourceError::retryable(
+                    SnapshotRestoreResourceStage::DrivePreparation,
+                    SnapshotRestoreResourceErrorKind::DriveBacking(
+                        SnapshotDriveBackingPreparationError::Backing(source),
+                    ),
+                )
+                .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+            }
+        };
+        if !snapshot_drive_observation_matches(drive, &backing, identity) {
+            drop(backing);
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::DrivePreflight,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            )
+            .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+        }
+        prepared.push(PreparedSnapshotDriveRestoreResource {
+            key: drive.key.clone(),
+            backing,
+            claim: None,
+        });
+    }
+    if reservations.next().is_some() {
+        return Err(SnapshotRestoreResourceError::terminal(
+            SnapshotRestoreResourceStage::DrivePreparation,
+            SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+        )
+        .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+    }
+    Ok(prepared)
+}
+
+fn prepare_contained_drives(
+    drives: &[RequestedSnapshotDriveRestoreResource],
+    mut claims: Vec<PreparedDriveBackingClaim>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<PreparedSnapshotDriveRestoreResource>, ContainedDrivePreparationFailure> {
+    let mut prepared = Vec::new();
+    let mut identities = HashSet::new();
+    if prepared.try_reserve_exact(drives.len()).is_err()
+        || identities.try_reserve(drives.len()).is_err()
+    {
+        return Err(Box::new((
+            SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::DrivePreflight,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            ),
+            prepared,
+            claims,
+        )));
+    }
+    if claims.len() != drives.len() {
+        return Err(Box::new((
+            SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::DrivePreflight,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            ),
+            prepared,
+            claims,
+        )));
+    }
+    for drive in drives {
+        if cancelled() {
+            return Err(Box::new((cancelled_batch_error(), prepared, claims)));
+        }
+        let mut claim = claims.remove(0);
+        let (file, observation) =
+            match claim.take_snapshot_file_for(&drive.selector, drive.is_read_only) {
+                Ok(parts) => parts,
+                Err(source) => {
+                    claims.insert(0, claim);
+                    return Err(Box::new((
+                        SnapshotRestoreResourceError::retryable(
+                            SnapshotRestoreResourceStage::DrivePreparation,
+                            SnapshotRestoreResourceErrorKind::DriveBacking(
+                                SnapshotDriveBackingPreparationError::Authority(source),
+                            ),
+                        ),
+                        prepared,
+                        claims,
+                    )));
+                }
+            };
+        let (backing, identity) =
+            match BlockFileBacking::from_snapshot_file(file, drive.is_read_only) {
+                Ok(parts) => parts,
+                Err(source) => {
+                    claims.insert(0, claim);
+                    return Err(Box::new((
+                        SnapshotRestoreResourceError::retryable(
+                            SnapshotRestoreResourceStage::DrivePreparation,
+                            SnapshotRestoreResourceErrorKind::DriveBacking(
+                                SnapshotDriveBackingPreparationError::Backing(source),
+                            ),
+                        ),
+                        prepared,
+                        claims,
+                    )));
+                }
+            };
+        let observation_matches = observation.is_some_and(|observation| {
+            observation.identity().device == identity.device()
+                && observation.identity().inode == identity.inode()
+                && observation.len() == identity.len()
+        });
+        if !observation_matches
+            || !snapshot_drive_observation_matches(drive, &backing, identity)
+            || !identities.insert((identity.device(), identity.inode()))
+        {
+            drop(backing);
+            claims.insert(0, claim);
+            return Err(Box::new((
+                SnapshotRestoreResourceError::retryable(
+                    SnapshotRestoreResourceStage::DrivePreflight,
+                    SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                ),
+                prepared,
+                claims,
+            )));
+        }
+        prepared.push(PreparedSnapshotDriveRestoreResource {
+            key: drive.key.clone(),
+            backing,
+            claim: Some(claim),
+        });
+    }
+    if !claims.is_empty() {
+        return Err(Box::new((
+            SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::DrivePreflight,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            ),
+            prepared,
+            claims,
+        )));
+    }
+    Ok(prepared)
+}
+
+fn snapshot_drive_reservation_matches(
+    drive: &RequestedSnapshotDriveRestoreResource,
+    reservation: &SnapshotBlockFileBackingReservation,
+) -> bool {
+    let identity = reservation.identity();
+    reservation.is_read_only() == drive.is_read_only
+        && identity.kind().is_regular_file()
+        && identity.len() == drive.expected_len
+}
+
+fn snapshot_drive_observation_matches(
+    drive: &RequestedSnapshotDriveRestoreResource,
+    backing: &BlockFileBacking,
+    identity: BlockFileBackingIdentity,
+) -> bool {
+    backing.kind().is_regular_file()
+        && backing.is_read_only() == drive.is_read_only
+        && backing.len() == drive.expected_len
+        && identity.kind().is_regular_file()
+        && identity.len() == drive.expected_len
+}
+
+fn abort_contained_vsock_facets(
+    facets: Option<(
+        crate::contained_session::PreparedSocketDirectoryClaim,
+        crate::contained_session::PreparedSocketBrokerEndpoint,
+        WorkerSocketNamespace,
+    )>,
+) -> SnapshotRestoreAbortOutcome {
+    match facets {
+        Some((directory, broker, namespace)) => {
+            drop(namespace);
+            if broker.abort().is_err() | directory.abort().is_err() {
+                SnapshotRestoreAbortOutcome::terminal(true)
+            } else {
+                SnapshotRestoreAbortOutcome::retryable()
+            }
+        }
+        None => SnapshotRestoreAbortOutcome::retryable(),
+    }
+}
+
+fn abort_prepared_drive_claims(
+    claims: Vec<PreparedDriveBackingClaim>,
+) -> SnapshotRestoreAbortOutcome {
+    let mut outcome = SnapshotRestoreAbortOutcome::retryable();
+    for claim in claims.into_iter().rev() {
+        if claim.abort().is_err() {
+            outcome = outcome.merge(SnapshotRestoreAbortOutcome::terminal(true));
+        }
+    }
+    outcome
+}
+
+fn abort_prepared_drive_resources(
+    resources: Vec<PreparedSnapshotDriveRestoreResource>,
+) -> SnapshotRestoreAbortOutcome {
+    abort_prepared_drive_resource_iter(resources.into_iter())
+}
+
+fn abort_prepared_drive_resource_iter(
+    resources: impl DoubleEndedIterator<Item = PreparedSnapshotDriveRestoreResource>,
+) -> SnapshotRestoreAbortOutcome {
+    let mut outcome = SnapshotRestoreAbortOutcome::retryable();
+    for resource in resources.rev() {
+        outcome = outcome.merge(resource.abort());
+    }
+    outcome
+}
+
+fn abort_drive_bindings(
+    resources: impl DoubleEndedIterator<Item = PreparedSnapshotDriveRestoreResource>,
+) -> SnapshotRestoreAbortOutcome {
+    let mut outcome = SnapshotRestoreAbortOutcome::retryable();
+    for resource in resources.rev() {
+        outcome = outcome.merge(resource.abort());
+    }
+    outcome
+}
+
+pub(crate) struct PreparedSnapshotMultiDriveRestoreResources {
+    drive_keys: Vec<SnapshotRestoreResourceKey>,
+    drive_configs: DriveConfigs,
+    bindings: PreparedSnapshotRestoreBindings<PreparedSnapshotDriveRestoreResource>,
+    contained_transaction: Option<ContainedSnapshotRestoreTransaction>,
+}
+
+impl PreparedSnapshotMultiDriveRestoreResources {
+    pub(crate) fn into_drive_batch(
+        mut self,
+    ) -> Result<PreparedSnapshotRestoreDriveBatch, SnapshotRestoreResourceError> {
+        let mut owners = Vec::new();
+        if owners.try_reserve_exact(self.drive_keys.len()).is_err() {
+            let outcome = self.abort();
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::Take,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        for key in &self.drive_keys {
+            match self.bindings.take(key) {
+                Ok(owner) if owner.key == *key => owners.push(owner),
+                Ok(owner) => {
+                    owners.push(owner);
+                    let outcome = self.abort_with_taken(owners);
+                    return Err(SnapshotRestoreResourceError::terminal(
+                        SnapshotRestoreResourceStage::Take,
+                        SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                    )
+                    .with_abort_outcome(outcome));
+                }
+                Err(source) => {
+                    let outcome = self.abort_with_taken(owners);
+                    return Err(SnapshotRestoreResourceError::terminal(
+                        SnapshotRestoreResourceStage::Take,
+                        SnapshotRestoreResourceErrorKind::Take(source),
+                    )
+                    .with_abort_outcome(outcome));
+                }
+            }
+        }
+        let Self {
+            drive_keys: _,
+            drive_configs,
+            bindings,
+            contained_transaction,
+        } = self;
+        if let Err(unconsumed) = bindings.finish() {
+            let unconsumed_count = unconsumed.unconsumed_count();
+            let outcome = abort_drive_bindings(unconsumed.into_bindings().into_values())
+                .merge(abort_prepared_drive_resources(owners))
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::Unconsumed { unconsumed_count },
+            )
+            .with_abort_outcome(outcome));
+        }
+        let mut backings = Vec::new();
+        let mut claims = Vec::new();
+        if backings.try_reserve_exact(owners.len()).is_err()
+            || claims.try_reserve_exact(owners.len()).is_err()
+        {
+            let outcome = abort_prepared_drive_resources(owners)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        for owner in owners {
+            let PreparedSnapshotDriveRestoreResource {
+                key: _,
+                backing,
+                claim,
+            } = owner;
+            backings.push(backing);
+            if let Some(claim) = claim {
+                claims.push(claim);
+            }
+        }
+        Ok(PreparedSnapshotRestoreDriveBatch {
+            drive_configs,
+            backings,
+            completion: PreparedSnapshotDriveRestoreCompletion {
+                claims,
+                contained_transaction,
+            },
+        })
+    }
+
+    fn abort(self) -> SnapshotRestoreAbortOutcome {
+        abort_drive_bindings(self.bindings.into_values())
+            .merge(abort_contained_transaction(self.contained_transaction))
+    }
+
+    fn abort_with_taken(
+        self,
+        taken: Vec<PreparedSnapshotDriveRestoreResource>,
+    ) -> SnapshotRestoreAbortOutcome {
+        abort_drive_bindings(self.bindings.into_values())
+            .merge(abort_prepared_drive_resources(taken))
+            .merge(abort_contained_transaction(self.contained_transaction))
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotMultiDriveRestoreResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotMultiDriveRestoreResources")
+            .field("resource_count", &self.drive_keys.len())
+            .field("remaining_count", &self.bindings.remaining_count())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Exact graph-ordered block resources ready for pathless device construction.
+pub(crate) struct PreparedSnapshotRestoreDriveBatch {
+    drive_configs: DriveConfigs,
+    backings: Vec<BlockFileBacking>,
+    completion: PreparedSnapshotDriveRestoreCompletion,
+}
+
+impl PreparedSnapshotRestoreDriveBatch {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        DriveConfigs,
+        Vec<BlockFileBacking>,
+        PreparedSnapshotDriveRestoreCompletion,
+    ) {
+        (self.drive_configs, self.backings, self.completion)
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotRestoreDriveBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotRestoreDriveBatch")
+            .field("drive_count", &self.backings.len())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+pub(crate) struct PreparedSnapshotDriveRestoreCompletion {
+    claims: Vec<PreparedDriveBackingClaim>,
+    contained_transaction: Option<ContainedSnapshotRestoreTransaction>,
+}
+
+impl PreparedSnapshotDriveRestoreCompletion {
+    pub(crate) fn commit(mut self) -> Result<(), PreparedSnapshotDriveRestoreCompletionError> {
+        let claims = std::mem::take(&mut self.claims);
+        let contained_transaction = self.contained_transaction.take();
+        for claim in claims {
+            claim.commit();
+        }
+        match contained_transaction {
+            Some(transaction) => {
+                transaction
+                    .commit()
+                    .map_err(|source| PreparedSnapshotDriveRestoreCompletionError {
+                        grant_failed: false,
+                        contained: Some(source),
+                    })
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), PreparedSnapshotDriveRestoreCompletionError> {
+        let claims = std::mem::take(&mut self.claims);
+        let contained_transaction = self.contained_transaction.take();
+        let grant_failed = claims
+            .into_iter()
+            .rev()
+            .fold(false, |failed, claim| claim.abort().is_err() | failed);
+        let contained = contained_transaction.and_then(|transaction| transaction.abort().err());
+        if grant_failed || contained.is_some() {
+            Err(PreparedSnapshotDriveRestoreCompletionError {
+                grant_failed,
+                contained,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for PreparedSnapshotDriveRestoreCompletion {
+    fn drop(&mut self) {
+        for claim in std::mem::take(&mut self.claims).into_iter().rev() {
+            let _ = claim.abort();
+        }
+        if let Some(transaction) = self.contained_transaction.take() {
+            let _ = transaction.abort();
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotDriveRestoreCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotDriveRestoreCompletion")
+            .field("state", &"<provisional>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedSnapshotDriveRestoreCompletionError {
+    grant_failed: bool,
+    contained: Option<ContainedSnapshotRestoreError>,
+}
+
+impl PreparedSnapshotDriveRestoreCompletionError {
+    pub(crate) const fn disposition(&self) -> SnapshotRestoreResourceDisposition {
+        SnapshotRestoreResourceDisposition::Terminal
+    }
+}
+
+impl fmt::Display for PreparedSnapshotDriveRestoreCompletionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("snapshot drive batch completion authority failed")?;
+        if self.grant_failed {
+            formatter.write_str("; grant cleanup also failed")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PreparedSnapshotDriveRestoreCompletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.contained
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
 pub(crate) enum RequestedSnapshotRestoreResource {
     Root {
         key: SnapshotRestoreResourceKey,
@@ -773,9 +1712,35 @@ enum SnapshotRestoreReservationSource<'a> {
 }
 
 impl RequestedSnapshotRestoreResources {
+    /// Dormant typed profile-2 resource producer. Public native-v2 dispatch
+    /// remains exact 2.4 until the later activation slice.
+    pub(crate) fn prepare_native_v2_multi_block_device_graph<F>(
+        graph: &SnapshotV2MultiBlockDeviceGraph,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: F,
+    ) -> Result<PreparedSnapshotRestoreDriveBatch, SnapshotRestoreResourceError>
+    where
+        F: Fn() -> bool,
+    {
+        // Keep the complete dormant handoff contract type-checked before the
+        // dependent pathless-device slice consumes it.
+        let _batch_parts = PreparedSnapshotRestoreDriveBatch::into_parts;
+        let _commit = PreparedSnapshotDriveRestoreCompletion::commit;
+        let _abort = PreparedSnapshotDriveRestoreCompletion::abort;
+        let _completion_disposition = PreparedSnapshotDriveRestoreCompletionError::disposition;
+        RequestedSnapshotMultiDriveRestoreResources::try_from_native_v2_multi_block_device_graph(
+            graph,
+        )?
+        .prepare(authority, cancelled)?
+        .into_drive_batch()
+    }
+
     pub(crate) fn try_from_native_v2_device_graph(
         graph: &SnapshotV2DeviceGraph,
     ) -> Result<Self, SnapshotRestoreResourceError> {
+        // Keep the dormant typed producer linked without admitting profile 2
+        // to public dispatch.
+        let _profile_2_producer = Self::prepare_native_v2_multi_block_device_graph::<fn() -> bool>;
         Self::try_from_native_v2_device_graph_and_vsock(graph, None)
     }
 
@@ -1608,12 +2573,16 @@ mod tests {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use bangbang_runtime::block::DriveConfigInput;
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
     use bangbang_runtime::snapshot::SnapshotVsockOverride;
     use bangbang_runtime::snapshot_device_v2::{
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceTransportKind,
+    };
+    use bangbang_runtime::snapshot_device_v2_5::{
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
     };
     use bangbang_runtime::snapshot_restore::{
         SnapshotRestoreBindingRejectionReason, SnapshotRestorePublicId,
@@ -1627,7 +2596,8 @@ mod tests {
 
     use crate::contained_session::{
         ContainedSnapshotRestoreErrorKind, GrantAuthority, TestContainedRestoreAuthority,
-        contained_restore_authority_for_test, root_file_grant_authority_for_test,
+        contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
+        file_grant_authority_for_test, root_file_grant_authority_for_test,
         vsock_directory_authority_for_test,
     };
 
@@ -1644,6 +2614,10 @@ mod tests {
     impl TempRoot {
         fn new(name: &str, bytes: &[u8]) -> Self {
             let path = unique_path(name);
+            Self::new_at(path, bytes)
+        }
+
+        fn new_at(path: PathBuf, bytes: &[u8]) -> Self {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1674,6 +2648,11 @@ mod tests {
         ))
     }
 
+    fn unique_short_path() -> PathBuf {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        PathBuf::from(format!("/tmp/bb{id:011x}"))
+    }
+
     fn fixture_graph(transport: SnapshotV2DeviceTransportKind) -> SnapshotV2DeviceGraph {
         let fixture = match transport {
             SnapshotV2DeviceTransportKind::Mmio => {
@@ -1694,6 +2673,45 @@ mod tests {
             .collect::<Vec<_>>();
         SnapshotV2DeviceGraph::decode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, &bytes)
             .expect("fixture graph should decode")
+    }
+
+    fn multi_fixture_graph(
+        first_selector: Option<&Path>,
+        second_selector: Option<&Path>,
+    ) -> SnapshotV2MultiBlockDeviceGraph {
+        let fixture = include_str!("../../runtime/src/snapshot_device_v2_5/fixtures/root-mmio.hex");
+        let mut bytes = fixture
+            .trim()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
+                u8::from_str_radix(pair, 16).expect("fixture hex should decode")
+            })
+            .collect::<Vec<_>>();
+        for (captured, replacement) in [
+            (b"logical-selector-0".as_slice(), first_selector),
+            (b"logical-selector-1".as_slice(), second_selector),
+        ] {
+            let Some(replacement) = replacement else {
+                continue;
+            };
+            let replacement = replacement
+                .to_str()
+                .expect("test selector should be UTF-8")
+                .as_bytes();
+            assert_eq!(replacement.len(), captured.len());
+            let offset = bytes
+                .windows(captured.len())
+                .position(|window| window == captured)
+                .expect("fixture selector should exist");
+            bytes[offset..offset + captured.len()].copy_from_slice(replacement);
+        }
+        SnapshotV2MultiBlockDeviceGraph::decode(
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &bytes,
+        )
+        .expect("profile-2 fixture graph should decode")
     }
 
     fn requested() -> RequestedSnapshotRestoreResources {
@@ -2021,6 +3039,301 @@ mod tests {
             let diagnostics = format!("{request:?} {:?}", request.root_key);
             assert!(!diagnostics.contains(graph.record().config().drive_id()));
             assert!(!diagnostics.contains(graph.record().config().selector()));
+        }
+    }
+
+    #[test]
+    fn profile_2_derives_one_exact_request_and_config_per_record() {
+        let graph = multi_fixture_graph(None, None);
+        let request =
+            RequestedSnapshotMultiDriveRestoreResources::try_from_native_v2_multi_block_device_graph(
+                &graph,
+            )
+            .expect("profile-2 graph should produce an exact request");
+        assert_eq!(request.drives.len(), graph.records().len());
+        assert_eq!(request.drive_keys.len(), graph.records().len());
+        assert_eq!(
+            request.drive_configs.as_slice().len(),
+            graph.records().len()
+        );
+        assert_eq!(request.bindings.manifest().len(), graph.records().len());
+        for (((drive, key), config), record) in request
+            .drives
+            .iter()
+            .zip(&request.drive_keys)
+            .zip(request.drive_configs.as_slice())
+            .zip(graph.records())
+        {
+            assert_eq!(drive.key, *key);
+            assert_eq!(key.device_key(), record.key());
+            assert_eq!(key.public_id().as_str(), record.config().drive_id());
+            assert_eq!(
+                key.resource_class(),
+                SnapshotRestoreResourceClass::BlockBacking
+            );
+            assert_eq!(drive.selector, Path::new(record.config().selector()));
+            assert_eq!(drive.is_read_only, record.config().is_read_only());
+            assert_eq!(drive.expected_len, record.block().backing_bytes());
+            assert_eq!(config.drive_id(), record.config().drive_id());
+            assert_eq!(
+                config.path_on_host(),
+                Some(Path::new(record.config().selector()))
+            );
+        }
+        let diagnostics = format!("{request:?}");
+        for record in graph.records() {
+            assert!(!diagnostics.contains(record.config().drive_id()));
+            assert!(!diagnostics.contains(record.config().selector()));
+        }
+    }
+
+    #[test]
+    fn profile_2_direct_batch_preserves_mixed_access_order_and_completion() {
+        let template = multi_fixture_graph(None, None);
+        let first_path = unique_short_path();
+        let second_path = unique_short_path();
+        let first = TempRoot::new_at(
+            first_path.clone(),
+            &vec![
+                0x11;
+                usize::try_from(template.records()[0].block().backing_bytes())
+                    .expect("fixture length should fit")
+            ],
+        );
+        let second = TempRoot::new_at(
+            second_path.clone(),
+            &vec![
+                0x22;
+                usize::try_from(template.records()[1].block().backing_bytes())
+                    .expect("fixture length should fit")
+            ],
+        );
+        let graph = multi_fixture_graph(Some(first.path()), Some(second.path()));
+        let batch = RequestedSnapshotRestoreResources::prepare_native_v2_multi_block_device_graph(
+            &graph,
+            None,
+            || false,
+        )
+        .expect("mixed direct batch should prepare");
+        let (configs, backings, completion) = batch.into_parts();
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(backings.len(), 2);
+        for (((config, backing), record), expected_path) in configs
+            .as_slice()
+            .iter()
+            .zip(&backings)
+            .zip(graph.records())
+            .zip([first.path(), second.path()])
+        {
+            assert_eq!(config.drive_id(), record.config().drive_id());
+            assert_eq!(config.path_on_host(), Some(expected_path));
+            assert_eq!(config.is_root_device(), record.is_root());
+            assert_eq!(config.is_read_only(), Some(record.config().is_read_only()));
+            assert_eq!(backing.is_read_only(), record.config().is_read_only());
+            assert_eq!(backing.len(), record.block().backing_bytes());
+        }
+        assert!(configs.as_slice()[0].is_root_device());
+        assert!(!configs.as_slice()[1].is_root_device());
+        completion
+            .commit()
+            .expect("direct batch completion should commit once");
+    }
+
+    #[test]
+    fn profile_2_contained_batch_has_no_path_fallback_and_aborts_as_one_vector() {
+        let graph = multi_fixture_graph(None, None);
+        let selectors = [
+            PathBuf::from("bangbang-grant:drive-ro"),
+            PathBuf::from("bangbang-grant:drive-rw"),
+        ];
+        let expected_lengths = [
+            fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contained_session.rs"))
+                .expect("read-only grant metadata should read")
+                .len(),
+            fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vmm.rs"))
+                .expect("read-write grant metadata should read")
+                .len(),
+        ];
+        let mut drives = Vec::new();
+        let mut drive_keys = Vec::new();
+        let mut resources = Vec::new();
+        let mut configs = DriveConfigs::new();
+        for ((record, selector), expected_len) in
+            graph.records().iter().zip(&selectors).zip(expected_lengths)
+        {
+            let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id())
+                .expect("fixture public ID should validate");
+            let key = SnapshotRestoreResourceKey::new(
+                record.key(),
+                public_id,
+                SnapshotRestoreResourceClass::BlockBacking,
+            );
+            let mut input = DriveConfigInput::new(
+                record.config().drive_id(),
+                record.config().drive_id(),
+                selector,
+                record.is_root(),
+            )
+            .with_is_read_only(record.config().is_read_only())
+            .with_cache_type(record.config().cache_type())
+            .with_io_engine(record.config().io_engine());
+            if let Some(partuuid) = record.config().partuuid() {
+                input = input.with_partuuid(partuuid);
+            }
+            if let Some(rate_limiter) = record.config().rate_limiter() {
+                input = input.with_rate_limiter(rate_limiter);
+            }
+            configs
+                .insert(input)
+                .expect("contained projected config should validate");
+            drives.push(RequestedSnapshotDriveRestoreResource {
+                key: key.clone(),
+                selector: selector.clone(),
+                is_read_only: record.config().is_read_only(),
+                expected_len,
+            });
+            drive_keys.push(key.clone());
+            resources.push(key);
+        }
+        let manifest = SnapshotRestoreManifest::try_new(resources, Vec::new())
+            .expect("contained manifest should validate");
+        let bindings = manifest
+            .try_into_bindings()
+            .expect("contained bindings should allocate");
+        let request = RequestedSnapshotMultiDriveRestoreResources {
+            drives,
+            drive_keys,
+            drive_configs: configs,
+            bindings,
+        };
+        let fixture = contained_restore_authority_with_grants_for_test(
+            file_grant_authority_for_test(),
+            false,
+        );
+        let prepared = request
+            .prepare(Some(fixture.authority()), || false)
+            .expect("contained mixed vector should prepare");
+        let batch = prepared
+            .into_drive_batch()
+            .expect("contained bindings should become one batch");
+        let diagnostic = format!("{batch:?}");
+        for selector in &selectors {
+            assert!(!diagnostic.contains(selector.to_string_lossy().as_ref()));
+        }
+        let (configs, backings, completion) = batch.into_parts();
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(backings.len(), 2);
+        for (((config, backing), selector), expected_len) in configs
+            .as_slice()
+            .iter()
+            .zip(&backings)
+            .zip(&selectors)
+            .zip(expected_lengths)
+        {
+            assert_eq!(config.path_on_host(), Some(selector.as_path()));
+            assert_eq!(backing.len(), expected_len);
+        }
+        assert!(backings[0].is_read_only());
+        assert!(!backings[1].is_read_only());
+        drop(backings);
+        completion
+            .abort()
+            .expect("contained claims and generation should abort once");
+        for (selector, access) in [
+            (&selectors[0], GrantAccess::ReadOnly),
+            (&selectors[1], GrantAccess::ReadWrite),
+        ] {
+            fixture
+                .grants()
+                .prepare_drive_backing_claim(selector, access)
+                .expect("batch abort should restore every grant")
+                .expect("selector should remain contained")
+                .abort()
+                .expect("restored grant should remain reusable");
+        }
+    }
+
+    #[test]
+    fn profile_2_direct_preflight_rejects_alias_geometry_grants_and_cancellation() {
+        let graph = multi_fixture_graph(None, None);
+        let shared = TempRoot::new("multi-alias", &[0x33; 4096]);
+        let requests = graph
+            .records()
+            .iter()
+            .map(|record| {
+                let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id())
+                    .expect("fixture public ID should validate");
+                RequestedSnapshotDriveRestoreResource {
+                    key: SnapshotRestoreResourceKey::new(
+                        record.key(),
+                        public_id,
+                        SnapshotRestoreResourceClass::BlockBacking,
+                    ),
+                    selector: shared.path().to_path_buf(),
+                    is_read_only: record.config().is_read_only(),
+                    expected_len: 4096,
+                }
+            })
+            .collect::<Vec<_>>();
+        let alias = prepare_direct_drives(&requests, &|| false)
+            .expect_err("same descriptor identity must reject");
+        assert_eq!(alias.stage, SnapshotRestoreResourceStage::DrivePreflight);
+        assert!(matches!(
+            alias.kind,
+            SnapshotRestoreResourceErrorKind::InvalidDriveSet
+        ));
+
+        let first = TempRoot::new("multi-geometry-0", &[0x44; 4096]);
+        let second = TempRoot::new("multi-geometry-1", &[0x55; 8192]);
+        let mut distinct = requests;
+        distinct[0].selector = first.path().to_path_buf();
+        distinct[1].selector = second.path().to_path_buf();
+        distinct[1].expected_len = 8193;
+        let geometry = prepare_direct_drives(&distinct, &|| false)
+            .expect_err("wrong expected geometry must reject");
+        assert_eq!(geometry.stage, SnapshotRestoreResourceStage::DrivePreflight);
+
+        distinct[1].expected_len = 8192;
+        let calls = Cell::new(0_u8);
+        let changed = prepare_direct_drives(&distinct, &|| {
+            let next = calls.get().saturating_add(1);
+            calls.set(next);
+            if next == 3 {
+                fs::write(first.path(), [0x66; 4097])
+                    .expect("reserved direct fixture should change before adoption");
+            }
+            false
+        })
+        .expect_err("changed preflight observation must reject before binding");
+        assert_eq!(
+            changed.stage,
+            SnapshotRestoreResourceStage::DrivePreparation
+        );
+        fs::write(first.path(), [0x44; 4096])
+            .expect("changed direct fixture should reset for later checks");
+
+        distinct[0].selector = PathBuf::from(ROOT_REFERENCE);
+        let grant = prepare_direct_drives(&distinct, &|| false)
+            .expect_err("direct mode must not treat a grant reference as a path");
+        assert_eq!(grant.stage, SnapshotRestoreResourceStage::DrivePreflight);
+
+        distinct[0].selector = first.path().to_path_buf();
+        let calls = Cell::new(0_u8);
+        let cancelled = prepare_direct_drives(&distinct, &|| {
+            let next = calls.get().saturating_add(1);
+            calls.set(next);
+            next >= 2
+        })
+        .expect_err("mid-vector cancellation must unwind earlier reservations");
+        assert_eq!(cancelled.stage, SnapshotRestoreResourceStage::Cancellation);
+        let diagnostic = format!("{alias:?} {geometry:?} {changed:?} {grant:?} {cancelled:?}");
+        for private in [
+            shared.path(),
+            first.path(),
+            second.path(),
+            Path::new(ROOT_REFERENCE),
+        ] {
+            assert!(!diagnostic.contains(private.to_string_lossy().as_ref()));
         }
     }
 

@@ -4616,6 +4616,141 @@ impl fmt::Display for SnapshotBlockFileBackingError {
 
 impl std::error::Error for SnapshotBlockFileBackingError {}
 
+/// Securely opened regular-file snapshot backing awaiting complete-set
+/// validation.
+///
+/// This value owns only the descriptor reservation. It does not construct a
+/// live block backing until [`Self::into_backing`] revalidates the captured
+/// descriptor observation.
+pub struct SnapshotBlockFileBackingReservation {
+    file: File,
+    identity: BlockFileBackingIdentity,
+    is_read_only: bool,
+}
+
+impl SnapshotBlockFileBackingReservation {
+    /// Opens and inspects one exact regular-file snapshot descriptor.
+    pub fn open(path: &Path, is_read_only: bool) -> Result<Self, SnapshotBlockFileBackingError> {
+        #[cfg(unix)]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true);
+            if !is_read_only {
+                options.write(true);
+            }
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let file = options
+                .open(path)
+                .map_err(|_| SnapshotBlockFileBackingError::Open)?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| SnapshotBlockFileBackingError::ReadMetadata)?;
+            if !metadata.file_type().is_file() {
+                return Err(SnapshotBlockFileBackingError::NonRegularFile);
+            }
+            validate_block_file_descriptor_status(
+                &file,
+                is_read_only,
+                DescriptorCloexecPolicy::SetIfMissing,
+            )
+            .map_err(|_| SnapshotBlockFileBackingError::InvalidMetadata)?;
+            let identity = snapshot_block_file_identity(
+                &metadata,
+                BlockFileBackingKind::REGULAR_FILE,
+                metadata.len(),
+            )?;
+            Ok(Self {
+                file,
+                identity,
+                is_read_only,
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (path, is_read_only);
+            Err(SnapshotBlockFileBackingError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the descriptor-derived pre-adoption observation.
+    pub const fn identity(&self) -> BlockFileBackingIdentity {
+        self.identity
+    }
+
+    /// Returns the captured descriptor access.
+    pub const fn is_read_only(&self) -> bool {
+        self.is_read_only
+    }
+
+    /// Revalidates and adopts the reserved descriptor as a block backing.
+    pub fn into_backing(
+        self,
+    ) -> Result<(BlockFileBacking, BlockFileBackingIdentity), SnapshotBlockFileBackingError> {
+        snapshot_block_file_backing_from_file(
+            self.file,
+            self.is_read_only,
+            BlockFileBackingOrigin::Path,
+            Some(self.identity),
+        )
+    }
+}
+
+impl fmt::Debug for SnapshotBlockFileBackingReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotBlockFileBackingReservation")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+fn snapshot_block_file_backing_from_file(
+    file: File,
+    is_read_only: bool,
+    origin: BlockFileBackingOrigin,
+    expected_identity: Option<BlockFileBackingIdentity>,
+) -> Result<(BlockFileBacking, BlockFileBackingIdentity), SnapshotBlockFileBackingError> {
+    #[cfg(unix)]
+    {
+        let descriptor_status = validate_block_file_descriptor_status(
+            &file,
+            is_read_only,
+            DescriptorCloexecPolicy::SetIfMissing,
+        )
+        .map_err(|_| SnapshotBlockFileBackingError::InvalidMetadata)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| SnapshotBlockFileBackingError::ReadMetadata)?;
+        if !metadata.file_type().is_file() {
+            return Err(SnapshotBlockFileBackingError::NonRegularFile);
+        }
+        let kind = BlockFileBackingKind::REGULAR_FILE;
+        let identity = snapshot_block_file_identity(&metadata, kind, metadata.len())?;
+        if expected_identity.is_some_and(|expected| expected != identity) {
+            return Err(SnapshotBlockFileBackingError::InvalidMetadata);
+        }
+        let backing = BlockFileBacking {
+            file,
+            len: metadata.len(),
+            kind,
+            descriptor_identity: block_file_descriptor_identity(&metadata, kind),
+            descriptor_status,
+            block_control: None,
+            device_id: virtio_block_device_id_from_metadata(&metadata),
+            is_read_only,
+            origin,
+        };
+        Ok((backing, identity))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (file, is_read_only, origin, expected_identity);
+        Err(SnapshotBlockFileBackingError::UnsupportedPlatform)
+    }
+}
+
 impl BlockFileBacking {
     pub fn open(config: &DriveConfig) -> Result<Self, BlockFileBackingError> {
         let DriveBackendConfig::File {
@@ -4712,94 +4847,43 @@ impl BlockFileBacking {
         })
     }
 
+    /// Opens one exact regular-file snapshot backing with the captured access.
+    ///
+    /// Snapshot restore never follows a final symlink and always requires a
+    /// close-on-exec descriptor. The returned identity is descriptor-derived
+    /// and may be retained transiently for complete-set validation.
+    pub fn open_snapshot(
+        path: &Path,
+        is_read_only: bool,
+    ) -> Result<(Self, BlockFileBackingIdentity), SnapshotBlockFileBackingError> {
+        SnapshotBlockFileBackingReservation::open(path, is_read_only)?.into_backing()
+    }
+
+    /// Compatibility wrapper for the exact read-only profile-1 restore path.
     pub fn open_snapshot_read_only(
         path: &Path,
     ) -> Result<(Self, BlockFileBackingIdentity), SnapshotBlockFileBackingError> {
-        #[cfg(unix)]
-        {
-            let mut options = OpenOptions::new();
-            options
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-            let file = options
-                .open(path)
-                .map_err(|_| SnapshotBlockFileBackingError::Open)?;
-            let metadata = file
-                .metadata()
-                .map_err(|_| SnapshotBlockFileBackingError::ReadMetadata)?;
-            if !metadata.file_type().is_file() {
-                return Err(SnapshotBlockFileBackingError::NonRegularFile);
-            }
-            let descriptor_status = validate_block_file_descriptor_status(
-                &file,
-                true,
-                DescriptorCloexecPolicy::SetIfMissing,
-            )
-            .map_err(|_| SnapshotBlockFileBackingError::InvalidMetadata)?;
-            let kind = BlockFileBackingKind::REGULAR_FILE;
-            let descriptor_identity = block_file_descriptor_identity(&metadata, kind);
-            let identity = snapshot_block_file_identity(&metadata, kind, metadata.len())?;
-            let backing = Self {
-                file,
-                len: metadata.len(),
-                kind,
-                descriptor_identity,
-                descriptor_status,
-                block_control: None,
-                device_id: virtio_block_device_id_from_metadata(&metadata),
-                is_read_only: true,
-                origin: BlockFileBackingOrigin::Path,
-            };
-            Ok((backing, identity))
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Err(SnapshotBlockFileBackingError::UnsupportedPlatform)
-        }
+        Self::open_snapshot(path, true)
     }
 
-    /// Adopts an already-opened exact read-only snapshot backing.
+    /// Adopts an already-opened exact regular-file snapshot backing.
+    pub fn from_snapshot_file(
+        file: File,
+        is_read_only: bool,
+    ) -> Result<(Self, BlockFileBackingIdentity), SnapshotBlockFileBackingError> {
+        snapshot_block_file_backing_from_file(
+            file,
+            is_read_only,
+            BlockFileBackingOrigin::SuppliedFile,
+            None,
+        )
+    }
+
+    /// Compatibility wrapper for the exact read-only profile-1 restore path.
     pub fn from_snapshot_read_only_file(
         file: File,
     ) -> Result<(Self, BlockFileBackingIdentity), SnapshotBlockFileBackingError> {
-        #[cfg(unix)]
-        {
-            let descriptor_status = validate_block_file_descriptor_status(
-                &file,
-                true,
-                DescriptorCloexecPolicy::SetIfMissing,
-            )
-            .map_err(|_| SnapshotBlockFileBackingError::InvalidMetadata)?;
-            let metadata = file
-                .metadata()
-                .map_err(|_| SnapshotBlockFileBackingError::ReadMetadata)?;
-            if !metadata.file_type().is_file() {
-                return Err(SnapshotBlockFileBackingError::NonRegularFile);
-            }
-            let kind = BlockFileBackingKind::REGULAR_FILE;
-            let descriptor_identity = block_file_descriptor_identity(&metadata, kind);
-            let identity = snapshot_block_file_identity(&metadata, kind, metadata.len())?;
-            let backing = Self {
-                file,
-                len: metadata.len(),
-                kind,
-                descriptor_identity,
-                descriptor_status,
-                block_control: None,
-                device_id: virtio_block_device_id_from_metadata(&metadata),
-                is_read_only: true,
-                origin: BlockFileBackingOrigin::SuppliedFile,
-            };
-            Ok((backing, identity))
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = file;
-            Err(SnapshotBlockFileBackingError::UnsupportedPlatform)
-        }
+        Self::from_snapshot_file(file, true)
     }
 
     pub fn snapshot_identity(
@@ -8827,18 +8911,18 @@ mod tests {
         PreparedBlockDeviceError, PreparedBlockDevices, PreparedVhostUserBlockFrontend,
         PreparedVhostUserBlockFrontendError, PreparedVhostUserBlockMemoryError,
         RuntimeBlockDeviceResource, SnapshotBlockFileBackingError,
-        VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_CONFIG_SIZE, VIRTIO_BLOCK_DEVICE_ID,
-        VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
-        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
-        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
-        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
-        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
-        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
-        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VIRTIO_RING_FEATURE_INDIRECT_DESC, VhostUserBlockConfigRefreshError,
-        VhostUserBlockConfigSignalError, VhostUserBlockMemoryRegion,
-        VhostUserBlockNotificationError, VhostUserBlockState, VirtioBlockBackend,
-        VirtioBlockBackendKind, VirtioBlockConfigSpace, VirtioBlockDevice,
+        SnapshotBlockFileBackingReservation, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE,
+        VIRTIO_BLOCK_CONFIG_SIZE, VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_FLUSH,
+        VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT,
+        VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
+        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
+        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
+        VIRTIO_BLOCK_STATUS_SIZE, VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC,
+        VhostUserBlockConfigRefreshError, VhostUserBlockConfigSignalError,
+        VhostUserBlockMemoryRegion, VhostUserBlockNotificationError, VhostUserBlockState,
+        VirtioBlockBackend, VirtioBlockBackendKind, VirtioBlockConfigSpace, VirtioBlockDevice,
         VirtioBlockDeviceActivationError, VirtioBlockDeviceCaptureError, VirtioBlockDeviceId,
         VirtioBlockDeviceNotificationError, VirtioBlockLiveUpdateError, VirtioBlockQueue,
         VirtioBlockQueueBuildError, VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError,
@@ -17364,6 +17448,35 @@ mod tests {
                 .expect("opened descriptor identity should read"),
             identity
         );
+        let writable_file = temp_file("snapshot-backing-rw.img", &[0x11; 512]);
+        let (writable, writable_identity) =
+            BlockFileBacking::open_snapshot(writable_file.as_path(), false)
+                .expect("writable snapshot backing should open");
+        assert!(!writable.is_read_only());
+        assert_eq!(writable_identity.len(), 512);
+        writable
+            .write_at(0, &[0x22])
+            .expect("captured writable access should permit writes");
+        let read_only_file =
+            File::open(writable_file.as_path()).expect("read-only supplied backing should open");
+        assert_eq!(
+            BlockFileBacking::from_snapshot_file(read_only_file, false)
+                .expect_err("supplied access mismatch should reject"),
+            SnapshotBlockFileBackingError::InvalidMetadata
+        );
+        let changed_file = temp_file("snapshot-backing-changed.img", &[0x44; 512]);
+        let reservation = SnapshotBlockFileBackingReservation::open(changed_file.as_path(), true)
+            .expect("snapshot reservation should open");
+        assert_eq!(reservation.identity().len(), 512);
+        assert!(reservation.is_read_only());
+        fs::write(changed_file.as_path(), [0x55; 1024])
+            .expect("reserved backing fixture should change");
+        assert_eq!(
+            reservation
+                .into_backing()
+                .expect_err("changed reservation must reject before adoption"),
+            SnapshotBlockFileBackingError::InvalidMetadata
+        );
         let supplied_file = File::open(file.as_path()).expect("supplied backing should open");
         let moved = file.as_path().with_extension("opened");
         fs::rename(file.as_path(), &moved).expect("opened backing should move");
@@ -17383,6 +17496,11 @@ mod tests {
         assert_eq!(
             BlockFileBacking::open_snapshot_read_only(link.as_path())
                 .expect_err("snapshot backing symlink should reject"),
+            SnapshotBlockFileBackingError::Open
+        );
+        assert_eq!(
+            BlockFileBacking::open_snapshot(link.as_path(), false)
+                .expect_err("writable snapshot symlink should reject"),
             SnapshotBlockFileBackingError::Open
         );
         for unsupported in [directory.as_path(), fifo.as_path(), socket.as_path()] {
