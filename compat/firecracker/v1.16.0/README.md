@@ -618,9 +618,13 @@ PVTime continuity, and recapture-to-restore. #1575–#1578 then compose the
 native-family transaction, minimal producer/restorer, and matching public
 Full/File lifecycle. #1578 promotes the snapshot-version argument, complete
 instance/version-output semantic, aggregate run operation, and minimal Full
-public-lifecycle semantic. General devices, Diff, tools, Firecracker
-interoperability, and broad portability remain audited, so the current overlay
-is 233/165/3/17.
+public-lifecycle semantic. #1583–#1589 then add the exact root device graph,
+MMIO/PCI reconstruction, quiesced capture, backing/controller handoff, complete
+unpublished owners, and public native-v2 `2.4.0` activation for exactly one
+read-only File/Sync root. Exact device-free `2.3.0` remains loadable. This
+widens no broad inventory disposition: optional devices/MMDS, Diff, tools,
+Firecracker interoperability, and broad portability remain audited, so the
+current overlay is 233/165/3/17.
 
 ## Commands
 

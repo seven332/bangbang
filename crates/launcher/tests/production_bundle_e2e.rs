@@ -47,6 +47,7 @@ use vhost_user_block::{
 
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
 const GRANT_TEST_BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH";
+const GUEST_KERNEL_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
 const GUEST_EXT4_ROOTFS_ENV: &str = "BANGBANG_GUEST_EXT4_ROOTFS_PATH";
 const GRANT_MANIFEST_OPTION: &str = "--bangbang-grant-manifest";
 const JAILER_OPTION: &str = "--bangbang-jailer-v1";
@@ -153,6 +154,7 @@ const CONTAINED_VHOST_USER_SUCCESS_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_r
 const VHOST_CONFIG_RESIZED_MARKER: &[u8] = b"BANGBANG_VHOST_CONFIG_RESIZED";
 const SNAPSHOT_KERNEL_ID: &str = "grant-snapshot-kernel-1368";
 const SNAPSHOT_METRICS_ID: &str = "grant-snapshot-metrics-1368";
+const SNAPSHOT_ROOT_ID: &str = "grant-snapshot-root-1589";
 const SNAPSHOT_STATE_OUTPUT_ID: &str = "grant-snapshot-state-output-1368";
 const SNAPSHOT_MEMORY_OUTPUT_ID: &str = "grant-snapshot-memory-output-1368";
 const SNAPSHOT_STATE_INPUT_ID: &str = "grant-snapshot-state-input-1368";
@@ -160,6 +162,7 @@ const SNAPSHOT_MEMORY_INPUT_ID: &str = "grant-snapshot-memory-input-1368";
 const SNAPSHOT_DESCRIBE_INPUT_ID: &str = "grant-snapshot-describe-input-1368";
 const SNAPSHOT_KERNEL_REF: &str = "bangbang-grant:grant-snapshot-kernel-1368";
 const SNAPSHOT_METRICS_REF: &str = "bangbang-grant:grant-snapshot-metrics-1368";
+const SNAPSHOT_ROOT_REF: &str = "bangbang-grant:grant-snapshot-root-1589";
 const SNAPSHOT_STATE_OUTPUT_REF: &str =
     "bangbang-grant:grant-snapshot-state-output-1368/state-1368.snap";
 const SNAPSHOT_MEMORY_OUTPUT_REF: &str =
@@ -177,18 +180,7 @@ const SNAPSHOT_STATE_CHILD: &str = "state-1368.snap";
 const SNAPSHOT_MEMORY_CHILD: &str = "memory-1368.snap";
 const SNAPSHOT_REPEAT_STATE_CHILD: &str = "state-repeat-1368.snap";
 const SNAPSHOT_REPEAT_MEMORY_CHILD: &str = "memory-repeat-1368.snap";
-const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
-const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
-const SNAPSHOT_GUEST_MEMORY_BASE: u64 = 0x8000_0000;
-const SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET: usize = 0x4000;
-const SNAPSHOT_GUEST_CODE_OFFSET: u64 = 0x20_4000;
-const SNAPSHOT_GUEST_READ_OFFSET: u64 = 0x1_0000;
-const SNAPSHOT_GUEST_WRITE_OFFSET: u64 = 0x2_0000;
-const SNAPSHOT_GUEST_CODE_ADDRESS: u64 = SNAPSHOT_GUEST_MEMORY_BASE + SNAPSHOT_GUEST_CODE_OFFSET;
-const SNAPSHOT_GUEST_READ_ADDRESS: u64 = SNAPSHOT_GUEST_MEMORY_BASE + SNAPSHOT_GUEST_READ_OFFSET;
-const SNAPSHOT_GUEST_WRITE_ADDRESS: u64 = SNAPSHOT_GUEST_MEMORY_BASE + SNAPSHOT_GUEST_WRITE_OFFSET;
-const SNAPSHOT_GUEST_UART_ADDRESS: u64 = 0x4000_2000;
-const SNAPSHOT_GUEST_VMGENID_ADDRESS: u64 = 0x801f_eff0;
+const SNAPSHOT_ROOT_BOOT_ARGS: &str = "console=null reboot=k panic=0 quiet loglevel=1 root=/dev/vda ro rootwait init=/bangbang-direct-rootfs-init bangbang.native-v2-root-snapshot=1";
 const GRANTED_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
 const GRANTED_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_MULTISTREAM_OK";
 const GRANTED_VSOCK_EXCHANGES: &[(u32, &[u8], &[u8])] = &[
@@ -354,6 +346,15 @@ fn guest_ext4_rootfs() -> PathBuf {
         .expect("signed runner must provide the direct-rootfs fixture path");
     let path = PathBuf::from(path);
     assert!(path.is_file(), "direct-rootfs fixture must be a file");
+    path
+}
+
+fn guest_kernel() -> PathBuf {
+    let path = std::env::var_os(GUEST_KERNEL_ENV)
+        .filter(|value| !value.is_empty())
+        .expect("signed runner must provide the guest kernel fixture path");
+    let path = PathBuf::from(path);
+    assert!(path.is_file(), "guest kernel fixture must be a file");
     path
 }
 
@@ -1281,15 +1282,23 @@ fn normal_bundle_delays_boot_claim_until_api_and_keeps_opened_identity() {
 #[test]
 fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restore() {
     let bundle = production_bundle();
-    initialize_worker_container(&bundle);
+    for enable_pci in [false, true] {
+        run_native_v2_snapshot_grant_case(&bundle, enable_pci);
+    }
+}
+
+fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
+    let transport = if enable_pci { "pci" } else { "mmio" };
+    initialize_worker_container(bundle);
     let baseline_sessions = session_entries();
-    let source_fixture = SnapshotSourceGrantFixture::new("continuity");
+    let source_fixture = SnapshotSourceGrantFixture::new(&format!("{transport}-continuity"));
     let mut source = spawn_ready_snapshot_grant_api_launcher(
-        &bundle,
+        bundle,
         &source_fixture.manifest,
         source_fixture.sensitive_strings(),
-        "snapshot-source",
+        &format!("snapshot-{transport}-source"),
         false,
+        enable_pci,
     );
     source_fixture.replace_source_file_pathnames();
     configure_and_pause_snapshot_source(&source, &source_fixture.opened_metrics);
@@ -1368,13 +1377,14 @@ fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restor
         repeated_memory_before
     );
 
-    let peer_fixture = SnapshotSourceGrantFixture::new("concurrent-peer");
+    let peer_fixture = SnapshotSourceGrantFixture::new(&format!("{transport}-concurrent-peer"));
     let mut peer = spawn_ready_snapshot_grant_api_launcher(
-        &bundle,
+        bundle,
         &peer_fixture.manifest,
         peer_fixture.sensitive_strings(),
-        "snapshot-concurrent-peer",
+        &format!("snapshot-{transport}-concurrent-peer"),
         false,
+        enable_pci,
     );
     peer_fixture.replace_source_file_pathnames();
     configure_and_pause_snapshot_source(&peer, &peer_fixture.opened_metrics);
@@ -1399,17 +1409,22 @@ fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restor
     stop_running_launcher(&mut source, "granted snapshot source");
     assert_eq!(session_entries(), baseline_sessions);
 
-    let describe = SnapshotDescribeGrantFixture::new("valid", &artifacts.state, true);
-    let describe_output = run_snapshot_describe(&bundle, &describe);
+    let describe =
+        SnapshotDescribeGrantFixture::new(&format!("{transport}-valid"), &artifacts.state, true);
+    let describe_output = run_snapshot_describe(bundle, &describe);
     assert_output_success(&describe_output, "granted snapshot description");
     assert_eq!(
         String::from_utf8_lossy(&describe_output.stdout).trim(),
-        "v2.3.0"
+        "v2.4.0"
     );
     assert_snapshot_output_redacted(&describe_output, &describe.sensitive_strings());
 
-    let mismatch = SnapshotDescribeGrantFixture::new("wrong-role", &artifacts.state, false);
-    let mismatch_output = run_snapshot_describe(&bundle, &mismatch);
+    let mismatch = SnapshotDescribeGrantFixture::new(
+        &format!("{transport}-wrong-role"),
+        &artifacts.state,
+        false,
+    );
+    let mismatch_output = run_snapshot_describe(bundle, &mismatch);
     assert_eq!(
         mismatch_output.status.code(),
         Some(BAD_CONFIGURATION_EXIT_CODE)
@@ -1418,13 +1433,14 @@ fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restor
     assert_snapshot_output_redacted(&mismatch_output, &mismatch.sensitive_strings());
     assert_eq!(session_entries(), baseline_sessions);
 
-    let paused_fixture = SnapshotInputGrantFixture::new("paused", artifacts);
+    let paused_fixture = SnapshotInputGrantFixture::new(&format!("{transport}-paused"), artifacts);
     let mut paused = spawn_ready_snapshot_grant_api_launcher(
-        &bundle,
+        bundle,
         &paused_fixture.manifest,
         paused_fixture.sensitive_strings(),
-        "snapshot-paused",
+        &format!("snapshot-{transport}-paused"),
         false,
+        enable_pci,
     );
     let next_artifacts = paused_fixture.replace_source_pathnames();
     let paused_load_body = snapshot_load_body(false);
@@ -1439,18 +1455,24 @@ fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restor
         "resume granted snapshot",
     );
     assert!(
-        paused.wait("granted snapshot explicit resume").success(),
-        "explicitly resumed granted snapshot should reach SYSTEM_OFF"
+        paused
+            .wait(&format!(
+                "explicitly resumed {transport} granted snapshot root read"
+            ))
+            .success(),
+        "explicitly resumed {transport} granted snapshot should power off after the root read"
     );
     assert_eq!(session_entries(), baseline_sessions);
 
-    let resumed_fixture = SnapshotInputGrantFixture::new("automatic", next_artifacts);
+    let resumed_fixture =
+        SnapshotInputGrantFixture::new(&format!("{transport}-automatic"), next_artifacts);
     let mut resumed = spawn_ready_snapshot_grant_api_launcher(
-        &bundle,
+        bundle,
         &resumed_fixture.manifest,
         resumed_fixture.sensitive_strings(),
-        "snapshot-automatic",
+        &format!("snapshot-{transport}-automatic"),
         false,
+        enable_pci,
     );
     let final_artifacts = resumed_fixture.replace_source_pathnames();
     let resumed_load = http_put(&resumed.socket, "/snapshot/load", &snapshot_load_body(true));
@@ -1460,8 +1482,12 @@ fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restor
         "load and automatically resume granted snapshot",
     );
     assert!(
-        resumed.wait("granted snapshot automatic resume").success(),
-        "automatically resumed granted snapshot should reach SYSTEM_OFF"
+        resumed
+            .wait(&format!(
+                "automatically resumed {transport} granted snapshot root read"
+            ))
+            .success(),
+        "automatically resumed {transport} granted snapshot should power off after the root read"
     );
     assert_eq!(
         fs::read(&final_artifacts.state).expect("final state should read"),
@@ -1493,6 +1519,7 @@ fn grant_test_bundle_recovers_recorded_snapshot_staging_after_worker_sigkill() {
             fixture.sensitive_strings(),
             case,
             true,
+            false,
         );
         fixture.replace_source_file_pathnames();
         configure_and_pause_snapshot_source(&running, &fixture.opened_metrics);
@@ -6350,6 +6377,7 @@ fn run_graceful_signal_case(signal: i32, name: &str) {
 struct SnapshotArtifactSet {
     state: PathBuf,
     memory: PathBuf,
+    root: PathBuf,
 }
 
 #[derive(Debug)]
@@ -6358,10 +6386,12 @@ struct SnapshotSourceGrantFixture {
     manifest: PathBuf,
     kernel: PathBuf,
     metrics: PathBuf,
+    root_backing: PathBuf,
     state_directory: PathBuf,
     memory_directory: PathBuf,
     opened_kernel: PathBuf,
     opened_metrics: PathBuf,
+    opened_root_backing: PathBuf,
     opened_state_directory: PathBuf,
     opened_memory_directory: PathBuf,
 }
@@ -6374,16 +6404,18 @@ impl SnapshotSourceGrantFixture {
         let manifest = canonical_root.join("grant-manifest.json");
         let kernel = canonical_root.join("snapshot-kernel.image");
         let metrics = canonical_root.join("snapshot.metrics");
+        let root_backing = canonical_root.join("snapshot-root.img");
         let state_directory = canonical_root.join("state-output");
         let memory_directory = canonical_root.join("memory-output");
         let opened_kernel = canonical_root.join("opened-snapshot-kernel.image");
         let opened_metrics = canonical_root.join("opened-snapshot.metrics");
+        let opened_root_backing = canonical_root.join("opened-snapshot-root.img");
         let opened_state_directory = canonical_root.join("opened-state-output");
         let opened_memory_directory = canonical_root.join("opened-memory-output");
 
-        fs::write(&kernel, snapshot_continuity_guest_image())
-            .expect("snapshot guest image should write");
+        hard_link_or_copy_fixture(&guest_kernel(), &kernel, "snapshot guest kernel");
         fs::write(&metrics, b"").expect("snapshot metrics fixture should write");
+        hard_link_or_copy_fixture(&guest_ext4_rootfs(), &root_backing, "snapshot root backing");
         fs::create_dir(&state_directory).expect("state output directory should create");
         fs::create_dir(&memory_directory).expect("memory output directory should create");
         let manifest_json = serde_json::json!({
@@ -6400,6 +6432,12 @@ impl SnapshotSourceGrantFixture {
                     "role": "metrics-sink",
                     "access": "write-only",
                     "source": path_text(&metrics),
+                },
+                {
+                    "id": SNAPSHOT_ROOT_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&root_backing),
                 },
                 {
                     "id": SNAPSHOT_STATE_OUTPUT_ID,
@@ -6426,10 +6464,12 @@ impl SnapshotSourceGrantFixture {
             manifest,
             kernel,
             metrics,
+            root_backing,
             state_directory,
             memory_directory,
             opened_kernel,
             opened_metrics,
+            opened_root_backing,
             opened_state_directory,
             opened_memory_directory,
         }
@@ -6439,6 +6479,7 @@ impl SnapshotSourceGrantFixture {
         for (source, opened) in [
             (&self.kernel, &self.opened_kernel),
             (&self.metrics, &self.opened_metrics),
+            (&self.root_backing, &self.opened_root_backing),
         ] {
             fs::rename(source, opened).expect("launcher-opened snapshot file should move");
         }
@@ -6446,6 +6487,8 @@ impl SnapshotSourceGrantFixture {
             .expect("replacement snapshot kernel should write");
         fs::write(&self.metrics, b"replacement metrics must remain unused\n")
             .expect("replacement metrics should write");
+        fs::write(&self.root_backing, vec![0xff_u8; 4096])
+            .expect("replacement snapshot root should write");
     }
 
     fn artifacts(&self) -> SnapshotArtifactSet {
@@ -6464,6 +6507,7 @@ impl SnapshotSourceGrantFixture {
         SnapshotArtifactSet {
             state: self.state_directory.join(state_child),
             memory: self.memory_directory.join(memory_child),
+            root: self.opened_root_backing.clone(),
         }
     }
 
@@ -6472,18 +6516,22 @@ impl SnapshotSourceGrantFixture {
             path_text(&self.manifest),
             path_text(&self.kernel),
             path_text(&self.metrics),
+            path_text(&self.root_backing),
             path_text(&self.state_directory),
             path_text(&self.memory_directory),
             path_text(&self.opened_kernel),
             path_text(&self.opened_metrics),
+            path_text(&self.opened_root_backing),
             path_text(&self.opened_state_directory),
             path_text(&self.opened_memory_directory),
             SNAPSHOT_KERNEL_ID,
             SNAPSHOT_METRICS_ID,
+            SNAPSHOT_ROOT_ID,
             SNAPSHOT_STATE_OUTPUT_ID,
             SNAPSHOT_MEMORY_OUTPUT_ID,
             SNAPSHOT_KERNEL_REF,
             SNAPSHOT_METRICS_REF,
+            SNAPSHOT_ROOT_REF,
             SNAPSHOT_STATE_OUTPUT_REF,
             SNAPSHOT_MEMORY_OUTPUT_REF,
             SNAPSHOT_REPEAT_STATE_OUTPUT_REF,
@@ -6496,6 +6544,18 @@ impl SnapshotSourceGrantFixture {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+}
+
+fn hard_link_or_copy_fixture(source: &Path, destination: &Path, context: &str) {
+    if let Err(link_error) = fs::hard_link(source, destination) {
+        fs::copy(source, destination).unwrap_or_else(|copy_error| {
+            panic!(
+                "{context} should hard-link or copy from {} to {}: hard-link failed: {link_error}; copy failed: {copy_error}",
+                source.display(),
+                destination.display()
+            )
+        });
     }
 }
 
@@ -6516,6 +6576,7 @@ impl SnapshotInputGrantFixture {
         let opened = SnapshotArtifactSet {
             state: replacement_opened_path(&sources.state, case),
             memory: replacement_opened_path(&sources.memory, case),
+            root: replacement_opened_path(&sources.root, case),
         };
         let grants = vec![
             serde_json::json!({
@@ -6529,6 +6590,12 @@ impl SnapshotInputGrantFixture {
                 "role": "snapshot-memory-input",
                 "access": "read-only",
                 "source": path_text(&sources.memory),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_ROOT_ID,
+                "role": "drive-backing",
+                "access": "read-only",
+                "source": path_text(&sources.root),
             }),
         ];
         let manifest_json = serde_json::json!({
@@ -6552,6 +6619,7 @@ impl SnapshotInputGrantFixture {
         for (source, opened) in [
             (&self.sources.state, &self.opened.state),
             (&self.sources.memory, &self.opened.memory),
+            (&self.sources.root, &self.opened.root),
         ] {
             fs::rename(source, opened).expect("launcher-opened snapshot input should move");
         }
@@ -6559,6 +6627,8 @@ impl SnapshotInputGrantFixture {
             .expect("replacement snapshot state should write");
         fs::write(&self.sources.memory, b"replacement memory must not load")
             .expect("replacement snapshot memory should write");
+        fs::write(&self.sources.root, vec![0xff_u8; 4096])
+            .expect("replacement snapshot root must not load");
         self.opened.clone()
     }
 
@@ -6567,12 +6637,16 @@ impl SnapshotInputGrantFixture {
             path_text(&self.manifest),
             path_text(&self.sources.state),
             path_text(&self.sources.memory),
+            path_text(&self.sources.root),
             path_text(&self.opened.state),
             path_text(&self.opened.memory),
+            path_text(&self.opened.root),
             SNAPSHOT_STATE_INPUT_ID,
             SNAPSHOT_MEMORY_INPUT_ID,
+            SNAPSHOT_ROOT_ID,
             SNAPSHOT_STATE_INPUT_REF,
             SNAPSHOT_MEMORY_INPUT_REF,
+            SNAPSHOT_ROOT_REF,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -8885,6 +8959,7 @@ fn spawn_ready_snapshot_grant_api_launcher(
     sensitive: Vec<String>,
     name: &str,
     hold_after_staging_record: bool,
+    enable_pci: bool,
 ) -> RunningApiLauncher {
     initialize_worker_container(bundle);
     let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
@@ -8894,6 +8969,9 @@ fn spawn_ready_snapshot_grant_api_launcher(
     command.arg(GRANT_MANIFEST_OPTION).arg(manifest).arg("--");
     if hold_after_staging_record {
         command.arg(SNAPSHOT_STAGING_HOLD_OPTION);
+    }
+    if enable_pci {
+        command.arg("--enable-pci");
     }
     let mut child = command
         .args(["--api-sock", path_text(&socket)])
@@ -8928,7 +9006,10 @@ fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_pat
     for (path, body, context) in [
         (
             "/machine-config",
-            serde_json::json!({"vcpu_count": 1, "mem_size_mib": 16}),
+            serde_json::json!({
+                "vcpu_count": 1,
+                "mem_size_mib": 256,
+            }),
             "PUT snapshot machine config",
         ),
         (
@@ -8938,8 +9019,22 @@ fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_pat
         ),
         (
             "/boot-source",
-            serde_json::json!({"kernel_image_path": SNAPSHOT_KERNEL_REF}),
+            serde_json::json!({
+                "kernel_image_path": SNAPSHOT_KERNEL_REF,
+                "boot_args": SNAPSHOT_ROOT_BOOT_ARGS,
+            }),
             "PUT snapshot boot source",
+        ),
+        (
+            "/drives/rootfs",
+            serde_json::json!({
+                "drive_id": "rootfs",
+                "path_on_host": SNAPSHOT_ROOT_REF,
+                "is_root_device": true,
+                "is_read_only": true,
+                "io_engine": "Sync",
+            }),
+            "PUT snapshot read-only Sync rootfs",
         ),
     ] {
         assert_http_status(
@@ -8961,7 +9056,7 @@ fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_pat
         204,
         "start snapshot source",
     );
-    wait_for_snapshot_uart_write(&running.socket, metrics_path, PROCESS_TIMEOUT);
+    wait_for_snapshot_root_read(&running.socket, metrics_path, PROCESS_TIMEOUT);
     assert_http_status(
         &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
         204,
@@ -8969,39 +9064,54 @@ fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_pat
     );
 }
 
-fn wait_for_snapshot_uart_write(socket: &Path, metrics: &Path, timeout: Duration) {
+fn wait_for_snapshot_root_read(socket: &Path, metrics: &Path, timeout: Duration) {
     let deadline = Instant::now()
         .checked_add(timeout)
         .expect("snapshot metric deadline should fit");
+    let mut last_count = 0;
+    let mut stable_since = None;
     loop {
         assert_http_status(
             &http_put(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
             204,
             "flush snapshot metrics",
         );
-        if latest_snapshot_uart_write_count(metrics).is_some_and(|count| count >= 1) {
-            return;
+        let count = total_snapshot_root_read_count(metrics);
+        let now = Instant::now();
+        if count >= 1 {
+            if count != last_count {
+                last_count = count;
+                stable_since = Some(now);
+            } else if stable_since
+                .is_some_and(|started| now.duration_since(started) >= Duration::from_millis(500))
+            {
+                return;
+            }
         }
         assert!(
-            Instant::now() < deadline,
-            "snapshot guest did not write readiness byte before timeout"
+            now < deadline,
+            "snapshot source did not complete root I/O before timeout"
         );
-        thread::yield_now();
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
-fn latest_snapshot_uart_write_count(path: &Path) -> Option<u64> {
+fn total_snapshot_root_read_count(path: &Path) -> u64 {
     fs::read_to_string(path)
-        .ok()?
-        .lines()
-        .rev()
-        .find_map(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()?
-                .get("uart")?
-                .get("write_count")?
-                .as_u64()
+        .ok()
+        .map(|output| {
+            output
+                .lines()
+                .filter_map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .ok()?
+                        .get("block_rootfs")?
+                        .get("read_count")?
+                        .as_u64()
+                })
+                .fold(0, u64::saturating_add)
         })
+        .unwrap_or(0)
 }
 
 fn snapshot_create_body() -> String {
@@ -10411,98 +10521,6 @@ fn copy_tree(source: &Path, destination: &Path) {
 
 fn path_text(path: &Path) -> &str {
     path.to_str().expect("test path should be UTF-8")
-}
-
-fn snapshot_continuity_guest_image() -> Vec<u8> {
-    let instructions = [
-        aarch64_movz_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 0), 0),
-        aarch64_movk_x(1, low_u16(SNAPSHOT_GUEST_VMGENID_ADDRESS, 16), 16),
-        aarch64_ldp_x(2, 3, 1),
-        aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
-        aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
-        aarch64_movz_x(7, u16::from(b'R'), 0),
-        aarch64_strb_w(7, 4),
-        aarch64_ldp_x(5, 6, 1),
-        aarch64_cmp_x(5, 2),
-        0x5400_0061,
-        aarch64_cmp_x(6, 3),
-        0x54ff_ff80,
-        aarch64_movz_x(21, low_u16(SNAPSHOT_GUEST_CODE_ADDRESS, 0), 0),
-        aarch64_movk_x(21, low_u16(SNAPSHOT_GUEST_CODE_ADDRESS, 16), 16),
-        aarch64_br(21),
-    ];
-    let continuation = [
-        aarch64_movz_x(18, low_u16(SNAPSHOT_GUEST_READ_ADDRESS, 0), 0),
-        aarch64_movk_x(18, low_u16(SNAPSHOT_GUEST_READ_ADDRESS, 16), 16),
-        aarch64_ldr_x(19, 18, 0),
-        aarch64_movz_x(20, low_u16(SNAPSHOT_GUEST_WRITE_ADDRESS, 0), 0),
-        aarch64_movk_x(20, low_u16(SNAPSHOT_GUEST_WRITE_ADDRESS, 16), 16),
-        aarch64_str_x(19, 20, 0),
-        aarch64_movz_x(7, u16::from(b'C'), 0),
-        aarch64_strb_w(7, 4),
-        aarch64_movz_x(0, 0x0008, 0),
-        aarch64_movk_x(0, 0x8400, 16),
-        0xd400_0002,
-        0x1400_0000,
-    ];
-    let mut image = vec![0; SNAPSHOT_GUEST_IMAGE_HEADER_SIZE];
-    write_snapshot_test_u32(&mut image, 0, 0x1400_0010);
-    write_snapshot_test_u32(&mut image, 4, 0xd503_201f);
-    write_snapshot_test_u64(&mut image, 8, 0);
-    write_snapshot_test_u32(&mut image, 56, SNAPSHOT_GUEST_IMAGE_MAGIC);
-    image.extend(instructions.into_iter().flat_map(u32::to_le_bytes));
-    image.resize(SNAPSHOT_GUEST_CONTINUATION_IMAGE_OFFSET, 0);
-    image.extend(continuation.into_iter().flat_map(u32::to_le_bytes));
-    let image_size = u64::try_from(image.len()).expect("snapshot guest image length should fit");
-    write_snapshot_test_u64(&mut image, 16, image_size);
-    image
-}
-
-fn aarch64_movz_x(register: u32, immediate: u16, shift: u32) -> u32 {
-    0xd280_0000 | ((shift / 16) << 21) | (u32::from(immediate) << 5) | register
-}
-
-fn aarch64_movk_x(register: u32, immediate: u16, shift: u32) -> u32 {
-    0xf280_0000 | ((shift / 16) << 21) | (u32::from(immediate) << 5) | register
-}
-
-fn aarch64_ldp_x(first: u32, second: u32, base: u32) -> u32 {
-    0xa940_0000 | (second << 10) | (base << 5) | first
-}
-
-fn aarch64_cmp_x(left: u32, right: u32) -> u32 {
-    0xeb00_001f | (right << 16) | (left << 5)
-}
-
-fn aarch64_ldr_x(destination: u32, base: u32, byte_offset: u32) -> u32 {
-    assert!(byte_offset.is_multiple_of(8) && byte_offset / 8 <= 0xfff);
-    0xf940_0000 | ((byte_offset / 8) << 10) | (base << 5) | destination
-}
-
-fn aarch64_str_x(source: u32, base: u32, byte_offset: u32) -> u32 {
-    assert!(byte_offset.is_multiple_of(8) && byte_offset / 8 <= 0xfff);
-    0xf900_0000 | ((byte_offset / 8) << 10) | (base << 5) | source
-}
-
-fn aarch64_br(register: u32) -> u32 {
-    0xd61f_0000 | (register << 5)
-}
-
-fn aarch64_strb_w(source: u32, base: u32) -> u32 {
-    0x3900_0000 | (base << 5) | source
-}
-
-fn low_u16(value: u64, shift: u32) -> u16 {
-    u16::try_from((value >> shift) & u64::from(u16::MAX))
-        .expect("masked snapshot immediate should fit")
-}
-
-fn write_snapshot_test_u32(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_snapshot_test_u64(bytes: &mut [u8], offset: usize, value: u64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 #[derive(Debug)]

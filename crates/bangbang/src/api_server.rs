@@ -2279,10 +2279,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use bangbang_hvf::{
-        HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureInput,
-        HvfSnapshotV2EncodeError,
-    };
+    use bangbang_hvf::HvfArm64BootSnapshotV2CaptureError;
     use bangbang_runtime::balloon::{
         BalloonConfig, BalloonConfigInput, BalloonHintingCommandError, BalloonHintingStartInput,
         BalloonHintingStatus, BalloonHintingStatusError, BalloonOptionalStats, BalloonStats,
@@ -2311,14 +2308,22 @@ mod tests {
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactState,
-        NativeSnapshotPublicationOutcome, SnapshotArtifactPaths, SnapshotPublicationOutcome,
-        publish_native_snapshot_artifacts_with, publish_snapshot_artifacts_with,
+        NativeSnapshotPublicationOutcome, NativeV2SnapshotCandidateState, SnapshotArtifactPaths,
+        SnapshotPublicationOutcome, publish_native_snapshot_artifacts_with,
+        publish_snapshot_artifacts_with,
     };
     use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
+    use bangbang_runtime::snapshot_device_v2::{
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
+        SnapshotV2DeviceTransportKind,
+    };
+    use bangbang_runtime::snapshot_format_v2::{
+        NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component,
+        SnapshotV2ComponentDisposition, encode_snapshot_v2_state_with_compatibility_version,
+    };
     use bangbang_runtime::snapshot_memory::write_snapshot_memory_image;
     use bangbang_runtime::snapshot_memory_v2::{
-        SnapshotV2MemoryStateEncodeError, encode_snapshot_v2_state_with_memory,
-        write_snapshot_v2_memory_image_with_cancel,
+        SnapshotV2MemoryBinding, write_snapshot_v2_memory_image_with_cancel,
     };
     use bangbang_runtime::startup::Arm64BootResources;
     use bangbang_runtime::{BackendError, VmmActionError, VmmController};
@@ -2328,11 +2333,11 @@ mod tests {
         BlockBackingUpdate, InstanceStartError, InstanceStartExecutor,
         NativeV1SnapshotCaptureCancellation, NativeV1SnapshotLoadError,
         NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
-        NativeV2SnapshotCaptureCancellation, NativeV2SnapshotCaptureError,
-        NativeV2SnapshotLoadError, NativeV2SnapshotPublicationError,
-        NativeV2SnapshotPublicationProducerError, ProcessSessionDiagnostics,
-        ProcessSessionExitStatus, ProcessVmm, ProcessVmnetAuthority, SnapshotV1LoadSuccess,
-        SnapshotV2LoadSuccess,
+        NativeV2SnapshotCaptureError, NativeV2SnapshotLoadError, NativeV2SnapshotPublicationError,
+        NativeV2SnapshotPublicationProducerError, NativeV2SnapshotPublicationRequest,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSnapshotV2RootLoadCompletion,
+        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess, ProcessVmm,
+        ProcessVmnetAuthority, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
     };
 
     use super::*;
@@ -2855,14 +2860,19 @@ mod tests {
         fn publish_snapshot_v2(
             &mut self,
             _session: &mut Self::Session,
-            _input: HvfArm64BootSnapshotV2CaptureInput,
-            _serial_config: SerialConfig,
+            request: NativeV2SnapshotPublicationRequest,
             paths: &SnapshotArtifactPaths,
-            cancellation: NativeV2SnapshotCaptureCancellation,
         ) -> Result<NativeSnapshotPublicationOutcome, NativeV2SnapshotPublicationError> {
             if !self.snapshot_operations_succeed {
                 return Err(NativeV2SnapshotPublicationError::SessionUnavailable);
             }
+            let NativeV2SnapshotPublicationRequest {
+                input: _,
+                serial_config: _,
+                storage_configs: _,
+                expected_transport,
+                cancellation,
+            } = request;
             if let Some(snapshot_gate) = &self.snapshot_gate {
                 snapshot_gate.enter_and_wait(&cancellation);
             }
@@ -2885,24 +2895,7 @@ mod tests {
                             },
                         )
                     })?;
-                let encoded = encode_snapshot_v2_state_with_memory(&binding).map_err(|source| {
-                    let source = match source {
-                        SnapshotV2MemoryStateEncodeError::Binding(source) => {
-                            HvfSnapshotV2EncodeError::Memory(source)
-                        }
-                        SnapshotV2MemoryStateEncodeError::State(source) => {
-                            HvfSnapshotV2EncodeError::Container(source)
-                        }
-                    };
-                    NativeV2SnapshotPublicationProducerError::Capture(
-                        NativeV2SnapshotCaptureError::Encode { source },
-                    )
-                })?;
-                NativeSnapshotArtifactState::from_current_v2(encoded).map_err(|source| {
-                    NativeV2SnapshotPublicationProducerError::Capture(
-                        NativeV2SnapshotCaptureError::ClosedState { source },
-                    )
-                })
+                Ok(fake_native_v2_current_state(&binding, expected_transport))
             })
             .map_err(Box::new)
             .map_err(NativeV2SnapshotPublicationError::Transaction)
@@ -2965,6 +2958,57 @@ mod tests {
             Ok(SnapshotV2LoadSuccess::new(
                 TestSession::without_boot_run_loop_status(),
                 commit,
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        fn load_prepared_snapshot_v2_root(
+            &mut self,
+            request: ProcessSnapshotV2RootLoadRequest<'_>,
+        ) -> Result<ProcessSnapshotV2RootLoadSuccess<Self::Session>, NativeV2SnapshotLoadError>
+        {
+            let ProcessSnapshotV2RootLoadRequest {
+                controller: _,
+                vmnet_authority: _,
+                grant_authority: _,
+                pci_enabled: _,
+                input,
+                candidate: _,
+                memory: _,
+            } = request;
+            if !self.snapshot_operations_succeed {
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::InvalidState("test snapshot load failed"),
+                ));
+            }
+            let boot_source = BootSourceConfigInput::new("/private/fake-api-restored-vmlinux")
+                .validate()
+                .map_err(|_| {
+                    NativeV2SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                        "fake snapshot boot configuration failed",
+                    ))
+                })?;
+            let root =
+                DriveConfigInput::new("root", "root", "/private/fake-api-restored-root", true)
+                    .with_is_read_only(true)
+                    .with_io_engine(DriveIoEngine::Sync)
+                    .validate()
+                    .map_err(|_| {
+                        NativeV2SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                            "fake snapshot root configuration failed",
+                        ))
+                    })?;
+            let commit = SnapshotV2ControllerCommit::try_new_with_root(
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages()),
+                boot_source,
+                root,
+                input.resume_vm(),
+            )
+            .map_err(NativeV2SnapshotLoadError::Allocation)?;
+            Ok(ProcessSnapshotV2RootLoadSuccess::new(
+                TestSession::without_boot_run_loop_status(),
+                commit,
+                ProcessSnapshotV2RootLoadCompletion::empty_for_test(),
             ))
         }
     }
@@ -3039,6 +3083,60 @@ mod tests {
         env::temp_dir().join(format!("bb-{name}-{}-{nanos}.sock", std::process::id()))
     }
 
+    fn fake_native_v2_current_state(
+        binding: &SnapshotV2MemoryBinding,
+        transport: SnapshotV2DeviceTransportKind,
+    ) -> NativeSnapshotArtifactState {
+        let fixture = match transport {
+            SnapshotV2DeviceTransportKind::Mmio => {
+                include_str!("../../runtime/src/snapshot_device_v2/fixtures/mmio.hex")
+            }
+            SnapshotV2DeviceTransportKind::Pci => {
+                include_str!("../../runtime/src/snapshot_device_v2/fixtures/pci.hex")
+            }
+        };
+        let fixture = fixture.trim();
+        let graph_bytes = fixture
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
+                u8::from_str_radix(pair, 16).expect("fixture hex should decode")
+            })
+            .collect::<Vec<_>>();
+        let graph = SnapshotV2DeviceGraph::decode(
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &graph_bytes,
+        )
+        .expect("fixed native-v2 graph should decode")
+        .encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+        .expect("fixed native-v2 graph should encode");
+        let memory = binding
+            .encode()
+            .expect("native-v2 fixture memory binding should encode");
+        let components = [
+            SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &memory,
+            ),
+            SnapshotV2Component::new(
+                NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &graph,
+            ),
+        ];
+        let encoded = encode_snapshot_v2_state_with_compatibility_version(
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &[],
+            &components,
+        )
+        .expect("native-v2 fixture state should encode");
+        NativeV2SnapshotCandidateState::from_device_graph_v2_4(encoded)
+            .expect("native-v2 fixture candidate should close")
+            .into_current_artifact_state()
+    }
+
     #[cfg(target_os = "macos")]
     fn native_v2_snapshot_fixture(name: &str) -> (PathBuf, PathBuf) {
         let state_path = unique_socket_path(&format!("{name}-state")).with_extension("state");
@@ -3054,8 +3152,10 @@ mod tests {
             let binding =
                 write_snapshot_v2_memory_image_with_cancel(&memory, &mut writer, |_| false)
                     .map_err(|_| ())?;
-            let encoded = encode_snapshot_v2_state_with_memory(&binding).map_err(|_| ())?;
-            NativeSnapshotArtifactState::from_current_v2(encoded).map_err(|_| ())
+            Ok::<_, ()>(fake_native_v2_current_state(
+                &binding,
+                SnapshotV2DeviceTransportKind::Mmio,
+            ))
         })
         .expect("native-v2 fixture should publish");
         (state_path, memory_path)
@@ -7409,6 +7509,12 @@ mod tests {
             handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
             bangbang_api::http::StatusCode::NoContent
         );
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("root", "root", "/tmp/snapshot-stateful-root", true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("snapshot root should configure");
         let start_response = put_action_over_socket(&mut vmm, "snap-start", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
@@ -7507,6 +7613,12 @@ mod tests {
             .status(),
             bangbang_api::http::StatusCode::NoContent
         );
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("root", "root", "/tmp/snapshot-rootfs.ext4", true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("snapshot root should configure");
         let metrics_path =
             unique_socket_path("snapshot-public-create-metrics").with_extension("out");
         let metrics_body = serde_json::json!({"metrics_path": metrics_path}).to_string();
@@ -9064,6 +9176,12 @@ mod tests {
             .status(),
             bangbang_api::http::StatusCode::NoContent
         );
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("root", "root", "/tmp/snapshot-metrics-root", true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("snapshot root should configure");
         let start_response = put_action_over_socket(&mut vmm, "scs", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         let pause_response = request_over_socket(
@@ -11217,6 +11335,17 @@ mod tests {
             &metrics_path,
         )))
         .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new(
+                "root",
+                "root",
+                "/tmp/snapshot-serialization-rootfs.ext4",
+                true,
+            )
+            .with_is_read_only(true)
+            .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("snapshot root should configure");
         vmm.handle_action(VmmAction::InstanceStart)
             .expect("instance should start");
         vmm.handle_action(VmmAction::Pause)

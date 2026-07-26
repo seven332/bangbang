@@ -24,6 +24,7 @@ use crate::pci::{
     PciType0GuestState,
 };
 use crate::snapshot_format::SnapshotFormatVersion;
+use crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
 use crate::storage_capture::{
     CaptureReadyBlockDeviceState, StorageDeviceOrigin, StorageRetryState, StorageTransportState,
 };
@@ -44,11 +45,16 @@ use crate::virtio_pci::{
 };
 
 /// Exact outer native-v2 version understood by the first device-graph codec.
-///
-/// This is a payload compatibility constant. It does not change the advertised
-/// native-v2 writer version.
 pub const NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION: SnapshotFormatVersion =
     SnapshotFormatVersion::new(2, 4, 0);
+
+const _: () = assert!(
+    NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION.major() == NATIVE_V2_SNAPSHOT_VERSION.major()
+        && NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor()
+            == NATIVE_V2_SNAPSHOT_VERSION.minor()
+        && NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION.patch()
+            == NATIVE_V2_SNAPSHOT_VERSION.patch()
+);
 
 /// Maximum encoded size of one native-v2 2.4 device graph.
 pub const NATIVE_V2_DEVICE_GRAPH_MAX_BYTES: usize = 64 * 1024;

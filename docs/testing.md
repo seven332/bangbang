@@ -561,9 +561,10 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.3.0` writer additionally admits machine/global/topology kinds 2–4
-and per-vCPU kind 5 introduced in minor 2, plus singleton time kind 6
-introduced in minor 3. The mutation corpus
+current `2.4.0` writer additionally admits machine/global/topology kinds 2–4
+and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
+minor 3, and mandatory singleton device-graph kind 7 introduced in minor 4.
+Exact `2.3.0` remains the legacy device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
 zero/order/duplicate/unknown cases, and component
@@ -575,7 +576,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.3.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.4.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -651,18 +652,19 @@ scripts/run-integration-tests.sh --test native_v2_process
 
 The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
-minimal two-vCPU guest does not touch serial or optional devices. The test
-starts and pauses the real process-owned HVF supervisor, publishes one current
-native-v2 pair, resumes and repauses the source, publishes a fresh recapture,
-and drops the source. It restores the first immutable pair into one fresh
-normal process initially `Paused`, proves the pristine no-drive profile and
-fresh destination UART/metrics state, explicitly resumes and repauses it, then
-shuts it down. A second fresh process restores the same pair with resume intent,
-through already-opened contained state/memory descriptors after both source
+minimal two-vCPU guest does not touch serial or optional devices beyond the
+required read-only root. The first test starts and pauses the real
+process-owned HVF supervisor, publishes one current 2.4 MMIO-root pair, resumes
+and repauses the source, publishes a fresh recapture, and drops the source. It
+restores the first immutable pair into one fresh normal process initially
+`Paused`, proves the exact root configuration plus fresh destination
+UART/metrics state, explicitly resumes and repauses it, then shuts it down. A
+second fresh process restores the same pair with resume intent through
+already-opened contained state/memory/root descriptors after both artifact
 paths are replaced, uses the ordinary action gate to reach `Running`, pauses,
-and shuts down. The replacements remain untouched. The adapter also checks the
-exact default FDT/UART/RTC/time shell and admits no optional device. This group
-is part of the default integration set and must run without
+and shuts down. The replacements remain untouched. The second ignored test
+exercises complete MMIO and PCI root-owner commit/rollback boundaries. This
+group is part of the default integration set and must run without
 `--allow-unsupported` on supported Apple Silicon. It adds no API, CLI,
 config-file, or environment activation for native-v2.
 
@@ -1534,12 +1536,13 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating a native-v2 2.3 pair into separate
-  output directories, reusing both retained directories for a second successful
-  pair, preserving all finals on collision, and keeping same-GrantId concurrent
-  source workers in their own directories; granted early description and two
-  fresh state/memory File/COW loads then prove explicit and automatic resume
-  through guest `SYSTEM_OFF`;
+- exact external snapshot grants creating native-v2 2.4 single-root MMIO and
+  PCI pairs into separate output directories, reusing both retained directories
+  for a second successful pair, preserving all finals on collision, and keeping
+  same-GrantId concurrent source workers in their own directories; granted
+  early description and two fresh state/memory/root File/COW loads per
+  transport then prove exact root reconstruction, explicit and automatic
+  resume, and a root-read-conditional guest `SYSTEM_OFF`;
 - source kernel/root/metrics and load state/memory pathnames replaced after the
   launcher opens them, with no tag reopen, no staging residue, redacted
   wrong-role output, and no extra private session namespace;
@@ -1693,8 +1696,8 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.3.0` output for `--snapshot-version`, exact description of
-native-v1 and current/compatible native-v2 fixtures, and explicit pinned
+checks exact `v2.4.0` output for `--snapshot-version`, exact description of
+native-v1, legacy `2.3.0`, and current/compatible native-v2 fixtures, and explicit pinned
 Firecracker/unknown incompatibility. It also covers missing, non-regular,
 oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
 unsupported-version, incompatible-architecture, and incompatible-page-size
@@ -1741,25 +1744,32 @@ kernel, deterministic tiny initrd, and generated direct-boot ext4 rootfs,
 starts `bangbang` as a child process, configures the VM through the Unix-socket
 API or a Firecracker-shaped config file depending on the scenario, and waits
 for the guest to write deterministic markers to host-observable outputs. The
-native-v2 snapshot scenario uses a test-only arm64 Image with a valid Linux
-header and no rootfs dependency for guest control flow. Its primary vCPU brings
-up a secondary vCPU; both reach distinct source memory checkpoints without
-mutating the canonical UART. The host pauses and creates through
-`/snapshot/create`, verifies the real CLI reports `v2.3.0`, checks
-collision/no-clobber redaction, and terminates the source. Fresh signed
-processes repeatedly load the same immutable pair: one remains paused until
-public `PATCH /vm`, and one uses `resume_vm: true`. Both vCPUs then execute
-distinct continuation pages, read and write distinct private COW pages, emit
-distinct destination UART markers, and reach PSCI shutdown. The state and
-memory artifacts remain byte-identical after both destinations. A third
-Paused destination closes the sole stdout reader before resume; deterministic
-guest UART output reaches the ordinary `BrokenPipe` terminal path without
-SIGPIPE killing the process, and the API socket is cleaned. Run just this proof
-with:
+native-v2 snapshot scenarios configure exactly one read-only Sync root and run
+the public lifecycle over both default MMIO and `--enable-pci`. The real-root
+case waits until a positive root-read metric is stable for 500 ms before
+pausing, proving the source has already followed live MMIO or PCI root I/O.
+The source UART must remain canonical, while its Linux-consumed FDT bytes are
+captured and CRC-bound without being reparsed as trusted post-boot topology.
+Creation through `/snapshot/create` then verifies the real CLI reports
+`v2.4.0`. Fresh signed processes repeatedly load the same immutable pair: one
+remains paused until public `PATCH /vm`, and one uses `resume_vm: true`. The
+paused destination is also publicly recaptured and its decoded root graph must
+equal the source graph. After resume Linux reads the known root marker through
+the reconstructed virtio-block owner, observes completion through the restored
+transport interrupt path, and calls PSCI shutdown only when that read matches;
+`panic=0` and a failure sleep make any boot or read failure time out instead of
+producing a false success. State and memory artifacts remain byte-identical
+after every destination. The companion two-vCPU bare-guest case retains
+deterministic pre-capture memory
+checkpoints, collision/no-clobber redaction, all-vCPU private-COW continuation,
+recapture, and root-owner rollback. Its terminal destination closes the sole
+stdout reader before resume; deterministic guest UART output reaches the
+ordinary `BrokenPipe` terminal path without SIGPIPE killing the process, and
+the API socket is cleaned. Run just the real-root proof with:
 
 ```sh
 scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
-  macos_arm64::signed_executable_creates_and_restores_native_v2_snapshot_across_processes \
+  macos_arm64::signed_executable_restores_native_v2_root_io_over_mmio_and_pci \
   --exact
 ```
 

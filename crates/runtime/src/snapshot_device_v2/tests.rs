@@ -354,10 +354,10 @@ fn semantic_accessors_and_debug_output_are_stable_and_redacted() {
 }
 
 #[test]
-fn exact_outer_version_is_required_without_advancing_public_native_v2() {
+fn exact_current_outer_version_is_required() {
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        SnapshotFormatVersion::new(2, 3, 0)
+        SnapshotFormatVersion::new(2, 4, 0)
     );
     let graph = mmio_graph();
     let bytes = encoded(&graph);

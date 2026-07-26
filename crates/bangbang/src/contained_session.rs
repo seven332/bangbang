@@ -2926,8 +2926,8 @@ mod platform {
     pub(crate) use tests::{
         TestDirectory as TestVhostDirectory, empty_grant_authority_for_vhost_test,
         file_grant_authority_for_test, root_file_grant_authority_for_test,
-        snapshot_file_grant_authority_for_test, vhost_directory_authority_for_test,
-        vsock_directory_authority_for_test,
+        snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
+        vhost_directory_authority_for_test, vsock_directory_authority_for_test,
     };
 
     #[cfg(test)]
@@ -3174,23 +3174,26 @@ mod platform {
         }
 
         fn snapshot_file_registry(state_path: &Path, memory_path: &Path) -> GrantRegistry {
+            snapshot_file_registry_with_root(state_path, memory_path, None)
+        }
+
+        fn snapshot_root_file_registry(
+            state_path: &Path,
+            memory_path: &Path,
+            root_path: &Path,
+        ) -> GrantRegistry {
+            snapshot_file_registry_with_root(state_path, memory_path, Some(root_path))
+        }
+
+        fn snapshot_file_registry_with_root(
+            state_path: &Path,
+            memory_path: &Path,
+            root_path: Option<&Path>,
+        ) -> GrantRegistry {
             let session = SessionId::from_bytes([33; 32]);
             let batch = BatchId::from_bytes([34; 16]);
             let mut staged = StagedGrantBatch::new(session);
-            staged
-                .accept(received(
-                    session,
-                    batch,
-                    0,
-                    GrantRecord::Begin {
-                        grant_count: 2,
-                        record_count: 4,
-                        bookmark_bytes: 0,
-                    },
-                    None,
-                ))
-                .expect("snapshot grant begin should stage");
-            for (sequence, (id, role, path)) in [
+            let mut grants = vec![
                 (
                     "snapshot-state",
                     ResourceRole::SnapshotStateInput,
@@ -3201,10 +3204,28 @@ mod platform {
                     ResourceRole::SnapshotMemoryInput,
                     memory_path,
                 ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            ];
+            if let Some(root_path) = root_path {
+                grants.push(("drive-ro", ResourceRole::DriveBacking, root_path));
+            }
+            let grant_count = u16::try_from(grants.len()).expect("snapshot grant count should fit");
+            let record_count = grant_count
+                .checked_add(2)
+                .expect("snapshot record count should fit");
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    0,
+                    GrantRecord::Begin {
+                        grant_count,
+                        record_count,
+                        bookmark_bytes: 0,
+                    },
+                    None,
+                ))
+                .expect("snapshot grant begin should stage");
+            for (sequence, (id, role, path)) in grants.into_iter().enumerate() {
                 let (record, descriptor) = file_record(id, role, GrantAccess::ReadOnly, path);
                 staged
                     .accept(received(
@@ -3220,10 +3241,10 @@ mod platform {
                 .accept(received(
                     session,
                     batch,
-                    3,
+                    u64::from(record_count - 1),
                     GrantRecord::Commit {
-                        grant_count: 2,
-                        record_count: 4,
+                        grant_count,
+                        record_count,
                         bookmark_bytes: 0,
                     },
                     None,
@@ -3391,6 +3412,15 @@ mod platform {
             memory_path: &Path,
         ) -> GrantAuthority {
             let mut registry = snapshot_file_registry(state_path, memory_path);
+            GrantAuthority::new(registry.take_file_registry())
+        }
+
+        pub(crate) fn snapshot_root_file_grant_authority_for_test(
+            state_path: &Path,
+            memory_path: &Path,
+            root_path: &Path,
+        ) -> GrantAuthority {
+            let mut registry = snapshot_root_file_registry(state_path, memory_path, root_path);
             GrantAuthority::new(registry.take_file_registry())
         }
 
@@ -4597,5 +4627,6 @@ pub(crate) use platform::{
 pub(crate) use platform::{
     TestVhostDirectory, empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
     root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
-    vhost_directory_authority_for_test, vsock_directory_authority_for_test,
+    snapshot_root_file_grant_authority_for_test, vhost_directory_authority_for_test,
+    vsock_directory_authority_for_test,
 };

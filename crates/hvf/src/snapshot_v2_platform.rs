@@ -30,8 +30,9 @@ use bangbang_runtime::snapshot_device_v2::{
     SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind, SnapshotV2RootRestorePlan,
     SnapshotV2RootRestorePlanError,
 };
+use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
 use bangbang_runtime::snapshot_memory_v2::{
-    SnapshotV2MemoryBinding, write_snapshot_v2_memory_image,
+    SnapshotV2MemoryBinding, write_snapshot_v2_memory_image_with_compatibility_version,
 };
 use bangbang_runtime::startup::{
     Arm64BootResourceError, Arm64BootRtcDevice, Arm64BootSerialDevice, Arm64BootSerialDeviceConfig,
@@ -254,7 +255,7 @@ pub enum PrepareHvfSnapshotV2RootPlanError {
     ResourcePlan,
     /// The retained GIC cannot supply the deterministic SPI sequence.
     Interrupt(HvfInterruptLineAllocationError),
-    /// The retained FDT is not the exact root-bearing product shell.
+    /// Source-profile or root metadata cannot reconstruct the exact product shell.
     ProcessFdt {
         /// Value-free mismatch category.
         mismatch: HvfSnapshotV2ProcessFdtMismatch,
@@ -300,6 +301,12 @@ impl fmt::Display for PrepareHvfSnapshotV2RootPlanError {
             Self::ProcessFdt { .. } => "process FDT",
             Self::TimeIdentity(_) => "time identity",
         };
+        if let Self::ProcessFdt { mismatch } = self {
+            return write!(
+                formatter,
+                "native-v2 root preparation {category} ({mismatch}) failed"
+            );
+        }
         write!(formatter, "native-v2 root preparation {category} failed")
     }
 }
@@ -483,7 +490,7 @@ pub enum HvfSnapshotV2PlatformRestoreFailure {
     FdtRead(GuestMemoryAccessError),
     /// Supplied memory does not contain the prepared FDT identity.
     FdtIdentity,
-    /// The retained FDT is not the exact minimal destination process shell.
+    /// Retained legacy FDT or current source-profile evidence is not exact.
     ProcessShellFdt {
         mismatch: HvfSnapshotV2ProcessFdtMismatch,
     },
@@ -1030,8 +1037,12 @@ impl RestoredHvfSnapshotV2Platform {
             &pvtime_capture,
         )
         .map_err(|source| HvfArm64BootSnapshotV2CaptureError::Time { source })?;
-        let memory_binding = write_snapshot_v2_memory_image(memory, memory_writer)
-            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
+        let memory_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+            memory,
+            memory_writer,
+            NATIVE_V2_LEGACY_PLATFORM_VERSION,
+        )
+        .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
         HvfSnapshotV2PlatformState::try_new(
             memory_binding,
             parts.machine.clone(),
@@ -1134,8 +1145,11 @@ impl Drop for RestoredHvfSnapshotV2Platform {
 /// Proves an exact 2.4 root graph and product shell before backing or HVF access.
 ///
 /// This boundary constructs no backend, VM, dispatcher, transport endpoint, or
-/// scheduler. The returned owner still contains the inert selector solely so
-/// the destination authority layer can resolve one read-only backing.
+/// scheduler. It integrity-binds the retained live FDT bytes but derives the
+/// product shell from source-profile evidence and typed state because a booted
+/// guest may already have consumed or reclaimed those bytes. The returned owner
+/// still contains the inert selector solely so the destination authority layer
+/// can resolve one read-only backing.
 pub fn prepare_hvf_snapshot_v2_root_plan(
     state: HvfSnapshotV2State,
     memory: GuestMemory,
@@ -1146,12 +1160,12 @@ pub fn prepare_hvf_snapshot_v2_root_plan(
     if !memory_matches_binding(&memory, platform.memory()) {
         return Err(PrepareHvfSnapshotV2RootPlanError::MemoryTopology);
     }
-    let fdt = verified_fdt_bytes(&memory, platform.machine())
+    verified_fdt_bytes(&memory, platform.machine())
         .map_err(|source| PrepareHvfSnapshotV2RootPlanError::Fdt(Box::new(source)))?;
     let root = SnapshotV2RootRestorePlan::prepare(graph, &memory, now)
         .map_err(PrepareHvfSnapshotV2RootPlanError::Root)?;
     let resources = prepare_root_resource_plan(&platform, &root, process)?;
-    validate_root_process_fdt(&fdt, &platform, &root, resources)
+    validate_root_process_profile(&platform, &root, resources)
         .map_err(|mismatch| PrepareHvfSnapshotV2RootPlanError::ProcessFdt { mismatch })?;
 
     prepare_arm64_snapshot_time_identity(
@@ -1190,8 +1204,9 @@ pub fn restore_hvf_snapshot_v2_platform(
 
 /// Reconstruct one native-v2 platform with the exact default process UART.
 ///
-/// The retained FDT, minimal interrupt sequence, and fresh output owner are
-/// validated and installed before Hypervisor.framework VM construction.
+/// The retained live FDT identity, source process profile, minimal interrupt
+/// sequence, and fresh output owner are validated and installed before
+/// Hypervisor.framework VM construction.
 pub fn restore_hvf_snapshot_v2_process_platform(
     state: HvfSnapshotV2PlatformState,
     memory: GuestMemory,
@@ -2096,14 +2111,14 @@ fn prepare_process_shell(
     }
     let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
         .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
-    let (shell, root) = match shell_restore {
+    let (shell, root, product_process_profile) = match shell_restore {
         HvfSnapshotV2ProcessShellRestore::DeviceFree(shell) => {
             if gic.msi.is_some() {
                 return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
                     mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
                 });
             }
-            (shell, None)
+            (shell, None, false)
         }
         HvfSnapshotV2ProcessShellRestore::Root {
             shell,
@@ -2131,7 +2146,7 @@ fn prepare_process_shell(
                     }
                 }
             }
-            (shell, Some((partuuid, resources.transport())))
+            (shell, Some((partuuid, resources.transport())), true)
         }
     };
     let serial_interrupt = allocator
@@ -2148,14 +2163,22 @@ fn prepare_process_shell(
     {
         return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
     }
-    validate_process_fdt(
-        fdt_bytes,
-        state,
-        serial_interrupt,
-        root.as_ref()
-            .map(|(partuuid, transport)| (partuuid.as_deref(), *transport)),
-    )
-    .map_err(|mismatch| HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt { mismatch })?;
+    if product_process_profile {
+        if !state.machine().fdt().is_product_process_profile() {
+            return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+            });
+        }
+    } else {
+        validate_process_fdt(
+            fdt_bytes,
+            state,
+            serial_interrupt,
+            root.as_ref()
+                .map(|(partuuid, transport)| (partuuid.as_deref(), *transport)),
+        )
+        .map_err(|mismatch| HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt { mismatch })?;
+    }
 
     let serial = register_arm64_boot_serial_mmio(
         &mut dispatcher,
@@ -2179,6 +2202,7 @@ fn validate_default_process_fdt(
     validate_process_fdt(bytes, state, serial_interrupt, None)
 }
 
+#[cfg(test)]
 fn validate_root_process_fdt(
     bytes: &[u8],
     state: &HvfSnapshotV2PlatformState,
@@ -2194,6 +2218,30 @@ fn validate_root_process_fdt(
         resources.serial_interrupt,
         Some((root.partuuid(), resources.transport)),
     )
+}
+
+fn validate_root_process_profile(
+    state: &HvfSnapshotV2PlatformState,
+    root: &SnapshotV2RootRestorePlan,
+    resources: HvfSnapshotV2RootResourcePlan,
+) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
+    if !state.machine().fdt().is_product_process_profile() {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Profile);
+    }
+    if root.transport().kind() != resources.transport().kind() {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Root);
+    }
+    canonical_process_root_block_command_line(
+        state.machine().boot().boot_arguments(),
+        matches!(
+            resources.transport(),
+            HvfSnapshotV2RootTransportPlan::Pci { .. }
+        ),
+        root.partuuid(),
+        true,
+    )
+    .map_err(|_| HvfSnapshotV2ProcessFdtMismatch::Boot)?;
+    Ok(())
 }
 
 fn validate_process_fdt(
@@ -2910,6 +2958,8 @@ fn restore_protocol_stages(vcpu_count: usize) -> Vec<HvfSnapshotV2PlatformRestor
 
 #[cfg(test)]
 mod tests {
+    use bangbang_runtime::snapshot_memory_v2::write_snapshot_v2_memory_image;
+
     use super::*;
 
     fn root_restore_memory() -> GuestMemory {
@@ -3007,9 +3057,7 @@ mod tests {
         memory
     }
 
-    fn coherent_mmio_root_plan_fixture(
-        include_root_in_fdt: bool,
-    ) -> (
+    fn coherent_mmio_root_plan_fixture() -> (
         HvfSnapshotV2State,
         GuestMemory,
         HvfSnapshotV2RootProcessConfig,
@@ -3072,14 +3120,10 @@ mod tests {
             },
             interrupt_line,
         };
-        let root_devices = include_root_in_fdt
-            .then_some(root_device)
-            .into_iter()
-            .collect::<Vec<_>>();
         let fdt = build_process_fdt_fixture_with_profile(
             &platform,
             root_shell_devices(&platform, resources),
-            &root_devices,
+            &[root_device],
             &command_line,
             None,
         );
@@ -3097,7 +3141,7 @@ mod tests {
             )
             .expect("coherent restore memory should encode");
         let (_old_binding, machine, global, topology, vcpus, time) = platform.into_parts();
-        let fdt = crate::snapshot_v2::HvfSnapshotV2FdtState::try_new(
+        let fdt = crate::snapshot_v2::HvfSnapshotV2FdtState::try_new_product_process_profile(
             fdt_address,
             fdt.len(),
             crc64(0, &fdt),
@@ -3549,7 +3593,7 @@ mod tests {
 
     #[test]
     fn exact_root_preparation_accepts_one_coherent_pathless_mmio_plan() {
-        let (state, memory, process) = coherent_mmio_root_plan_fixture(true);
+        let (state, memory, process) = coherent_mmio_root_plan_fixture();
         let prepared = prepare_hvf_snapshot_v2_root_plan(state, memory, process, Instant::now())
             .expect("coherent exact-2.4 root plan should prepare");
 
@@ -3563,14 +3607,55 @@ mod tests {
     }
 
     #[test]
-    fn exact_root_preparation_rejects_hostile_fdt_before_backing() {
-        let (state, memory, process) = coherent_mmio_root_plan_fixture(false);
+    fn exact_root_preparation_integrity_binds_guest_consumed_fdt_bytes() {
+        let (state, mut memory, process) = coherent_mmio_root_plan_fixture();
+        let (platform, graph) = state.into_parts();
+        let fdt = platform.machine().fdt();
+        let consumed = vec![0xa5; usize::try_from(fdt.size()).expect("FDT size should fit")];
+        memory
+            .write_slice(&consumed, fdt.address())
+            .expect("guest-consumed FDT bytes should write");
+        let (binding, machine, global, topology, vcpus, time) = platform.into_parts();
+        let fdt = crate::snapshot_v2::HvfSnapshotV2FdtState::try_new_product_process_profile(
+            fdt.address(),
+            consumed.len(),
+            crc64(0, &consumed),
+        )
+        .expect("consumed FDT identity should validate");
+        let machine = HvfSnapshotV2MachineState::try_new(
+            machine.machine(),
+            machine.boot().clone(),
+            fdt,
+            machine.cpu_template().cloned(),
+        )
+        .expect("product machine metadata should validate");
+        let platform =
+            HvfSnapshotV2PlatformState::try_new(binding, machine, global, topology, vcpus, time)
+                .expect("product platform should cross-validate");
+        let state = HvfSnapshotV2State::try_new(platform, graph)
+            .expect("product state should cross-validate");
 
+        prepare_hvf_snapshot_v2_root_plan(state, memory, process, Instant::now())
+            .expect("typed product profile should not parse guest-consumed FDT bytes");
+    }
+
+    #[test]
+    fn exact_root_preparation_rejects_changed_live_fdt_identity() {
+        let (state, mut memory, process) = coherent_mmio_root_plan_fixture();
+        let fdt_address = state.platform().machine().fdt().address();
+        memory
+            .write_slice(&[0xff], fdt_address)
+            .expect("changed live FDT byte should write");
+
+        let error = prepare_hvf_snapshot_v2_root_plan(state, memory, process, Instant::now())
+            .expect_err("changed live FDT bytes must fail integrity binding");
         assert!(matches!(
-            prepare_hvf_snapshot_v2_root_plan(state, memory, process, Instant::now()),
-            Err(PrepareHvfSnapshotV2RootPlanError::ProcessFdt {
-                mismatch: HvfSnapshotV2ProcessFdtMismatch::RootInventory,
-            })
+            error,
+            PrepareHvfSnapshotV2RootPlanError::Fdt(source)
+                if matches!(
+                    source.as_ref(),
+                    HvfSnapshotV2PlatformRestoreFailure::FdtIdentity
+                )
         ));
     }
 

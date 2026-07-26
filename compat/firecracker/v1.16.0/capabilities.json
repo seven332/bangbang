@@ -8512,7 +8512,7 @@
     {
       "id": "corpus:device-hotplug",
       "family": "runtime-device-management",
-      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification and PCI snapshot persistence remain outside the pinned live corpus and the supported native-v1 profile.",
+      "summary": "Implement the complete pinned Developer Preview live-device contract for non-root virtio-block, virtio-pmem, and virtio-net under public all-virtio PCI. Running and Paused PUT/DELETE use one failure-atomic owner inventory, require manual guest rescan/removal, preserve type-scoped IDs and global network-MAC uniqueness, commit live configuration last, and release exact backing, packet-I/O, mapping, metrics, scheduler, dispatcher, BAR, MSI-X, and function ownership before shared capacity is reusable. Default MMIO rejects runtime mutation. Automatic guest notification and persistence of runtime-attached PCI devices remain outside the pinned live corpus and the supported native-v1 profile; current native-v2 independently supports only its exact startup root.",
       "source_refs": [
         "corpus:device-hotplug"
       ],
@@ -9175,7 +9175,7 @@
     {
       "id": "corpus:snapshot-versioning",
       "family": "snapshots",
-      "summary": "Native-v2 provides bounded compatible-minor decoding, a current 2.3.0 public writer, exact CLI version/description output, immutable repeated File/COW loads, and explicit Firecracker incompatibility. Continue auditing editor/rebase tooling, general device-schema evolution, Firecracker artifact interoperability, and broad portability owned by the pinned snapshot-versioning corpus.",
+      "summary": "Native-v2 provides bounded compatible-minor decoding, exact legacy device-free 2.3 loading, a current graph-required 2.4.0 public writer for one read-only File/Sync root over MMIO or PCI, exact CLI version/description output, immutable repeated File/COW loads, and explicit Firecracker incompatibility. Continue auditing editor/rebase tooling, optional/general device-schema evolution, Firecracker artifact interoperability, and broad portability owned by the pinned snapshot-versioning corpus.",
       "source_refs": [
         "corpus:snapshot-versioning"
       ],
@@ -9809,7 +9809,7 @@
     {
       "id": "firecracker-argument:snapshot-version",
       "family": "process",
-      "summary": "Report the current bangbang-native public writer version v2.3.0 through the early --snapshot-version command without claiming Firecracker v10 artifact compatibility.",
+      "summary": "Report the current bangbang-native public writer version v2.4.0 through the early --snapshot-version command, while exact description and load retain legacy device-free 2.3.0, without claiming Firecracker v10 artifact compatibility.",
       "source_refs": [
         "firecracker-argument:snapshot-version"
       ],
@@ -10712,7 +10712,7 @@
     {
       "id": "semantic.snapshot:full-create-load-and-public-lifecycle",
       "family": "snapshots",
-      "summary": "Implement and verify the minimal bangbang-native v2.3 Full/File public lifecycle: paused 1–32-vCPU canonical-default-serial creation, no-clobber paired publication, one-open family load, retained private File/COW memory, Paused commit, optional resume, immutable repeated destinations, terminal postcommit failure, direct/contained authority, cleanup, redaction, and frozen native-v1 reading.",
+      "summary": "Implement and verify the narrow bangbang-native v2.4 Full/File public lifecycle: paused 1–32-vCPU canonical-default-serial creation with exactly one read-only File/Sync root over MMIO or PCI, graph-required no-clobber paired publication, one-open version/profile dispatch, retained private File/COW memory, newly authorized root backing, Paused commit, optional resume, immutable repeated destinations, terminal postcommit failure, direct/contained authority, cleanup, redaction, legacy device-free 2.3 loading, and frozen native-v1 reading.",
       "source_refs": [
         "corpus:snapshot-support",
         "corpus:snapshot-versioning"
@@ -10743,6 +10743,11 @@
         },
         {
           "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_restores_native_v2_root_io_over_mmio_and_pci"
+        },
+        {
+          "kind": "local",
           "path": "crates/launcher/tests/production_bundle_e2e.rs",
           "anchor": "normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restore"
         }
@@ -10751,7 +10756,7 @@
     {
       "id": "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
       "family": "snapshots",
-      "summary": "The current native-v2 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, and applied CPU evidence. It deliberately admits no drives, optional devices, MMDS, PCI, boot timer, or mutated/general serial state. Complete live-owner handoffs exist for many devices, but their encoding, placement, restore, resources, and guest outcomes remain under audit.",
+      "summary": "The current native-v2 2.4 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, applied CPU evidence, and exactly one read-only File/Sync root including exact MMIO or PCI transport state and destination backing authority. It deliberately excludes extra/writable/non-Sync/vhost-user roots, optional devices, MMDS, boot timer, and mutated/general serial state. Complete live-owner handoffs exist for many remaining devices, but their encoding, placement, restore resources, and guest outcomes remain under audit.",
       "source_refs": [
         "corpus:snapshot-support"
       ],
@@ -10859,7 +10864,7 @@
     {
       "id": "semantic.transport:pci-msi-and-coexistence",
       "family": "device-transport",
-      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and current native-v2 create completes its live-storage handoff before rejecting PCI ahead of native-state capture and artifact mutation rather than omitting transport state; load retains its pre-VM-mutation rejection.",
+      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and current native-v2 2.4 create/load persists and reconstructs the exact first read-only File/Sync root endpoint, including its BAR/capability/common configuration, queue, MSI-X, registry, and GICv2m placement. Optional, multi-device, and runtime-attached PCI snapshot persistence remains outside this terminal transport aggregate.",
       "source_refs": [
         "corpus:device-api",
         "corpus:device-hotplug"
@@ -10888,6 +10893,11 @@
         },
         {
           "kind": "local",
+          "path": "crates/runtime/src/snapshot_device_v2.rs",
+          "anchor": "exact native-v2 root device graph and PCI reconstruction"
+        },
+        {
+          "kind": "local",
           "path": "crates/runtime/src/virtio_pci.rs",
           "anchor": "modern virtio-pci transport and PublishedVirtioPciEndpoint"
         }
@@ -10896,7 +10906,7 @@
         {
           "kind": "local",
           "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
-          "anchor": "signed_executable_runs_all_startup_virtio_devices_over_product_pci and runtime hotplug gates"
+          "anchor": "signed all-startup-virtio, runtime hotplug, and native-v2 root snapshot PCI gates"
         },
         {
           "kind": "local",

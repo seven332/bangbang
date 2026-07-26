@@ -200,7 +200,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn device_graph_component_is_minor_four_only_without_advancing_public_dispatch() {
+fn device_graph_component_is_current_minor_four_and_rejects_downgrade() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -209,7 +209,7 @@ fn device_graph_component_is_minor_four_only_without_advancing_public_dispatch()
     );
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        SnapshotFormatVersion::new(2, 3, 0)
+        SnapshotFormatVersion::new(2, 4, 0)
     );
 
     let graph = SnapshotV2Component::new(
@@ -217,17 +217,8 @@ fn device_graph_component_is_minor_four_only_without_advancing_public_dispatch()
         SnapshotV2ComponentDisposition::Semantic,
         b"device-graph",
     );
-    assert!(matches!(
-        encode_snapshot_v2_state(&[], &[graph]),
-        Err(SnapshotV2EncodeError::UnknownSemanticComponent)
-    ));
-
-    let encoded = encode_snapshot_v2_state_with_compatibility_version(
-        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-        &[],
-        &[graph],
-    )
-    .expect("minor-four graph component should encode internally");
+    let encoded =
+        encode_snapshot_v2_state(&[], &[graph]).expect("current graph component should encode");
     let decoded = decode_snapshot_v2_state_with_compatibility_version(
         &encoded,
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
@@ -242,21 +233,10 @@ fn device_graph_component_is_minor_four_only_without_advancing_public_dispatch()
         Some(graph)
     );
 
-    assert_eq!(
-        decode_snapshot_v2_state(&encoded),
-        Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-            supported: NATIVE_V2_SNAPSHOT_VERSION,
-        })
-    );
+    assert!(decode_snapshot_v2_state(&encoded).is_ok());
     assert!(matches!(
         decode_native_snapshot_state(&encoded),
-        Err(NativeSnapshotFormatError::NativeV2(
-            SnapshotV2DecodeError::UnsupportedVersion {
-                found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-                supported: NATIVE_V2_SNAPSHOT_VERSION,
-            }
-        ))
+        Ok(NativeSnapshotState::V2(_))
     ));
 
     let downgraded = with_u16_field_and_checksum(&encoded, VERSION_MINOR_OFFSET, 3);
@@ -372,11 +352,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 4);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 5);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 4, 0),
+            found: SnapshotFormatVersion::new(2, 5, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );

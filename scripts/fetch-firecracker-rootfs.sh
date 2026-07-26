@@ -116,7 +116,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v87"
+direct_boot_variant="direct-boot-v91"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -3468,6 +3468,30 @@ PY
   fi
 }
 
+check_native_v2_root_snapshot_marker() {
+  sleep 10
+
+  expected=BANGBANG_NATIVE_V2_ROOT_SNAPSHOT_BACKING
+  actual=$(dd if=/bangbang-native-v2-root-snapshot-marker bs=1 count="${#expected}" 2>/dev/null || true)
+  if [ "$actual" = "$expected" ]; then
+    emit_line BANGBANG_NATIVE_V2_ROOT_SNAPSHOT_RESTORED_OK
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - <<'PY'
+import ctypes
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.reboot.argtypes = [ctypes.c_int]
+libc.reboot.restype = ctypes.c_int
+if libc.reboot(0x4321FEDC) != 0:
+    raise OSError(ctypes.get_errno(), "reboot(RB_POWER_OFF) failed")
+PY
+    fi
+    emit_line BANGBANG_NATIVE_V2_ROOT_SNAPSHOT_POWEROFF_FAIL
+  else
+    emit_line BANGBANG_NATIVE_V2_ROOT_SNAPSHOT_RESTORED_FAIL
+  fi
+}
+
 fetch_vsock_snapshot_reset_marker() {
   if ! command -v python3 >/dev/null 2>&1; then
     emit_line BANGBANG_VSOCK_SNAPSHOT_RESET_FAIL_NO_PYTHON
@@ -4293,6 +4317,8 @@ elif cmdline_has bangbang.virtio-net-semantics=1; then
   prove_virtio_network_semantics
 elif cmdline_has bangbang.mmds-fetch=1; then
   fetch_mmds_marker
+elif cmdline_has bangbang.native-v2-root-snapshot=1; then
+  check_native_v2_root_snapshot_marker
 elif cmdline_has bangbang.vsock-snapshot-reset=1; then
   fetch_vsock_snapshot_reset_marker
 elif cmdline_has bangbang.vsock-guest-connect=1; then
@@ -4310,6 +4336,10 @@ emit_line BANGBANG_DIRECT_ROOTFS_BOOT_OK
 exec sleep 3600
 EOF
   chmod 0755 "$init_path"
+  printf '%s' BANGBANG_NATIVE_V2_ROOT_SNAPSHOT_BACKING \
+    > "${extract_dir}/bangbang-native-v2-root-snapshot-marker"
+  truncate -s 4096 "${extract_dir}/bangbang-native-v2-root-snapshot-marker"
+  chmod 0444 "${extract_dir}/bangbang-native-v2-root-snapshot-marker"
 }
 
 if [[ "$format" == "ext4" ]]; then
