@@ -1543,6 +1543,14 @@ may skip execution. On supported Apple Silicon it proves:
   early description and two fresh state/memory/root File/COW loads per
   transport then prove exact root reconstruction, explicit and automatic
   resume, and a root-read-conditional guest `SYSTEM_OFF`;
+- a feature-gated root-plus-vsock restore-resource probe that uses the real
+  coherent contained-session authority, exact typed take/adopt/commit, reverse
+  reservation abort and reuse, and all nine deterministic cancellation points;
+  signed cases cover launcher-opened root identity after pathname replacement,
+  prepared and active cleanup, both independent launcher/worker death orders,
+  published-socket replacement preservation, concurrent same-ID session
+  isolation, fixed redacted output, unchanged networkless entitlements, and no
+  ready-state helper, while the normal bundle rejects the probe option;
 - source kernel/root/metrics and load state/memory pathnames replaced after the
   launcher opens them, with no tag reopen, no staging residue, redacted
   wrong-role output, and no extra private session namespace;

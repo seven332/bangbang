@@ -1783,6 +1783,17 @@ encoding/placement and load rejects overrides; the exact six aggregate
 encoding, invocation, restored-guest, clone/version, and portability outcomes
 remain #1490 work, so this classification does not imply public snapshot
 compatibility.
+
+A disposable feature-gated production bundle now certifies that the contained
+preparation is one coherent root-plus-vsock transaction across the signed
+launcher/worker boundary. It covers prepublication reserve/abort/reuse, all
+nine deterministic cancellation checkpoints, one-time typed take/adopt/commit,
+launcher-opened root identity after pathname replacement, prepared and active
+cleanup, both independent process-death orders, socket replacement
+preservation, concurrent same-ID isolation, redaction, unchanged entitlements,
+and no ready-state helper. The normal bundle contains no probe; the evidence
+adds neither a public artifact record nor a restored-guest claim.
+
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target while
 still contributing to the `/actions` request count metric.
 
@@ -3964,11 +3975,16 @@ Their eventual support level should follow the endpoint matrix:
   unchanged optional-device rejection. Internal destination preparation now
   provides pre-access captured/override validation, owner-only stale-safe direct
   publication, exact transactional contained authority without ambient
-  fallback, and single-use runtime adoption. The eight API/live records are
-  checked and terminal; public native-v2 encoding, placement and invocation,
-  restored-guest acknowledgement/reconnect/override proof, clone/versioning,
-  and portability remain #1490 work rather than live snapshot-compatibility
-  claims
+  fallback, and single-use runtime adoption. A disposable feature-gated signed
+  bundle certifies the coherent root-plus-vsock transaction, reverse abort and
+  reuse, deterministic cancellation, launcher-opened root replacement,
+  prepared/active and independent-death cleanup, socket replacement,
+  concurrent same-ID isolation, redaction, unchanged entitlements, and no
+  ready-state helper; normal bundles exclude the probe. The eight API/live
+  records are checked and terminal; public native-v2 encoding, placement and
+  invocation, restored-guest acknowledgement/reconnect/override proof,
+  clone/versioning, and portability remain #1490 work rather than live
+  snapshot-compatibility claims
 - snapshot behavior beyond the implemented narrow native-v2 Full/File profile.
   The native-v2 reader retains readable `2.0.0`/`2.1.x`/`2.2.x` state and the
   exact device-free `2.3.0` platform profile. The current public `2.4.0` writer

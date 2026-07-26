@@ -951,6 +951,20 @@ take or stream claim. The persisted root identity includes file metadata such
 as `ctime`, so a later rename or metadata-changing replacement is correctly
 rejected even when it refers to the same inode.
 
+Internal restore-resource preparation can bind a complete host-free root/vsock
+request to one coherent contained-session authority before duplicating a root
+descriptor, invoking the socket binder, or publishing a socket. A disposable
+feature-gated signed bundle certifies exact root and vsock authority,
+prepublication reserve/abort/reuse, all nine deterministic cancellation
+checkpoints, one-time typed take/adopt/commit, launcher-opened root identity
+after pathname replacement, active and prepared cleanup, both independent
+process-death orders, socket replacement preservation, same-ID session
+isolation, and value redaction. It adds no worker entitlement, ambient path
+access, launcher protocol, or steady-state helper, and the normal bundle does
+not contain the probe. This is an internal resource foundation only: public
+native-v2 artifacts still contain no vsock record, and public load does not
+claim restored vsock behavior.
+
 Create outputs instead use
 `bangbang-grant:<GrantId>/<SnapshotOutputChild>`. The child is one 1–255 byte
 UTF-8 component, contains no NUL or `/`, and is neither `.` nor `..`. One

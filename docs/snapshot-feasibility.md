@@ -37,6 +37,20 @@ optionally resumes through the ordinary lifecycle path. The public loader also
 recognizes device-free native-v2 2.3 and frozen native-v1 state, routing the
 latter to the unchanged eager File or macOS pager compatibility path.
 
+The generalized internal destination foundation also prepares one complete
+host-free root/vsock resource request through a coherent contained-session
+transaction. A feature-gated disposable signed bundle now certifies exact
+root-file and socket-directory/broker authority, prepublication abort and
+reuse, nine deterministic cancellation checkpoints, one-time typed
+take/adopt/commit, launcher-opened root identity after pathname replacement,
+prepared and active cleanup, both independent process-death orders,
+replacement-safe socket ownership, concurrent same-ID isolation, and
+redaction without a new entitlement, ambient path, protocol, or steady helper.
+The normal bundle excludes that probe. This is delivery evidence for internal
+resource preparation only: current public native-v2 bytes, placement, load
+invocation, restored-guest behavior, override behavior, clones, and portability
+remain unchanged.
+
 - `PUT /snapshot/create` and `PUT /snapshot/load` parse and normalize complete
   request bodies into debug-redacted API and runtime values before reaching VMM
   action policy. Paths and override contents are never logged or echoed.

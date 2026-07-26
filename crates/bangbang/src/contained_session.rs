@@ -6118,6 +6118,8 @@ mod platform {
     }
 }
 
+#[cfg(all(target_os = "macos", any(test, feature = "grant-integration-probe")))]
+pub(crate) use platform::ContainedSnapshotRestoreErrorKind;
 pub(crate) use platform::{
     ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
     PagerGrantAuthority, PreparedDriveBackingClaim, PreparedFileGrantClaim,
@@ -6132,10 +6134,9 @@ pub(crate) use platform::{
 };
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{
-    ContainedSnapshotRestoreErrorKind, TestContainedRestoreAuthority, TestVhostDirectory,
-    contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
-    empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
-    root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
-    snapshot_root_file_grant_authority_for_test, vhost_directory_authority_for_test,
-    vsock_directory_authority_for_test,
+    TestContainedRestoreAuthority, TestVhostDirectory, contained_restore_authority_for_test,
+    contained_restore_authority_with_grants_for_test, empty_grant_authority_for_vhost_test,
+    file_grant_authority_for_test, root_file_grant_authority_for_test,
+    snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
+    vhost_directory_authority_for_test, vsock_directory_authority_for_test,
 };
