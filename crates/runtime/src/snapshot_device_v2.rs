@@ -59,6 +59,9 @@ const _: () = assert!(
 /// Maximum encoded size of one native-v2 2.4 device graph.
 pub const NATIVE_V2_DEVICE_GRAPH_MAX_BYTES: usize = 64 * 1024;
 
+/// Maximum record count accepted by the current native-v2 device graph.
+pub const NATIVE_V2_DEVICE_GRAPH_MAX_RECORDS: u16 = 1;
+
 /// Maximum UTF-8 byte length of one public drive identifier.
 pub const NATIVE_V2_DEVICE_GRAPH_MAX_DRIVE_ID_BYTES: usize = 255;
 
@@ -81,7 +84,6 @@ const DEVICE_GRAPH_MAGIC: [u8; 8] = *b"BANGD2A\0";
 const DEVICE_GRAPH_PROFILE: u16 = 1;
 const DEVICE_GRAPH_FLAGS: u32 = 0;
 const DEVICE_GRAPH_ALIGNMENT: usize = 8;
-const DEVICE_GRAPH_RECORD_COUNT: u16 = 1;
 const DEVICE_GRAPH_SECTION_COUNT: u16 = 4;
 const DEVICE_GRAPH_SECTION_COUNT_USIZE: usize = 4;
 const DEVICE_GRAPH_SECTION_COUNT_U32: u32 = 4;
@@ -185,6 +187,14 @@ impl SnapshotV2DeviceKey {
     pub const fn instance(self) -> u32 {
         self.instance
     }
+}
+
+#[cfg(test)]
+pub(crate) const fn snapshot_v2_device_key_for_test(
+    kind: u32,
+    instance: u32,
+) -> SnapshotV2DeviceKey {
+    SnapshotV2DeviceKey { kind, instance }
 }
 
 redacted_debug!(SnapshotV2DeviceKey, "SnapshotV2DeviceKey");
@@ -2796,7 +2806,7 @@ pub fn encode_snapshot_v2_device_graph(
     );
     write_u16(&mut output, DEVICE_GRAPH_PROFILE);
     write_u16(&mut output, transport_kind_tag(graph.transport_kind()));
-    write_u16(&mut output, DEVICE_GRAPH_RECORD_COUNT);
+    write_u16(&mut output, NATIVE_V2_DEVICE_GRAPH_MAX_RECORDS);
     write_u16(&mut output, DEVICE_GRAPH_SECTION_COUNT);
     write_u16(&mut output, 0);
     write_u32(&mut output, DEVICE_GRAPH_FLAGS);
@@ -3232,7 +3242,7 @@ pub fn decode_snapshot_v2_device_graph(
     let section_count = read_u16_at(bytes, HEADER_SECTION_COUNT_OFFSET)?;
     if header_bytes != NATIVE_V2_DEVICE_GRAPH_HEADER_BYTES
         || profile != DEVICE_GRAPH_PROFILE
-        || record_count != DEVICE_GRAPH_RECORD_COUNT
+        || record_count != NATIVE_V2_DEVICE_GRAPH_MAX_RECORDS
         || section_count != DEVICE_GRAPH_SECTION_COUNT
         || read_u32_at(bytes, HEADER_FLAGS_OFFSET)? != DEVICE_GRAPH_FLAGS
     {

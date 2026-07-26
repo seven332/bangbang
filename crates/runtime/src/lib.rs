@@ -42,6 +42,7 @@ pub mod snapshot_format;
 pub mod snapshot_format_v2;
 pub mod snapshot_memory;
 pub mod snapshot_memory_v2;
+pub mod snapshot_restore;
 pub mod startup;
 pub mod storage_capture;
 pub(crate) mod token_bucket;
