@@ -5347,7 +5347,6 @@ mod macos_arm64 {
                 "/actions",
                 r#"{"action_type":"FlushMetrics"}"#,
             );
-            let error = error.replace(path_text(&control_path), "<control-backing>");
             let metrics = file_tail_lossy(&metrics_path, 16 * 1024);
             let output = bangbang.force_stop_and_collect();
             panic!(
@@ -5373,6 +5372,7 @@ mod macos_arm64 {
                 "/actions",
                 r#"{"action_type":"FlushMetrics"}"#,
             );
+            let error = error.replace(path_text(&control_path), "<control-backing>");
             let metrics = file_tail_lossy(&metrics_path, 16 * 1024);
             let output = bangbang.force_stop_and_collect();
             panic!(
