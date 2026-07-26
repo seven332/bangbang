@@ -35,6 +35,7 @@ use crate::virtio_pci::{
     VIRTIO_PCI_NO_VECTOR, VirtioPciEndpointPhase,
 };
 
+mod capture;
 mod codec;
 
 #[cfg(test)]
@@ -358,6 +359,56 @@ impl fmt::Display for SnapshotV2MultiBlockDeviceGraphBuildError {
 }
 
 impl std::error::Error for SnapshotV2MultiBlockDeviceGraphBuildError {}
+
+/// Failure while converting live capture-ready blocks into profile 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2MultiBlockDeviceGraphCaptureError {
+    /// The supplied compatibility context is not exact 2.5.
+    UnsupportedVersion,
+    /// The selected block inventory is empty, too large, or transport-mixed.
+    UnsupportedInventory,
+    /// A drive lies outside the regular-file Sync/Async profile.
+    UnsupportedConfiguration,
+    /// A bounded string is empty, non-UTF-8, or too large.
+    InvalidString,
+    /// Repeated block-local facts disagree.
+    InconsistentBlockState,
+    /// Common virtio continuation is invalid.
+    InvalidVirtioState,
+    /// MMIO placement or selectors are invalid.
+    InvalidMmioState,
+    /// PCI placement, configuration, or MSI-X state is invalid.
+    InvalidPciState,
+    /// The complete config-ordered graph violates profile 2.
+    InvalidGraph,
+    /// A bounded artifact allocation failed.
+    Allocation,
+}
+
+impl fmt::Display for SnapshotV2MultiBlockDeviceGraphCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedVersion => {
+                "native-v2 multi-block graph compatibility version is unsupported"
+            }
+            Self::UnsupportedInventory => {
+                "live block inventory is outside the native-v2 multi-block profile"
+            }
+            Self::UnsupportedConfiguration => {
+                "live block configuration is outside the native-v2 multi-block profile"
+            }
+            Self::InvalidString => "live block string metadata is invalid",
+            Self::InconsistentBlockState => "live block continuation state is inconsistent",
+            Self::InvalidVirtioState => "live common virtio state is invalid",
+            Self::InvalidMmioState => "live virtio-mmio state is invalid",
+            Self::InvalidPciState => "live virtio-pci state is invalid",
+            Self::InvalidGraph => "captured native-v2 multi-block graph is invalid",
+            Self::Allocation => "failed to allocate a native-v2 multi-block graph",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2MultiBlockDeviceGraphCaptureError {}
 
 /// Failure while encoding one validated profile-2 graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
