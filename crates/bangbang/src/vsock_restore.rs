@@ -3,7 +3,8 @@
 use std::fmt;
 
 use bangbang_runtime::snapshot::{
-    SnapshotVsockOverride, SnapshotVsockSelectorError, resolve_snapshot_vsock_selectors,
+    SnapshotVsockOverride, SnapshotVsockSelectorError, SnapshotVsockSelectors,
+    resolve_snapshot_vsock_selectors,
 };
 use bangbang_runtime::vsock::{
     DirectVsockRestoreCleanupError, DirectVsockRestoreError, DirectVsockSocketGuard,
@@ -14,7 +15,10 @@ use bangbang_session::ResourceRole;
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
 
 use crate::anchored_socket::{AnchoredSocketError, AnchoredSocketGuard, bind_prepared_vsock};
-use crate::contained_session::{DirectoryGrantAuthority, SocketBrokerAuthority};
+use crate::contained_session::{
+    DirectoryGrantAuthority, PreparedSocketBrokerEndpoint, PreparedSocketDirectoryClaim,
+    SocketBrokerAuthority,
+};
 
 /// Whether the same process may safely retry a failed restore preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +295,287 @@ fn failed_adoption_disposition(
     }
 }
 
+/// Host-operation-free logical request for one captured vsock endpoint.
+pub(crate) struct RequestedVsockRestoreResource {
+    selectors: SnapshotVsockSelectors,
+    overridden: bool,
+}
+
+impl RequestedVsockRestoreResource {
+    /// Resolves captured and destination selectors before cancellation or authority access.
+    pub(crate) fn resolve(
+        captured: Option<&VsockBackendSelector>,
+        requested_override: Option<&SnapshotVsockOverride>,
+    ) -> Result<Option<Self>, VsockRestoreError> {
+        resolve_snapshot_vsock_selectors(captured, requested_override)
+            .map(|selectors| {
+                selectors.map(|selectors| Self {
+                    selectors,
+                    overridden: requested_override.is_some(),
+                })
+            })
+            .map_err(|source| {
+                VsockRestoreError::retryable(
+                    VsockRestoreStage::Selection,
+                    VsockRestoreErrorKind::Selector(source),
+                )
+            })
+    }
+
+    pub(crate) const fn is_overridden(&self) -> bool {
+        self.overridden
+    }
+
+    /// Reserves every contained authority without publishing an endpoint.
+    pub(crate) fn reserve(
+        self,
+        directory_authority: Option<&DirectoryGrantAuthority>,
+        broker_authority: Option<&SocketBrokerAuthority>,
+        namespace: Option<&WorkerSocketNamespace>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<ReservedVsockRestoreResource, VsockRestoreError> {
+        if cancelled() {
+            return Err(cancelled_error());
+        }
+        if directory_authority.is_none() && broker_authority.is_none() && namespace.is_none() {
+            return Ok(ReservedVsockRestoreResource::Direct(self.selectors));
+        }
+
+        let directory_authority = directory_authority.ok_or_else(contained_authority_error)?;
+        let reference = self.selectors.destination().path();
+        let claim = directory_authority
+            .prepare_socket_directory(reference, ResourceRole::VsockSocketDirectory)
+            .map_err(|_| {
+                VsockRestoreError::retryable(
+                    VsockRestoreStage::ContainedClaim,
+                    VsockRestoreErrorKind::Grant,
+                )
+            })?
+            .ok_or_else(|| {
+                VsockRestoreError::retryable(
+                    VsockRestoreStage::ContainedClaim,
+                    VsockRestoreErrorKind::ContainedReferenceRequired,
+                )
+            })?;
+        let broker_authority = broker_authority.ok_or_else(contained_authority_error)?;
+        let namespace = namespace.ok_or_else(contained_authority_error)?;
+        let broker = broker_authority.prepare_endpoint().map_err(|_| {
+            VsockRestoreError::retryable(
+                VsockRestoreStage::ContainedClaim,
+                VsockRestoreErrorKind::Grant,
+            )
+        })?;
+        let namespace = namespace.try_clone().map_err(|_| {
+            VsockRestoreError::retryable(
+                VsockRestoreStage::ContainedClaim,
+                VsockRestoreErrorKind::Namespace,
+            )
+        })?;
+        Ok(ReservedVsockRestoreResource::Contained(Box::new(
+            ReservedContainedVsockRestoreResource {
+                selectors: self.selectors,
+                claim,
+                broker,
+                namespace,
+            },
+        )))
+    }
+}
+
+impl fmt::Debug for RequestedVsockRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestedVsockRestoreResource")
+            .field("selectors", &"<redacted>")
+            .field("overridden", &self.overridden)
+            .finish()
+    }
+}
+
+fn cancelled_error() -> VsockRestoreError {
+    VsockRestoreError::retryable(
+        VsockRestoreStage::Cancellation,
+        VsockRestoreErrorKind::Cancelled,
+    )
+}
+
+fn contained_authority_error() -> VsockRestoreError {
+    VsockRestoreError::retryable(
+        VsockRestoreStage::ContainedClaim,
+        VsockRestoreErrorKind::ContainedAuthorityUnavailable,
+    )
+}
+
+pub(crate) struct ReservedContainedVsockRestoreResource {
+    selectors: SnapshotVsockSelectors,
+    claim: PreparedSocketDirectoryClaim,
+    broker: PreparedSocketBrokerEndpoint,
+    namespace: WorkerSocketNamespace,
+}
+
+/// One vsock request after reversible authority reservation.
+pub(crate) enum ReservedVsockRestoreResource {
+    Direct(SnapshotVsockSelectors),
+    Contained(Box<ReservedContainedVsockRestoreResource>),
+}
+
+impl ReservedVsockRestoreResource {
+    /// Performs rollbackable local preparation without contained publication.
+    pub(crate) fn prepare_local(
+        self,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<LocallyPreparedVsockRestoreResource, VsockRestoreError> {
+        match self {
+            Self::Direct(selectors) => {
+                let prepared = prepare_direct_vsock_restore(selectors).map_err(|source| {
+                    let kind = VsockRestoreErrorKind::Direct(source);
+                    if matches!(source, DirectVsockRestoreError::Cleanup(_)) {
+                        VsockRestoreError::terminal(VsockRestoreStage::Cleanup, kind)
+                    } else {
+                        VsockRestoreError::retryable(VsockRestoreStage::DirectPreparation, kind)
+                    }
+                })?;
+                if cancelled() {
+                    prepared.abort().map_err(|source| {
+                        VsockRestoreError::terminal(
+                            VsockRestoreStage::Cleanup,
+                            VsockRestoreErrorKind::Cleanup(source),
+                        )
+                    })?;
+                    return Err(cancelled_error());
+                }
+                let (resource, guard) = prepared.into_parts();
+                Ok(LocallyPreparedVsockRestoreResource::Direct(
+                    PreparedVsockRestoreResource {
+                        resource,
+                        guard: VsockRestoreGuard::Direct(guard),
+                    },
+                ))
+            }
+            Self::Contained(contained) => {
+                if cancelled() {
+                    drop(contained);
+                    return Err(cancelled_error());
+                }
+                Ok(LocallyPreparedVsockRestoreResource::Contained(*contained))
+            }
+        }
+    }
+
+    pub(crate) fn abort(self) -> VsockRestoreDisposition {
+        drop(self);
+        VsockRestoreDisposition::Retryable
+    }
+}
+
+impl fmt::Debug for ReservedVsockRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReservedVsockRestoreResource")
+            .field(
+                "kind",
+                &match self {
+                    Self::Direct(_) => "direct",
+                    Self::Contained(_) => "contained",
+                },
+            )
+            .field("state", &"<reserved>")
+            .finish()
+    }
+}
+
+/// One vsock request after rollbackable local preparation.
+pub(crate) enum LocallyPreparedVsockRestoreResource {
+    Direct(PreparedVsockRestoreResource),
+    Contained(ReservedContainedVsockRestoreResource),
+}
+
+impl LocallyPreparedVsockRestoreResource {
+    /// Crosses the externally visible contained publication boundary last.
+    pub(crate) fn publish(
+        self,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<PreparedVsockRestoreResource, VsockRestoreError> {
+        match self {
+            Self::Direct(prepared) => Ok(prepared),
+            Self::Contained(contained) => {
+                if cancelled() {
+                    drop(contained);
+                    return Err(cancelled_error());
+                }
+                let ReservedContainedVsockRestoreResource {
+                    selectors,
+                    claim,
+                    broker,
+                    namespace,
+                } = contained;
+                let socket =
+                    bind_prepared_vsock(namespace, claim, broker, cancelled).map_err(|source| {
+                        let kind = VsockRestoreErrorKind::Anchored(source);
+                        if matches!(
+                            source,
+                            AnchoredSocketError::Broker | AnchoredSocketError::Cleanup
+                        ) {
+                            VsockRestoreError::terminal(
+                                VsockRestoreStage::ContainedPublication,
+                                kind,
+                            )
+                        } else if source == AnchoredSocketError::Cancelled {
+                            VsockRestoreError::retryable(VsockRestoreStage::Cancellation, kind)
+                        } else {
+                            VsockRestoreError::retryable(
+                                VsockRestoreStage::ContainedPublication,
+                                kind,
+                            )
+                        }
+                    })?;
+                let (listener, guard, connector) = socket.into_vsock_parts().map_err(|_| {
+                    VsockRestoreError::terminal(
+                        VsockRestoreStage::ContainedPublication,
+                        VsockRestoreErrorKind::ContainedResourceIncomplete,
+                    )
+                })?;
+                let (captured_selector, destination_selector) = selectors.into_parts();
+                let resource = VirtioVsockReconstructionResource::with_destination_selector(
+                    captured_selector,
+                    destination_selector,
+                    SuppliedVsockListener::new(listener).with_guest_connector(connector),
+                );
+                Ok(PreparedVsockRestoreResource {
+                    resource,
+                    guard: VsockRestoreGuard::Contained(guard),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn abort(self) -> Result<VsockRestoreDisposition, VsockRestoreError> {
+        match self {
+            Self::Direct(prepared) => prepared.abort(),
+            Self::Contained(contained) => {
+                drop(contained);
+                Ok(VsockRestoreDisposition::Retryable)
+            }
+        }
+    }
+}
+
+impl fmt::Debug for LocallyPreparedVsockRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocallyPreparedVsockRestoreResource")
+            .field(
+                "kind",
+                &match self {
+                    Self::Direct(_) => "direct",
+                    Self::Contained(_) => "contained",
+                },
+            )
+            .field("state", &"<owned>")
+            .finish()
+    }
+}
+
 /// Resolves intent before any authority access, then prepares one destination.
 pub(crate) fn prepare_vsock_restore_resource(
     captured: Option<&VsockBackendSelector>,
@@ -300,126 +585,14 @@ pub(crate) fn prepare_vsock_restore_resource(
     namespace: Option<&WorkerSocketNamespace>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Option<PreparedVsockRestoreResource>, VsockRestoreError> {
-    let Some(selectors) =
-        resolve_snapshot_vsock_selectors(captured, requested_override).map_err(|source| {
-            VsockRestoreError::retryable(
-                VsockRestoreStage::Selection,
-                VsockRestoreErrorKind::Selector(source),
-            )
-        })?
+    let Some(requested) = RequestedVsockRestoreResource::resolve(captured, requested_override)?
     else {
         return Ok(None);
     };
-
-    if cancelled() {
-        return Err(VsockRestoreError::retryable(
-            VsockRestoreStage::Cancellation,
-            VsockRestoreErrorKind::Cancelled,
-        ));
-    }
-
-    if directory_authority.is_none() && broker_authority.is_none() && namespace.is_none() {
-        let prepared = prepare_direct_vsock_restore(selectors).map_err(|source| {
-            let kind = VsockRestoreErrorKind::Direct(source);
-            if matches!(source, DirectVsockRestoreError::Cleanup(_)) {
-                VsockRestoreError::terminal(VsockRestoreStage::Cleanup, kind)
-            } else {
-                VsockRestoreError::retryable(VsockRestoreStage::DirectPreparation, kind)
-            }
-        })?;
-        if cancelled() {
-            prepared.abort().map_err(|source| {
-                VsockRestoreError::terminal(
-                    VsockRestoreStage::Cleanup,
-                    VsockRestoreErrorKind::Cleanup(source),
-                )
-            })?;
-            return Err(VsockRestoreError::retryable(
-                VsockRestoreStage::Cancellation,
-                VsockRestoreErrorKind::Cancelled,
-            ));
-        }
-        let (resource, guard) = prepared.into_parts();
-        return Ok(Some(PreparedVsockRestoreResource {
-            resource,
-            guard: VsockRestoreGuard::Direct(guard),
-        }));
-    }
-
-    let directory_authority = directory_authority.ok_or_else(|| {
-        VsockRestoreError::retryable(
-            VsockRestoreStage::ContainedClaim,
-            VsockRestoreErrorKind::ContainedAuthorityUnavailable,
-        )
-    })?;
-    let reference = selectors.destination().path();
-    let claim = directory_authority
-        .prepare_socket_directory(reference, ResourceRole::VsockSocketDirectory)
-        .map_err(|_| {
-            VsockRestoreError::retryable(
-                VsockRestoreStage::ContainedClaim,
-                VsockRestoreErrorKind::Grant,
-            )
-        })?
-        .ok_or_else(|| {
-            VsockRestoreError::retryable(
-                VsockRestoreStage::ContainedClaim,
-                VsockRestoreErrorKind::ContainedReferenceRequired,
-            )
-        })?;
-    let broker_authority = broker_authority.ok_or_else(|| {
-        VsockRestoreError::retryable(
-            VsockRestoreStage::ContainedClaim,
-            VsockRestoreErrorKind::ContainedAuthorityUnavailable,
-        )
-    })?;
-    let namespace = namespace.ok_or_else(|| {
-        VsockRestoreError::retryable(
-            VsockRestoreStage::ContainedClaim,
-            VsockRestoreErrorKind::ContainedAuthorityUnavailable,
-        )
-    })?;
-    let broker = broker_authority.prepare_endpoint().map_err(|_| {
-        VsockRestoreError::retryable(
-            VsockRestoreStage::ContainedClaim,
-            VsockRestoreErrorKind::Grant,
-        )
-    })?;
-    let namespace = namespace.try_clone().map_err(|_| {
-        VsockRestoreError::retryable(
-            VsockRestoreStage::ContainedClaim,
-            VsockRestoreErrorKind::Namespace,
-        )
-    })?;
-    let socket = bind_prepared_vsock(namespace, claim, broker, &cancelled).map_err(|source| {
-        let kind = VsockRestoreErrorKind::Anchored(source);
-        if matches!(
-            source,
-            AnchoredSocketError::Broker | AnchoredSocketError::Cleanup
-        ) {
-            VsockRestoreError::terminal(VsockRestoreStage::ContainedPublication, kind)
-        } else if source == AnchoredSocketError::Cancelled {
-            VsockRestoreError::retryable(VsockRestoreStage::Cancellation, kind)
-        } else {
-            VsockRestoreError::retryable(VsockRestoreStage::ContainedPublication, kind)
-        }
-    })?;
-    let (listener, guard, connector) = socket.into_vsock_parts().map_err(|_| {
-        VsockRestoreError::terminal(
-            VsockRestoreStage::ContainedPublication,
-            VsockRestoreErrorKind::ContainedResourceIncomplete,
-        )
-    })?;
-    let (captured_selector, destination_selector) = selectors.into_parts();
-    let resource = VirtioVsockReconstructionResource::with_destination_selector(
-        captured_selector,
-        destination_selector,
-        SuppliedVsockListener::new(listener).with_guest_connector(connector),
-    );
-    Ok(Some(PreparedVsockRestoreResource {
-        resource,
-        guard: VsockRestoreGuard::Contained(guard),
-    }))
+    let reserved =
+        requested.reserve(directory_authority, broker_authority, namespace, &cancelled)?;
+    let local = reserved.prepare_local(&cancelled)?;
+    local.publish(&cancelled).map(Some)
 }
 
 #[cfg(test)]
