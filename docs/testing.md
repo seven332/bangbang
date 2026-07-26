@@ -2177,7 +2177,10 @@ exact five PCI virtio identities, and emits phase/failure markers for memory
 hotplug, time/identity discovery, entropy, balloon, and greater-than-FIFO serial
 input. Host tests use control-drive sectors and public API state as the source
 of progress; no entropy bytes, serial bytes, raw PVTime values, or paths appear
-in failure diagnostics.
+in failure diagnostics. The final guest stdout success line is progress rather
+than a durability boundary: the host then uses a bounded kqueue-backed wait for
+the exact sector-5 control marker written with `fsync`, followed by an
+independent exact-byte assertion.
 When the boot args include `bangbang.rtc-check=1`, the same init script checks
 that Linux exposes `/dev/rtc0` as a character device and finds PL031 RTC
 evidence in sysfs, procfs, or dmesg before writing

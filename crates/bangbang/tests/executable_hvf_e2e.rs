@@ -5347,6 +5347,7 @@ mod macos_arm64 {
                 "/actions",
                 r#"{"action_type":"FlushMetrics"}"#,
             );
+            let error = error.replace(path_text(&control_path), "<control-backing>");
             let metrics = file_tail_lossy(&metrics_path, 16 * 1024);
             let output = bangbang.force_stop_and_collect();
             panic!(
@@ -5358,6 +5359,27 @@ mod macos_arm64 {
         assert!(aggregate_stdout.contains(REMAINING_DEVICE_SERIAL_SUCCESS_MARKER));
         assert!(aggregate_stdout.contains("BANGBANG_REMAINING_DEVICE_PVTIME_STEAL="));
         assert!(!aggregate_stdout.contains(REMAINING_DEVICE_FAILURE_MARKER));
+        if let Err(error) = wait_for_file_markers_at(
+            &control_path,
+            &[(
+                REMAINING_DEVICE_FINAL_MARKER_OFFSET,
+                REMAINING_DEVICE_SUCCESS_MARKER.as_bytes(),
+                REMAINING_DEVICE_FAILURE_MARKER.as_bytes(),
+            )],
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let _ = http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"FlushMetrics"}"#,
+            );
+            let metrics = file_tail_lossy(&metrics_path, 16 * 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "{transport} remaining-device final control marker should become durable: {error}; status: {:?}\nmetrics:\n{metrics}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr,
+            );
+        }
         assert_eq!(
             file_bytes_at(
                 &control_path,
