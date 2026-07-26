@@ -599,6 +599,18 @@ mod platform {
     }
 
     impl PreparedDriveBackingClaim {
+        fn restore_original(&mut self) -> Result<(), GrantClaimError> {
+            if self.original.is_none() {
+                return Ok(());
+            }
+            let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            let registry = registry.as_mut().ok_or(GrantClaimError)?;
+            let original = self.original.take().ok_or(GrantClaimError)?;
+            registry
+                .restore_drive_backing(self.id.clone(), original)
+                .map_err(|_| GrantClaimError)
+        }
+
         pub(crate) fn take_snapshot_read_only_file(&mut self) -> Result<File, GrantClaimError> {
             let duplicate = self.duplicate.take().ok_or(GrantClaimError)?;
             if duplicate.access() != GrantAccess::ReadOnly
@@ -651,6 +663,10 @@ mod platform {
 
         pub(crate) fn commit(mut self) {
             self.original.take();
+        }
+
+        pub(crate) fn abort(mut self) -> Result<(), GrantClaimError> {
+            self.restore_original()
         }
     }
 
@@ -884,6 +900,22 @@ mod platform {
                 Err(error) => error.into_inner(),
             };
             registry.take();
+        }
+
+        #[cfg(test)]
+        pub(crate) fn invalidate_for_test(&self) {
+            self.invalidate();
+        }
+
+        #[cfg(test)]
+        fn poison_for_test(&self) {
+            let registry = Arc::clone(&self.registry);
+            let result = std::thread::spawn(move || {
+                let _registry = registry.lock().expect("test authority should lock");
+                panic!("injected file authority poison");
+            })
+            .join();
+            assert!(result.is_err(), "test authority poison should panic");
         }
     }
 
@@ -3696,7 +3728,9 @@ mod platform {
                     .take_snapshot_read_only_file()
                     .expect("regular read-only root should remain a dedicated drive claim"),
             );
-            drop(snapshot_root);
+            snapshot_root
+                .abort()
+                .expect("explicit snapshot-root abort should restore authority");
             assert!(
                 authority
                     .prepare_drive_backing_claim(
@@ -3718,7 +3752,9 @@ mod platform {
                 .take_backing(false)
                 .expect("prepared claim should expose one backing");
             drop(duplicate);
-            drop(prepared);
+            prepared
+                .abort()
+                .expect("explicit writable-drive abort should restore authority");
             let restored = authority
                 .prepare_drive_backing_claim(
                     Path::new("bangbang-grant:drive-rw"),
@@ -3750,6 +3786,65 @@ mod platform {
                         GrantAccess::ReadWrite,
                     )
                     .is_err()
+            );
+
+            let mut inactive_registry = file_registry();
+            let inactive_authority = GrantAuthority::new(inactive_registry.take_file_registry());
+            let inactive = inactive_authority
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-ro"),
+                    GrantAccess::ReadOnly,
+                )
+                .expect("inactive-abort fixture should prepare")
+                .expect("inactive-abort fixture should reserve a grant");
+            inactive_authority.invalidate();
+            assert_eq!(inactive.abort(), Err(GrantClaimError));
+        }
+
+        #[test]
+        fn prepared_drive_claim_abort_reports_poison_and_restoration_collision() {
+            let mut poisoned_registry = file_registry();
+            let poisoned_authority = GrantAuthority::new(poisoned_registry.take_file_registry());
+            let poisoned = poisoned_authority
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-ro"),
+                    GrantAccess::ReadOnly,
+                )
+                .expect("poison fixture should prepare")
+                .expect("poison fixture should reserve a grant");
+            poisoned_authority.poison_for_test();
+            assert_eq!(poisoned.abort(), Err(GrantClaimError));
+
+            let mut collision_registry = file_registry();
+            let collision_authority = GrantAuthority::new(collision_registry.take_file_registry());
+            let mut collision = collision_authority
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-ro"),
+                    GrantAccess::ReadOnly,
+                )
+                .expect("collision fixture should prepare")
+                .expect("collision fixture should reserve a grant");
+            let replacement = collision
+                .duplicate
+                .take()
+                .expect("collision fixture should retain a duplicate");
+            collision_authority
+                .registry
+                .lock()
+                .expect("collision authority should lock")
+                .as_mut()
+                .expect("collision authority should remain active")
+                .restore_drive_backing(collision.id.clone(), replacement)
+                .expect("collision fixture should insert replacement");
+            assert_eq!(collision.abort(), Err(GrantClaimError));
+            assert!(
+                collision_authority
+                    .prepare_drive_backing_claim(
+                        Path::new("bangbang-grant:drive-ro"),
+                        GrantAccess::ReadOnly,
+                    )
+                    .expect("replacement grant should remain valid")
+                    .is_some()
             );
         }
 
@@ -4435,6 +4530,10 @@ mod platform {
         }
 
         pub(crate) fn commit(self) {}
+
+        pub(crate) fn abort(self) -> Result<(), GrantClaimError> {
+            Err(GrantClaimError)
+        }
     }
 
     #[derive(Debug, Clone)]
