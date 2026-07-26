@@ -27,7 +27,7 @@ const HEALTHY_DRIVER_OK: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
     | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 const FIXTURE_RECORDS: usize = 2;
 
-fn fixture_graph(
+pub(super) fn fixture_graph(
     transport_kind: SnapshotV2DeviceTransportKind,
     with_root: bool,
 ) -> SnapshotV2MultiBlockDeviceGraph {
@@ -51,7 +51,10 @@ fn fixture_graph(
     .expect("fixture graph should validate")
 }
 
-fn boundary_graph(record_count: usize, with_root: bool) -> SnapshotV2MultiBlockDeviceGraph {
+pub(super) fn boundary_graph(
+    record_count: usize,
+    with_root: bool,
+) -> SnapshotV2MultiBlockDeviceGraph {
     let records = (0..record_count)
         .map(|index| {
             let index = u32::try_from(index).expect("boundary index should fit");
@@ -975,7 +978,7 @@ fn hostile_mmio_and_pci_mutations_fail_closed() {
     assert_rejected(&pci_cases, "hostile PCI");
 }
 
-fn replace_queue(
+pub(super) fn replace_queue(
     state: &SnapshotV2VirtioState,
     queue: SnapshotV2VirtioQueueState,
 ) -> SnapshotV2VirtioState {

@@ -7173,6 +7173,56 @@ impl std::error::Error for VirtioBlockLiveUpdateError {
     }
 }
 
+/// Exact pathless snapshot parts consumed by [`PreparedBlockDevice`].
+///
+/// The caller must validate the complete backing batch before constructing
+/// the first device. This value deliberately carries no path or open action.
+pub(crate) struct PreparedSnapshotBlockDeviceParts {
+    pub(crate) drive_id: String,
+    pub(crate) is_root_device: bool,
+    pub(crate) io_engine: DriveIoEngine,
+    pub(crate) cache_type: DriveCacheType,
+    pub(crate) config_space: VirtioBlockConfigSpace,
+    pub(crate) backing: BlockFileBacking,
+    pub(crate) device_id: VirtioBlockDeviceId,
+    pub(crate) active_queue: Option<VirtioBlockQueue>,
+    pub(crate) rate_limiter: Option<VirtioBlockRateLimiter>,
+    pub(crate) pending_rate_limited_queue: bool,
+}
+
+impl fmt::Debug for PreparedSnapshotBlockDeviceParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotBlockDeviceParts")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Value-redacted rejection at the exact snapshot block constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedSnapshotBlockDeviceError {
+    UnsupportedBacking,
+    BackingModeMismatch,
+    GeometryMismatch,
+}
+
+impl fmt::Display for PreparedSnapshotBlockDeviceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedBacking => "snapshot block device requires one regular-file backing",
+            Self::BackingModeMismatch => {
+                "snapshot block backing access does not match captured configuration"
+            }
+            Self::GeometryMismatch => {
+                "snapshot block backing geometry does not match captured configuration"
+            }
+        })
+    }
+}
+
+impl std::error::Error for PreparedSnapshotBlockDeviceError {}
+
 #[derive(Debug)]
 pub struct PreparedBlockDevice {
     drive_id: String,
@@ -7238,6 +7288,61 @@ impl PreparedBlockDevice {
         })
     }
 
+    /// Validates one already-authorized backing without consuming it.
+    ///
+    /// This is intentionally separate from [`Self::from_snapshot_parts`] so a
+    /// caller can prove the complete vector before moving its first owner.
+    pub(crate) fn validate_snapshot_backing(
+        backing: &BlockFileBacking,
+        expected: VirtioBlockConfigSpace,
+    ) -> Result<(), PreparedSnapshotBlockDeviceError> {
+        if !backing.kind().is_regular_file() {
+            return Err(PreparedSnapshotBlockDeviceError::UnsupportedBacking);
+        }
+        if backing.is_read_only() != expected.is_read_only() {
+            return Err(PreparedSnapshotBlockDeviceError::BackingModeMismatch);
+        }
+        let actual = VirtioBlockConfigSpace::from_backing(backing, expected.cache_type());
+        if actual != expected {
+            return Err(PreparedSnapshotBlockDeviceError::GeometryMismatch);
+        }
+        Ok(())
+    }
+
+    /// Constructs one exact pathless block owner from captured snapshot parts.
+    pub(crate) fn from_snapshot_parts(
+        parts: PreparedSnapshotBlockDeviceParts,
+    ) -> Result<Self, PreparedSnapshotBlockDeviceError> {
+        let PreparedSnapshotBlockDeviceParts {
+            drive_id,
+            is_root_device,
+            io_engine,
+            cache_type,
+            config_space,
+            backing,
+            device_id,
+            active_queue,
+            rate_limiter,
+            pending_rate_limited_queue,
+        } = parts;
+        Self::validate_snapshot_backing(&backing, config_space)?;
+        let device = VirtioBlockDevice::from_snapshot_parts(
+            backing,
+            device_id,
+            active_queue,
+            rate_limiter,
+            pending_rate_limited_queue,
+        );
+        Ok(Self {
+            drive_id,
+            is_root_device,
+            io_engine: Some(io_engine),
+            cache_type,
+            config_space,
+            device,
+        })
+    }
+
     pub fn from_config_with_vhost_user(
         config: &DriveConfig,
         frontend: PreparedVhostUserBlockFrontend,
@@ -7292,6 +7397,14 @@ impl PreparedBlockDevice {
 
     pub const fn config_space(&self) -> VirtioBlockConfigSpace {
         self.config_space
+    }
+
+    pub const fn io_engine(&self) -> Option<DriveIoEngine> {
+        self.io_engine
+    }
+
+    pub const fn cache_type(&self) -> DriveCacheType {
+        self.cache_type
     }
 
     pub fn device(&self) -> &VirtioBlockDevice {

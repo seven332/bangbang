@@ -38,6 +38,14 @@ use crate::virtio_pci::{
 
 mod capture;
 mod codec;
+mod restore;
+
+pub use restore::{
+    PreparedSnapshotV2MultiBlockBundle, PreparedSnapshotV2MultiBlockRecord,
+    SnapshotV2MultiBlockBundleError, SnapshotV2MultiBlockCleanupError,
+    SnapshotV2MultiBlockRestorePlan, SnapshotV2MultiBlockRestorePlanError,
+    SnapshotV2MultiBlockRetryProjection,
+};
 
 #[cfg(test)]
 mod tests;
