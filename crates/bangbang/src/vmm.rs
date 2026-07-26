@@ -171,6 +171,8 @@ use bangbang_session::{GrantAccess, GrantId, ResourceRole, SessionId, VmnetAutho
 #[cfg(target_os = "macos")]
 use crate::anchored_socket::{AnchoredSocketGuard, bind as bind_anchored_socket};
 #[cfg(target_os = "macos")]
+use crate::contained_session::ContainedSnapshotRestoreAuthority;
+#[cfg(target_os = "macos")]
 use crate::contained_session::{
     ClaimedSocketDirectory, ClaimedVhostUserSocket, DirectoryGrantAuthority, PagerGrantAuthority,
     PreparedVhostUserSocketClaim, SnapshotStagingRecordTracker, SocketBrokerAuthority,
@@ -198,8 +200,9 @@ use crate::host_network::vmnet::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_restore_resources::{
     PreparedSnapshotRootBackingLease, PreparedSnapshotRootRestoreCompletion,
-    RequestedSnapshotRestoreResources, SnapshotRestoreResourceDisposition,
-    SnapshotRestoreResourceError, SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
+    PreparedSnapshotRootRestoreCompletionError, RequestedSnapshotRestoreResources,
+    SnapshotRestoreResourceDisposition, SnapshotRestoreResourceError,
+    SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
 };
 #[cfg(target_os = "macos")]
 use crate::vsock_restore::{
@@ -312,7 +315,8 @@ impl NativeV2SnapshotPublicationRequest {
 pub(crate) struct ProcessSnapshotV2RootLoadRequest<'a> {
     pub(crate) controller: &'a VmmController,
     pub(crate) vmnet_authority: ProcessVmnetAuthority,
-    pub(crate) grant_authority: Option<&'a GrantAuthority>,
+    #[cfg(target_os = "macos")]
+    pub(crate) contained_restore_authority: Option<&'a ContainedSnapshotRestoreAuthority>,
     pub(crate) pci_enabled: bool,
     pub(crate) input: &'a SnapshotLoadInput,
     pub(crate) candidate: NativeV2SnapshotCandidateState,
@@ -487,7 +491,8 @@ pub(crate) trait InstanceStartExecutor {
     fn commit_prepared_snapshot_v2_root_load(
         &mut self,
         _completion: ProcessSnapshotV2RootLoadCompletion,
-    ) {
+    ) -> Result<(), ProcessSnapshotV2RootLoadCompletionError> {
+        Ok(())
     }
 
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
@@ -1281,6 +1286,38 @@ pub(crate) struct ProcessSnapshotV2RootLoadCompletionResources {
     serial_output: SharedSerialOutput,
 }
 
+#[derive(Debug)]
+pub(crate) struct ProcessSnapshotV2RootLoadCompletionError {
+    #[cfg(target_os = "macos")]
+    source: PreparedSnapshotRootRestoreCompletionError,
+}
+
+impl fmt::Display for ProcessSnapshotV2RootLoadCompletionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("native-v2 root-load completion failed")
+    }
+}
+
+impl std::error::Error for ProcessSnapshotV2RootLoadCompletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        #[cfg(target_os = "macos")]
+        {
+            Some(&self.source)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<PreparedSnapshotRootRestoreCompletionError> for ProcessSnapshotV2RootLoadCompletionError {
+    fn from(source: PreparedSnapshotRootRestoreCompletionError) -> Self {
+        Self { source }
+    }
+}
+
 #[cfg(all(not(test), target_os = "macos"))]
 impl ProcessSnapshotV2RootLoadCompletion {
     const fn new(
@@ -1293,13 +1330,13 @@ impl ProcessSnapshotV2RootLoadCompletion {
         }
     }
 
-    fn abort(self) -> Result<(), GrantClaimError> {
+    fn abort(self) -> Result<(), ProcessSnapshotV2RootLoadCompletionError> {
         let Self {
             root_completion,
             serial_output,
         } = self;
         drop(serial_output);
-        root_completion.abort()
+        root_completion.abort().map_err(Into::into)
     }
 }
 
@@ -1315,7 +1352,7 @@ impl ProcessSnapshotV2RootLoadCompletion {
         }))
     }
 
-    fn abort(self) -> Result<(), GrantClaimError> {
+    fn abort(self) -> Result<(), ProcessSnapshotV2RootLoadCompletionError> {
         match self {
             Self::Prepared(resources) => {
                 let ProcessSnapshotV2RootLoadCompletionResources {
@@ -1323,7 +1360,7 @@ impl ProcessSnapshotV2RootLoadCompletion {
                     serial_output,
                 } = *resources;
                 drop(serial_output);
-                root_completion.abort()
+                root_completion.abort().map_err(Into::into)
             }
             Self::Empty => Ok(()),
         }
@@ -1385,8 +1422,9 @@ pub(crate) enum NativeV2SnapshotLoadError {
     #[cfg(target_os = "macos")]
     RootResourceCleanup {
         source: Box<NativeV2SnapshotLoadError>,
-        cleanup: GrantClaimError,
+        cleanup: ProcessSnapshotV2RootLoadCompletionError,
     },
+    RootResourceCommit(ProcessSnapshotV2RootLoadCompletionError),
     Artifact(SnapshotArtifactLoadError),
     ArtifactState(NativeSnapshotArtifactStateError),
     UnexpectedFamily(NativeSnapshotArtifactFamily),
@@ -1430,6 +1468,7 @@ impl NativeV2SnapshotLoadError {
             | Self::Resume(_) => true,
             #[cfg(target_os = "macos")]
             Self::RootResourceCleanup { .. } => true,
+            Self::RootResourceCommit(_) => true,
             Self::Restore(source) => source.is_committed() || !source.cleanup_failures().is_empty(),
             Self::RootRestore(source) => source.is_terminal(),
             Self::Preflight(_)
@@ -1489,6 +1528,9 @@ impl fmt::Display for NativeV2SnapshotLoadError {
                     formatter,
                     "native-v2 load failed and root authority cleanup was incomplete: {source}"
                 )
+            }
+            Self::RootResourceCommit(_) => {
+                formatter.write_str("native-v2 root authority commit failed")
             }
             Self::Artifact(source) => write!(formatter, "native-v2 artifact load failed: {source}"),
             Self::ArtifactState(source) => {
@@ -1599,6 +1641,7 @@ impl std::error::Error for NativeV2SnapshotLoadError {
             Self::AfterResourceAdoption { source } => Some(source.as_ref()),
             #[cfg(target_os = "macos")]
             Self::RootResourceCleanup { source, .. } => Some(source.as_ref()),
+            Self::RootResourceCommit(source) => Some(source),
             Self::Artifact(source) => Some(source),
             Self::ArtifactState(source) => Some(source),
             Self::State(source) => Some(source),
@@ -1635,7 +1678,7 @@ fn native_v2_error_after_root_resource_abort(
         Ok(()) => source,
         Err(cleanup) => NativeV2SnapshotLoadError::RootResourceCleanup {
             source: Box::new(source),
-            cleanup,
+            cleanup: cleanup.into(),
         },
     }
 }
@@ -2995,6 +3038,8 @@ where
     #[cfg(target_os = "macos")]
     socket_namespace: Option<WorkerSocketNamespace>,
     #[cfg(target_os = "macos")]
+    contained_restore_authority: Option<ContainedSnapshotRestoreAuthority>,
+    #[cfg(target_os = "macos")]
     vsock_grant_state: VsockGrantState,
 }
 
@@ -3101,6 +3146,8 @@ where
             #[cfg(target_os = "macos")]
             socket_namespace: None,
             #[cfg(target_os = "macos")]
+            contained_restore_authority: None,
+            #[cfg(target_os = "macos")]
             vsock_grant_state: VsockGrantState::PathBased,
         }
     }
@@ -3157,6 +3204,15 @@ where
         self.socket_broker_authority = broker;
         self.vhost_user_broker_authority = vhost_user_broker;
         self.socket_namespace = namespace;
+        self
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_contained_restore_authority(
+        mut self,
+        authority: Option<ContainedSnapshotRestoreAuthority>,
+    ) -> Self {
+        self.contained_restore_authority = authority;
         self
     }
 
@@ -5219,7 +5275,8 @@ where
                 .load_prepared_snapshot_v2_root(ProcessSnapshotV2RootLoadRequest {
                     controller: &self.controller,
                     vmnet_authority: self.vmnet_authority,
-                    grant_authority: self.grant_authority.as_ref(),
+                    #[cfg(target_os = "macos")]
+                    contained_restore_authority: self.contained_restore_authority.as_ref(),
                     pci_enabled: self.pci_enabled,
                     input,
                     candidate,
@@ -5253,7 +5310,8 @@ where
             self.started_session = Some(session);
             let resume_requested = self.controller.commit_snapshot_v2_load(controller_commit);
             self.starter
-                .commit_prepared_snapshot_v2_root_load(completion);
+                .commit_prepared_snapshot_v2_root_load(completion)
+                .map_err(NativeV2SnapshotLoadError::RootResourceCommit)?;
             Ok(resume_requested)
         } else {
             let restored = self
@@ -6128,7 +6186,7 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
         }
         prepare_hvf_native_v2_root_candidate_load(
             &self.starter,
-            self.grant_authority.as_ref(),
+            self.contained_restore_authority.as_ref(),
             self.pci_enabled,
             input,
             candidate,
@@ -6188,7 +6246,10 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
         self.starter.active_serial_output = Some(serial_output);
         self.started_session = Some(session);
         let resume_requested = self.controller.commit_snapshot_v2_load(controller_commit);
-        root_completion.commit();
+        root_completion
+            .commit()
+            .map_err(ProcessSnapshotV2RootLoadCompletionError::from)
+            .map_err(NativeV2SnapshotLoadError::RootResourceCommit)?;
         Ok(resume_requested)
     }
 
@@ -6597,7 +6658,7 @@ fn native_v2_boot_source_config(
 #[cfg(target_os = "macos")]
 fn prepare_hvf_native_v2_root_candidate_load(
     starter: &HvfInstanceStartExecutor,
-    grant_authority: Option<&GrantAuthority>,
+    contained_restore_authority: Option<&ContainedSnapshotRestoreAuthority>,
     pci_enabled: bool,
     input: &SnapshotLoadInput,
     candidate: NativeV2SnapshotCandidateState,
@@ -6663,7 +6724,7 @@ fn prepare_hvf_native_v2_root_candidate_load(
     };
 
     let prepared_resources = requested_resources
-        .prepare_root(grant_authority, || cancellation.is_cancelled())
+        .prepare_root(contained_restore_authority, || cancellation.is_cancelled())
         .map_err(NativeV2SnapshotLoadError::RestoreResources)?;
     let root_resource = prepared_resources
         .into_root()
@@ -7329,7 +7390,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         let ProcessSnapshotV2RootLoadRequest {
             controller,
             vmnet_authority,
-            grant_authority,
+            contained_restore_authority,
             pci_enabled,
             input,
             candidate,
@@ -7340,7 +7401,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             .map_err(NativeV2SnapshotLoadError::Preflight)?;
         let prepared = prepare_hvf_native_v2_root_candidate_load(
             self,
-            grant_authority,
+            contained_restore_authority,
             pci_enabled,
             input,
             candidate,
@@ -7361,7 +7422,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     fn commit_prepared_snapshot_v2_root_load(
         &mut self,
         completion: ProcessSnapshotV2RootLoadCompletion,
-    ) {
+    ) -> Result<(), ProcessSnapshotV2RootLoadCompletionError> {
         #[cfg(not(test))]
         {
             let ProcessSnapshotV2RootLoadCompletion {
@@ -7369,7 +7430,9 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 serial_output,
             } = completion;
             self.active_serial_output = Some(serial_output);
-            root_completion.commit();
+            root_completion
+                .commit()
+                .map_err(ProcessSnapshotV2RootLoadCompletionError::from)?;
         }
         #[cfg(test)]
         match completion {
@@ -7379,12 +7442,15 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                     serial_output,
                 } = *resources;
                 self.active_serial_output = Some(serial_output);
-                root_completion.commit();
+                root_completion
+                    .commit()
+                    .map_err(ProcessSnapshotV2RootLoadCompletionError::from)?;
             }
             ProcessSnapshotV2RootLoadCompletion::Empty => {
                 debug_assert!(false, "HVF root-load completion must own both resources");
             }
         }
+        Ok(())
     }
 
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
@@ -15189,7 +15255,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use crate::contained_session::{
-        TestVhostDirectory, VhostUserBrokerAuthority, empty_grant_authority_for_vhost_test,
+        TestVhostDirectory, VhostUserBrokerAuthority, contained_restore_authority_for_test,
+        contained_restore_authority_with_grants_for_test, empty_grant_authority_for_vhost_test,
         file_grant_authority_for_test, root_file_grant_authority_for_test,
         snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
         vhost_directory_authority_for_test,
@@ -17075,7 +17142,7 @@ mod tests {
             let ProcessSnapshotV2RootLoadRequest {
                 controller,
                 vmnet_authority,
-                grant_authority: _,
+                contained_restore_authority: _,
                 pci_enabled,
                 input,
                 candidate,
@@ -27774,13 +27841,16 @@ mod tests {
             first_paths.state(),
             SnapshotMemoryBackend::new(first_paths.memory(), SnapshotMemoryBackendType::File),
         );
+        let paused_restore = contained_restore_authority_for_test(root.path(), false);
+        let paused_grants = paused_restore.grants().clone();
         let mut paused_destination = ProcessVmm::with_starter(
             "native-v2-paused-destination",
             "0.1.0",
             "bangbang",
             HvfInstanceStartExecutor::default(),
         )
-        .with_grant_authority(Some(root_file_grant_authority_for_test(root.path())));
+        .with_grant_authority(Some(paused_grants))
+        .with_contained_restore_authority(Some(paused_restore.into_authority()));
         assert_eq!(
             paused_destination.handle_action(VmmAction::LoadSnapshot(paused_load)),
             Ok(VmmData::Empty)
@@ -27813,6 +27883,8 @@ mod tests {
             first_paths.memory(),
             root.path(),
         );
+        let resumed_restore =
+            contained_restore_authority_with_grants_for_test(authority.clone(), false);
         let replacement_state = first_paths
             .state()
             .with_file_name("contained-replacement.state");
@@ -27839,7 +27911,8 @@ mod tests {
             "bangbang",
             HvfInstanceStartExecutor::default(),
         )
-        .with_grant_authority(Some(authority));
+        .with_grant_authority(Some(authority))
+        .with_contained_restore_authority(Some(resumed_restore.into_authority()));
         assert_eq!(
             resumed_destination.handle_action(VmmAction::LoadSnapshot(resumed_load)),
             Ok(VmmData::Empty)
@@ -27957,13 +28030,18 @@ mod tests {
             if !pci_enabled {
                 let failed_authority = root_file_grant_authority_for_test(root.path());
                 let failed_observer = failed_authority.clone();
+                let failed_restore = contained_restore_authority_with_grants_for_test(
+                    failed_authority.clone(),
+                    false,
+                );
                 let mut failed = ProcessVmm::with_starter(
                     "native-v2-mmio-controller-checkpoint",
                     "0.1.0",
                     "bangbang",
                     HvfInstanceStartExecutor::default(),
                 )
-                .with_grant_authority(Some(failed_authority));
+                .with_grant_authority(Some(failed_authority))
+                .with_contained_restore_authority(Some(failed_restore.into_authority()));
                 let error = failed
                     .restore_native_v2_root_candidate_once_with_controller_hook(
                         &input,
@@ -28025,13 +28103,16 @@ mod tests {
 
             let authority = root_file_grant_authority_for_test(root.path());
             let observer = authority.clone();
+            let restore =
+                contained_restore_authority_with_grants_for_test(authority.clone(), false);
             let mut destination = ProcessVmm::with_starter(
                 format!("native-v2-{case}-destination"),
                 "0.1.0",
                 "bangbang",
                 HvfInstanceStartExecutor::default(),
             )
-            .with_grant_authority(Some(authority));
+            .with_grant_authority(Some(authority))
+            .with_contained_restore_authority(Some(restore.into_authority()));
             destination.pci_enabled = pci_enabled;
             destination.starter.pci_enabled = pci_enabled;
             assert!(

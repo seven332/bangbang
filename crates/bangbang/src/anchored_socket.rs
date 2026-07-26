@@ -522,10 +522,13 @@ fn bind_inner(
             .as_ref()
             .ok_or(AnchoredSocketError::Invalid)
             .and_then(SocketBrokerClaim::endpoint)
-            .and_then(prepare_connector_endpoint);
+            .and_then(|endpoint| {
+                prepare_connector_endpoint(endpoint)?;
+                wait_for_broker(endpoint, libc::POLLOUT, AnchoredSocketError::Cancelled)
+            });
         if let Err(error) = prepared {
             cleanup_published_claim_checked(&namespace, &claim, &record)?;
-            return Err(error);
+            return Err(pre_activation_broker_error(error));
         }
     }
     if cancelled() {
@@ -567,6 +570,14 @@ fn bind_inner(
         },
         connector,
     })
+}
+
+const fn pre_activation_broker_error(error: AnchoredSocketError) -> AnchoredSocketError {
+    if matches!(error, AnchoredSocketError::Cancelled) {
+        AnchoredSocketError::Cancelled
+    } else {
+        AnchoredSocketError::Broker
+    }
 }
 
 fn spawn_binder(
@@ -648,6 +659,7 @@ fn spawn_connector(
     endpoint: SocketBrokerEndpoint,
 ) -> Result<AnchoredVsockConnector, AnchoredSocketError> {
     prepare_connector_endpoint(&endpoint)?;
+    wait_for_broker(&endpoint, libc::POLLOUT, AnchoredSocketError::Broker)?;
     let activate = SocketBrokerMessage::Activate {
         session: endpoint.session,
         sequence: 1,
@@ -655,6 +667,7 @@ fn spawn_connector(
     };
     send_socket_broker_message(&endpoint.socket, &activate, None)
         .map_err(|_| AnchoredSocketError::Binder)?;
+    wait_for_broker(&endpoint, libc::POLLIN, AnchoredSocketError::Broker)?;
     let response =
         receive_socket_broker_message(&endpoint.socket).map_err(|_| AnchoredSocketError::Binder)?;
     verify_peer_pid(endpoint.socket.as_raw_fd(), endpoint.launcher_pid)
@@ -668,13 +681,97 @@ fn spawn_connector(
     ) {
         return Err(AnchoredSocketError::Invalid);
     }
+    let SocketBrokerEndpoint {
+        socket,
+        session,
+        launcher_pid,
+        wakeup: _,
+    } = endpoint;
     Ok(AnchoredVsockConnector {
-        socket: endpoint.socket,
-        session: endpoint.session,
-        launcher_pid: endpoint.launcher_pid,
+        socket,
+        session,
+        launcher_pid,
         next_sequence: 2,
         healthy: true,
     })
+}
+
+fn wait_for_broker(
+    endpoint: &SocketBrokerEndpoint,
+    broker_events: libc::c_short,
+    wakeup_error: AnchoredSocketError,
+) -> Result<(), AnchoredSocketError> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: endpoint.socket.as_raw_fd(),
+            events: broker_events,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: endpoint
+                .wakeup
+                .as_ref()
+                .map_or(-1, |wakeup| wakeup.as_raw_fd()),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let descriptor_count = if endpoint.wakeup.is_some() {
+        descriptors.len()
+    } else {
+        descriptors.len() - 1
+    };
+    let timeout =
+        i32::try_from(BINDER_TIMEOUT.as_millis()).map_err(|_| AnchoredSocketError::Invalid)?;
+    loop {
+        // SAFETY: The initialized poll array remains writable for the call.
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptor_count as libc::nfds_t,
+                timeout,
+            )
+        };
+        if result < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(AnchoredSocketError::Broker);
+        }
+        if result == 0 {
+            return Err(AnchoredSocketError::Broker);
+        }
+        let invalid = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+        if endpoint.wakeup.is_some() && descriptors[1].revents & (libc::POLLIN | invalid) != 0 {
+            return Err(wakeup_error);
+        }
+        if descriptors[0].revents & invalid != 0 {
+            return Err(AnchoredSocketError::Broker);
+        }
+        if descriptors[0].revents & broker_events != 0 {
+            if broker_events & libc::POLLIN != 0 {
+                let mut byte = 0_u8;
+                // SAFETY: The byte is writable and MSG_PEEK preserves the
+                // complete authenticated broker datagram for its decoder.
+                let peeked = unsafe {
+                    libc::recv(
+                        endpoint.socket.as_raw_fd(),
+                        (&raw mut byte).cast(),
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                };
+                if peeked <= 0 {
+                    if peeked < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    return Err(AnchoredSocketError::Broker);
+                }
+            }
+            return Ok(());
+        }
+    }
 }
 
 fn prepare_connector_endpoint(endpoint: &SocketBrokerEndpoint) -> Result<(), AnchoredSocketError> {
@@ -1716,6 +1813,11 @@ fn cvt_spawn(result: libc::c_int) -> Result<(), AnchoredSocketError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::rc::Rc;
+
+    use bangbang_session::SessionId;
+
     use super::*;
 
     #[test]
@@ -1770,5 +1872,95 @@ mod tests {
             helper_exit_registration_recovery(&invalid, None),
             HelperExitRegistrationRecovery::Error(io::ErrorKind::InvalidInput)
         );
+    }
+
+    #[test]
+    fn broker_wait_observes_broker_and_wakeup_without_consuming_either() {
+        let (worker, launcher) = UnixDatagram::pair().expect("broker pair should create");
+        let (wakeup_reader, mut wakeup_writer) =
+            UnixStream::pair().expect("wakeup pair should create");
+        // SAFETY: Both endpoints belong to this test process.
+        let pid = unsafe { libc::getpid() };
+        let endpoint = SocketBrokerEndpoint {
+            socket: worker,
+            session: SessionId::from_bytes([71; 32]),
+            launcher_pid: pid,
+            wakeup: Some(Rc::new(wakeup_reader)),
+        };
+
+        launcher
+            .send(b"ready")
+            .expect("launcher readiness should send");
+        wait_for_broker(&endpoint, libc::POLLIN, AnchoredSocketError::Broker)
+            .expect("broker readiness should wake poll");
+        let mut broker_bytes = [0_u8; 5];
+        endpoint
+            .socket
+            .recv(&mut broker_bytes)
+            .expect("broker wait must not consume broker data");
+        assert_eq!(&broker_bytes, b"ready");
+
+        wakeup_writer
+            .write_all(&[1])
+            .expect("worker shutdown should signal");
+        assert_eq!(
+            wait_for_broker(&endpoint, libc::POLLIN, AnchoredSocketError::Cancelled),
+            Err(AnchoredSocketError::Cancelled)
+        );
+        assert_eq!(
+            wait_for_broker(&endpoint, libc::POLLIN, AnchoredSocketError::Broker),
+            Err(AnchoredSocketError::Broker)
+        );
+        let mut observed_wakeup = endpoint
+            .wakeup
+            .as_ref()
+            .expect("endpoint should retain wakeup")
+            .try_clone()
+            .expect("wakeup should clone");
+        let mut wakeup_byte = [0_u8; 1];
+        observed_wakeup
+            .read_exact(&mut wakeup_byte)
+            .expect("broker wait must leave shutdown evidence for the outer loop");
+        assert_eq!(wakeup_byte, [1]);
+    }
+
+    #[test]
+    fn launcher_death_interrupts_broker_wait_independently() {
+        let (worker, launcher) = UnixDatagram::pair().expect("broker pair should create");
+        // SAFETY: Both endpoints belong to this test process.
+        let pid = unsafe { libc::getpid() };
+        let endpoint = SocketBrokerEndpoint {
+            socket: worker,
+            session: SessionId::from_bytes([72; 32]),
+            launcher_pid: pid,
+            wakeup: None,
+        };
+        launcher
+            .shutdown(std::net::Shutdown::Both)
+            .expect("launcher endpoint should shut down");
+        drop(launcher);
+        assert_eq!(
+            wait_for_broker(&endpoint, libc::POLLIN, AnchoredSocketError::Broker),
+            Err(AnchoredSocketError::Broker)
+        );
+    }
+
+    #[test]
+    fn only_pre_activation_wakeup_cancellation_remains_retryable() {
+        assert_eq!(
+            pre_activation_broker_error(AnchoredSocketError::Cancelled),
+            AnchoredSocketError::Cancelled
+        );
+        for error in [
+            AnchoredSocketError::Binder,
+            AnchoredSocketError::Broker,
+            AnchoredSocketError::Invalid,
+            AnchoredSocketError::Io(io::ErrorKind::Other),
+        ] {
+            assert_eq!(
+                pre_activation_broker_error(error),
+                AnchoredSocketError::Broker
+            );
+        }
     }
 }

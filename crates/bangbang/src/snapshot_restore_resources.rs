@@ -14,12 +14,16 @@ use bangbang_runtime::snapshot_restore::{
     SnapshotRestoreResourceKey, SnapshotRestoreTakeError,
 };
 use bangbang_session::GrantAccess;
+#[cfg(test)]
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
 
 use crate::contained_session::{
-    DirectoryGrantAuthority, GrantAuthority, GrantClaimError, PreparedDriveBackingClaim,
-    SocketBrokerAuthority, grant_reference_id,
+    ContainedSnapshotRestoreAuthority, ContainedSnapshotRestoreError,
+    ContainedSnapshotRestoreTransaction, GrantAuthority, GrantClaimError,
+    PreparedDriveBackingClaim, grant_reference_id,
 };
+#[cfg(test)]
+use crate::contained_session::{DirectoryGrantAuthority, SocketBrokerAuthority};
 use crate::vsock_restore::{
     LocallyPreparedVsockRestoreResource, PreparedVsockRestoreResource,
     RequestedVsockRestoreResource, ReservedVsockRestoreResource, VsockRestoreDisposition,
@@ -37,6 +41,7 @@ pub(crate) enum SnapshotRestoreResourceStage {
     Manifest,
     BindingAllocation,
     Cancellation,
+    ContainedReservation,
     RootPreparation,
     VsockPreparation,
     Binding,
@@ -48,6 +53,7 @@ pub(crate) enum SnapshotRestoreResourceStage {
 pub(crate) enum SnapshotRestoreResourceErrorKind {
     Manifest(SnapshotRestoreManifestError),
     BindingAllocation(SnapshotRestoreBindingAllocationError),
+    Contained(ContainedSnapshotRestoreError),
     RootBacking(SnapshotRootBackingLeaseError),
     Vsock(VsockRestoreError),
     Binding(SnapshotRestoreBindingRejectionReason),
@@ -67,6 +73,10 @@ impl fmt::Debug for SnapshotRestoreResourceErrorKind {
                 .finish(),
             Self::BindingAllocation(source) => formatter
                 .debug_tuple("SnapshotRestoreResourceErrorKind::BindingAllocation")
+                .field(source)
+                .finish(),
+            Self::Contained(source) => formatter
+                .debug_tuple("SnapshotRestoreResourceErrorKind::Contained")
                 .field(source)
                 .finish(),
             Self::RootBacking(source) => formatter
@@ -106,6 +116,7 @@ impl fmt::Display for SnapshotRestoreResourceErrorKind {
         match self {
             Self::Manifest(source) => source.fmt(formatter),
             Self::BindingAllocation(source) => source.fmt(formatter),
+            Self::Contained(source) => source.fmt(formatter),
             Self::RootBacking(source) => source.fmt(formatter),
             Self::Vsock(source) => source.fmt(formatter),
             Self::Binding(reason) => reason.fmt(formatter),
@@ -204,6 +215,7 @@ impl std::error::Error for SnapshotRestoreResourceError {
         match &self.kind {
             SnapshotRestoreResourceErrorKind::Manifest(source) => Some(source),
             SnapshotRestoreResourceErrorKind::BindingAllocation(source) => Some(source),
+            SnapshotRestoreResourceErrorKind::Contained(source) => Some(source),
             SnapshotRestoreResourceErrorKind::RootBacking(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Vsock(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Take(source) => Some(source),
@@ -264,6 +276,19 @@ fn snapshot_vsock_error(source: VsockRestoreError) -> SnapshotRestoreResourceErr
     }
 }
 
+fn snapshot_contained_error(source: ContainedSnapshotRestoreError) -> SnapshotRestoreResourceError {
+    SnapshotRestoreResourceError {
+        stage: SnapshotRestoreResourceStage::ContainedReservation,
+        kind: SnapshotRestoreResourceErrorKind::Contained(source),
+        disposition: if source.is_terminal() {
+            SnapshotRestoreResourceDisposition::Terminal
+        } else {
+            SnapshotRestoreResourceDisposition::Retryable
+        },
+        cleanup_failed: source.cleanup_failed(),
+    }
+}
+
 fn vsock_abort_outcome(
     result: Result<VsockRestoreDisposition, VsockRestoreError>,
 ) -> SnapshotRestoreAbortOutcome {
@@ -319,6 +344,14 @@ impl PreparedSnapshotRootBackingLease {
             claim,
             consumed: false,
         })
+    }
+
+    fn from_prepared_claim(selector: PathBuf, claim: PreparedDriveBackingClaim) -> Self {
+        Self {
+            selector: Some(selector),
+            claim: Some(claim),
+            consumed: false,
+        }
     }
 
     pub(crate) fn take_snapshot_read_only_file(&mut self) -> Result<Option<File>, GrantClaimError> {
@@ -412,15 +445,50 @@ impl std::error::Error for SnapshotRootBackingLeaseError {
 
 pub(crate) struct PreparedSnapshotRootRestoreCompletion {
     lease: PreparedSnapshotRootBackingLease,
+    contained_transaction: Option<ContainedSnapshotRestoreTransaction>,
 }
 
 impl PreparedSnapshotRootRestoreCompletion {
-    pub(crate) fn commit(self) {
-        self.lease.commit();
+    pub(crate) fn commit(self) -> Result<(), PreparedSnapshotRootRestoreCompletionError> {
+        let Self {
+            lease,
+            contained_transaction,
+        } = self;
+        lease.commit();
+        match contained_transaction {
+            Some(transaction) => {
+                transaction
+                    .commit()
+                    .map_err(|source| PreparedSnapshotRootRestoreCompletionError {
+                        grant: None,
+                        contained: Some(source),
+                    })
+            }
+            None => Ok(()),
+        }
     }
 
-    pub(crate) fn abort(self) -> Result<(), GrantClaimError> {
-        self.lease.abort()
+    pub(crate) fn abort(self) -> Result<(), PreparedSnapshotRootRestoreCompletionError> {
+        let Self {
+            lease,
+            contained_transaction,
+        } = self;
+        let grant = lease.abort().err();
+        let contained = contained_transaction.and_then(|transaction| transaction.abort().err());
+        if grant.is_some() || contained.is_some() {
+            Err(PreparedSnapshotRootRestoreCompletionError { grant, contained })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn with_contained_transaction(
+        mut self,
+        transaction: ContainedSnapshotRestoreTransaction,
+    ) -> Self {
+        debug_assert!(self.contained_transaction.is_none());
+        self.contained_transaction = Some(transaction);
+        self
     }
 }
 
@@ -430,6 +498,31 @@ impl fmt::Debug for PreparedSnapshotRootRestoreCompletion {
             .debug_struct("PreparedSnapshotRootRestoreCompletion")
             .field("state", &"<provisional>")
             .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedSnapshotRootRestoreCompletionError {
+    grant: Option<GrantClaimError>,
+    contained: Option<ContainedSnapshotRestoreError>,
+}
+
+impl fmt::Display for PreparedSnapshotRootRestoreCompletionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("snapshot root completion authority failed")
+    }
+}
+
+impl std::error::Error for PreparedSnapshotRootRestoreCompletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.contained
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.grant
+                    .as_ref()
+                    .map(|source| source as &(dyn std::error::Error + 'static))
+            })
     }
 }
 
@@ -445,7 +538,11 @@ impl ReservedSnapshotRootRestoreResource {
         let lease = PreparedSnapshotRootBackingLease::prepare(
             selector,
             authority,
-            SnapshotRootSelectorPolicy::RequireGrantWhenContained,
+            if authority.is_some() {
+                SnapshotRootSelectorPolicy::RequireGrantWhenContained
+            } else {
+                SnapshotRootSelectorPolicy::RejectGrantReference
+            },
         )
         .map_err(|source| {
             let kind = SnapshotRestoreResourceErrorKind::RootBacking(
@@ -466,6 +563,12 @@ impl ReservedSnapshotRootRestoreResource {
         Ok(Self { lease })
     }
 
+    fn from_prepared_claim(selector: PathBuf, claim: PreparedDriveBackingClaim) -> Self {
+        Self {
+            lease: PreparedSnapshotRootBackingLease::from_prepared_claim(selector, claim),
+        }
+    }
+
     fn prepare_local(
         mut self,
     ) -> Result<
@@ -478,7 +581,10 @@ impl ReservedSnapshotRootRestoreResource {
         match self.lease.open_snapshot_read_only() {
             Ok(backing) => Ok(PreparedSnapshotRootRestoreResource {
                 backing,
-                completion: PreparedSnapshotRootRestoreCompletion { lease: self.lease },
+                completion: PreparedSnapshotRootRestoreCompletion {
+                    lease: self.lease,
+                    contained_transaction: None,
+                },
             }),
             Err(source) => Err(Box::new((source, self))),
         }
@@ -527,7 +633,15 @@ impl PreparedSnapshotRootRestoreResource {
         (self.backing, self.completion)
     }
 
-    fn abort(self) -> Result<(), GrantClaimError> {
+    fn with_contained_transaction(
+        mut self,
+        transaction: ContainedSnapshotRestoreTransaction,
+    ) -> Self {
+        self.completion = self.completion.with_contained_transaction(transaction);
+        self
+    }
+
+    fn abort(self) -> Result<(), PreparedSnapshotRootRestoreCompletionError> {
         let Self {
             backing,
             completion,
@@ -644,6 +758,18 @@ enum SnapshotRestorePreparationStep {
     Completion,
     VsockAbort,
     RootAbort,
+}
+
+enum SnapshotRestoreReservationSource<'a> {
+    Direct,
+    Contained(&'a ContainedSnapshotRestoreAuthority),
+    #[cfg(test)]
+    Independent {
+        root: Option<&'a GrantAuthority>,
+        directory: Option<&'a DirectoryGrantAuthority>,
+        broker: Option<&'a SocketBrokerAuthority>,
+        namespace: Option<&'a WorkerSocketNamespace>,
+    },
 }
 
 impl RequestedSnapshotRestoreResources {
@@ -768,13 +894,29 @@ impl RequestedSnapshotRestoreResources {
 
     pub(crate) fn prepare_root(
         self,
-        authority: Option<&GrantAuthority>,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
         cancelled: impl Fn() -> bool,
     ) -> Result<PreparedSnapshotRestoreResources, SnapshotRestoreResourceError> {
-        self.prepare(authority, None, None, None, cancelled)
+        self.prepare(authority, cancelled)
     }
 
     pub(crate) fn prepare(
+        self,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PreparedSnapshotRestoreResources, SnapshotRestoreResourceError> {
+        self.prepare_from_source_with_observer(
+            match authority {
+                Some(authority) => SnapshotRestoreReservationSource::Contained(authority),
+                None => SnapshotRestoreReservationSource::Direct,
+            },
+            cancelled,
+            |_| {},
+        )
+    }
+
+    #[cfg(test)]
+    fn prepare_with_independent(
         self,
         root_authority: Option<&GrantAuthority>,
         directory_authority: Option<&DirectoryGrantAuthority>,
@@ -782,7 +924,7 @@ impl RequestedSnapshotRestoreResources {
         namespace: Option<&WorkerSocketNamespace>,
         cancelled: impl Fn() -> bool,
     ) -> Result<PreparedSnapshotRestoreResources, SnapshotRestoreResourceError> {
-        self.prepare_with_observer(
+        self.prepare_with_independent_observer(
             root_authority,
             directory_authority,
             broker_authority,
@@ -792,12 +934,31 @@ impl RequestedSnapshotRestoreResources {
         )
     }
 
-    fn prepare_with_observer(
+    #[cfg(test)]
+    fn prepare_with_independent_observer(
         self,
         root_authority: Option<&GrantAuthority>,
         directory_authority: Option<&DirectoryGrantAuthority>,
         broker_authority: Option<&SocketBrokerAuthority>,
         namespace: Option<&WorkerSocketNamespace>,
+        cancelled: impl Fn() -> bool,
+        observe: impl FnMut(SnapshotRestorePreparationStep),
+    ) -> Result<PreparedSnapshotRestoreResources, SnapshotRestoreResourceError> {
+        self.prepare_from_source_with_observer(
+            SnapshotRestoreReservationSource::Independent {
+                root: root_authority,
+                directory: directory_authority,
+                broker: broker_authority,
+                namespace,
+            },
+            cancelled,
+            observe,
+        )
+    }
+
+    fn prepare_from_source_with_observer(
+        self,
+        source: SnapshotRestoreReservationSource<'_>,
         cancelled: impl Fn() -> bool,
         mut observe: impl FnMut(SnapshotRestorePreparationStep),
     ) -> Result<PreparedSnapshotRestoreResources, SnapshotRestoreResourceError> {
@@ -815,34 +976,124 @@ impl RequestedSnapshotRestoreResources {
         }
 
         observe(SnapshotRestorePreparationStep::RootReservation);
-        let root_reserved =
-            match ReservedSnapshotRootRestoreResource::reserve(&root_selector, root_authority) {
-                Ok(reserved) => reserved,
-                Err(source) => {
-                    let outcome = abort_resources(bindings.into_values());
-                    return Err(source.with_abort_outcome(outcome));
+        let (root_reserved, vsock_reserved, contained_transaction) = match source {
+            SnapshotRestoreReservationSource::Direct => {
+                let root_reserved =
+                    match ReservedSnapshotRootRestoreResource::reserve(&root_selector, None) {
+                        Ok(reserved) => reserved,
+                        Err(source) => {
+                            let outcome = abort_resources(bindings.into_values());
+                            return Err(source.with_abort_outcome(outcome));
+                        }
+                    };
+                let vsock_reserved = match vsock_request {
+                    Some(request) => {
+                        observe(SnapshotRestorePreparationStep::VsockReservation);
+                        match request.reserve(None, None, None, &cancelled) {
+                            Ok(reserved) => Some(reserved),
+                            Err(source) => {
+                                let outcome = root_reserved
+                                    .abort()
+                                    .merge(abort_resources(bindings.into_values()));
+                                return Err(
+                                    snapshot_vsock_error(source).with_abort_outcome(outcome)
+                                );
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                (root_reserved, vsock_reserved, None)
+            }
+            SnapshotRestoreReservationSource::Contained(authority) => {
+                if vsock_request.is_some() {
+                    observe(SnapshotRestorePreparationStep::VsockReservation);
                 }
-            };
-        let vsock_reserved = match vsock_request {
-            Some(request) => {
-                observe(SnapshotRestorePreparationStep::VsockReservation);
-                match request.reserve(directory_authority, broker_authority, namespace, &cancelled)
-                {
-                    Ok(reserved) => Some(reserved),
-                    Err(source) => {
+                let reserved = authority
+                    .prepare(
+                        &root_selector,
+                        vsock_request
+                            .as_ref()
+                            .map(RequestedVsockRestoreResource::destination_reference),
+                        &cancelled,
+                    )
+                    .map_err(snapshot_contained_error)?;
+                let (root_claim, vsock_facets, transaction) =
+                    reserved.into_parts().map_err(snapshot_contained_error)?;
+                let root_reserved = ReservedSnapshotRootRestoreResource::from_prepared_claim(
+                    root_selector,
+                    root_claim,
+                );
+                let vsock_reserved = match (vsock_request, vsock_facets) {
+                    (Some(request), Some((claim, broker, namespace))) => {
+                        Some(request.reserve_contained(claim, broker, namespace))
+                    }
+                    (None, None) => None,
+                    (Some(_), None) => {
                         let outcome = root_reserved
                             .abort()
-                            .merge(abort_resources(bindings.into_values()));
-                        return Err(snapshot_vsock_error(source).with_abort_outcome(outcome));
+                            .merge(abort_contained_transaction(Some(transaction)));
+                        let error = ContainedSnapshotRestoreError::invalid_request();
+                        return Err(snapshot_contained_error(error).with_abort_outcome(outcome));
                     }
-                }
+                    (None, Some((directory, broker, namespace))) => {
+                        drop(namespace);
+                        let owner_cleanup_failed =
+                            broker.abort().is_err() | directory.abort().is_err();
+                        let owner_outcome = if owner_cleanup_failed {
+                            SnapshotRestoreAbortOutcome::terminal(true)
+                        } else {
+                            SnapshotRestoreAbortOutcome::retryable()
+                        };
+                        let outcome = owner_outcome
+                            .merge(root_reserved.abort())
+                            .merge(abort_contained_transaction(Some(transaction)));
+                        let error = ContainedSnapshotRestoreError::invalid_request();
+                        return Err(snapshot_contained_error(error).with_abort_outcome(outcome));
+                    }
+                };
+                (root_reserved, vsock_reserved, Some(transaction))
             }
-            None => None,
+            #[cfg(test)]
+            SnapshotRestoreReservationSource::Independent {
+                root,
+                directory,
+                broker,
+                namespace,
+            } => {
+                let root_reserved =
+                    match ReservedSnapshotRootRestoreResource::reserve(&root_selector, root) {
+                        Ok(reserved) => reserved,
+                        Err(source) => {
+                            let outcome = abort_resources(bindings.into_values());
+                            return Err(source.with_abort_outcome(outcome));
+                        }
+                    };
+                let vsock_reserved = match vsock_request {
+                    Some(request) => {
+                        observe(SnapshotRestorePreparationStep::VsockReservation);
+                        match request.reserve(directory, broker, namespace, &cancelled) {
+                            Ok(reserved) => Some(reserved),
+                            Err(source) => {
+                                let outcome = root_reserved
+                                    .abort()
+                                    .merge(abort_resources(bindings.into_values()));
+                                return Err(
+                                    snapshot_vsock_error(source).with_abort_outcome(outcome)
+                                );
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                (root_reserved, vsock_reserved, None)
+            }
         };
         if cancelled() {
             let outcome = abort_reserved_vsock(vsock_reserved)
                 .merge(root_reserved.abort())
-                .merge(abort_resources(bindings.into_values()));
+                .merge(abort_resources(bindings.into_values()))
+                .merge(abort_contained_transaction(contained_transaction));
             return Err(cancelled_batch_error().with_abort_outcome(outcome));
         }
 
@@ -853,7 +1104,8 @@ impl RequestedSnapshotRestoreResources {
                 let (source, root_reserved) = *failure;
                 let outcome = abort_reserved_vsock(vsock_reserved)
                     .merge(root_reserved.abort())
-                    .merge(abort_resources(bindings.into_values()));
+                    .merge(abort_resources(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
                 return Err(SnapshotRestoreResourceError::retryable(
                     SnapshotRestoreResourceStage::RootPreparation,
                     SnapshotRestoreResourceErrorKind::RootBacking(source),
@@ -868,7 +1120,8 @@ impl RequestedSnapshotRestoreResources {
                     Ok(local) => Some(local),
                     Err(source) => {
                         let outcome = prepared_root_abort_outcome(root)
-                            .merge(abort_resources(bindings.into_values()));
+                            .merge(abort_resources(bindings.into_values()))
+                            .merge(abort_contained_transaction(contained_transaction));
                         return Err(snapshot_vsock_error(source).with_abort_outcome(outcome));
                     }
                 }
@@ -878,7 +1131,8 @@ impl RequestedSnapshotRestoreResources {
         if cancelled() {
             let outcome = abort_local_vsock(vsock_local)
                 .merge(prepared_root_abort_outcome(root))
-                .merge(abort_resources(bindings.into_values()));
+                .merge(abort_resources(bindings.into_values()))
+                .merge(abort_contained_transaction(contained_transaction));
             return Err(cancelled_batch_error().with_abort_outcome(outcome));
         }
         let vsock = match vsock_local {
@@ -888,7 +1142,8 @@ impl RequestedSnapshotRestoreResources {
                     Ok(vsock) => Some(vsock),
                     Err(source) => {
                         let outcome = prepared_root_abort_outcome(root)
-                            .merge(abort_resources(bindings.into_values()));
+                            .merge(abort_resources(bindings.into_values()))
+                            .merge(abort_contained_transaction(contained_transaction));
                         return Err(snapshot_vsock_error(source).with_abort_outcome(outcome));
                     }
                 }
@@ -908,7 +1163,8 @@ impl RequestedSnapshotRestoreResources {
                     observe(SnapshotRestorePreparationStep::RootAbort);
                     rejection.into_value().abort()
                 })
-                .merge(abort_resources(bindings.into_values()));
+                .merge(abort_resources(bindings.into_values()))
+                .merge(abort_contained_transaction(contained_transaction));
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::Binding,
                 SnapshotRestoreResourceErrorKind::Binding(reason),
@@ -923,7 +1179,8 @@ impl RequestedSnapshotRestoreResources {
                 let outcome = rejection
                     .into_value()
                     .abort()
-                    .merge(abort_resources(bindings.into_values()));
+                    .merge(abort_resources(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
                 return Err(SnapshotRestoreResourceError::terminal(
                     SnapshotRestoreResourceStage::Binding,
                     SnapshotRestoreResourceErrorKind::Binding(reason),
@@ -937,7 +1194,8 @@ impl RequestedSnapshotRestoreResources {
             Ok(bindings) => bindings,
             Err(incomplete) => {
                 let missing_count = incomplete.missing_count();
-                let outcome = abort_resources(incomplete.into_bindings().into_values());
+                let outcome = abort_resources(incomplete.into_bindings().into_values())
+                    .merge(abort_contained_transaction(contained_transaction));
                 return Err(SnapshotRestoreResourceError::terminal(
                     SnapshotRestoreResourceStage::Completion,
                     SnapshotRestoreResourceErrorKind::Incomplete { missing_count },
@@ -949,6 +1207,7 @@ impl RequestedSnapshotRestoreResources {
             root_key,
             vsock_key,
             bindings,
+            contained_transaction,
         };
         if cancelled() {
             let outcome = prepared.abort();
@@ -1034,6 +1293,7 @@ impl RequestedSnapshotRestoreResources {
             root_key: self.root_key,
             vsock_key: self.vsock_key,
             bindings,
+            contained_transaction: None,
         };
         if cancelled() {
             let outcome = prepared.abort();
@@ -1060,6 +1320,7 @@ impl RequestedSnapshotRestoreResources {
             root_key: self.root_key,
             vsock_key: self.vsock_key,
             bindings,
+            contained_transaction: None,
         })
     }
 }
@@ -1084,10 +1345,7 @@ fn abort_reserved_vsock(
     reserved: Option<ReservedVsockRestoreResource>,
 ) -> SnapshotRestoreAbortOutcome {
     match reserved {
-        Some(reserved) => match reserved.abort() {
-            VsockRestoreDisposition::Retryable => SnapshotRestoreAbortOutcome::retryable(),
-            VsockRestoreDisposition::Terminal => SnapshotRestoreAbortOutcome::terminal(false),
-        },
+        Some(reserved) => vsock_abort_outcome(reserved.abort()),
         None => SnapshotRestoreAbortOutcome::retryable(),
     }
 }
@@ -1097,6 +1355,18 @@ fn abort_local_vsock(
 ) -> SnapshotRestoreAbortOutcome {
     match local {
         Some(local) => vsock_abort_outcome(local.abort()),
+        None => SnapshotRestoreAbortOutcome::retryable(),
+    }
+}
+
+fn abort_contained_transaction(
+    transaction: Option<ContainedSnapshotRestoreTransaction>,
+) -> SnapshotRestoreAbortOutcome {
+    match transaction {
+        Some(transaction) => match transaction.abort() {
+            Ok(()) => SnapshotRestoreAbortOutcome::retryable(),
+            Err(_) => SnapshotRestoreAbortOutcome::terminal(true),
+        },
         None => SnapshotRestoreAbortOutcome::retryable(),
     }
 }
@@ -1133,6 +1403,7 @@ pub(crate) struct PreparedSnapshotRestoreResources {
     root_key: SnapshotRestoreResourceKey,
     vsock_key: Option<SnapshotRestoreResourceKey>,
     bindings: PreparedSnapshotRestoreBindings<PreparedSnapshotRestoreResource>,
+    contained_transaction: Option<ContainedSnapshotRestoreTransaction>,
 }
 
 impl PreparedSnapshotRestoreResources {
@@ -1180,12 +1451,35 @@ impl PreparedSnapshotRestoreResources {
         }
     }
 
+    fn abort_bindings_and_take_transaction(
+        self,
+    ) -> (
+        SnapshotRestoreAbortOutcome,
+        Option<ContainedSnapshotRestoreTransaction>,
+    ) {
+        (
+            abort_resources(self.bindings.into_values()),
+            self.contained_transaction,
+        )
+    }
+
+    #[cfg(test)]
     fn finish(self) -> Result<(), SnapshotRestoreResourceError> {
-        match self.bindings.finish() {
-            Ok(()) => Ok(()),
+        let Self {
+            root_key: _,
+            vsock_key: _,
+            bindings,
+            contained_transaction,
+        } = self;
+        match bindings.finish() {
+            Ok(()) => match contained_transaction {
+                Some(transaction) => transaction.abort().map_err(snapshot_contained_error),
+                None => Ok(()),
+            },
             Err(unconsumed) => {
                 let unconsumed_count = unconsumed.unconsumed_count();
-                let outcome = abort_resources(unconsumed.into_bindings().into_values());
+                let outcome = abort_resources(unconsumed.into_bindings().into_values())
+                    .merge(abort_contained_transaction(contained_transaction));
                 Err(SnapshotRestoreResourceError::terminal(
                     SnapshotRestoreResourceStage::Finish,
                     SnapshotRestoreResourceErrorKind::Unconsumed { unconsumed_count },
@@ -1216,17 +1510,39 @@ impl PreparedSnapshotRestoreResources {
             Some(key) => match self.take_vsock(&key) {
                 Ok(vsock) => Some(vsock),
                 Err(source) => {
-                    let outcome = self.abort().merge(prepared_root_abort_outcome(root));
+                    let (outcome, transaction) = self.abort_bindings_and_take_transaction();
+                    let outcome = outcome
+                        .merge(prepared_root_abort_outcome(root))
+                        .merge(abort_contained_transaction(transaction));
                     return Err(source.with_abort_outcome(outcome));
                 }
             },
             None => None,
         };
-        if let Err(source) = self.finish() {
-            let outcome =
-                prepared_vsock_abort_outcome(vsock).merge(prepared_root_abort_outcome(root));
-            return Err(source.with_abort_outcome(outcome));
-        }
+        let Self {
+            root_key: _,
+            vsock_key: _,
+            bindings,
+            contained_transaction,
+        } = self;
+        let root = match bindings.finish() {
+            Ok(()) => match contained_transaction {
+                Some(transaction) => root.with_contained_transaction(transaction),
+                None => root,
+            },
+            Err(unconsumed) => {
+                let unconsumed_count = unconsumed.unconsumed_count();
+                let outcome = abort_resources(unconsumed.into_bindings().into_values())
+                    .merge(prepared_vsock_abort_outcome(vsock))
+                    .merge(prepared_root_abort_outcome(root))
+                    .merge(abort_contained_transaction(contained_transaction));
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Finish,
+                    SnapshotRestoreResourceErrorKind::Unconsumed { unconsumed_count },
+                )
+                .with_abort_outcome(outcome));
+            }
+        };
         Ok((root, vsock))
     }
 
@@ -1255,6 +1571,7 @@ impl PreparedSnapshotRestoreResources {
 
     fn abort(self) -> SnapshotRestoreAbortOutcome {
         abort_resources(self.bindings.into_values())
+            .merge(abort_contained_transaction(self.contained_transaction))
     }
 }
 
@@ -1264,6 +1581,10 @@ impl fmt::Debug for PreparedSnapshotRestoreResources {
             .debug_struct("PreparedSnapshotRestoreResources")
             .field("resource_count", &self.bindings.manifest().len())
             .field("remaining_count", &self.bindings.remaining_count())
+            .field(
+                "contained_transaction",
+                &self.contained_transaction.as_ref().map(|_| "<provisional>"),
+            )
             .field("values", &"<redacted>")
             .finish()
     }
@@ -1305,7 +1626,9 @@ mod tests {
     use bangbang_session::ResourceRole;
 
     use crate::contained_session::{
-        GrantAuthority, root_file_grant_authority_for_test, vsock_directory_authority_for_test,
+        ContainedSnapshotRestoreErrorKind, GrantAuthority, TestContainedRestoreAuthority,
+        contained_restore_authority_for_test, root_file_grant_authority_for_test,
+        vsock_directory_authority_for_test,
     };
 
     use super::*;
@@ -1378,6 +1701,23 @@ mod tests {
             SnapshotV2DeviceTransportKind::Mmio,
         ))
         .expect("fixture request should build")
+    }
+
+    fn contained_requested_root() -> RequestedSnapshotRestoreResources {
+        let graph = fixture_graph(SnapshotV2DeviceTransportKind::Mmio);
+        let key = SnapshotRestoreResourceKey::new(
+            graph.root_key(),
+            SnapshotRestorePublicId::try_from(graph.record().config().drive_id())
+                .expect("fixture root ID should validate"),
+            SnapshotRestoreResourceClass::BlockBacking,
+        );
+        RequestedSnapshotRestoreResources::try_from_exact_requests(vec![
+            RequestedSnapshotRestoreResource::Root {
+                key,
+                selector: PathBuf::from(ROOT_REFERENCE),
+            },
+        ])
+        .expect("contained root request should validate")
     }
 
     fn socket_path(name: &str) -> PathBuf {
@@ -1455,6 +1795,162 @@ mod tests {
             .expect("observed restored claim should return to authority");
     }
 
+    fn assert_coherent_root_claim_restored(fixture: &TestContainedRestoreAuthority) {
+        assert_root_claim_restored(fixture.grants());
+    }
+
+    #[test]
+    fn coherent_contained_generation_moves_from_bindings_to_root_completion() {
+        let root = TempRoot::new("coherent-contained", b"root");
+        let fixture = contained_restore_authority_for_test(root.path(), false);
+        let prepared = contained_requested_root()
+            .prepare(Some(fixture.authority()), || false)
+            .expect("coherent contained batch should prepare");
+        let overlap = fixture
+            .authority()
+            .prepare(Path::new(ROOT_REFERENCE), None, &|| false)
+            .expect_err("completed bindings must retain their generation");
+        assert_eq!(overlap.kind(), ContainedSnapshotRestoreErrorKind::Busy);
+
+        let root_owner = prepared
+            .into_root()
+            .expect("exact take and finish should produce the root owner");
+        let overlap = fixture
+            .authority()
+            .prepare(Path::new(ROOT_REFERENCE), None, &|| false)
+            .expect_err("root owner completion must retain its generation");
+        assert_eq!(overlap.kind(), ContainedSnapshotRestoreErrorKind::Busy);
+        let (backing, completion) = root_owner.into_parts();
+        drop(backing);
+        completion
+            .abort()
+            .expect("root and generation should abort in order");
+        assert_coherent_root_claim_restored(&fixture);
+
+        let committed = contained_requested_root()
+            .prepare(Some(fixture.authority()), || false)
+            .expect("released transaction should prepare again")
+            .into_root()
+            .expect("committed transaction should take exactly");
+        let (backing, completion) = committed.into_parts();
+        drop(backing);
+        completion
+            .commit()
+            .expect("final completion boundary should clear the generation");
+        assert!(
+            fixture
+                .grants()
+                .prepare_drive_backing_claim(Path::new(ROOT_REFERENCE), GrantAccess::ReadOnly)
+                .is_err(),
+            "committed root authority must remain consumed"
+        );
+        let consumed = fixture
+            .authority()
+            .prepare(Path::new(ROOT_REFERENCE), None, &|| false)
+            .expect_err("consumed root must fail complete-set preflight");
+        assert_eq!(
+            consumed.kind(),
+            ContainedSnapshotRestoreErrorKind::Authority
+        );
+    }
+
+    #[test]
+    fn coherent_contained_abort_restores_root_before_stale_generation_failure() {
+        let root = TempRoot::new("coherent-stale", b"root");
+        let fixture = contained_restore_authority_for_test(root.path(), false);
+        let root_owner = contained_requested_root()
+            .prepare(Some(fixture.authority()), || false)
+            .expect("coherent contained batch should prepare")
+            .into_root()
+            .expect("coherent root should take exactly");
+        let (backing, completion) = root_owner.into_parts();
+        drop(backing);
+        fixture.invalidate_generation();
+        let error = completion
+            .abort()
+            .expect_err("stale generation must not be converted into success");
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains(ROOT_REFERENCE));
+        assert!(!diagnostic.contains(root.path().to_string_lossy().as_ref()));
+        assert_coherent_root_claim_restored(&fixture);
+    }
+
+    #[test]
+    fn coherent_contained_vsock_facets_abort_before_publication_on_cancellation() {
+        let root = TempRoot::new("coherent-vsock-cancel", b"root");
+        let fixture = contained_restore_authority_for_test(root.path(), true);
+        let contained_vsock = selector(Path::new("bangbang-grant:vsock-directory/restored.sock"));
+        let (request, _, _) =
+            composed_request(Path::new(ROOT_REFERENCE), &contained_vsock, None, false);
+        let checks = Cell::new(0);
+        let error = request
+            .prepare(Some(fixture.authority()), || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next > 10
+            })
+            .expect_err("cancellation after coherent reservation should reverse every facet");
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::Cancellation);
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert!(!error.cleanup_failed);
+        fixture.assert_authorities_available(true);
+    }
+
+    #[test]
+    fn coherent_contained_vsock_abort_reports_broker_restoration_failure() {
+        let root = TempRoot::new("coherent-vsock-broker-loss", b"root");
+        let fixture = contained_restore_authority_for_test(root.path(), true);
+        let contained_vsock = selector(Path::new("bangbang-grant:vsock-directory/restored.sock"));
+        let (request, _, _) =
+            composed_request(Path::new(ROOT_REFERENCE), &contained_vsock, None, false);
+        let checks = Cell::new(0);
+        let error = request
+            .prepare(Some(fixture.authority()), || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                if next == 11 {
+                    fixture.invalidate_broker();
+                    true
+                } else {
+                    false
+                }
+            })
+            .expect_err("broker invalidation during outer cancellation must be terminal");
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::Cancellation);
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+        assert!(error.cleanup_failed);
+        assert_coherent_root_claim_restored(&fixture);
+        let directory = fixture
+            .directories()
+            .prepare_socket_directory(
+                Path::new("bangbang-grant:vsock-directory/restored.sock"),
+                bangbang_session::ResourceRole::VsockSocketDirectory,
+            )
+            .expect("directory restoration should still be attempted")
+            .expect("directory reference should remain contained");
+        directory
+            .abort()
+            .expect("restored directory should remain reusable");
+    }
+
+    #[test]
+    fn direct_batch_rejects_reserved_root_reference_without_path_fallback() {
+        let error = contained_requested_root()
+            .prepare(None, || false)
+            .expect_err("direct mode must reject reserved grant grammar");
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::RootPreparation);
+        assert!(matches!(
+            error.kind,
+            SnapshotRestoreResourceErrorKind::RootBacking(SnapshotRootBackingLeaseError::Grant(_))
+        ));
+    }
+
     #[test]
     fn current_graphs_build_one_exact_host_free_root_request() {
         for transport in [
@@ -1527,7 +2023,7 @@ mod tests {
 
             let events = RefCell::new(Vec::new());
             let prepared = request
-                .prepare_with_observer(
+                .prepare_with_independent_observer(
                     None,
                     None,
                     None,
@@ -1602,7 +2098,7 @@ mod tests {
             true,
         );
         let (root_owner, vsock) = request
-            .prepare(None, None, None, None, || false)
+            .prepare(None, || false)
             .expect("composed owners should prepare before construction")
             .into_root_and_optional_vsock()
             .expect("exact owners should be taken before construction");
@@ -1638,7 +2134,7 @@ mod tests {
         let (request, _, _) = composed_request(Path::new(ROOT_REFERENCE), &captured, None, false);
         let events = RefCell::new(Vec::new());
         let error = request
-            .prepare_with_observer(
+            .prepare_with_independent_observer(
                 Some(&authority),
                 None,
                 None,
@@ -1680,7 +2176,7 @@ mod tests {
         let (request, _, _) = composed_request(Path::new(ROOT_REFERENCE), &captured, None, true);
         let events = RefCell::new(Vec::new());
         let error = request
-            .prepare_with_observer(
+            .prepare_with_independent_observer(
                 Some(&root_authority),
                 Some(&directory_authority),
                 None,
@@ -1826,7 +2322,7 @@ mod tests {
         );
         let events = RefCell::new(Vec::new());
         let error = request
-            .prepare_with_observer(
+            .prepare_with_independent_observer(
                 Some(&authority),
                 None,
                 None,
@@ -1893,7 +2389,7 @@ mod tests {
         let (request, root_key, vsock_key) =
             composed_request(Path::new(ROOT_REFERENCE), &captured, None, false);
         let mut prepared = request
-            .prepare(Some(&authority), None, None, None, || false)
+            .prepare_with_independent(Some(&authority), None, None, None, || false)
             .expect("composed batch should prepare");
         let vsock = prepared
             .take_vsock(&vsock_key)
@@ -1925,7 +2421,7 @@ mod tests {
         let (request, _, _) =
             composed_request(Path::new(ROOT_REFERENCE), &second_captured, None, false);
         let unconsumed = request
-            .prepare(Some(&second_authority), None, None, None, || false)
+            .prepare_with_independent(Some(&second_authority), None, None, None, || false)
             .expect("second composed batch should prepare")
             .finish()
             .expect_err("finish must reject both unconsumed owners");
@@ -2090,7 +2586,9 @@ mod tests {
             contained_root(&committed_authority).expect("committed root should prepare");
         let (backing, completion) = committed.into_parts();
         drop(backing);
-        completion.commit();
+        completion
+            .commit()
+            .expect("contained completion should commit its exact claim");
         assert!(
             committed_observer
                 .prepare_drive_backing_claim(Path::new(ROOT_REFERENCE), GrantAccess::ReadOnly,)

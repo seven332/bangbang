@@ -231,6 +231,62 @@ impl FileGrantRegistry {
         duplicate_files(&self.entries, requests)
     }
 
+    /// Validates exact file grants without duplicating or adopting descriptors.
+    ///
+    /// The returned identities preserve request order and permit a caller to
+    /// reject aliases across independently owned authority classes.
+    pub fn inspect_exact_files(
+        &self,
+        requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+    ) -> Result<Vec<ObjectIdentity>, GrantRegistryError> {
+        inspect_exact_files(&self.entries, requests)
+    }
+
+    /// Validates exact file grants into caller-preallocated identity storage.
+    ///
+    /// This variant performs no allocation, duplication, or adoption.
+    pub fn inspect_exact_files_into(
+        &self,
+        requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+        identities: &mut Vec<ObjectIdentity>,
+    ) -> Result<(), GrantRegistryError> {
+        inspect_exact_files_into(&self.entries, requests, identities)
+    }
+
+    /// Duplicates exact file grants after complete in-memory validation.
+    pub fn duplicate_exact_files(
+        &self,
+        requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+    ) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+        duplicate_exact_files(&self.entries, requests)
+    }
+
+    /// Duplicates exact file grants into caller-preallocated owner storage.
+    pub fn duplicate_exact_files_into(
+        &self,
+        requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+        files: &mut Vec<GrantedFile>,
+    ) -> Result<(), GrantRegistryError> {
+        duplicate_exact_files_into(&self.entries, requests, files)
+    }
+
+    /// Atomically adopts exact file grants after complete validation.
+    pub fn take_exact_files(
+        &mut self,
+        requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+    ) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+        take_exact_files(&mut self.entries, requests)
+    }
+
+    /// Atomically adopts exact file grants into caller-preallocated storage.
+    pub fn take_exact_files_into(
+        &mut self,
+        requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+        files: &mut Vec<GrantedFile>,
+    ) -> Result<(), GrantRegistryError> {
+        take_exact_files_into(&mut self.entries, requests, files)
+    }
+
     /// Duplicates one exact drive backing without adopting the original.
     pub fn duplicate_drive_backing(
         &self,
@@ -383,6 +439,45 @@ impl DirectoryGrantRegistry {
         take_scoped_directories(&mut self.entries, requests)
     }
 
+    /// Validates exact directory grants without adopting active scopes.
+    ///
+    /// The returned identities preserve request order and permit a caller to
+    /// reject aliases across independently owned authority classes.
+    pub fn inspect_exact_directories(
+        &self,
+        requests: &[(GrantId, ResourceRole, GrantAccess)],
+    ) -> Result<Vec<ObjectIdentity>, GrantRegistryError> {
+        inspect_exact_directories(&self.entries, requests)
+    }
+
+    /// Validates exact directory grants into caller-preallocated identity storage.
+    ///
+    /// This variant performs no allocation or scope adoption.
+    pub fn inspect_exact_directories_into(
+        &self,
+        requests: &[(GrantId, ResourceRole, GrantAccess)],
+        identities: &mut Vec<ObjectIdentity>,
+    ) -> Result<(), GrantRegistryError> {
+        inspect_exact_directories_into(&self.entries, requests, identities)
+    }
+
+    /// Atomically adopts exact directory grants after complete validation.
+    pub fn take_exact_directories(
+        &mut self,
+        requests: &[(GrantId, ResourceRole, GrantAccess)],
+    ) -> Result<Vec<GrantedDirectory>, GrantRegistryError> {
+        take_exact_directories(&mut self.entries, requests)
+    }
+
+    /// Atomically adopts exact directories into caller-preallocated storage.
+    pub fn take_exact_directories_into(
+        &mut self,
+        requests: &[(GrantId, ResourceRole, GrantAccess)],
+        directories: &mut Vec<GrantedDirectory>,
+    ) -> Result<(), GrantRegistryError> {
+        take_exact_directories_into(&mut self.entries, requests, directories)
+    }
+
     /// Returns one reserved directory grant after an aborted owner transaction.
     pub fn restore_scoped_directory(
         &mut self,
@@ -415,6 +510,108 @@ fn take_scoped_directory(
         return Err(GrantRegistryError);
     }
     entries.remove(id).ok_or(GrantRegistryError)
+}
+
+fn inspect_exact_directories(
+    entries: &HashMap<GrantId, GrantedDirectory>,
+    requests: &[(GrantId, ResourceRole, GrantAccess)],
+) -> Result<Vec<ObjectIdentity>, GrantRegistryError> {
+    let mut inspected = Vec::new();
+    inspected
+        .try_reserve_exact(requests.len())
+        .map_err(|_| GrantRegistryError)?;
+    inspect_exact_directories_into(entries, requests, &mut inspected)?;
+    Ok(inspected)
+}
+
+fn validate_exact_directories(
+    entries: &HashMap<GrantId, GrantedDirectory>,
+    requests: &[(GrantId, ResourceRole, GrantAccess)],
+) -> Result<(), GrantRegistryError> {
+    for (index, (id, role, access)) in requests.iter().enumerate() {
+        let directory = entries.get(id).ok_or(GrantRegistryError)?;
+        let prior = requests.get(..index).ok_or(GrantRegistryError)?;
+        if !matches_exact_directory(directory, *role, *access)
+            || prior.iter().any(|(prior_id, _, _)| prior_id == id)
+            || prior.iter().any(|(prior_id, _, _)| {
+                entries
+                    .get(prior_id)
+                    .is_some_and(|prior| prior.identity == directory.identity)
+            })
+        {
+            return Err(GrantRegistryError);
+        }
+    }
+    Ok(())
+}
+
+fn inspect_exact_directories_into(
+    entries: &HashMap<GrantId, GrantedDirectory>,
+    requests: &[(GrantId, ResourceRole, GrantAccess)],
+    inspected: &mut Vec<ObjectIdentity>,
+) -> Result<(), GrantRegistryError> {
+    if !inspected.is_empty() || inspected.capacity() < requests.len() {
+        return Err(GrantRegistryError);
+    }
+    validate_exact_directories(entries, requests)?;
+    inspected.extend(
+        requests
+            .iter()
+            .filter_map(|(id, _, _)| entries.get(id).map(|directory| directory.identity)),
+    );
+    if inspected.len() != requests.len() {
+        inspected.clear();
+        return Err(GrantRegistryError);
+    }
+    Ok(())
+}
+
+fn take_exact_directories(
+    entries: &mut HashMap<GrantId, GrantedDirectory>,
+    requests: &[(GrantId, ResourceRole, GrantAccess)],
+) -> Result<Vec<GrantedDirectory>, GrantRegistryError> {
+    let mut directories = Vec::new();
+    directories
+        .try_reserve_exact(requests.len())
+        .map_err(|_| GrantRegistryError)?;
+    take_exact_directories_into(entries, requests, &mut directories)?;
+    Ok(directories)
+}
+
+fn take_exact_directories_into(
+    entries: &mut HashMap<GrantId, GrantedDirectory>,
+    requests: &[(GrantId, ResourceRole, GrantAccess)],
+    directories: &mut Vec<GrantedDirectory>,
+) -> Result<(), GrantRegistryError> {
+    if !directories.is_empty() || directories.capacity() < requests.len() {
+        return Err(GrantRegistryError);
+    }
+    validate_exact_directories(entries, requests)?;
+    for (id, _, _) in requests {
+        let Some(directory) = entries.remove(id) else {
+            for (restored_id, restored_directory) in requests.iter().zip(directories.drain(..)).map(
+                |((restored_id, _, _), restored_directory)| {
+                    (restored_id.clone(), restored_directory)
+                },
+            ) {
+                entries.insert(restored_id, restored_directory);
+            }
+            return Err(GrantRegistryError);
+        };
+        directories.push(directory);
+    }
+    Ok(())
+}
+
+fn matches_exact_directory(
+    directory: &GrantedDirectory,
+    role: ResourceRole,
+    access: GrantAccess,
+) -> bool {
+    directory.role == role
+        && directory.access == access
+        && role.is_scoped_directory()
+        && role.permits(access)
 }
 
 fn take_scoped_directories(
@@ -569,6 +766,153 @@ fn duplicate_files(
         files.push(duplicate_file(file)?);
     }
     Ok(files)
+}
+
+fn inspect_exact_files(
+    entries: &HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+) -> Result<Vec<ObjectIdentity>, GrantRegistryError> {
+    let mut inspected = Vec::new();
+    inspected
+        .try_reserve_exact(requests.len())
+        .map_err(|_| GrantRegistryError)?;
+    inspect_exact_files_into(entries, requests, &mut inspected)?;
+    Ok(inspected)
+}
+
+fn validate_exact_files(
+    entries: &HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+) -> Result<(), GrantRegistryError> {
+    for (index, (id, role, access, kind)) in requests.iter().enumerate() {
+        let file = entries.get(id).ok_or(GrantRegistryError)?;
+        let prior = requests.get(..index).ok_or(GrantRegistryError)?;
+        if !matches_exact_file(file, *role, *access, *kind)
+            || prior.iter().any(|(prior_id, _, _, _)| prior_id == id)
+            || prior.iter().any(|(prior_id, _, _, _)| {
+                entries
+                    .get(prior_id)
+                    .is_some_and(|prior| prior.identity == file.identity)
+            })
+        {
+            return Err(GrantRegistryError);
+        }
+    }
+    Ok(())
+}
+
+fn inspect_exact_files_into(
+    entries: &HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+    inspected: &mut Vec<ObjectIdentity>,
+) -> Result<(), GrantRegistryError> {
+    if !inspected.is_empty() || inspected.capacity() < requests.len() {
+        return Err(GrantRegistryError);
+    }
+    validate_exact_files(entries, requests)?;
+    inspected.extend(
+        requests
+            .iter()
+            .filter_map(|(id, _, _, _)| entries.get(id).map(|file| file.identity)),
+    );
+    if inspected.len() != requests.len() {
+        inspected.clear();
+        return Err(GrantRegistryError);
+    }
+    Ok(())
+}
+
+fn duplicate_exact_files(
+    entries: &HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+    let mut files = Vec::new();
+    files
+        .try_reserve_exact(requests.len())
+        .map_err(|_| GrantRegistryError)?;
+    duplicate_exact_files_into(entries, requests, &mut files)?;
+    Ok(files)
+}
+
+fn duplicate_exact_files_into(
+    entries: &HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+    files: &mut Vec<GrantedFile>,
+) -> Result<(), GrantRegistryError> {
+    if !files.is_empty() || files.capacity() < requests.len() {
+        return Err(GrantRegistryError);
+    }
+    validate_exact_files(entries, requests)?;
+    for (id, _, _, _) in requests {
+        let duplicate = entries
+            .get(id)
+            .ok_or(GrantRegistryError)
+            .and_then(duplicate_file);
+        match duplicate {
+            Ok(file) => files.push(file),
+            Err(source) => {
+                files.clear();
+                return Err(source);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn take_exact_files(
+    entries: &mut HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+) -> Result<Vec<GrantedFile>, GrantRegistryError> {
+    let mut files = Vec::new();
+    files
+        .try_reserve_exact(requests.len())
+        .map_err(|_| GrantRegistryError)?;
+    take_exact_files_into(entries, requests, &mut files)?;
+    Ok(files)
+}
+
+fn take_exact_files_into(
+    entries: &mut HashMap<GrantId, GrantedFile>,
+    requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+    files: &mut Vec<GrantedFile>,
+) -> Result<(), GrantRegistryError> {
+    if !files.is_empty() || files.capacity() < requests.len() {
+        return Err(GrantRegistryError);
+    }
+    validate_exact_files(entries, requests)?;
+    for (id, _, _, _) in requests {
+        let Some(file) = entries.remove(id) else {
+            for (restored_id, restored_file) in requests
+                .iter()
+                .zip(files.drain(..))
+                .map(|((restored_id, _, _, _), restored_file)| (restored_id.clone(), restored_file))
+            {
+                entries.insert(restored_id, restored_file);
+            }
+            return Err(GrantRegistryError);
+        };
+        files.push(file);
+    }
+    Ok(())
+}
+
+fn matches_exact_file(
+    file: &GrantedFile,
+    role: ResourceRole,
+    access: GrantAccess,
+    kind: GrantObjectKind,
+) -> bool {
+    file.role == role
+        && file.access == access
+        && file.kind == kind
+        && role.permits(access)
+        && match kind {
+            GrantObjectKind::RegularFile => file.block_device.is_none(),
+            GrantObjectKind::BlockDevice => {
+                role == ResourceRole::DriveBacking && file.block_device.is_some()
+            }
+            GrantObjectKind::Directory | GrantObjectKind::ConnectedUnixStream => false,
+        }
 }
 
 fn matches_generic_file(file: &GrantedFile, role: ResourceRole, access: GrantAccess) -> bool {
@@ -2236,6 +2580,86 @@ mod tests {
         assert!(files.duplicate_files(&duplicate).is_err());
         assert_eq!(files.len(), 2);
 
+        let exact = [
+            (
+                kernel_id.clone(),
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+                GrantObjectKind::RegularFile,
+            ),
+            (
+                initrd_id.clone(),
+                ResourceRole::InitrdImage,
+                GrantAccess::ReadOnly,
+                GrantObjectKind::RegularFile,
+            ),
+        ];
+        let identities = files
+            .inspect_exact_files(&exact)
+            .expect("exact inspection should use retained metadata");
+        assert_eq!(
+            identities,
+            [
+                ObjectIdentity {
+                    device: normalized_device(kernel_stat.st_dev),
+                    inode: kernel_stat.st_ino,
+                },
+                ObjectIdentity {
+                    device: normalized_device(initrd_stat.st_dev),
+                    inode: initrd_stat.st_ino,
+                },
+            ]
+        );
+        assert_eq!(files.len(), 2);
+        for invalid in [
+            vec![(
+                kernel_id.clone(),
+                ResourceRole::KernelImage,
+                GrantAccess::WriteOnly,
+                GrantObjectKind::RegularFile,
+            )],
+            vec![(
+                kernel_id.clone(),
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+                GrantObjectKind::BlockDevice,
+            )],
+            vec![exact[0].clone(), exact[0].clone()],
+        ] {
+            assert!(files.inspect_exact_files(&invalid).is_err());
+            assert!(files.duplicate_exact_files(&invalid).is_err());
+            assert!(files.take_exact_files(&invalid).is_err());
+            assert_eq!(files.len(), 2);
+        }
+        let exact_duplicates = files
+            .duplicate_exact_files(&exact)
+            .expect("exact duplication should follow complete validation");
+        assert_eq!(exact_duplicates.len(), 2);
+        assert_eq!(files.len(), 2);
+        drop(exact_duplicates);
+        let initrd_identity = files
+            .entries
+            .get(&initrd_id)
+            .expect("initrd grant should remain")
+            .identity;
+        let kernel_identity = files
+            .entries
+            .get(&kernel_id)
+            .expect("kernel grant should remain")
+            .identity;
+        files
+            .entries
+            .get_mut(&initrd_id)
+            .expect("initrd grant should remain")
+            .identity = kernel_identity;
+        assert!(files.inspect_exact_files(&exact).is_err());
+        assert_eq!(files.len(), 2);
+        files
+            .entries
+            .get_mut(&initrd_id)
+            .expect("initrd grant should remain")
+            .identity = initrd_identity;
+
         let reserved = files
             .take_file(&kernel_id, ResourceRole::KernelImage, GrantAccess::ReadOnly)
             .expect("matching grant should reserve");
@@ -2257,18 +2681,7 @@ mod tests {
         );
 
         let adopted = files
-            .take_files(&[
-                (
-                    initrd_id.clone(),
-                    ResourceRole::InitrdImage,
-                    GrantAccess::ReadOnly,
-                ),
-                (
-                    kernel_id.clone(),
-                    ResourceRole::KernelImage,
-                    GrantAccess::ReadOnly,
-                ),
-            ])
+            .take_exact_files(&[exact[1].clone(), exact[0].clone()])
             .expect("matching reverse-order pair should adopt");
         assert_eq!(adopted.len(), 2);
         assert_eq!(adopted[0].role, ResourceRole::InitrdImage);
@@ -2325,6 +2738,39 @@ mod tests {
             ]),
         };
 
+        let exact = [
+            (
+                state_id.clone(),
+                ResourceRole::SnapshotOutputDirectory,
+                GrantAccess::CreateChildren,
+            ),
+            (
+                memory_id.clone(),
+                ResourceRole::SnapshotOutputDirectory,
+                GrantAccess::CreateChildren,
+            ),
+        ];
+        assert_eq!(
+            directories
+                .inspect_exact_directories(&exact)
+                .expect("exact directory inspection should remain read-only")
+                .len(),
+            2
+        );
+        assert_eq!(directories.len(), 2);
+        for invalid in [
+            vec![(
+                state_id.clone(),
+                ResourceRole::SnapshotOutputDirectory,
+                GrantAccess::ConnectChildren,
+            )],
+            vec![exact[0].clone(), exact[0].clone()],
+        ] {
+            assert!(directories.inspect_exact_directories(&invalid).is_err());
+            assert!(directories.take_exact_directories(&invalid).is_err());
+            assert_eq!(directories.len(), 2);
+        }
+
         assert!(
             directories
                 .take_scoped_directories(&[
@@ -2345,10 +2791,7 @@ mod tests {
         assert_eq!(directories.len(), 2);
 
         let adopted = directories
-            .take_scoped_directories(&[
-                (memory_id, ResourceRole::SnapshotOutputDirectory),
-                (state_id, ResourceRole::SnapshotOutputDirectory),
-            ])
+            .take_exact_directories(&[exact[1].clone(), exact[0].clone()])
             .expect("matching directories should adopt atomically");
         assert_eq!(adopted.len(), 2);
         assert!(directories.is_empty());

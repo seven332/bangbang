@@ -215,6 +215,13 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
                 .transpose()
                 .map_err(|_| ProcessError::ContainedSession)?
                 .flatten();
+            #[cfg(target_os = "macos")]
+            let contained_restore_authority = contained
+                .as_ref()
+                .map(ContainedSession::snapshot_restore_authority)
+                .transpose()
+                .map_err(|_| ProcessError::ContainedSession)?
+                .flatten();
             preallocate_fdtable().map_err(ProcessError::FdTablePreallocation)?;
             if contained_shutdown_requested(contained)? {
                 return Ok(());
@@ -267,7 +274,8 @@ fn run(contained: &mut Option<ContainedSession>) -> Result<(), ProcessError> {
                     socket_broker_authority,
                     vhost_user_broker_authority,
                     socket_namespace,
-                );
+                )
+                .with_contained_restore_authority(contained_restore_authority);
             #[cfg(not(target_os = "macos"))]
             let mut vmm = vmm;
             apply_startup_metrics_config(&mut vmm, metrics_config)?;

@@ -297,6 +297,7 @@ mod platform {
     use std::collections::{HashMap, HashSet};
     use std::env;
     use std::ffi::OsStr;
+    use std::fmt;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem::MaybeUninit;
@@ -409,6 +410,211 @@ mod platform {
                 *current = state;
             }
             Ok(())
+        }
+    }
+
+    /// Redacted reason a contained restore transaction could not proceed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ContainedSnapshotRestoreErrorKind {
+        Busy,
+        Cancelled,
+        Inactive,
+        InvalidRequest,
+        Authority,
+        Provenance,
+        Cleanup,
+    }
+
+    /// Process-only contained restore transaction failure.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct ContainedSnapshotRestoreError {
+        kind: ContainedSnapshotRestoreErrorKind,
+        cleanup_failed: bool,
+    }
+
+    impl ContainedSnapshotRestoreError {
+        const fn new(kind: ContainedSnapshotRestoreErrorKind) -> Self {
+            Self {
+                kind,
+                cleanup_failed: false,
+            }
+        }
+
+        const fn with_cleanup_failure(mut self) -> Self {
+            self.cleanup_failed = true;
+            self
+        }
+
+        pub(crate) const fn kind(&self) -> ContainedSnapshotRestoreErrorKind {
+            self.kind
+        }
+
+        pub(crate) const fn cleanup_failed(&self) -> bool {
+            self.cleanup_failed
+        }
+
+        pub(crate) const fn is_terminal(&self) -> bool {
+            matches!(
+                self.kind(),
+                ContainedSnapshotRestoreErrorKind::Inactive
+                    | ContainedSnapshotRestoreErrorKind::Provenance
+                    | ContainedSnapshotRestoreErrorKind::Cleanup
+            ) || self.cleanup_failed
+        }
+
+        pub(crate) const fn invalid_request() -> Self {
+            Self::new(ContainedSnapshotRestoreErrorKind::InvalidRequest)
+        }
+    }
+
+    impl fmt::Display for ContainedSnapshotRestoreError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("contained snapshot restore transaction failed")
+        }
+    }
+
+    impl std::error::Error for ContainedSnapshotRestoreError {}
+
+    struct ContainedSnapshotRestoreGenerationState {
+        session: SessionId,
+        next_generation: u64,
+        active_generation: Option<u64>,
+        active: bool,
+    }
+
+    /// Sendable lifecycle revocation facet for process-only restore generations.
+    #[derive(Clone)]
+    struct ContainedSnapshotRestoreGenerationAuthority {
+        state: Arc<Mutex<ContainedSnapshotRestoreGenerationState>>,
+    }
+
+    impl ContainedSnapshotRestoreGenerationAuthority {
+        fn new(session: SessionId) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(ContainedSnapshotRestoreGenerationState {
+                    session,
+                    next_generation: 0,
+                    active_generation: None,
+                    active: true,
+                })),
+            }
+        }
+
+        fn begin(
+            &self,
+            expected_session: SessionId,
+        ) -> Result<ContainedSnapshotRestoreTransaction, ContainedSnapshotRestoreError> {
+            let mut state = self.state.lock().map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+            })?;
+            if !state.active || state.session != expected_session {
+                return Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::Inactive,
+                ));
+            }
+            if state.active_generation.is_some() {
+                return Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::Busy,
+                ));
+            }
+            let generation = state.next_generation.checked_add(1).ok_or_else(|| {
+                state.active = false;
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+            })?;
+            state.next_generation = generation;
+            state.active_generation = Some(generation);
+            Ok(ContainedSnapshotRestoreTransaction {
+                authority: self.clone(),
+                session: expected_session,
+                generation,
+                finished: false,
+            })
+        }
+
+        fn invalidate(&self) {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.active = false;
+            state.active_generation = None;
+        }
+    }
+
+    /// Move-only witness for one active contained restore generation.
+    pub(crate) struct ContainedSnapshotRestoreTransaction {
+        authority: ContainedSnapshotRestoreGenerationAuthority,
+        session: SessionId,
+        generation: u64,
+        finished: bool,
+    }
+
+    impl ContainedSnapshotRestoreTransaction {
+        pub(crate) fn check(&self) -> Result<(), ContainedSnapshotRestoreError> {
+            let state = self.authority.state.lock().map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+            })?;
+            if !state.active
+                || state.session != self.session
+                || state.active_generation != Some(self.generation)
+            {
+                return Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::Inactive,
+                ));
+            }
+            Ok(())
+        }
+
+        fn finish_inner(&mut self) -> Result<(), ContainedSnapshotRestoreError> {
+            let mut state = self.authority.state.lock().map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Cleanup)
+            })?;
+            if !state.active
+                || state.session != self.session
+                || state.active_generation != Some(self.generation)
+            {
+                self.finished = true;
+                return Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::Inactive,
+                ));
+            }
+            state.active_generation = None;
+            self.finished = true;
+            Ok(())
+        }
+
+        pub(crate) fn commit(mut self) -> Result<(), ContainedSnapshotRestoreError> {
+            self.finish_inner()
+        }
+
+        pub(crate) fn abort(mut self) -> Result<(), ContainedSnapshotRestoreError> {
+            self.finish_inner()
+        }
+    }
+
+    impl fmt::Debug for ContainedSnapshotRestoreTransaction {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("ContainedSnapshotRestoreTransaction")
+                .field("identity", &"<redacted>")
+                .field("active", &self.check().is_ok())
+                .finish()
+        }
+    }
+
+    impl Drop for ContainedSnapshotRestoreTransaction {
+        fn drop(&mut self) {
+            if self.finished {
+                return;
+            }
+            let mut state = match self.authority.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if state.session == self.session && state.active_generation == Some(self.generation) {
+                state.active_generation = None;
+            }
+            self.finished = true;
         }
     }
 
@@ -686,6 +892,40 @@ mod platform {
         }
     }
 
+    struct SnapshotRestoreDriveClaimBuffers {
+        identities: Vec<ObjectIdentity>,
+        duplicates: Vec<GrantedFile>,
+        originals: Vec<GrantedFile>,
+        claims: Vec<PreparedDriveBackingClaim>,
+    }
+
+    impl SnapshotRestoreDriveClaimBuffers {
+        fn try_new(count: usize) -> Result<Self, ContainedSnapshotRestoreError> {
+            let mut identities = Vec::new();
+            let mut duplicates = Vec::new();
+            let mut originals = Vec::new();
+            let mut claims = Vec::new();
+            identities.try_reserve_exact(count).map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+            })?;
+            duplicates.try_reserve_exact(count).map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+            })?;
+            originals.try_reserve_exact(count).map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+            })?;
+            claims.try_reserve_exact(count).map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+            })?;
+            Ok(Self {
+                identities,
+                duplicates,
+                originals,
+                claims,
+            })
+        }
+    }
+
     impl std::fmt::Debug for GrantAuthority {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -864,6 +1104,76 @@ mod platform {
                 })
         }
 
+        fn inspect_snapshot_restore_files(
+            &self,
+            requests: &[(GrantId, ResourceRole, GrantAccess, GrantObjectKind)],
+            identities: &mut Vec<ObjectIdentity>,
+        ) -> Result<(), ContainedSnapshotRestoreError> {
+            let registry = self.registry.lock().map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+            })?;
+            registry
+                .as_ref()
+                .ok_or_else(|| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+                })?
+                .inspect_exact_files_into(requests, identities)
+                .map_err(|_| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+                })
+        }
+
+        fn prepare_snapshot_restore_drive_claims(
+            &self,
+            requests: Vec<(GrantId, ResourceRole, GrantAccess, GrantObjectKind)>,
+            mut buffers: SnapshotRestoreDriveClaimBuffers,
+        ) -> Result<Vec<PreparedDriveBackingClaim>, ContainedSnapshotRestoreError> {
+            if requests
+                .iter()
+                .any(|(_, role, _, _)| *role != ResourceRole::DriveBacking)
+            {
+                return Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                ));
+            }
+            {
+                let mut locked = self.registry.lock().map_err(|_| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+                })?;
+                let registry = locked.as_mut().ok_or_else(|| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+                })?;
+                registry
+                    .duplicate_exact_files_into(&requests, &mut buffers.duplicates)
+                    .map_err(|_| {
+                        ContainedSnapshotRestoreError::new(
+                            ContainedSnapshotRestoreErrorKind::Authority,
+                        )
+                    })?;
+                registry
+                    .take_exact_files_into(&requests, &mut buffers.originals)
+                    .map_err(|_| {
+                        ContainedSnapshotRestoreError::new(
+                            ContainedSnapshotRestoreErrorKind::Authority,
+                        )
+                    })?;
+            }
+            for (((id, _, _, _), original), duplicate) in requests
+                .into_iter()
+                .zip(buffers.originals)
+                .zip(buffers.duplicates)
+            {
+                buffers.claims.push(PreparedDriveBackingClaim {
+                    registry: Arc::clone(&self.registry),
+                    block_control: self.block_control.clone(),
+                    id,
+                    original: Some(original),
+                    duplicate: Some(duplicate),
+                });
+            }
+            Ok(buffers.claims)
+        }
+
         pub(crate) fn take_exact_files(
             &self,
             requests: &[(GrantId, ResourceRole, GrantAccess)],
@@ -965,23 +1275,30 @@ mod platform {
                 child: self.child.clone(),
             }
         }
+
+        fn restore(&mut self) -> Result<(), GrantClaimError> {
+            let Some(directory) = self.directory.take() else {
+                return Ok(());
+            };
+            let mut registry = self
+                .authority
+                .registry
+                .try_borrow_mut()
+                .map_err(|_| GrantClaimError)?;
+            let registry = registry.as_mut().ok_or(GrantClaimError)?;
+            registry
+                .restore_scoped_directory(self.grant_id.clone(), directory)
+                .map_err(|_| GrantClaimError)
+        }
+
+        pub(crate) fn abort(mut self) -> Result<(), GrantClaimError> {
+            self.restore()
+        }
     }
 
     impl Drop for PreparedSocketDirectoryClaim {
         fn drop(&mut self) {
-            let Some(directory) = self.directory.take() else {
-                return;
-            };
-            let Ok(mut registry) = self.authority.registry.try_borrow_mut() else {
-                abort_vhost_user_claim_invariant();
-            };
-            let Some(registry) = registry.as_mut() else {
-                abort_vhost_user_claim_invariant();
-            };
-            if registry
-                .restore_scoped_directory(self.grant_id.clone(), directory)
-                .is_err()
-            {
+            if self.restore().is_err() {
                 abort_vhost_user_claim_invariant();
             }
         }
@@ -1251,6 +1568,34 @@ mod platform {
         retained_vhost: Rc<RefCell<HashMap<GrantId, Rc<GrantedDirectory>>>>,
     }
 
+    struct SnapshotRestoreDirectoryClaimBuffers {
+        identities: Vec<ObjectIdentity>,
+        directories: Vec<GrantedDirectory>,
+        claims: Vec<PreparedSocketDirectoryClaim>,
+    }
+
+    impl SnapshotRestoreDirectoryClaimBuffers {
+        fn try_new(count: usize) -> Result<Self, ContainedSnapshotRestoreError> {
+            let mut identities = Vec::new();
+            let mut directories = Vec::new();
+            let mut claims = Vec::new();
+            identities.try_reserve_exact(count).map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+            })?;
+            directories.try_reserve_exact(count).map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+            })?;
+            claims.try_reserve_exact(count).map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+            })?;
+            Ok(Self {
+                identities,
+                directories,
+                claims,
+            })
+        }
+    }
+
     impl std::fmt::Debug for DirectoryGrantAuthority {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -1380,6 +1725,67 @@ mod platform {
             }))
         }
 
+        fn inspect_snapshot_restore_directories(
+            &self,
+            requests: &[(GrantId, ResourceRole, GrantAccess)],
+            identities: &mut Vec<ObjectIdentity>,
+        ) -> Result<(), ContainedSnapshotRestoreError> {
+            let registry = self.registry.try_borrow().map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+            })?;
+            registry
+                .as_ref()
+                .ok_or_else(|| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+                })?
+                .inspect_exact_directories_into(requests, identities)
+                .map_err(|_| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+                })
+        }
+
+        fn prepare_snapshot_restore_directory_claims(
+            &self,
+            requests: Vec<(GrantId, ResourceRole, GrantAccess)>,
+            children: Vec<SocketChild>,
+            mut buffers: SnapshotRestoreDirectoryClaimBuffers,
+        ) -> Result<Vec<PreparedSocketDirectoryClaim>, ContainedSnapshotRestoreError> {
+            if requests.len() != children.len() {
+                return Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                ));
+            }
+            {
+                let mut locked = self.registry.try_borrow_mut().map_err(|_| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+                })?;
+                locked
+                    .as_mut()
+                    .ok_or_else(|| {
+                        ContainedSnapshotRestoreError::new(
+                            ContainedSnapshotRestoreErrorKind::Inactive,
+                        )
+                    })?
+                    .take_exact_directories_into(&requests, &mut buffers.directories)
+                    .map_err(|_| {
+                        ContainedSnapshotRestoreError::new(
+                            ContainedSnapshotRestoreErrorKind::Authority,
+                        )
+                    })?;
+            }
+            for (((grant_id, _, _), directory), child) in
+                requests.into_iter().zip(buffers.directories).zip(children)
+            {
+                buffers.claims.push(PreparedSocketDirectoryClaim {
+                    authority: self.clone(),
+                    directory: Some(directory),
+                    grant_id,
+                    child,
+                });
+            }
+            Ok(buffers.claims)
+        }
+
         pub(crate) fn claim_snapshot_outputs(
             &self,
             state_reference: &Path,
@@ -1485,6 +1891,7 @@ mod platform {
         pub(crate) socket: UnixDatagram,
         pub(crate) session: SessionId,
         pub(crate) launcher_pid: libc::pid_t,
+        pub(crate) wakeup: Option<Rc<UnixStream>>,
     }
 
     /// One launcher broker endpoint reserved until its activation boundary.
@@ -1529,6 +1936,33 @@ mod platform {
             }
             self.endpoint.take().ok_or(GrantClaimError)
         }
+
+        fn with_restore_wakeup(mut self, wakeup: Rc<UnixStream>) -> Self {
+            if let Some(endpoint) = self.endpoint.as_mut() {
+                endpoint.wakeup = Some(wakeup);
+            }
+            self
+        }
+
+        fn restore(&mut self) -> Result<(), GrantClaimError> {
+            let Some(endpoint) = self.endpoint.take() else {
+                return Ok(());
+            };
+            let mut state = self
+                .authority
+                .state
+                .try_borrow_mut()
+                .map_err(|_| GrantClaimError)?;
+            if !state.active || state.endpoint.is_some() {
+                return Err(GrantClaimError);
+            }
+            state.endpoint = Some(endpoint);
+            Ok(())
+        }
+
+        pub(crate) fn abort(mut self) -> Result<(), GrantClaimError> {
+            self.restore()
+        }
     }
 
     impl Drop for PreparedSocketBrokerEndpoint {
@@ -1561,6 +1995,7 @@ mod platform {
                 .field("socket", &"<owned>")
                 .field("session", &"<redacted>")
                 .field("launcher_pid", &"<redacted>")
+                .field("wakeup", &self.wakeup.as_ref().map(|_| "<borrowed>"))
                 .finish()
         }
     }
@@ -1588,6 +2023,7 @@ mod platform {
                         socket,
                         session,
                         launcher_pid,
+                        wakeup: None,
                     }),
                     active: true,
                 })),
@@ -1600,6 +2036,27 @@ mod platform {
                 return Err(GrantClaimError);
             }
             state.endpoint.take().ok_or(GrantClaimError)
+        }
+
+        fn validates_snapshot_restore_session(
+            &self,
+            session: SessionId,
+        ) -> Result<(), ContainedSnapshotRestoreError> {
+            let state = self.state.try_borrow().map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Inactive)
+            })?;
+            if state.active
+                && state
+                    .endpoint
+                    .as_ref()
+                    .is_some_and(|endpoint| endpoint.session == session)
+            {
+                Ok(())
+            } else {
+                Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::Provenance,
+                ))
+            }
         }
 
         pub(crate) fn prepare_endpoint(
@@ -1623,6 +2080,386 @@ mod platform {
                 state.endpoint.take();
             }
         }
+    }
+
+    /// Exact contained facets bound to one authenticated restore session.
+    pub(crate) struct ContainedSnapshotRestoreAuthority {
+        session: SessionId,
+        generations: ContainedSnapshotRestoreGenerationAuthority,
+        grants: GrantAuthority,
+        directories: DirectoryGrantAuthority,
+        broker: SocketBrokerAuthority,
+        namespace: Rc<WorkerSocketNamespace>,
+        wakeup: Rc<UnixStream>,
+    }
+
+    impl fmt::Debug for ContainedSnapshotRestoreAuthority {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("ContainedSnapshotRestoreAuthority")
+                .field("identity", &"<redacted>")
+                .field("facets", &"<bound>")
+                .finish()
+        }
+    }
+
+    impl ContainedSnapshotRestoreAuthority {
+        pub(crate) fn prepare(
+            &self,
+            root_reference: &Path,
+            vsock_reference: Option<&Path>,
+            cancelled: &impl Fn() -> bool,
+        ) -> Result<ReservedContainedSnapshotRestoreResources, ContainedSnapshotRestoreError>
+        {
+            let root_id = grant_reference_id(root_reference)
+                .map_err(|_| {
+                    ContainedSnapshotRestoreError::new(
+                        ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                    )
+                })?
+                .ok_or_else(|| {
+                    ContainedSnapshotRestoreError::new(
+                        ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                    )
+                })?;
+            let mut file_requests = Vec::new();
+            file_requests.try_reserve_exact(1).map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+            })?;
+            file_requests.push((
+                root_id,
+                ResourceRole::DriveBacking,
+                GrantAccess::ReadOnly,
+                GrantObjectKind::RegularFile,
+            ));
+
+            let mut directory_requests = Vec::new();
+            let mut children = Vec::new();
+            directory_requests
+                .try_reserve_exact(usize::from(vsock_reference.is_some()))
+                .map_err(|_| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+                })?;
+            children
+                .try_reserve_exact(usize::from(vsock_reference.is_some()))
+                .map_err(|_| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+                })?;
+            if let Some(reference) = vsock_reference {
+                let (id, child) = socket_directory_reference(reference)
+                    .map_err(|_| {
+                        ContainedSnapshotRestoreError::new(
+                            ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        ContainedSnapshotRestoreError::new(
+                            ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                        )
+                    })?;
+                directory_requests.push((
+                    id,
+                    ResourceRole::VsockSocketDirectory,
+                    GrantAccess::CreateChildren,
+                ));
+                children.push(child);
+            }
+
+            let mut drive_buffers = SnapshotRestoreDriveClaimBuffers::try_new(file_requests.len())?;
+            let mut directory_buffers =
+                SnapshotRestoreDirectoryClaimBuffers::try_new(directory_requests.len())?;
+            let mut identities = HashSet::new();
+            identities
+                .try_reserve(file_requests.len().saturating_add(directory_requests.len()))
+                .map_err(|_| {
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+                })?;
+            if cancelled() {
+                return Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::Cancelled,
+                ));
+            }
+            let transaction = self.generations.begin(self.session)?;
+            check_contained_restore_progress(&transaction, cancelled)?;
+            self.grants
+                .inspect_snapshot_restore_files(&file_requests, &mut drive_buffers.identities)?;
+            check_contained_restore_progress(&transaction, cancelled)?;
+            self.directories.inspect_snapshot_restore_directories(
+                &directory_requests,
+                &mut directory_buffers.identities,
+            )?;
+            check_contained_restore_progress(&transaction, cancelled)?;
+            if drive_buffers
+                .identities
+                .iter()
+                .copied()
+                .chain(directory_buffers.identities.iter().copied())
+                .any(|identity| !identities.insert(identity))
+            {
+                return Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                ));
+            }
+            if !directory_buffers.identities.is_empty()
+                && directory_buffers
+                    .identities
+                    .iter()
+                    .any(|identity| identity.device != self.namespace.identity().device)
+            {
+                return Err(ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::Authority,
+                ));
+            }
+            if vsock_reference.is_some() {
+                self.broker
+                    .validates_snapshot_restore_session(self.session)?;
+            }
+            check_contained_restore_progress(&transaction, cancelled)?;
+
+            let drive_claims = self
+                .grants
+                .prepare_snapshot_restore_drive_claims(file_requests, drive_buffers)?;
+            if let Err(source) = check_contained_restore_progress(&transaction, cancelled) {
+                return Err(if abort_drive_claims(drive_claims).is_err() {
+                    source.with_cleanup_failure()
+                } else {
+                    source
+                });
+            }
+            let directory_claims = match self.directories.prepare_snapshot_restore_directory_claims(
+                directory_requests,
+                children,
+                directory_buffers,
+            ) {
+                Ok(claims) => claims,
+                Err(source) => {
+                    return Err(if abort_drive_claims(drive_claims).is_err() {
+                        source.with_cleanup_failure()
+                    } else {
+                        source
+                    });
+                }
+            };
+            if let Err(source) = check_contained_restore_progress(&transaction, cancelled) {
+                let cleanup_failed = abort_directory_claims(directory_claims).is_err()
+                    | abort_drive_claims(drive_claims).is_err();
+                return Err(if cleanup_failed {
+                    source.with_cleanup_failure()
+                } else {
+                    source
+                });
+            }
+            let broker = if vsock_reference.is_some() {
+                match self.broker.prepare_endpoint() {
+                    Ok(broker) => Some(broker.with_restore_wakeup(Rc::clone(&self.wakeup))),
+                    Err(_) => {
+                        let cleanup_failed = abort_directory_claims(directory_claims).is_err()
+                            | abort_drive_claims(drive_claims).is_err();
+                        let source = ContainedSnapshotRestoreError::new(
+                            ContainedSnapshotRestoreErrorKind::Authority,
+                        );
+                        return Err(if cleanup_failed {
+                            source.with_cleanup_failure()
+                        } else {
+                            source
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+            if let Err(source) = check_contained_restore_progress(&transaction, cancelled) {
+                let cleanup_failed = abort_prepared_broker(broker).is_err()
+                    | abort_directory_claims(directory_claims).is_err()
+                    | abort_drive_claims(drive_claims).is_err();
+                return Err(if cleanup_failed {
+                    source.with_cleanup_failure()
+                } else {
+                    source
+                });
+            }
+            let namespace = if vsock_reference.is_some() {
+                match self.namespace.try_clone() {
+                    Ok(namespace) => Some(namespace),
+                    Err(_) => {
+                        let cleanup_failed = abort_prepared_broker(broker).is_err()
+                            | abort_directory_claims(directory_claims).is_err()
+                            | abort_drive_claims(drive_claims).is_err();
+                        let source = ContainedSnapshotRestoreError::new(
+                            ContainedSnapshotRestoreErrorKind::Authority,
+                        );
+                        return Err(if cleanup_failed {
+                            source.with_cleanup_failure()
+                        } else {
+                            source
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+            if let Err(source) = check_contained_restore_progress(&transaction, cancelled) {
+                let cleanup_failed = abort_prepared_broker(broker).is_err()
+                    | abort_directory_claims(directory_claims).is_err()
+                    | abort_drive_claims(drive_claims).is_err();
+                return Err(if cleanup_failed {
+                    source.with_cleanup_failure()
+                } else {
+                    source
+                });
+            }
+            Ok(ReservedContainedSnapshotRestoreResources {
+                transaction: Some(transaction),
+                drive_claims,
+                directory_claims,
+                broker,
+                namespace,
+                expects_vsock: vsock_reference.is_some(),
+            })
+        }
+    }
+
+    fn check_contained_restore_progress(
+        transaction: &ContainedSnapshotRestoreTransaction,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(), ContainedSnapshotRestoreError> {
+        transaction.check()?;
+        if cancelled() {
+            Err(ContainedSnapshotRestoreError::new(
+                ContainedSnapshotRestoreErrorKind::Cancelled,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Preflighted and failure-atomically reserved contained restore facets.
+    pub(crate) struct ReservedContainedSnapshotRestoreResources {
+        // Declaration order preserves reverse restoration during conservative
+        // drop: borrowed namespace, broker, directory, file, then generation.
+        namespace: Option<WorkerSocketNamespace>,
+        broker: Option<PreparedSocketBrokerEndpoint>,
+        directory_claims: Vec<PreparedSocketDirectoryClaim>,
+        drive_claims: Vec<PreparedDriveBackingClaim>,
+        transaction: Option<ContainedSnapshotRestoreTransaction>,
+        expects_vsock: bool,
+    }
+
+    type PreparedContainedVsockRestoreFacets = (
+        PreparedSocketDirectoryClaim,
+        PreparedSocketBrokerEndpoint,
+        WorkerSocketNamespace,
+    );
+
+    type ContainedSnapshotRestoreReservationParts = (
+        PreparedDriveBackingClaim,
+        Option<PreparedContainedVsockRestoreFacets>,
+        ContainedSnapshotRestoreTransaction,
+    );
+
+    impl ReservedContainedSnapshotRestoreResources {
+        pub(crate) fn into_parts(
+            mut self,
+        ) -> Result<ContainedSnapshotRestoreReservationParts, ContainedSnapshotRestoreError>
+        {
+            let valid = self.drive_claims.len() == 1
+                && if self.expects_vsock {
+                    self.directory_claims.len() == 1
+                        && self.broker.is_some()
+                        && self.namespace.is_some()
+                } else {
+                    self.directory_claims.is_empty()
+                        && self.broker.is_none()
+                        && self.namespace.is_none()
+                }
+                && self.transaction.is_some();
+            if !valid {
+                let source = ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                );
+                return Err(if self.abort().is_err() {
+                    source.with_cleanup_failure()
+                } else {
+                    source
+                });
+            }
+            let Some(root) = self.drive_claims.pop() else {
+                abort_vhost_user_claim_invariant();
+            };
+            let vsock = if self.expects_vsock {
+                let Some(directory) = self.directory_claims.pop() else {
+                    abort_vhost_user_claim_invariant();
+                };
+                let Some(broker) = self.broker.take() else {
+                    abort_vhost_user_claim_invariant();
+                };
+                let Some(namespace) = self.namespace.take() else {
+                    abort_vhost_user_claim_invariant();
+                };
+                Some((directory, broker, namespace))
+            } else {
+                None
+            };
+            let Some(transaction) = self.transaction.take() else {
+                abort_vhost_user_claim_invariant();
+            };
+            Ok((root, vsock, transaction))
+        }
+
+        pub(crate) fn abort(mut self) -> Result<(), ContainedSnapshotRestoreError> {
+            drop(self.namespace.take());
+            let cleanup_failed = abort_prepared_broker(self.broker.take()).is_err()
+                | abort_directory_claims(std::mem::take(&mut self.directory_claims)).is_err()
+                | abort_drive_claims(std::mem::take(&mut self.drive_claims)).is_err();
+            let generation_failed = self
+                .transaction
+                .take()
+                .is_some_and(|transaction| transaction.abort().is_err());
+            if cleanup_failed | generation_failed {
+                Err(
+                    ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Cleanup)
+                        .with_cleanup_failure(),
+                )
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl fmt::Debug for ReservedContainedSnapshotRestoreResources {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("ReservedContainedSnapshotRestoreResources")
+                .field("identity", &"<redacted>")
+                .field("file_count", &self.drive_claims.len())
+                .field("directory_count", &self.directory_claims.len())
+                .field("broker", &self.broker.as_ref().map(|_| "<reserved>"))
+                .finish()
+        }
+    }
+
+    fn abort_drive_claims(claims: Vec<PreparedDriveBackingClaim>) -> Result<(), GrantClaimError> {
+        let mut failed = false;
+        for claim in claims.into_iter().rev() {
+            failed |= claim.abort().is_err();
+        }
+        if failed { Err(GrantClaimError) } else { Ok(()) }
+    }
+
+    fn abort_directory_claims(
+        claims: Vec<PreparedSocketDirectoryClaim>,
+    ) -> Result<(), GrantClaimError> {
+        let mut failed = false;
+        for claim in claims.into_iter().rev() {
+            failed |= claim.abort().is_err();
+        }
+        if failed { Err(GrantClaimError) } else { Ok(()) }
+    }
+
+    fn abort_prepared_broker(
+        broker: Option<PreparedSocketBrokerEndpoint>,
+    ) -> Result<(), GrantClaimError> {
+        broker.map_or(Ok(()), PreparedSocketBrokerEndpoint::abort)
     }
 
     struct BlockControlBrokerState {
@@ -2223,7 +3060,9 @@ mod platform {
         directory_grants: DirectoryGrantAuthority,
         socket_broker: SocketBrokerAuthority,
         vhost_user_broker: VhostUserBrokerAuthority,
-        socket_namespace: WorkerSocketNamespace,
+        socket_namespace: Rc<WorkerSocketNamespace>,
+        restore_generations: ContainedSnapshotRestoreGenerationAuthority,
+        restore_wakeup: Option<Rc<UnixStream>>,
         policy: WorkerPolicy,
         started: bool,
         closed: bool,
@@ -2306,9 +3145,11 @@ mod platform {
             let namespace = WorkerNamespace::create(session).map_err(|_| ContainedSessionError)?;
             namespace.enter().map_err(|_| ContainedSessionError)?;
             let identity = namespace.identity();
-            let socket_namespace = namespace
-                .socket_namespace()
-                .map_err(|_| ContainedSessionError)?;
+            let socket_namespace = Rc::new(
+                namespace
+                    .socket_namespace()
+                    .map_err(|_| ContainedSessionError)?,
+            );
             let prepared = lifecycle
                 .prepared(identity.device, identity.inode)
                 .map_err(|_| ContainedSessionError)?;
@@ -2390,6 +3231,7 @@ mod platform {
             let socket_broker = SocketBrokerAuthority::new(broker_socket, session, parent);
             let vhost_user_broker =
                 VhostUserBrokerAuthority::new(vhost_broker_socket, session, parent);
+            let restore_generations = ContainedSnapshotRestoreGenerationAuthority::new(session);
             let lifecycle = Arc::new(Mutex::new(lifecycle));
             let namespace = Arc::new(Mutex::new(Some(namespace)));
             let (wakeup_reader, mut wakeup_writer) =
@@ -2409,6 +3251,7 @@ mod platform {
                         grants: file_grants.clone(),
                         pager_grants: pager_grants.clone(),
                         vhost_user_broker: vhost_user_broker.clone(),
+                        restore_generations: restore_generations.clone(),
                     },
                     reader_wakeup,
                 )?)
@@ -2432,6 +3275,8 @@ mod platform {
                 socket_broker,
                 vhost_user_broker,
                 socket_namespace,
+                restore_generations,
+                restore_wakeup: None,
                 policy,
                 started,
                 closed: false,
@@ -2441,10 +3286,11 @@ mod platform {
         pub(crate) fn take_wakeup_pair(
             &mut self,
         ) -> Result<(UnixStream, UnixStream), ContainedSessionError> {
-            Ok((
-                self.wakeup_reader.take().ok_or(ContainedSessionError)?,
-                self.wakeup_writer.take().ok_or(ContainedSessionError)?,
-            ))
+            let reader = self.wakeup_reader.take().ok_or(ContainedSessionError)?;
+            let restore_wakeup = reader.try_clone().map_err(|_| ContainedSessionError)?;
+            let writer = self.wakeup_writer.take().ok_or(ContainedSessionError)?;
+            self.restore_wakeup = Some(Rc::new(restore_wakeup));
+            Ok((reader, writer))
         }
 
         pub(crate) fn shutdown_requested(&self) -> Result<bool, ContainedSessionError> {
@@ -2486,6 +3332,35 @@ mod platform {
 
         pub(crate) fn socket_broker_authority(&self) -> Option<SocketBrokerAuthority> {
             self.started.then(|| self.socket_broker.clone())
+        }
+
+        pub(crate) fn snapshot_restore_authority(
+            &self,
+        ) -> Result<Option<ContainedSnapshotRestoreAuthority>, ContainedSessionError> {
+            if !self.started {
+                return Ok(None);
+            }
+            let session = self
+                .lifecycle
+                .lock()
+                .map_err(|_| ContainedSessionError)?
+                .session()
+                .filter(|session| !session.is_pre_session())
+                .ok_or(ContainedSessionError)?;
+            let wakeup = self
+                .restore_wakeup
+                .as_ref()
+                .map(Rc::clone)
+                .ok_or(ContainedSessionError)?;
+            Ok(Some(ContainedSnapshotRestoreAuthority {
+                session,
+                generations: self.restore_generations.clone(),
+                grants: self.grants.clone(),
+                directories: self.directory_grants.clone(),
+                broker: self.socket_broker.clone(),
+                namespace: Rc::clone(&self.socket_namespace),
+                wakeup,
+            }))
         }
 
         pub(crate) fn vhost_user_broker_authority(&self) -> Option<VhostUserBrokerAuthority> {
@@ -2599,6 +3474,7 @@ mod platform {
             self.directory_grants.invalidate();
             self.socket_broker.invalidate();
             self.vhost_user_broker.invalidate();
+            self.restore_generations.invalidate();
             let _ = self.stream.shutdown(std::net::Shutdown::Both);
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
@@ -2833,6 +3709,7 @@ mod platform {
         grants: GrantAuthority,
         pager_grants: PagerGrantAuthority,
         vhost_user_broker: VhostUserBrokerAuthority,
+        restore_generations: ContainedSnapshotRestoreGenerationAuthority,
     }
 
     fn spawn_reader(
@@ -2852,6 +3729,7 @@ mod platform {
                     authorities.grants.invalidate();
                     authorities.pager_grants.invalidate();
                     authorities.vhost_user_broker.invalidate();
+                    authorities.restore_generations.invalidate();
                     if state == ControlState::Disconnected {
                         cleanup_namespace(&namespace);
                     }
@@ -2960,19 +3838,22 @@ mod platform {
 
     #[cfg(test)]
     pub(crate) use tests::{
-        TestDirectory as TestVhostDirectory, empty_grant_authority_for_vhost_test,
-        file_grant_authority_for_test, root_file_grant_authority_for_test,
-        snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
-        vhost_directory_authority_for_test, vsock_directory_authority_for_test,
+        TestContainedRestoreAuthority, TestDirectory as TestVhostDirectory,
+        contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
+        empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
+        root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
+        snapshot_root_file_grant_authority_for_test, vhost_directory_authority_for_test,
+        vsock_directory_authority_for_test,
     };
 
     #[cfg(test)]
     mod tests {
+        use std::cell::Cell;
         use std::fs::{self, OpenOptions};
         use std::io::{self, Read as _};
         use std::mem::MaybeUninit;
         use std::os::fd::{AsRawFd, OwnedFd};
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         use std::os::unix::net::{UnixDatagram, UnixStream};
         use std::path::{Path, PathBuf};
         use std::rc::Rc;
@@ -2986,8 +3867,11 @@ mod platform {
             receive_block_control_message, send_block_control_message,
         };
         use bangbang_session::macos::bookmark::create_implicit_bookmark;
-        use bangbang_session::macos::grant_registry::{GrantRegistry, StagedGrantBatch};
+        use bangbang_session::macos::grant_registry::{
+            DirectoryGrantRegistry, GrantRegistry, StagedGrantBatch,
+        };
         use bangbang_session::macos::grant_transport::ReceivedGrant;
+        use bangbang_session::macos::runtime::WorkerSocketNamespace;
         use bangbang_session::macos::vhost_user_broker::{
             VhostUserBrokerMessage, receive_vhost_user_broker_message,
             send_vhost_user_broker_message,
@@ -3030,6 +3914,525 @@ mod platform {
             fn drop(&mut self) {
                 fs::remove_dir_all(&self.0).expect("test directory should clean up");
             }
+        }
+
+        pub(crate) struct TestContainedRestoreAuthority {
+            authority: super::ContainedSnapshotRestoreAuthority,
+            grants: GrantAuthority,
+            directories: DirectoryGrantAuthority,
+            broker: SocketBrokerAuthority,
+            _namespace_directory: TestDirectory,
+            _launcher: UnixDatagram,
+            _wakeup_writer: UnixStream,
+            _vsock_directory: Option<TestDirectory>,
+        }
+
+        impl TestContainedRestoreAuthority {
+            pub(crate) const fn authority(&self) -> &super::ContainedSnapshotRestoreAuthority {
+                &self.authority
+            }
+
+            pub(crate) const fn grants(&self) -> &GrantAuthority {
+                &self.grants
+            }
+
+            pub(crate) const fn directories(&self) -> &DirectoryGrantAuthority {
+                &self.directories
+            }
+
+            pub(crate) fn invalidate_generation(&self) {
+                self.authority.generations.invalidate();
+            }
+
+            pub(crate) fn invalidate_broker(&self) {
+                self.broker.invalidate();
+            }
+
+            pub(crate) fn assert_authorities_available(&self, with_vsock: bool) {
+                assert_contained_restore_authorities_available(self, with_vsock);
+            }
+
+            pub(crate) fn into_authority(self) -> super::ContainedSnapshotRestoreAuthority {
+                self.authority
+            }
+        }
+
+        fn next_restore_session() -> SessionId {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let mut bytes = [0_u8; 32];
+            bytes[..8].copy_from_slice(&sequence.to_le_bytes());
+            bytes[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+            bytes[31] = 0xa5;
+            SessionId::from_bytes(bytes)
+        }
+
+        pub(crate) fn contained_restore_authority_for_test(
+            root_path: &Path,
+            with_vsock: bool,
+        ) -> TestContainedRestoreAuthority {
+            contained_restore_authority_with_grants_for_test(
+                root_file_grant_authority_for_test(root_path),
+                with_vsock,
+            )
+        }
+
+        pub(crate) fn contained_restore_authority_with_grants_for_test(
+            grants: GrantAuthority,
+            with_vsock: bool,
+        ) -> TestContainedRestoreAuthority {
+            let session = next_restore_session();
+            let (directories, vsock_directory) = if with_vsock {
+                let (authority, directory) = vsock_directory_authority_for_test();
+                (authority, Some(directory))
+            } else {
+                (
+                    DirectoryGrantAuthority::new(DirectoryGrantRegistry::default()),
+                    None,
+                )
+            };
+            let (worker, launcher) = UnixDatagram::pair().expect("broker pair should create");
+            // SAFETY: Both broker endpoints belong to this test process.
+            let broker = SocketBrokerAuthority::new(worker, session, unsafe { libc::getpid() });
+            let namespace_directory = TestDirectory::new();
+            fs::set_permissions(
+                namespace_directory.path(),
+                fs::Permissions::from_mode(0o700),
+            )
+            .expect("test namespace permissions should restrict");
+            let socket_namespace = Rc::new(
+                WorkerSocketNamespace::from_directory_for_test(namespace_directory.path())
+                    .expect("test socket namespace should anchor"),
+            );
+            let (wakeup_reader, wakeup_writer) =
+                UnixStream::pair().expect("test wakeup pair should create");
+            let authority = super::ContainedSnapshotRestoreAuthority {
+                session,
+                generations: super::ContainedSnapshotRestoreGenerationAuthority::new(session),
+                grants: grants.clone(),
+                directories: directories.clone(),
+                broker: broker.clone(),
+                namespace: socket_namespace,
+                wakeup: Rc::new(wakeup_reader),
+            };
+            TestContainedRestoreAuthority {
+                authority,
+                grants,
+                directories,
+                broker,
+                _namespace_directory: namespace_directory,
+                _launcher: launcher,
+                _wakeup_writer: wakeup_writer,
+                _vsock_directory: vsock_directory,
+            }
+        }
+
+        fn assert_contained_restore_authorities_available(
+            fixture: &TestContainedRestoreAuthority,
+            with_vsock: bool,
+        ) {
+            let root = fixture
+                .grants
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-ro"),
+                    GrantAccess::ReadOnly,
+                )
+                .expect("root authority should remain valid")
+                .expect("root reference should remain contained");
+            root.abort().expect("root authority should restore");
+            if with_vsock {
+                let directory = fixture
+                    .directories
+                    .prepare_socket_directory(
+                        Path::new("bangbang-grant:vsock-directory/restored.sock"),
+                        ResourceRole::VsockSocketDirectory,
+                    )
+                    .expect("directory authority should remain valid")
+                    .expect("directory reference should remain contained");
+                directory
+                    .abort()
+                    .expect("directory authority should restore");
+            }
+            let broker = fixture
+                .broker
+                .prepare_endpoint()
+                .expect("broker authority should remain valid");
+            broker.abort().expect("broker authority should restore");
+        }
+
+        #[test]
+        fn contained_restore_generation_rejects_overlap_and_releases_after_reverse_abort() {
+            let root_directory = TestDirectory::new();
+            let root_path = root_directory.path().join("root.img");
+            fs::write(&root_path, b"root").expect("root fixture should write");
+            let fixture = contained_restore_authority_for_test(&root_path, false);
+            let reserved = fixture
+                .authority
+                .prepare(Path::new("bangbang-grant:drive-ro"), None, &|| false)
+                .expect("first root-only transaction should reserve");
+            let overlap = fixture
+                .authority
+                .prepare(Path::new("bangbang-grant:drive-ro"), None, &|| false)
+                .expect_err("overlapping transaction must fail before inspection");
+            assert_eq!(
+                overlap.kind(),
+                super::ContainedSnapshotRestoreErrorKind::Busy
+            );
+            assert!(!overlap.is_terminal());
+            assert!(!overlap.cleanup_failed());
+
+            let diagnostic = format!("{:?} {overlap}", fixture.authority);
+            assert!(!diagnostic.contains("drive-ro"));
+            assert!(!diagnostic.contains(root_path.to_string_lossy().as_ref()));
+            let (root, vsock, transaction) = reserved
+                .into_parts()
+                .expect("exact root-only reservation should split");
+            assert!(vsock.is_none());
+            let first_generation = transaction.generation;
+            let stale = super::ContainedSnapshotRestoreTransaction {
+                authority: transaction.authority.clone(),
+                session: transaction.session,
+                generation: transaction.generation,
+                finished: false,
+            };
+            transaction
+                .check()
+                .expect("current transaction witness should remain active");
+            root.abort()
+                .expect("root owner should restore before generation release");
+            transaction
+                .abort()
+                .expect("active generation should release after owners");
+            assert_contained_restore_authorities_available(&fixture, false);
+
+            let second = fixture
+                .authority
+                .prepare(Path::new("bangbang-grant:drive-ro"), None, &|| false)
+                .expect("released generation and root should be reusable");
+            let (root, vsock, transaction) = second
+                .into_parts()
+                .expect("second root-only reservation should split");
+            assert!(vsock.is_none());
+            assert!(transaction.generation > first_generation);
+            assert_eq!(
+                stale
+                    .check()
+                    .expect_err("old generation must remain stale")
+                    .kind(),
+                super::ContainedSnapshotRestoreErrorKind::Inactive
+            );
+            drop(stale);
+            transaction
+                .check()
+                .expect("dropping a stale witness must not clear the current generation");
+            root.abort()
+                .expect("second root owner should reverse cleanly");
+            transaction
+                .abort()
+                .expect("second generation should reverse cleanly");
+        }
+
+        #[test]
+        fn contained_restore_generation_poison_and_overflow_fail_terminal_before_authority_use() {
+            let poisoned_root = TestDirectory::new();
+            let poisoned_root_path = poisoned_root.path().join("root.img");
+            fs::write(&poisoned_root_path, b"root").expect("root fixture should write");
+            let poisoned = contained_restore_authority_for_test(&poisoned_root_path, false);
+            let generations = poisoned.authority.generations.clone();
+            let result = std::thread::spawn(move || {
+                let _state = generations
+                    .state
+                    .lock()
+                    .expect("generation state should initially lock");
+                panic!("injected generation poison");
+            })
+            .join();
+            assert!(result.is_err(), "generation poison helper should panic");
+            let error = poisoned
+                .authority
+                .prepare(Path::new("bangbang-grant:drive-ro"), None, &|| false)
+                .expect_err("poisoned generation state must reject before inspection");
+            assert_eq!(
+                error.kind(),
+                super::ContainedSnapshotRestoreErrorKind::Inactive
+            );
+            assert!(error.is_terminal());
+            assert_contained_restore_authorities_available(&poisoned, false);
+
+            let overflow_root = TestDirectory::new();
+            let overflow_root_path = overflow_root.path().join("root.img");
+            fs::write(&overflow_root_path, b"root").expect("root fixture should write");
+            let overflow = contained_restore_authority_for_test(&overflow_root_path, false);
+            overflow
+                .authority
+                .generations
+                .state
+                .lock()
+                .expect("generation state should lock")
+                .next_generation = u64::MAX;
+            let error = overflow
+                .authority
+                .prepare(Path::new("bangbang-grant:drive-ro"), None, &|| false)
+                .expect_err("generation overflow must reject before inspection");
+            assert_eq!(
+                error.kind(),
+                super::ContainedSnapshotRestoreErrorKind::Inactive
+            );
+            assert!(error.is_terminal());
+            assert_contained_restore_authorities_available(&overflow, false);
+        }
+
+        #[test]
+        fn contained_restore_cancellation_restores_every_reserved_phase() {
+            let root_directory = TestDirectory::new();
+            let root_path = root_directory.path().join("root.img");
+            fs::write(&root_path, b"root").expect("root fixture should write");
+            let fixture = contained_restore_authority_for_test(&root_path, true);
+            for cancellation_check in 1..=9 {
+                let checks = Cell::new(0);
+                let error = fixture
+                    .authority
+                    .prepare(
+                        Path::new("bangbang-grant:drive-ro"),
+                        Some(Path::new("bangbang-grant:vsock-directory/restored.sock")),
+                        &|| {
+                            let next = checks.get() + 1;
+                            checks.set(next);
+                            next == cancellation_check
+                        },
+                    )
+                    .expect_err("injected phase cancellation should fail");
+                assert_eq!(
+                    error.kind(),
+                    super::ContainedSnapshotRestoreErrorKind::Cancelled
+                );
+                assert!(!error.is_terminal());
+                assert!(!error.cleanup_failed());
+                assert_contained_restore_authorities_available(&fixture, true);
+            }
+
+            fixture
+                .authority
+                .prepare(
+                    Path::new("bangbang-grant:drive-ro"),
+                    Some(Path::new("bangbang-grant:vsock-directory/restored.sock")),
+                    &|| false,
+                )
+                .expect("uncancelled complete batch should reserve")
+                .abort()
+                .expect("uncancelled batch should reverse cleanly");
+        }
+
+        #[test]
+        fn contained_restore_preflight_rejects_reference_and_authority_substitution_without_use() {
+            let root_directory = TestDirectory::new();
+            let root_path = root_directory.path().join("root.img");
+            fs::write(&root_path, b"root").expect("root fixture should write");
+            let fixture = contained_restore_authority_for_test(&root_path, true);
+            for (root, vsock, expected_kind) in [
+                (
+                    Path::new("/tmp/ordinary-root.img"),
+                    None,
+                    super::ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                ),
+                (
+                    Path::new("bangbang-grant:missing"),
+                    None,
+                    super::ContainedSnapshotRestoreErrorKind::Authority,
+                ),
+                (
+                    Path::new("bangbang-grant:drive-ro"),
+                    Some(Path::new("/tmp/ordinary-vsock.sock")),
+                    super::ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                ),
+                (
+                    Path::new("bangbang-grant:drive-ro"),
+                    Some(Path::new("bangbang-grant:missing/restored.sock")),
+                    super::ContainedSnapshotRestoreErrorKind::Authority,
+                ),
+            ] {
+                let error = fixture
+                    .authority
+                    .prepare(root, vsock, &|| false)
+                    .expect_err("substituted contained authority must fail preflight");
+                assert_eq!(error.kind(), expected_kind);
+                assert!(!error.cleanup_failed());
+                let diagnostic = format!("{error:?} {error}");
+                assert!(!diagnostic.contains("drive-ro"));
+                assert!(!diagnostic.contains("missing"));
+                assert!(!diagnostic.contains("ordinary"));
+                assert_contained_restore_authorities_available(&fixture, true);
+            }
+
+            let mixed_files = file_grant_authority_for_test();
+            let mixed =
+                contained_restore_authority_with_grants_for_test(mixed_files.clone(), false);
+            for reference in [
+                Path::new("bangbang-grant:kernel"),
+                Path::new("bangbang-grant:drive-rw"),
+            ] {
+                let error = mixed
+                    .authority
+                    .prepare(reference, None, &|| false)
+                    .expect_err("wrong role or access must fail exact file preflight");
+                assert_eq!(
+                    error.kind(),
+                    super::ContainedSnapshotRestoreErrorKind::Authority
+                );
+                assert!(!error.cleanup_failed());
+            }
+            let kernel = mixed_files
+                .prepare_file_claim(
+                    Path::new("bangbang-grant:kernel"),
+                    ResourceRole::KernelImage,
+                    GrantAccess::ReadOnly,
+                )
+                .expect("failed preflight must retain substituted kernel")
+                .expect("kernel reference should remain contained");
+            drop(kernel);
+            let drive = mixed_files
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-rw"),
+                    GrantAccess::ReadWrite,
+                )
+                .expect("failed preflight must retain wrong-access drive")
+                .expect("drive reference should remain contained");
+            drive
+                .abort()
+                .expect("wrong-access drive should restore after observation");
+
+            let consumed_root = TestDirectory::new();
+            let consumed_root_path = consumed_root.path().join("root.img");
+            fs::write(&consumed_root_path, b"root").expect("root fixture should write");
+            let consumed = contained_restore_authority_for_test(&consumed_root_path, false);
+            consumed
+                .grants
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-ro"),
+                    GrantAccess::ReadOnly,
+                )
+                .expect("root claim should validate")
+                .expect("root reference should remain contained")
+                .commit();
+            let error = consumed
+                .authority
+                .prepare(Path::new("bangbang-grant:drive-ro"), None, &|| false)
+                .expect_err("already-consumed root must fail exact preflight");
+            assert_eq!(
+                error.kind(),
+                super::ContainedSnapshotRestoreErrorKind::Authority
+            );
+            assert!(!error.cleanup_failed());
+        }
+
+        #[test]
+        fn contained_restore_worker_and_launcher_invalidation_are_independently_terminal() {
+            let worker_root = TestDirectory::new();
+            let worker_root_path = worker_root.path().join("root.img");
+            fs::write(&worker_root_path, b"root").expect("root fixture should write");
+            let worker = contained_restore_authority_for_test(&worker_root_path, false);
+            let reserved = worker
+                .authority
+                .prepare(Path::new("bangbang-grant:drive-ro"), None, &|| false)
+                .expect("worker fixture should reserve");
+            worker.authority.generations.invalidate();
+            let error = reserved
+                .abort()
+                .expect_err("invalidated worker generation must be terminal");
+            assert_eq!(
+                error.kind(),
+                super::ContainedSnapshotRestoreErrorKind::Cleanup
+            );
+            assert!(error.is_terminal());
+            assert!(error.cleanup_failed());
+            let inactive = worker
+                .authority
+                .prepare(Path::new("bangbang-grant:drive-ro"), None, &|| false)
+                .expect_err("invalidated worker must reject later generations");
+            assert_eq!(
+                inactive.kind(),
+                super::ContainedSnapshotRestoreErrorKind::Inactive
+            );
+            assert!(inactive.is_terminal());
+            assert_contained_restore_authorities_available(&worker, false);
+
+            let launcher_root = TestDirectory::new();
+            let launcher_root_path = launcher_root.path().join("root.img");
+            fs::write(&launcher_root_path, b"root").expect("root fixture should write");
+            let launcher = contained_restore_authority_for_test(&launcher_root_path, true);
+            let reserved = launcher
+                .authority
+                .prepare(
+                    Path::new("bangbang-grant:drive-ro"),
+                    Some(Path::new("bangbang-grant:vsock-directory/restored.sock")),
+                    &|| false,
+                )
+                .expect("launcher fixture should reserve");
+            launcher.broker.invalidate();
+            let error = reserved
+                .abort()
+                .expect_err("invalidated launcher broker must report incomplete cleanup");
+            assert_eq!(
+                error.kind(),
+                super::ContainedSnapshotRestoreErrorKind::Cleanup
+            );
+            assert!(error.is_terminal());
+            assert!(error.cleanup_failed());
+            let root = launcher
+                .grants
+                .prepare_drive_backing_claim(
+                    Path::new("bangbang-grant:drive-ro"),
+                    GrantAccess::ReadOnly,
+                )
+                .expect("launcher death should still restore root")
+                .expect("root should remain contained");
+            root.abort().expect("restored root should abort");
+            let directory = launcher
+                .directories
+                .prepare_socket_directory(
+                    Path::new("bangbang-grant:vsock-directory/restored.sock"),
+                    ResourceRole::VsockSocketDirectory,
+                )
+                .expect("launcher death should still restore directory")
+                .expect("directory should remain contained");
+            directory.abort().expect("restored directory should abort");
+            assert!(launcher.broker.prepare_endpoint().is_err());
+        }
+
+        #[test]
+        fn contained_restore_rejects_cross_session_broker_before_reservation() {
+            let first_root = TestDirectory::new();
+            let first_root_path = first_root.path().join("root.img");
+            fs::write(&first_root_path, b"root").expect("root fixture should write");
+            let first = contained_restore_authority_for_test(&first_root_path, true);
+            let second_root = TestDirectory::new();
+            let second_root_path = second_root.path().join("root.img");
+            fs::write(&second_root_path, b"root").expect("root fixture should write");
+            let second = contained_restore_authority_for_test(&second_root_path, true);
+            let mixed = super::ContainedSnapshotRestoreAuthority {
+                session: first.authority.session,
+                generations: first.authority.generations.clone(),
+                grants: first.grants.clone(),
+                directories: first.directories.clone(),
+                broker: second.broker.clone(),
+                namespace: Rc::clone(&first.authority.namespace),
+                wakeup: Rc::clone(&first.authority.wakeup),
+            };
+
+            let error = mixed
+                .prepare(
+                    Path::new("bangbang-grant:drive-ro"),
+                    Some(Path::new("bangbang-grant:vsock-directory/restored.sock")),
+                    &|| false,
+                )
+                .expect_err("cross-session broker must fail during read-only preflight");
+            assert_eq!(
+                error.kind(),
+                super::ContainedSnapshotRestoreErrorKind::Provenance
+            );
+            assert!(error.is_terminal());
+            assert!(!error.cleanup_failed());
+            assert_contained_restore_authorities_available(&first, true);
+            assert_contained_restore_authorities_available(&second, true);
         }
 
         #[test]
@@ -4722,13 +6125,16 @@ pub(crate) use platform::{
 };
 #[cfg(target_os = "macos")]
 pub(crate) use platform::{
-    ClaimedVhostUserSocket, PreparedSocketBrokerEndpoint, PreparedVhostUserSocketClaim,
-    SnapshotStagingRecordTracker, SocketBrokerAuthority, SocketBrokerEndpoint,
-    VhostUserBrokerAuthority,
+    ClaimedVhostUserSocket, ContainedSnapshotRestoreAuthority, ContainedSnapshotRestoreError,
+    ContainedSnapshotRestoreTransaction, PreparedSocketBrokerEndpoint,
+    PreparedVhostUserSocketClaim, SnapshotStagingRecordTracker, SocketBrokerAuthority,
+    SocketBrokerEndpoint, VhostUserBrokerAuthority,
 };
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{
-    TestVhostDirectory, empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
+    ContainedSnapshotRestoreErrorKind, TestContainedRestoreAuthority, TestVhostDirectory,
+    contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
+    empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
     root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
     snapshot_root_file_grant_authority_for_test, vhost_directory_authority_for_test,
     vsock_directory_authority_for_test,

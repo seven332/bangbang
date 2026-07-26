@@ -17,7 +17,7 @@ use bangbang_session::macos::runtime::WorkerSocketNamespace;
 use crate::anchored_socket::{AnchoredSocketError, AnchoredSocketGuard, bind_prepared_vsock};
 use crate::contained_session::{
     DirectoryGrantAuthority, PreparedSocketBrokerEndpoint, PreparedSocketDirectoryClaim,
-    SocketBrokerAuthority,
+    SocketBrokerAuthority, socket_directory_reference,
 };
 
 /// Whether the same process may safely retry a failed restore preparation.
@@ -326,6 +326,10 @@ impl RequestedVsockRestoreResource {
         self.overridden
     }
 
+    pub(crate) fn destination_reference(&self) -> &std::path::Path {
+        self.selectors.destination().path()
+    }
+
     /// Reserves every contained authority without publishing an endpoint.
     pub(crate) fn reserve(
         self,
@@ -338,6 +342,12 @@ impl RequestedVsockRestoreResource {
             return Err(cancelled_error());
         }
         if directory_authority.is_none() && broker_authority.is_none() && namespace.is_none() {
+            if socket_directory_reference(self.destination_reference())
+                .map_err(|_| contained_authority_error())?
+                .is_some()
+            {
+                return Err(contained_authority_error());
+            }
             return Ok(ReservedVsockRestoreResource::Direct(self.selectors));
         }
 
@@ -380,6 +390,21 @@ impl RequestedVsockRestoreResource {
             },
         )))
     }
+
+    /// Accepts only the coherent facets reserved by a contained restore batch.
+    pub(crate) fn reserve_contained(
+        self,
+        claim: PreparedSocketDirectoryClaim,
+        broker: PreparedSocketBrokerEndpoint,
+        namespace: WorkerSocketNamespace,
+    ) -> ReservedVsockRestoreResource {
+        ReservedVsockRestoreResource::Contained(Box::new(ReservedContainedVsockRestoreResource {
+            selectors: self.selectors,
+            claim,
+            broker,
+            namespace,
+        }))
+    }
 }
 
 impl fmt::Debug for RequestedVsockRestoreResource {
@@ -407,10 +432,33 @@ fn contained_authority_error() -> VsockRestoreError {
 }
 
 pub(crate) struct ReservedContainedVsockRestoreResource {
-    selectors: SnapshotVsockSelectors,
-    claim: PreparedSocketDirectoryClaim,
-    broker: PreparedSocketBrokerEndpoint,
+    // Declaration order preserves reverse restoration during conservative
+    // drop; explicit abort additionally reports incomplete restoration.
     namespace: WorkerSocketNamespace,
+    broker: PreparedSocketBrokerEndpoint,
+    claim: PreparedSocketDirectoryClaim,
+    selectors: SnapshotVsockSelectors,
+}
+
+impl ReservedContainedVsockRestoreResource {
+    fn abort(self) -> Result<(), VsockRestoreError> {
+        let Self {
+            selectors: _,
+            claim,
+            broker,
+            namespace,
+        } = self;
+        drop(namespace);
+        let cleanup_failed = broker.abort().is_err() | claim.abort().is_err();
+        if cleanup_failed {
+            Err(VsockRestoreError::terminal(
+                VsockRestoreStage::Cleanup,
+                VsockRestoreErrorKind::Grant,
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// One vsock request after reversible authority reservation.
@@ -454,7 +502,7 @@ impl ReservedVsockRestoreResource {
             }
             Self::Contained(contained) => {
                 if cancelled() {
-                    drop(contained);
+                    contained.abort()?;
                     return Err(cancelled_error());
                 }
                 Ok(LocallyPreparedVsockRestoreResource::Contained(*contained))
@@ -462,9 +510,14 @@ impl ReservedVsockRestoreResource {
         }
     }
 
-    pub(crate) fn abort(self) -> VsockRestoreDisposition {
-        drop(self);
-        VsockRestoreDisposition::Retryable
+    pub(crate) fn abort(self) -> Result<VsockRestoreDisposition, VsockRestoreError> {
+        match self {
+            Self::Direct(_) => Ok(VsockRestoreDisposition::Retryable),
+            Self::Contained(contained) => {
+                contained.abort()?;
+                Ok(VsockRestoreDisposition::Retryable)
+            }
+        }
     }
 }
 
@@ -500,7 +553,7 @@ impl LocallyPreparedVsockRestoreResource {
             Self::Direct(prepared) => Ok(prepared),
             Self::Contained(contained) => {
                 if cancelled() {
-                    drop(contained);
+                    contained.abort()?;
                     return Err(cancelled_error());
                 }
                 let ReservedContainedVsockRestoreResource {
@@ -553,7 +606,7 @@ impl LocallyPreparedVsockRestoreResource {
         match self {
             Self::Direct(prepared) => prepared.abort(),
             Self::Contained(contained) => {
-                drop(contained);
+                contained.abort()?;
                 Ok(VsockRestoreDisposition::Retryable)
             }
         }

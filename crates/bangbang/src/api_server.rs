@@ -2970,7 +2970,7 @@ mod tests {
             let ProcessSnapshotV2RootLoadRequest {
                 controller: _,
                 vmnet_authority: _,
-                grant_authority: _,
+                contained_restore_authority: _,
                 pci_enabled: _,
                 input,
                 candidate: _,
