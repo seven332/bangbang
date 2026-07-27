@@ -27,6 +27,7 @@ mod snapshot_restore;
 mod snapshot_v2;
 mod snapshot_v2_multi_block_platform;
 mod snapshot_v2_platform;
+mod snapshot_v2_storage_platform;
 mod startup;
 mod topology;
 mod vcpu;
@@ -163,6 +164,12 @@ pub use snapshot_v2_platform::{
     RestoredHvfSnapshotV2Platform, prepare_hvf_snapshot_v2_root_plan,
     restore_hvf_snapshot_v2_platform, restore_hvf_snapshot_v2_process_platform,
 };
+pub use snapshot_v2_storage_platform::{
+    HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioProcessConfig,
+    HvfSnapshotV2StorageMmioRecordPlan, HvfSnapshotV2StorageRetryPlan,
+    PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
+    prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
+};
 pub use startup::{
     HvfArm64BootBalloonCaptureError, HvfArm64BootBalloonCaptureState,
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootBalloonTransportState,
@@ -203,9 +210,12 @@ pub use startup::{
     HvfSnapshotV2MultiBlockPciRestoreCleanupFailure, HvfSnapshotV2MultiBlockPciRestoreError,
     HvfSnapshotV2MultiBlockPciRestoreFailure, HvfSnapshotV2MultiBlockPciRestoreStage,
     HvfSnapshotV2RootRestoreCleanupFailure, HvfSnapshotV2RootRestoreError,
-    HvfSnapshotV2RootRestoreFailure, HvfSnapshotV2RootRestoreStage, OwnedHvfArm64BootSession,
-    PreparedHvfArm64BootPciNetworkRemoval, RestoredHvfArm64BootSession,
+    HvfSnapshotV2RootRestoreFailure, HvfSnapshotV2RootRestoreStage,
+    HvfSnapshotV2StorageMmioRestoreCleanupFailure, HvfSnapshotV2StorageMmioRestoreError,
+    HvfSnapshotV2StorageMmioRestoreFailure, HvfSnapshotV2StorageMmioRestoreStage,
+    OwnedHvfArm64BootSession, PreparedHvfArm64BootPciNetworkRemoval, RestoredHvfArm64BootSession,
     RestoredHvfSnapshotV2MultiBlockMmioOwners, RestoredHvfSnapshotV2MultiBlockPciOwners,
+    RestoredHvfSnapshotV2StorageMmioOwners,
 };
 pub use topology::{
     HvfVcpuTopology, HvfVcpuTopologyAllocation, HvfVcpuTopologyCreateStage, HvfVcpuTopologyError,

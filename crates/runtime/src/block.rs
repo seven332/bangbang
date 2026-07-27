@@ -775,6 +775,12 @@ impl DriveConfigs {
         &self.configs
     }
 
+    /// Consumes the validated configuration set in canonical device order.
+    #[doc(hidden)]
+    pub fn into_vec(self) -> Vec<DriveConfig> {
+        self.configs
+    }
+
     pub fn has_root_device(&self) -> bool {
         self.configs.iter().any(DriveConfig::is_root_device)
     }

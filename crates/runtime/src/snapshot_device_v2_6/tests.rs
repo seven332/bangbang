@@ -697,6 +697,139 @@ fn later_pmem_construction_fault_releases_the_prepared_prefix_and_allows_retry()
 }
 
 #[test]
+fn mmio_handoff_preserves_exact_pmem_transport_semantics_and_storage_order() {
+    for (blocks, pmems, root) in [
+        (1, 0, Some(DEVICE_KIND_BLOCK)),
+        (0, 1, Some(DEVICE_KIND_PMEM)),
+        (1, 1, Some(DEVICE_KIND_BLOCK)),
+        (0, 1, None),
+    ] {
+        let graph = fixture_graph(SnapshotV2DeviceTransportKind::Mmio, blocks, pmems, root);
+        let expected = graph.clone();
+        let memory = restore_memory_for(&graph);
+        let now = Instant::now();
+        let (_files, block_backings, pmem_backings) = restore_backings(&graph);
+        let bundle = SnapshotV2StorageRestorePlan::prepare(graph, &memory, now)
+            .expect("MMIO handoff plan should prepare")
+            .prepare_backings(block_backings, pmem_backings, || false)
+            .expect("MMIO handoff bundle should prepare");
+
+        let mmio = bundle
+            .prepare_mmio_transport()
+            .expect("MMIO handoff should reconstruct");
+        assert_eq!(mmio.root_key(), expected.root_key());
+        assert_eq!(
+            mmio.block_bundle()
+                .map_or(0, |bundle| bundle.records().len()),
+            blocks
+        );
+        assert_eq!(mmio.pmem_records().len(), pmems);
+        assert_eq!(mmio.pmem_configs().as_slice().len(), pmems);
+        for (record, expected) in mmio.pmem_records().iter().zip(expected.pmem_records()) {
+            let SnapshotV2DeviceTransport::Mmio(expected_mmio) = expected.transport() else {
+                panic!("fixture pmem transport should be MMIO");
+            };
+            let expected_transport =
+                crate::snapshot_device_v2::restore_mmio_transport_state_for_device(
+                    crate::pmem::VIRTIO_PMEM_DEVICE_ID,
+                    expected.virtio(),
+                    expected_mmio,
+                )
+                .expect("fixture retained transport should restore");
+            assert_eq!(record.key(), expected.key());
+            assert_eq!(record.pmem_id(), expected.config().pmem_id());
+            assert_eq!(record.is_root_device(), expected.is_root());
+            assert_eq!(record.retry(), expected.pmem().retry());
+            assert_eq!(
+                record.retry_deadline(),
+                Some(now + Duration::from_nanos(99))
+            );
+            assert_eq!(record.region(), expected_mmio.region());
+            assert_eq!(record.interrupt_line(), expected_mmio.interrupt_line());
+            assert_eq!(
+                record.prepared_device().guest_range(),
+                expected.pmem().guest_range()
+            );
+            assert_eq!(record.handler().transport_state(), expected_transport);
+            let recaptured = record
+                .handler()
+                .capture_pmem_device_state_at(
+                    expected.pmem().file_bytes(),
+                    expected.config().rate_limiter(),
+                    now,
+                )
+                .expect("reconstructed pmem handler should recapture");
+            assert_eq!(recaptured.active_queue(), expected.pmem().active_queue());
+            assert_eq!(
+                recaptured.pending_rate_limited_queue(),
+                expected.pmem().pending_rate_limited_queue()
+            );
+            assert_eq!(
+                recaptured.rate_limiter().bandwidth().map(|bucket| (
+                    bucket.budget(),
+                    bucket.remaining_burst(),
+                    bucket.age_nanos(),
+                )),
+                expected.pmem().limiter().bandwidth().map(|bucket| (
+                    bucket.budget(),
+                    bucket.remaining_burst(),
+                    bucket.age_nanos(),
+                ))
+            );
+        }
+        let debug = format!("{mmio:?}");
+        for secret in ["pmem-selector", "root=", "PARTUUID"] {
+            assert!(!debug.contains(secret));
+        }
+        mmio.abort()
+            .expect("MMIO handoff should release every unpublished owner");
+    }
+}
+
+#[test]
+fn mmio_handoff_rejects_pci_and_allocation_faults_with_clean_owner_release() {
+    let pci = fixture_graph(SnapshotV2DeviceTransportKind::Pci, 0, 1, None);
+    let memory = restore_memory_for(&pci);
+    let (_files, blocks, pmems) = restore_backings(&pci);
+    let bundle = SnapshotV2StorageRestorePlan::prepare(pci, &memory, Instant::now())
+        .expect("PCI rejection plan should prepare")
+        .prepare_backings(blocks, pmems, || false)
+        .expect("PCI rejection bundle should prepare");
+    let error = bundle
+        .prepare_mmio_transport()
+        .expect_err("PCI storage must not fall back to MMIO");
+    assert!(!error.cleanup_failed());
+
+    let graph = fixture_graph(
+        SnapshotV2DeviceTransportKind::Mmio,
+        2,
+        1,
+        Some(DEVICE_KIND_BLOCK),
+    );
+    let memory = restore_memory_for(&graph);
+    let (_files, blocks, pmems) = restore_backings(&graph);
+    let bundle = SnapshotV2StorageRestorePlan::prepare(graph, &memory, Instant::now())
+        .expect("allocation handoff plan should prepare")
+        .prepare_backings(blocks, pmems, || false)
+        .expect("allocation handoff bundle should prepare");
+    let async_runtime = bundle
+        .block_bundle()
+        .and_then(|bundle| bundle.async_runtime())
+        .cloned();
+    let error = super::restore::prepare_mmio_transport_with_failing_reserve_for_test(bundle)
+        .expect_err("pmem MMIO record reservation should fail explicitly");
+    assert!(!error.cleanup_failed());
+    if let Some(runtime) = async_runtime {
+        assert_eq!(
+            runtime
+                .generation_count()
+                .expect("Async runtime should remain observable"),
+            0
+        );
+    }
+}
+
+#[test]
 fn profile_identity_is_exact_distinct_and_bounded() {
     assert_eq!(
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,

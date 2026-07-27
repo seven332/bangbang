@@ -70,6 +70,7 @@ use crate::snapshot_v2::{
 use crate::snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockMmioRecordPlan, HvfSnapshotV2MultiBlockPciPlan,
 };
+use crate::snapshot_v2_storage_platform::HvfSnapshotV2StorageMmioRecordPlan;
 use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
@@ -366,6 +367,15 @@ pub(crate) struct HvfSnapshotV2MultiBlockPciShellPlan<'a> {
     pub(crate) vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2StorageMmioShellPlan<'a> {
+    pub(crate) command_line: &'a str,
+    pub(crate) block_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    pub(crate) pmem_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 enum HvfSnapshotV2ProcessShellRestore<'a> {
     DeviceFree(HvfSnapshotV2DefaultProcessShell),
     Root {
@@ -380,6 +390,10 @@ enum HvfSnapshotV2ProcessShellRestore<'a> {
     MultiBlockPci {
         shell: HvfSnapshotV2DefaultProcessShell,
         plan: HvfSnapshotV2MultiBlockPciShellPlan<'a>,
+    },
+    StorageMmio {
+        shell: HvfSnapshotV2DefaultProcessShell,
+        plan: HvfSnapshotV2StorageMmioShellPlan<'a>,
     },
 }
 
@@ -396,6 +410,11 @@ enum HvfSnapshotV2ProcessBlockFdtPlan<'a> {
     MultiBlockPci {
         command_line: &'a str,
         pci: &'a HvfSnapshotV2MultiBlockPciPlan,
+    },
+    StorageMmio {
+        command_line: &'a str,
+        block_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+        pmem_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
     },
 }
 
@@ -1157,6 +1176,10 @@ impl RestoredHvfSnapshotV2Platform {
         &self.parts().backend
     }
 
+    pub(crate) fn backend_mut(&mut self) -> &mut HvfBackend {
+        &mut self.parts_mut().backend
+    }
+
     pub(crate) fn mmio_dispatcher(&self) -> &Arc<Mutex<MmioDispatcher>> {
         &self.parts().mmio_dispatcher
     }
@@ -1327,6 +1350,19 @@ pub(crate) fn restore_hvf_snapshot_v2_multi_block_pci_process_platform(
         state,
         memory,
         Some(HvfSnapshotV2ProcessShellRestore::MultiBlockPci { shell, plan }),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_storage_mmio_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2DefaultProcessShell,
+    plan: HvfSnapshotV2StorageMmioShellPlan<'_>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::StorageMmio { shell, plan }),
     )
 }
 
@@ -2316,6 +2352,39 @@ fn prepare_process_shell(
                     )),
                 )
             }
+            HvfSnapshotV2ProcessShellRestore::StorageMmio { shell, plan } => {
+                if gic.msi.is_some() || plan.block_records.len() + plan.pmem_records.len() == 0 {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                for record in plan.block_records.iter().chain(plan.pmem_records) {
+                    if allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != record.interrupt_line()
+                    {
+                        return Err(
+                            HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                        );
+                    }
+                }
+                (
+                    shell,
+                    HvfSnapshotV2ProcessBlockFdtPlan::StorageMmio {
+                        command_line: plan.command_line,
+                        block_records: plan.block_records,
+                        pmem_records: plan.pmem_records,
+                    },
+                    true,
+                    false,
+                    Some((
+                        plan.serial_interrupt,
+                        plan.vmgenid_interrupt,
+                        plan.vmclock_interrupt,
+                    )),
+                )
+            }
         };
     let serial_interrupt = allocator
         .allocate()
@@ -2436,6 +2505,11 @@ fn validate_process_fdt(
         HvfSnapshotV2ProcessBlockFdtPlan::Root { .. } => 1,
         HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockMmio { records, .. } => records.len(),
         HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci { .. } => 1,
+        HvfSnapshotV2ProcessBlockFdtPlan::StorageMmio {
+            block_records,
+            pmem_records,
+            ..
+        } => block_records.len() + pmem_records.len(),
     };
     if tree.root.children.len() != 11 + block_child_count
         || [
@@ -2549,6 +2623,9 @@ fn validate_process_fdt(
             .prop_str("bootargs")
             .is_ok_and(|arguments| arguments == *command_line),
         HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci { command_line, .. } => chosen
+            .prop_str("bootargs")
+            .is_ok_and(|arguments| arguments == *command_line),
+        HvfSnapshotV2ProcessBlockFdtPlan::StorageMmio { command_line, .. } => chosen
             .prop_str("bootargs")
             .is_ok_and(|arguments| arguments == *command_line),
         HvfSnapshotV2ProcessBlockFdtPlan::None => {
@@ -2754,6 +2831,20 @@ fn validate_process_block_nodes(
                 || !validate_process_gic_msi(intc, pci.msi())
             {
                 return Err(HvfSnapshotV2ProcessFdtMismatch::Pci);
+            }
+            return Ok(());
+        }
+        HvfSnapshotV2ProcessBlockFdtPlan::StorageMmio {
+            block_records,
+            pmem_records,
+            ..
+        } => {
+            for record in block_records.iter().chain(*pmem_records) {
+                validate_process_mmio_block_node(
+                    root_node,
+                    record.region(),
+                    record.interrupt_line(),
+                )?;
             }
             return Ok(());
         }

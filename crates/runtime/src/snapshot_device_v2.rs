@@ -567,7 +567,10 @@ pub struct SnapshotV2MmioDeviceState {
 }
 
 impl SnapshotV2MmioDeviceState {
-    pub(crate) const fn from_parts(
+    /// Reassembles already-validated retained selectors and placement before
+    /// graph-wide validation.
+    #[doc(hidden)]
+    pub const fn from_parts(
         device_feature_select: u32,
         driver_feature_select: u32,
         queue_select: u32,
@@ -1649,8 +1652,16 @@ pub(crate) fn restore_mmio_transport_state(
     common: &SnapshotV2VirtioState,
     mmio: &SnapshotV2MmioDeviceState,
 ) -> Result<VirtioMmioTransportState, SnapshotV2RootTransportRestoreError> {
+    restore_mmio_transport_state_for_device(VIRTIO_BLOCK_DEVICE_ID, common, mmio)
+}
+
+pub(crate) fn restore_mmio_transport_state_for_device(
+    device_id: u32,
+    common: &SnapshotV2VirtioState,
+    mmio: &SnapshotV2MmioDeviceState,
+) -> Result<VirtioMmioTransportState, SnapshotV2RootTransportRestoreError> {
     let device = VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(
-        VIRTIO_BLOCK_DEVICE_ID,
+        device_id,
         VIRTIO_MMIO_VENDOR_ID,
         common.available_features(),
         common.config_generation(),

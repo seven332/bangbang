@@ -6896,31 +6896,36 @@ fn prepares_internal_hvf_arm64_boot_session() {
 #[test]
 fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
     use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt;
     use std::time::Instant;
 
     use bangbang_hvf::{
-        HvfArm64BootSessionConfig, HvfArm64BootSnapshotV2CaptureInput,
-        HvfArm64BootStorageCaptureErrorKind, HvfArm64BootStorageCaptureStage,
-        HvfSnapshotV2BootState, HvfSnapshotV2NativePath, HvfSnapshotV2StorageState,
-        OwnedHvfArm64BootSession,
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfArm64BootStorageCaptureErrorKind,
+        HvfArm64BootStorageCaptureStage, HvfSnapshotV2BootState, HvfSnapshotV2DefaultProcessShell,
+        HvfSnapshotV2NativePath, HvfSnapshotV2StorageMmioProcessConfig, HvfSnapshotV2StorageState,
+        HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
+        prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
     };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::{
-        BlockCaptureIoEngine, BlockMmioLayout, DriveCacheType, DriveConfigInput, DriveIoEngine,
-        PreparedBlockDevice,
+        BlockCaptureIoEngine, BlockFileBacking, BlockMmioLayout, DriveCacheType, DriveConfigInput,
+        DriveIoEngine, PreparedBlockDevice,
     };
     use bangbang_runtime::boot::BootSourceConfigInput;
-    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryLayout};
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::pmem::{
         PmemConfig, PmemConfigInput, PmemFileBacking, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT,
     };
+    use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::snapshot_device_v2::{
         SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
     };
     use bangbang_runtime::snapshot_device_v2_6::{
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
+        SnapshotV2StorageRestorePlan,
     };
     use bangbang_runtime::storage_capture::{
         CaptureReadyStorageConfigs, StorageDeviceOrigin, StorageTransportState,
@@ -6976,13 +6981,22 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
                 .with_read_only(true),
         ))
         .expect("read-only MMIO pmem should configure");
+    let mmio_serial = SharedSerialOutputBuffer::default();
     let mmio_session_config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
         PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
         NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
         VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
-        test_rtc_mmio_layout(),
-    );
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(mmio_serial),
+    ));
     let mut mmio_session = OwnedHvfArm64BootSession::new(&mmio_controller, mmio_session_config)
         .expect("signed MMIO storage session should prepare");
     let mmio_configs = CaptureReadyStorageConfigs::new(
@@ -7260,10 +7274,265 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
     ] {
         assert!(!mmio_debug.contains(&private_path));
     }
+
+    let restored_layout =
+        GuestMemoryLayout::new(mmio_session.runtime_resources().layout.ranges().to_vec())
+            .expect("MMIO profile-3 destination layout should validate");
+    let mut fault_memory = GuestMemory::allocate(&restored_layout)
+        .expect("MMIO profile-3 fault destination memory should allocate");
+    let mut restored_memory = GuestMemory::allocate(&restored_layout)
+        .expect("MMIO profile-3 destination memory should allocate");
+    let source_memory = mmio_session
+        .guest_memory()
+        .expect("MMIO profile-3 source memory should remain mapped");
+    let mut copy_buffer = vec![0_u8; 64 * 1024];
+    for range in restored_layout.ranges() {
+        let mut copied = 0_u64;
+        while copied < range.size() {
+            let remaining = range.size() - copied;
+            let count =
+                usize::try_from(remaining.min(
+                    u64::try_from(copy_buffer.len()).expect("copy buffer length should fit u64"),
+                ))
+                .expect("MMIO profile-3 copy count should fit usize");
+            let address = range
+                .start()
+                .checked_add(copied)
+                .expect("MMIO profile-3 copy address should fit");
+            source_memory
+                .read_slice(&mut copy_buffer[..count], address)
+                .expect("MMIO profile-3 source memory should read");
+            fault_memory
+                .write_slice(&copy_buffer[..count], address)
+                .expect("MMIO profile-3 fault destination memory should write");
+            restored_memory
+                .write_slice(&copy_buffer[..count], address)
+                .expect("MMIO profile-3 destination memory should write");
+            copied += u64::try_from(count).expect("copy count should fit u64");
+        }
+    }
     drop(mmio_guard);
     mmio_session
         .shutdown()
         .expect("signed MMIO storage session should shut down");
+
+    let (source_platform, source_graph) = mmio_complete.into_parts();
+    let reopen_block_backings = || {
+        source_graph
+            .block_records()
+            .iter()
+            .map(|record| {
+                BlockFileBacking::open_snapshot(
+                    std::path::Path::new(record.config().selector()),
+                    record.config().is_read_only(),
+                )
+                .map(|(backing, _identity)| backing)
+                .expect("MMIO profile-3 block backing should reopen")
+            })
+            .collect::<Vec<_>>()
+    };
+    let reopen_pmem_backings = || {
+        mmio_controller
+            .pmem_configs()
+            .iter()
+            .map(|config| {
+                PmemFileBacking::open(config).expect("MMIO profile-3 pmem backing should reopen")
+            })
+            .collect::<Vec<_>>()
+    };
+    let restore_process_config = HvfSnapshotV2StorageMmioProcessConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+    );
+    let restore_now = Instant::now();
+
+    let fault_bundle =
+        SnapshotV2StorageRestorePlan::prepare(source_graph.clone(), &fault_memory, restore_now)
+            .expect("MMIO profile-3 fault restore plan should validate")
+            .prepare_backings(reopen_block_backings(), reopen_pmem_backings(), || false)
+            .expect("MMIO profile-3 fault backings should prepare");
+    let fault_plan = prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
+        &source_platform,
+        &fault_bundle,
+        restore_process_config,
+    )
+    .expect("MMIO profile-3 fault platform plan should validate");
+    let fault_shell = HvfSnapshotV2DefaultProcessShell::new(SharedSerialOutput::from(
+        SharedSerialOutputBuffer::default(),
+    ));
+    let fault =
+        OwnedHvfArm64BootSession::restore_snapshot_v2_storage_mmio_with_pmem_publication_fault(
+            source_platform.clone(),
+            fault_memory,
+            fault_shell,
+            fault_bundle,
+            fault_plan,
+            0,
+        )
+        .expect_err("injected post-mapping publication fault should reject");
+    assert_eq!(
+        fault.stage(),
+        bangbang_hvf::HvfSnapshotV2StorageMmioRestoreStage::Registration {
+            index: source_graph.block_records().len(),
+        }
+    );
+    assert!(fault.cleanup_failures().is_empty());
+    assert!(!fault.is_terminal());
+    let fault_diagnostics = format!("{fault:?} {fault}");
+    for private_path in [
+        path_text(mmio_root.path()),
+        path_text(mmio_async.path()),
+        path_text(mmio_pmem.path()),
+        path_text(mmio_read_only_pmem.path()),
+    ] {
+        assert!(!fault_diagnostics.contains(&private_path));
+    }
+
+    let restore_bundle =
+        SnapshotV2StorageRestorePlan::prepare(source_graph.clone(), &restored_memory, restore_now)
+            .expect("MMIO profile-3 restore plan should validate")
+            .prepare_backings(reopen_block_backings(), reopen_pmem_backings(), || false)
+            .expect("MMIO profile-3 backings should prepare");
+    let restore_plan = prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
+        &source_platform,
+        &restore_bundle,
+        restore_process_config,
+    )
+    .expect("MMIO profile-3 platform plan should validate");
+    let restored_serial = SharedSerialOutputBuffer::default();
+    let restore_shell =
+        HvfSnapshotV2DefaultProcessShell::new(SharedSerialOutput::from(restored_serial));
+    let restored_owners = OwnedHvfArm64BootSession::restore_snapshot_v2_storage_mmio(
+        source_platform.clone(),
+        restored_memory,
+        restore_shell,
+        restore_bundle,
+        restore_plan,
+    )
+    .unwrap_or_else(|error| panic!("MMIO profile-3 owners should restore: {error:?}"));
+    assert_eq!(restored_owners.configs(), &mmio_configs);
+    let (mut restored, restored_configs) = restored_owners.into_parts();
+    assert_eq!(restored_configs, mmio_configs);
+    assert_eq!(restored.runtime_resources().block_devices.len(), 2);
+    assert_eq!(restored.runtime_resources().pmem_devices.len(), 2);
+    assert_eq!(restored.runtime_resources().pmem_mmio_devices.len(), 2);
+    assert!(restored.runtime_resources().pci_block_devices.is_empty());
+    assert!(!restored.uses_pci_data_devices());
+
+    for ((device, registration), record) in restored
+        .runtime_resources()
+        .pmem_devices
+        .iter()
+        .zip(&restored.runtime_resources().pmem_mmio_devices)
+        .zip(source_graph.pmem_records())
+    {
+        let SnapshotV2DeviceTransport::Mmio(transport) = record.transport() else {
+            panic!("restored profile-3 pmem record should use MMIO");
+        };
+        assert_eq!(device.id(), record.config().pmem_id());
+        assert_eq!(device.guest_range(), record.pmem().guest_range());
+        assert_eq!(device.config_space(), record.pmem().config_space());
+        assert_eq!(registration.registration.region(), transport.region());
+        assert_eq!(
+            registration.fdt_device.interrupt_line,
+            transport.interrupt_line()
+        );
+    }
+    let block_metrics = restored.shared_block_device_metrics();
+    for config in restored_configs.drives() {
+        assert!(
+            block_metrics
+                .per_drive(config.drive_id())
+                .expect("restored block metrics owner should exist")
+                .snapshot()
+                .is_empty()
+        );
+    }
+    let pmem_metrics = restored.shared_pmem_device_metrics();
+    for config in restored_configs.pmem() {
+        assert!(
+            pmem_metrics
+                .per_device(config.id())
+                .expect("restored pmem metrics owner should exist")
+                .snapshot()
+                .is_empty()
+        );
+    }
+
+    let restored_guard = restored
+        .quiesce_limiter_retry_wakeups()
+        .expect("restored profile-3 retry publishers should quiesce");
+    let recaptured_graph = restored
+        .capture_snapshot_v2_storage_device_graph_at(
+            &restored_configs,
+            &restored_guard,
+            restore_now,
+        )
+        .expect("restored MMIO profile-3 graph should recapture");
+    assert_eq!(recaptured_graph, source_graph);
+    let recaptured_memory = TempFile::new_len("restored-mmio-profile-3-memory", 0)
+        .expect("restored MMIO profile-3 memory artifact should create");
+    let mut recaptured_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(recaptured_memory.path())
+        .expect("restored MMIO profile-3 memory artifact should open");
+    let recaptured_boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(mmio_kernel.path().as_os_str())
+            .expect("restored MMIO profile-3 kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("restored MMIO profile-3 boot metadata should validate");
+    let recaptured_platform = restored
+        .capture_snapshot_v2_storage_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(recaptured_boot),
+            &mut recaptured_writer,
+            |_| false,
+        )
+        .expect("restored MMIO profile-3 platform should recapture");
+    assert_native_v2_platform_recapture_equivalent(&source_platform, &recaptured_platform);
+    drop(restored_guard);
+
+    const RESTORED_PMEM_WRITE_OFFSET: u64 = 4096;
+    const RESTORED_PMEM_WRITE_VALUE: u32 = 0x1631_cafe;
+    let restored_entry = GuestAddress::new(
+        restored
+            .capture_arm64_general_register_state()
+            .expect("restored MMIO profile-3 registers should capture")
+            .pc(),
+    );
+    let restored_target = restored.runtime_resources().pmem_devices[0]
+        .guest_range()
+        .start()
+        .checked_add(RESTORED_PMEM_WRITE_OFFSET)
+        .expect("restored MMIO profile-3 pmem target should fit");
+    let restored_program =
+        arm64_store_u32_and_hvc_program(restored_target.raw_value(), RESTORED_PMEM_WRITE_VALUE);
+    restored
+        .guest_memory_mut()
+        .expect("restored MMIO profile-3 guest memory should map")
+        .write_slice(&restored_program, restored_entry)
+        .expect("restored MMIO profile-3 guest program should write");
+    restored
+        .resume_after_snapshot_v2_capture()
+        .expect("restored MMIO profile-3 runner should resume");
+    assert!(matches!(
+        restored
+            .run_once_and_handle_mmio()
+            .expect("restored guest should reach HVC through the pmem mapping"),
+        HvfVcpuRunStepOutcome::Hvc { exit, .. } if exit.immediate() == 0
+    ));
+    let observer =
+        std::fs::File::open(mmio_pmem.path()).expect("restored pmem observer should open");
+    let mut observed = [0_u8; std::mem::size_of::<u32>()];
+    observer
+        .read_exact_at(&mut observed, RESTORED_PMEM_WRITE_OFFSET)
+        .expect("restored pmem observer should read");
+    assert_eq!(u32::from_le_bytes(observed), RESTORED_PMEM_WRITE_VALUE);
+    restored
+        .shutdown()
+        .expect("restored MMIO profile-3 session should tear down in ownership order");
 
     let pci_kernel = TempFile::new("capture-ready-pci-kernel", &image)
         .expect("PCI capture kernel should create");
