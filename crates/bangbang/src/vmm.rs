@@ -30,16 +30,18 @@ use bangbang_hvf::{
     HvfArm64BootPciNetworkDeviceUpdater, HvfArm64BootPciPmemDeviceUpdater,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialCaptureError, HvfArm64BootSerialDeviceConfig,
-    HvfArm64BootSessionConfig, HvfArm64BootSnapshotV1CaptureStage,
-    HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootSnapshotV1StateCaptureError,
-    HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureInput,
-    HvfArm64BootStorageCaptureError, HvfArm64BootStorageCaptureErrorKind,
-    HvfArm64BootStorageCaptureStage, HvfArm64BootTimerDeviceConfig, HvfArm64BootVcpuError,
-    HvfArm64BootVsockCaptureDisposition, HvfArm64BootVsockCaptureError,
-    HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState, HvfBackend, HvfSnapshotV1Bundle,
-    HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
-    HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfSnapshotV2BootState, HvfSnapshotV2BuildError,
-    HvfSnapshotV2DecodeError, HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
+    HvfArm64BootSessionConfig, HvfArm64BootSessionShutdownError,
+    HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
+    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootSnapshotV2CaptureError,
+    HvfArm64BootSnapshotV2CaptureInput, HvfArm64BootStorageCaptureError,
+    HvfArm64BootStorageCaptureErrorKind, HvfArm64BootStorageCaptureStage,
+    HvfArm64BootTimerDeviceConfig, HvfArm64BootVcpuError, HvfArm64BootVsockCaptureDisposition,
+    HvfArm64BootVsockCaptureError, HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState,
+    HvfBackend, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup,
+    HvfSnapshotV1RestoreDisposition, HvfSnapshotV1RestoreError, HvfSnapshotV1State,
+    HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2DecodeError,
+    HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
+    HvfSnapshotV2MultiBlockMmioRestoreError, HvfSnapshotV2MultiBlockPlatformPlan,
     HvfSnapshotV2NativePath, HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformState,
     HvfSnapshotV2RootProcessConfig, HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootRestoreError,
     HvfSnapshotV2State, HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome,
@@ -57,7 +59,7 @@ use bangbang_runtime::balloon::{
 };
 use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveBackendConfig, DriveConfig, DriveConfigError,
-    DriveConfigInput, DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig,
+    DriveConfigInput, DriveConfigs, DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig,
     DriveRuntimeMutationError, DriveUpdateError, DriveUpdateInput, PreparedBlockDevice,
     PreparedVhostUserBlockFrontend, RuntimeBlockDeviceResource,
 };
@@ -200,7 +202,9 @@ use crate::host_network::vmnet::{
 #[cfg(target_os = "macos")]
 use crate::snapshot_restore_resources::{
     PreparedSnapshotRootBackingLease, PreparedSnapshotRootRestoreCompletion,
-    PreparedSnapshotRootRestoreCompletionError, RequestedSnapshotRestoreResources,
+    PreparedSnapshotRootRestoreCompletionError, PreparedSnapshotV2MultiBlockDestinationCommitError,
+    PreparedSnapshotV2MultiBlockDestinationConstructionError,
+    PreparedSnapshotV2MultiBlockRestoreBundle, RequestedSnapshotRestoreResources,
     SnapshotRestoreResourceDisposition, SnapshotRestoreResourceError,
     SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
 };
@@ -6653,6 +6657,211 @@ fn native_v2_boot_source_config(
         input = input.with_boot_args(arguments);
     }
     input.validate()
+}
+
+#[cfg(target_os = "macos")]
+struct PreparedHvfSnapshotV2MultiBlockMmioDestination {
+    session: Box<OwnedHvfArm64BootSession>,
+    drive_configs: Option<DriveConfigs>,
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedHvfSnapshotV2MultiBlockMmioDestination {
+    fn prepare_controller(
+        mut self,
+        machine: bangbang_runtime::machine::MachineConfig,
+        boot: bangbang_runtime::boot::BootSourceConfig,
+        resume_requested: bool,
+    ) -> Result<
+        (Self, SnapshotV2ControllerCommit),
+        (Self, PreparedHvfSnapshotV2MultiBlockControllerError),
+    > {
+        let Some(drive_configs) = self.drive_configs.take() else {
+            return Err((
+                self,
+                PreparedHvfSnapshotV2MultiBlockControllerError::MissingDriveConfigs,
+            ));
+        };
+        let controller = SnapshotV2ControllerCommit::with_drive_configs(
+            machine,
+            boot,
+            drive_configs,
+            resume_requested,
+        );
+        Ok((self, controller))
+    }
+
+    fn shutdown(mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
+        self.session.shutdown()
+    }
+
+    fn into_session(self) -> OwnedHvfArm64BootSession {
+        debug_assert!(self.drive_configs.is_none());
+        *self.session
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for PreparedHvfSnapshotV2MultiBlockMmioDestination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedHvfSnapshotV2MultiBlockMmioDestination")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedHvfSnapshotV2MultiBlockControllerError {
+    MissingDriveConfigs,
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for PreparedHvfSnapshotV2MultiBlockControllerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("profile-2 controller projection is unavailable")
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for PreparedHvfSnapshotV2MultiBlockControllerError {}
+
+#[cfg(target_os = "macos")]
+enum PrepareHvfSnapshotV2MultiBlockMmioDestinationError {
+    Construction(
+        PreparedSnapshotV2MultiBlockDestinationConstructionError<
+            HvfSnapshotV2MultiBlockMmioRestoreError,
+        >,
+    ),
+    Commit(
+        PreparedSnapshotV2MultiBlockDestinationCommitError<
+            PreparedHvfSnapshotV2MultiBlockControllerError,
+            HvfArm64BootSessionShutdownError,
+        >,
+    ),
+}
+
+#[cfg(target_os = "macos")]
+impl PrepareHvfSnapshotV2MultiBlockMmioDestinationError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Construction(source) => {
+                source.is_terminal()
+                    || matches!(
+                        source,
+                        PreparedSnapshotV2MultiBlockDestinationConstructionError::Construction {
+                            source,
+                            ..
+                        } if source.is_terminal()
+                    )
+            }
+            Self::Commit(source) => source.is_terminal(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for PrepareHvfSnapshotV2MultiBlockMmioDestinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stage = match self {
+            Self::Construction(_) => "construction",
+            Self::Commit(_) => "completion",
+        };
+        formatter
+            .debug_struct("PrepareHvfSnapshotV2MultiBlockMmioDestinationError")
+            .field("stage", &stage)
+            .field("terminal", &self.is_terminal())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for PrepareHvfSnapshotV2MultiBlockMmioDestinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "profile-2 MMIO destination transaction failed ({})",
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for PrepareHvfSnapshotV2MultiBlockMmioDestinationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Construction(source) => Some(source),
+            Self::Commit(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct PrepareHvfSnapshotV2MultiBlockMmioDestinationInput {
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    process_shell: HvfSnapshotV2DefaultProcessShell,
+    bundle: PreparedSnapshotV2MultiBlockRestoreBundle,
+    plan: HvfSnapshotV2MultiBlockPlatformPlan,
+    machine: bangbang_runtime::machine::MachineConfig,
+    boot: bangbang_runtime::boot::BootSourceConfig,
+    resume_requested: bool,
+}
+
+/// Dormant profile-2 process transaction. Public native-v2 dispatch remains
+/// exact 2.4 until the activation slice consumes this boundary.
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "profile-2 public native-v2 activation is owned by the dependent delivery slice"
+)]
+fn prepare_hvf_native_v2_multi_block_mmio_destination(
+    input: PrepareHvfSnapshotV2MultiBlockMmioDestinationInput,
+) -> Result<
+    (OwnedHvfArm64BootSession, SnapshotV2ControllerCommit),
+    PrepareHvfSnapshotV2MultiBlockMmioDestinationError,
+> {
+    let PrepareHvfSnapshotV2MultiBlockMmioDestinationInput {
+        platform,
+        memory,
+        process_shell,
+        bundle,
+        plan,
+        machine,
+        boot,
+        resume_requested,
+    } = input;
+    let destination = bundle
+        .construct_destination(|bundle| {
+            OwnedHvfArm64BootSession::restore_snapshot_v2_multi_block_mmio(
+                platform,
+                memory,
+                process_shell,
+                bundle,
+                plan,
+            )
+            .map(|owners| {
+                let (session, drive_configs) = owners.into_parts();
+                PreparedHvfSnapshotV2MultiBlockMmioDestination {
+                    session: Box::new(session),
+                    drive_configs: Some(drive_configs),
+                }
+            })
+        })
+        .map_err(PrepareHvfSnapshotV2MultiBlockMmioDestinationError::Construction)?;
+    let (destination, controller) = destination
+        .commit(
+            |destination| destination.prepare_controller(machine, boot, resume_requested),
+            PreparedHvfSnapshotV2MultiBlockMmioDestination::shutdown,
+        )
+        .map_err(PrepareHvfSnapshotV2MultiBlockMmioDestinationError::Commit)?;
+    Ok((destination.into_session(), controller))
 }
 
 #[cfg(target_os = "macos")]

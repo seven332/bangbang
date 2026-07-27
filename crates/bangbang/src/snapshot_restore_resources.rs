@@ -1653,20 +1653,39 @@ impl PreparedSnapshotV2MultiBlockRestoreBundle {
         self.bundle.as_ref()
     }
 
-    pub(crate) fn commit(
+    pub(crate) fn construct_destination<D, E>(
         mut self,
-    ) -> Result<PreparedSnapshotV2MultiBlockBundle, PreparedSnapshotV2MultiBlockRestoreCommitError>
-    {
-        let completion = self
-            .completion
-            .take()
-            .ok_or(PreparedSnapshotV2MultiBlockRestoreCommitError::InvalidState)?;
-        completion
-            .commit()
-            .map_err(PreparedSnapshotV2MultiBlockRestoreCommitError::Completion)?;
-        self.bundle
-            .take()
-            .ok_or(PreparedSnapshotV2MultiBlockRestoreCommitError::InvalidState)
+        construct: impl FnOnce(PreparedSnapshotV2MultiBlockBundle) -> Result<D, E>,
+    ) -> Result<
+        PreparedSnapshotV2MultiBlockDestination<D>,
+        PreparedSnapshotV2MultiBlockDestinationConstructionError<E>,
+    > {
+        let Some(bundle) = self.bundle.take() else {
+            return Err(
+                PreparedSnapshotV2MultiBlockDestinationConstructionError::InvalidState {
+                    bundle_cleanup: None,
+                },
+            );
+        };
+        let Some(completion) = self.completion.take() else {
+            return Err(
+                PreparedSnapshotV2MultiBlockDestinationConstructionError::InvalidState {
+                    bundle_cleanup: bundle.abort().err(),
+                },
+            );
+        };
+        match construct(bundle) {
+            Ok(destination) => Ok(PreparedSnapshotV2MultiBlockDestination {
+                destination: Some(destination),
+                completion: Some(completion),
+            }),
+            Err(source) => Err(
+                PreparedSnapshotV2MultiBlockDestinationConstructionError::Construction {
+                    source,
+                    completion_abort: completion.abort().err(),
+                },
+            ),
+        }
     }
 
     pub(crate) fn abort(mut self) -> Result<(), PreparedSnapshotV2MultiBlockRestoreAbortError> {
@@ -1710,25 +1729,203 @@ impl fmt::Debug for PreparedSnapshotV2MultiBlockRestoreBundle {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum PreparedSnapshotV2MultiBlockRestoreCommitError {
-    InvalidState,
-    Completion(PreparedSnapshotDriveRestoreCompletionError),
+/// One complete private destination whose backing authority remains
+/// provisional until the controller projection is also ready.
+pub(crate) struct PreparedSnapshotV2MultiBlockDestination<D> {
+    destination: Option<D>,
+    completion: Option<PreparedSnapshotDriveRestoreCompletion>,
 }
 
-impl fmt::Display for PreparedSnapshotV2MultiBlockRestoreCommitError {
+impl<D> PreparedSnapshotV2MultiBlockDestination<D> {
+    pub(crate) fn commit<C, E, T>(
+        mut self,
+        prepare_controller: impl FnOnce(D) -> Result<(D, C), (D, E)>,
+        destroy_destination: impl FnOnce(D) -> Result<(), T>,
+    ) -> Result<(D, C), PreparedSnapshotV2MultiBlockDestinationCommitError<E, T>> {
+        let destination = self
+            .destination
+            .take()
+            .ok_or(PreparedSnapshotV2MultiBlockDestinationCommitError::InvalidState)?;
+        let completion = self
+            .completion
+            .take()
+            .ok_or(PreparedSnapshotV2MultiBlockDestinationCommitError::InvalidState)?;
+        let (destination, controller) = match prepare_controller(destination) {
+            Ok(prepared) => prepared,
+            Err((destination, source)) => {
+                let destination_cleanup = destroy_destination(destination).err();
+                let completion_abort = completion.abort().err();
+                return Err(
+                    PreparedSnapshotV2MultiBlockDestinationCommitError::Controller {
+                        source,
+                        destination_cleanup,
+                        completion_abort,
+                    },
+                );
+            }
+        };
+        match completion.commit() {
+            Ok(()) => Ok((destination, controller)),
+            Err(source) => {
+                let destination_cleanup = destroy_destination(destination).err();
+                Err(
+                    PreparedSnapshotV2MultiBlockDestinationCommitError::Completion {
+                        source,
+                        destination_cleanup,
+                    },
+                )
+            }
+        }
+    }
+}
+
+impl<D> fmt::Debug for PreparedSnapshotV2MultiBlockDestination<D> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MultiBlockDestination")
+            .field("state", &"<private-provisional>")
+            .finish()
+    }
+}
+
+pub(crate) enum PreparedSnapshotV2MultiBlockDestinationConstructionError<E> {
+    InvalidState {
+        bundle_cleanup: Option<SnapshotV2MultiBlockCleanupError>,
+    },
+    Construction {
+        source: E,
+        completion_abort: Option<PreparedSnapshotDriveRestoreCompletionError>,
+    },
+}
+
+impl<E> PreparedSnapshotV2MultiBlockDestinationConstructionError<E> {
+    pub(crate) const fn is_terminal(&self) -> bool {
+        match self {
+            Self::InvalidState { .. }
+            | Self::Construction {
+                completion_abort: Some(_),
+                ..
+            } => true,
+            Self::Construction {
+                completion_abort: None,
+                ..
+            } => false,
+        }
+    }
+}
+
+impl<E> fmt::Debug for PreparedSnapshotV2MultiBlockDestinationConstructionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::InvalidState { .. } => "invalid-state",
+            Self::Construction { .. } => "construction",
+        };
+        formatter
+            .debug_struct("PreparedSnapshotV2MultiBlockDestinationConstructionError")
+            .field("kind", &kind)
+            .field("terminal", &self.is_terminal())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<E> fmt::Display for PreparedSnapshotV2MultiBlockDestinationConstructionError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::InvalidState => "snapshot multi-block restore commit state is invalid",
-            Self::Completion(_) => "snapshot multi-block restore completion commit failed",
+            Self::InvalidState { .. } => {
+                "snapshot multi-block destination construction state is invalid"
+            }
+            Self::Construction { .. } => "snapshot multi-block destination construction failed",
         })
     }
 }
 
-impl std::error::Error for PreparedSnapshotV2MultiBlockRestoreCommitError {
+impl<E> std::error::Error for PreparedSnapshotV2MultiBlockDestinationConstructionError<E>
+where
+    E: std::error::Error + 'static,
+{
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Completion(source) => Some(source),
+            Self::InvalidState { bundle_cleanup } => bundle_cleanup
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+            Self::Construction { source, .. } => Some(source),
+        }
+    }
+}
+
+pub(crate) enum PreparedSnapshotV2MultiBlockDestinationCommitError<E, T> {
+    InvalidState,
+    Controller {
+        source: E,
+        destination_cleanup: Option<T>,
+        completion_abort: Option<PreparedSnapshotDriveRestoreCompletionError>,
+    },
+    Completion {
+        source: PreparedSnapshotDriveRestoreCompletionError,
+        destination_cleanup: Option<T>,
+    },
+}
+
+impl<E, T> PreparedSnapshotV2MultiBlockDestinationCommitError<E, T> {
+    pub(crate) const fn is_terminal(&self) -> bool {
+        match self {
+            Self::InvalidState => true,
+            Self::Controller {
+                destination_cleanup,
+                completion_abort,
+                ..
+            } => destination_cleanup.is_some() || completion_abort.is_some(),
+            Self::Completion {
+                destination_cleanup,
+                ..
+            } => {
+                let _cleanup_failed = destination_cleanup.is_some();
+                true
+            }
+        }
+    }
+}
+
+impl<E, T> fmt::Debug for PreparedSnapshotV2MultiBlockDestinationCommitError<E, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::InvalidState => "invalid-state",
+            Self::Controller { .. } => "controller",
+            Self::Completion { .. } => "completion",
+        };
+        formatter
+            .debug_struct("PreparedSnapshotV2MultiBlockDestinationCommitError")
+            .field("kind", &kind)
+            .field("terminal", &self.is_terminal())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<E, T> fmt::Display for PreparedSnapshotV2MultiBlockDestinationCommitError<E, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidState => "snapshot multi-block destination commit state is invalid",
+            Self::Controller { .. } => {
+                "snapshot multi-block controller preparation failed before completion"
+            }
+            Self::Completion { .. } => {
+                "snapshot multi-block backing completion failed after destination construction"
+            }
+        })
+    }
+}
+
+impl<E, T> std::error::Error for PreparedSnapshotV2MultiBlockDestinationCommitError<E, T>
+where
+    E: std::error::Error + 'static,
+    T: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Controller { source, .. } => Some(source),
+            Self::Completion { source, .. } => Some(source),
             Self::InvalidState => None,
         }
     }
@@ -1927,7 +2124,15 @@ impl RequestedSnapshotRestoreResources {
         // Keep the complete dormant ownership contract type-checked before
         // later profile-2 activation consumes it.
         let _bundle = PreparedSnapshotV2MultiBlockRestoreBundle::bundle;
-        let _commit = PreparedSnapshotV2MultiBlockRestoreBundle::commit;
+        let _construct = |prepared: PreparedSnapshotV2MultiBlockRestoreBundle| {
+            prepared.construct_destination(Ok::<_, std::convert::Infallible>)
+        };
+        let _commit = |destination: PreparedSnapshotV2MultiBlockDestination<()>| {
+            destination.commit(
+                |destination| Ok::<_, ((), std::convert::Infallible)>((destination, ())),
+                |_| Ok::<_, std::convert::Infallible>(()),
+            )
+        };
         let _abort = PreparedSnapshotV2MultiBlockRestoreBundle::abort;
         Self::prepare_native_v2_multi_block_restore_bundle_with(
             graph,
@@ -2843,7 +3048,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::env;
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{self, Write};
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use bangbang_runtime::block::DriveConfigInput;
@@ -3025,6 +3231,60 @@ mod tests {
                 .expect("profile-2 used cursor should write");
         }
         memory
+    }
+
+    fn direct_profile_2_process_bundle() -> (
+        PreparedSnapshotV2MultiBlockRestoreBundle,
+        TempRoot,
+        TempRoot,
+    ) {
+        let template = multi_fixture_graph(None, None);
+        let first_path = unique_short_path();
+        let second_path = unique_short_path();
+        let first = TempRoot::new_at(
+            first_path,
+            &vec![
+                0x61;
+                usize::try_from(template.records()[0].block().backing_bytes())
+                    .expect("fixture length should fit")
+            ],
+        );
+        let second = TempRoot::new_at(
+            second_path,
+            &vec![
+                0x62;
+                usize::try_from(template.records()[1].block().backing_bytes())
+                    .expect("fixture length should fit")
+            ],
+        );
+        let graph = multi_fixture_graph(Some(first.path()), Some(second.path()));
+        let memory = multi_restore_memory(&graph);
+        let prepared =
+            RequestedSnapshotRestoreResources::prepare_native_v2_multi_block_restore_bundle(
+                graph,
+                &memory,
+                Instant::now(),
+                None,
+                || false,
+            )
+            .expect("direct profile-2 process bundle should prepare");
+        (prepared, first, second)
+    }
+
+    #[derive(Debug)]
+    struct TestPrivateMultiBlockDestination {
+        bundle: Option<PreparedSnapshotV2MultiBlockBundle>,
+        destroyed: Rc<Cell<bool>>,
+    }
+
+    impl TestPrivateMultiBlockDestination {
+        fn destroy(mut self) -> Result<(), SnapshotV2MultiBlockCleanupError> {
+            self.destroyed.set(true);
+            match self.bundle.take() {
+                Some(bundle) => bundle.abort(),
+                None => Ok(()),
+            }
+        }
     }
 
     fn requested() -> RequestedSnapshotRestoreResources {
@@ -3509,13 +3769,187 @@ mod tests {
             assert!(!diagnostics.contains(private.as_ref()));
         }
 
-        let bundle = prepared
-            .commit()
+        let destination = prepared
+            .construct_destination(Ok::<_, std::convert::Infallible>)
+            .expect("private destination should construct before completion");
+        let (bundle, ()) = destination
+            .commit(
+                |bundle| {
+                    Ok::<_, (PreparedSnapshotV2MultiBlockBundle, std::convert::Infallible)>((
+                        bundle,
+                        (),
+                    ))
+                },
+                PreparedSnapshotV2MultiBlockBundle::abort,
+            )
             .expect("direct aggregate completion should commit");
         assert_eq!(bundle.drive_configs(), &expected_configs);
         bundle
             .abort()
             .expect("fresh Async generation should release cleanly");
+    }
+
+    #[test]
+    fn profile_2_destination_construction_failure_aborts_completion_and_runtime() {
+        let (prepared, _first, _second) = direct_profile_2_process_bundle();
+        let runtime = prepared
+            .bundle()
+            .and_then(PreparedSnapshotV2MultiBlockBundle::async_runtime)
+            .expect("mixed fixture should own one runtime")
+            .clone();
+        let error = prepared
+            .construct_destination(|bundle| {
+                bundle
+                    .abort()
+                    .expect("injected construction should release the runtime");
+                Err::<(), _>(io::Error::other("injected destination construction"))
+            })
+            .expect_err("injected destination construction should fail");
+        assert!(!error.is_terminal());
+        assert!(matches!(
+            error,
+            PreparedSnapshotV2MultiBlockDestinationConstructionError::Construction {
+                completion_abort: None,
+                ..
+            }
+        ));
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
+    }
+
+    #[test]
+    fn profile_2_invalid_destination_state_is_terminal() {
+        let invalid = PreparedSnapshotV2MultiBlockRestoreBundle {
+            bundle: None,
+            completion: None,
+        };
+        let error = invalid
+            .construct_destination(Ok::<_, std::convert::Infallible>)
+            .expect_err("consumed destination state must fail");
+        assert!(error.is_terminal());
+        assert!(matches!(
+            error,
+            PreparedSnapshotV2MultiBlockDestinationConstructionError::InvalidState {
+                bundle_cleanup: None
+            }
+        ));
+    }
+
+    #[test]
+    fn profile_2_controller_failure_destroys_destination_before_completion_abort() {
+        let (prepared, _first, _second) = direct_profile_2_process_bundle();
+        let runtime = prepared
+            .bundle()
+            .and_then(PreparedSnapshotV2MultiBlockBundle::async_runtime)
+            .expect("mixed fixture should own one runtime")
+            .clone();
+        let destroyed = Rc::new(Cell::new(false));
+        let destination = prepared
+            .construct_destination({
+                let destroyed = Rc::clone(&destroyed);
+                move |bundle| {
+                    Ok::<_, std::convert::Infallible>(TestPrivateMultiBlockDestination {
+                        bundle: Some(bundle),
+                        destroyed,
+                    })
+                }
+            })
+            .expect("private destination should construct");
+        let error = destination
+            .commit(
+                |destination| {
+                    Err::<(TestPrivateMultiBlockDestination, ()), _>((
+                        destination,
+                        io::Error::other("injected controller preparation"),
+                    ))
+                },
+                TestPrivateMultiBlockDestination::destroy,
+            )
+            .expect_err("injected controller preparation should fail");
+        assert!(destroyed.get());
+        assert!(!error.is_terminal());
+        assert!(matches!(
+            error,
+            PreparedSnapshotV2MultiBlockDestinationCommitError::Controller {
+                destination_cleanup: None,
+                completion_abort: None,
+                ..
+            }
+        ));
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
+    }
+
+    #[test]
+    fn profile_2_completion_failure_destroys_destination_and_is_terminal() {
+        let (mut prepared, _first, _second) = direct_profile_2_process_bundle();
+        prepared
+            .completion
+            .take()
+            .expect("direct completion should exist")
+            .abort()
+            .expect("direct completion should abort before injection");
+
+        let root = TempRoot::new("multi-completion", b"root");
+        let fixture = contained_restore_authority_for_test(root.path(), false);
+        let root_owner = contained_requested_root()
+            .prepare(Some(fixture.authority()), || false)
+            .expect("contained root should prepare")
+            .into_root()
+            .expect("contained root should take exactly");
+        let (backing, completion) = root_owner.into_parts();
+        drop(backing);
+        let PreparedSnapshotRootRestoreCompletion {
+            lease,
+            contained_transaction,
+        } = completion;
+        let PreparedSnapshotRootBackingLease {
+            selector: _,
+            claim,
+            consumed: _,
+        } = lease;
+        prepared.completion = Some(PreparedSnapshotDriveRestoreCompletion {
+            claims: claim.into_iter().collect(),
+            contained_transaction,
+        });
+
+        let runtime = prepared
+            .bundle()
+            .and_then(PreparedSnapshotV2MultiBlockBundle::async_runtime)
+            .expect("mixed fixture should own one runtime")
+            .clone();
+        let destroyed = Rc::new(Cell::new(false));
+        let destination = prepared
+            .construct_destination({
+                let destroyed = Rc::clone(&destroyed);
+                move |bundle| {
+                    Ok::<_, std::convert::Infallible>(TestPrivateMultiBlockDestination {
+                        bundle: Some(bundle),
+                        destroyed,
+                    })
+                }
+            })
+            .expect("private destination should construct");
+        fixture.invalidate_generation();
+        let error = destination
+            .commit(
+                |destination| {
+                    Ok::<_, (TestPrivateMultiBlockDestination, std::convert::Infallible)>((
+                        destination,
+                        (),
+                    ))
+                },
+                TestPrivateMultiBlockDestination::destroy,
+            )
+            .expect_err("stale contained completion should fail");
+        assert!(destroyed.get());
+        assert!(error.is_terminal());
+        assert!(matches!(
+            error,
+            PreparedSnapshotV2MultiBlockDestinationCommitError::Completion {
+                destination_cleanup: None,
+                ..
+            }
+        ));
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
     }
 
     #[test]

@@ -22,9 +22,9 @@ use bangbang_runtime::balloon::{
 };
 use bangbang_runtime::block::async_executor::{BlockAsyncRuntimeError, SharedBlockAsyncRuntime};
 use bangbang_runtime::block::{
-    BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, DriveConfig, DriveIoEngine,
-    DriveLiveUpdateMode, DriveRateLimiterConfig, DriveRuntimeMutationError, DriveUpdateError,
-    PreparedBlockDevice, RuntimeBlockDeviceResource, VIRTIO_BLOCK_DEVICE_ID,
+    BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, DriveConfig, DriveConfigs,
+    DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig, DriveRuntimeMutationError,
+    DriveUpdateError, PreparedBlockDevice, RuntimeBlockDeviceResource, VIRTIO_BLOCK_DEVICE_ID,
     VIRTIO_BLOCK_QUEUE_SIZES, VhostUserBlockConfigSignalError, VirtioBlockBackendKind,
     VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceNotificationError,
     VirtioBlockLiveUpdateError, VirtioBlockSnapshotPersistenceBinding,
@@ -66,6 +66,8 @@ use bangbang_runtime::metrics::{
 };
 use bangbang_runtime::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
+    MmioRegionRequest, MmioRegistrationError, MmioRegistrationLease, MmioRegistrationOwner,
+    MmioRegistrationReleaseError,
 };
 use bangbang_runtime::network::{
     NetworkDeviceProfile, NetworkInterfaceConfig, NetworkInterfaceUpdate,
@@ -102,7 +104,10 @@ use bangbang_runtime::snapshot_device_v2::{
     SnapshotV2RootTransportRestoreError,
 };
 use bangbang_runtime::snapshot_device_v2_5::{
-    NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
+    NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, PreparedSnapshotV2MultiBlockBundle,
+    PreparedSnapshotV2MultiBlockMmioBundle, PreparedSnapshotV2MultiBlockMmioRecord,
+    SnapshotV2MultiBlockCleanupError, SnapshotV2MultiBlockDeviceGraph,
+    SnapshotV2MultiBlockMmioTransportError,
 };
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
@@ -216,10 +221,15 @@ use crate::snapshot_v2::{
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
     HvfSnapshotV2PvTimeVcpuState, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
 };
+use crate::snapshot_v2_multi_block_platform::{
+    HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockPlatformPlanParts,
+    HvfSnapshotV2MultiBlockTransportPlan,
+};
 use crate::snapshot_v2_platform::{
-    HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2PlatformRestoreError,
-    HvfSnapshotV2PlatformShutdownError, HvfSnapshotV2RootResourcePlan,
-    HvfSnapshotV2RootTransportPlan, RestoredHvfSnapshotV2Platform,
+    HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2MultiBlockMmioShellPlan,
+    HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformShutdownError,
+    HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootTransportPlan, RestoredHvfSnapshotV2Platform,
+    restore_hvf_snapshot_v2_multi_block_mmio_process_platform,
     restore_hvf_snapshot_v2_root_process_platform,
 };
 use crate::topology::{HvfVcpuTopologyError, prepare_ordered_mpidrs};
@@ -3259,6 +3269,7 @@ pub struct OwnedHvfArm64BootSession {
     backend: HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    _restored_snapshot_v2_mmio_registrations: Option<HvfSnapshotV2MultiBlockMmioRegistrations>,
     restored_snapshot_v2_memory_binding: Option<SnapshotV2MemoryBinding>,
     restored_snapshot_v2_machine: Option<HvfSnapshotV2MachineState>,
     cpu_template_application: Option<crate::cpu_template::HvfArm64CpuTemplateApplicationState>,
@@ -3366,6 +3377,312 @@ impl fmt::Debug for RestoredHvfArm64BootSession {
             .field("profile", &"native-v1")
             .field("resources", &"<redacted>")
             .finish()
+    }
+}
+
+#[derive(Debug)]
+struct HvfSnapshotV2MultiBlockMmioRegistrations {
+    _owner: MmioRegistrationOwner,
+    _leases: Vec<MmioRegistrationLease>,
+}
+
+/// One complete, still-unpublished profile-2 MMIO destination and controller
+/// projection.
+pub struct RestoredHvfSnapshotV2MultiBlockMmioOwners {
+    session: OwnedHvfArm64BootSession,
+    drive_configs: DriveConfigs,
+}
+
+impl RestoredHvfSnapshotV2MultiBlockMmioOwners {
+    pub const fn session(&self) -> &OwnedHvfArm64BootSession {
+        &self.session
+    }
+
+    pub const fn drive_configs(&self) -> &DriveConfigs {
+        &self.drive_configs
+    }
+
+    pub fn into_parts(self) -> (OwnedHvfArm64BootSession, DriveConfigs) {
+        (self.session, self.drive_configs)
+    }
+}
+
+impl fmt::Debug for RestoredHvfSnapshotV2MultiBlockMmioOwners {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredHvfSnapshotV2MultiBlockMmioOwners")
+            .field("record_count", &self.drive_configs.as_slice().len())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Stage at which complete profile-2 MMIO owner reconstruction stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2MultiBlockMmioRestoreStage {
+    MemoryLayout,
+    Transport,
+    ResourcePlan,
+    Metrics,
+    Platform,
+    Registration { index: usize },
+    RetryScheduler,
+}
+
+/// Primary failure from complete profile-2 MMIO owner reconstruction.
+pub enum HvfSnapshotV2MultiBlockMmioRestoreFailure {
+    Allocation,
+    MemoryLayout,
+    Transport(SnapshotV2MultiBlockMmioTransportError),
+    ResourcePlan,
+    Metrics(BlockDeviceMetricsRegistryError),
+    Platform(Box<HvfSnapshotV2PlatformRestoreError>),
+    DispatcherUnavailable,
+    Registration(MmioRegistrationError),
+    RetryScheduler(io::ErrorKind),
+}
+
+impl fmt::Debug for HvfSnapshotV2MultiBlockMmioRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Allocation => "allocation",
+            Self::MemoryLayout => "memory-layout",
+            Self::Transport(_) => "transport",
+            Self::ResourcePlan => "resource-plan",
+            Self::Metrics(_) => "metrics",
+            Self::Platform(_) => "platform",
+            Self::DispatcherUnavailable => "dispatcher",
+            Self::Registration(_) => "registration",
+            Self::RetryScheduler(_) => "retry-scheduler",
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2MultiBlockMmioRestoreFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2MultiBlockMmioRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation => "profile-2 MMIO owner allocation failed",
+            Self::MemoryLayout => "restored memory layout is invalid",
+            Self::Transport(_) => "profile-2 MMIO transport reconstruction failed",
+            Self::ResourcePlan => "profile-2 MMIO resource plan diverged",
+            Self::Metrics(_) => "profile-2 MMIO metrics ownership failed",
+            Self::Platform(_) => "HVF platform reconstruction failed",
+            Self::DispatcherUnavailable => "profile-2 MMIO dispatcher is unavailable",
+            Self::Registration(_) => "profile-2 MMIO registration failed",
+            Self::RetryScheduler(kind) => {
+                return write!(formatter, "block retry scheduler startup failed: {kind:?}");
+            }
+        })
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2MultiBlockMmioRestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(source) => Some(source),
+            Self::Metrics(source) => Some(source),
+            Self::Platform(source) => Some(source.as_ref()),
+            Self::Registration(source) => Some(source),
+            Self::Allocation
+            | Self::MemoryLayout
+            | Self::ResourcePlan
+            | Self::DispatcherUnavailable
+            | Self::RetryScheduler(_) => None,
+        }
+    }
+}
+
+/// Cleanup uncertainty retained after profile-2 MMIO reconstruction failed.
+pub enum HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure {
+    PreparedBundle(SnapshotV2MultiBlockCleanupError),
+    RetryScheduler,
+    AsyncGuestMemory(HvfGuestMemoryMappingError),
+    Async(BlockAsyncRuntimeError),
+    DispatcherUnavailable,
+    Registration {
+        index: usize,
+        source: MmioRegistrationReleaseError,
+    },
+    Platform(HvfSnapshotV2PlatformShutdownError),
+}
+
+impl fmt::Debug for HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::PreparedBundle(_) => "prepared-bundle",
+            Self::RetryScheduler => "retry-scheduler",
+            Self::AsyncGuestMemory(_) => "async-guest-memory",
+            Self::Async(_) => "async-runtime",
+            Self::DispatcherUnavailable => "dispatcher",
+            Self::Registration { .. } => "registration",
+            Self::Platform(_) => "platform",
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PreparedBundle(_) => "prepared Async bundle cleanup failed",
+            Self::RetryScheduler => "retry scheduler cleanup failed",
+            Self::AsyncGuestMemory(_) => "Async cleanup could not borrow guest memory",
+            Self::Async(_) => "Async runtime cleanup failed",
+            Self::DispatcherUnavailable => "MMIO dispatcher cleanup was unavailable",
+            Self::Registration { .. } => "owned MMIO registration cleanup failed",
+            Self::Platform(_) => "HVF platform cleanup failed",
+        })
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PreparedBundle(source) => Some(source),
+            Self::AsyncGuestMemory(source) => Some(source),
+            Self::Async(source) => Some(source),
+            Self::Registration { source, .. } => Some(source),
+            Self::Platform(source) => Some(source),
+            Self::RetryScheduler | Self::DispatcherUnavailable => None,
+        }
+    }
+}
+
+/// Redacted profile-2 MMIO owner failure with ordered cleanup evidence.
+pub struct HvfSnapshotV2MultiBlockMmioRestoreError {
+    stage: HvfSnapshotV2MultiBlockMmioRestoreStage,
+    failure: Box<HvfSnapshotV2MultiBlockMmioRestoreFailure>,
+    cleanup: Vec<HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure>,
+}
+
+impl HvfSnapshotV2MultiBlockMmioRestoreError {
+    fn preflight(
+        stage: HvfSnapshotV2MultiBlockMmioRestoreStage,
+        failure: HvfSnapshotV2MultiBlockMmioRestoreFailure,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            cleanup: Vec::new(),
+        }
+    }
+
+    fn with_prepared_bundle_abort(
+        stage: HvfSnapshotV2MultiBlockMmioRestoreStage,
+        failure: HvfSnapshotV2MultiBlockMmioRestoreFailure,
+        bundle: PreparedSnapshotV2MultiBlockMmioBundle,
+    ) -> Self {
+        let cleanup = bundle
+            .abort()
+            .err()
+            .map(HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure::PreparedBundle)
+            .into_iter()
+            .collect();
+        Self {
+            stage,
+            failure: Box::new(failure),
+            cleanup,
+        }
+    }
+
+    fn platform(
+        source: HvfSnapshotV2PlatformRestoreError,
+        bundle: PreparedSnapshotV2MultiBlockMmioBundle,
+    ) -> Self {
+        Self::with_prepared_bundle_abort(
+            HvfSnapshotV2MultiBlockMmioRestoreStage::Platform,
+            HvfSnapshotV2MultiBlockMmioRestoreFailure::Platform(Box::new(source)),
+            bundle,
+        )
+    }
+
+    fn after_platform(
+        stage: HvfSnapshotV2MultiBlockMmioRestoreStage,
+        failure: HvfSnapshotV2MultiBlockMmioRestoreFailure,
+        cleanup: Vec<HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure>,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            cleanup,
+        }
+    }
+
+    pub const fn stage(&self) -> HvfSnapshotV2MultiBlockMmioRestoreStage {
+        self.stage
+    }
+
+    pub fn cleanup_failures(&self) -> &[HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure] {
+        &self.cleanup
+    }
+
+    pub fn has_incomplete_cleanup(&self) -> bool {
+        !self.cleanup.is_empty()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MultiBlockMmioRestoreFailure::Transport(source)
+                    if source.cleanup_failed()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MultiBlockMmioRestoreFailure::Platform(source)
+                    if !source.cleanup_failures().is_empty()
+            )
+    }
+
+    /// Returns whether retry safety cannot be proven.
+    pub fn is_terminal(&self) -> bool {
+        self.has_incomplete_cleanup()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2MultiBlockMmioRestoreFailure::Platform(source)
+                    if source.is_committed()
+            )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2MultiBlockMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2MultiBlockMmioRestoreError")
+            .field("stage", &self.stage)
+            .field("failure", &"<redacted>")
+            .field("cleanup_count", &self.cleanup.len())
+            .field("terminal", &self.is_terminal())
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2MultiBlockMmioRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "profile-2 MMIO owner reconstruction failed at {:?}: {}",
+            self.stage, self.failure
+        )?;
+        if !self.cleanup.is_empty() {
+            write!(
+                formatter,
+                "; {} cleanup failure(s) retained",
+                self.cleanup.len()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2MultiBlockMmioRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.failure.as_ref())
     }
 }
 
@@ -11029,6 +11346,159 @@ fn failed_snapshot_v2_root_after_platform(
     HvfSnapshotV2RootRestoreError::after_platform(stage, failure, cleanup)
 }
 
+fn validate_snapshot_v2_multi_block_mmio_resource_plan(
+    bundle: &PreparedSnapshotV2MultiBlockMmioBundle,
+    plan: &HvfSnapshotV2MultiBlockPlatformPlanParts,
+) -> bool {
+    let records = bundle.records();
+    let configs = bundle.drive_configs().as_slice();
+    let Some(planned_records) = plan.transport.mmio_records() else {
+        return false;
+    };
+    if records.is_empty()
+        || records.len() != configs.len()
+        || records.len() != planned_records.len()
+        || records.len() != plan.metrics_ids.len()
+        || records.len() != plan.retries.len()
+    {
+        return false;
+    }
+
+    let mut root_key = None;
+    for (index, ((((record, config), planned), retry), metrics_id)) in records
+        .iter()
+        .zip(configs)
+        .zip(planned_records)
+        .zip(&plan.retries)
+        .zip(&plan.metrics_ids)
+        .enumerate()
+    {
+        let async_binding_matches = match config.io_engine() {
+            Some(DriveIoEngine::Sync) => record.async_generation().is_none(),
+            Some(DriveIoEngine::Async) => record.async_generation().is_some(),
+            None => false,
+        };
+        if record.key() != planned.key()
+            || record.key() != retry.key()
+            || record.drive_id() != config.drive_id()
+            || record.drive_id() != metrics_id
+            || record.is_root_device() != config.is_root_device()
+            || record.region() != planned.region()
+            || record.interrupt_line() != planned.interrupt_line()
+            || record.retry() != retry.retry()
+            || record.retry_deadline().is_some()
+                == matches!(record.retry(), StorageRetryState::None)
+            || !async_binding_matches
+            || (record.is_root_device() && index != 0)
+        {
+            return false;
+        }
+        if record.is_root_device() && root_key.replace(record.key()).is_some() {
+            return false;
+        }
+    }
+
+    let earliest_retry_index = records
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            snapshot_v2_multi_block_retry_rank(record.retry()).map(|rank| (rank, index))
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, index)| index);
+    root_key == plan.root_key && earliest_retry_index == plan.earliest_retry_index
+}
+
+const fn snapshot_v2_multi_block_retry_rank(retry: StorageRetryState) -> Option<(u8, u64)> {
+    match retry {
+        StorageRetryState::None => None,
+        StorageRetryState::Immediate => Some((0, 0)),
+        StorageRetryState::After { remaining_nanos } => Some((1, remaining_nanos)),
+    }
+}
+
+struct HvfSnapshotV2MultiBlockMmioCleanup<'a> {
+    scheduler: &'a mut Option<HvfArm64BootLimiterRetryWakeupScheduler>,
+    async_runtime: Option<&'a SharedBlockAsyncRuntime>,
+    registration_owner: &'a MmioRegistrationOwner,
+    registration_leases: &'a [MmioRegistrationLease],
+    failures: Vec<HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure>,
+}
+
+fn failed_snapshot_v2_multi_block_mmio_after_platform(
+    mut platform: RestoredHvfSnapshotV2Platform,
+    stage: HvfSnapshotV2MultiBlockMmioRestoreStage,
+    failure: HvfSnapshotV2MultiBlockMmioRestoreFailure,
+    cleanup: HvfSnapshotV2MultiBlockMmioCleanup<'_>,
+) -> HvfSnapshotV2MultiBlockMmioRestoreError {
+    let HvfSnapshotV2MultiBlockMmioCleanup {
+        scheduler,
+        async_runtime,
+        registration_owner,
+        registration_leases,
+        failures: mut cleanup,
+    } = cleanup;
+    if scheduler
+        .as_mut()
+        .is_some_and(|scheduler| scheduler.stop_with_result().is_err())
+    {
+        cleanup.push(HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure::RetryScheduler);
+    }
+    drop(scheduler.take());
+
+    if let Some(runtime) = async_runtime {
+        let needs_memory = match runtime.shutdown_if_idle() {
+            Ok(idle) => !idle,
+            Err(source) => {
+                cleanup.push(HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure::Async(
+                    source,
+                ));
+                true
+            }
+        };
+        if needs_memory {
+            match platform.guest_memory_mut() {
+                Ok(memory) => {
+                    if let Err(source) = runtime.shutdown(memory) {
+                        cleanup.push(HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure::Async(
+                            source,
+                        ));
+                    }
+                }
+                Err(source) => cleanup.push(
+                    HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure::AsyncGuestMemory(source),
+                ),
+            }
+        }
+    }
+
+    match platform.mmio_dispatcher().lock() {
+        Ok(mut dispatcher) => {
+            for (index, lease) in registration_leases.iter().enumerate().rev() {
+                if let Err(source) = dispatcher.release_owned_handler(registration_owner, lease) {
+                    cleanup.push(
+                        HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure::Registration {
+                            index,
+                            source,
+                        },
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            cleanup.push(HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure::DispatcherUnavailable)
+        }
+    }
+
+    if let Err(source) = platform.shutdown() {
+        cleanup.push(HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure::Platform(
+            source,
+        ));
+    }
+
+    HvfSnapshotV2MultiBlockMmioRestoreError::after_platform(stage, failure, cleanup)
+}
+
 fn failed_snapshot_v1_restore(
     stage: HvfSnapshotV1RestoreStage,
     failure: HvfSnapshotV1RestoreFailure,
@@ -11118,6 +11588,7 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            _restored_snapshot_v2_mmio_registrations: None,
             restored_snapshot_v2_memory_binding: None,
             restored_snapshot_v2_machine: None,
             cpu_template_application: prepared.cpu_template_application,
@@ -11382,6 +11853,7 @@ impl OwnedHvfArm64BootSession {
             backend: parts.backend,
             mmio_dispatcher: parts.mmio_dispatcher,
             runtime_resources,
+            _restored_snapshot_v2_mmio_registrations: None,
             restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
@@ -11420,6 +11892,377 @@ impl OwnedHvfArm64BootSession {
             vmgenid_interrupt_line,
             vmclock_interrupt_line,
             boot_registers: None,
+        })
+    }
+
+    /// Reconstructs one exact profile-2 MMIO vector without publishing a
+    /// process session or controller.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_multi_block_mmio(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2DefaultProcessShell,
+        bundle: PreparedSnapshotV2MultiBlockBundle,
+        plan: HvfSnapshotV2MultiBlockPlatformPlan,
+    ) -> Result<RestoredHvfSnapshotV2MultiBlockMmioOwners, HvfSnapshotV2MultiBlockMmioRestoreError>
+    {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(memory.regions().len())
+            .map_err(|_| {
+                HvfSnapshotV2MultiBlockMmioRestoreError::preflight(
+                    HvfSnapshotV2MultiBlockMmioRestoreStage::MemoryLayout,
+                    HvfSnapshotV2MultiBlockMmioRestoreFailure::Allocation,
+                )
+            })?;
+        ranges.extend(memory.regions().iter().map(|region| region.range()));
+        let layout = GuestMemoryLayout::new(ranges).map_err(|_| {
+            HvfSnapshotV2MultiBlockMmioRestoreError::preflight(
+                HvfSnapshotV2MultiBlockMmioRestoreStage::MemoryLayout,
+                HvfSnapshotV2MultiBlockMmioRestoreFailure::MemoryLayout,
+            )
+        })?;
+        let source_fdt = state.machine().fdt();
+        let retained_fdt = Arm64FdtGuestMemoryWrite {
+            address: source_fdt.address(),
+            size: usize::try_from(source_fdt.size()).map_err(|_| {
+                HvfSnapshotV2MultiBlockMmioRestoreError::preflight(
+                    HvfSnapshotV2MultiBlockMmioRestoreStage::MemoryLayout,
+                    HvfSnapshotV2MultiBlockMmioRestoreFailure::Allocation,
+                )
+            })?,
+        };
+        let prepared = bundle.prepare_mmio_transport().map_err(|source| {
+            HvfSnapshotV2MultiBlockMmioRestoreError::preflight(
+                HvfSnapshotV2MultiBlockMmioRestoreStage::Transport,
+                HvfSnapshotV2MultiBlockMmioRestoreFailure::Transport(source),
+            )
+        })?;
+        let plan = plan.into_parts();
+        if !validate_snapshot_v2_multi_block_mmio_resource_plan(&prepared, &plan) {
+            return Err(
+                HvfSnapshotV2MultiBlockMmioRestoreError::with_prepared_bundle_abort(
+                    HvfSnapshotV2MultiBlockMmioRestoreStage::ResourcePlan,
+                    HvfSnapshotV2MultiBlockMmioRestoreFailure::ResourcePlan,
+                    prepared,
+                ),
+            );
+        }
+
+        let HvfSnapshotV2MultiBlockPlatformPlanParts {
+            root_key: _,
+            command_line,
+            metrics_ids,
+            retries: _,
+            earliest_retry_index: _,
+            transport,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        } = plan;
+        let HvfSnapshotV2MultiBlockTransportPlan::Mmio(planned_records) = transport else {
+            return Err(
+                HvfSnapshotV2MultiBlockMmioRestoreError::with_prepared_bundle_abort(
+                    HvfSnapshotV2MultiBlockMmioRestoreStage::ResourcePlan,
+                    HvfSnapshotV2MultiBlockMmioRestoreFailure::ResourcePlan,
+                    prepared,
+                ),
+            );
+        };
+        let record_count = prepared.records().len();
+        let earliest_retry_deadline = prepared
+            .records()
+            .iter()
+            .filter_map(PreparedSnapshotV2MultiBlockMmioRecord::retry_deadline)
+            .min();
+        let block_device_metrics =
+            match SharedBlockDeviceMetricsRegistry::from_owned_drive_ids_with_capacity(
+                metrics_ids,
+                record_count,
+            ) {
+                Ok(metrics) => metrics,
+                Err(source) => {
+                    return Err(
+                        HvfSnapshotV2MultiBlockMmioRestoreError::with_prepared_bundle_abort(
+                            HvfSnapshotV2MultiBlockMmioRestoreStage::Metrics,
+                            HvfSnapshotV2MultiBlockMmioRestoreFailure::Metrics(source),
+                            prepared,
+                        ),
+                    );
+                }
+            };
+        let mut block_devices = Vec::new();
+        if block_devices.try_reserve_exact(record_count).is_err() {
+            return Err(
+                HvfSnapshotV2MultiBlockMmioRestoreError::with_prepared_bundle_abort(
+                    HvfSnapshotV2MultiBlockMmioRestoreStage::ResourcePlan,
+                    HvfSnapshotV2MultiBlockMmioRestoreFailure::Allocation,
+                    prepared,
+                ),
+            );
+        }
+        let mut block_interrupt_lines = Vec::new();
+        if block_interrupt_lines
+            .try_reserve_exact(record_count)
+            .is_err()
+        {
+            return Err(
+                HvfSnapshotV2MultiBlockMmioRestoreError::with_prepared_bundle_abort(
+                    HvfSnapshotV2MultiBlockMmioRestoreStage::ResourcePlan,
+                    HvfSnapshotV2MultiBlockMmioRestoreFailure::Allocation,
+                    prepared,
+                ),
+            );
+        }
+        let mut registration_leases = Vec::new();
+        if registration_leases.try_reserve_exact(record_count).is_err() {
+            return Err(
+                HvfSnapshotV2MultiBlockMmioRestoreError::with_prepared_bundle_abort(
+                    HvfSnapshotV2MultiBlockMmioRestoreStage::ResourcePlan,
+                    HvfSnapshotV2MultiBlockMmioRestoreFailure::Allocation,
+                    prepared,
+                ),
+            );
+        }
+        let mut cleanup = Vec::new();
+        if cleanup
+            .try_reserve_exact(record_count.saturating_add(5))
+            .is_err()
+        {
+            return Err(
+                HvfSnapshotV2MultiBlockMmioRestoreError::with_prepared_bundle_abort(
+                    HvfSnapshotV2MultiBlockMmioRestoreStage::ResourcePlan,
+                    HvfSnapshotV2MultiBlockMmioRestoreFailure::Allocation,
+                    prepared,
+                ),
+            );
+        }
+
+        let shell_plan = HvfSnapshotV2MultiBlockMmioShellPlan {
+            command_line: &command_line,
+            records: &planned_records,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        };
+        let platform = match restore_hvf_snapshot_v2_multi_block_mmio_process_platform(
+            state,
+            memory,
+            process_shell,
+            shell_plan,
+        ) {
+            Ok(platform) => platform,
+            Err(source) => {
+                return Err(HvfSnapshotV2MultiBlockMmioRestoreError::platform(
+                    source, prepared,
+                ));
+            }
+        };
+        let (drive_configs, records, async_runtime, async_generations) = prepared.into_parts();
+        debug_assert_eq!(
+            async_generations.len(),
+            records
+                .iter()
+                .filter(|record| record.async_generation().is_some())
+                .count()
+        );
+        drop(async_generations);
+
+        let registration_owner = MmioRegistrationOwner::new();
+        let install_result = (|| {
+            for (index, (record, planned)) in records.into_iter().zip(planned_records).enumerate() {
+                let (
+                    _key,
+                    drive_id,
+                    _is_root_device,
+                    _retry,
+                    _retry_deadline,
+                    region,
+                    interrupt_line,
+                    _async_generation,
+                    handler,
+                ) = record.into_parts();
+                let request = [MmioRegionRequest::new(
+                    region.range().start(),
+                    region.range().size(),
+                )];
+                let lease = {
+                    let mut dispatcher = platform.mmio_dispatcher().lock().map_err(|_| {
+                        (
+                            HvfSnapshotV2MultiBlockMmioRestoreStage::Registration { index },
+                            HvfSnapshotV2MultiBlockMmioRestoreFailure::DispatcherUnavailable,
+                        )
+                    })?;
+                    dispatcher
+                        .register_owned_handler(&registration_owner, region.id(), &request, handler)
+                        .map_err(|source| {
+                            (
+                                HvfSnapshotV2MultiBlockMmioRestoreStage::Registration { index },
+                                HvfSnapshotV2MultiBlockMmioRestoreFailure::Registration(source),
+                            )
+                        })?
+                };
+                registration_leases.push(lease);
+                if registration_leases.last().is_none_or(|lease| {
+                    lease.region_id() != region.id() || lease.regions() != [region]
+                }) {
+                    return Err((
+                        HvfSnapshotV2MultiBlockMmioRestoreStage::Registration { index },
+                        HvfSnapshotV2MultiBlockMmioRestoreFailure::ResourcePlan,
+                    ));
+                }
+                block_devices.push(Arm64BootBlockDevice {
+                    registration: BlockMmioDeviceRegistration::from_restored(
+                        index, drive_id, region,
+                    ),
+                    fdt_device: planned.fdt_device(),
+                });
+                block_interrupt_lines.push(interrupt_line);
+            }
+            Ok(())
+        })();
+        let mut block_retry_wakeup_scheduler = None;
+        if let Err((stage, failure)) = install_result {
+            return Err(failed_snapshot_v2_multi_block_mmio_after_platform(
+                platform,
+                stage,
+                failure,
+                HvfSnapshotV2MultiBlockMmioCleanup {
+                    scheduler: &mut block_retry_wakeup_scheduler,
+                    async_runtime: async_runtime.as_ref(),
+                    registration_owner: &registration_owner,
+                    registration_leases: &registration_leases,
+                    failures: cleanup,
+                },
+            ));
+        }
+
+        let block_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let vcpu_control = platform.control();
+        block_retry_wakeup_scheduler =
+            match HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                BLOCK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                block_retry_wakeup.clone(),
+                move || vcpu_control.request_wakeup(),
+            ) {
+                Ok(scheduler) => Some(scheduler),
+                Err(source) => {
+                    return Err(failed_snapshot_v2_multi_block_mmio_after_platform(
+                        platform,
+                        HvfSnapshotV2MultiBlockMmioRestoreStage::RetryScheduler,
+                        HvfSnapshotV2MultiBlockMmioRestoreFailure::RetryScheduler(source.kind()),
+                        HvfSnapshotV2MultiBlockMmioCleanup {
+                            scheduler: &mut block_retry_wakeup_scheduler,
+                            async_runtime: async_runtime.as_ref(),
+                            registration_owner: &registration_owner,
+                            registration_leases: &registration_leases,
+                            failures: cleanup,
+                        },
+                    ));
+                }
+            };
+        let Some(block_retry_wakeup_scheduler) = block_retry_wakeup_scheduler.take() else {
+            std::process::abort();
+        };
+        block_retry_wakeup_scheduler.schedule_deadline(earliest_retry_deadline);
+
+        let parts = platform.into_parts();
+        let machine_config = parts.machine.machine();
+        let cpu_template_application = parts.machine.cpu_template().cloned();
+        let cache_source = crate::vcpu_config::HvfArm64VcpuCacheFdtSource::new(
+            parts.compatibility.identification().id_aa64mmfr2_el1(),
+            parts.compatibility.cache_manifest(),
+        );
+        let gic = parts.compatibility.gic_metadata();
+        let serial_interrupt_line = parts
+            .serial_device
+            .as_ref()
+            .map(|device| device.fdt_device.interrupt_line);
+        let vmgenid_interrupt_line = parts.vmgenid_device.fdt_device.interrupt_line;
+        let vmclock_interrupt_line = parts.vmclock_device.fdt_device.interrupt_line;
+        let runtime_resources = Arm64BootRuntimeResources {
+            machine_config,
+            layout,
+            boot_origin: None,
+            retained_fdt: Some(retained_fdt),
+            rtc_device: Some(parts.rtc_device),
+            serial_device: parts.serial_device,
+            vmgenid_device: parts.vmgenid_device,
+            vmclock_device: parts.vmclock_device,
+            pvtime_state: Arm64BootPvTimeState::restored(parts.pvtime_layout),
+            block_devices,
+            block_async_runtime: async_runtime.unwrap_or_default(),
+            pci_block_devices: Vec::new(),
+            pmem_devices: Vec::new(),
+            pmem_mmio_devices: Vec::new(),
+            network_devices: Vec::new(),
+            pci_network_devices: Vec::new(),
+            vsock_device: None,
+            pci_vsock_device: None,
+            balloon_device: None,
+            pci_balloon_device: None,
+            memory_hotplug_device: None,
+            pci_memory_hotplug_device: None,
+            entropy_device: None,
+            pci_entropy_device: None,
+            pci_validation: None,
+        };
+        let pmem_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let session = Self {
+            runner: parts.runner,
+            backend: parts.backend,
+            mmio_dispatcher: parts.mmio_dispatcher,
+            runtime_resources,
+            _restored_snapshot_v2_mmio_registrations: Some(
+                HvfSnapshotV2MultiBlockMmioRegistrations {
+                    _owner: registration_owner,
+                    _leases: registration_leases,
+                },
+            ),
+            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            restored_snapshot_v2_machine: Some(parts.machine),
+            cpu_template_application,
+            pci_validation_endpoint: None,
+            pci_data_devices: None,
+            cache_source,
+            cache_hierarchy: None,
+            control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
+            run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
+            block_retry_wakeup,
+            block_retry_wakeup_scheduler,
+            pmem_retry_wakeup,
+            pmem_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            network_retry_wakeup,
+            network_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            entropy_retry_wakeup,
+            entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            entropy_source: VirtioRngOsEntropySource::new(),
+            block_device_metrics,
+            pmem_device_metrics: SharedPmemDeviceMetricsRegistry::default(),
+            balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+            memory_hotplug_device_metrics: None,
+            network_interface_metrics: SharedNetworkInterfaceMetricsRegistry::default(),
+            vsock_device_metrics: SharedVsockDeviceMetrics::default(),
+            entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
+            gic,
+            block_interrupt_lines,
+            pmem_interrupt_lines: Vec::new(),
+            network_interrupt_lines: Vec::new(),
+            vsock_interrupt_line: None,
+            balloon_interrupt_line: None,
+            entropy_interrupt_line: None,
+            memory_hotplug_interrupt_line: None,
+            serial_interrupt_line,
+            serial_input: None,
+            vmgenid_interrupt_line,
+            vmclock_interrupt_line,
+            boot_registers: None,
+        };
+        Ok(RestoredHvfSnapshotV2MultiBlockMmioOwners {
+            session,
+            drive_configs,
         })
     }
 
@@ -11717,6 +12560,7 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher,
             runtime_resources,
+            _restored_snapshot_v2_mmio_registrations: None,
             restored_snapshot_v2_memory_binding: None,
             restored_snapshot_v2_machine: None,
             cpu_template_application: None,
@@ -31416,6 +32260,47 @@ mod tests {
         assert!(cleanup_debug.contains("<redacted>"));
         for diagnostics in [debug, incomplete.to_string(), cleanup_debug] {
             assert!(!diagnostics.contains("secret-primary"));
+            assert!(!diagnostics.contains("secret-cleanup"));
+        }
+    }
+
+    #[test]
+    fn native_v2_multi_block_mmio_errors_preserve_terminality_and_redact_cleanup() {
+        let retryable = super::HvfSnapshotV2MultiBlockMmioRestoreError::preflight(
+            super::HvfSnapshotV2MultiBlockMmioRestoreStage::ResourcePlan,
+            super::HvfSnapshotV2MultiBlockMmioRestoreFailure::ResourcePlan,
+        );
+        assert!(!retryable.has_incomplete_cleanup());
+        assert!(!retryable.is_terminal());
+
+        let clean_rollback = super::HvfSnapshotV2MultiBlockMmioRestoreError::after_platform(
+            super::HvfSnapshotV2MultiBlockMmioRestoreStage::Registration { index: 1 },
+            super::HvfSnapshotV2MultiBlockMmioRestoreFailure::ResourcePlan,
+            Vec::new(),
+        );
+        assert!(!clean_rollback.has_incomplete_cleanup());
+        assert!(!clean_rollback.is_terminal());
+
+        let incomplete = super::HvfSnapshotV2MultiBlockMmioRestoreError::after_platform(
+            super::HvfSnapshotV2MultiBlockMmioRestoreStage::RetryScheduler,
+            super::HvfSnapshotV2MultiBlockMmioRestoreFailure::RetryScheduler(
+                io::ErrorKind::PermissionDenied,
+            ),
+            vec![
+                super::HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure::Platform(
+                    crate::snapshot_v2_platform::HvfSnapshotV2PlatformShutdownError::Backend(
+                        super::BackendError::Hypervisor("secret-cleanup/path".to_string()),
+                    ),
+                ),
+            ],
+        );
+        assert!(incomplete.has_incomplete_cleanup());
+        assert!(incomplete.is_terminal());
+        let debug = format!("{incomplete:?}");
+        let cleanup_debug = format!("{:?}", incomplete.cleanup_failures());
+        assert!(debug.contains("<redacted>"));
+        assert!(cleanup_debug.contains("<redacted>"));
+        for diagnostics in [debug, incomplete.to_string(), cleanup_debug] {
             assert!(!diagnostics.contains("secret-cleanup"));
         }
     }

@@ -317,6 +317,18 @@ pub struct HvfSnapshotV2MultiBlockPlatformPlan {
     vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2MultiBlockPlatformPlanParts {
+    pub(crate) root_key: Option<SnapshotV2DeviceKey>,
+    pub(crate) command_line: String,
+    pub(crate) metrics_ids: Vec<String>,
+    pub(crate) retries: Vec<HvfSnapshotV2MultiBlockRetryPlan>,
+    pub(crate) earliest_retry_index: Option<usize>,
+    pub(crate) transport: HvfSnapshotV2MultiBlockTransportPlan,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 impl HvfSnapshotV2MultiBlockPlatformPlan {
     /// Returns the optional root graph key.
     pub const fn root_key(&self) -> Option<SnapshotV2DeviceKey> {
@@ -362,6 +374,20 @@ impl HvfSnapshotV2MultiBlockPlatformPlan {
     /// Returns the canonical VMClock SPI.
     pub const fn vmclock_interrupt(&self) -> GuestInterruptLine {
         self.vmclock_interrupt
+    }
+
+    pub(crate) fn into_parts(self) -> HvfSnapshotV2MultiBlockPlatformPlanParts {
+        HvfSnapshotV2MultiBlockPlatformPlanParts {
+            root_key: self.root_key,
+            command_line: self.command_line,
+            metrics_ids: self.metrics_ids,
+            retries: self.retries,
+            earliest_retry_index: self.earliest_retry_index,
+            transport: self.transport,
+            serial_interrupt: self.serial_interrupt,
+            vmgenid_interrupt: self.vmgenid_interrupt,
+            vmclock_interrupt: self.vmclock_interrupt,
+        }
     }
 }
 
@@ -994,7 +1020,7 @@ impl PlatformPlanReserve for SystemPlatformPlanReserve {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs::{self, OpenOptions};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1352,6 +1378,21 @@ mod tests {
             crate::snapshot_v2_platform::tests::mmio_root_plan_fixture();
         drop(root);
         rebuild_product_platform(platform, record_count, None, true)
+    }
+
+    pub(crate) fn mmio_fdt_plan_fixture() -> (
+        HvfSnapshotV2PlatformState,
+        HvfSnapshotV2MultiBlockPlatformPlan,
+    ) {
+        let fixture = bundle_from_graph(fixture_graph(SnapshotV2DeviceTransportKind::Mmio, false));
+        let platform = product_mmio_platform(fixture.bundle.records().len());
+        let plan = prepare_hvf_snapshot_v2_multi_block_platform_plan(
+            &platform,
+            &fixture.bundle,
+            mmio_process(),
+        )
+        .expect("multi-block MMIO FDT plan should validate");
+        (platform, plan)
     }
 
     fn product_pci_platform() -> HvfSnapshotV2PlatformState {

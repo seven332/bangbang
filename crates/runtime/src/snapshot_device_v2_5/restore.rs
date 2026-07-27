@@ -11,11 +11,15 @@ use crate::block::async_executor::{
 use crate::block::{
     PreparedBlockDevice, PreparedSnapshotBlockDeviceError, PreparedSnapshotBlockDeviceParts,
     VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace,
-    VirtioBlockQueue, VirtioBlockRateLimiter, VirtioBlockRateLimiterState,
-    VirtioBlockTokenBucketState,
+    VirtioBlockMmioHandler, VirtioBlockQueue, VirtioBlockRateLimiter, VirtioBlockRateLimiterState,
+    VirtioBlockTokenBucketState, restore_prepared_block_mmio_handler,
 };
+use crate::interrupt::GuestInterruptLine;
 use crate::memory::GuestMemory;
-use crate::snapshot_device_v2::SnapshotV2BlockBucketState;
+use crate::mmio::MmioRegion;
+use crate::snapshot_device_v2::{
+    SnapshotV2BlockBucketState, SnapshotV2RootTransportRestoreError, restore_mmio_transport_state,
+};
 use crate::virtio_mmio::VirtioMmioQueueState;
 
 /// Complete pure destination proof for one detached profile-2 graph.
@@ -443,6 +447,235 @@ impl fmt::Debug for PreparedSnapshotV2MultiBlockRecord {
     }
 }
 
+/// One exact profile-2 MMIO handler prepared before live bus construction.
+pub struct PreparedSnapshotV2MultiBlockMmioRecord {
+    key: SnapshotV2DeviceKey,
+    drive_id: String,
+    is_root_device: bool,
+    retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+    async_generation: Option<BlockAsyncDriveGeneration>,
+    handler: VirtioBlockMmioHandler,
+}
+
+impl PreparedSnapshotV2MultiBlockMmioRecord {
+    pub const fn key(&self) -> SnapshotV2DeviceKey {
+        self.key
+    }
+
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    pub const fn is_root_device(&self) -> bool {
+        self.is_root_device
+    }
+
+    pub const fn retry(&self) -> StorageRetryState {
+        self.retry
+    }
+
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn interrupt_line(&self) -> GuestInterruptLine {
+        self.interrupt_line
+    }
+
+    pub const fn async_generation(&self) -> Option<BlockAsyncDriveGeneration> {
+        self.async_generation
+    }
+
+    /// Consumes the still-unpublished exact handler and its owner metadata.
+    pub fn into_parts(
+        self,
+    ) -> (
+        SnapshotV2DeviceKey,
+        String,
+        bool,
+        StorageRetryState,
+        Option<Instant>,
+        MmioRegion,
+        GuestInterruptLine,
+        Option<BlockAsyncDriveGeneration>,
+        VirtioBlockMmioHandler,
+    ) {
+        (
+            self.key,
+            self.drive_id,
+            self.is_root_device,
+            self.retry,
+            self.retry_deadline,
+            self.region,
+            self.interrupt_line,
+            self.async_generation,
+            self.handler,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MultiBlockMmioRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MultiBlockMmioRecord")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Move-only exact profile-2 MMIO vector awaiting one private dispatcher.
+pub struct PreparedSnapshotV2MultiBlockMmioBundle {
+    drive_configs: DriveConfigs,
+    records: Vec<PreparedSnapshotV2MultiBlockMmioRecord>,
+    async_runtime: Option<SharedBlockAsyncRuntime>,
+    async_generations: Vec<BlockAsyncDriveGeneration>,
+}
+
+impl PreparedSnapshotV2MultiBlockMmioBundle {
+    pub const fn drive_configs(&self) -> &DriveConfigs {
+        &self.drive_configs
+    }
+
+    pub fn records(&self) -> &[PreparedSnapshotV2MultiBlockMmioRecord] {
+        &self.records
+    }
+
+    pub const fn async_runtime(&self) -> Option<&SharedBlockAsyncRuntime> {
+        self.async_runtime.as_ref()
+    }
+
+    /// Transfers every exact handler, generation owner, and controller value.
+    pub fn into_parts(
+        mut self,
+    ) -> (
+        DriveConfigs,
+        Vec<PreparedSnapshotV2MultiBlockMmioRecord>,
+        Option<SharedBlockAsyncRuntime>,
+        Vec<BlockAsyncDriveGeneration>,
+    ) {
+        (
+            std::mem::take(&mut self.drive_configs),
+            std::mem::take(&mut self.records),
+            self.async_runtime.take(),
+            std::mem::take(&mut self.async_generations),
+        )
+    }
+
+    /// Explicitly releases every transferred fresh Async generation.
+    pub fn abort(mut self) -> Result<(), SnapshotV2MultiBlockCleanupError> {
+        let result =
+            cleanup_async_generations(self.async_runtime.as_ref(), &self.async_generations);
+        self.async_generations.clear();
+        self.async_runtime = None;
+        result
+    }
+}
+
+impl Drop for PreparedSnapshotV2MultiBlockMmioBundle {
+    fn drop(&mut self) {
+        let _ = cleanup_async_generations(self.async_runtime.as_ref(), &self.async_generations);
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MultiBlockMmioBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MultiBlockMmioBundle")
+            .field("record_count", &self.records.len())
+            .field("has_async_runtime", &self.async_runtime.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+enum SnapshotV2MultiBlockMmioTransportErrorKind {
+    TransportPolicy,
+    Allocation,
+    AsyncBinding,
+    Transport(SnapshotV2RootTransportRestoreError),
+}
+
+/// Redacted failure while consuming profile-2 devices into exact MMIO handlers.
+pub struct SnapshotV2MultiBlockMmioTransportError {
+    kind: SnapshotV2MultiBlockMmioTransportErrorKind,
+    cleanup: Option<SnapshotV2MultiBlockCleanupError>,
+}
+
+impl SnapshotV2MultiBlockMmioTransportError {
+    fn new(
+        kind: SnapshotV2MultiBlockMmioTransportErrorKind,
+        cleanup: Option<SnapshotV2MultiBlockCleanupError>,
+    ) -> Self {
+        Self { kind, cleanup }
+    }
+
+    pub const fn cleanup_failed(&self) -> bool {
+        self.cleanup.is_some()
+    }
+}
+
+impl fmt::Debug for SnapshotV2MultiBlockMmioTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind {
+            SnapshotV2MultiBlockMmioTransportErrorKind::TransportPolicy => "transport-policy",
+            SnapshotV2MultiBlockMmioTransportErrorKind::Allocation => "allocation",
+            SnapshotV2MultiBlockMmioTransportErrorKind::AsyncBinding => "async-binding",
+            SnapshotV2MultiBlockMmioTransportErrorKind::Transport(_) => "transport",
+        };
+        formatter
+            .debug_struct("SnapshotV2MultiBlockMmioTransportError")
+            .field("kind", &kind)
+            .field("cleanup_failed", &self.cleanup_failed())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2MultiBlockMmioTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.kind {
+            SnapshotV2MultiBlockMmioTransportErrorKind::TransportPolicy => {
+                "snapshot multi-block MMIO transport policy is invalid"
+            }
+            SnapshotV2MultiBlockMmioTransportErrorKind::Allocation => {
+                "snapshot multi-block MMIO transport allocation failed"
+            }
+            SnapshotV2MultiBlockMmioTransportErrorKind::AsyncBinding => {
+                "snapshot multi-block MMIO Async ownership is invalid"
+            }
+            SnapshotV2MultiBlockMmioTransportErrorKind::Transport(_) => {
+                "snapshot multi-block MMIO handler reconstruction failed"
+            }
+        })?;
+        if self.cleanup_failed() {
+            formatter.write_str("; Async cleanup also failed")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SnapshotV2MultiBlockMmioTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            SnapshotV2MultiBlockMmioTransportErrorKind::Transport(source) => Some(source),
+            SnapshotV2MultiBlockMmioTransportErrorKind::TransportPolicy
+            | SnapshotV2MultiBlockMmioTransportErrorKind::Allocation
+            | SnapshotV2MultiBlockMmioTransportErrorKind::AsyncBinding => self
+                .cleanup
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+        }
+    }
+}
+
 /// Host-time projection of one record retry disposition.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotV2MultiBlockRetryProjection {
@@ -511,6 +744,112 @@ impl PreparedSnapshotV2MultiBlockBundle {
 
     pub fn retry_projection(&self) -> &[SnapshotV2MultiBlockRetryProjection] {
         &self.retry_projection
+    }
+
+    /// Reconstructs the complete exact MMIO vector without publishing a bus.
+    pub fn prepare_mmio_transport(
+        mut self,
+    ) -> Result<PreparedSnapshotV2MultiBlockMmioBundle, SnapshotV2MultiBlockMmioTransportError>
+    {
+        let mut async_generations = Vec::new();
+        if async_generations
+            .try_reserve_exact(self.records.len())
+            .is_err()
+        {
+            return Err(
+                self.mmio_transport_error(SnapshotV2MultiBlockMmioTransportErrorKind::Allocation)
+            );
+        }
+        if !validate_mmio_async_ownership(
+            &self.records,
+            self.async_runtime.as_ref(),
+            &mut async_generations,
+        ) {
+            return Err(
+                self.mmio_transport_error(SnapshotV2MultiBlockMmioTransportErrorKind::AsyncBinding)
+            );
+        }
+        if self
+            .records
+            .iter()
+            .any(|record| !matches!(record.transport, SnapshotV2DeviceTransport::Mmio(_)))
+        {
+            return Err(self.mmio_transport_error(
+                SnapshotV2MultiBlockMmioTransportErrorKind::TransportPolicy,
+            ));
+        }
+
+        let mut prepared = Vec::new();
+        if prepared.try_reserve_exact(self.records.len()).is_err() {
+            return Err(
+                self.mmio_transport_error(SnapshotV2MultiBlockMmioTransportErrorKind::Allocation)
+            );
+        }
+
+        let drive_configs = std::mem::take(&mut self.drive_configs);
+        let records = std::mem::take(&mut self.records);
+        let async_runtime = self.async_runtime.take();
+        self.retry_projection.clear();
+        let result = (|| {
+            for record in records {
+                let PreparedSnapshotV2MultiBlockRecord {
+                    key,
+                    queue_ranges: _,
+                    retry,
+                    retry_deadline,
+                    virtio,
+                    transport,
+                    async_generation,
+                    device,
+                } = record;
+                let SnapshotV2DeviceTransport::Mmio(mmio) = transport else {
+                    return Err(SnapshotV2MultiBlockMmioTransportErrorKind::TransportPolicy);
+                };
+                let retained = restore_mmio_transport_state(&virtio, &mmio)
+                    .map_err(SnapshotV2MultiBlockMmioTransportErrorKind::Transport)?;
+                let (drive_id, is_root_device, config_space, device) = device.into_parts();
+                let handler = restore_prepared_block_mmio_handler(config_space, device, &retained)
+                    .map_err(|source| {
+                        SnapshotV2MultiBlockMmioTransportErrorKind::Transport(
+                            SnapshotV2RootTransportRestoreError::Mmio(source),
+                        )
+                    })?;
+                prepared.push(PreparedSnapshotV2MultiBlockMmioRecord {
+                    key,
+                    drive_id,
+                    is_root_device,
+                    retry,
+                    retry_deadline,
+                    region: mmio.region(),
+                    interrupt_line: mmio.interrupt_line(),
+                    async_generation,
+                    handler,
+                });
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(PreparedSnapshotV2MultiBlockMmioBundle {
+                drive_configs,
+                records: prepared,
+                async_runtime,
+                async_generations,
+            }),
+            Err(kind) => {
+                drop(prepared);
+                let cleanup =
+                    cleanup_async_generations(async_runtime.as_ref(), &async_generations).err();
+                Err(SnapshotV2MultiBlockMmioTransportError::new(kind, cleanup))
+            }
+        }
+    }
+
+    fn mmio_transport_error(
+        self,
+        kind: SnapshotV2MultiBlockMmioTransportErrorKind,
+    ) -> SnapshotV2MultiBlockMmioTransportError {
+        let cleanup = self.abort().err();
+        SnapshotV2MultiBlockMmioTransportError::new(kind, cleanup)
     }
 
     /// Explicitly releases every fresh Async generation in reverse order.
@@ -682,6 +1021,49 @@ fn async_binding_failure(
     }
 }
 
+fn validate_mmio_async_ownership(
+    records: &[PreparedSnapshotV2MultiBlockRecord],
+    runtime: Option<&SharedBlockAsyncRuntime>,
+    generations: &mut Vec<BlockAsyncDriveGeneration>,
+) -> bool {
+    for record in records {
+        match (
+            record.device.device().io_engine(),
+            record.async_generation,
+            record.device.device().async_binding(),
+            runtime,
+        ) {
+            (Some(DriveIoEngine::Sync), None, None, _) => {}
+            (
+                Some(DriveIoEngine::Async),
+                Some(generation),
+                Some((bound_runtime, bound_generation)),
+                Some(runtime),
+            ) if generation == bound_generation
+                && runtime.same_runtime(&bound_runtime)
+                && !generations.contains(&generation)
+                && runtime
+                    .pressure_pending(generation)
+                    .is_ok_and(|pending| !pending)
+                && runtime
+                    .pop_completion(generation)
+                    .is_ok_and(|completion| completion.is_none()) =>
+            {
+                generations.push(generation);
+            }
+            _ => return false,
+        }
+    }
+    match runtime {
+        Some(runtime) => {
+            !generations.is_empty()
+                && runtime.generation_count().ok() == Some(generations.len())
+                && runtime.outstanding_tasks().ok() == Some(0)
+        }
+        None => generations.is_empty(),
+    }
+}
+
 fn cleanup_async_bundle(
     records: &mut [PreparedSnapshotV2MultiBlockRecord],
     runtime: Option<&SharedBlockAsyncRuntime>,
@@ -692,9 +1074,57 @@ fn cleanup_async_bundle(
     let mut first = None;
     let mut additional_failures = 0_usize;
     for record in records.iter_mut().rev() {
-        let Some(generation) = record.async_generation.take() else {
+        let generation = record
+            .device
+            .device()
+            .async_binding()
+            .and_then(|(bound_runtime, generation)| {
+                runtime.same_runtime(&bound_runtime).then_some(generation)
+            })
+            .or_else(|| record.async_generation.take());
+        record.async_generation = None;
+        let Some(generation) = generation else {
             continue;
         };
+        if let Err(source) = runtime.discard_generation_without_guest_memory(generation) {
+            if first.is_none() {
+                first = Some(source);
+            } else {
+                additional_failures = additional_failures.saturating_add(1);
+            }
+        }
+    }
+    let shutdown = match runtime.shutdown_if_idle() {
+        Ok(true) => None,
+        Ok(false) => Some(BlockAsyncRuntimeError::ExecutorInvariant),
+        Err(source) => Some(source),
+    };
+    if let Some(source) = shutdown {
+        if first.is_none() {
+            first = Some(source);
+        } else {
+            additional_failures = additional_failures.saturating_add(1);
+        }
+    }
+    match first {
+        Some(source) => Err(SnapshotV2MultiBlockCleanupError {
+            source,
+            additional_failures,
+        }),
+        None => Ok(()),
+    }
+}
+
+fn cleanup_async_generations(
+    runtime: Option<&SharedBlockAsyncRuntime>,
+    generations: &[BlockAsyncDriveGeneration],
+) -> Result<(), SnapshotV2MultiBlockCleanupError> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let mut first = None;
+    let mut additional_failures = 0_usize;
+    for generation in generations.iter().rev().copied() {
         if let Err(source) = runtime.discard_generation_without_guest_memory(generation) {
             if first.is_none() {
                 first = Some(source);
@@ -1099,6 +1529,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn consuming_mmio_handoff_preserves_exact_transport_and_async_identity() {
+        let graph = crate::snapshot_device_v2_5::tests::fixture_graph(
+            SnapshotV2DeviceTransportKind::Mmio,
+            true,
+        );
+        let expected = graph.clone();
+        let memory = memory_for(&graph);
+        let now = Instant::now();
+        let configs = graph
+            .project_drive_configs()
+            .expect("fixture configs should project");
+        let (_files, backings) = open_backings(&graph);
+        let bundle = SnapshotV2MultiBlockRestorePlan::prepare(graph, &memory, now)
+            .expect("fixture graph should prepare")
+            .prepare_backings(configs.clone(), backings)
+            .expect("fixture backings should prepare");
+        let expected_runtime = bundle
+            .async_runtime()
+            .expect("mixed fixture should own one runtime")
+            .clone();
+
+        let mmio = bundle
+            .prepare_mmio_transport()
+            .expect("exact MMIO vector should reconstruct");
+        assert_eq!(mmio.drive_configs(), &configs);
+        assert_eq!(mmio.records().len(), expected.records().len());
+        assert!(
+            mmio.async_runtime()
+                .is_some_and(|runtime| runtime.same_runtime(&expected_runtime))
+        );
+        let (returned_configs, records, runtime, generations) = mmio.into_parts();
+        assert_eq!(returned_configs, configs);
+        assert_eq!(generations.len(), 1);
+        for (record, expected) in records.into_iter().zip(expected.records()) {
+            let SnapshotV2DeviceTransport::Mmio(expected_mmio) = expected.transport() else {
+                panic!("fixture transport should be MMIO");
+            };
+            let expected_transport = restore_mmio_transport_state(expected.virtio(), expected_mmio)
+                .expect("retained transport should restore");
+            let (
+                key,
+                drive_id,
+                is_root,
+                retry,
+                retry_deadline,
+                region,
+                interrupt_line,
+                generation,
+                handler,
+            ) = record.into_parts();
+            assert_eq!(key, expected.key());
+            assert_eq!(drive_id, expected.config().drive_id());
+            assert_eq!(is_root, expected.is_root());
+            assert_eq!(retry, expected.block().continuation().retry());
+            assert_eq!(retry_deadline.is_some(), retry != StorageRetryState::None);
+            assert_eq!(region, expected_mmio.region());
+            assert_eq!(interrupt_line, expected_mmio.interrupt_line());
+            assert_eq!(handler.transport_state(), expected_transport);
+            match expected.config().io_engine() {
+                DriveIoEngine::Sync => {
+                    assert_eq!(generation, None);
+                    assert!(handler.block_async_binding().is_none());
+                }
+                DriveIoEngine::Async => {
+                    let generation = generation.expect("Async generation should transfer");
+                    let (handler_runtime, handler_generation) = handler
+                        .block_async_binding()
+                        .expect("Async handler should retain its binding");
+                    assert_eq!(handler_generation, generation);
+                    assert!(handler_runtime.same_runtime(&expected_runtime));
+                }
+            }
+        }
+        cleanup_async_generations(runtime.as_ref(), &generations)
+            .expect("transferred Async runtime should cleanly release");
+        assert_eq!(
+            expected_runtime
+                .generation_count()
+                .expect("runtime should remain observable"),
+            0
+        );
+    }
+
+    #[test]
+    fn consuming_mmio_handoff_rejects_foreign_transport_and_invalid_generation_set() {
+        let pci_graph = crate::snapshot_device_v2_5::tests::fixture_graph(
+            SnapshotV2DeviceTransportKind::Pci,
+            true,
+        );
+        let memory = memory_for(&pci_graph);
+        let configs = pci_graph
+            .project_drive_configs()
+            .expect("fixture configs should project");
+        let (_files, backings) = open_backings(&pci_graph);
+        let bundle = SnapshotV2MultiBlockRestorePlan::prepare(pci_graph, &memory, Instant::now())
+            .expect("PCI graph should prepare")
+            .prepare_backings(configs, backings)
+            .expect("PCI bundle should prepare");
+        let runtime = bundle
+            .async_runtime()
+            .expect("mixed fixture should own one runtime")
+            .clone();
+        let error = bundle
+            .prepare_mmio_transport()
+            .expect_err("PCI vector must not enter the MMIO handoff");
+        assert!(!error.cleanup_failed());
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
+
+        let graph = crate::snapshot_device_v2_5::tests::fixture_graph(
+            SnapshotV2DeviceTransportKind::Mmio,
+            true,
+        );
+        let memory = memory_for(&graph);
+        let configs = graph
+            .project_drive_configs()
+            .expect("fixture configs should project");
+        let (_files, backings) = open_backings(&graph);
+        let mut bundle = SnapshotV2MultiBlockRestorePlan::prepare(graph, &memory, Instant::now())
+            .expect("MMIO graph should prepare")
+            .prepare_backings(configs, backings)
+            .expect("MMIO bundle should prepare");
+        let runtime = bundle
+            .async_runtime()
+            .expect("mixed fixture should own one runtime")
+            .clone();
+        let async_record = bundle
+            .records
+            .iter_mut()
+            .find(|record| record.async_generation.is_some())
+            .expect("fixture should contain one Async record");
+        async_record.async_generation = None;
+        let error = bundle
+            .prepare_mmio_transport()
+            .expect_err("missing generation ownership must be rejected");
+        assert!(!error.cleanup_failed());
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
     }
 
     #[test]

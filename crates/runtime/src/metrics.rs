@@ -2099,6 +2099,55 @@ impl SharedBlockDeviceMetricsRegistry {
         })
     }
 
+    /// Builds a bounded registry by consuming already-validated owned IDs.
+    ///
+    /// This avoids allocating a second string vector while an unpublished
+    /// restore transaction is acquiring its complete metrics owner.
+    #[doc(hidden)]
+    pub fn from_owned_drive_ids_with_capacity(
+        drive_ids: Vec<String>,
+        capacity: usize,
+    ) -> Result<Self, BlockDeviceMetricsRegistryError> {
+        if drive_ids.len() > capacity {
+            return Err(BlockDeviceMetricsRegistryError::Capacity);
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| BlockDeviceMetricsRegistryError::Capacity)?;
+        let mut reservations = Vec::new();
+        reservations
+            .try_reserve_exact(capacity)
+            .map_err(|_| BlockDeviceMetricsRegistryError::Capacity)?;
+        for drive_id in drive_ids {
+            if entries
+                .iter()
+                .any(|entry: &BlockDeviceMetricsRegistryEntry| entry.drive_id == drive_id)
+            {
+                return Err(BlockDeviceMetricsRegistryError::DuplicateDrive);
+            }
+            let generation = u64::try_from(entries.len())
+                .map_err(|_| BlockDeviceMetricsRegistryError::GenerationExhausted)?;
+            entries.push(BlockDeviceMetricsRegistryEntry {
+                generation,
+                drive_id,
+                metrics: SharedBlockDeviceMetrics::default(),
+                lease_claimed: false,
+            });
+        }
+        let next_generation = u64::try_from(entries.len())
+            .map_err(|_| BlockDeviceMetricsRegistryError::GenerationExhausted)?;
+        Ok(Self {
+            aggregate: SharedBlockDeviceMetrics::default(),
+            per_drive: Arc::new(Mutex::new(BlockDeviceMetricsRegistryState {
+                entries,
+                reservations,
+                next_generation,
+                capacity,
+            })),
+        })
+    }
+
     pub fn prepare_drive(
         &self,
         drive_id: impl Into<String>,
