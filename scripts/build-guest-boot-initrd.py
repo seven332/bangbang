@@ -59,6 +59,17 @@ SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE = 0x22
 SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE = 0x23
 SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE = 0x24
 SNAPSHOT_BLOCK_AUDIT_BYTE = 0x31
+SNAPSHOT_PMEM_SECTOR_SIZE = 512
+SNAPSHOT_PMEM_FILE_SIZE = (2 * 1024 * 1024) + 4096
+SNAPSHOT_PMEM_PRIVATE_TAIL_OFFSET = SNAPSHOT_PMEM_FILE_SIZE + 4096
+SNAPSHOT_PMEM_WRITABLE_INITIAL_BYTE = 0x41
+SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE = 0x42
+SNAPSHOT_PMEM_WRITABLE_DESTINATION_ONE_BYTE = 0x43
+SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE = 0x44
+SNAPSHOT_PMEM_READ_ONLY_BYTE = 0x51
+SNAPSHOT_PMEM_SOURCE_TAIL_BYTE = 0x61
+SNAPSHOT_PMEM_DESTINATION_ONE_TAIL_BYTE = 0x62
+SNAPSHOT_PMEM_DESTINATION_TWO_TAIL_BYTE = 0x63
 SNAPSHOT_BLOCK_DELAY_SECONDS = 5
 SERIAL_TTY_PATH = b"/dev/ttyS0\0"
 SERIAL_TTY_RAW_TERMIOS = (
@@ -82,6 +93,8 @@ SQUASHFS_NAME = b"squashfs\0"
 VDA_PATH = b"/dev/vda\0"
 VDB_PATH = b"/dev/vdb\0"
 VDC_PATH = b"/dev/vdc\0"
+PMEM0_PATH = b"/dev/pmem0\0"
+PMEM1_PATH = b"/dev/pmem1\0"
 ROOTFS_OS_RELEASE_PATH = b"/mnt/etc/os-release\0"
 DEFAULT_RELATIVE_OUTPUT = Path("bangbang/guest-boot/initrd.cpio")
 CPIO_NEWC_HEADER_SIZE = 110
@@ -104,6 +117,7 @@ LINUX_AARCH64_SYSCALL_MOUNT = 40
 LINUX_AARCH64_SYSCALL_IOCTL = 29
 LINUX_AARCH64_SYSCALL_OPENAT = 56
 LINUX_AARCH64_SYSCALL_CLOSE = 57
+LINUX_AARCH64_SYSCALL_LSEEK = 62
 LINUX_AARCH64_SYSCALL_READ = 63
 LINUX_AARCH64_SYSCALL_WRITE = 64
 LINUX_AARCH64_SYSCALL_FSYNC = 82
@@ -220,6 +234,11 @@ def sub_reg_64(destination: int, left: int, right: int) -> bytes:
 
 def cmp_reg_32(left: int, right: int) -> bytes:
     instruction = 0x6B00001F | (right << 16) | (left << 5)
+    return struct.pack("<I", instruction)
+
+
+def cmp_reg_64(left: int, right: int) -> bytes:
+    instruction = 0xEB00001F | (right << 16) | (left << 5)
     return struct.pack("<I", instruction)
 
 
@@ -590,6 +609,10 @@ def snapshot_block_sector(value: int) -> bytes:
     return bytes([value]) * SNAPSHOT_BLOCK_SECTOR_SIZE
 
 
+def snapshot_pmem_sector(value: int) -> bytes:
+    return bytes([value]) * SNAPSHOT_PMEM_SECTOR_SIZE
+
+
 def emit_snapshot_block_open(
     code: Aarch64CodeBuilder,
     addresses: dict[str, int],
@@ -624,6 +647,109 @@ def emit_snapshot_block_close(code: Aarch64CodeBuilder) -> None:
             )
         )
     )
+
+
+def emit_snapshot_file_seek_open_fd(
+    code: Aarch64CodeBuilder,
+    *,
+    offset: int,
+) -> None:
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                mov_imm_64(1, offset),
+                movz_64(2, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_LSEEK),
+                svc_0(),
+                mov_imm_64(21, offset),
+                cmp_reg_64(0, 21),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+
+
+def emit_snapshot_file_write_sector_at_open_fd(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    offset: int,
+    sector: str,
+) -> None:
+    emit_snapshot_file_seek_open_fd(code, offset=offset)
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                write_from_open_fd(
+                    addresses[sector],
+                    SNAPSHOT_PMEM_SECTOR_SIZE,
+                ),
+                cmp_imm_64(0, SNAPSHOT_PMEM_SECTOR_SIZE),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+
+
+def emit_snapshot_file_fsync_open_fd(code: Aarch64CodeBuilder) -> None:
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                movz_64(8, LINUX_AARCH64_SYSCALL_FSYNC),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+
+
+def emit_snapshot_file_read_byte_at(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    path: str,
+    offset: int,
+) -> None:
+    emit_snapshot_block_open(code, addresses, path=path, flags=0)
+    emit_snapshot_file_seek_open_fd(code, offset=offset)
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                mov_imm_64(1, addresses["read_buffer"]),
+                movz_64(2, SNAPSHOT_PMEM_SECTOR_SIZE),
+                movz_64(8, LINUX_AARCH64_SYSCALL_READ),
+                svc_0(),
+                cmp_imm_64(0, SNAPSHOT_PMEM_SECTOR_SIZE),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    emit_snapshot_block_close(code)
+    code.emit(mov_imm_64(1, addresses["read_buffer"]))
+    code.emit(ldrb_u32(0, 1))
+
+
+def emit_snapshot_file_expect_byte_at(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    path: str,
+    offset: int,
+    expected: int,
+) -> None:
+    emit_snapshot_file_read_byte_at(
+        code,
+        addresses,
+        path=path,
+        offset=offset,
+    )
+    code.emit(cmp_imm_64(0, expected))
+    code.branch_cond("failure", AARCH64_COND_NE)
 
 
 def emit_snapshot_block_read_byte(
@@ -782,6 +908,126 @@ def emit_snapshot_block_advance(
     code.label(f"{label_prefix}_complete")
 
 
+def emit_snapshot_pmem_source(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+) -> None:
+    emit_snapshot_file_expect_byte_at(
+        code,
+        addresses,
+        path="pmem0",
+        offset=0,
+        expected=SNAPSHOT_PMEM_WRITABLE_INITIAL_BYTE,
+    )
+    emit_snapshot_file_expect_byte_at(
+        code,
+        addresses,
+        path="pmem1",
+        offset=0,
+        expected=SNAPSHOT_PMEM_READ_ONLY_BYTE,
+    )
+    emit_snapshot_block_open(
+        code,
+        addresses,
+        path="pmem0",
+        flags=LINUX_OPEN_FLAG_RDWR,
+    )
+    emit_snapshot_file_write_sector_at_open_fd(
+        code,
+        addresses,
+        offset=SNAPSHOT_PMEM_PRIVATE_TAIL_OFFSET,
+        sector="pmem_source_tail_sector",
+    )
+    emit_snapshot_file_write_sector_at_open_fd(
+        code,
+        addresses,
+        offset=0,
+        sector="pmem_writable_pre_capture_sector",
+    )
+    emit_snapshot_file_fsync_open_fd(code)
+    emit_snapshot_file_fsync_open_fd(code)
+    emit_snapshot_block_close(code)
+
+
+def emit_snapshot_pmem_destination_epoch(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    prefix_sector: str,
+    tail_sector: str,
+) -> None:
+    emit_snapshot_block_open(
+        code,
+        addresses,
+        path="pmem0",
+        flags=LINUX_OPEN_FLAG_RDWR,
+    )
+    emit_snapshot_file_write_sector_at_open_fd(
+        code,
+        addresses,
+        offset=SNAPSHOT_PMEM_PRIVATE_TAIL_OFFSET,
+        sector=tail_sector,
+    )
+    emit_snapshot_file_write_sector_at_open_fd(
+        code,
+        addresses,
+        offset=0,
+        sector=prefix_sector,
+    )
+    emit_snapshot_file_fsync_open_fd(code)
+    emit_snapshot_file_fsync_open_fd(code)
+    emit_snapshot_block_close(code)
+
+
+def emit_snapshot_pmem_advance(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+) -> None:
+    emit_snapshot_file_expect_byte_at(
+        code,
+        addresses,
+        path="pmem1",
+        offset=0,
+        expected=SNAPSHOT_PMEM_READ_ONLY_BYTE,
+    )
+    emit_snapshot_file_expect_byte_at(
+        code,
+        addresses,
+        path="pmem0",
+        offset=SNAPSHOT_PMEM_PRIVATE_TAIL_OFFSET,
+        expected=0,
+    )
+    emit_snapshot_file_read_byte_at(
+        code,
+        addresses,
+        path="pmem0",
+        offset=0,
+    )
+    code.emit(cmp_imm_64(0, SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE))
+    code.branch_cond("pmem_destination_one", AARCH64_COND_EQ)
+    code.emit(cmp_imm_64(0, SNAPSHOT_PMEM_WRITABLE_DESTINATION_ONE_BYTE))
+    code.branch_cond("pmem_destination_two", AARCH64_COND_EQ)
+    code.branch("failure")
+
+    code.label("pmem_destination_one")
+    emit_snapshot_pmem_destination_epoch(
+        code,
+        addresses,
+        prefix_sector="pmem_writable_destination_one_sector",
+        tail_sector="pmem_destination_one_tail_sector",
+    )
+    code.branch("pmem_complete")
+
+    code.label("pmem_destination_two")
+    emit_snapshot_pmem_destination_epoch(
+        code,
+        addresses,
+        prefix_sector="pmem_writable_destination_two_sector",
+        tail_sector="pmem_destination_two_tail_sector",
+    )
+    code.label("pmem_complete")
+
+
 def emit_snapshot_block_poweroff(code: Aarch64CodeBuilder) -> None:
     code.emit(
         b"".join(
@@ -813,6 +1059,24 @@ def build_snapshot_block_init_code(addresses: dict[str, int]) -> bytes:
             )
         )
     )
+    code.emit(movz_64(20, 0))
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses["vda"]),
+                movz_64(2, 0),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("source_block_complete", AARCH64_COND_MI)
+    code.emit(mov_reg_64(19, 0))
+    emit_snapshot_block_close(code)
+    code.emit(movz_64(20, 1))
     emit_snapshot_block_expect_byte(
         code,
         addresses,
@@ -850,6 +1114,8 @@ def build_snapshot_block_init_code(addresses: dict[str, int]) -> bytes:
         path="vdb",
         sector="drive_b_pre_capture_sector",
     )
+    code.label("source_block_complete")
+    emit_snapshot_pmem_source(code, addresses)
     code.emit(
         write_syscalls(
             1,
@@ -868,6 +1134,8 @@ def build_snapshot_block_init_code(addresses: dict[str, int]) -> bytes:
         )
     )
 
+    code.emit(cmp_imm_64(20, 0))
+    code.branch_cond("destination_block_complete", AARCH64_COND_EQ)
     emit_snapshot_block_audit_check(code, addresses, label_prefix="destination_audit")
     emit_snapshot_block_advance(
         code,
@@ -889,6 +1157,8 @@ def build_snapshot_block_init_code(addresses: dict[str, int]) -> bytes:
         destination_two_sector="drive_b_destination_two_sector",
         label_prefix="drive_b",
     )
+    code.label("destination_block_complete")
+    emit_snapshot_pmem_advance(code, addresses)
     code.emit(
         write_syscalls(
             1,
@@ -917,6 +1187,8 @@ def snapshot_block_init_data() -> list[tuple[str, bytes]]:
         ("vda", VDA_PATH),
         ("vdb", VDB_PATH),
         ("vdc", VDC_PATH),
+        ("pmem0", PMEM0_PATH),
+        ("pmem1", PMEM1_PATH),
         ("read_buffer", bytes(SNAPSHOT_BLOCK_SECTOR_SIZE)),
         (
             "drive_a_pre_capture_sector",
@@ -945,6 +1217,30 @@ def snapshot_block_init_data() -> list[tuple[str, bytes]]:
         (
             "audit_write_sector",
             snapshot_block_sector(SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE),
+        ),
+        (
+            "pmem_writable_pre_capture_sector",
+            snapshot_pmem_sector(SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE),
+        ),
+        (
+            "pmem_writable_destination_one_sector",
+            snapshot_pmem_sector(SNAPSHOT_PMEM_WRITABLE_DESTINATION_ONE_BYTE),
+        ),
+        (
+            "pmem_writable_destination_two_sector",
+            snapshot_pmem_sector(SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE),
+        ),
+        (
+            "pmem_source_tail_sector",
+            snapshot_pmem_sector(SNAPSHOT_PMEM_SOURCE_TAIL_BYTE),
+        ),
+        (
+            "pmem_destination_one_tail_sector",
+            snapshot_pmem_sector(SNAPSHOT_PMEM_DESTINATION_ONE_TAIL_BYTE),
+        ),
+        (
+            "pmem_destination_two_tail_sector",
+            snapshot_pmem_sector(SNAPSHOT_PMEM_DESTINATION_TWO_TAIL_BYTE),
         ),
         (
             "capture_delay",
@@ -2559,6 +2855,8 @@ def validate_snapshot_block_init_entry(
         VDA_PATH,
         VDB_PATH,
         VDC_PATH,
+        PMEM0_PATH,
+        PMEM1_PATH,
     ):
         if guest_path not in payload:
             raise RuntimeError(
@@ -2576,6 +2874,26 @@ def validate_snapshot_block_init_entry(
             raise RuntimeError(
                 "guest initrd snapshot-block-init payload omits a writable epoch sector"
             )
+    for value in (
+        SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE,
+        SNAPSHOT_PMEM_WRITABLE_DESTINATION_ONE_BYTE,
+        SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE,
+        SNAPSHOT_PMEM_SOURCE_TAIL_BYTE,
+        SNAPSHOT_PMEM_DESTINATION_ONE_TAIL_BYTE,
+        SNAPSHOT_PMEM_DESTINATION_TWO_TAIL_BYTE,
+    ):
+        if snapshot_pmem_sector(value) not in payload:
+            raise RuntimeError(
+                "guest initrd snapshot-block-init payload omits a pmem epoch sector"
+            )
+    if (
+        cmp_imm_64(0, SNAPSHOT_PMEM_WRITABLE_INITIAL_BYTE) not in payload
+        or cmp_imm_64(0, SNAPSHOT_PMEM_READ_ONLY_BYTE) not in payload
+        or mov_imm_64(1, SNAPSHOT_PMEM_PRIVATE_TAIL_OFFSET) not in payload
+    ):
+        raise RuntimeError(
+            "guest initrd snapshot-block-init payload omits pmem protection or tail geometry"
+        )
     if struct.pack("<QQ", SNAPSHOT_BLOCK_DELAY_SECONDS, 0) not in payload:
         raise RuntimeError(
             "guest initrd snapshot-block-init payload omits the capture delay"
@@ -2584,6 +2902,7 @@ def validate_snapshot_block_init_entry(
         (LINUX_AARCH64_SYSCALL_MOUNT, "mount"),
         (LINUX_AARCH64_SYSCALL_OPENAT, "openat"),
         (LINUX_AARCH64_SYSCALL_CLOSE, "close"),
+        (LINUX_AARCH64_SYSCALL_LSEEK, "lseek"),
         (LINUX_AARCH64_SYSCALL_READ, "read"),
         (LINUX_AARCH64_SYSCALL_WRITE, "write"),
         (LINUX_AARCH64_SYSCALL_FSYNC, "fsync"),
