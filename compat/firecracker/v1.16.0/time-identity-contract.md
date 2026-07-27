@@ -10,8 +10,9 @@ time-source portability remain under
 [Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490). #1529
 therefore advances the checked contract without changing the inventory
 disposition or global count. #1578 later activates the device-free public
-lifecycle, and #1589 carries this unchanged time component into the current
-single-root native-v2 `2.4.0` lifecycle.
+lifecycle, #1589 carries this unchanged time component into exact single-root
+native-v2 `2.4.0`, and #1616/#1617 carry it unchanged into the current rooted
+or rootless regular-file multi-block `2.5.0` lifecycle.
 
 ## Evidence keys
 
@@ -92,7 +93,7 @@ single-root native-v2 `2.4.0` lifecycle.
 
 | Identity | Current disposition | Exact contract and remaining handoff |
 | --- | --- | --- |
-| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, public per-vCPU PVTime measurement/accounting/publication/discovery, native-v2 `2.3.0` introduction plus unchanged `2.4.0` carriage, repeated immutable clone restore, recapture, failure classification, redaction, and signed multi-vCPU guest observation are implemented and verified. The narrow public device-free 2.3 and single-root 2.4 lifecycle/production compositions are implemented. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** retains optional-device composition, broader cross-host time-source migration/clone portability, and terminal disposition. |
+| `semantic.device:rtc-vmclock-vmgenid-and-pvtime` | audit required | PL031 startup/metrics/destination-wall-clock reconstruction, no-alarm policy, VMGenID startup and fresh post-restore replacement/notification, complete VMClock startup/capture/codec/restore/notification, public per-vCPU PVTime measurement/accounting/publication/discovery, native-v2 `2.3.0` introduction plus unchanged `2.4.0` and `2.5.0` carriage, repeated immutable clone restore, recapture, failure classification, redaction, and signed multi-vCPU guest observation are implemented and verified. The public device-free 2.3, single-root 2.4, and rooted/rootless regular-file multi-block 2.5 lifecycle/production compositions are implemented. **[Wave 6 #1490](https://github.com/seven332/bangbang/issues/1490)** retains optional-device composition, broader cross-host time-source migration/clone portability, and terminal disposition. |
 
 ## VMClock state and version contract
 
@@ -114,8 +115,9 @@ single-root native-v2 `2.4.0` lifecycle.
   vCPU execution and auxiliary publishers are quiesced.
 - Native-v2 `2.3.0` stores the same exact ABI inside `BANGTM2\0`, together with
   portable placement, notification, policy, and per-vCPU PVTime state.
-  Current `2.4.0` retains that exact component before mandatory root-device
-  kind 7. Structural readers still admit valid `2.2.x` containers, but the
+  Exact `2.4.0` and current `2.5.0` retain that exact component before
+  mandatory device-graph kind 7; only kind 7's profile changes between those
+  versions. Structural readers still admit valid `2.2.x` containers, but the
   complete typed HVF platform decoder requires kind 6 and therefore at least
   minor 3.
 

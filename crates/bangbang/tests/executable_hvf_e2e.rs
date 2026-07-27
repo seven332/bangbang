@@ -28,6 +28,7 @@ mod macos_arm64 {
 
     use bangbang_hvf::decode_hvf_snapshot_v2_multi_block_state;
     use bangbang_runtime::block::{DriveCacheType, DriveIoEngine};
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
     use bangbang_runtime::snapshot_device_v2_5::{
         NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
     };
@@ -295,6 +296,19 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
     const DIRECT_ROOTFS_NATIVE_V2_ROOT_SNAPSHOT_BOOT_ARGS: &str = "console=null reboot=k panic=0 quiet loglevel=1 root=/dev/vda ro rootwait init=/bangbang-direct-rootfs-init bangbang.native-v2-root-snapshot=1";
+    const SNAPSHOT_BLOCK_BOOT_ARGS: &str =
+        "console=null reboot=k panic=1 quiet loglevel=1 rdinit=/snapshot-block-init";
+    const SNAPSHOT_BLOCK_SECTOR_SIZE: usize = 512;
+    const SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE: u8 = 0x11;
+    const SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE: u8 = 0x12;
+    const SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE: u8 = 0x13;
+    const SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE: u8 = 0x14;
+    const SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE: u8 = 0x21;
+    const SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE: u8 = 0x22;
+    const SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE: u8 = 0x23;
+    const SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE: u8 = 0x24;
+    const SNAPSHOT_BLOCK_AUDIT_BYTE: u8 = 0x31;
+    const SNAPSHOT_BLOCK_PARTUUID: &str = "1617-CAFE";
     const ROOTFS_BOOT_TIMER_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 nomodule swiotlb=noforce init=/usr/local/bin/init";
     const DIRECT_ROOTFS_ENTROPY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-read=1";
@@ -312,6 +326,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
     const DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-multistream=1";
     const GUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+    const GUEST_STOP_TIMEOUT: Duration = Duration::from_secs(60);
     const PCI_ALL_VIRTIO_GUEST_TIMEOUT: Duration = Duration::from_secs(90);
     const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
     const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
@@ -10905,8 +10920,8 @@ mod macos_arm64 {
             &instance_id,
             &["--config-file", path_text(&config_path)],
         );
-        let output = bangbang
-            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "API-enabled guest SYSTEM_OFF");
+        let output =
+            bangbang.wait_for_exit_with_timeout(GUEST_STOP_TIMEOUT, "API-enabled guest SYSTEM_OFF");
 
         assert!(
             output.status.success(),
@@ -10949,7 +10964,7 @@ mod macos_arm64 {
         );
 
         let output =
-            bangbang.wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "no-api guest SYSTEM_OFF");
+            bangbang.wait_for_exit_with_timeout(GUEST_STOP_TIMEOUT, "no-api guest SYSTEM_OFF");
 
         assert!(
             output.status.success(),
@@ -10987,7 +11002,7 @@ mod macos_arm64 {
             &["--config-file", path_text(&config_path)],
         );
         let output = bangbang
-            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "API-enabled guest SYSTEM_RESET");
+            .wait_for_exit_with_timeout(GUEST_STOP_TIMEOUT, "API-enabled guest SYSTEM_RESET");
 
         assert!(
             output.status.success(),
@@ -11029,8 +11044,8 @@ mod macos_arm64 {
             "guest reset no-api startup must not publish an API socket"
         );
 
-        let output = bangbang
-            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "no-api guest SYSTEM_RESET");
+        let output =
+            bangbang.wait_for_exit_with_timeout(GUEST_STOP_TIMEOUT, "no-api guest SYSTEM_RESET");
 
         assert!(
             output.status.success(),
@@ -11106,12 +11121,18 @@ mod macos_arm64 {
         );
         assert_no_content_response(&start, "PUT source InstanceStart");
 
-        wait_for_uart_write_count(
-            &source_socket,
-            &source_metrics,
-            2,
-            GUEST_EXECUTION_TIMEOUT,
-            "all source snapshot guest vCPUs ready",
+        let secondary_ready = char::from(SNAPSHOT_GUEST_SECONDARY_READY_BYTE).to_string();
+        source
+            .wait_for_stdout_marker(&secondary_ready, GUEST_EXECUTION_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("all source snapshot guest vCPUs should become ready: {error}")
+            });
+        assert!(
+            source
+                .stdout_snapshot()
+                .as_bytes()
+                .contains(&SNAPSHOT_GUEST_PRIMARY_READY_BYTE),
+            "secondary readiness should follow the primary source checkpoint"
         );
         let pause = http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#);
         assert_no_content_response(&pause, "PATCH source /vm Paused");
@@ -11790,6 +11811,588 @@ mod macos_arm64 {
         assert_no_snapshot_staging(test_root);
     }
 
+    #[test]
+    fn signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci() {
+        for enable_pci in [false, true] {
+            for rooted in [true, false] {
+                let test_dir = TestDir::new();
+                let instance_id = test_dir.instance_id();
+                run_native_v2_multi_block_epoch_case(
+                    test_dir.path(),
+                    &instance_id,
+                    enable_pci,
+                    rooted,
+                );
+            }
+        }
+    }
+
+    fn run_native_v2_multi_block_epoch_case(
+        test_root: &Path,
+        instance_id: &str,
+        enable_pci: bool,
+        rooted: bool,
+    ) {
+        let transport = if enable_pci { "pci" } else { "mmio" };
+        let root_kind = if rooted { "rooted" } else { "rootless" };
+        let case = format!("{transport}-{root_kind}");
+        let source_socket = test_root.join(format!("nve-{case}-s.sock"));
+        let paused_socket = test_root.join(format!("nve-{case}-p.sock"));
+        let resumed_socket = test_root.join(format!("nve-{case}-r.sock"));
+        let state_path = test_root.join(format!("nve-{case}.state"));
+        let memory_path = test_root.join(format!("nve-{case}.memory"));
+        let recaptured_state_path = test_root.join(format!("nve-{case}-recaptured.state"));
+        let recaptured_memory_path = test_root.join(format!("nve-{case}-recaptured.memory"));
+        let source_metrics_path = test_root.join(format!("nve-{case}-source.metrics"));
+        let paused_metrics_path = test_root.join(format!("nve-{case}-paused.metrics"));
+        let resumed_metrics_path = test_root.join(format!("nve-{case}-resumed.metrics"));
+        let drive_a_path = test_root.join(format!("nve-{case}-a.img"));
+        let drive_b_path = test_root.join(format!("nve-{case}-b.img"));
+        let audit_path = test_root.join(format!("nve-{case}-audit.img"));
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let process_args: &[&str] = if enable_pci { &["--enable-pci"] } else { &[] };
+
+        create_snapshot_block_epoch_backing(&drive_a_path, SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE);
+        create_snapshot_block_epoch_backing(&drive_b_path, SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE);
+        create_snapshot_block_epoch_backing(&audit_path, SNAPSHOT_BLOCK_AUDIT_BYTE);
+
+        let source = BangbangProcess::start_with_extra_args(
+            &source_socket,
+            &format!("{instance_id}-native-v2-epoch-{case}-source"),
+            process_args,
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT native-v2 epoch source /machine-config",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/boot-source",
+                &format!(
+                    r#"{{"kernel_image_path":{},"initrd_path":{},"boot_args":{}}}"#,
+                    json_string(path_text(&kernel_path)),
+                    json_string(path_text(&initrd_path)),
+                    json_string(SNAPSHOT_BLOCK_BOOT_ARGS)
+                ),
+            ),
+            "PUT native-v2 epoch source /boot-source",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/drives/primary",
+                &format!(
+                    r#"{{"drive_id":"primary","path_on_host":{},"is_root_device":{rooted},"is_read_only":false,"cache_type":"Unsafe","io_engine":"Async","rate_limiter":{{"ops":{{"size":1,"refill_time":1000}}}}}}"#,
+                    json_string(path_text(&drive_a_path))
+                ),
+            ),
+            "PUT native-v2 epoch Async Unsafe primary",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/drives/data",
+                &format!(
+                    r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync","partuuid":"{SNAPSHOT_BLOCK_PARTUUID}"}}"#,
+                    json_string(path_text(&drive_b_path))
+                ),
+            ),
+            "PUT native-v2 epoch Sync Writeback data",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/drives/audit",
+                &format!(
+                    r#"{{"drive_id":"audit","path_on_host":{},"is_root_device":false,"is_read_only":true,"cache_type":"Unsafe","io_engine":"Async"}}"#,
+                    json_string(path_text(&audit_path))
+                ),
+            ),
+            "PUT native-v2 epoch read-only audit",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/metrics",
+                &format!(
+                    r#"{{"metrics_path":{}}}"#,
+                    json_string(path_text(&source_metrics_path))
+                ),
+            ),
+            "PUT native-v2 epoch source /metrics",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "PUT native-v2 epoch source InstanceStart",
+        );
+        wait_for_snapshot_block_epoch(
+            &drive_b_path,
+            SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+            GUEST_EXECUTION_TIMEOUT,
+            &format!("{case} source pre-capture data epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &drive_a_path,
+            SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
+            &format!("{case} source pre-capture primary epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &audit_path,
+            SNAPSHOT_BLOCK_AUDIT_BYTE,
+            &format!("{case} source audit epoch"),
+        );
+        assert_no_content_response(
+            &http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+            "PATCH native-v2 epoch source /vm Paused",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/actions",
+                r#"{"action_type":"FlushMetrics"}"#,
+            ),
+            "PUT native-v2 epoch source FlushMetrics",
+        );
+        assert_snapshot_block_metrics(
+            &source_metrics_path,
+            true,
+            &format!("{case} source metrics"),
+        );
+
+        let create_body = format!(
+            r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+            json_string(path_text(&state_path)),
+            json_string(path_text(&memory_path))
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &source_socket,
+                "PUT",
+                "/snapshot/create",
+                &create_body,
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            &format!("{case} PUT native-v2 epoch source /snapshot/create"),
+        );
+        let state_before = fs::read(&state_path).expect("native-v2 epoch state should read");
+        let memory_before = fs::read(&memory_path).expect("native-v2 epoch memory should read");
+        let graph_before = native_v2_device_graph(&state_path);
+        assert_snapshot_block_graph(&graph_before, enable_pci, rooted, &case);
+        let source_output = source.terminate();
+        assert_clean_shutdown(
+            source_output,
+            &source_socket,
+            &format!("{case} native-v2 epoch source"),
+        );
+
+        let paused = BangbangProcess::start_with_extra_args(
+            &paused_socket,
+            &format!("{instance_id}-native-v2-epoch-{case}-paused"),
+            process_args,
+        );
+        configure_snapshot_destination_metrics(
+            &paused_socket,
+            &paused_metrics_path,
+            &format!("{case} paused destination"),
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &paused_socket,
+                "PUT",
+                "/snapshot/load",
+                &snapshot_root_load_body(&state_path, &memory_path, false),
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            "PUT native-v2 epoch paused destination /snapshot/load",
+        );
+        let paused_info = http_get(&paused_socket, "/");
+        assert_response_contains(
+            &paused_info,
+            r#""state":"Paused""#,
+            "GET native-v2 epoch paused destination state",
+        );
+        assert_response_contains(
+            &paused_info,
+            &format!(r#""id":"{instance_id}-native-v2-epoch-{case}-paused""#),
+            "GET native-v2 epoch paused destination identity",
+        );
+        let paused_config = http_get(&paused_socket, "/vm/config");
+        assert_ok_response(&paused_config, "GET restored native-v2 epoch VM config");
+        assert_eq!(paused_config.matches(r#""drive_id":"#).count(), 3);
+        for expected in [
+            r#""drive_id":"primary""#,
+            r#""drive_id":"data""#,
+            r#""drive_id":"audit""#,
+            r#""cache_type":"Unsafe""#,
+            r#""cache_type":"Writeback""#,
+            r#""io_engine":"Async""#,
+            r#""io_engine":"Sync""#,
+            SNAPSHOT_BLOCK_PARTUUID,
+        ] {
+            assert_response_contains(
+                &paused_config,
+                expected,
+                "GET restored native-v2 epoch VM config",
+            );
+        }
+        let recapture_body = format!(
+            r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
+            json_string(path_text(&recaptured_state_path)),
+            json_string(path_text(&recaptured_memory_path))
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
+                &paused_socket,
+                "PUT",
+                "/snapshot/create",
+                &recapture_body,
+                GUEST_EXECUTION_TIMEOUT,
+            ),
+            "PUT restored native-v2 epoch destination /snapshot/create",
+        );
+        let recaptured_graph = native_v2_device_graph(&recaptured_state_path);
+        assert_snapshot_block_stable_graph(
+            &graph_before,
+            &recaptured_graph,
+            &format!("{case} restored destination recapture"),
+        );
+        assert_no_content_response(
+            &http_json(&paused_socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+            "PATCH native-v2 epoch paused destination /vm Resumed",
+        );
+        let paused_output = paused.wait_for_exit_with_timeout(
+            GUEST_EXECUTION_TIMEOUT,
+            &format!("{case} explicitly resumed native-v2 epoch guest poweroff"),
+        );
+        assert_clean_shutdown(
+            paused_output,
+            &paused_socket,
+            &format!("{case} explicitly resumed native-v2 epoch destination"),
+        );
+        assert_snapshot_block_epoch(
+            &drive_a_path,
+            SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE,
+            &format!("{case} destination-one primary epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &drive_b_path,
+            SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE,
+            &format!("{case} destination-one data epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &audit_path,
+            SNAPSHOT_BLOCK_AUDIT_BYTE,
+            &format!("{case} destination-one audit epoch"),
+        );
+        assert_snapshot_block_metrics(
+            &paused_metrics_path,
+            true,
+            &format!("{case} paused destination metrics"),
+        );
+
+        if !rooted {
+            let resumed = BangbangProcess::start_with_extra_args(
+                &resumed_socket,
+                &format!("{instance_id}-native-v2-epoch-{case}-resumed"),
+                process_args,
+            );
+            configure_snapshot_destination_metrics(
+                &resumed_socket,
+                &resumed_metrics_path,
+                &format!("{case} automatic destination"),
+            );
+            assert_no_content_response(
+                &http_json_with_io_timeout(
+                    &resumed_socket,
+                    "PUT",
+                    "/snapshot/load",
+                    &snapshot_root_load_body(&state_path, &memory_path, true),
+                    GUEST_EXECUTION_TIMEOUT,
+                ),
+                "PUT native-v2 epoch automatic destination /snapshot/load",
+            );
+            let resumed_output = resumed.wait_for_exit_with_timeout(
+                GUEST_EXECUTION_TIMEOUT,
+                &format!("{case} automatically resumed native-v2 epoch guest poweroff"),
+            );
+            assert_clean_shutdown(
+                resumed_output,
+                &resumed_socket,
+                &format!("{case} automatically resumed native-v2 epoch destination"),
+            );
+            assert_snapshot_block_epoch(
+                &drive_a_path,
+                SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE,
+                &format!("{case} destination-two primary epoch"),
+            );
+            assert_snapshot_block_epoch(
+                &drive_b_path,
+                SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE,
+                &format!("{case} destination-two data epoch"),
+            );
+            assert_snapshot_block_epoch(
+                &audit_path,
+                SNAPSHOT_BLOCK_AUDIT_BYTE,
+                &format!("{case} destination-two audit epoch"),
+            );
+            assert_snapshot_block_metrics(
+                &resumed_metrics_path,
+                true,
+                &format!("{case} automatic destination metrics"),
+            );
+        }
+
+        assert_eq!(
+            fs::read(&state_path).expect("final native-v2 epoch state should read"),
+            state_before,
+            "{case} repeated loads must not mutate state"
+        );
+        assert_eq!(
+            fs::read(&memory_path).expect("final native-v2 epoch memory should read"),
+            memory_before,
+            "{case} repeated loads must not mutate memory"
+        );
+        assert_no_snapshot_staging(test_root);
+    }
+
+    fn create_snapshot_block_epoch_backing(path: &Path, initial: u8) {
+        let mut bytes = vec![0_u8; 8 * SNAPSHOT_BLOCK_SECTOR_SIZE];
+        bytes[..SNAPSHOT_BLOCK_SECTOR_SIZE].fill(initial);
+        fs::write(path, bytes).unwrap_or_else(|error| {
+            panic!(
+                "snapshot block epoch backing {} should write: {error}",
+                path.display()
+            )
+        });
+    }
+
+    fn snapshot_block_epoch(value: u8) -> Vec<u8> {
+        vec![value; SNAPSHOT_BLOCK_SECTOR_SIZE]
+    }
+
+    fn wait_for_snapshot_block_epoch(path: &Path, value: u8, timeout: Duration, context: &str) {
+        wait_for_file_prefix_marker(path, &snapshot_block_epoch(value), timeout)
+            .unwrap_or_else(|error| panic!("{context} should become visible: {error}"));
+    }
+
+    fn assert_snapshot_block_epoch(path: &Path, value: u8, context: &str) {
+        let bytes =
+            fs::read(path).unwrap_or_else(|error| panic!("{context} backing should read: {error}"));
+        assert_eq!(
+            bytes.get(..SNAPSHOT_BLOCK_SECTOR_SIZE),
+            Some(snapshot_block_epoch(value).as_slice()),
+            "{context} should retain the exact sector epoch"
+        );
+    }
+
+    fn configure_snapshot_destination_metrics(socket: &Path, metrics: &Path, context: &str) {
+        assert_no_content_response(
+            &http_put_json(
+                socket,
+                "/metrics",
+                &format!(r#"{{"metrics_path":{}}}"#, json_string(path_text(metrics))),
+            ),
+            &format!("PUT {context} /metrics"),
+        );
+    }
+
+    fn assert_snapshot_block_graph(
+        graph: &SnapshotV2MultiBlockDeviceGraph,
+        enable_pci: bool,
+        rooted: bool,
+        case: &str,
+    ) {
+        assert_eq!(
+            graph.records().len(),
+            3,
+            "{case} should capture three drives"
+        );
+        assert_eq!(
+            graph.transport_kind(),
+            if enable_pci {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            },
+            "{case} should retain the selected transport"
+        );
+        let primary = graph
+            .records()
+            .iter()
+            .find(|record| record.config().drive_id() == "primary")
+            .expect("epoch graph should contain primary");
+        assert_eq!(primary.is_root(), rooted);
+        assert!(!primary.config().is_read_only());
+        assert_eq!(primary.config().cache_type(), DriveCacheType::Unsafe);
+        assert_eq!(primary.config().io_engine(), DriveIoEngine::Async);
+        assert!(primary.config().rate_limiter().is_some());
+
+        let data = graph
+            .records()
+            .iter()
+            .find(|record| record.config().drive_id() == "data")
+            .expect("epoch graph should contain data");
+        assert!(!data.is_root());
+        assert!(!data.config().is_read_only());
+        assert_eq!(data.config().cache_type(), DriveCacheType::Writeback);
+        assert_eq!(data.config().io_engine(), DriveIoEngine::Sync);
+        assert_eq!(data.config().partuuid(), Some(SNAPSHOT_BLOCK_PARTUUID));
+
+        let audit = graph
+            .records()
+            .iter()
+            .find(|record| record.config().drive_id() == "audit")
+            .expect("epoch graph should contain audit");
+        assert!(!audit.is_root());
+        assert!(audit.config().is_read_only());
+        assert_eq!(audit.config().io_engine(), DriveIoEngine::Async);
+    }
+
+    fn assert_snapshot_block_stable_graph(
+        expected: &SnapshotV2MultiBlockDeviceGraph,
+        actual: &SnapshotV2MultiBlockDeviceGraph,
+        context: &str,
+    ) {
+        assert_eq!(actual.root_key(), expected.root_key(), "{context} root");
+        assert_eq!(
+            actual.transport_kind(),
+            expected.transport_kind(),
+            "{context} transport"
+        );
+        assert_eq!(
+            actual.records().len(),
+            expected.records().len(),
+            "{context} record count"
+        );
+        for (expected, actual) in expected.records().iter().zip(actual.records()) {
+            assert_eq!(actual.key(), expected.key(), "{context} record key");
+            assert_eq!(
+                actual.config(),
+                expected.config(),
+                "{context} stable configuration"
+            );
+            assert_eq!(
+                actual.block().backing_bytes(),
+                expected.block().backing_bytes(),
+                "{context} backing geometry"
+            );
+            let expected_block = expected.block().continuation();
+            let actual_block = actual.block().continuation();
+            assert_eq!(
+                actual_block.capacity_sectors(),
+                expected_block.capacity_sectors(),
+                "{context} block capacity"
+            );
+            assert_eq!(
+                actual_block.device_id(),
+                expected_block.device_id(),
+                "{context} device identifier"
+            );
+            assert_eq!(
+                actual_block.active_queue(),
+                expected_block.active_queue(),
+                "{context} active request cursor"
+            );
+            assert_eq!(
+                actual_block.retry(),
+                expected_block.retry(),
+                "{context} retry disposition"
+            );
+            for (name, expected_bucket, actual_bucket) in [
+                (
+                    "bandwidth",
+                    expected_block.limiter().bandwidth(),
+                    actual_block.limiter().bandwidth(),
+                ),
+                (
+                    "ops",
+                    expected_block.limiter().ops(),
+                    actual_block.limiter().ops(),
+                ),
+            ] {
+                assert_eq!(
+                    actual_bucket.map(|bucket| (bucket.budget(), bucket.remaining_burst())),
+                    expected_bucket.map(|bucket| (bucket.budget(), bucket.remaining_burst())),
+                    "{context} {name} limiter state"
+                );
+            }
+            assert_eq!(
+                actual.virtio(),
+                expected.virtio(),
+                "{context} virtio continuation"
+            );
+            assert_eq!(
+                actual.transport(),
+                expected.transport(),
+                "{context} transport continuation"
+            );
+        }
+    }
+
+    fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {
+        let output = fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!("{context} metrics {} should read: {error}", path.display())
+        });
+        for (drive_id, expect_write) in [("primary", true), ("data", true), ("audit", false)] {
+            assert!(
+                snapshot_block_metric_total(path, drive_id, "queue_event_count") > 0,
+                "{context} should report queue events for {drive_id}"
+            );
+            assert!(
+                snapshot_block_metric_total(path, drive_id, "read_count") > 0,
+                "{context} should report reads for {drive_id}"
+            );
+            if expect_write {
+                assert!(
+                    snapshot_block_metric_total(path, drive_id, "write_count") > 0,
+                    "{context} should report writes for {drive_id}"
+                );
+            } else {
+                assert_eq!(
+                    snapshot_block_metric_total(path, drive_id, "write_count"),
+                    0,
+                    "{context} must not report an audit write"
+                );
+            }
+        }
+        if expect_limiter {
+            assert!(
+                snapshot_block_metric_total(path, "primary", "rate_limiter_throttled_events") > 0,
+                "{context} should report a throttled primary request; metrics:\n{output}"
+            );
+        }
+    }
+
+    fn snapshot_block_metric_total(path: &Path, drive_id: &str, field: &str) -> u64 {
+        let section = format!("block_{drive_id}");
+        fs::read_to_string(path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "snapshot block metrics {} should read: {error}",
+                    path.display()
+                )
+            })
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()?
+                    .get(&section)?
+                    .get(field)?
+                    .as_u64()
+            })
+            .fold(0, u64::saturating_add)
+    }
+
     fn native_v2_device_graph(state_path: &Path) -> SnapshotV2MultiBlockDeviceGraph {
         let bytes = fs::read(state_path).unwrap_or_else(|error| {
             panic!(
@@ -11844,7 +12447,7 @@ mod macos_arm64 {
             0xd400_0002
         );
         assert_eq!(
-            read_test_u32(&image, SNAPSHOT_GUEST_SECONDARY_IMAGE_OFFSET + (17 * 4)),
+            read_test_u32(&image, SNAPSHOT_GUEST_SECONDARY_IMAGE_OFFSET + (19 * 4)),
             aarch64_br(21)
         );
         assert_eq!(
@@ -11909,42 +12512,6 @@ mod macos_arm64 {
             .unwrap_or_else(|| {
                 panic!("{context} should emit memory_hotplug metrics; output:\n{output}")
             })
-    }
-
-    fn wait_for_uart_write_count(
-        socket_path: &Path,
-        metrics_path: &Path,
-        expected: u64,
-        timeout: Duration,
-        context: &str,
-    ) {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let flush = http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
-            assert_no_content_response(&flush, context);
-            if latest_uart_write_count(metrics_path).is_some_and(|count| count >= expected) {
-                return;
-            }
-            if Instant::now() >= deadline {
-                let metrics = fs::read_to_string(metrics_path)
-                    .unwrap_or_else(|err| format!("<metrics unavailable: {err}>"));
-                panic!(
-                    "{context} did not observe uart.write_count >= {expected} within {timeout:?}; metrics:\n{metrics}"
-                );
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-
-    fn latest_uart_write_count(path: &Path) -> Option<u64> {
-        let output = fs::read_to_string(path).ok()?;
-        output.lines().rev().find_map(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()?
-                .get("uart")?
-                .get("write_count")?
-                .as_u64()
-        })
     }
 
     fn wait_for_block_root_read_count(
@@ -12183,6 +12750,10 @@ mod macos_arm64 {
             aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
             aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
             aarch64_movz_x(7, u16::from(SNAPSHOT_GUEST_SECONDARY_READY_BYTE), 0),
+            aarch64_strb_w(7, 4),
+            // Complete one observable readiness record only after both vCPUs
+            // have reached their source checkpoints.
+            aarch64_movz_x(7, u16::from(b'\n'), 0),
             aarch64_strb_w(7, 4),
             aarch64_movz_x(5, 1, 0),
             aarch64_str_w(5, 19, 24),

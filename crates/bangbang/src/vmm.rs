@@ -14177,15 +14177,11 @@ where
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        let wakeup_result = self.control.request_wakeup();
         match response_receiver.recv() {
             Ok(response) => boot_run_loop_snapshot_response_into_result(response),
             Err(_) => {
                 self.admission.cancel_snapshot_preparation();
-                match wakeup_result {
-                    Ok(()) => Err(BootRunLoopCommandError::ResponseClosed),
-                    Err(source) => Err(BootRunLoopCommandError::Wakeup { source }),
-                }
+                Err(BootRunLoopCommandError::ResponseClosed)
             }
         }
     }
@@ -25259,6 +25255,7 @@ mod tests {
             20
         );
         supervisor.pause().expect("supervisor should pause");
+        let wakeup_count_before_snapshot = control.request_wakeup_count();
         let snapshot_handle = supervisor.command_handle();
         let (entered_sender, entered_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
@@ -25347,6 +25344,11 @@ mod tests {
         assert_eq!(
             supervisor.admission_state(),
             BootRunLoopCommandAdmissionState::Ordinary
+        );
+        assert_eq!(
+            control.request_wakeup_count(),
+            wakeup_count_before_snapshot,
+            "paused snapshot commands should use the pause gate without a vCPU wakeup"
         );
         assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
         supervisor

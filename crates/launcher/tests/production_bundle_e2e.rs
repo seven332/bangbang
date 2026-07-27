@@ -48,6 +48,7 @@ use vhost_user_block::{
 const BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_BUNDLE_PATH";
 const GRANT_TEST_BUNDLE_ENV: &str = "BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH";
 const GUEST_KERNEL_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
+const GUEST_INITRD_ENV: &str = "BANGBANG_GUEST_INITRD_PATH";
 const GUEST_EXT4_ROOTFS_ENV: &str = "BANGBANG_GUEST_EXT4_ROOTFS_PATH";
 const GRANT_MANIFEST_OPTION: &str = "--bangbang-grant-manifest";
 const JAILER_OPTION: &str = "--bangbang-jailer-v1";
@@ -163,6 +164,7 @@ const CONTAINED_VHOST_USER_HOST_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_HOST
 const CONTAINED_VHOST_USER_SUCCESS_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_ro_OK";
 const VHOST_CONFIG_RESIZED_MARKER: &[u8] = b"BANGBANG_VHOST_CONFIG_RESIZED";
 const SNAPSHOT_KERNEL_ID: &str = "grant-snapshot-kernel-1368";
+const SNAPSHOT_INITRD_ID: &str = "grant-snapshot-initrd-1617";
 const SNAPSHOT_METRICS_ID: &str = "grant-snapshot-metrics-1368";
 const SNAPSHOT_ROOT_ID: &str = "grant-snapshot-root-1589";
 const SNAPSHOT_DATA_ID: &str = "grant-snapshot-data-1616";
@@ -173,6 +175,7 @@ const SNAPSHOT_STATE_INPUT_ID: &str = "grant-snapshot-state-input-1368";
 const SNAPSHOT_MEMORY_INPUT_ID: &str = "grant-snapshot-memory-input-1368";
 const SNAPSHOT_DESCRIBE_INPUT_ID: &str = "grant-snapshot-describe-input-1368";
 const SNAPSHOT_KERNEL_REF: &str = "bangbang-grant:grant-snapshot-kernel-1368";
+const SNAPSHOT_INITRD_REF: &str = "bangbang-grant:grant-snapshot-initrd-1617";
 const SNAPSHOT_METRICS_REF: &str = "bangbang-grant:grant-snapshot-metrics-1368";
 const SNAPSHOT_ROOT_REF: &str = "bangbang-grant:grant-snapshot-root-1589";
 const SNAPSHOT_DATA_REF: &str = "bangbang-grant:grant-snapshot-data-1616";
@@ -195,6 +198,19 @@ const SNAPSHOT_MEMORY_CHILD: &str = "memory-1368.snap";
 const SNAPSHOT_REPEAT_STATE_CHILD: &str = "state-repeat-1368.snap";
 const SNAPSHOT_REPEAT_MEMORY_CHILD: &str = "memory-repeat-1368.snap";
 const SNAPSHOT_ROOT_BOOT_ARGS: &str = "console=null reboot=k panic=0 quiet loglevel=1 root=/dev/vda ro rootwait init=/bangbang-direct-rootfs-init bangbang.native-v2-root-snapshot=1";
+const SNAPSHOT_BLOCK_BOOT_ARGS: &str =
+    "console=null reboot=k panic=1 quiet loglevel=1 rdinit=/snapshot-block-init";
+const SNAPSHOT_BLOCK_SECTOR_SIZE: usize = 512;
+const SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE: u8 = 0x11;
+const SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE: u8 = 0x12;
+const SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE: u8 = 0x13;
+const SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE: u8 = 0x14;
+const SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE: u8 = 0x21;
+const SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE: u8 = 0x22;
+const SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE: u8 = 0x23;
+const SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE: u8 = 0x24;
+const SNAPSHOT_BLOCK_AUDIT_BYTE: u8 = 0x31;
+const SNAPSHOT_BLOCK_PARTUUID: &str = "1617-CAFE";
 const GRANTED_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
 const GRANTED_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_MULTISTREAM_OK";
 const GRANTED_VSOCK_EXCHANGES: &[(u32, &[u8], &[u8])] = &[
@@ -369,6 +385,15 @@ fn guest_kernel() -> PathBuf {
         .expect("signed runner must provide the guest kernel fixture path");
     let path = PathBuf::from(path);
     assert!(path.is_file(), "guest kernel fixture must be a file");
+    path
+}
+
+fn guest_initrd() -> PathBuf {
+    let path = std::env::var_os(GUEST_INITRD_ENV)
+        .filter(|value| !value.is_empty())
+        .expect("signed runner must provide the guest initrd fixture path");
+    let path = PathBuf::from(path);
+    assert!(path.is_file(), "guest initrd fixture must be a file");
     path
 }
 
@@ -1540,6 +1565,363 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
         memory_before
     );
     assert_eq!(session_entries(), baseline_sessions);
+}
+
+#[test]
+fn normal_bundle_certifies_native_v2_multi_block_epochs_over_mmio_and_pci() {
+    let bundle = production_bundle();
+    for enable_pci in [false, true] {
+        for rooted in [true, false] {
+            run_native_v2_snapshot_epoch_grant_case(&bundle, enable_pci, rooted);
+        }
+    }
+}
+
+fn run_native_v2_snapshot_epoch_grant_case(bundle: &Path, enable_pci: bool, rooted: bool) {
+    let transport = if enable_pci { "pci" } else { "mmio" };
+    let root_kind = if rooted { "rooted" } else { "rootless" };
+    let case = format!("{transport}-{root_kind}");
+    initialize_worker_container(bundle);
+    let baseline_sessions = session_entries();
+
+    let source_fixture = SnapshotEpochSourceGrantFixture::new(&case);
+    let mut source = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &source_fixture.manifest,
+        &source_fixture.api_socket(),
+        source_fixture.sensitive_strings(),
+        &format!("snapshot-epoch-{case}-source"),
+        enable_pci,
+    );
+    source_fixture.replace_source_file_pathnames();
+    configure_and_pause_snapshot_epoch_source(
+        &source,
+        &source_fixture.opened_metrics,
+        &source_fixture.opened_root_backing,
+        &source_fixture.opened_data_backing,
+        &source_fixture.opened_audit_backing,
+        rooted,
+    );
+
+    let create_body = snapshot_create_body();
+    assert_http_status(
+        &http_put(&source.socket, "/snapshot/create", &create_body),
+        204,
+        "create epoch snapshot",
+    );
+    let artifacts = source_fixture.artifacts();
+    assert!(artifacts.state.is_file(), "{case} state should publish");
+    assert!(artifacts.memory.is_file(), "{case} memory should publish");
+    let state_before = fs::read(&artifacts.state).expect("epoch snapshot state should read");
+    let memory_before = fs::read(&artifacts.memory).expect("epoch snapshot memory should read");
+    assert_snapshot_block_epoch(
+        &artifacts.root,
+        SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
+        &format!("{case} source primary epoch"),
+    );
+    assert_snapshot_block_epoch(
+        &artifacts.data,
+        SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+        &format!("{case} source data epoch"),
+    );
+    assert_snapshot_block_epoch(
+        &artifacts.audit,
+        SNAPSHOT_BLOCK_AUDIT_BYTE,
+        &format!("{case} source audit epoch"),
+    );
+
+    assert_http_status(
+        &http_put(
+            &source.socket,
+            "/snapshot/create",
+            &repeated_snapshot_create_body(),
+        ),
+        204,
+        "create second epoch snapshot through reused output grants",
+    );
+    let repeated = source_fixture.repeated_artifacts();
+    assert!(
+        repeated.state.is_file(),
+        "{case} repeated state should publish"
+    );
+    assert!(
+        repeated.memory.is_file(),
+        "{case} repeated memory should publish"
+    );
+    assert_http_status(
+        &http_put(&source.socket, "/snapshot/create", &create_body),
+        400,
+        "reject epoch snapshot output collision without clobber",
+    );
+    assert_eq!(
+        fs::read(&artifacts.state).expect("epoch state should survive collision"),
+        state_before
+    );
+    assert_eq!(
+        fs::read(&artifacts.memory).expect("epoch memory should survive collision"),
+        memory_before
+    );
+    assert_no_snapshot_staging(&source_fixture.state_directory);
+    assert_no_snapshot_staging(&source_fixture.memory_directory);
+    stop_running_launcher(&mut source, "granted snapshot epoch source");
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let mut current = artifacts;
+    if !enable_pci && !rooted {
+        current = run_snapshot_epoch_paused_death_case(
+            bundle,
+            current,
+            SnapshotEpochDeathOrder::WorkerFirst,
+            &baseline_sessions,
+        );
+        current = run_snapshot_epoch_paused_death_case(
+            bundle,
+            current,
+            SnapshotEpochDeathOrder::LauncherFirst,
+            &baseline_sessions,
+        );
+    }
+
+    let paused_fixture = SnapshotEpochInputGrantFixture::new(&format!("{case}-paused"), current);
+    let mut paused = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &paused_fixture.manifest,
+        &paused_fixture.api_socket(),
+        paused_fixture.sensitive_strings(),
+        &format!("snapshot-epoch-{case}-paused"),
+        enable_pci,
+    );
+    let next = paused_fixture.replace_source_pathnames();
+    configure_snapshot_epoch_destination_metrics(&paused, &format!("{case} paused destination"));
+    assert_http_status(
+        &http_put(&paused.socket, "/snapshot/load", &snapshot_load_body(false)),
+        204,
+        "load epoch snapshot paused",
+    );
+    let paused_state = http_get(&paused.socket, "/");
+    assert_http_status(&paused_state, 200, "read epoch destination state");
+    assert!(paused_state.contains(r#""state":"Paused""#));
+    assert!(
+        paused_state.contains(&format!("snapshot-epoch-{case}-paused")),
+        "{case} destination should publish a fresh process identity"
+    );
+    assert_snapshot_epoch_public_config(&paused.socket, rooted, &case);
+    assert_http_status(
+        &http_put(&paused.socket, "/snapshot/create", &snapshot_create_body()),
+        204,
+        "recapture paused epoch destination",
+    );
+    assert!(
+        paused_fixture.recaptured_artifacts().state.is_file(),
+        "{case} recaptured state should publish"
+    );
+    assert!(
+        paused_fixture.recaptured_artifacts().memory.is_file(),
+        "{case} recaptured memory should publish"
+    );
+    assert_no_snapshot_staging(&paused_fixture.state_directory);
+    assert_no_snapshot_staging(&paused_fixture.memory_directory);
+    assert_http_status(
+        &http_request(&paused.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
+        204,
+        "resume epoch snapshot",
+    );
+    assert!(
+        paused
+            .wait(&format!("{case} explicitly resumed epoch destination"))
+            .success(),
+        "{case} explicitly resumed epoch destination should power off"
+    );
+    assert_snapshot_block_epoch(
+        &next.root,
+        SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE,
+        &format!("{case} destination-one primary epoch"),
+    );
+    assert_snapshot_block_epoch(
+        &next.data,
+        SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE,
+        &format!("{case} destination-one data epoch"),
+    );
+    assert_snapshot_block_epoch(
+        &next.audit,
+        SNAPSHOT_BLOCK_AUDIT_BYTE,
+        &format!("{case} destination-one audit epoch"),
+    );
+    assert_snapshot_block_metrics(
+        &paused_fixture.opened_metrics,
+        true,
+        &format!("{case} paused destination metrics"),
+    );
+    assert_eq!(session_entries(), baseline_sessions);
+
+    let final_artifacts = if rooted {
+        next
+    } else {
+        let resumed_fixture =
+            SnapshotEpochInputGrantFixture::new(&format!("{case}-automatic"), next);
+        let mut resumed = spawn_ready_snapshot_epoch_grant_api_launcher(
+            bundle,
+            &resumed_fixture.manifest,
+            &resumed_fixture.api_socket(),
+            resumed_fixture.sensitive_strings(),
+            &format!("snapshot-epoch-{case}-automatic"),
+            enable_pci,
+        );
+        let final_artifacts = resumed_fixture.replace_source_pathnames();
+        configure_snapshot_epoch_destination_metrics(
+            &resumed,
+            &format!("{case} automatic destination"),
+        );
+        assert_http_status(
+            &http_put(&resumed.socket, "/snapshot/load", &snapshot_load_body(true)),
+            204,
+            "load and automatically resume epoch snapshot",
+        );
+        assert!(
+            resumed
+                .wait(&format!("{case} automatically resumed epoch destination"))
+                .success(),
+            "{case} automatically resumed epoch destination should power off"
+        );
+        assert_snapshot_block_epoch(
+            &final_artifacts.root,
+            SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE,
+            &format!("{case} destination-two primary epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &final_artifacts.data,
+            SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE,
+            &format!("{case} destination-two data epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &final_artifacts.audit,
+            SNAPSHOT_BLOCK_AUDIT_BYTE,
+            &format!("{case} destination-two audit epoch"),
+        );
+        assert_snapshot_block_metrics(
+            &resumed_fixture.opened_metrics,
+            true,
+            &format!("{case} automatic destination metrics"),
+        );
+        assert_eq!(session_entries(), baseline_sessions);
+        final_artifacts
+    };
+
+    assert_eq!(
+        fs::read(&final_artifacts.state).expect("final epoch state should read"),
+        state_before,
+        "{case} repeated destinations must not mutate state"
+    );
+    assert_eq!(
+        fs::read(&final_artifacts.memory).expect("final epoch memory should read"),
+        memory_before,
+        "{case} repeated destinations must not mutate memory"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SnapshotEpochDeathOrder {
+    WorkerFirst,
+    LauncherFirst,
+}
+
+fn run_snapshot_epoch_paused_death_case(
+    bundle: &Path,
+    artifacts: SnapshotArtifactSet,
+    order: SnapshotEpochDeathOrder,
+    baseline_sessions: &[PathBuf],
+) -> SnapshotArtifactSet {
+    let order_name = match order {
+        SnapshotEpochDeathOrder::WorkerFirst => "worker-first",
+        SnapshotEpochDeathOrder::LauncherFirst => "launcher-first",
+    };
+    let fixture = SnapshotEpochInputGrantFixture::new(order_name, artifacts);
+    let mut running = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &fixture.manifest,
+        &fixture.api_socket(),
+        fixture.sensitive_strings(),
+        &format!("snapshot-epoch-death-{order_name}"),
+        false,
+    );
+    let opened = fixture.replace_source_pathnames();
+    configure_snapshot_epoch_destination_metrics(
+        &running,
+        &format!("{order_name} death destination"),
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/snapshot/load",
+            &snapshot_load_body(false),
+        ),
+        204,
+        "load rootless MMIO epoch snapshot before process death",
+    );
+    assert!(
+        http_get(&running.socket, "/").contains(r#""state":"Paused""#),
+        "{order_name} death destination should publish Paused"
+    );
+    let state_before = fs::read(&opened.state).expect("death-case state should read");
+    let memory_before = fs::read(&opened.memory).expect("death-case memory should read");
+    let root_before = fs::read(&opened.root).expect("death-case primary should read");
+    let data_before = fs::read(&opened.data).expect("death-case data should read");
+    let audit_before = fs::read(&opened.audit).expect("death-case audit should read");
+    assert_eq!(session_entries().len(), baseline_sessions.len() + 1);
+
+    match order {
+        SnapshotEpochDeathOrder::WorkerFirst => {
+            let worker = only_worker_pid(&running.child);
+            // SAFETY: The worker is the one live child of this unreaped launcher.
+            assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+            assert_eq!(
+                running.wait("profile-2 worker-first death").code(),
+                Some(128 + libc::SIGKILL)
+            );
+        }
+        SnapshotEpochDeathOrder::LauncherFirst => {
+            let worker = only_worker_pid(&running.child);
+            let worker_exit = ProcessExitWatch::new(worker);
+            let launcher = i32::try_from(running.child.id()).expect("launcher PID should fit");
+            // SAFETY: The unreaped launcher owns this PID and its worker
+            // observes authenticated lifecycle EOF independently.
+            assert_eq!(unsafe { libc::kill(launcher, libc::SIGKILL) }, 0);
+            assert_eq!(
+                running.wait("profile-2 launcher-first death").signal(),
+                Some(libc::SIGKILL)
+            );
+            assert!(
+                worker_exit.wait(PROCESS_TIMEOUT),
+                "profile-2 worker should observe launcher death"
+            );
+        }
+    }
+
+    assert_eq!(session_entries(), baseline_sessions);
+    assert!(!running.socket.exists());
+    assert_eq!(
+        fs::read(&opened.state).expect("death-case state should remain"),
+        state_before
+    );
+    assert_eq!(
+        fs::read(&opened.memory).expect("death-case memory should remain"),
+        memory_before
+    );
+    assert_eq!(
+        fs::read(&opened.root).expect("death-case primary should remain"),
+        root_before
+    );
+    assert_eq!(
+        fs::read(&opened.data).expect("death-case data should remain"),
+        data_before
+    );
+    assert_eq!(
+        fs::read(&opened.audit).expect("death-case audit should remain"),
+        audit_before
+    );
+    assert_no_snapshot_staging(&fixture.state_directory);
+    assert_no_snapshot_staging(&fixture.memory_directory);
+    opened
 }
 
 #[test]
@@ -6883,6 +7265,253 @@ impl SnapshotSourceGrantFixture {
     }
 }
 
+#[derive(Debug)]
+struct SnapshotEpochSourceGrantFixture {
+    _root: TestDir,
+    _socket_root: TestDir,
+    manifest: PathBuf,
+    kernel: PathBuf,
+    initrd: PathBuf,
+    metrics: PathBuf,
+    root_backing: PathBuf,
+    data_backing: PathBuf,
+    audit_backing: PathBuf,
+    api_directory: PathBuf,
+    state_directory: PathBuf,
+    memory_directory: PathBuf,
+    opened_kernel: PathBuf,
+    opened_initrd: PathBuf,
+    opened_metrics: PathBuf,
+    opened_root_backing: PathBuf,
+    opened_data_backing: PathBuf,
+    opened_audit_backing: PathBuf,
+}
+
+impl SnapshotEpochSourceGrantFixture {
+    fn new(case: &str) -> Self {
+        let root = TestDir::new(&format!("snapshot-epoch-source-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("snapshot epoch source root should canonicalize");
+        let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let socket_root = TestDir(
+            PathBuf::from("/private/tmp").join(format!("bbse-{}-{socket_id}", std::process::id())),
+        );
+        fs::create_dir(socket_root.path()).expect("short snapshot epoch socket root should create");
+        let manifest = canonical_root.join("grant-manifest.json");
+        let kernel = canonical_root.join("snapshot-kernel.image");
+        let initrd = canonical_root.join("snapshot-initrd.cpio");
+        let metrics = canonical_root.join("snapshot.metrics");
+        let root_backing = canonical_root.join("snapshot-primary.img");
+        let data_backing = canonical_root.join("snapshot-data.img");
+        let audit_backing = canonical_root.join("snapshot-audit.img");
+        let api_directory = socket_root.path().join("a");
+        let state_directory = canonical_root.join("state-output");
+        let memory_directory = canonical_root.join("memory-output");
+        let opened_kernel = canonical_root.join("opened-snapshot-kernel.image");
+        let opened_initrd = canonical_root.join("opened-snapshot-initrd.cpio");
+        let opened_metrics = canonical_root.join("opened-snapshot.metrics");
+        let opened_root_backing = canonical_root.join("opened-snapshot-primary.img");
+        let opened_data_backing = canonical_root.join("opened-snapshot-data.img");
+        let opened_audit_backing = canonical_root.join("opened-snapshot-audit.img");
+
+        hard_link_or_copy_fixture(&guest_kernel(), &kernel, "snapshot epoch guest kernel");
+        hard_link_or_copy_fixture(&guest_initrd(), &initrd, "snapshot epoch guest initrd");
+        fs::write(&metrics, b"").expect("snapshot epoch metrics fixture should write");
+        create_snapshot_block_epoch_backing(&root_backing, SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE);
+        create_snapshot_block_epoch_backing(&data_backing, SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE);
+        create_snapshot_block_epoch_backing(&audit_backing, SNAPSHOT_BLOCK_AUDIT_BYTE);
+        fs::create_dir(&api_directory).expect("epoch API directory should create");
+        fs::create_dir(&state_directory).expect("epoch state output directory should create");
+        fs::create_dir(&memory_directory).expect("epoch memory output directory should create");
+
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": SNAPSHOT_KERNEL_ID,
+                    "role": "kernel-image",
+                    "access": "read-only",
+                    "source": path_text(&kernel),
+                },
+                {
+                    "id": SNAPSHOT_INITRD_ID,
+                    "role": "initrd-image",
+                    "access": "read-only",
+                    "source": path_text(&initrd),
+                },
+                {
+                    "id": SNAPSHOT_METRICS_ID,
+                    "role": "metrics-sink",
+                    "access": "write-only",
+                    "source": path_text(&metrics),
+                },
+                {
+                    "id": SNAPSHOT_ROOT_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&root_backing),
+                },
+                {
+                    "id": SNAPSHOT_DATA_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&data_backing),
+                },
+                {
+                    "id": SNAPSHOT_AUDIT_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&audit_backing),
+                },
+                {
+                    "id": API_SOCKET_DIRECTORY_ID,
+                    "role": "api-socket-directory",
+                    "access": "create-children",
+                    "source": path_text(&api_directory),
+                },
+                {
+                    "id": SNAPSHOT_STATE_OUTPUT_ID,
+                    "role": "snapshot-output-directory",
+                    "access": "create-children",
+                    "source": path_text(&state_directory),
+                },
+                {
+                    "id": SNAPSHOT_MEMORY_OUTPUT_ID,
+                    "role": "snapshot-output-directory",
+                    "access": "create-children",
+                    "source": path_text(&memory_directory),
+                },
+            ],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("snapshot epoch manifest should serialize"),
+        )
+        .expect("snapshot epoch manifest should write");
+
+        Self {
+            _root: root,
+            _socket_root: socket_root,
+            manifest,
+            kernel,
+            initrd,
+            metrics,
+            root_backing,
+            data_backing,
+            audit_backing,
+            api_directory,
+            state_directory,
+            memory_directory,
+            opened_kernel,
+            opened_initrd,
+            opened_metrics,
+            opened_root_backing,
+            opened_data_backing,
+            opened_audit_backing,
+        }
+    }
+
+    fn replace_source_file_pathnames(&self) {
+        for (source, opened) in [
+            (&self.kernel, &self.opened_kernel),
+            (&self.initrd, &self.opened_initrd),
+            (&self.metrics, &self.opened_metrics),
+            (&self.root_backing, &self.opened_root_backing),
+            (&self.data_backing, &self.opened_data_backing),
+            (&self.audit_backing, &self.opened_audit_backing),
+        ] {
+            fs::rename(source, opened).expect("launcher-opened snapshot epoch file should move");
+        }
+        fs::write(&self.kernel, b"replacement kernel must not boot")
+            .expect("replacement snapshot epoch kernel should write");
+        fs::write(&self.initrd, b"replacement initrd must not boot")
+            .expect("replacement snapshot epoch initrd should write");
+        fs::write(&self.metrics, b"replacement metrics must remain unused\n")
+            .expect("replacement snapshot epoch metrics should write");
+        fs::write(&self.root_backing, vec![0xff_u8; 4096])
+            .expect("replacement snapshot epoch primary should write");
+        fs::write(&self.data_backing, vec![0xee_u8; 4096])
+            .expect("replacement snapshot epoch data should write");
+        fs::write(&self.audit_backing, vec![0xdd_u8; 4096])
+            .expect("replacement snapshot epoch audit should write");
+    }
+
+    fn artifacts(&self) -> SnapshotArtifactSet {
+        self.artifacts_with_children(SNAPSHOT_STATE_CHILD, SNAPSHOT_MEMORY_CHILD)
+    }
+
+    fn repeated_artifacts(&self) -> SnapshotArtifactSet {
+        self.artifacts_with_children(SNAPSHOT_REPEAT_STATE_CHILD, SNAPSHOT_REPEAT_MEMORY_CHILD)
+    }
+
+    fn api_socket(&self) -> PathBuf {
+        self.api_directory.join(API_SOCKET_CHILD)
+    }
+
+    fn artifacts_with_children(
+        &self,
+        state_child: &str,
+        memory_child: &str,
+    ) -> SnapshotArtifactSet {
+        SnapshotArtifactSet {
+            state: self.state_directory.join(state_child),
+            memory: self.memory_directory.join(memory_child),
+            root: self.opened_root_backing.clone(),
+            data: self.opened_data_backing.clone(),
+            audit: self.opened_audit_backing.clone(),
+        }
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.manifest),
+            path_text(&self.kernel),
+            path_text(&self.initrd),
+            path_text(&self.metrics),
+            path_text(&self.root_backing),
+            path_text(&self.data_backing),
+            path_text(&self.audit_backing),
+            path_text(&self.api_directory),
+            path_text(&self.state_directory),
+            path_text(&self.memory_directory),
+            path_text(&self.opened_kernel),
+            path_text(&self.opened_initrd),
+            path_text(&self.opened_metrics),
+            path_text(&self.opened_root_backing),
+            path_text(&self.opened_data_backing),
+            path_text(&self.opened_audit_backing),
+            SNAPSHOT_KERNEL_ID,
+            SNAPSHOT_INITRD_ID,
+            SNAPSHOT_METRICS_ID,
+            SNAPSHOT_ROOT_ID,
+            SNAPSHOT_DATA_ID,
+            SNAPSHOT_AUDIT_ID,
+            API_SOCKET_DIRECTORY_ID,
+            SNAPSHOT_STATE_OUTPUT_ID,
+            SNAPSHOT_MEMORY_OUTPUT_ID,
+            SNAPSHOT_KERNEL_REF,
+            SNAPSHOT_INITRD_REF,
+            SNAPSHOT_METRICS_REF,
+            SNAPSHOT_ROOT_REF,
+            SNAPSHOT_DATA_REF,
+            SNAPSHOT_AUDIT_REF,
+            API_SOCKET_REF,
+            API_SOCKET_CHILD,
+            SNAPSHOT_STATE_OUTPUT_REF,
+            SNAPSHOT_MEMORY_OUTPUT_REF,
+            SNAPSHOT_REPEAT_STATE_OUTPUT_REF,
+            SNAPSHOT_REPEAT_MEMORY_OUTPUT_REF,
+            SNAPSHOT_STATE_CHILD,
+            SNAPSHOT_MEMORY_CHILD,
+            SNAPSHOT_REPEAT_STATE_CHILD,
+            SNAPSHOT_REPEAT_MEMORY_CHILD,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
 fn hard_link_or_copy_fixture(source: &Path, destination: &Path, context: &str) {
     if let Err(link_error) = fs::hard_link(source, destination) {
         fs::copy(source, destination).unwrap_or_else(|copy_error| {
@@ -7011,6 +7640,212 @@ impl SnapshotInputGrantFixture {
             SNAPSHOT_ROOT_REF,
             SNAPSHOT_DATA_REF,
             SNAPSHOT_AUDIT_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
+#[derive(Debug)]
+struct SnapshotEpochInputGrantFixture {
+    _root: TestDir,
+    _socket_root: TestDir,
+    manifest: PathBuf,
+    sources: SnapshotArtifactSet,
+    opened: SnapshotArtifactSet,
+    metrics: PathBuf,
+    opened_metrics: PathBuf,
+    api_directory: PathBuf,
+    state_directory: PathBuf,
+    memory_directory: PathBuf,
+}
+
+impl SnapshotEpochInputGrantFixture {
+    fn new(case: &str, sources: SnapshotArtifactSet) -> Self {
+        let root = TestDir::new(&format!("snapshot-epoch-input-{case}"));
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("snapshot epoch input root should canonicalize");
+        let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let socket_root = TestDir(
+            PathBuf::from("/private/tmp").join(format!("bbsi-{}-{socket_id}", std::process::id())),
+        );
+        fs::create_dir(socket_root.path()).expect("short snapshot input socket root should create");
+        let manifest = canonical_root.join("grant-manifest.json");
+        let metrics = canonical_root.join("snapshot.metrics");
+        let opened_metrics = canonical_root.join("opened-snapshot.metrics");
+        let api_directory = socket_root.path().join("a");
+        let state_directory = canonical_root.join("state-output");
+        let memory_directory = canonical_root.join("memory-output");
+        fs::write(&metrics, b"").expect("snapshot epoch input metrics should write");
+        fs::create_dir(&api_directory).expect("snapshot epoch input API directory should create");
+        fs::create_dir(&state_directory).expect("epoch recapture state directory should create");
+        fs::create_dir(&memory_directory).expect("epoch recapture memory directory should create");
+        let opened = SnapshotArtifactSet {
+            state: replacement_opened_path(&sources.state, case),
+            memory: replacement_opened_path(&sources.memory, case),
+            root: replacement_opened_path(&sources.root, case),
+            data: replacement_opened_path(&sources.data, case),
+            audit: replacement_opened_path(&sources.audit, case),
+        };
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [
+                {
+                    "id": SNAPSHOT_STATE_INPUT_ID,
+                    "role": "snapshot-state-input",
+                    "access": "read-only",
+                    "source": path_text(&sources.state),
+                },
+                {
+                    "id": SNAPSHOT_MEMORY_INPUT_ID,
+                    "role": "snapshot-memory-input",
+                    "access": "read-only",
+                    "source": path_text(&sources.memory),
+                },
+                {
+                    "id": SNAPSHOT_ROOT_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&sources.root),
+                },
+                {
+                    "id": SNAPSHOT_DATA_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&sources.data),
+                },
+                {
+                    "id": SNAPSHOT_AUDIT_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&sources.audit),
+                },
+                {
+                    "id": SNAPSHOT_METRICS_ID,
+                    "role": "metrics-sink",
+                    "access": "write-only",
+                    "source": path_text(&metrics),
+                },
+                {
+                    "id": API_SOCKET_DIRECTORY_ID,
+                    "role": "api-socket-directory",
+                    "access": "create-children",
+                    "source": path_text(&api_directory),
+                },
+                {
+                    "id": SNAPSHOT_STATE_OUTPUT_ID,
+                    "role": "snapshot-output-directory",
+                    "access": "create-children",
+                    "source": path_text(&state_directory),
+                },
+                {
+                    "id": SNAPSHOT_MEMORY_OUTPUT_ID,
+                    "role": "snapshot-output-directory",
+                    "access": "create-children",
+                    "source": path_text(&memory_directory),
+                },
+            ],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json)
+                .expect("snapshot epoch input manifest should serialize"),
+        )
+        .expect("snapshot epoch input manifest should write");
+        Self {
+            _root: root,
+            _socket_root: socket_root,
+            manifest,
+            sources,
+            opened,
+            metrics,
+            opened_metrics,
+            api_directory,
+            state_directory,
+            memory_directory,
+        }
+    }
+
+    fn replace_source_pathnames(&self) -> SnapshotArtifactSet {
+        for (source, opened) in [
+            (&self.sources.state, &self.opened.state),
+            (&self.sources.memory, &self.opened.memory),
+            (&self.sources.root, &self.opened.root),
+            (&self.sources.data, &self.opened.data),
+            (&self.sources.audit, &self.opened.audit),
+            (&self.metrics, &self.opened_metrics),
+        ] {
+            fs::rename(source, opened).expect("launcher-opened snapshot epoch input should move");
+        }
+        fs::write(&self.sources.state, b"replacement state must not load")
+            .expect("replacement snapshot epoch state should write");
+        fs::write(&self.sources.memory, b"replacement memory must not load")
+            .expect("replacement snapshot epoch memory should write");
+        fs::write(&self.sources.root, vec![0xff_u8; 4096])
+            .expect("replacement snapshot epoch primary must not load");
+        fs::write(&self.sources.data, vec![0xee_u8; 4096])
+            .expect("replacement snapshot epoch data must not load");
+        fs::write(&self.sources.audit, vec![0xdd_u8; 4096])
+            .expect("replacement snapshot epoch audit must not load");
+        fs::write(&self.metrics, b"replacement metrics must remain unused\n")
+            .expect("replacement snapshot epoch metrics should write");
+        self.opened.clone()
+    }
+
+    fn api_socket(&self) -> PathBuf {
+        self.api_directory.join(API_SOCKET_CHILD)
+    }
+
+    fn recaptured_artifacts(&self) -> SnapshotArtifactSet {
+        SnapshotArtifactSet {
+            state: self.state_directory.join(SNAPSHOT_STATE_CHILD),
+            memory: self.memory_directory.join(SNAPSHOT_MEMORY_CHILD),
+            root: self.opened.root.clone(),
+            data: self.opened.data.clone(),
+            audit: self.opened.audit.clone(),
+        }
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.manifest),
+            path_text(&self.sources.state),
+            path_text(&self.sources.memory),
+            path_text(&self.sources.root),
+            path_text(&self.sources.data),
+            path_text(&self.sources.audit),
+            path_text(&self.opened.state),
+            path_text(&self.opened.memory),
+            path_text(&self.opened.root),
+            path_text(&self.opened.data),
+            path_text(&self.opened.audit),
+            path_text(&self.metrics),
+            path_text(&self.opened_metrics),
+            path_text(&self.api_directory),
+            path_text(&self.state_directory),
+            path_text(&self.memory_directory),
+            SNAPSHOT_STATE_INPUT_ID,
+            SNAPSHOT_MEMORY_INPUT_ID,
+            SNAPSHOT_ROOT_ID,
+            SNAPSHOT_DATA_ID,
+            SNAPSHOT_AUDIT_ID,
+            SNAPSHOT_METRICS_ID,
+            API_SOCKET_DIRECTORY_ID,
+            SNAPSHOT_STATE_OUTPUT_ID,
+            SNAPSHOT_MEMORY_OUTPUT_ID,
+            SNAPSHOT_STATE_INPUT_REF,
+            SNAPSHOT_MEMORY_INPUT_REF,
+            SNAPSHOT_ROOT_REF,
+            SNAPSHOT_DATA_REF,
+            SNAPSHOT_AUDIT_REF,
+            SNAPSHOT_METRICS_REF,
+            API_SOCKET_REF,
+            API_SOCKET_CHILD,
+            SNAPSHOT_STATE_OUTPUT_REF,
+            SNAPSHOT_MEMORY_OUTPUT_REF,
+            SNAPSHOT_STATE_CHILD,
+            SNAPSHOT_MEMORY_CHILD,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -9713,6 +10548,50 @@ fn spawn_ready_snapshot_grant_api_launcher(
     }
 }
 
+fn spawn_ready_snapshot_epoch_grant_api_launcher(
+    bundle: &Path,
+    manifest: &Path,
+    socket: &Path,
+    sensitive: Vec<String>,
+    name: &str,
+    enable_pci: bool,
+) -> RunningApiLauncher {
+    initialize_worker_container(bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let mut command = Command::new(launcher(bundle));
+    command.arg(GRANT_MANIFEST_OPTION).arg(manifest).arg("--");
+    if enable_pci {
+        command.arg("--enable-pci");
+    }
+    let mut child = command
+        .args(["--api-sock", API_SOCKET_REF])
+        .args(["--id", &format!("{name}-{test_id}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("snapshot epoch grant launcher should start");
+    let (ready, stdout_reader) = read_stdout_until_ready(&mut child);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "snapshot epoch grant API should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    RunningApiLauncher {
+        child,
+        socket: socket.to_path_buf(),
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive,
+        completed: false,
+    }
+}
+
 fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_path: &Path) {
     for (path, body, context) in [
         (
@@ -9798,6 +10677,263 @@ fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_pat
         204,
         "pause snapshot source",
     );
+}
+
+fn configure_and_pause_snapshot_epoch_source(
+    running: &RunningApiLauncher,
+    metrics_path: &Path,
+    primary_path: &Path,
+    data_path: &Path,
+    audit_path: &Path,
+    rooted: bool,
+) {
+    for (path, body, context) in [
+        (
+            "/machine-config",
+            serde_json::json!({
+                "vcpu_count": 1,
+                "mem_size_mib": 256,
+            }),
+            "PUT snapshot epoch machine config",
+        ),
+        (
+            "/metrics",
+            serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}),
+            "PUT snapshot epoch metrics",
+        ),
+        (
+            "/boot-source",
+            serde_json::json!({
+                "kernel_image_path": SNAPSHOT_KERNEL_REF,
+                "initrd_path": SNAPSHOT_INITRD_REF,
+                "boot_args": SNAPSHOT_BLOCK_BOOT_ARGS,
+            }),
+            "PUT snapshot epoch boot source",
+        ),
+        (
+            "/drives/primary",
+            serde_json::json!({
+                "drive_id": "primary",
+                "path_on_host": SNAPSHOT_ROOT_REF,
+                "is_root_device": rooted,
+                "is_read_only": false,
+                "cache_type": "Unsafe",
+                "io_engine": "Async",
+                "rate_limiter": {
+                    "ops": {
+                        "size": 1,
+                        "refill_time": 1000,
+                    },
+                },
+            }),
+            "PUT snapshot epoch writable Async Unsafe primary",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": SNAPSHOT_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
+                "io_engine": "Sync",
+                "partuuid": SNAPSHOT_BLOCK_PARTUUID,
+            }),
+            "PUT snapshot epoch writable Sync Writeback data",
+        ),
+        (
+            "/drives/audit",
+            serde_json::json!({
+                "drive_id": "audit",
+                "path_on_host": SNAPSHOT_AUDIT_REF,
+                "is_root_device": false,
+                "is_read_only": true,
+                "cache_type": "Unsafe",
+                "io_engine": "Async",
+            }),
+            "PUT snapshot epoch read-only Async Unsafe audit",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body).expect("snapshot epoch request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ),
+        204,
+        "start snapshot epoch source",
+    );
+    wait_for_snapshot_block_epoch(
+        data_path,
+        SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+        PROCESS_TIMEOUT,
+        "contained source data pre-capture epoch",
+    );
+    assert_snapshot_block_epoch(
+        primary_path,
+        SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
+        "contained source primary pre-capture epoch",
+    );
+    assert_snapshot_block_epoch(
+        audit_path,
+        SNAPSHOT_BLOCK_AUDIT_BYTE,
+        "contained source audit epoch",
+    );
+    assert_http_status(
+        &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
+        204,
+        "pause snapshot epoch source",
+    );
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/actions",
+            r#"{"action_type":"FlushMetrics"}"#,
+        ),
+        204,
+        "flush snapshot epoch source metrics",
+    );
+    assert_snapshot_block_metrics(metrics_path, true, "contained source metrics");
+}
+
+fn configure_snapshot_epoch_destination_metrics(running: &RunningApiLauncher, context: &str) {
+    assert_http_status(
+        &http_put(
+            &running.socket,
+            "/metrics",
+            &serde_json::to_string(&serde_json::json!({"metrics_path": SNAPSHOT_METRICS_REF}))
+                .expect("snapshot epoch destination metrics should serialize"),
+        ),
+        204,
+        &format!("PUT {context} metrics"),
+    );
+}
+
+fn assert_snapshot_epoch_public_config(socket: &Path, rooted: bool, context: &str) {
+    let config = http_get(socket, "/vm/config");
+    assert_http_status(&config, 200, "read restored snapshot epoch configuration");
+    for expected in [
+        r#""drive_id":"primary""#,
+        r#""drive_id":"data""#,
+        r#""drive_id":"audit""#,
+        r#""is_read_only":false"#,
+        r#""is_read_only":true"#,
+        r#""cache_type":"Unsafe""#,
+        r#""cache_type":"Writeback""#,
+        r#""io_engine":"Async""#,
+        r#""io_engine":"Sync""#,
+        SNAPSHOT_BLOCK_PARTUUID,
+        r#""rate_limiter""#,
+    ] {
+        assert!(
+            config.contains(expected),
+            "{context} restored configuration should contain {expected}; response:\n{config}"
+        );
+    }
+    assert_eq!(
+        config.contains(r#""is_root_device":true"#),
+        rooted,
+        "{context} restored root role should be exact"
+    );
+    assert_eq!(
+        config.matches(r#""drive_id":"#).count(),
+        3,
+        "{context} restore should publish exactly three drives"
+    );
+}
+
+fn create_snapshot_block_epoch_backing(path: &Path, initial: u8) {
+    let mut bytes = vec![0_u8; 8 * SNAPSHOT_BLOCK_SECTOR_SIZE];
+    bytes[..SNAPSHOT_BLOCK_SECTOR_SIZE].fill(initial);
+    fs::write(path, bytes).unwrap_or_else(|error| {
+        panic!(
+            "snapshot block epoch backing {} should write: {error}",
+            path.display()
+        )
+    });
+}
+
+fn snapshot_block_epoch(value: u8) -> Vec<u8> {
+    vec![value; SNAPSHOT_BLOCK_SECTOR_SIZE]
+}
+
+fn wait_for_snapshot_block_epoch(path: &Path, value: u8, timeout: Duration, context: &str) {
+    wait_for_file_prefix(path, &snapshot_block_epoch(value), timeout)
+        .unwrap_or_else(|error| panic!("{context} should become visible: {error}"));
+}
+
+fn assert_snapshot_block_epoch(path: &Path, value: u8, context: &str) {
+    let bytes =
+        fs::read(path).unwrap_or_else(|error| panic!("{context} backing should read: {error}"));
+    assert_eq!(
+        bytes.get(..SNAPSHOT_BLOCK_SECTOR_SIZE),
+        Some(snapshot_block_epoch(value).as_slice()),
+        "{context} should retain the exact sector epoch"
+    );
+}
+
+fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {
+    let output = fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!("{context} metrics {} should read: {error}", path.display())
+    });
+    for (drive_id, expect_write) in [("primary", true), ("data", true), ("audit", false)] {
+        assert!(
+            snapshot_block_metric_total(path, drive_id, "queue_event_count") > 0,
+            "{context} should report queue events for {drive_id}"
+        );
+        assert!(
+            snapshot_block_metric_total(path, drive_id, "read_count") > 0,
+            "{context} should report reads for {drive_id}"
+        );
+        if expect_write {
+            assert!(
+                snapshot_block_metric_total(path, drive_id, "write_count") > 0,
+                "{context} should report writes for {drive_id}"
+            );
+        } else {
+            assert_eq!(
+                snapshot_block_metric_total(path, drive_id, "write_count"),
+                0,
+                "{context} must not report an audit write"
+            );
+        }
+    }
+    if expect_limiter {
+        assert!(
+            snapshot_block_metric_total(path, "primary", "rate_limiter_throttled_events") > 0,
+            "{context} should report a throttled primary request; metrics:\n{output}"
+        );
+    }
+}
+
+fn snapshot_block_metric_total(path: &Path, drive_id: &str, field: &str) -> u64 {
+    let section = format!("block_{drive_id}");
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "snapshot block metrics {} should read: {error}",
+                path.display()
+            )
+        })
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get(&section)?
+                .get(field)?
+                .as_u64()
+        })
+        .fold(0, u64::saturating_add)
 }
 
 fn wait_for_snapshot_root_read(socket: &Path, metrics: &Path, timeout: Duration) {

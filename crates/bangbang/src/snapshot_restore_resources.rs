@@ -3272,6 +3272,89 @@ mod tests {
         (prepared, first, second)
     }
 
+    fn contained_profile_2_lengths() -> [u64; 2] {
+        [
+            fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contained_session.rs"))
+                .expect("read-only grant metadata should read")
+                .len(),
+            fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vmm.rs"))
+                .expect("read-write grant metadata should read")
+                .len(),
+        ]
+    }
+
+    fn contained_profile_2_request(
+        selectors: [&Path; 2],
+        read_only: [bool; 2],
+        expected_lengths: [u64; 2],
+    ) -> RequestedSnapshotMultiDriveRestoreResources {
+        let graph = multi_fixture_graph(None, None);
+        let mut drives = Vec::new();
+        let mut drive_keys = Vec::new();
+        let mut resources = Vec::new();
+        let mut configs = DriveConfigs::new();
+        for (index, record) in graph.records().iter().enumerate() {
+            let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id())
+                .expect("fixture public ID should validate");
+            let key = SnapshotRestoreResourceKey::new(
+                record.key(),
+                public_id,
+                SnapshotRestoreResourceClass::BlockBacking,
+            );
+            let mut input = DriveConfigInput::new(
+                record.config().drive_id(),
+                record.config().drive_id(),
+                selectors[index],
+                record.is_root(),
+            )
+            .with_is_read_only(read_only[index])
+            .with_cache_type(record.config().cache_type())
+            .with_io_engine(record.config().io_engine());
+            if let Some(partuuid) = record.config().partuuid() {
+                input = input.with_partuuid(partuuid);
+            }
+            if let Some(rate_limiter) = record.config().rate_limiter() {
+                input = input.with_rate_limiter(rate_limiter);
+            }
+            configs
+                .insert(input)
+                .expect("contained profile-2 config should validate");
+            drives.push(RequestedSnapshotDriveRestoreResource {
+                key: key.clone(),
+                selector: selectors[index].to_path_buf(),
+                is_read_only: read_only[index],
+                expected_len: expected_lengths[index],
+            });
+            drive_keys.push(key.clone());
+            resources.push(key);
+        }
+        let manifest = SnapshotRestoreManifest::try_new(resources, Vec::new())
+            .expect("contained profile-2 manifest should validate");
+        let bindings = manifest
+            .try_into_bindings()
+            .expect("contained profile-2 bindings should allocate");
+        RequestedSnapshotMultiDriveRestoreResources {
+            drives,
+            drive_keys,
+            drive_configs: configs,
+            bindings,
+        }
+    }
+
+    fn assert_profile_2_grants_reusable(authority: &GrantAuthority) {
+        for (selector, access) in [
+            (Path::new("bangbang-grant:drive-ro"), GrantAccess::ReadOnly),
+            (Path::new("bangbang-grant:drive-rw"), GrantAccess::ReadWrite),
+        ] {
+            authority
+                .prepare_drive_backing_claim(selector, access)
+                .expect("retryable profile-2 failure should retain authority")
+                .expect("profile-2 selector should remain contained")
+                .abort()
+                .expect("observed profile-2 claim should restore");
+        }
+    }
+
     #[derive(Debug)]
     struct TestPrivateMultiBlockDestination {
         bundle: Option<PreparedSnapshotV2MultiBlockBundle>,
@@ -4112,6 +4195,329 @@ mod tests {
                 .expect("selector should remain contained")
                 .abort()
                 .expect("restored grant should remain reusable");
+        }
+    }
+
+    #[test]
+    fn profile_2_contained_authority_failures_are_preconstruction_retryable_and_reusable() {
+        let exact_selectors = [
+            Path::new("bangbang-grant:drive-ro"),
+            Path::new("bangbang-grant:drive-rw"),
+        ];
+        let exact_access = [true, false];
+        let exact_lengths = contained_profile_2_lengths();
+        let mut diagnostics = Vec::new();
+
+        let missing_backing = TempRoot::new(
+            "profile-2-missing",
+            &vec![0x71; usize::try_from(exact_lengths[0]).expect("fixture length should fit")],
+        );
+        let missing = contained_restore_authority_with_grants_for_test(
+            root_file_grant_authority_for_test(missing_backing.path()),
+            false,
+        );
+        let error = contained_profile_2_request(exact_selectors, exact_access, exact_lengths)
+            .prepare(Some(missing.authority()), || false)
+            .expect_err("missing second selector must fail complete-set reservation");
+        assert_eq!(
+            error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert!(!error.cleanup_failed);
+        diagnostics.push(format!("{error:?} {error}"));
+        missing
+            .grants()
+            .prepare_drive_backing_claim(exact_selectors[0], GrantAccess::ReadOnly)
+            .expect("missing-set failure should retain the present claim")
+            .expect("present claim should remain contained")
+            .abort()
+            .expect("present claim should restore");
+
+        for (name, selectors, access, lengths, with_vsock) in [
+            (
+                "alias",
+                [exact_selectors[0], exact_selectors[0]],
+                [true, true],
+                [exact_lengths[0], exact_lengths[0]],
+                false,
+            ),
+            (
+                "wrong-access",
+                exact_selectors,
+                [false, false],
+                exact_lengths,
+                false,
+            ),
+            (
+                "wrong-role",
+                [Path::new("bangbang-grant:kernel"), exact_selectors[1]],
+                exact_access,
+                [
+                    fs::metadata(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+                        .expect("kernel-role fixture metadata should read")
+                        .len(),
+                    exact_lengths[1],
+                ],
+                false,
+            ),
+            (
+                "wrong-kind",
+                [
+                    Path::new("bangbang-grant:vsock-directory"),
+                    exact_selectors[1],
+                ],
+                exact_access,
+                exact_lengths,
+                true,
+            ),
+            (
+                "wrong-size",
+                exact_selectors,
+                exact_access,
+                [exact_lengths[0].saturating_add(1), exact_lengths[1]],
+                false,
+            ),
+        ] {
+            let fixture = contained_restore_authority_with_grants_for_test(
+                file_grant_authority_for_test(),
+                with_vsock,
+            );
+            let error = contained_profile_2_request(selectors, access, lengths)
+                .prepare(Some(fixture.authority()), || false)
+                .unwrap_err();
+            assert_eq!(
+                error.stage,
+                SnapshotRestoreResourceStage::ContainedReservation,
+                "{name} should fail during complete-set reservation"
+            );
+            assert_eq!(
+                error.disposition,
+                SnapshotRestoreResourceDisposition::Retryable,
+                "{name} should remain retryable"
+            );
+            assert!(!error.cleanup_failed, "{name} cleanup should remain exact");
+            diagnostics.push(format!("{error:?} {error}"));
+            assert_profile_2_grants_reusable(fixture.grants());
+            fixture.assert_authorities_available(with_vsock);
+        }
+
+        let swapped = contained_restore_authority_with_grants_for_test(
+            file_grant_authority_for_test(),
+            false,
+        );
+        let request = contained_profile_2_request(exact_selectors, exact_access, exact_lengths);
+        let contained_requests = request
+            .drives
+            .iter()
+            .map(|drive| {
+                ContainedSnapshotRestoreDriveRequest::new(
+                    &drive.selector,
+                    if drive.is_read_only {
+                        GrantAccess::ReadOnly
+                    } else {
+                        GrantAccess::ReadWrite
+                    },
+                    Some(drive.expected_len),
+                )
+            })
+            .collect::<Vec<_>>();
+        let reserved = swapped
+            .authority()
+            .prepare_drives(&contained_requests, None, &|| false)
+            .expect("swapped-claim fixture should reserve");
+        let (mut claims, vsock, transaction) = reserved
+            .into_drive_parts()
+            .expect("swapped-claim fixture should split");
+        assert!(vsock.is_none());
+        claims.swap(0, 1);
+        let failure = prepare_contained_drives(&request.drives, claims, &|| false)
+            .expect_err("swapped descriptor bindings must fail before construction");
+        let (error, resources, claims) = *failure;
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::DrivePreparation);
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        let outcome = abort_prepared_drive_claims(claims)
+            .merge(abort_prepared_drive_resources(resources))
+            .merge(abort_contained_transaction(Some(transaction)));
+        assert_eq!(
+            outcome.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert!(!outcome.cleanup_failed);
+        diagnostics.push(format!("{error:?} {error}"));
+        assert_profile_2_grants_reusable(swapped.grants());
+
+        let extra = contained_restore_authority_with_grants_for_test(
+            file_grant_authority_for_test(),
+            false,
+        );
+        let extra_claims = contained_restore_authority_with_grants_for_test(
+            file_grant_authority_for_test(),
+            false,
+        );
+        let request = contained_profile_2_request(exact_selectors, exact_access, exact_lengths);
+        let contained_requests = request
+            .drives
+            .iter()
+            .map(|drive| {
+                ContainedSnapshotRestoreDriveRequest::new(
+                    &drive.selector,
+                    if drive.is_read_only {
+                        GrantAccess::ReadOnly
+                    } else {
+                        GrantAccess::ReadWrite
+                    },
+                    Some(drive.expected_len),
+                )
+            })
+            .collect::<Vec<_>>();
+        let reserved = extra
+            .authority()
+            .prepare_drives(&contained_requests, None, &|| false)
+            .expect("extra-claim fixture should reserve the exact vector");
+        let (mut claims, vsock, transaction) = reserved
+            .into_drive_parts()
+            .expect("extra-claim fixture should split");
+        assert!(vsock.is_none());
+        claims.push(
+            extra_claims
+                .grants()
+                .prepare_drive_backing_claim(exact_selectors[0], GrantAccess::ReadOnly)
+                .expect("extra claim should validate")
+                .expect("extra selector should remain contained"),
+        );
+        let failure = prepare_contained_drives(&request.drives, claims, &|| false)
+            .expect_err("extra prepared claims must fail before construction");
+        let (error, resources, claims) = *failure;
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::DrivePreflight);
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+        assert!(resources.is_empty());
+        let outcome = abort_prepared_drive_claims(claims)
+            .merge(abort_prepared_drive_resources(resources))
+            .merge(abort_contained_transaction(Some(transaction)));
+        assert_eq!(
+            outcome.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert!(!outcome.cleanup_failed);
+        diagnostics.push(format!("{error:?} {error}"));
+        assert_profile_2_grants_reusable(extra.grants());
+        assert_profile_2_grants_reusable(extra_claims.grants());
+
+        let changed_backing = TempRoot::new("profile-2-changed-geometry", &[0x72; 4096]);
+        let changed = contained_restore_authority_with_grants_for_test(
+            root_file_grant_authority_for_test(changed_backing.path()),
+            false,
+        );
+        let mut request = contained_profile_2_request(exact_selectors, exact_access, exact_lengths);
+        request.drives[0].expected_len = 4096;
+        let contained_request = [ContainedSnapshotRestoreDriveRequest::new(
+            &request.drives[0].selector,
+            GrantAccess::ReadOnly,
+            Some(request.drives[0].expected_len),
+        )];
+        let reserved = changed
+            .authority()
+            .prepare_drives(&contained_request, None, &|| false)
+            .expect("changed-geometry fixture should reserve");
+        fs::write(changed_backing.path(), [0x73; 4097])
+            .expect("reserved backing geometry should change before adoption");
+        let (claims, vsock, transaction) = reserved
+            .into_drive_parts()
+            .expect("changed-geometry fixture should split");
+        assert!(vsock.is_none());
+        let failure = prepare_contained_drives(&request.drives[..1], claims, &|| false)
+            .expect_err("changed backing geometry must fail before construction");
+        let (error, resources, claims) = *failure;
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::DrivePreflight);
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert!(resources.is_empty());
+        let outcome = abort_prepared_drive_claims(claims)
+            .merge(abort_prepared_drive_resources(resources))
+            .merge(abort_contained_transaction(Some(transaction)));
+        assert_eq!(
+            outcome.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert!(!outcome.cleanup_failed);
+        diagnostics.push(format!("{error:?} {error}"));
+        fs::write(changed_backing.path(), [0x72; 4096])
+            .expect("changed backing geometry should reset after cleanup");
+        changed
+            .grants()
+            .prepare_drive_backing_claim(exact_selectors[0], GrantAccess::ReadOnly)
+            .expect("changed-geometry authority should remain valid")
+            .expect("changed-geometry selector should remain contained")
+            .abort()
+            .expect("changed-geometry claim should restore");
+
+        let consumed = contained_restore_authority_with_grants_for_test(
+            file_grant_authority_for_test(),
+            false,
+        );
+        consumed
+            .grants()
+            .prepare_drive_backing_claim(exact_selectors[0], GrantAccess::ReadOnly)
+            .expect("consumed fixture claim should validate")
+            .expect("consumed fixture selector should remain contained")
+            .commit();
+        let error = contained_profile_2_request(exact_selectors, exact_access, exact_lengths)
+            .prepare(Some(consumed.authority()), || false)
+            .expect_err("already-consumed claim must fail complete-set reservation");
+        assert_eq!(
+            error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        diagnostics.push(format!("{error:?} {error}"));
+        consumed
+            .grants()
+            .prepare_drive_backing_claim(exact_selectors[1], GrantAccess::ReadWrite)
+            .expect("consumed-set failure should retain the other claim")
+            .expect("other claim should remain contained")
+            .abort()
+            .expect("other claim should restore");
+
+        let cancelled = contained_restore_authority_with_grants_for_test(
+            file_grant_authority_for_test(),
+            false,
+        );
+        let error = contained_profile_2_request(exact_selectors, exact_access, exact_lengths)
+            .prepare(Some(cancelled.authority()), || true)
+            .expect_err("outer cancellation must stop before authority use");
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::Cancellation);
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        diagnostics.push(format!("{error:?} {error}"));
+        assert_profile_2_grants_reusable(cancelled.grants());
+
+        let diagnostic = diagnostics.join(" ");
+        for private in [
+            missing_backing.path().to_string_lossy(),
+            std::borrow::Cow::Borrowed("bangbang-grant:drive-ro"),
+            std::borrow::Cow::Borrowed("bangbang-grant:drive-rw"),
+            std::borrow::Cow::Borrowed("bangbang-grant:kernel"),
+            std::borrow::Cow::Borrowed("bangbang-grant:vsock-directory"),
+            changed_backing.path().to_string_lossy(),
+        ] {
+            assert!(!diagnostic.contains(private.as_ref()));
         }
     }
 
