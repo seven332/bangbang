@@ -10,7 +10,7 @@ use crate::memory::GuestMemoryRange;
 use crate::pmem::{
     PmemRateLimiterConfig, PmemTokenBucketConfig, VIRTIO_PMEM_ALIGNMENT,
     VIRTIO_PMEM_CONFIG_SPACE_SIZE, VIRTIO_PMEM_QUEUE_SIZE, VirtioPmemConfigSpace,
-    VirtioPmemQueueState,
+    VirtioPmemQueueState, aligned_pmem_mapping_len,
 };
 use crate::snapshot_device_v2::{
     SnapshotV2DeviceKey, SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
@@ -836,7 +836,8 @@ fn validate_pmem_config(config: &SnapshotV2PmemConfig) -> Result<(), GraphValida
 }
 
 fn validate_pmem_state_local(state: &SnapshotV2PmemState) -> Result<(), GraphValidationError> {
-    let expected_mapped = align_pmem_length(state.file_bytes).ok_or(GraphValidationError::Pmem)?;
+    let expected_mapped =
+        aligned_pmem_mapping_len(state.file_bytes).ok_or(GraphValidationError::Pmem)?;
     if state.file_bytes == 0
         || state.mapped_bytes != expected_mapped
         || state.guest_range.size() != state.mapped_bytes
@@ -926,15 +927,6 @@ fn pmem_token_bucket_is_enabled(config: PmemTokenBucketConfig) -> bool {
             .refill_time()
             .checked_mul(1_000_000)
             .is_some_and(|nanos| nanos != 0)
-}
-
-fn align_pmem_length(length: u64) -> Option<u64> {
-    let remainder = length % VIRTIO_PMEM_ALIGNMENT;
-    if remainder == 0 {
-        Some(length)
-    } else {
-        length.checked_add(VIRTIO_PMEM_ALIGNMENT - remainder)
-    }
 }
 
 #[derive(Clone, Copy)]

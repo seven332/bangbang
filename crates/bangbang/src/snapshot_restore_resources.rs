@@ -12,12 +12,17 @@ use bangbang_runtime::block::{
     SnapshotBlockFileBackingReservation,
 };
 use bangbang_runtime::memory::GuestMemory;
+use bangbang_runtime::pmem::{
+    PmemFileBacking, SnapshotPmemFileBackingError, SnapshotPmemFileBackingReservation,
+    aligned_pmem_mapping_len,
+};
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceGraph;
 use bangbang_runtime::snapshot_device_v2_5::{
     PreparedSnapshotV2MultiBlockBundle, SnapshotV2MultiBlockBundleError,
     SnapshotV2MultiBlockCleanupError, SnapshotV2MultiBlockDeviceGraph,
     SnapshotV2MultiBlockRestorePlan, SnapshotV2MultiBlockRestorePlanError,
 };
+use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
 use bangbang_runtime::snapshot_restore::{
     PreparedSnapshotRestoreBindings, SnapshotRestoreBindingAllocationError,
     SnapshotRestoreBindingRejectionReason, SnapshotRestoreBindings, SnapshotRestoreManifest,
@@ -28,12 +33,14 @@ use bangbang_session::GrantAccess;
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
 
 use crate::contained_session::{
-    ContainedSnapshotRestoreAuthority, ContainedSnapshotRestoreDriveRequest,
-    ContainedSnapshotRestoreError, ContainedSnapshotRestoreTransaction, GrantAuthority,
-    GrantClaimError, PreparedDriveBackingClaim, grant_reference_id,
+    ContainedSnapshotRestoreAuthority, ContainedSnapshotRestoreError,
+    ContainedSnapshotRestoreFileRequest, ContainedSnapshotRestoreTransaction, GrantAuthority,
+    GrantClaimError, PreparedDriveBackingClaim, PreparedSnapshotBackingClaim, grant_reference_id,
 };
 #[cfg(test)]
-use crate::contained_session::{DirectoryGrantAuthority, SocketBrokerAuthority};
+use crate::contained_session::{
+    ContainedSnapshotRestoreDriveRequest, DirectoryGrantAuthority, SocketBrokerAuthority,
+};
 use crate::vsock_restore::{
     LocallyPreparedVsockRestoreResource, PreparedVsockRestoreResource,
     RequestedVsockRestoreResource, ReservedVsockRestoreResource, VsockRestoreDisposition,
@@ -54,6 +61,8 @@ pub(crate) enum SnapshotRestoreResourceStage {
     ContainedReservation,
     DrivePreflight,
     DrivePreparation,
+    PmemPreparation,
+    StoragePreflight,
     RootPreparation,
     VsockPreparation,
     Binding,
@@ -68,6 +77,7 @@ pub(crate) enum SnapshotRestoreResourceErrorKind {
     Contained(ContainedSnapshotRestoreError),
     RootBacking(SnapshotRootBackingLeaseError),
     DriveBacking(SnapshotDriveBackingPreparationError),
+    PmemBacking(SnapshotPmemFileBackingError),
     Vsock(VsockRestoreError),
     Binding(SnapshotRestoreBindingRejectionReason),
     Incomplete { missing_count: usize },
@@ -75,6 +85,7 @@ pub(crate) enum SnapshotRestoreResourceErrorKind {
     Unconsumed { unconsumed_count: usize },
     OwnerClassMismatch,
     InvalidDriveSet,
+    InvalidStorageSet,
     DriveProjection,
     Cancelled,
 }
@@ -100,6 +111,10 @@ impl fmt::Debug for SnapshotRestoreResourceErrorKind {
                 .finish(),
             Self::DriveBacking(source) => formatter
                 .debug_tuple("SnapshotRestoreResourceErrorKind::DriveBacking")
+                .field(source)
+                .finish(),
+            Self::PmemBacking(source) => formatter
+                .debug_tuple("SnapshotRestoreResourceErrorKind::PmemBacking")
                 .field(source)
                 .finish(),
             Self::Vsock(source) => formatter
@@ -128,6 +143,9 @@ impl fmt::Debug for SnapshotRestoreResourceErrorKind {
             Self::InvalidDriveSet => {
                 formatter.write_str("SnapshotRestoreResourceErrorKind::InvalidDriveSet")
             }
+            Self::InvalidStorageSet => {
+                formatter.write_str("SnapshotRestoreResourceErrorKind::InvalidStorageSet")
+            }
             Self::DriveProjection => {
                 formatter.write_str("SnapshotRestoreResourceErrorKind::DriveProjection")
             }
@@ -144,6 +162,7 @@ impl fmt::Display for SnapshotRestoreResourceErrorKind {
             Self::Contained(source) => source.fmt(formatter),
             Self::RootBacking(source) => source.fmt(formatter),
             Self::DriveBacking(source) => source.fmt(formatter),
+            Self::PmemBacking(source) => source.fmt(formatter),
             Self::Vsock(source) => source.fmt(formatter),
             Self::Binding(reason) => reason.fmt(formatter),
             Self::Incomplete { .. } => {
@@ -158,6 +177,9 @@ impl fmt::Display for SnapshotRestoreResourceErrorKind {
             }
             Self::InvalidDriveSet => {
                 formatter.write_str("snapshot restore drive resource set is invalid")
+            }
+            Self::InvalidStorageSet => {
+                formatter.write_str("snapshot restore storage resource set is invalid")
             }
             Self::DriveProjection => {
                 formatter.write_str("snapshot restore drive projection is invalid")
@@ -250,6 +272,7 @@ impl std::error::Error for SnapshotRestoreResourceError {
             SnapshotRestoreResourceErrorKind::Contained(source) => Some(source),
             SnapshotRestoreResourceErrorKind::RootBacking(source) => Some(source),
             SnapshotRestoreResourceErrorKind::DriveBacking(source) => Some(source),
+            SnapshotRestoreResourceErrorKind::PmemBacking(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Vsock(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Take(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Binding(_)
@@ -257,6 +280,7 @@ impl std::error::Error for SnapshotRestoreResourceError {
             | SnapshotRestoreResourceErrorKind::Unconsumed { .. }
             | SnapshotRestoreResourceErrorKind::OwnerClassMismatch
             | SnapshotRestoreResourceErrorKind::InvalidDriveSet
+            | SnapshotRestoreResourceErrorKind::InvalidStorageSet
             | SnapshotRestoreResourceErrorKind::DriveProjection
             | SnapshotRestoreResourceErrorKind::Cancelled => None,
         }
@@ -758,27 +782,86 @@ impl fmt::Debug for PreparedSnapshotRestoreResource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotRestoreFileKind {
+    Block,
+    Pmem { expected_mapped_len: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotRestoreFileSetKind {
+    MultiBlock,
+    Storage,
+}
+
+impl SnapshotRestoreFileSetKind {
+    const fn preflight_stage(self) -> SnapshotRestoreResourceStage {
+        match self {
+            Self::MultiBlock => SnapshotRestoreResourceStage::DrivePreflight,
+            Self::Storage => SnapshotRestoreResourceStage::StoragePreflight,
+        }
+    }
+
+    const fn invalid_set(self) -> SnapshotRestoreResourceErrorKind {
+        match self {
+            Self::MultiBlock => SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            Self::Storage => SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+        }
+    }
+}
+
+impl SnapshotRestoreFileKind {
+    const fn resource_class(self) -> SnapshotRestoreResourceClass {
+        match self {
+            Self::Block => SnapshotRestoreResourceClass::BlockBacking,
+            Self::Pmem { .. } => SnapshotRestoreResourceClass::PmemBacking,
+        }
+    }
+
+    const fn grant_role(self) -> bangbang_session::ResourceRole {
+        match self {
+            Self::Block => bangbang_session::ResourceRole::DriveBacking,
+            Self::Pmem { .. } => bangbang_session::ResourceRole::PmemBacking,
+        }
+    }
+
+    const fn expected_mapped_len(self) -> Option<u64> {
+        match self {
+            Self::Block => None,
+            Self::Pmem {
+                expected_mapped_len,
+            } => Some(expected_mapped_len),
+        }
+    }
+}
+
 struct RequestedSnapshotDriveRestoreResource {
     key: SnapshotRestoreResourceKey,
     selector: PathBuf,
     is_read_only: bool,
     expected_len: u64,
+    kind: SnapshotRestoreFileKind,
 }
 
 impl fmt::Debug for RequestedSnapshotDriveRestoreResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RequestedSnapshotDriveRestoreResource")
-            .field("class", &SnapshotRestoreResourceClass::BlockBacking)
+            .field("class", &self.kind.resource_class())
             .field("state", &"<redacted>")
             .finish()
     }
 }
 
+enum PreparedSnapshotFileBacking {
+    Block(BlockFileBacking),
+    Pmem(PmemFileBacking),
+}
+
 struct PreparedSnapshotDriveRestoreResource {
     key: SnapshotRestoreResourceKey,
-    backing: BlockFileBacking,
-    claim: Option<PreparedDriveBackingClaim>,
+    backing: PreparedSnapshotFileBacking,
+    claim: Option<PreparedSnapshotBackingClaim>,
 }
 
 impl PreparedSnapshotDriveRestoreResource {
@@ -802,15 +885,31 @@ impl PreparedSnapshotDriveRestoreResource {
     }
 }
 
+enum ReservedDirectSnapshotFileBacking {
+    Block(SnapshotBlockFileBackingReservation),
+    Pmem(SnapshotPmemFileBackingReservation),
+}
+
 struct ReservedDirectSnapshotDriveRestoreResource {
     key: SnapshotRestoreResourceKey,
-    reservation: SnapshotBlockFileBackingReservation,
+    reservation: ReservedDirectSnapshotFileBacking,
 }
 
 impl fmt::Debug for PreparedSnapshotDriveRestoreResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedSnapshotDriveRestoreResource")
+            .field(
+                "class",
+                &match &self.backing {
+                    PreparedSnapshotFileBacking::Block(_) => {
+                        SnapshotRestoreResourceClass::BlockBacking
+                    }
+                    PreparedSnapshotFileBacking::Pmem(_) => {
+                        SnapshotRestoreResourceClass::PmemBacking
+                    }
+                },
+            )
             .field("backing", &"<owned>")
             .field("claim", &self.claim.as_ref().map(|_| "<provisional>"))
             .finish()
@@ -823,6 +922,7 @@ pub(crate) struct RequestedSnapshotMultiDriveRestoreResources {
     drive_keys: Vec<SnapshotRestoreResourceKey>,
     drive_configs: DriveConfigs,
     bindings: SnapshotRestoreBindings<PreparedSnapshotDriveRestoreResource>,
+    file_set_kind: SnapshotRestoreFileSetKind,
 }
 
 impl RequestedSnapshotMultiDriveRestoreResources {
@@ -868,6 +968,7 @@ impl RequestedSnapshotMultiDriveRestoreResources {
                 selector: PathBuf::from(record.config().selector()),
                 is_read_only: record.config().is_read_only(),
                 expected_len: record.block().backing_bytes(),
+                kind: SnapshotRestoreFileKind::Block,
             });
             drive_keys.push(key.clone());
             resources.push(key);
@@ -892,6 +993,7 @@ impl RequestedSnapshotMultiDriveRestoreResources {
                         || drive.selector != Path::new(record.config().selector())
                         || drive.is_read_only != record.config().is_read_only()
                         || drive.expected_len != record.block().backing_bytes()
+                        || drive.kind != SnapshotRestoreFileKind::Block
                         || config.drive_id() != record.config().drive_id()
                 })
         {
@@ -911,6 +1013,7 @@ impl RequestedSnapshotMultiDriveRestoreResources {
             drive_keys,
             drive_configs,
             bindings,
+            file_set_kind: SnapshotRestoreFileSetKind::MultiBlock,
         })
     }
 
@@ -924,6 +1027,7 @@ impl RequestedSnapshotMultiDriveRestoreResources {
             drive_keys,
             drive_configs,
             mut bindings,
+            file_set_kind,
         } = self;
         if cancelled() {
             return Err(cancelled_batch_error());
@@ -936,8 +1040,9 @@ impl RequestedSnapshotMultiDriveRestoreResources {
                     .try_reserve_exact(drives.len())
                     .map_err(manifest_allocation_error)?;
                 for drive in &drives {
-                    requests.push(ContainedSnapshotRestoreDriveRequest::new(
+                    requests.push(ContainedSnapshotRestoreFileRequest::new(
                         &drive.selector,
+                        drive.kind.grant_role(),
                         if drive.is_read_only {
                             GrantAccess::ReadOnly
                         } else {
@@ -947,35 +1052,39 @@ impl RequestedSnapshotMultiDriveRestoreResources {
                     ));
                 }
                 let reserved = authority
-                    .prepare_drives(&requests, None, &cancelled)
+                    .prepare_files(&requests, None, &cancelled)
                     .map_err(snapshot_contained_error)?;
                 let (claims, vsock, transaction) = reserved
-                    .into_drive_parts()
+                    .into_file_parts()
                     .map_err(snapshot_contained_error)?;
                 if vsock.is_some() || claims.len() != drives.len() {
                     let outcome = abort_contained_vsock_facets(vsock)
                         .merge(abort_prepared_drive_claims(claims))
                         .merge(abort_contained_transaction(Some(transaction)));
                     return Err(SnapshotRestoreResourceError::terminal(
-                        SnapshotRestoreResourceStage::DrivePreflight,
-                        SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                        file_set_kind.preflight_stage(),
+                        file_set_kind.invalid_set(),
                     )
                     .with_abort_outcome(outcome));
                 }
-                let prepared = match prepare_contained_drives(&drives, claims, &cancelled) {
-                    Ok(prepared) => prepared,
-                    Err(failure) => {
-                        let (source, resources, claims) = *failure;
-                        return Err(source.with_abort_outcome(
-                            abort_prepared_drive_claims(claims)
-                                .merge(abort_prepared_drive_resources(resources))
-                                .merge(abort_contained_transaction(Some(transaction))),
-                        ));
-                    }
-                };
+                let prepared =
+                    match prepare_contained_drives(&drives, claims, file_set_kind, &cancelled) {
+                        Ok(prepared) => prepared,
+                        Err(failure) => {
+                            let (source, resources, claims) = *failure;
+                            return Err(source.with_abort_outcome(
+                                abort_prepared_drive_claims(claims)
+                                    .merge(abort_prepared_drive_resources(resources))
+                                    .merge(abort_contained_transaction(Some(transaction))),
+                            ));
+                        }
+                    };
                 (prepared, Some(transaction))
             }
-            None => (prepare_direct_drives(&drives, &cancelled)?, None),
+            None => (
+                prepare_direct_drives(&drives, file_set_kind, &cancelled)?,
+                None,
+            ),
         };
 
         if cancelled() {
@@ -993,7 +1102,7 @@ impl RequestedSnapshotMultiDriveRestoreResources {
                 .merge(abort_contained_transaction(contained_transaction));
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::Binding,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                file_set_kind.invalid_set(),
             )
             .with_abort_outcome(outcome));
         }
@@ -1005,7 +1114,7 @@ impl RequestedSnapshotMultiDriveRestoreResources {
                     .merge(abort_contained_transaction(contained_transaction));
                 return Err(SnapshotRestoreResourceError::terminal(
                     SnapshotRestoreResourceStage::Binding,
-                    SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                    file_set_kind.invalid_set(),
                 )
                 .with_abort_outcome(outcome));
             };
@@ -1016,7 +1125,7 @@ impl RequestedSnapshotMultiDriveRestoreResources {
                     .merge(abort_contained_transaction(contained_transaction));
                 return Err(SnapshotRestoreResourceError::terminal(
                     SnapshotRestoreResourceStage::Binding,
-                    SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                    file_set_kind.invalid_set(),
                 )
                 .with_abort_outcome(outcome));
             }
@@ -1040,7 +1149,7 @@ impl RequestedSnapshotMultiDriveRestoreResources {
                     .merge(abort_contained_transaction(contained_transaction));
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::Binding,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                file_set_kind.invalid_set(),
             )
             .with_abort_outcome(outcome));
         }
@@ -1062,12 +1171,159 @@ impl RequestedSnapshotMultiDriveRestoreResources {
             drive_configs,
             bindings,
             contained_transaction,
+            file_set_kind,
         };
         if cancelled() {
             let outcome = prepared.abort();
             return Err(cancelled_batch_error().with_abort_outcome(outcome));
         }
         Ok(prepared)
+    }
+}
+
+/// Complete exact-2.6 block+pmem resource request before host authority is
+/// touched.
+pub(crate) struct RequestedSnapshotStorageRestoreResources {
+    resources: RequestedSnapshotMultiDriveRestoreResources,
+    block_count: usize,
+    pmem_count: usize,
+}
+
+impl RequestedSnapshotStorageRestoreResources {
+    pub(crate) fn try_from_native_v2_storage_device_graph(
+        graph: &SnapshotV2StorageDeviceGraph,
+    ) -> Result<Self, SnapshotRestoreResourceError> {
+        let manifest =
+            SnapshotRestoreManifest::try_from_native_v2_storage_device_graph(graph, Vec::new())
+                .map_err(|source| {
+                    SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::Manifest,
+                        SnapshotRestoreResourceErrorKind::Manifest(source),
+                    )
+                })?;
+        let mut drives = Vec::new();
+        let mut drive_keys = Vec::new();
+        drives
+            .try_reserve_exact(graph.record_count())
+            .map_err(manifest_allocation_error)?;
+        drive_keys
+            .try_reserve_exact(graph.record_count())
+            .map_err(manifest_allocation_error)?;
+        for record in graph.block_records() {
+            let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id()).map_err(
+                |source| {
+                    SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::Manifest,
+                        SnapshotRestoreResourceErrorKind::Manifest(
+                            SnapshotRestoreManifestError::PublicId { source },
+                        ),
+                    )
+                },
+            )?;
+            let key = SnapshotRestoreResourceKey::new(
+                record.key(),
+                public_id,
+                SnapshotRestoreResourceClass::BlockBacking,
+            );
+            drives.push(RequestedSnapshotDriveRestoreResource {
+                key: key.clone(),
+                selector: PathBuf::from(record.config().selector()),
+                is_read_only: record.config().is_read_only(),
+                expected_len: record.block().backing_bytes(),
+                kind: SnapshotRestoreFileKind::Block,
+            });
+            drive_keys.push(key);
+        }
+        for record in graph.pmem_records() {
+            let public_id =
+                SnapshotRestorePublicId::try_from(record.config().pmem_id()).map_err(|source| {
+                    SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::Manifest,
+                        SnapshotRestoreResourceErrorKind::Manifest(
+                            SnapshotRestoreManifestError::PublicId { source },
+                        ),
+                    )
+                })?;
+            let key = SnapshotRestoreResourceKey::new(
+                record.key(),
+                public_id,
+                SnapshotRestoreResourceClass::PmemBacking,
+            );
+            drives.push(RequestedSnapshotDriveRestoreResource {
+                key: key.clone(),
+                selector: PathBuf::from(record.config().selector()),
+                is_read_only: record.config().is_read_only(),
+                expected_len: record.pmem().file_bytes(),
+                kind: SnapshotRestoreFileKind::Pmem {
+                    expected_mapped_len: record.pmem().mapped_bytes(),
+                },
+            });
+            drive_keys.push(key);
+        }
+        if drives.is_empty()
+            || drives.len() != graph.record_count()
+            || manifest.resources() != drive_keys.as_slice()
+            || drives.iter().zip(&drive_keys).any(|(drive, key)| {
+                drive.key != *key
+                    || drive.key.resource_class() != drive.kind.resource_class()
+                    || drive.expected_len == 0
+                    || drive.kind.expected_mapped_len().is_some_and(|expected| {
+                        aligned_pmem_mapping_len(drive.expected_len) != Some(expected)
+                    })
+            })
+        {
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::StoragePreflight,
+                SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+            ));
+        }
+        let bindings = manifest.try_into_bindings().map_err(|source| {
+            SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::BindingAllocation,
+                SnapshotRestoreResourceErrorKind::BindingAllocation(source),
+            )
+        })?;
+        Ok(Self {
+            resources: RequestedSnapshotMultiDriveRestoreResources {
+                drives,
+                drive_keys,
+                drive_configs: DriveConfigs::new(),
+                bindings,
+                file_set_kind: SnapshotRestoreFileSetKind::Storage,
+            },
+            block_count: graph.block_records().len(),
+            pmem_count: graph.pmem_records().len(),
+        })
+    }
+
+    pub(crate) fn prepare(
+        self,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PreparedSnapshotStorageRestoreResources, SnapshotRestoreResourceError> {
+        let Self {
+            resources,
+            block_count,
+            pmem_count,
+        } = self;
+        resources.prepare(authority, cancelled).map(|resources| {
+            PreparedSnapshotStorageRestoreResources {
+                resources,
+                block_count,
+                pmem_count,
+            }
+        })
+    }
+}
+
+impl fmt::Debug for RequestedSnapshotStorageRestoreResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestedSnapshotStorageRestoreResources")
+            .field("block_count", &self.block_count)
+            .field("pmem_count", &self.pmem_count)
+            .field("values", &"<redacted>")
+            .finish()
     }
 }
 
@@ -1084,24 +1340,14 @@ impl fmt::Debug for RequestedSnapshotMultiDriveRestoreResources {
 type ContainedDrivePreparationFailure = Box<(
     SnapshotRestoreResourceError,
     Vec<PreparedSnapshotDriveRestoreResource>,
-    Vec<PreparedDriveBackingClaim>,
+    Vec<PreparedSnapshotBackingClaim>,
 )>;
 
 fn prepare_direct_drives(
     drives: &[RequestedSnapshotDriveRestoreResource],
+    file_set_kind: SnapshotRestoreFileSetKind,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<PreparedSnapshotDriveRestoreResource>, SnapshotRestoreResourceError> {
-    let mut reservations = Vec::new();
-    let mut identities = HashSet::new();
-    reservations
-        .try_reserve_exact(drives.len())
-        .map_err(manifest_allocation_error)?;
-    identities.try_reserve(drives.len()).map_err(|_| {
-        SnapshotRestoreResourceError::retryable(
-            SnapshotRestoreResourceStage::DrivePreflight,
-            SnapshotRestoreResourceErrorKind::InvalidDriveSet,
-        )
-    })?;
     for drive in drives {
         if cancelled() {
             return Err(cancelled_batch_error());
@@ -1109,7 +1355,7 @@ fn prepare_direct_drives(
         if grant_reference_id(&drive.selector)
             .map_err(|source| {
                 SnapshotRestoreResourceError::retryable(
-                    SnapshotRestoreResourceStage::DrivePreflight,
+                    file_set_kind.preflight_stage(),
                     SnapshotRestoreResourceErrorKind::DriveBacking(
                         SnapshotDriveBackingPreparationError::Authority(source),
                     ),
@@ -1118,29 +1364,101 @@ fn prepare_direct_drives(
             .is_some()
         {
             return Err(SnapshotRestoreResourceError::retryable(
-                SnapshotRestoreResourceStage::DrivePreflight,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                file_set_kind.preflight_stage(),
+                file_set_kind.invalid_set(),
             ));
         }
-        let reservation =
-            match SnapshotBlockFileBackingReservation::open(&drive.selector, drive.is_read_only) {
-                Ok(reservation) => reservation,
-                Err(source) => {
+        if drive.key.resource_class() != drive.kind.resource_class()
+            || drive.expected_len == 0
+            || drive.kind.expected_mapped_len().is_some_and(|expected| {
+                aligned_pmem_mapping_len(drive.expected_len) != Some(expected)
+            })
+        {
+            return Err(SnapshotRestoreResourceError::terminal(
+                file_set_kind.preflight_stage(),
+                file_set_kind.invalid_set(),
+            ));
+        }
+    }
+
+    let mut reservations = Vec::new();
+    let mut identities = HashSet::new();
+    reservations
+        .try_reserve_exact(drives.len())
+        .map_err(manifest_allocation_error)?;
+    identities.try_reserve(drives.len()).map_err(|_| {
+        SnapshotRestoreResourceError::retryable(
+            file_set_kind.preflight_stage(),
+            file_set_kind.invalid_set(),
+        )
+    })?;
+    for drive in drives {
+        if cancelled() {
+            return Err(cancelled_batch_error());
+        }
+        let reservation = match drive.kind {
+            SnapshotRestoreFileKind::Block => {
+                match SnapshotBlockFileBackingReservation::open(&drive.selector, drive.is_read_only)
+                {
+                    Ok(reservation) => ReservedDirectSnapshotFileBacking::Block(reservation),
+                    Err(source) => {
+                        return Err(SnapshotRestoreResourceError::retryable(
+                            SnapshotRestoreResourceStage::DrivePreparation,
+                            SnapshotRestoreResourceErrorKind::DriveBacking(
+                                SnapshotDriveBackingPreparationError::Backing(source),
+                            ),
+                        ));
+                    }
+                }
+            }
+            SnapshotRestoreFileKind::Pmem { .. } => {
+                match SnapshotPmemFileBackingReservation::open(&drive.selector, drive.is_read_only)
+                {
+                    Ok(reservation) => ReservedDirectSnapshotFileBacking::Pmem(reservation),
+                    Err(source) => {
+                        return Err(SnapshotRestoreResourceError::retryable(
+                            SnapshotRestoreResourceStage::PmemPreparation,
+                            SnapshotRestoreResourceErrorKind::PmemBacking(source),
+                        ));
+                    }
+                }
+            }
+        };
+        let (device, inode) = match &reservation {
+            ReservedDirectSnapshotFileBacking::Block(reservation) => {
+                let identity = reservation.identity();
+                if reservation.is_read_only() != drive.is_read_only
+                    || !identity.kind().is_regular_file()
+                    || identity.len() != drive.expected_len
+                {
                     return Err(SnapshotRestoreResourceError::retryable(
-                        SnapshotRestoreResourceStage::DrivePreparation,
-                        SnapshotRestoreResourceErrorKind::DriveBacking(
-                            SnapshotDriveBackingPreparationError::Backing(source),
-                        ),
+                        file_set_kind.preflight_stage(),
+                        file_set_kind.invalid_set(),
                     ));
                 }
-            };
-        let identity = reservation.identity();
-        if !snapshot_drive_reservation_matches(drive, &reservation)
-            || !identities.insert((identity.device(), identity.inode()))
-        {
+                (identity.device(), identity.inode())
+            }
+            ReservedDirectSnapshotFileBacking::Pmem(reservation) => {
+                let identity = reservation.identity();
+                if reservation.is_read_only() != drive.is_read_only
+                    || !identity.is_regular_file()
+                    || identity.len() != drive.expected_len
+                    || drive.kind.expected_mapped_len().is_none_or(|expected| {
+                        aligned_pmem_mapping_len(identity.len()) != Some(expected)
+                    })
+                {
+                    return Err(SnapshotRestoreResourceError::retryable(
+                        file_set_kind.preflight_stage(),
+                        file_set_kind.invalid_set(),
+                    ));
+                }
+                (identity.device(), identity.inode())
+            }
+        };
+        if !identities.insert((device, inode)) {
             return Err(SnapshotRestoreResourceError::retryable(
-                SnapshotRestoreResourceStage::DrivePreflight,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                file_set_kind.preflight_stage(),
+                file_set_kind.invalid_set(),
             ));
         }
         reservations.push(ReservedDirectSnapshotDriveRestoreResource {
@@ -1164,38 +1482,78 @@ fn prepare_direct_drives(
         }
         let Some(reserved) = reservations.next() else {
             return Err(SnapshotRestoreResourceError::terminal(
-                SnapshotRestoreResourceStage::DrivePreparation,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                file_set_kind.preflight_stage(),
+                file_set_kind.invalid_set(),
             )
             .with_abort_outcome(abort_prepared_drive_resources(prepared)));
         };
         if reserved.key != drive.key {
             return Err(SnapshotRestoreResourceError::terminal(
-                SnapshotRestoreResourceStage::DrivePreparation,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                file_set_kind.preflight_stage(),
+                file_set_kind.invalid_set(),
             )
             .with_abort_outcome(abort_prepared_drive_resources(prepared)));
         }
-        let (backing, identity) = match reserved.reservation.into_backing() {
-            Ok(parts) => parts,
-            Err(source) => {
-                return Err(SnapshotRestoreResourceError::retryable(
-                    SnapshotRestoreResourceStage::DrivePreparation,
-                    SnapshotRestoreResourceErrorKind::DriveBacking(
-                        SnapshotDriveBackingPreparationError::Backing(source),
-                    ),
+        let backing = match (drive.kind, reserved.reservation) {
+            (
+                SnapshotRestoreFileKind::Block,
+                ReservedDirectSnapshotFileBacking::Block(reservation),
+            ) => {
+                let (backing, identity) = match reservation.into_backing() {
+                    Ok(parts) => parts,
+                    Err(source) => {
+                        return Err(SnapshotRestoreResourceError::retryable(
+                            SnapshotRestoreResourceStage::DrivePreparation,
+                            SnapshotRestoreResourceErrorKind::DriveBacking(
+                                SnapshotDriveBackingPreparationError::Backing(source),
+                            ),
+                        )
+                        .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+                    }
+                };
+                if !snapshot_drive_observation_matches(drive, &backing, identity) {
+                    drop(backing);
+                    return Err(SnapshotRestoreResourceError::retryable(
+                        file_set_kind.preflight_stage(),
+                        file_set_kind.invalid_set(),
+                    )
+                    .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+                }
+                PreparedSnapshotFileBacking::Block(backing)
+            }
+            (
+                SnapshotRestoreFileKind::Pmem { .. },
+                ReservedDirectSnapshotFileBacking::Pmem(reservation),
+            ) => {
+                let (backing, identity) = match reservation.into_backing() {
+                    Ok(parts) => parts,
+                    Err(source) => {
+                        return Err(SnapshotRestoreResourceError::retryable(
+                            SnapshotRestoreResourceStage::PmemPreparation,
+                            SnapshotRestoreResourceErrorKind::PmemBacking(source),
+                        )
+                        .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+                    }
+                };
+                if !snapshot_pmem_observation_matches(drive, &backing, identity) {
+                    drop(backing);
+                    return Err(SnapshotRestoreResourceError::retryable(
+                        file_set_kind.preflight_stage(),
+                        file_set_kind.invalid_set(),
+                    )
+                    .with_abort_outcome(abort_prepared_drive_resources(prepared)));
+                }
+                PreparedSnapshotFileBacking::Pmem(backing)
+            }
+            (_, reservation) => {
+                drop(reservation);
+                return Err(SnapshotRestoreResourceError::terminal(
+                    file_set_kind.preflight_stage(),
+                    file_set_kind.invalid_set(),
                 )
                 .with_abort_outcome(abort_prepared_drive_resources(prepared)));
             }
         };
-        if !snapshot_drive_observation_matches(drive, &backing, identity) {
-            drop(backing);
-            return Err(SnapshotRestoreResourceError::retryable(
-                SnapshotRestoreResourceStage::DrivePreflight,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
-            )
-            .with_abort_outcome(abort_prepared_drive_resources(prepared)));
-        }
         prepared.push(PreparedSnapshotDriveRestoreResource {
             key: drive.key.clone(),
             backing,
@@ -1204,8 +1562,8 @@ fn prepare_direct_drives(
     }
     if reservations.next().is_some() {
         return Err(SnapshotRestoreResourceError::terminal(
-            SnapshotRestoreResourceStage::DrivePreparation,
-            SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            file_set_kind.preflight_stage(),
+            file_set_kind.invalid_set(),
         )
         .with_abort_outcome(abort_prepared_drive_resources(prepared)));
     }
@@ -1214,7 +1572,8 @@ fn prepare_direct_drives(
 
 fn prepare_contained_drives(
     drives: &[RequestedSnapshotDriveRestoreResource],
-    mut claims: Vec<PreparedDriveBackingClaim>,
+    mut claims: Vec<PreparedSnapshotBackingClaim>,
+    file_set_kind: SnapshotRestoreFileSetKind,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<PreparedSnapshotDriveRestoreResource>, ContainedDrivePreparationFailure> {
     let mut prepared = Vec::new();
@@ -1224,8 +1583,8 @@ fn prepare_contained_drives(
     {
         return Err(Box::new((
             SnapshotRestoreResourceError::retryable(
-                SnapshotRestoreResourceStage::DrivePreflight,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                file_set_kind.preflight_stage(),
+                file_set_kind.invalid_set(),
             ),
             prepared,
             claims,
@@ -1234,8 +1593,8 @@ fn prepare_contained_drives(
     if claims.len() != drives.len() {
         return Err(Box::new((
             SnapshotRestoreResourceError::terminal(
-                SnapshotRestoreResourceStage::DrivePreflight,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                file_set_kind.preflight_stage(),
+                file_set_kind.invalid_set(),
             ),
             prepared,
             claims,
@@ -1246,55 +1605,96 @@ fn prepare_contained_drives(
             return Err(Box::new((cancelled_batch_error(), prepared, claims)));
         }
         let mut claim = claims.remove(0);
-        let (file, observation) =
-            match claim.take_snapshot_file_for(&drive.selector, drive.is_read_only) {
-                Ok(parts) => parts,
-                Err(source) => {
-                    claims.insert(0, claim);
-                    return Err(Box::new((
-                        SnapshotRestoreResourceError::retryable(
-                            SnapshotRestoreResourceStage::DrivePreparation,
-                            SnapshotRestoreResourceErrorKind::DriveBacking(
-                                SnapshotDriveBackingPreparationError::Authority(source),
-                            ),
+        let (file, observation) = match claim.take_snapshot_file_for_reference(
+            &drive.selector,
+            drive.kind.grant_role(),
+            drive.is_read_only,
+        ) {
+            Ok(parts) => parts,
+            Err(source) => {
+                claims.insert(0, claim);
+                return Err(Box::new((
+                    SnapshotRestoreResourceError::retryable(
+                        if matches!(drive.kind, SnapshotRestoreFileKind::Block) {
+                            SnapshotRestoreResourceStage::DrivePreparation
+                        } else {
+                            SnapshotRestoreResourceStage::PmemPreparation
+                        },
+                        SnapshotRestoreResourceErrorKind::DriveBacking(
+                            SnapshotDriveBackingPreparationError::Authority(source),
                         ),
-                        prepared,
-                        claims,
-                    )));
-                }
-            };
-        let (backing, identity) =
-            match BlockFileBacking::from_snapshot_file(file, drive.is_read_only) {
-                Ok(parts) => parts,
-                Err(source) => {
-                    claims.insert(0, claim);
-                    return Err(Box::new((
-                        SnapshotRestoreResourceError::retryable(
-                            SnapshotRestoreResourceStage::DrivePreparation,
-                            SnapshotRestoreResourceErrorKind::DriveBacking(
-                                SnapshotDriveBackingPreparationError::Backing(source),
-                            ),
-                        ),
-                        prepared,
-                        claims,
-                    )));
-                }
-            };
+                    ),
+                    prepared,
+                    claims,
+                )));
+            }
+        };
+        let (backing, device, inode, len, valid) = match drive.kind {
+            SnapshotRestoreFileKind::Block => {
+                let (backing, identity) =
+                    match BlockFileBacking::from_snapshot_file(file, drive.is_read_only) {
+                        Ok(parts) => parts,
+                        Err(source) => {
+                            claims.insert(0, claim);
+                            return Err(Box::new((
+                                SnapshotRestoreResourceError::retryable(
+                                    SnapshotRestoreResourceStage::DrivePreparation,
+                                    SnapshotRestoreResourceErrorKind::DriveBacking(
+                                        SnapshotDriveBackingPreparationError::Backing(source),
+                                    ),
+                                ),
+                                prepared,
+                                claims,
+                            )));
+                        }
+                    };
+                let valid = snapshot_drive_observation_matches(drive, &backing, identity);
+                (
+                    PreparedSnapshotFileBacking::Block(backing),
+                    identity.device(),
+                    identity.inode(),
+                    identity.len(),
+                    valid,
+                )
+            }
+            SnapshotRestoreFileKind::Pmem { .. } => {
+                let (backing, identity) =
+                    match PmemFileBacking::from_snapshot_file(file, drive.is_read_only) {
+                        Ok(parts) => parts,
+                        Err(source) => {
+                            claims.insert(0, claim);
+                            return Err(Box::new((
+                                SnapshotRestoreResourceError::retryable(
+                                    SnapshotRestoreResourceStage::PmemPreparation,
+                                    SnapshotRestoreResourceErrorKind::PmemBacking(source),
+                                ),
+                                prepared,
+                                claims,
+                            )));
+                        }
+                    };
+                let valid = snapshot_pmem_observation_matches(drive, &backing, identity);
+                (
+                    PreparedSnapshotFileBacking::Pmem(backing),
+                    identity.device(),
+                    identity.inode(),
+                    identity.len(),
+                    valid,
+                )
+            }
+        };
         let observation_matches = observation.is_some_and(|observation| {
-            observation.identity().device == identity.device()
-                && observation.identity().inode == identity.inode()
-                && observation.len() == identity.len()
+            observation.identity().device == device
+                && observation.identity().inode == inode
+                && observation.len() == len
         });
-        if !observation_matches
-            || !snapshot_drive_observation_matches(drive, &backing, identity)
-            || !identities.insert((identity.device(), identity.inode()))
-        {
+        if !observation_matches || !valid || !identities.insert((device, inode)) {
             drop(backing);
             claims.insert(0, claim);
             return Err(Box::new((
                 SnapshotRestoreResourceError::retryable(
-                    SnapshotRestoreResourceStage::DrivePreflight,
-                    SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                    file_set_kind.preflight_stage(),
+                    file_set_kind.invalid_set(),
                 ),
                 prepared,
                 claims,
@@ -1309,24 +1709,14 @@ fn prepare_contained_drives(
     if !claims.is_empty() {
         return Err(Box::new((
             SnapshotRestoreResourceError::terminal(
-                SnapshotRestoreResourceStage::DrivePreflight,
-                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                file_set_kind.preflight_stage(),
+                file_set_kind.invalid_set(),
             ),
             prepared,
             claims,
         )));
     }
     Ok(prepared)
-}
-
-fn snapshot_drive_reservation_matches(
-    drive: &RequestedSnapshotDriveRestoreResource,
-    reservation: &SnapshotBlockFileBackingReservation,
-) -> bool {
-    let identity = reservation.identity();
-    reservation.is_read_only() == drive.is_read_only
-        && identity.kind().is_regular_file()
-        && identity.len() == drive.expected_len
 }
 
 fn snapshot_drive_observation_matches(
@@ -1339,6 +1729,22 @@ fn snapshot_drive_observation_matches(
         && backing.len() == drive.expected_len
         && identity.kind().is_regular_file()
         && identity.len() == drive.expected_len
+}
+
+fn snapshot_pmem_observation_matches(
+    drive: &RequestedSnapshotDriveRestoreResource,
+    backing: &PmemFileBacking,
+    identity: bangbang_runtime::pmem::PmemFileBackingIdentity,
+) -> bool {
+    identity.is_regular_file()
+        && !identity.is_empty()
+        && backing.is_read_only() == drive.is_read_only
+        && backing.len() == drive.expected_len
+        && identity.len() == drive.expected_len
+        && drive
+            .kind
+            .expected_mapped_len()
+            .is_some_and(|expected| aligned_pmem_mapping_len(identity.len()) == Some(expected))
 }
 
 fn abort_contained_vsock_facets(
@@ -1404,12 +1810,21 @@ pub(crate) struct PreparedSnapshotMultiDriveRestoreResources {
     drive_configs: DriveConfigs,
     bindings: PreparedSnapshotRestoreBindings<PreparedSnapshotDriveRestoreResource>,
     contained_transaction: Option<ContainedSnapshotRestoreTransaction>,
+    file_set_kind: SnapshotRestoreFileSetKind,
 }
 
 impl PreparedSnapshotMultiDriveRestoreResources {
     pub(crate) fn into_drive_batch(
         mut self,
     ) -> Result<PreparedSnapshotRestoreDriveBatch, SnapshotRestoreResourceError> {
+        if self.file_set_kind != SnapshotRestoreFileSetKind::MultiBlock {
+            let outcome = self.abort();
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Take,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+            )
+            .with_abort_outcome(outcome));
+        }
         let mut owners = Vec::new();
         if owners.try_reserve_exact(self.drive_keys.len()).is_err() {
             let outcome = self.abort();
@@ -1446,6 +1861,7 @@ impl PreparedSnapshotMultiDriveRestoreResources {
             drive_configs,
             bindings,
             contained_transaction,
+            file_set_kind: _,
         } = self;
         if let Err(unconsumed) = bindings.finish() {
             let unconsumed_count = unconsumed.unconsumed_count();
@@ -1455,6 +1871,18 @@ impl PreparedSnapshotMultiDriveRestoreResources {
             return Err(SnapshotRestoreResourceError::terminal(
                 SnapshotRestoreResourceStage::Finish,
                 SnapshotRestoreResourceErrorKind::Unconsumed { unconsumed_count },
+            )
+            .with_abort_outcome(outcome));
+        }
+        if owners.iter().any(|owner| {
+            owner.key.resource_class() != SnapshotRestoreResourceClass::BlockBacking
+                || !matches!(owner.backing, PreparedSnapshotFileBacking::Block(_))
+        }) {
+            let outcome = abort_prepared_drive_resources(owners)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::InvalidDriveSet,
             )
             .with_abort_outcome(outcome));
         }
@@ -1477,6 +1905,16 @@ impl PreparedSnapshotMultiDriveRestoreResources {
                 backing,
                 claim,
             } = owner;
+            let backing = match backing {
+                PreparedSnapshotFileBacking::Block(backing) => backing,
+                PreparedSnapshotFileBacking::Pmem(backing) => {
+                    drop(backing);
+                    return Err(SnapshotRestoreResourceError::terminal(
+                        SnapshotRestoreResourceStage::Finish,
+                        SnapshotRestoreResourceErrorKind::InvalidDriveSet,
+                    ));
+                }
+            };
             backings.push(backing);
             if let Some(claim) = claim {
                 claims.push(claim);
@@ -1513,6 +1951,251 @@ impl fmt::Debug for PreparedSnapshotMultiDriveRestoreResources {
             .debug_struct("PreparedSnapshotMultiDriveRestoreResources")
             .field("resource_count", &self.drive_keys.len())
             .field("remaining_count", &self.bindings.remaining_count())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+pub(crate) struct PreparedSnapshotStorageRestoreResources {
+    resources: PreparedSnapshotMultiDriveRestoreResources,
+    block_count: usize,
+    pmem_count: usize,
+}
+
+impl PreparedSnapshotStorageRestoreResources {
+    pub(crate) fn into_storage_batch(
+        self,
+    ) -> Result<PreparedSnapshotStorageRestoreBatch, SnapshotRestoreResourceError> {
+        let Self {
+            mut resources,
+            block_count,
+            pmem_count,
+        } = self;
+        if resources.file_set_kind != SnapshotRestoreFileSetKind::Storage {
+            let outcome = resources.abort();
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Take,
+                SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        let Some(expected_count) = block_count.checked_add(pmem_count) else {
+            let outcome = resources.abort();
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Take,
+                SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+            )
+            .with_abort_outcome(outcome));
+        };
+        if expected_count == 0 || resources.drive_keys.len() != expected_count {
+            let outcome = resources.abort();
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Take,
+                SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        let mut owners = Vec::new();
+        if owners.try_reserve_exact(expected_count).is_err() {
+            let outcome = resources.abort();
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::Take,
+                SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        for key in &resources.drive_keys {
+            match resources.bindings.take(key) {
+                Ok(owner) if owner.key == *key => owners.push(owner),
+                Ok(owner) => {
+                    owners.push(owner);
+                    let outcome = resources.abort_with_taken(owners);
+                    return Err(SnapshotRestoreResourceError::terminal(
+                        SnapshotRestoreResourceStage::Take,
+                        SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+                    )
+                    .with_abort_outcome(outcome));
+                }
+                Err(source) => {
+                    let outcome = resources.abort_with_taken(owners);
+                    return Err(SnapshotRestoreResourceError::terminal(
+                        SnapshotRestoreResourceStage::Take,
+                        SnapshotRestoreResourceErrorKind::Take(source),
+                    )
+                    .with_abort_outcome(outcome));
+                }
+            }
+        }
+        let PreparedSnapshotMultiDriveRestoreResources {
+            drive_keys: _,
+            drive_configs: _,
+            bindings,
+            contained_transaction,
+            file_set_kind: _,
+        } = resources;
+        if let Err(unconsumed) = bindings.finish() {
+            let unconsumed_count = unconsumed.unconsumed_count();
+            let outcome = abort_drive_bindings(unconsumed.into_bindings().into_values())
+                .merge(abort_prepared_drive_resources(owners))
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::Unconsumed { unconsumed_count },
+            )
+            .with_abort_outcome(outcome));
+        }
+        let valid_order = owners.len() == expected_count
+            && owners.iter().enumerate().all(|(index, owner)| {
+                if index < block_count {
+                    owner.key.resource_class() == SnapshotRestoreResourceClass::BlockBacking
+                        && matches!(owner.backing, PreparedSnapshotFileBacking::Block(_))
+                } else {
+                    owner.key.resource_class() == SnapshotRestoreResourceClass::PmemBacking
+                        && matches!(owner.backing, PreparedSnapshotFileBacking::Pmem(_))
+                }
+            });
+        if !valid_order {
+            let outcome = abort_prepared_drive_resources(owners)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        let mut blocks = Vec::new();
+        let mut pmems = Vec::new();
+        let mut claims = Vec::new();
+        if blocks.try_reserve_exact(block_count).is_err()
+            || pmems.try_reserve_exact(pmem_count).is_err()
+            || claims.try_reserve_exact(expected_count).is_err()
+        {
+            let outcome = abort_prepared_drive_resources(owners)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        for owner in owners {
+            let PreparedSnapshotDriveRestoreResource {
+                key,
+                backing,
+                claim,
+            } = owner;
+            match backing {
+                PreparedSnapshotFileBacking::Block(backing) => {
+                    blocks.push(PreparedSnapshotBlockRestoreBacking { key, backing });
+                }
+                PreparedSnapshotFileBacking::Pmem(backing) => {
+                    pmems.push(PreparedSnapshotPmemRestoreBacking { key, backing });
+                }
+            }
+            if let Some(claim) = claim {
+                claims.push(claim);
+            }
+        }
+        if blocks.len() != block_count || pmems.len() != pmem_count {
+            drop(blocks);
+            drop(pmems);
+            let outcome = abort_prepared_drive_claims(claims)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        Ok(PreparedSnapshotStorageRestoreBatch {
+            blocks,
+            pmems,
+            completion: PreparedSnapshotDriveRestoreCompletion {
+                claims,
+                contained_transaction,
+            },
+        })
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotStorageRestoreResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotStorageRestoreResources")
+            .field("block_count", &self.block_count)
+            .field("pmem_count", &self.pmem_count)
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+pub(crate) struct PreparedSnapshotBlockRestoreBacking {
+    key: SnapshotRestoreResourceKey,
+    backing: BlockFileBacking,
+}
+
+impl PreparedSnapshotBlockRestoreBacking {
+    pub(crate) fn into_parts(self) -> (SnapshotRestoreResourceKey, BlockFileBacking) {
+        (self.key, self.backing)
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotBlockRestoreBacking {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotBlockRestoreBacking")
+            .field("key", &self.key)
+            .field("backing", &"<owned>")
+            .finish()
+    }
+}
+
+pub(crate) struct PreparedSnapshotPmemRestoreBacking {
+    key: SnapshotRestoreResourceKey,
+    backing: PmemFileBacking,
+}
+
+impl PreparedSnapshotPmemRestoreBacking {
+    pub(crate) fn into_parts(self) -> (SnapshotRestoreResourceKey, PmemFileBacking) {
+        (self.key, self.backing)
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotPmemRestoreBacking {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotPmemRestoreBacking")
+            .field("key", &self.key)
+            .field("backing", &"<owned>")
+            .finish()
+    }
+}
+
+/// Exact graph-ordered, unmapped block and pmem restore owners.
+pub(crate) struct PreparedSnapshotStorageRestoreBatch {
+    blocks: Vec<PreparedSnapshotBlockRestoreBacking>,
+    pmems: Vec<PreparedSnapshotPmemRestoreBacking>,
+    completion: PreparedSnapshotDriveRestoreCompletion,
+}
+
+impl PreparedSnapshotStorageRestoreBatch {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<PreparedSnapshotBlockRestoreBacking>,
+        Vec<PreparedSnapshotPmemRestoreBacking>,
+        PreparedSnapshotDriveRestoreCompletion,
+    ) {
+        (self.blocks, self.pmems, self.completion)
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotStorageRestoreBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotStorageRestoreBatch")
+            .field("block_count", &self.blocks.len())
+            .field("pmem_count", &self.pmems.len())
             .field("values", &"<redacted>")
             .finish()
     }
@@ -2212,6 +2895,26 @@ impl RequestedSnapshotRestoreResources {
         .into_drive_batch()
     }
 
+    /// Typed exact-2.6 resource producer retained for the pathless storage
+    /// reconstruction child.
+    pub(crate) fn prepare_native_v2_storage_device_graph<F>(
+        graph: &SnapshotV2StorageDeviceGraph,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: F,
+    ) -> Result<PreparedSnapshotStorageRestoreBatch, SnapshotRestoreResourceError>
+    where
+        F: Fn() -> bool,
+    {
+        let _batch_parts = PreparedSnapshotStorageRestoreBatch::into_parts;
+        let _block_parts = PreparedSnapshotBlockRestoreBacking::into_parts;
+        let _pmem_parts = PreparedSnapshotPmemRestoreBacking::into_parts;
+        let _commit = PreparedSnapshotDriveRestoreCompletion::commit;
+        let _abort = PreparedSnapshotDriveRestoreCompletion::abort;
+        RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(graph)?
+            .prepare(authority, cancelled)?
+            .into_storage_batch()
+    }
+
     pub(crate) fn try_from_native_v2_device_graph(
         graph: &SnapshotV2DeviceGraph,
     ) -> Result<Self, SnapshotRestoreResourceError> {
@@ -2220,6 +2923,7 @@ impl RequestedSnapshotRestoreResources {
         let _profile_2_producer = Self::prepare_native_v2_multi_block_device_graph::<fn() -> bool>;
         let _profile_2_bundle_producer =
             Self::prepare_native_v2_multi_block_restore_bundle::<fn() -> bool>;
+        let _profile_3_producer = Self::prepare_native_v2_storage_device_graph::<fn() -> bool>;
         Self::try_from_native_v2_device_graph_and_vsock(graph, None)
     }
 
@@ -3064,6 +3768,9 @@ mod tests {
     use bangbang_runtime::snapshot_device_v2_5::{
         NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
     };
+    use bangbang_runtime::snapshot_device_v2_6::{
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
+    };
     use bangbang_runtime::snapshot_restore::{
         SnapshotRestoreBindingRejectionReason, SnapshotRestorePublicId,
     };
@@ -3078,7 +3785,7 @@ mod tests {
         ContainedSnapshotRestoreErrorKind, GrantAuthority, TestContainedRestoreAuthority,
         contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
         file_grant_authority_for_test, root_file_grant_authority_for_test,
-        vsock_directory_authority_for_test,
+        snapshot_storage_grant_authority_for_test, vsock_directory_authority_for_test,
     };
 
     use super::*;
@@ -3109,6 +3816,19 @@ mod tests {
             Self { path }
         }
 
+        fn new_sized_at(path: PathBuf, len: u64) -> Self {
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("temporary backing should be created once");
+            file.set_len(len)
+                .expect("temporary backing length should set");
+            file.sync_all()
+                .expect("temporary backing should synchronize");
+            Self { path }
+        }
+
         fn path(&self) -> &Path {
             &self.path
         }
@@ -3131,6 +3851,11 @@ mod tests {
     fn unique_short_path() -> PathBuf {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         PathBuf::from(format!("/tmp/bb{id:011x}"))
+    }
+
+    fn unique_pmem_short_path() -> PathBuf {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        PathBuf::from(format!("/tmp/p{id:09x}"))
     }
 
     fn fixture_graph(transport: SnapshotV2DeviceTransportKind) -> SnapshotV2DeviceGraph {
@@ -3192,6 +3917,100 @@ mod tests {
             &bytes,
         )
         .expect("profile-2 fixture graph should decode")
+    }
+
+    fn storage_fixture_graph_from_hex(
+        fixture: &str,
+        selectors: &[(&[u8], &Path)],
+    ) -> SnapshotV2StorageDeviceGraph {
+        let mut bytes = fixture
+            .trim()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
+                u8::from_str_radix(pair, 16).expect("fixture hex should decode")
+            })
+            .collect::<Vec<_>>();
+        for &(captured, replacement) in selectors {
+            let replacement = replacement
+                .to_str()
+                .expect("test selector should be UTF-8")
+                .as_bytes();
+            assert_eq!(replacement.len(), captured.len());
+            let offset = bytes
+                .windows(captured.len())
+                .position(|window| window == captured)
+                .expect("fixture selector should exist");
+            bytes[offset..offset + captured.len()].copy_from_slice(replacement);
+        }
+        SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &bytes,
+        )
+        .expect("profile-3 fixture graph should decode")
+    }
+
+    fn storage_fixture_graph(
+        block_selector: &Path,
+        pmem_selector: &Path,
+    ) -> SnapshotV2StorageDeviceGraph {
+        storage_fixture_graph_from_hex(
+            include_str!(
+                "../../runtime/src/snapshot_device_v2_6/fixtures/mixed-block-root-mmio.hex"
+            ),
+            &[
+                (b"logical-selector-0".as_slice(), block_selector),
+                (b"pmem-selector-0".as_slice(), pmem_selector),
+            ],
+        )
+    }
+
+    fn contained_storage_request(
+        graph: &SnapshotV2StorageDeviceGraph,
+        block_reference: &Path,
+        pmem_reference: &Path,
+    ) -> RequestedSnapshotStorageRestoreResources {
+        let mut request =
+            RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(
+                graph,
+            )
+            .expect("mixed contained storage request should derive");
+        assert_eq!(request.resources.drives.len(), 2);
+        request.resources.drives[0].selector = block_reference.to_path_buf();
+        request.resources.drives[1].selector = pmem_reference.to_path_buf();
+        request
+    }
+
+    const fn grant_access(is_read_only: bool) -> GrantAccess {
+        if is_read_only {
+            GrantAccess::ReadOnly
+        } else {
+            GrantAccess::ReadWrite
+        }
+    }
+
+    fn assert_storage_grants_reusable(
+        fixture: &TestContainedRestoreAuthority,
+        block_reference: &Path,
+        block_access: GrantAccess,
+        pmem_reference: &Path,
+        pmem_access: GrantAccess,
+    ) {
+        fixture
+            .grants()
+            .prepare_drive_backing_claim(block_reference, block_access)
+            .expect("block grant inspection should succeed")
+            .expect("block reference should remain contained")
+            .abort()
+            .expect("block grant inspection should restore");
+        drop(
+            fixture
+                .grants()
+                .prepare_file_claim(pmem_reference, ResourceRole::PmemBacking, pmem_access)
+                .expect("pmem grant inspection should succeed")
+                .expect("pmem reference should remain contained"),
+        );
     }
 
     fn multi_restore_memory(graph: &SnapshotV2MultiBlockDeviceGraph) -> GuestMemory {
@@ -3324,6 +4143,7 @@ mod tests {
                 selector: selectors[index].to_path_buf(),
                 is_read_only: read_only[index],
                 expected_len: expected_lengths[index],
+                kind: SnapshotRestoreFileKind::Block,
             });
             drive_keys.push(key.clone());
             resources.push(key);
@@ -3338,6 +4158,7 @@ mod tests {
             drive_keys,
             drive_configs: configs,
             bindings,
+            file_set_kind: SnapshotRestoreFileSetKind::MultiBlock,
         }
     }
 
@@ -3745,6 +4566,830 @@ mod tests {
     }
 
     #[test]
+    fn profile_3_direct_block_only_and_pmem_only_batches_preserve_typed_cardinality() {
+        let block_path = unique_short_path();
+        let block_graph = storage_fixture_graph_from_hex(
+            include_str!("../../runtime/src/snapshot_device_v2_6/fixtures/block-root-mmio.hex"),
+            &[(b"logical-selector-0".as_slice(), block_path.as_path())],
+        );
+        assert_eq!(
+            block_graph.root_key(),
+            Some(block_graph.block_records()[0].key())
+        );
+        let _block = TempRoot::new_sized_at(
+            block_path,
+            block_graph.block_records()[0].block().backing_bytes(),
+        );
+        let block_batch =
+            RequestedSnapshotRestoreResources::prepare_native_v2_storage_device_graph(
+                &block_graph,
+                None,
+                || false,
+            )
+            .expect("block-only exact-2.6 batch should prepare");
+        let (blocks, pmems, completion) = block_batch.into_parts();
+        assert_eq!(blocks.len(), 1);
+        assert!(pmems.is_empty());
+        drop(blocks);
+        completion
+            .abort()
+            .expect("block-only direct completion should abort");
+
+        let mut invalid_block_only =
+            RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(
+                &block_graph,
+            )
+            .expect("block-only exact-2.6 request should validate");
+        invalid_block_only.resources.drives[0].expected_len = 0;
+        let error = invalid_block_only
+            .prepare(None, || false)
+            .expect_err("block-only exact-2.6 preflight should reject invalid geometry");
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::StoragePreflight);
+        assert!(matches!(
+            error.kind,
+            SnapshotRestoreResourceErrorKind::InvalidStorageSet
+        ));
+
+        let pmem_path = unique_pmem_short_path();
+        let pmem_graph = storage_fixture_graph_from_hex(
+            include_str!("../../runtime/src/snapshot_device_v2_6/fixtures/pmem-root-mmio.hex"),
+            &[(b"pmem-selector-0".as_slice(), pmem_path.as_path())],
+        );
+        assert_eq!(
+            pmem_graph.root_key(),
+            Some(pmem_graph.pmem_records()[0].key())
+        );
+        let _pmem =
+            TempRoot::new_sized_at(pmem_path, pmem_graph.pmem_records()[0].pmem().file_bytes());
+        let pmem_batch = RequestedSnapshotRestoreResources::prepare_native_v2_storage_device_graph(
+            &pmem_graph,
+            None,
+            || false,
+        )
+        .expect("pmem-only exact-2.6 batch should prepare");
+        let (blocks, pmems, completion) = pmem_batch.into_parts();
+        assert!(blocks.is_empty());
+        assert_eq!(pmems.len(), 1);
+        drop(pmems);
+        completion
+            .abort()
+            .expect("pmem-only direct completion should abort");
+    }
+
+    #[test]
+    fn profile_3_direct_mixed_pmem_root_pci_batch_preserves_cross_class_root() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph_from_hex(
+            include_str!("../../runtime/src/snapshot_device_v2_6/fixtures/mixed-pmem-root-pci.hex"),
+            &[
+                (b"logical-selector-0".as_slice(), block_path.as_path()),
+                (b"pmem-selector-0".as_slice(), pmem_path.as_path()),
+            ],
+        );
+        assert_eq!(graph.root_key(), Some(graph.pmem_records()[0].key()));
+        let _block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        let _pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+
+        let batch = RequestedSnapshotRestoreResources::prepare_native_v2_storage_device_graph(
+            &graph,
+            None,
+            || false,
+        )
+        .expect("mixed pmem-root PCI batch should prepare");
+        let (blocks, pmems, completion) = batch.into_parts();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(pmems.len(), 1);
+        drop(blocks);
+        drop(pmems);
+        completion
+            .commit()
+            .expect("mixed pmem-root direct completion should commit");
+    }
+
+    #[test]
+    fn profile_3_direct_batch_returns_exact_keyed_unmapped_block_and_pmem_owners() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        assert_eq!(graph.block_records().len(), 1);
+        assert_eq!(graph.pmem_records().len(), 1);
+        let _block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        let _pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+
+        let batch = RequestedSnapshotRestoreResources::prepare_native_v2_storage_device_graph(
+            &graph,
+            None,
+            || false,
+        )
+        .expect("mixed direct storage batch should prepare");
+        let diagnostic = format!("{batch:?}");
+        assert!(!diagnostic.contains(graph.block_records()[0].config().selector()));
+        assert!(!diagnostic.contains(graph.pmem_records()[0].config().selector()));
+        assert!(!diagnostic.contains(graph.block_records()[0].config().drive_id()));
+        assert!(!diagnostic.contains(graph.pmem_records()[0].config().pmem_id()));
+
+        let (mut blocks, mut pmems, completion) = batch.into_parts();
+        let (block_key, block) = blocks
+            .pop()
+            .expect("one block owner should exist")
+            .into_parts();
+        let (pmem_key, pmem) = pmems
+            .pop()
+            .expect("one pmem owner should exist")
+            .into_parts();
+        assert!(blocks.is_empty());
+        assert!(pmems.is_empty());
+        assert_eq!(
+            block_key.resource_class(),
+            SnapshotRestoreResourceClass::BlockBacking
+        );
+        assert_eq!(block_key.device_key(), graph.block_records()[0].key());
+        assert_eq!(
+            block_key.public_id().as_str(),
+            graph.block_records()[0].config().drive_id()
+        );
+        assert_eq!(
+            block.len(),
+            graph.block_records()[0].block().backing_bytes()
+        );
+        assert_eq!(
+            block.is_read_only(),
+            graph.block_records()[0].config().is_read_only()
+        );
+        assert_eq!(
+            pmem_key.resource_class(),
+            SnapshotRestoreResourceClass::PmemBacking
+        );
+        assert_eq!(pmem_key.device_key(), graph.pmem_records()[0].key());
+        assert_eq!(
+            pmem_key.public_id().as_str(),
+            graph.pmem_records()[0].config().pmem_id()
+        );
+        assert_eq!(pmem.len(), graph.pmem_records()[0].pmem().file_bytes());
+        assert_eq!(
+            aligned_pmem_mapping_len(pmem.len()),
+            Some(graph.pmem_records()[0].pmem().mapped_bytes())
+        );
+        assert_eq!(
+            pmem.is_read_only(),
+            graph.pmem_records()[0].config().is_read_only()
+        );
+        completion
+            .commit()
+            .expect("direct storage completion should commit once");
+    }
+
+    #[test]
+    fn profile_3_direct_preflight_rejects_cross_class_alias_before_conversion() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let mut requested =
+            RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(
+                &graph,
+            )
+            .expect("mixed storage request should derive");
+        let common_len = 4096;
+        let _block = TempRoot::new_sized_at(block_path.clone(), common_len);
+        fs::hard_link(&block_path, &pmem_path).expect("cross-class hard link should create");
+        let _pmem = TempRoot {
+            path: pmem_path.clone(),
+        };
+        requested.resources.drives[0].selector = block_path;
+        requested.resources.drives[0].expected_len = common_len;
+        requested.resources.drives[1].selector = pmem_path;
+        requested.resources.drives[1].expected_len = common_len;
+        requested.resources.drives[1].kind = SnapshotRestoreFileKind::Pmem {
+            expected_mapped_len: aligned_pmem_mapping_len(common_len)
+                .expect("test pmem length should align"),
+        };
+
+        let error = requested
+            .prepare(None, || false)
+            .expect_err("cross-class descriptor alias must reject");
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::StoragePreflight);
+        assert!(matches!(
+            error.kind,
+            SnapshotRestoreResourceErrorKind::InvalidStorageSet
+        ));
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+    }
+
+    #[test]
+    fn profile_3_direct_mode_rejects_pmem_grant_reference_without_path_fallback() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let mut requested =
+            RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(
+                &graph,
+            )
+            .expect("mixed storage request should derive");
+        let _block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        requested.resources.drives[1].selector = PathBuf::from("bangbang-grant:pmem-ro");
+        let error = requested
+            .prepare(None, || false)
+            .expect_err("direct mode must reject contained pmem reference");
+        assert_eq!(error.stage, SnapshotRestoreResourceStage::StoragePreflight);
+        assert!(matches!(
+            error.kind,
+            SnapshotRestoreResourceErrorKind::InvalidStorageSet
+        ));
+    }
+
+    #[test]
+    fn profile_3_direct_rejects_pmem_geometry_changes_and_cancellation_before_batch() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let _block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        let pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+        let expected_pmem_len = graph.pmem_records()[0].pmem().file_bytes();
+
+        let mut wrong_alignment =
+            RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(
+                &graph,
+            )
+            .expect("mixed storage request should derive");
+        wrong_alignment.resources.drives[1].kind = SnapshotRestoreFileKind::Pmem {
+            expected_mapped_len: graph.pmem_records()[0]
+                .pmem()
+                .mapped_bytes()
+                .saturating_add(1),
+        };
+        let alignment_error = wrong_alignment
+            .prepare(None, || false)
+            .expect_err("wrong aligned pmem geometry must reject before opening a batch");
+        assert_eq!(
+            alignment_error.stage,
+            SnapshotRestoreResourceStage::StoragePreflight
+        );
+        assert_eq!(
+            alignment_error.disposition,
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+
+        OpenOptions::new()
+            .write(true)
+            .open(pmem.path())
+            .expect("pmem geometry fixture should reopen")
+            .set_len(expected_pmem_len.saturating_add(1))
+            .expect("pmem geometry fixture should grow");
+        let file_error =
+            RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(
+                &graph,
+            )
+            .expect("mixed storage request should derive")
+            .prepare(None, || false)
+            .expect_err("wrong pmem file length must reject the complete reservation");
+        assert_eq!(
+            file_error.stage,
+            SnapshotRestoreResourceStage::StoragePreflight
+        );
+        assert_eq!(
+            file_error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        OpenOptions::new()
+            .write(true)
+            .open(pmem.path())
+            .expect("pmem geometry fixture should reopen")
+            .set_len(expected_pmem_len)
+            .expect("pmem geometry fixture should reset");
+
+        let conversion_calls = Cell::new(0_u8);
+        let conversion_error =
+            RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(
+                &graph,
+            )
+            .expect("mixed storage request should derive")
+            .prepare(None, || {
+                let next = conversion_calls.get().saturating_add(1);
+                conversion_calls.set(next);
+                if next == 8 {
+                    OpenOptions::new()
+                        .write(true)
+                        .open(pmem.path())
+                        .expect("reserved pmem fixture should reopen")
+                        .set_len(expected_pmem_len.saturating_add(1))
+                        .expect("reserved pmem fixture should change before adoption");
+                }
+                false
+            })
+            .expect_err("changed pmem reservation must reject before binding");
+        assert_eq!(
+            conversion_error.stage,
+            SnapshotRestoreResourceStage::PmemPreparation
+        );
+        assert_eq!(
+            conversion_error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        OpenOptions::new()
+            .write(true)
+            .open(pmem.path())
+            .expect("changed pmem fixture should reopen")
+            .set_len(expected_pmem_len)
+            .expect("changed pmem fixture should reset");
+
+        let cancellation_calls = Cell::new(0_u8);
+        let cancellation_error =
+            RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(
+                &graph,
+            )
+            .expect("mixed storage request should derive")
+            .prepare(None, || {
+                let next = cancellation_calls.get().saturating_add(1);
+                cancellation_calls.set(next);
+                next >= 5
+            })
+            .expect_err("mid-reservation cancellation must unwind the earlier block");
+        assert_eq!(
+            cancellation_error.stage,
+            SnapshotRestoreResourceStage::Cancellation
+        );
+        assert_eq!(
+            cancellation_error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+
+        let diagnostics = format!(
+            "{alignment_error:?} {file_error:?} {conversion_error:?} {cancellation_error:?}"
+        );
+        assert!(!diagnostics.contains(pmem.path().to_string_lossy().as_ref()));
+        let retry = RequestedSnapshotRestoreResources::prepare_native_v2_storage_device_graph(
+            &graph,
+            None,
+            || false,
+        )
+        .expect("all direct failure paths should leave the mixed files reusable");
+        let (blocks, pmems, completion) = retry.into_parts();
+        drop(blocks);
+        drop(pmems);
+        completion
+            .abort()
+            .expect("retried direct completion should abort");
+    }
+
+    #[test]
+    fn profile_3_contained_batch_returns_mixed_owners_under_one_rollback_transaction() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        let pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+        let block_reference = PathBuf::from("bangbang-grant:block0");
+        let pmem_reference = PathBuf::from("bangbang-grant:pmem0");
+        let block_access = grant_access(graph.block_records()[0].config().is_read_only());
+        let pmem_access = grant_access(graph.pmem_records()[0].config().is_read_only());
+        let fixture = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[
+                (
+                    "block0",
+                    ResourceRole::DriveBacking,
+                    block_access,
+                    block.path(),
+                ),
+                ("pmem0", ResourceRole::PmemBacking, pmem_access, pmem.path()),
+            ]),
+            false,
+        );
+
+        let batch = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(fixture.authority()), || false)
+            .expect("mixed contained storage resources should prepare")
+            .into_storage_batch()
+            .expect("mixed contained storage batch should take exact owners");
+        let diagnostics = format!("{batch:?}");
+        assert!(!diagnostics.contains("block0"));
+        assert!(!diagnostics.contains("pmem0"));
+        assert!(!diagnostics.contains(block.path().to_string_lossy().as_ref()));
+        assert!(!diagnostics.contains(pmem.path().to_string_lossy().as_ref()));
+
+        let (mut blocks, mut pmems, completion) = batch.into_parts();
+        let (block_key, block_backing) = blocks
+            .pop()
+            .expect("one contained block owner should exist")
+            .into_parts();
+        let (pmem_key, pmem_backing) = pmems
+            .pop()
+            .expect("one contained pmem owner should exist")
+            .into_parts();
+        assert!(blocks.is_empty());
+        assert!(pmems.is_empty());
+        assert_eq!(
+            block_key.resource_class(),
+            SnapshotRestoreResourceClass::BlockBacking
+        );
+        assert_eq!(
+            pmem_key.resource_class(),
+            SnapshotRestoreResourceClass::PmemBacking
+        );
+        assert_eq!(
+            block_backing.len(),
+            graph.block_records()[0].block().backing_bytes()
+        );
+        assert_eq!(
+            pmem_backing.len(),
+            graph.pmem_records()[0].pmem().file_bytes()
+        );
+        drop(block_backing);
+        drop(pmem_backing);
+        completion
+            .abort()
+            .expect("mixed contained completion should restore both grants and generation");
+
+        let rebound = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(fixture.authority()), || false)
+            .expect("one abort should restore the complete mixed transaction")
+            .into_storage_batch()
+            .expect("restored mixed contained batch should take exact owners");
+        let (blocks, pmems, completion) = rebound.into_parts();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(pmems.len(), 1);
+        drop(blocks);
+        drop(pmems);
+        completion
+            .abort()
+            .expect("rebound mixed contained completion should restore");
+    }
+
+    #[test]
+    fn profile_3_contained_mode_rejects_wrong_pmem_role_atomically_without_path_fallback() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        let pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+        let block_reference = PathBuf::from("bangbang-grant:block0");
+        let pmem_reference = PathBuf::from("bangbang-grant:pmem0");
+        let block_access = grant_access(graph.block_records()[0].config().is_read_only());
+        let pmem_access = grant_access(graph.pmem_records()[0].config().is_read_only());
+        let fixture = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[
+                (
+                    "block0",
+                    ResourceRole::DriveBacking,
+                    block_access,
+                    block.path(),
+                ),
+                (
+                    "pmem0",
+                    ResourceRole::DriveBacking,
+                    pmem_access,
+                    pmem.path(),
+                ),
+            ]),
+            false,
+        );
+
+        let error = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(fixture.authority()), || false)
+            .expect_err("wrong-class pmem grant must reject the complete contained batch");
+        assert_eq!(
+            error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert!(matches!(
+            error.kind,
+            SnapshotRestoreResourceErrorKind::Contained(_)
+        ));
+        assert_eq!(
+            error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        let diagnostics = format!("{error:?}");
+        assert!(!diagnostics.contains("block0"));
+        assert!(!diagnostics.contains("pmem0"));
+        assert!(!diagnostics.contains(block.path().to_string_lossy().as_ref()));
+        assert!(!diagnostics.contains(pmem.path().to_string_lossy().as_ref()));
+
+        let block_claim = fixture
+            .grants()
+            .prepare_drive_backing_claim(&block_reference, block_access)
+            .expect("wrong-role failure should preserve the block grant")
+            .expect("block reference should remain contained");
+        block_claim
+            .abort()
+            .expect("preserved block grant should restore after inspection");
+        let pmem_claim = fixture
+            .grants()
+            .prepare_drive_backing_claim(&pmem_reference, pmem_access)
+            .expect("wrong-role failure should preserve the mislabeled pmem grant")
+            .expect("mislabeled pmem reference should remain contained");
+        pmem_claim
+            .abort()
+            .expect("preserved mislabeled pmem grant should restore after inspection");
+    }
+
+    #[test]
+    fn profile_3_contained_preflight_rejects_access_length_selector_and_cancellation() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        let pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+        let block_reference = PathBuf::from("bangbang-grant:block0");
+        let pmem_reference = PathBuf::from("bangbang-grant:pmem0");
+        let block_access = grant_access(graph.block_records()[0].config().is_read_only());
+        let pmem_access = grant_access(graph.pmem_records()[0].config().is_read_only());
+        let wrong_pmem_access = match pmem_access {
+            GrantAccess::ReadOnly => GrantAccess::ReadWrite,
+            GrantAccess::ReadWrite => GrantAccess::ReadOnly,
+            _ => panic!("pmem fixture access should be read-only or read-write"),
+        };
+
+        let wrong_access = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[
+                (
+                    "block0",
+                    ResourceRole::DriveBacking,
+                    block_access,
+                    block.path(),
+                ),
+                (
+                    "pmem0",
+                    ResourceRole::PmemBacking,
+                    wrong_pmem_access,
+                    pmem.path(),
+                ),
+            ]),
+            false,
+        );
+        let access_error = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(wrong_access.authority()), || false)
+            .expect_err("wrong pmem access must reject the complete contained vector");
+        assert_eq!(
+            access_error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert_eq!(
+            access_error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert_storage_grants_reusable(
+            &wrong_access,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            wrong_pmem_access,
+        );
+
+        let exact = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[
+                (
+                    "block0",
+                    ResourceRole::DriveBacking,
+                    block_access,
+                    block.path(),
+                ),
+                ("pmem0", ResourceRole::PmemBacking, pmem_access, pmem.path()),
+            ]),
+            false,
+        );
+        let mut wrong_length = contained_storage_request(&graph, &block_reference, &pmem_reference);
+        wrong_length.resources.drives[1].expected_len = wrong_length.resources.drives[1]
+            .expected_len
+            .saturating_add(1);
+        let length_error = wrong_length
+            .prepare(Some(exact.authority()), || false)
+            .expect_err("wrong pmem length must reject before exact take");
+        assert_eq!(
+            length_error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert_storage_grants_reusable(
+            &exact,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            pmem_access,
+        );
+
+        let mut invalid_selector =
+            contained_storage_request(&graph, &block_reference, &pmem_reference);
+        invalid_selector.resources.drives[1].selector = pmem.path().to_path_buf();
+        let selector_error = invalid_selector
+            .prepare(Some(exact.authority()), || false)
+            .expect_err("contained pmem selector must never fall back to a direct path");
+        assert_eq!(
+            selector_error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert_storage_grants_reusable(
+            &exact,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            pmem_access,
+        );
+
+        let cancellation_calls = Cell::new(0_u8);
+        let cancellation_error =
+            contained_storage_request(&graph, &block_reference, &pmem_reference)
+                .prepare(Some(exact.authority()), || {
+                    let next = cancellation_calls.get().saturating_add(1);
+                    cancellation_calls.set(next);
+                    next >= 4
+                })
+                .expect_err("post-inspection cancellation must release the mixed generation");
+        assert_eq!(
+            cancellation_error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert_eq!(
+            cancellation_error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert_storage_grants_reusable(
+            &exact,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            pmem_access,
+        );
+
+        let diagnostics = format!(
+            "{access_error:?} {length_error:?} {selector_error:?} \
+             {cancellation_error:?}"
+        );
+        for private in [
+            block.path(),
+            pmem.path(),
+            block_reference.as_path(),
+            pmem_reference.as_path(),
+        ] {
+            assert!(!diagnostics.contains(private.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[test]
+    fn profile_3_storage_batch_rejects_omitted_and_swapped_typed_outputs_with_full_rollback() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        let pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+        let block_reference = PathBuf::from("bangbang-grant:block0");
+        let pmem_reference = PathBuf::from("bangbang-grant:pmem0");
+        let block_access = grant_access(graph.block_records()[0].config().is_read_only());
+        let pmem_access = grant_access(graph.pmem_records()[0].config().is_read_only());
+        let fixture = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[
+                (
+                    "block0",
+                    ResourceRole::DriveBacking,
+                    block_access,
+                    block.path(),
+                ),
+                ("pmem0", ResourceRole::PmemBacking, pmem_access, pmem.path()),
+            ]),
+            false,
+        );
+
+        let mut omitted = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(fixture.authority()), || false)
+            .expect("omitted-output fixture should prepare");
+        omitted.pmem_count = 0;
+        let omitted_error = omitted
+            .into_storage_batch()
+            .expect_err("omitted typed output count must reject before consumption");
+        assert_eq!(omitted_error.stage, SnapshotRestoreResourceStage::Take);
+        assert_eq!(
+            omitted_error.disposition,
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+        assert_storage_grants_reusable(
+            &fixture,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            pmem_access,
+        );
+
+        let mut swapped = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(fixture.authority()), || false)
+            .expect("swapped-output fixture should prepare");
+        swapped.resources.drive_keys.swap(0, 1);
+        let swapped_error = swapped
+            .into_storage_batch()
+            .expect_err("swapped typed outputs must reject before returning a batch");
+        assert_eq!(swapped_error.stage, SnapshotRestoreResourceStage::Finish);
+        assert_eq!(
+            swapped_error.disposition,
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+        assert_storage_grants_reusable(
+            &fixture,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            pmem_access,
+        );
+
+        let diagnostics = format!("{omitted_error:?} {swapped_error:?}");
+        for private in [
+            block.path(),
+            pmem.path(),
+            block_reference.as_path(),
+            pmem_reference.as_path(),
+        ] {
+            assert!(!diagnostics.contains(private.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[test]
+    fn profile_3_contained_abort_faults_are_terminal_and_release_all_owned_descriptors() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        let pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+        let block_reference = PathBuf::from("bangbang-grant:block0");
+        let pmem_reference = PathBuf::from("bangbang-grant:pmem0");
+        let block_access = grant_access(graph.block_records()[0].config().is_read_only());
+        let pmem_access = grant_access(graph.pmem_records()[0].config().is_read_only());
+        let grants = || {
+            snapshot_storage_grant_authority_for_test(&[
+                (
+                    "block0",
+                    ResourceRole::DriveBacking,
+                    block_access,
+                    block.path(),
+                ),
+                ("pmem0", ResourceRole::PmemBacking, pmem_access, pmem.path()),
+            ])
+        };
+
+        let stale_generation = contained_restore_authority_with_grants_for_test(grants(), false);
+        let batch = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(stale_generation.authority()), || false)
+            .expect("stale-generation fixture should prepare")
+            .into_storage_batch()
+            .expect("stale-generation fixture should return one batch");
+        let (blocks, pmems, completion) = batch.into_parts();
+        drop(blocks);
+        drop(pmems);
+        stale_generation.invalidate_generation();
+        let generation_error = completion
+            .abort()
+            .expect_err("stale generation must report terminal completion uncertainty");
+        assert_eq!(
+            generation_error.disposition(),
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+        assert!(!generation_error.grant_failed);
+        assert_storage_grants_reusable(
+            &stale_generation,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            pmem_access,
+        );
+
+        let inactive_grants = contained_restore_authority_with_grants_for_test(grants(), false);
+        let batch = contained_storage_request(&graph, &block_reference, &pmem_reference)
+            .prepare(Some(inactive_grants.authority()), || false)
+            .expect("inactive-grant fixture should prepare")
+            .into_storage_batch()
+            .expect("inactive-grant fixture should return one batch");
+        let (blocks, pmems, completion) = batch.into_parts();
+        drop(blocks);
+        drop(pmems);
+        inactive_grants.grants().invalidate_for_test();
+        let grant_error = completion
+            .abort()
+            .expect_err("inactive grant registry must report terminal cleanup uncertainty");
+        assert_eq!(
+            grant_error.disposition(),
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+        assert!(grant_error.grant_failed);
+        let diagnostics = format!("{generation_error:?} {grant_error:?}");
+        for private in [
+            block.path(),
+            pmem.path(),
+            block_reference.as_path(),
+            pmem_reference.as_path(),
+        ] {
+            assert!(!diagnostics.contains(private.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[test]
     fn profile_2_direct_batch_preserves_mixed_access_order_and_completion() {
         let template = multi_fixture_graph(None, None);
         let first_path = unique_short_path();
@@ -4136,6 +5781,7 @@ mod tests {
                 selector: selector.clone(),
                 is_read_only: record.config().is_read_only(),
                 expected_len,
+                kind: SnapshotRestoreFileKind::Block,
             });
             drive_keys.push(key.clone());
             resources.push(key);
@@ -4150,6 +5796,7 @@ mod tests {
             drive_keys,
             drive_configs: configs,
             bindings,
+            file_set_kind: SnapshotRestoreFileSetKind::MultiBlock,
         };
         let fixture = contained_restore_authority_with_grants_for_test(
             file_grant_authority_for_test(),
@@ -4334,8 +5981,13 @@ mod tests {
             .expect("swapped-claim fixture should split");
         assert!(vsock.is_none());
         claims.swap(0, 1);
-        let failure = prepare_contained_drives(&request.drives, claims, &|| false)
-            .expect_err("swapped descriptor bindings must fail before construction");
+        let failure = prepare_contained_drives(
+            &request.drives,
+            claims,
+            SnapshotRestoreFileSetKind::MultiBlock,
+            &|| false,
+        )
+        .expect_err("swapped descriptor bindings must fail before construction");
         let (error, resources, claims) = *failure;
         assert_eq!(error.stage, SnapshotRestoreResourceStage::DrivePreparation);
         assert_eq!(
@@ -4392,8 +6044,13 @@ mod tests {
                 .expect("extra claim should validate")
                 .expect("extra selector should remain contained"),
         );
-        let failure = prepare_contained_drives(&request.drives, claims, &|| false)
-            .expect_err("extra prepared claims must fail before construction");
+        let failure = prepare_contained_drives(
+            &request.drives,
+            claims,
+            SnapshotRestoreFileSetKind::MultiBlock,
+            &|| false,
+        )
+        .expect_err("extra prepared claims must fail before construction");
         let (error, resources, claims) = *failure;
         assert_eq!(error.stage, SnapshotRestoreResourceStage::DrivePreflight);
         assert_eq!(
@@ -4435,8 +6092,13 @@ mod tests {
             .into_drive_parts()
             .expect("changed-geometry fixture should split");
         assert!(vsock.is_none());
-        let failure = prepare_contained_drives(&request.drives[..1], claims, &|| false)
-            .expect_err("changed backing geometry must fail before construction");
+        let failure = prepare_contained_drives(
+            &request.drives[..1],
+            claims,
+            SnapshotRestoreFileSetKind::MultiBlock,
+            &|| false,
+        )
+        .expect_err("changed backing geometry must fail before construction");
         let (error, resources, claims) = *failure;
         assert_eq!(error.stage, SnapshotRestoreResourceStage::DrivePreflight);
         assert_eq!(
@@ -4540,11 +6202,13 @@ mod tests {
                     selector: shared.path().to_path_buf(),
                     is_read_only: record.config().is_read_only(),
                     expected_len: 4096,
+                    kind: SnapshotRestoreFileKind::Block,
                 }
             })
             .collect::<Vec<_>>();
-        let alias = prepare_direct_drives(&requests, &|| false)
-            .expect_err("same descriptor identity must reject");
+        let alias =
+            prepare_direct_drives(&requests, SnapshotRestoreFileSetKind::MultiBlock, &|| false)
+                .expect_err("same descriptor identity must reject");
         assert_eq!(alias.stage, SnapshotRestoreResourceStage::DrivePreflight);
         assert!(matches!(
             alias.kind,
@@ -4557,22 +6221,24 @@ mod tests {
         distinct[0].selector = first.path().to_path_buf();
         distinct[1].selector = second.path().to_path_buf();
         distinct[1].expected_len = 8193;
-        let geometry = prepare_direct_drives(&distinct, &|| false)
-            .expect_err("wrong expected geometry must reject");
+        let geometry =
+            prepare_direct_drives(&distinct, SnapshotRestoreFileSetKind::MultiBlock, &|| false)
+                .expect_err("wrong expected geometry must reject");
         assert_eq!(geometry.stage, SnapshotRestoreResourceStage::DrivePreflight);
 
         distinct[1].expected_len = 8192;
         let calls = Cell::new(0_u8);
-        let changed = prepare_direct_drives(&distinct, &|| {
-            let next = calls.get().saturating_add(1);
-            calls.set(next);
-            if next == 3 {
-                fs::write(first.path(), [0x66; 4097])
-                    .expect("reserved direct fixture should change before adoption");
-            }
-            false
-        })
-        .expect_err("changed preflight observation must reject before binding");
+        let changed =
+            prepare_direct_drives(&distinct, SnapshotRestoreFileSetKind::MultiBlock, &|| {
+                let next = calls.get().saturating_add(1);
+                calls.set(next);
+                if next == 6 {
+                    fs::write(first.path(), [0x66; 4097])
+                        .expect("reserved direct fixture should change before adoption");
+                }
+                false
+            })
+            .expect_err("changed preflight observation must reject before binding");
         assert_eq!(
             changed.stage,
             SnapshotRestoreResourceStage::DrivePreparation
@@ -4581,18 +6247,20 @@ mod tests {
             .expect("changed direct fixture should reset for later checks");
 
         distinct[0].selector = PathBuf::from(ROOT_REFERENCE);
-        let grant = prepare_direct_drives(&distinct, &|| false)
-            .expect_err("direct mode must not treat a grant reference as a path");
+        let grant =
+            prepare_direct_drives(&distinct, SnapshotRestoreFileSetKind::MultiBlock, &|| false)
+                .expect_err("direct mode must not treat a grant reference as a path");
         assert_eq!(grant.stage, SnapshotRestoreResourceStage::DrivePreflight);
 
         distinct[0].selector = first.path().to_path_buf();
         let calls = Cell::new(0_u8);
-        let cancelled = prepare_direct_drives(&distinct, &|| {
-            let next = calls.get().saturating_add(1);
-            calls.set(next);
-            next >= 2
-        })
-        .expect_err("mid-vector cancellation must unwind earlier reservations");
+        let cancelled =
+            prepare_direct_drives(&distinct, SnapshotRestoreFileSetKind::MultiBlock, &|| {
+                let next = calls.get().saturating_add(1);
+                calls.set(next);
+                next >= 4
+            })
+            .expect_err("mid-vector cancellation must unwind earlier reservations");
         assert_eq!(cancelled.stage, SnapshotRestoreResourceStage::Cancellation);
         let diagnostic = format!("{alias:?} {geometry:?} {changed:?} {grant:?} {cancelled:?}");
         for private in [

@@ -309,7 +309,7 @@ fn capture_pmem_state(
     let mapping = state.mapping();
     let device = state.device();
     let guest_range = state.guest_range();
-    let expected_mapped = align_pmem_length(backing.len())
+    let expected_mapped = aligned_pmem_mapping_len(backing.len())
         .ok_or(SnapshotV2StorageDeviceGraphCaptureError::InconsistentPmemState)?;
     let expected_config_space =
         VirtioPmemConfigSpace::new(guest_range.start().raw_value(), guest_range.size());

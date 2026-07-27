@@ -441,6 +441,15 @@ mod platform {
         expected_len: Option<u64>,
     }
 
+    /// One exact graph-ordered contained snapshot file request.
+    #[derive(Clone, Copy)]
+    pub(crate) struct ContainedSnapshotRestoreFileRequest<'a> {
+        reference: &'a Path,
+        role: ResourceRole,
+        access: GrantAccess,
+        expected_len: Option<u64>,
+    }
+
     impl<'a> ContainedSnapshotRestoreDriveRequest<'a> {
         pub(crate) const fn new(
             reference: &'a Path,
@@ -471,6 +480,57 @@ mod platform {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter
                 .debug_struct("ContainedSnapshotRestoreDriveRequest")
+                .field("state", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl<'a> ContainedSnapshotRestoreFileRequest<'a> {
+        pub(crate) const fn new(
+            reference: &'a Path,
+            role: ResourceRole,
+            access: GrantAccess,
+            expected_len: Option<u64>,
+        ) -> Self {
+            Self {
+                reference,
+                role,
+                access,
+                expected_len,
+            }
+        }
+
+        const fn from_drive(request: ContainedSnapshotRestoreDriveRequest<'a>) -> Self {
+            Self::new(
+                request.reference(),
+                ResourceRole::DriveBacking,
+                request.access(),
+                request.expected_len(),
+            )
+        }
+
+        const fn reference(self) -> &'a Path {
+            self.reference
+        }
+
+        const fn role(self) -> ResourceRole {
+            self.role
+        }
+
+        const fn access(self) -> GrantAccess {
+            self.access
+        }
+
+        const fn expected_len(self) -> Option<u64> {
+            self.expected_len
+        }
+    }
+
+    impl fmt::Debug for ContainedSnapshotRestoreFileRequest<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("ContainedSnapshotRestoreFileRequest")
+                .field("role", &self.role)
                 .field("state", &"<redacted>")
                 .finish()
         }
@@ -792,10 +852,13 @@ mod platform {
         registry: Arc<Mutex<Option<FileGrantRegistry>>>,
         block_control: Option<BlockControlBrokerAuthority>,
         id: GrantId,
+        role: ResourceRole,
         original: Option<GrantedFile>,
         duplicate: Option<GrantedFile>,
         snapshot_observation: Option<ExactRegularFileGrantObservation>,
     }
+
+    pub(crate) type PreparedSnapshotBackingClaim = PreparedDriveBackingClaim;
 
     impl std::fmt::Debug for PreparedFileGrantClaim {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -843,6 +906,7 @@ mod platform {
                     "block_control",
                     &self.block_control.as_ref().map(|_| "<redacted>"),
                 )
+                .field("role", &self.role)
                 .field("original", &self.original.as_ref().map(|_| "<reserved>"))
                 .field("duplicate", &self.duplicate.as_ref().map(|_| "<owned>"))
                 .field(
@@ -854,6 +918,10 @@ mod platform {
     }
 
     impl PreparedDriveBackingClaim {
+        pub(crate) const fn role(&self) -> ResourceRole {
+            self.role
+        }
+
         fn restore_original(&mut self) -> Result<(), GrantClaimError> {
             if self.original.is_none() {
                 return Ok(());
@@ -861,9 +929,16 @@ mod platform {
             let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
             let registry = registry.as_mut().ok_or(GrantClaimError)?;
             let original = self.original.take().ok_or(GrantClaimError)?;
-            registry
-                .restore_drive_backing(self.id.clone(), original)
-                .map_err(|_| GrantClaimError)
+            match self.role {
+                ResourceRole::DriveBacking => {
+                    registry.restore_drive_backing(self.id.clone(), original)
+                }
+                ResourceRole::PmemBacking => {
+                    registry.restore_pmem_backing(self.id.clone(), original)
+                }
+                _ => Err(bangbang_session::macos::grant_registry::GrantRegistryError),
+            }
+            .map_err(|_| GrantClaimError)
         }
 
         pub(crate) fn take_snapshot_read_only_file(&mut self) -> Result<File, GrantClaimError> {
@@ -874,13 +949,23 @@ mod platform {
             &mut self,
             is_read_only: bool,
         ) -> Result<(File, Option<ExactRegularFileGrantObservation>), GrantClaimError> {
+            self.take_snapshot_file_for_role(ResourceRole::DriveBacking, is_read_only)
+        }
+
+        pub(crate) fn take_snapshot_file_for_role(
+            &mut self,
+            role: ResourceRole,
+            is_read_only: bool,
+        ) -> Result<(File, Option<ExactRegularFileGrantObservation>), GrantClaimError> {
             let duplicate = self.duplicate.take().ok_or(GrantClaimError)?;
             let expected_access = if is_read_only {
                 GrantAccess::ReadOnly
             } else {
                 GrantAccess::ReadWrite
             };
-            if duplicate.access() != expected_access
+            if self.role != role
+                || duplicate.role() != role
+                || duplicate.access() != expected_access
                 || duplicate.kind() != GrantObjectKind::RegularFile
                 || duplicate.block_device().is_some()
             {
@@ -898,15 +983,29 @@ mod platform {
             ))
         }
 
+        #[cfg(test)]
         pub(crate) fn take_snapshot_file_for(
             &mut self,
             reference: &Path,
             is_read_only: bool,
         ) -> Result<(File, Option<ExactRegularFileGrantObservation>), GrantClaimError> {
+            self.take_snapshot_file_for_reference(
+                reference,
+                ResourceRole::DriveBacking,
+                is_read_only,
+            )
+        }
+
+        pub(crate) fn take_snapshot_file_for_reference(
+            &mut self,
+            reference: &Path,
+            role: ResourceRole,
+            is_read_only: bool,
+        ) -> Result<(File, Option<ExactRegularFileGrantObservation>), GrantClaimError> {
             if grant_reference_id(reference)?.as_ref() != Some(&self.id) {
                 return Err(GrantClaimError);
             }
-            self.take_snapshot_file(is_read_only)
+            self.take_snapshot_file_for_role(role, is_read_only)
         }
 
         pub(crate) fn take_backing(
@@ -919,7 +1018,10 @@ mod platform {
             } else {
                 GrantAccess::ReadWrite
             };
-            if duplicate.access() != expected_access {
+            if self.role != ResourceRole::DriveBacking
+                || duplicate.role() != ResourceRole::DriveBacking
+                || duplicate.access() != expected_access
+            {
                 return Err(GrantClaimError);
             }
             match (duplicate.kind(), duplicate.block_device()) {
@@ -969,7 +1071,15 @@ mod platform {
             let Some(registry) = registry.as_mut() else {
                 return;
             };
-            let _ = registry.restore_drive_backing(self.id.clone(), original);
+            let _ = match self.role {
+                ResourceRole::DriveBacking => {
+                    registry.restore_drive_backing(self.id.clone(), original)
+                }
+                ResourceRole::PmemBacking => {
+                    registry.restore_pmem_backing(self.id.clone(), original)
+                }
+                _ => Err(bangbang_session::macos::grant_registry::GrantRegistryError),
+            };
         }
     }
 
@@ -1118,6 +1228,7 @@ mod platform {
                 registry: Arc::clone(&self.registry),
                 block_control: self.block_control.clone(),
                 id,
+                role: ResourceRole::DriveBacking,
                 original: Some(original),
                 duplicate: Some(duplicate),
                 snapshot_observation: None,
@@ -1205,15 +1316,16 @@ mod platform {
                 })
         }
 
-        fn prepare_snapshot_restore_drive_claims(
+        fn prepare_snapshot_restore_file_claims(
             &self,
             requests: Vec<(GrantId, ResourceRole, GrantAccess, GrantObjectKind)>,
             mut buffers: SnapshotRestoreDriveClaimBuffers,
         ) -> Result<Vec<PreparedDriveBackingClaim>, ContainedSnapshotRestoreError> {
-            if requests
-                .iter()
-                .any(|(_, role, _, _)| *role != ResourceRole::DriveBacking)
-                || buffers.observations.len() != requests.len()
+            if requests.iter().any(|(_, role, access, kind)| {
+                !matches!(role, ResourceRole::DriveBacking | ResourceRole::PmemBacking)
+                    || !matches!(access, GrantAccess::ReadOnly | GrantAccess::ReadWrite)
+                    || *kind != GrantObjectKind::RegularFile
+            }) || buffers.observations.len() != requests.len()
             {
                 return Err(ContainedSnapshotRestoreError::new(
                     ContainedSnapshotRestoreErrorKind::InvalidRequest,
@@ -1250,12 +1362,19 @@ mod platform {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 if let Some(registry) = locked.as_mut() {
-                    for ((id, _, _, _), original) in
+                    for ((id, role, _, _), original) in
                         requests.iter().zip(buffers.originals.drain(..))
                     {
-                        failed |= registry
-                            .restore_drive_backing(id.clone(), original)
-                            .is_err();
+                        failed |= match role {
+                            ResourceRole::DriveBacking => {
+                                registry.restore_drive_backing(id.clone(), original)
+                            }
+                            ResourceRole::PmemBacking => {
+                                registry.restore_pmem_backing(id.clone(), original)
+                            }
+                            _ => Err(bangbang_session::macos::grant_registry::GrantRegistryError),
+                        }
+                        .is_err();
                     }
                 } else {
                     failed = true;
@@ -1269,7 +1388,7 @@ mod platform {
                     source
                 });
             }
-            for ((((id, _, _, _), original), duplicate), observation) in requests
+            for ((((id, role, _, _), original), duplicate), observation) in requests
                 .into_iter()
                 .zip(buffers.originals)
                 .zip(buffers.duplicates)
@@ -1279,6 +1398,7 @@ mod platform {
                     registry: Arc::clone(&self.registry),
                     block_control: self.block_control.clone(),
                     id,
+                    role,
                     original: Some(original),
                     duplicate: Some(duplicate),
                     snapshot_observation: Some(observation),
@@ -2239,17 +2359,37 @@ mod platform {
             cancelled: &impl Fn() -> bool,
         ) -> Result<ReservedContainedSnapshotRestoreResources, ContainedSnapshotRestoreError>
         {
-            let mut file_requests = Vec::new();
-            file_requests.try_reserve_exact(drives.len()).map_err(|_| {
+            let mut files = Vec::new();
+            files.try_reserve_exact(drives.len()).map_err(|_| {
                 ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
             })?;
-            if drives.is_empty() {
+            files.extend(
+                drives
+                    .iter()
+                    .copied()
+                    .map(ContainedSnapshotRestoreFileRequest::from_drive),
+            );
+            self.prepare_files(&files, vsock_reference, cancelled)
+        }
+
+        pub(crate) fn prepare_files(
+            &self,
+            files: &[ContainedSnapshotRestoreFileRequest<'_>],
+            vsock_reference: Option<&Path>,
+            cancelled: &impl Fn() -> bool,
+        ) -> Result<ReservedContainedSnapshotRestoreResources, ContainedSnapshotRestoreError>
+        {
+            let mut file_requests = Vec::new();
+            file_requests.try_reserve_exact(files.len()).map_err(|_| {
+                ContainedSnapshotRestoreError::new(ContainedSnapshotRestoreErrorKind::Authority)
+            })?;
+            if files.is_empty() {
                 return Err(ContainedSnapshotRestoreError::new(
                     ContainedSnapshotRestoreErrorKind::InvalidRequest,
                 ));
             }
-            for drive in drives {
-                let id = grant_reference_id(drive.reference())
+            for file in files {
+                let id = grant_reference_id(file.reference())
                     .map_err(|_| {
                         ContainedSnapshotRestoreError::new(
                             ContainedSnapshotRestoreErrorKind::InvalidRequest,
@@ -2261,19 +2401,17 @@ mod platform {
                         )
                     })?;
                 if !matches!(
-                    drive.access(),
+                    file.access(),
                     GrantAccess::ReadOnly | GrantAccess::ReadWrite
+                ) || !matches!(
+                    file.role(),
+                    ResourceRole::DriveBacking | ResourceRole::PmemBacking
                 ) {
                     return Err(ContainedSnapshotRestoreError::new(
                         ContainedSnapshotRestoreErrorKind::InvalidRequest,
                     ));
                 }
-                file_requests.push((
-                    id,
-                    ResourceRole::DriveBacking,
-                    drive.access(),
-                    GrantObjectKind::RegularFile,
-                ));
+                file_requests.push((id, file.role(), file.access(), GrantObjectKind::RegularFile));
             }
 
             let mut directory_requests = Vec::new();
@@ -2327,11 +2465,11 @@ mod platform {
             self.grants
                 .inspect_snapshot_restore_files(&file_requests, &mut drive_buffers.observations)?;
             check_contained_restore_progress(&transaction, cancelled)?;
-            if drive_buffers.observations.len() != drives.len()
+            if drive_buffers.observations.len() != files.len()
                 || drive_buffers
                     .observations
                     .iter()
-                    .zip(drives)
+                    .zip(files)
                     .any(|(observation, request)| {
                         request
                             .expected_len()
@@ -2376,7 +2514,7 @@ mod platform {
 
             let drive_claims = self
                 .grants
-                .prepare_snapshot_restore_drive_claims(file_requests, drive_buffers)?;
+                .prepare_snapshot_restore_file_claims(file_requests, drive_buffers)?;
             if let Err(source) = check_contained_restore_progress(&transaction, cancelled) {
                 return Err(if abort_drive_claims(drive_claims).is_err() {
                     source.with_cleanup_failure()
@@ -2468,11 +2606,11 @@ mod platform {
             }
             Ok(ReservedContainedSnapshotRestoreResources {
                 transaction: Some(transaction),
-                drive_claims,
+                file_claims: drive_claims,
                 directory_claims,
                 broker,
                 namespace,
-                expected_drive_count: drives.len(),
+                expected_file_count: files.len(),
                 expects_vsock: vsock_reference.is_some(),
             })
         }
@@ -2499,9 +2637,9 @@ mod platform {
         namespace: Option<WorkerSocketNamespace>,
         broker: Option<PreparedSocketBrokerEndpoint>,
         directory_claims: Vec<PreparedSocketDirectoryClaim>,
-        drive_claims: Vec<PreparedDriveBackingClaim>,
+        file_claims: Vec<PreparedDriveBackingClaim>,
         transaction: Option<ContainedSnapshotRestoreTransaction>,
-        expected_drive_count: usize,
+        expected_file_count: usize,
         expects_vsock: bool,
     }
 
@@ -2551,11 +2689,37 @@ mod platform {
         }
 
         pub(crate) fn into_drive_parts(
+            self,
+        ) -> Result<ContainedSnapshotRestoreReservationParts, ContainedSnapshotRestoreError>
+        {
+            let (files, vsock, transaction) = self.into_file_parts()?;
+            if files
+                .iter()
+                .any(|claim| claim.role() != ResourceRole::DriveBacking)
+            {
+                let source = ContainedSnapshotRestoreError::new(
+                    ContainedSnapshotRestoreErrorKind::InvalidRequest,
+                );
+                let cleanup_failed = vsock.is_some_and(|(directory, broker, namespace)| {
+                    drop(namespace);
+                    broker.abort().is_err() | directory.abort().is_err()
+                }) | abort_drive_claims(files).is_err()
+                    | transaction.abort().is_err();
+                return Err(if cleanup_failed {
+                    source.with_cleanup_failure()
+                } else {
+                    source
+                });
+            }
+            Ok((files, vsock, transaction))
+        }
+
+        pub(crate) fn into_file_parts(
             mut self,
         ) -> Result<ContainedSnapshotRestoreReservationParts, ContainedSnapshotRestoreError>
         {
-            let valid = self.expected_drive_count != 0
-                && self.drive_claims.len() == self.expected_drive_count
+            let valid = self.expected_file_count != 0
+                && self.file_claims.len() == self.expected_file_count
                 && if self.expects_vsock {
                     self.directory_claims.len() == 1
                         && self.broker.is_some()
@@ -2576,7 +2740,7 @@ mod platform {
                     source
                 });
             }
-            let drives = std::mem::take(&mut self.drive_claims);
+            let files = std::mem::take(&mut self.file_claims);
             let vsock = if self.expects_vsock {
                 let Some(directory) = self.directory_claims.pop() else {
                     abort_vhost_user_claim_invariant();
@@ -2594,14 +2758,14 @@ mod platform {
             let Some(transaction) = self.transaction.take() else {
                 abort_vhost_user_claim_invariant();
             };
-            Ok((drives, vsock, transaction))
+            Ok((files, vsock, transaction))
         }
 
         pub(crate) fn abort(mut self) -> Result<(), ContainedSnapshotRestoreError> {
             drop(self.namespace.take());
             let cleanup_failed = abort_prepared_broker(self.broker.take()).is_err()
                 | abort_directory_claims(std::mem::take(&mut self.directory_claims)).is_err()
-                | abort_drive_claims(std::mem::take(&mut self.drive_claims)).is_err();
+                | abort_drive_claims(std::mem::take(&mut self.file_claims)).is_err();
             let generation_failed = self
                 .transaction
                 .take()
@@ -2622,7 +2786,7 @@ mod platform {
             formatter
                 .debug_struct("ReservedContainedSnapshotRestoreResources")
                 .field("identity", &"<redacted>")
-                .field("file_count", &self.drive_claims.len())
+                .field("file_count", &self.file_claims.len())
                 .field("directory_count", &self.directory_claims.len())
                 .field("broker", &self.broker.as_ref().map(|_| "<reserved>"))
                 .finish()
@@ -4033,8 +4197,8 @@ mod platform {
         contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
         empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
         root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
-        snapshot_root_file_grant_authority_for_test, vhost_directory_authority_for_test,
-        vsock_directory_authority_for_test,
+        snapshot_root_file_grant_authority_for_test, snapshot_storage_grant_authority_for_test,
+        vhost_directory_authority_for_test, vsock_directory_authority_for_test,
     };
 
     #[cfg(test)]
@@ -4074,9 +4238,10 @@ mod platform {
 
         use super::{
             BlockControlBrokerAuthority, BlockControlResponse,
-            ContainedSnapshotRestoreDriveRequest, DirectoryGrantAuthority, GrantAuthority,
-            GrantClaimError, SocketBrokerAuthority, VhostUserBrokerAuthority,
-            VhostUserBrokerConnectError, checked_observed_geometry, exact_resource_limit,
+            ContainedSnapshotRestoreDriveRequest, ContainedSnapshotRestoreFileRequest,
+            DirectoryGrantAuthority, GrantAuthority, GrantClaimError, SocketBrokerAuthority,
+            VhostUserBrokerAuthority, VhostUserBrokerConnectError, checked_observed_geometry,
+            exact_resource_limit,
         };
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -4379,6 +4544,115 @@ mod platform {
             transaction
                 .abort()
                 .expect("reordered claim transaction should abort once");
+        }
+
+        #[test]
+        fn contained_restore_mixed_block_pmem_claims_retain_exact_roles_through_completion() {
+            let block_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contained_session.rs");
+            let pmem_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vmm.rs");
+            let block_len = fs::metadata(&block_path)
+                .expect("block fixture metadata should read")
+                .len();
+            let pmem_len = fs::metadata(&pmem_path)
+                .expect("pmem fixture metadata should read")
+                .len();
+            let fixture = contained_restore_authority_with_grants_for_test(
+                snapshot_storage_grant_authority_for_test(&[
+                    (
+                        "snapshot-block",
+                        ResourceRole::DriveBacking,
+                        GrantAccess::ReadOnly,
+                        &block_path,
+                    ),
+                    (
+                        "snapshot-pmem",
+                        ResourceRole::PmemBacking,
+                        GrantAccess::ReadWrite,
+                        &pmem_path,
+                    ),
+                ]),
+                false,
+            );
+            let requests = [
+                ContainedSnapshotRestoreFileRequest::new(
+                    Path::new("bangbang-grant:snapshot-block"),
+                    ResourceRole::DriveBacking,
+                    GrantAccess::ReadOnly,
+                    Some(block_len),
+                ),
+                ContainedSnapshotRestoreFileRequest::new(
+                    Path::new("bangbang-grant:snapshot-pmem"),
+                    ResourceRole::PmemBacking,
+                    GrantAccess::ReadWrite,
+                    Some(pmem_len),
+                ),
+            ];
+
+            let reserve = || {
+                fixture
+                    .authority
+                    .prepare_files(&requests, None, &|| false)
+                    .expect("mixed block/pmem vector should reserve")
+                    .into_file_parts()
+                    .expect("mixed block/pmem vector should split")
+            };
+            let (mut claims, vsock, transaction) = reserve();
+            assert!(vsock.is_none());
+            assert_eq!(claims.len(), 2);
+            assert_eq!(claims[0].role(), ResourceRole::DriveBacking);
+            assert_eq!(claims[1].role(), ResourceRole::PmemBacking);
+            let (block, block_observation) = claims[0]
+                .take_snapshot_file_for_reference(
+                    Path::new("bangbang-grant:snapshot-block"),
+                    ResourceRole::DriveBacking,
+                    true,
+                )
+                .expect("exact block claim should expose its duplicate");
+            let (pmem, pmem_observation) = claims[1]
+                .take_snapshot_file_for_reference(
+                    Path::new("bangbang-grant:snapshot-pmem"),
+                    ResourceRole::PmemBacking,
+                    false,
+                )
+                .expect("exact pmem claim should expose its duplicate");
+            assert_eq!(
+                block_observation
+                    .expect("block observation should remain retained")
+                    .len(),
+                block_len
+            );
+            assert_eq!(
+                pmem_observation
+                    .expect("pmem observation should remain retained")
+                    .len(),
+                pmem_len
+            );
+            drop((block, pmem));
+            for claim in claims.into_iter().rev() {
+                claim
+                    .abort()
+                    .expect("mixed claim abort should restore the exact role");
+            }
+            transaction
+                .abort()
+                .expect("mixed generation should abort once");
+
+            let (claims, vsock, transaction) = reserve();
+            assert!(vsock.is_none());
+            for claim in claims {
+                claim.commit();
+            }
+            transaction
+                .commit()
+                .expect("mixed generation should commit once");
+            let consumed = fixture
+                .authority
+                .prepare_files(&requests, None, &|| false)
+                .expect_err("committed mixed grants must be consumed together");
+            assert_eq!(
+                consumed.kind(),
+                super::ContainedSnapshotRestoreErrorKind::Authority
+            );
         }
 
         #[test]
@@ -5058,6 +5332,58 @@ mod platform {
                 .registry
         }
 
+        fn snapshot_storage_file_registry(
+            grants: &[(&str, ResourceRole, GrantAccess, &Path)],
+        ) -> GrantRegistry {
+            let session = SessionId::from_bytes([37; 32]);
+            let batch = BatchId::from_bytes([38; 16]);
+            let grant_count = u16::try_from(grants.len()).expect("storage grant count should fit");
+            let record_count = grant_count
+                .checked_add(2)
+                .expect("storage record count should fit");
+            let mut staged = StagedGrantBatch::new(session);
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    0,
+                    GrantRecord::Begin {
+                        grant_count,
+                        record_count,
+                        bookmark_bytes: 0,
+                    },
+                    None,
+                ))
+                .expect("storage grant begin should stage");
+            for (index, &(id, role, access, path)) in grants.iter().enumerate() {
+                let (record, descriptor) = file_record(id, role, access, path);
+                staged
+                    .accept(received(
+                        session,
+                        batch,
+                        u64::try_from(index + 1).expect("storage sequence should fit"),
+                        record,
+                        Some(descriptor),
+                    ))
+                    .expect("storage descriptor should stage");
+            }
+            staged
+                .accept(received(
+                    session,
+                    batch,
+                    u64::from(record_count - 1),
+                    GrantRecord::Commit {
+                        grant_count,
+                        record_count,
+                        bookmark_bytes: 0,
+                    },
+                    None,
+                ))
+                .expect("storage grant commit should validate")
+                .expect("storage grant commit should return a registry")
+                .registry
+        }
+
         fn directory_registry(id: &str, role: ResourceRole) -> (GrantRegistry, TestDirectory) {
             let directory = TestDirectory::new();
             let bookmark = create_implicit_bookmark(directory.path(), true)
@@ -5182,6 +5508,13 @@ mod platform {
             root_path: &Path,
         ) -> GrantAuthority {
             let mut registry = snapshot_root_file_registry(state_path, memory_path, root_path);
+            GrantAuthority::new(registry.take_file_registry())
+        }
+
+        pub(crate) fn snapshot_storage_grant_authority_for_test(
+            grants: &[(&str, ResourceRole, GrantAccess, &Path)],
+        ) -> GrantAuthority {
+            let mut registry = snapshot_storage_file_registry(grants);
             GrantAuthority::new(registry.take_file_registry())
         }
 
@@ -6449,17 +6782,18 @@ pub(crate) use platform::{
 };
 #[cfg(target_os = "macos")]
 pub(crate) use platform::{
-    ClaimedVhostUserSocket, ContainedSnapshotRestoreAuthority,
-    ContainedSnapshotRestoreDriveRequest, ContainedSnapshotRestoreError,
-    ContainedSnapshotRestoreTransaction, PreparedSocketBrokerEndpoint,
-    PreparedVhostUserSocketClaim, SnapshotStagingRecordTracker, SocketBrokerAuthority,
-    SocketBrokerEndpoint, VhostUserBrokerAuthority,
+    ClaimedVhostUserSocket, ContainedSnapshotRestoreAuthority, ContainedSnapshotRestoreError,
+    ContainedSnapshotRestoreFileRequest, ContainedSnapshotRestoreTransaction,
+    PreparedSnapshotBackingClaim, PreparedSocketBrokerEndpoint, PreparedVhostUserSocketClaim,
+    SnapshotStagingRecordTracker, SocketBrokerAuthority, SocketBrokerEndpoint,
+    VhostUserBrokerAuthority,
 };
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{
-    TestContainedRestoreAuthority, TestVhostDirectory, contained_restore_authority_for_test,
-    contained_restore_authority_with_grants_for_test, empty_grant_authority_for_vhost_test,
-    file_grant_authority_for_test, root_file_grant_authority_for_test,
-    snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
+    ContainedSnapshotRestoreDriveRequest, TestContainedRestoreAuthority, TestVhostDirectory,
+    contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
+    empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
+    root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
+    snapshot_root_file_grant_authority_for_test, snapshot_storage_grant_authority_for_test,
     vhost_directory_authority_for_test, vsock_directory_authority_for_test,
 };
