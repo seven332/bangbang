@@ -42,10 +42,13 @@ mod restore;
 
 pub use restore::{
     PreparedSnapshotV2MultiBlockBundle, PreparedSnapshotV2MultiBlockMmioBundle,
-    PreparedSnapshotV2MultiBlockMmioRecord, PreparedSnapshotV2MultiBlockRecord,
+    PreparedSnapshotV2MultiBlockMmioRecord, PreparedSnapshotV2MultiBlockPciBundle,
+    PreparedSnapshotV2MultiBlockPciEndpoint, PreparedSnapshotV2MultiBlockPciEndpointParts,
+    PreparedSnapshotV2MultiBlockPciRecord, PreparedSnapshotV2MultiBlockRecord,
     SnapshotV2MultiBlockBundleError, SnapshotV2MultiBlockCleanupError,
-    SnapshotV2MultiBlockMmioTransportError, SnapshotV2MultiBlockRestorePlan,
-    SnapshotV2MultiBlockRestorePlanError, SnapshotV2MultiBlockRetryProjection,
+    SnapshotV2MultiBlockMmioTransportError, SnapshotV2MultiBlockPciTransportError,
+    SnapshotV2MultiBlockRestorePlan, SnapshotV2MultiBlockRestorePlanError,
+    SnapshotV2MultiBlockRetryProjection,
 };
 
 #[cfg(test)]

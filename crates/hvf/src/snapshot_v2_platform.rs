@@ -67,7 +67,9 @@ use crate::snapshot_v2::{
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
     HvfSnapshotV2State, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
 };
-use crate::snapshot_v2_multi_block_platform::HvfSnapshotV2MultiBlockMmioRecordPlan;
+use crate::snapshot_v2_multi_block_platform::{
+    HvfSnapshotV2MultiBlockMmioRecordPlan, HvfSnapshotV2MultiBlockPciPlan,
+};
 use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
@@ -356,6 +358,14 @@ pub(crate) struct HvfSnapshotV2MultiBlockMmioShellPlan<'a> {
     pub(crate) vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2MultiBlockPciShellPlan<'a> {
+    pub(crate) command_line: &'a str,
+    pub(crate) pci: &'a HvfSnapshotV2MultiBlockPciPlan,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 enum HvfSnapshotV2ProcessShellRestore<'a> {
     DeviceFree(HvfSnapshotV2DefaultProcessShell),
     Root {
@@ -366,6 +376,10 @@ enum HvfSnapshotV2ProcessShellRestore<'a> {
     MultiBlockMmio {
         shell: HvfSnapshotV2DefaultProcessShell,
         plan: HvfSnapshotV2MultiBlockMmioShellPlan<'a>,
+    },
+    MultiBlockPci {
+        shell: HvfSnapshotV2DefaultProcessShell,
+        plan: HvfSnapshotV2MultiBlockPciShellPlan<'a>,
     },
 }
 
@@ -378,6 +392,10 @@ enum HvfSnapshotV2ProcessBlockFdtPlan<'a> {
     MultiBlockMmio {
         command_line: &'a str,
         records: &'a [HvfSnapshotV2MultiBlockMmioRecordPlan],
+    },
+    MultiBlockPci {
+        command_line: &'a str,
+        pci: &'a HvfSnapshotV2MultiBlockPciPlan,
     },
 }
 
@@ -1292,6 +1310,19 @@ pub(crate) fn restore_hvf_snapshot_v2_multi_block_mmio_process_platform(
         state,
         memory,
         Some(HvfSnapshotV2ProcessShellRestore::MultiBlockMmio { shell, plan }),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_multi_block_pci_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2DefaultProcessShell,
+    plan: HvfSnapshotV2MultiBlockPciShellPlan<'_>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::MultiBlockPci { shell, plan }),
     )
 }
 
@@ -2253,6 +2284,30 @@ fn prepare_process_shell(
                     )),
                 )
             }
+            HvfSnapshotV2ProcessShellRestore::MultiBlockPci { shell, plan } => {
+                if plan.pci.records().is_empty()
+                    || plan.pci.route_demand() == 0
+                    || gic.msi != Some(plan.pci.msi())
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                (
+                    shell,
+                    HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci {
+                        command_line: plan.command_line,
+                        pci: plan.pci,
+                    },
+                    true,
+                    true,
+                    Some((
+                        plan.serial_interrupt,
+                        plan.vmgenid_interrupt,
+                        plan.vmclock_interrupt,
+                    )),
+                )
+            }
         };
     let serial_interrupt = allocator
         .allocate()
@@ -2372,6 +2427,7 @@ fn validate_process_fdt(
         HvfSnapshotV2ProcessBlockFdtPlan::None => 0,
         HvfSnapshotV2ProcessBlockFdtPlan::Root { .. } => 1,
         HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockMmio { records, .. } => records.len(),
+        HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci { .. } => 1,
     };
     if tree.root.children.len() != 11 + block_child_count
         || [
@@ -2484,6 +2540,9 @@ fn validate_process_fdt(
         HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockMmio { command_line, .. } => chosen
             .prop_str("bootargs")
             .is_ok_and(|arguments| arguments == *command_line),
+        HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci { command_line, .. } => chosen
+            .prop_str("bootargs")
+            .is_ok_and(|arguments| arguments == *command_line),
         HvfSnapshotV2ProcessBlockFdtPlan::None => {
             let expected = expected_process_boot_arguments(state.machine().boot().boot_arguments())
                 .ok_or(HvfSnapshotV2ProcessFdtMismatch::Boot)?;
@@ -2507,7 +2566,7 @@ fn validate_process_fdt(
         HvfSnapshotV2ProcessBlockFdtPlan::Root {
             transport: HvfSnapshotV2RootTransportPlan::Pci { .. },
             ..
-        }
+        } | HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci { .. }
     ));
     if intc.children.len() != expected_gic_children
         || !intc
@@ -2675,6 +2734,18 @@ fn validate_process_block_nodes(
                     record.region(),
                     record.interrupt_line(),
                 )?;
+            }
+            return Ok(());
+        }
+        HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci { pci, .. } => {
+            let canonical_host = Arm64PciAddressPlan::firecracker_v1_16()
+                .map(bangbang_runtime::fdt::Arm64FdtPciHost::from_address_plan)
+                .ok();
+            if canonical_host != Some(pci.host())
+                || !validate_process_pci_host(root_node)
+                || !validate_process_gic_msi(intc, pci.msi())
+            {
+                return Err(HvfSnapshotV2ProcessFdtMismatch::Pci);
             }
             return Ok(());
         }
@@ -4034,6 +4105,81 @@ pub(crate) mod tests {
             &devices,
             "console=ttyS0 pci=off",
             None,
+        );
+        assert_eq!(
+            validate_process_fdt(
+                &wrong_command_line,
+                &platform,
+                plan.serial_interrupt(),
+                &block
+            ),
+            Err(HvfSnapshotV2ProcessFdtMismatch::Boot)
+        );
+    }
+
+    #[test]
+    fn multi_block_pci_fdt_requires_one_exact_host_msi_frame_and_command_line() {
+        let (platform, plan) =
+            crate::snapshot_v2_multi_block_platform::tests::pci_fdt_plan_fixture();
+        let pci = plan.transport().pci().expect("fixture plan should use PCI");
+        assert_eq!(pci.records().len(), 2);
+        let shell = (
+            bangbang_runtime::fdt::Arm64FdtSerialDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: PROCESS_SERIAL_MMIO_BASE.raw_value(),
+                    size: SERIAL_MMIO_DEVICE_WINDOW_SIZE,
+                },
+                interrupt_line: plan.serial_interrupt(),
+            },
+            bangbang_runtime::fdt::Arm64FdtRtcDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: PROCESS_RTC_MMIO_BASE.raw_value(),
+                    size: RTC_MMIO_DEVICE_WINDOW_SIZE,
+                },
+            },
+            bangbang_runtime::fdt::Arm64FdtVmGenIdDevice {
+                region: platform.time().vmgenid().fdt_region(),
+                interrupt_line: plan.vmgenid_interrupt(),
+            },
+            bangbang_runtime::fdt::Arm64FdtVmClockDevice {
+                region: platform.time().vmclock().fdt_region(),
+                interrupt_line: plan.vmclock_interrupt(),
+            },
+        );
+        let block = HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci {
+            command_line: plan.command_line(),
+            pci,
+        };
+        let valid = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &[],
+            plan.command_line(),
+            Some(pci.host()),
+        );
+        assert_eq!(
+            validate_process_fdt(&valid, &platform, plan.serial_interrupt(), &block),
+            Ok(())
+        );
+
+        let missing_host = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &[],
+            plan.command_line(),
+            None,
+        );
+        assert_eq!(
+            validate_process_fdt(&missing_host, &platform, plan.serial_interrupt(), &block),
+            Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory)
+        );
+
+        let wrong_command_line = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &[],
+            "console=ttyS0 pci=off",
+            Some(pci.host()),
         );
         assert_eq!(
             validate_process_fdt(

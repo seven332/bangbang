@@ -3097,10 +3097,14 @@ where
             }
             return Err(publication_rollback(primary, cleanup));
         }
-        let retained = self
-            .endpoint
-            .transport_state()
-            .map_err(|source| VirtioPciPublicationError::Endpoint { source })?;
+        let retained = match self.endpoint.transport_state() {
+            Ok(retained) => retained,
+            Err(source) => {
+                let primary = VirtioPciPublicationError::Endpoint { source };
+                let cleanup = cleanup_prepared_endpoint(&self.endpoint, &mut interrupts);
+                return Err(publication_rollback(primary, cleanup));
+            }
+        };
         if let Err(source) = validate_retained_msix(&retained, &resource_registry) {
             let primary = VirtioPciPublicationError::Endpoint { source };
             let cleanup = cleanup_prepared_endpoint(&self.endpoint, &mut interrupts);
@@ -6544,6 +6548,35 @@ mod tests {
         );
         assert!(dispatcher.regions().is_empty());
         prepared_observer.release().unwrap();
+    }
+
+    #[test]
+    fn retained_publication_releases_interrupts_when_endpoint_state_is_poisoned() {
+        let fixture = retained_transport_fixture();
+        let CountingResourcesFixture {
+            registry,
+            resources,
+            signals: _,
+            releases,
+        } = counting_resources_for_messages(&fixture.messages);
+        let prepared = prepare_retained_endpoint(&fixture, &fixture.state, registry).unwrap();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = prepared.endpoint.inner.state.lock().unwrap();
+            panic!("inject retained endpoint state poison");
+        }));
+        assert!(poison.is_err());
+        let mut allocator = PciBarAllocator::new(PciBarAddressSpace::Memory64, fixture.bar_range);
+        let segment = SharedPciSegment::new(crate::pci::PciSegment::new());
+        let mut dispatcher = MmioDispatcher::new();
+
+        let error = prepared
+            .publish(&mut allocator, segment, &mut dispatcher, resources)
+            .expect_err("poisoned retained endpoint must reject publication");
+
+        assert!(matches!(error, VirtioPciPublicationError::Rollback { .. }));
+        assert_eq!(*releases.lock().unwrap(), 1);
+        assert_eq!(allocator.available_ranges(), &[fixture.bar_range]);
+        assert!(dispatcher.regions().is_empty());
     }
 
     #[test]

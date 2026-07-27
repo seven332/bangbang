@@ -1395,6 +1395,37 @@ pub(crate) mod tests {
         (platform, plan)
     }
 
+    pub(crate) fn pci_fdt_plan_fixture() -> (
+        HvfSnapshotV2PlatformState,
+        HvfSnapshotV2MultiBlockPlatformPlan,
+    ) {
+        let fixture = bundle_from_graph(fixture_graph(SnapshotV2DeviceTransportKind::Pci, false));
+        let platform = product_pci_platform();
+        let plan = prepare_hvf_snapshot_v2_multi_block_platform_plan(
+            &platform,
+            &fixture.bundle,
+            pci_process(),
+        )
+        .expect("multi-block PCI FDT plan should validate");
+        (platform, plan)
+    }
+
+    pub(crate) fn rooted_pci_bundle_and_fdt_plan_fixture() -> (
+        HvfSnapshotV2PlatformState,
+        PreparedSnapshotV2MultiBlockBundle,
+        HvfSnapshotV2MultiBlockPlatformPlan,
+    ) {
+        let fixture = bundle_from_graph(fixture_graph(SnapshotV2DeviceTransportKind::Pci, true));
+        let platform = product_pci_platform();
+        let plan = prepare_hvf_snapshot_v2_multi_block_platform_plan(
+            &platform,
+            &fixture.bundle,
+            pci_process(),
+        )
+        .expect("rooted multi-block PCI FDT plan should validate");
+        (platform, fixture.bundle, plan)
+    }
+
     fn product_pci_platform() -> HvfSnapshotV2PlatformState {
         let (platform, root, _process) =
             crate::snapshot_v2_platform::tests::pci_root_plan_fixture();
