@@ -8,6 +8,7 @@ use crate::snapshot_device_v2::{
     NATIVE_V2_DEVICE_GRAPH_MAX_DRIVE_ID_BYTES, NATIVE_V2_DEVICE_GRAPH_MAX_RECORDS,
     SnapshotV2DeviceGraph, SnapshotV2DeviceKey,
 };
+use crate::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
 
 /// Maximum number of logical resources in one snapshot restore transaction.
 ///
@@ -129,6 +130,8 @@ fn validate_public_id(value: &str) -> Result<(), SnapshotRestorePublicIdError> {
 pub enum SnapshotRestoreResourceClass {
     /// File backing for a restored virtio-block device.
     BlockBacking,
+    /// File backing for a restored virtio-pmem device.
+    PmemBacking,
     /// Destination endpoint for a restored virtio-vsock device.
     VsockEndpoint,
 }
@@ -250,6 +253,41 @@ impl SnapshotRestoreManifest {
             .try_reserve_exact(NATIVE_V2_DEVICE_GRAPH_MAX_RECORDS as usize)
             .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
         resources.push(key);
+        Self::try_new(resources, overrides)
+    }
+
+    /// Derives the complete resource set for one validated native-v2 2.6
+    /// storage graph.
+    ///
+    /// Resources retain canonical graph order: block backings first, then pmem
+    /// backings. [`Self::try_new`] independently canonicalizes and validates
+    /// the exact class/key/public-ID identities.
+    pub fn try_from_native_v2_storage_device_graph(
+        graph: &SnapshotV2StorageDeviceGraph,
+        overrides: Vec<SnapshotRestoreResourceKey>,
+    ) -> Result<Self, SnapshotRestoreManifestError> {
+        let mut resources = Vec::new();
+        resources
+            .try_reserve_exact(graph.record_count())
+            .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
+        for record in graph.block_records() {
+            let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id())
+                .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+            resources.push(SnapshotRestoreResourceKey::new(
+                record.key(),
+                public_id,
+                SnapshotRestoreResourceClass::BlockBacking,
+            ));
+        }
+        for record in graph.pmem_records() {
+            let public_id = SnapshotRestorePublicId::try_from(record.config().pmem_id())
+                .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+            resources.push(SnapshotRestoreResourceKey::new(
+                record.key(),
+                public_id,
+                SnapshotRestoreResourceClass::PmemBacking,
+            ));
+        }
         Self::try_new(resources, overrides)
     }
 
@@ -873,6 +911,23 @@ mod tests {
             .collect()
     }
 
+    fn maximum_storage_keys() -> Vec<SnapshotRestoreResourceKey> {
+        (0..MAX_SNAPSHOT_RESTORE_RESOURCES)
+            .map(|index| {
+                key(
+                    if index.is_multiple_of(2) { 1 } else { 4 },
+                    u32::try_from(index / 2).expect("bounded storage instance should fit"),
+                    format!("storage{index}"),
+                    if index.is_multiple_of(2) {
+                        SnapshotRestoreResourceClass::BlockBacking
+                    } else {
+                        SnapshotRestoreResourceClass::PmemBacking
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn public_ids_use_nonempty_utf8_byte_bounds_and_redacted_debug() {
         assert!(matches!(
@@ -910,6 +965,28 @@ mod tests {
             .expect("maximum manifest should validate");
         assert_eq!(maximum.len(), MAX_SNAPSHOT_RESTORE_RESOURCES);
 
+        let maximum_storage = SnapshotRestoreManifest::try_new(maximum_storage_keys(), Vec::new())
+            .expect("maximum mixed storage manifest should validate");
+        assert_eq!(maximum_storage.len(), MAX_SNAPSHOT_RESTORE_RESOURCES);
+        assert_eq!(
+            maximum_storage
+                .resources()
+                .iter()
+                .filter(|key| {
+                    key.resource_class() == SnapshotRestoreResourceClass::BlockBacking
+                })
+                .count(),
+            MAX_SNAPSHOT_RESTORE_RESOURCES / 2
+        );
+        assert_eq!(
+            maximum_storage
+                .resources()
+                .iter()
+                .filter(|key| { key.resource_class() == SnapshotRestoreResourceClass::PmemBacking })
+                .count(),
+            MAX_SNAPSHOT_RESTORE_RESOURCES / 2
+        );
+
         let mut one_over = maximum_keys();
         one_over.push(key(
             1000,
@@ -927,9 +1004,15 @@ mod tests {
     fn manifest_canonicalizes_order_and_rejects_identity_conflicts() {
         let block_later = key(2, 0, "z", SnapshotRestoreResourceClass::BlockBacking);
         let block_earlier = key(1, 1, "b", SnapshotRestoreResourceClass::BlockBacking);
+        let pmem = key(4, 0, "p", SnapshotRestoreResourceClass::PmemBacking);
         let vsock = key(0, 0, "a", SnapshotRestoreResourceClass::VsockEndpoint);
         let manifest = SnapshotRestoreManifest::try_new(
-            vec![vsock.clone(), block_later.clone(), block_earlier.clone()],
+            vec![
+                vsock.clone(),
+                pmem.clone(),
+                block_later.clone(),
+                block_earlier.clone(),
+            ],
             Vec::new(),
         )
         .expect("reordered manifest should validate");
@@ -950,6 +1033,7 @@ mod tests {
             [
                 (SnapshotRestoreResourceClass::BlockBacking, 1, 1, "b"),
                 (SnapshotRestoreResourceClass::BlockBacking, 2, 0, "z"),
+                (SnapshotRestoreResourceClass::PmemBacking, 4, 0, "p"),
                 (SnapshotRestoreResourceClass::VsockEndpoint, 0, 0, "a"),
             ]
         );
@@ -964,7 +1048,7 @@ mod tests {
         let wrong_class = SnapshotRestoreResourceKey::new(
             block_later.device_key(),
             block_later.public_id().clone(),
-            SnapshotRestoreResourceClass::VsockEndpoint,
+            SnapshotRestoreResourceClass::PmemBacking,
         );
         assert!(matches!(
             SnapshotRestoreManifest::try_new(vec![block_later, wrong_class], Vec::new()),
@@ -1003,6 +1087,16 @@ mod tests {
 
         assert!(matches!(
             SnapshotRestoreManifest::try_new(vec![block.clone()], vec![block]),
+            Err(SnapshotRestoreManifestError::UnsupportedOverrideClass)
+        ));
+        let pmem = key(
+            4,
+            0,
+            "pmem-secret",
+            SnapshotRestoreResourceClass::PmemBacking,
+        );
+        assert!(matches!(
+            SnapshotRestoreManifest::try_new(vec![pmem.clone()], vec![pmem]),
             Err(SnapshotRestoreManifestError::UnsupportedOverrideClass)
         ));
         assert!(matches!(

@@ -8,6 +8,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 #[cfg(test)]
@@ -54,6 +55,19 @@ pub const VIRTIO_PMEM_STATUS_SIZE: u32 = 4;
 pub const VIRTIO_PMEM_REQUEST_TYPE_FLUSH: u32 = 0;
 pub const VIRTIO_PMEM_STATUS_SUCCESS: i32 = 0;
 pub const VIRTIO_PMEM_STATUS_FAILURE: i32 = -1;
+
+/// Returns the checked 2 MiB-aligned mapping length for one pmem file.
+///
+/// A zero input remains zero; callers that require a usable backing must
+/// reject it separately.
+pub const fn aligned_pmem_mapping_len(len: u64) -> Option<u64> {
+    let remainder = len % VIRTIO_PMEM_ALIGNMENT;
+    if remainder == 0 {
+        Some(len)
+    } else {
+        len.checked_add(VIRTIO_PMEM_ALIGNMENT - remainder)
+    }
+}
 
 pub type VirtioPmemMmioHandler = VirtioMmioRegisterHandler<VirtioPmemConfigSpace, VirtioPmemDevice>;
 pub type VirtioPmemPciEndpoint = VirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice>;
@@ -2378,32 +2392,22 @@ impl PmemFileBacking {
                 .file
                 .metadata()
                 .map_err(|_| PmemFileBackingIdentityError::ReadMetadata)?;
-            if !metadata.file_type().is_file() {
-                return Err(PmemFileBackingIdentityError::NonRegularFile);
-            }
-            let modified_nanos = u32::try_from(metadata.mtime_nsec())
-                .map_err(|_| PmemFileBackingIdentityError::InvalidMetadata)?;
-            let changed_nanos = u32::try_from(metadata.ctime_nsec())
-                .map_err(|_| PmemFileBackingIdentityError::InvalidMetadata)?;
-            if modified_nanos >= 1_000_000_000 || changed_nanos >= 1_000_000_000 {
-                return Err(PmemFileBackingIdentityError::InvalidMetadata);
-            }
-            Ok(PmemFileBackingIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                len: metadata.len(),
-                mode: metadata.mode(),
-                modified_seconds: metadata.mtime(),
-                modified_nanos,
-                changed_seconds: metadata.ctime(),
-                changed_nanos,
-            })
+            pmem_file_backing_identity(&metadata)
         }
 
         #[cfg(not(unix))]
         {
             Err(PmemFileBackingIdentityError::UnsupportedPlatform)
         }
+    }
+
+    /// Adopts an already-opened exact snapshot backing without resolving its
+    /// configured selector.
+    pub fn from_snapshot_file(
+        file: File,
+        read_only: bool,
+    ) -> Result<(Self, PmemFileBackingIdentity), SnapshotPmemFileBackingError> {
+        snapshot_pmem_file_backing_from_file(file, read_only, None)
     }
 }
 
@@ -2449,6 +2453,212 @@ impl std::error::Error for PmemFileBackingError {
         match self {
             Self::OpenFile { source } | Self::ReadMetadata { source } => Some(source),
             Self::NonRegularFile | Self::ZeroSizedFile => None,
+        }
+    }
+}
+
+/// Redacted failure while reserving or adopting an exact snapshot pmem file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPmemFileBackingError {
+    /// Snapshot pmem files are unsupported on this platform.
+    UnsupportedPlatform,
+    /// The exact selector could not be opened.
+    Open,
+    /// Descriptor metadata could not be read.
+    ReadMetadata,
+    /// The descriptor is not a regular file.
+    NonRegularFile,
+    /// The descriptor refers to an empty file.
+    ZeroSizedFile,
+    /// Descriptor identity, access, or stable flags are invalid or changed.
+    InvalidMetadata,
+}
+
+impl fmt::Display for SnapshotPmemFileBackingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedPlatform => "snapshot pmem backing is unsupported on this platform",
+            Self::Open => "failed to open snapshot pmem backing",
+            Self::ReadMetadata => "failed to read snapshot pmem backing metadata",
+            Self::NonRegularFile => "snapshot pmem backing is not a regular file",
+            Self::ZeroSizedFile => "snapshot pmem backing is empty",
+            Self::InvalidMetadata => "snapshot pmem backing metadata is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotPmemFileBackingError {}
+
+/// Securely opened snapshot pmem file awaiting complete-set validation.
+///
+/// This value owns only the descriptor reservation. It never creates a pmem
+/// mapping.
+pub struct SnapshotPmemFileBackingReservation {
+    file: File,
+    identity: PmemFileBackingIdentity,
+    read_only: bool,
+}
+
+impl SnapshotPmemFileBackingReservation {
+    /// Opens and inspects one exact regular-file snapshot descriptor.
+    pub fn open(path: &Path, read_only: bool) -> Result<Self, SnapshotPmemFileBackingError> {
+        #[cfg(unix)]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).write(!read_only);
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let file = options
+                .open(path)
+                .map_err(|_| SnapshotPmemFileBackingError::Open)?;
+            validate_snapshot_pmem_descriptor(&file, read_only)?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| SnapshotPmemFileBackingError::ReadMetadata)?;
+            let identity =
+                pmem_file_backing_identity(&metadata).map_err(snapshot_pmem_identity_error)?;
+            if identity.is_empty() {
+                return Err(SnapshotPmemFileBackingError::ZeroSizedFile);
+            }
+            Ok(Self {
+                file,
+                identity,
+                read_only,
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (path, read_only);
+            Err(SnapshotPmemFileBackingError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the descriptor-derived pre-adoption observation.
+    pub const fn identity(&self) -> PmemFileBackingIdentity {
+        self.identity
+    }
+
+    /// Returns the captured descriptor access.
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Revalidates and adopts the reserved descriptor as a pmem backing.
+    pub fn into_backing(
+        self,
+    ) -> Result<(PmemFileBacking, PmemFileBackingIdentity), SnapshotPmemFileBackingError> {
+        snapshot_pmem_file_backing_from_file(self.file, self.read_only, Some(self.identity))
+    }
+}
+
+impl fmt::Debug for SnapshotPmemFileBackingReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotPmemFileBackingReservation")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+fn snapshot_pmem_file_backing_from_file(
+    file: File,
+    read_only: bool,
+    expected_identity: Option<PmemFileBackingIdentity>,
+) -> Result<(PmemFileBacking, PmemFileBackingIdentity), SnapshotPmemFileBackingError> {
+    #[cfg(unix)]
+    {
+        validate_snapshot_pmem_descriptor(&file, read_only)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| SnapshotPmemFileBackingError::ReadMetadata)?;
+        let identity =
+            pmem_file_backing_identity(&metadata).map_err(snapshot_pmem_identity_error)?;
+        if identity.is_empty() {
+            return Err(SnapshotPmemFileBackingError::ZeroSizedFile);
+        }
+        if expected_identity.is_some_and(|expected| expected != identity) {
+            return Err(SnapshotPmemFileBackingError::InvalidMetadata);
+        }
+        let backing = PmemFileBacking {
+            file,
+            len: identity.len(),
+            read_only,
+        };
+        Ok((backing, identity))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (file, read_only, expected_identity);
+        Err(SnapshotPmemFileBackingError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(unix)]
+fn validate_snapshot_pmem_descriptor(
+    file: &File,
+    read_only: bool,
+) -> Result<(), SnapshotPmemFileBackingError> {
+    // SAFETY: F_GETFD only reads per-descriptor flags from the live owned fd.
+    let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0 || descriptor_flags & libc::FD_CLOEXEC == 0 {
+        return Err(SnapshotPmemFileBackingError::InvalidMetadata);
+    }
+    // SAFETY: F_GETFL only reads status flags from the live owned descriptor.
+    let status_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    let expected_access = if read_only {
+        libc::O_RDONLY
+    } else {
+        libc::O_RDWR
+    };
+    if status_flags < 0
+        || status_flags & libc::O_ACCMODE != expected_access
+        || status_flags & libc::O_APPEND != 0
+    {
+        return Err(SnapshotPmemFileBackingError::InvalidMetadata);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pmem_file_backing_identity(
+    metadata: &std::fs::Metadata,
+) -> Result<PmemFileBackingIdentity, PmemFileBackingIdentityError> {
+    if !metadata.file_type().is_file() {
+        return Err(PmemFileBackingIdentityError::NonRegularFile);
+    }
+    let modified_nanos = u32::try_from(metadata.mtime_nsec())
+        .map_err(|_| PmemFileBackingIdentityError::InvalidMetadata)?;
+    let changed_nanos = u32::try_from(metadata.ctime_nsec())
+        .map_err(|_| PmemFileBackingIdentityError::InvalidMetadata)?;
+    if modified_nanos >= 1_000_000_000 || changed_nanos >= 1_000_000_000 {
+        return Err(PmemFileBackingIdentityError::InvalidMetadata);
+    }
+    Ok(PmemFileBackingIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        len: metadata.len(),
+        mode: metadata.mode(),
+        modified_seconds: metadata.mtime(),
+        modified_nanos,
+        changed_seconds: metadata.ctime(),
+        changed_nanos,
+    })
+}
+
+fn snapshot_pmem_identity_error(
+    source: PmemFileBackingIdentityError,
+) -> SnapshotPmemFileBackingError {
+    match source {
+        PmemFileBackingIdentityError::UnsupportedPlatform => {
+            SnapshotPmemFileBackingError::UnsupportedPlatform
+        }
+        PmemFileBackingIdentityError::ReadMetadata => SnapshotPmemFileBackingError::ReadMetadata,
+        PmemFileBackingIdentityError::NonRegularFile => {
+            SnapshotPmemFileBackingError::NonRegularFile
+        }
+        PmemFileBackingIdentityError::InvalidMetadata => {
+            SnapshotPmemFileBackingError::InvalidMetadata
         }
     }
 }
@@ -2967,17 +3177,10 @@ impl std::error::Error for PmemBackingMappingError {
 }
 
 fn align_pmem_mapping_len(len: u64) -> Result<u64, PmemBackingMappingError> {
-    let remainder = len % VIRTIO_PMEM_ALIGNMENT;
-    if remainder == 0 {
-        return Ok(len);
-    }
-
-    let padding = VIRTIO_PMEM_ALIGNMENT - remainder;
-    len.checked_add(padding)
-        .ok_or(PmemBackingMappingError::MappedLengthOverflow {
-            len,
-            alignment: VIRTIO_PMEM_ALIGNMENT,
-        })
+    aligned_pmem_mapping_len(len).ok_or(PmemBackingMappingError::MappedLengthOverflow {
+        len,
+        alignment: VIRTIO_PMEM_ALIGNMENT,
+    })
 }
 
 const fn pmem_host_mapping_protection() -> libc::c_int {
@@ -6332,6 +6535,82 @@ mod tests {
                 .expect("provided pmem backing should have metadata")
                 .len(),
             4
+        );
+    }
+
+    #[test]
+    fn snapshot_pmem_reservation_revalidates_access_identity_and_length_without_mapping() {
+        let file = temp_sized_file("snapshot-reserved-pmem.img", 4096);
+        let reservation = SnapshotPmemFileBackingReservation::open(file.as_path(), false)
+            .expect("writable snapshot pmem reservation should open");
+        assert!(!reservation.is_read_only());
+        assert_eq!(reservation.identity().len(), 4096);
+        assert!(reservation.identity().is_regular_file());
+
+        fs::OpenOptions::new()
+            .write(true)
+            .open(file.as_path())
+            .expect("snapshot pmem fixture should reopen")
+            .set_len(8192)
+            .expect("snapshot pmem fixture should change");
+        assert_eq!(
+            reservation
+                .into_backing()
+                .expect_err("changed snapshot reservation must reject"),
+            SnapshotPmemFileBackingError::InvalidMetadata
+        );
+
+        let read_only = fs::File::open(file.as_path()).expect("read-only pmem file should open");
+        assert_eq!(
+            PmemFileBacking::from_snapshot_file(read_only, false)
+                .expect_err("supplied snapshot access mismatch must reject"),
+            SnapshotPmemFileBackingError::InvalidMetadata
+        );
+        let reservation = SnapshotPmemFileBackingReservation::open(file.as_path(), true)
+            .expect("read-only snapshot pmem reservation should reopen");
+        let (backing, identity) = reservation
+            .into_backing()
+            .expect("unchanged snapshot reservation should adopt");
+        assert!(backing.is_read_only());
+        assert_eq!(backing.len(), 8192);
+        assert_eq!(identity.len(), backing.len());
+        assert_eq!(
+            aligned_pmem_mapping_len(backing.len()),
+            Some(VIRTIO_PMEM_ALIGNMENT)
+        );
+    }
+
+    #[test]
+    fn snapshot_pmem_reservation_rejects_symlink_empty_and_overflow_geometry_redacted() {
+        let target = temp_file("snapshot-pmem-target.img", b"pmem");
+        let link = TempPath {
+            path: temp_path("snapshot-pmem-link.img"),
+        };
+        std::os::unix::fs::symlink(target.as_path(), link.as_path())
+            .expect("snapshot pmem symlink should create");
+        let symlink = SnapshotPmemFileBackingReservation::open(link.as_path(), true)
+            .expect_err("snapshot pmem symlink must reject");
+        assert_eq!(symlink, SnapshotPmemFileBackingError::Open);
+        assert!(!symlink.to_string().contains("snapshot-pmem-link"));
+
+        let empty = temp_file("snapshot-empty-pmem.img", b"");
+        assert_eq!(
+            SnapshotPmemFileBackingReservation::open(empty.as_path(), true)
+                .expect_err("empty snapshot pmem must reject"),
+            SnapshotPmemFileBackingError::ZeroSizedFile
+        );
+        assert_eq!(
+            aligned_pmem_mapping_len(u64::MAX),
+            None,
+            "overflowing aligned geometry must reject before mapping"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                SnapshotPmemFileBackingReservation::open(target.as_path(), true)
+                    .expect("snapshot pmem reservation should open")
+            ),
+            "SnapshotPmemFileBackingReservation { state: \"<redacted>\" }"
         );
     }
 

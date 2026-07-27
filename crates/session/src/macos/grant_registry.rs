@@ -379,6 +379,25 @@ impl FileGrantRegistry {
         debug_assert!(previous.is_none());
         Ok(())
     }
+
+    /// Returns one reserved pmem backing after an aborted snapshot transaction.
+    pub fn restore_pmem_backing(
+        &mut self,
+        id: GrantId,
+        file: GrantedFile,
+    ) -> Result<(), GrantRegistryError> {
+        if self.entries.contains_key(&id)
+            || file.role != ResourceRole::PmemBacking
+            || !matches!(file.access, GrantAccess::ReadOnly | GrantAccess::ReadWrite)
+            || file.kind != GrantObjectKind::RegularFile
+            || file.block_device.is_some()
+        {
+            return Err(GrantRegistryError);
+        }
+        let previous = self.entries.insert(id, file);
+        debug_assert!(previous.is_none());
+        Ok(())
+    }
 }
 
 /// One-time registry containing only connected local-stream grants.
@@ -1086,6 +1105,12 @@ impl fmt::Debug for GrantedFile {
 }
 
 impl GrantedFile {
+    /// Returns the exact semantic resource role.
+    #[must_use]
+    pub const fn role(&self) -> ResourceRole {
+        self.role
+    }
+
     /// Returns the exact opened access.
     #[must_use]
     pub const fn access(&self) -> GrantAccess {
@@ -2553,6 +2578,89 @@ mod tests {
         assert_eq!(restored.identity(), identity);
         assert_eq!(restored.status_flags(), status_flags);
         assert_eq!(restored.block_device(), Some(block_device));
+    }
+
+    #[test]
+    fn snapshot_pmem_restore_returns_only_exact_regular_file_authority() {
+        let source = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("pmem descriptor fixture should open");
+        let descriptor = duplicate(&source);
+        let stat = descriptor_stat(descriptor.as_raw_fd()).expect("pmem fixture stat should read");
+        let id = GrantId::parse("pmem-restore").expect("pmem grant ID should parse");
+        let mut registry = FileGrantRegistry {
+            entries: HashMap::from([(
+                id.clone(),
+                GrantedFile {
+                    role: ResourceRole::PmemBacking,
+                    access: GrantAccess::ReadOnly,
+                    kind: GrantObjectKind::RegularFile,
+                    identity: ObjectIdentity {
+                        device: normalized_device(stat.st_dev),
+                        inode: stat.st_ino,
+                    },
+                    status_flags: 0,
+                    block_device: None,
+                    descriptor,
+                },
+            )]),
+        };
+        let request = [(
+            id.clone(),
+            ResourceRole::PmemBacking,
+            GrantAccess::ReadOnly,
+            GrantObjectKind::RegularFile,
+        )];
+
+        let mut reserved = registry
+            .take_exact_files(&request)
+            .expect("exact pmem grant should reserve")
+            .pop()
+            .expect("one pmem grant should exist");
+        assert!(registry.is_empty());
+        registry
+            .restore_pmem_backing(id.clone(), reserved)
+            .expect("exact pmem grant should restore");
+        assert_eq!(
+            registry
+                .duplicate_exact_files(&request)
+                .expect("restored pmem grant should remain exact")
+                .len(),
+            1
+        );
+
+        let mutations: [fn(&mut GrantedFile); 3] = [
+            |file: &mut GrantedFile| file.role = ResourceRole::DriveBacking,
+            |file: &mut GrantedFile| file.access = GrantAccess::WriteOnly,
+            |file: &mut GrantedFile| file.kind = GrantObjectKind::BlockDevice,
+        ];
+        for mutation in mutations {
+            let mut invalid = duplicate_file(
+                registry
+                    .entries
+                    .get(&id)
+                    .expect("original pmem grant should remain"),
+            )
+            .expect("pmem grant should duplicate");
+            mutation(&mut invalid);
+            assert!(
+                registry.restore_pmem_backing(id.clone(), invalid).is_err(),
+                "wrong pmem authority must not replace the exact grant"
+            );
+            assert_eq!(registry.len(), 1);
+        }
+
+        reserved = registry
+            .take_exact_files(&request)
+            .expect("restored exact pmem grant should reserve again")
+            .pop()
+            .expect("one restored pmem grant should exist");
+        assert!(registry.is_empty());
+        reserved.role = ResourceRole::DriveBacking;
+        assert!(
+            registry.restore_pmem_backing(id, reserved).is_err(),
+            "wrong-role reservation must not be restored as pmem"
+        );
+        assert!(registry.is_empty());
     }
 
     #[test]
