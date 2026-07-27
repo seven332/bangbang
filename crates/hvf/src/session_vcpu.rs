@@ -509,6 +509,9 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         if !self.pending_steps.is_empty() {
             return Err(self.power_error("native-v2 pause pending-step validation", 0));
         }
+        self.coordinator
+            .prepare_snapshot_pause()
+            .map_err(|source| self.coordinator_error("native-v2 pause preparation", 0, source))?;
         let waiter = self
             .control()
             .request_pause()

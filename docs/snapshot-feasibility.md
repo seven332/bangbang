@@ -1016,6 +1016,11 @@ After the acknowledgement, the worker cannot enter another guest run-loop
 window until resume. The pause gate still wakes to drain commands, however, so
 this is not a frozen runtime boundary. In particular:
 
+- native-v2 snapshot commands wake the paused worker through that gate without
+  issuing another vCPU wakeup; snapshot preparation may consume only an empty
+  outer-wakeup barrier and must dispatch any idle cancellation debt before its
+  topology-wide pause, while every other pending coordinator event fails
+  closed;
 - memory-hotplug updates and status queries can execute on the boot worker while
   paused, and updates can mutate mapped guest memory and device state;
 - MMDS put and patch actions can mutate process-owned shared state;

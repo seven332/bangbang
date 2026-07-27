@@ -1131,6 +1131,65 @@ where
             .map(|admissions| admissions.len())
     }
 
+    fn prepare_snapshot_pause(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
+        let indexes = {
+            let mut state = self.shared.lock_state()?;
+            // An outer run-loop command can win a natural-completion race
+            // before its wakeup request observes that no run remains active.
+            // The resulting empty wakeup barrier carries no member outcome for
+            // the boot session to translate, so snapshot preparation may
+            // consume it while the coordinator is still running.
+            while matches!(state.phase, CoordinatorPhase::Running)
+                && matches!(
+                state.pending_events.front(),
+                Some(HvfVcpuRunEvent::Barrier(report))
+                    if report.reason() == HvfVcpuRunControlReason::Wakeup
+                        && report.acknowledgements().is_empty()
+                )
+            {
+                let _ = state.pending_events.pop_front();
+            }
+            if !state.pending_events.is_empty() {
+                return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                    "cancellation-debt settlement requires an empty coordinator event queue",
+                ));
+            }
+            match state.phase {
+                CoordinatorPhase::Running => {}
+                CoordinatorPhase::Paused
+                    if state.members.iter().all(|member| {
+                        member.active.is_none() && member.cancellation_debt.is_none()
+                    }) =>
+                {
+                    return Ok(());
+                }
+                _ => {
+                    return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                        "cancellation-debt settlement requires a running or clean paused topology",
+                    ));
+                }
+            }
+            state
+                .members
+                .iter()
+                .enumerate()
+                .filter_map(|(index, member)| {
+                    (member.online && member.active.is_none() && member.cancellation_debt.is_some())
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let required = indexes.len();
+        let dispatched = self.submit_indexes(&indexes, false)?.len();
+        if dispatched != required {
+            return Err(HvfVcpuRunCoordinatorError::InvalidState(
+                "snapshot pause preparation could not dispatch all cancellation debt",
+            ));
+        }
+        Ok(())
+    }
+
     fn activate_and_dispatch_member(
         &mut self,
         index: usize,
@@ -2132,6 +2191,10 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
     /// Submit one bounded run to every online idle member before collecting.
     pub fn dispatch_online(&mut self) -> Result<usize, HvfVcpuRunCoordinatorError> {
         self.inner.dispatch_online()
+    }
+
+    pub(crate) fn prepare_snapshot_pause(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
+        self.inner.prepare_snapshot_pause()
     }
 
     pub(crate) fn activate_and_dispatch_member(
@@ -3913,6 +3976,93 @@ mod tests {
         assert!(matches!(event, HvfVcpuRunEvent::Member(_)));
         assert_eq!(coordinator.set_online(0, false), Ok(()));
         assert_eq!(batch.calls(), vec![vec![0]]);
+    }
+
+    #[test]
+    fn snapshot_pause_dispatches_idle_cancellation_debt_before_barrier() {
+        let members = fake_members(1);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+        coordinator
+            .dispatch_online()
+            .expect("initial member should dispatch");
+
+        let wakeup = coordinator
+            .control()
+            .request_wakeup()
+            .expect("wakeup should start");
+        assert!(matches!(
+            coordinator
+                .process_completion(members[0].completion(1, progressed()))
+                .expect("normal race completion should process"),
+            Some(HvfVcpuRunEvent::Barrier(_))
+        ));
+        wakeup.wait().expect("wakeup barrier should complete");
+
+        coordinator
+            .prepare_snapshot_pause()
+            .expect("snapshot preparation should dispatch stale debt");
+        assert_eq!(
+            members[0].pending_tokens(),
+            vec![HvfVcpuRunToken::new(0, 2)]
+        );
+        let pause = coordinator
+            .control()
+            .request_pause()
+            .expect("snapshot pause should start");
+        assert!(matches!(
+            coordinator
+                .process_completion(members[0].completion(2, canceled()))
+                .expect("debt cancellation should process"),
+            Some(HvfVcpuRunEvent::Barrier(_))
+        ));
+        pause.wait().expect("snapshot pause should complete");
+        assert_eq!(
+            coordinator
+                .capture_stable_paused_members()
+                .expect("settled pause should be stable")
+                .len(),
+            1
+        );
+        assert_eq!(batch.calls(), vec![vec![0], vec![0]]);
+    }
+
+    #[test]
+    fn snapshot_pause_consumes_idle_wakeup_barrier_before_settlement() {
+        let members = fake_members(1);
+        let batch = BatchHarness::default();
+        let mut coordinator =
+            coordinator(&members, &[0], batch.callback()).expect("coordinator should build");
+
+        let wakeup = coordinator
+            .control()
+            .request_wakeup()
+            .expect("idle wakeup should start");
+        wakeup.wait().expect("idle wakeup should complete");
+        coordinator
+            .prepare_snapshot_pause()
+            .expect("snapshot preparation should consume the idle wakeup");
+
+        let pause = coordinator
+            .control()
+            .request_pause()
+            .expect("snapshot pause should start");
+        assert!(matches!(
+            coordinator
+                .receive_event()
+                .expect("snapshot pause barrier should be available"),
+            HvfVcpuRunEvent::Barrier(_)
+        ));
+        pause.wait().expect("snapshot pause should complete");
+        assert_eq!(
+            coordinator
+                .capture_stable_paused_members()
+                .expect("settled pause should be stable")
+                .len(),
+            1
+        );
+        assert!(batch.calls().is_empty());
     }
 
     #[test]

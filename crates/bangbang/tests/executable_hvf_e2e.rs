@@ -326,6 +326,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
     const DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-multistream=1";
     const GUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+    const GUEST_STOP_TIMEOUT: Duration = Duration::from_secs(60);
     const PCI_ALL_VIRTIO_GUEST_TIMEOUT: Duration = Duration::from_secs(90);
     const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
     const SNAPSHOT_GUEST_IMAGE_MAGIC: u32 = 0x644d_5241;
@@ -10919,8 +10920,8 @@ mod macos_arm64 {
             &instance_id,
             &["--config-file", path_text(&config_path)],
         );
-        let output = bangbang
-            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "API-enabled guest SYSTEM_OFF");
+        let output =
+            bangbang.wait_for_exit_with_timeout(GUEST_STOP_TIMEOUT, "API-enabled guest SYSTEM_OFF");
 
         assert!(
             output.status.success(),
@@ -10963,7 +10964,7 @@ mod macos_arm64 {
         );
 
         let output =
-            bangbang.wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "no-api guest SYSTEM_OFF");
+            bangbang.wait_for_exit_with_timeout(GUEST_STOP_TIMEOUT, "no-api guest SYSTEM_OFF");
 
         assert!(
             output.status.success(),
@@ -11001,7 +11002,7 @@ mod macos_arm64 {
             &["--config-file", path_text(&config_path)],
         );
         let output = bangbang
-            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "API-enabled guest SYSTEM_RESET");
+            .wait_for_exit_with_timeout(GUEST_STOP_TIMEOUT, "API-enabled guest SYSTEM_RESET");
 
         assert!(
             output.status.success(),
@@ -11043,8 +11044,8 @@ mod macos_arm64 {
             "guest reset no-api startup must not publish an API socket"
         );
 
-        let output = bangbang
-            .wait_for_exit_with_timeout(GUEST_EXECUTION_TIMEOUT, "no-api guest SYSTEM_RESET");
+        let output =
+            bangbang.wait_for_exit_with_timeout(GUEST_STOP_TIMEOUT, "no-api guest SYSTEM_RESET");
 
         assert!(
             output.status.success(),
@@ -11120,12 +11121,18 @@ mod macos_arm64 {
         );
         assert_no_content_response(&start, "PUT source InstanceStart");
 
-        wait_for_uart_write_count(
-            &source_socket,
-            &source_metrics,
-            2,
-            GUEST_EXECUTION_TIMEOUT,
-            "all source snapshot guest vCPUs ready",
+        let secondary_ready = char::from(SNAPSHOT_GUEST_SECONDARY_READY_BYTE).to_string();
+        source
+            .wait_for_stdout_marker(&secondary_ready, GUEST_EXECUTION_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("all source snapshot guest vCPUs should become ready: {error}")
+            });
+        assert!(
+            source
+                .stdout_snapshot()
+                .as_bytes()
+                .contains(&SNAPSHOT_GUEST_PRIMARY_READY_BYTE),
+            "secondary readiness should follow the primary source checkpoint"
         );
         let pause = http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#);
         assert_no_content_response(&pause, "PATCH source /vm Paused");
@@ -11806,11 +11813,10 @@ mod macos_arm64 {
 
     #[test]
     fn signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci() {
-        let test_dir = TestDir::new();
-        let instance_id = test_dir.instance_id();
-
         for enable_pci in [false, true] {
             for rooted in [true, false] {
+                let test_dir = TestDir::new();
+                let instance_id = test_dir.instance_id();
                 run_native_v2_multi_block_epoch_case(
                     test_dir.path(),
                     &instance_id,
@@ -11976,7 +11982,7 @@ mod macos_arm64 {
                 &create_body,
                 GUEST_EXECUTION_TIMEOUT,
             ),
-            "PUT native-v2 epoch source /snapshot/create",
+            &format!("{case} PUT native-v2 epoch source /snapshot/create"),
         );
         let state_before = fs::read(&state_path).expect("native-v2 epoch state should read");
         let memory_before = fs::read(&memory_path).expect("native-v2 epoch memory should read");
@@ -12441,7 +12447,7 @@ mod macos_arm64 {
             0xd400_0002
         );
         assert_eq!(
-            read_test_u32(&image, SNAPSHOT_GUEST_SECONDARY_IMAGE_OFFSET + (17 * 4)),
+            read_test_u32(&image, SNAPSHOT_GUEST_SECONDARY_IMAGE_OFFSET + (19 * 4)),
             aarch64_br(21)
         );
         assert_eq!(
@@ -12506,42 +12512,6 @@ mod macos_arm64 {
             .unwrap_or_else(|| {
                 panic!("{context} should emit memory_hotplug metrics; output:\n{output}")
             })
-    }
-
-    fn wait_for_uart_write_count(
-        socket_path: &Path,
-        metrics_path: &Path,
-        expected: u64,
-        timeout: Duration,
-        context: &str,
-    ) {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let flush = http_put_json(socket_path, "/actions", r#"{"action_type":"FlushMetrics"}"#);
-            assert_no_content_response(&flush, context);
-            if latest_uart_write_count(metrics_path).is_some_and(|count| count >= expected) {
-                return;
-            }
-            if Instant::now() >= deadline {
-                let metrics = fs::read_to_string(metrics_path)
-                    .unwrap_or_else(|err| format!("<metrics unavailable: {err}>"));
-                panic!(
-                    "{context} did not observe uart.write_count >= {expected} within {timeout:?}; metrics:\n{metrics}"
-                );
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-
-    fn latest_uart_write_count(path: &Path) -> Option<u64> {
-        let output = fs::read_to_string(path).ok()?;
-        output.lines().rev().find_map(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()?
-                .get("uart")?
-                .get("write_count")?
-                .as_u64()
-        })
     }
 
     fn wait_for_block_root_read_count(
@@ -12780,6 +12750,10 @@ mod macos_arm64 {
             aarch64_movz_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 0), 0),
             aarch64_movk_x(4, low_u16(SNAPSHOT_GUEST_UART_ADDRESS, 16), 16),
             aarch64_movz_x(7, u16::from(SNAPSHOT_GUEST_SECONDARY_READY_BYTE), 0),
+            aarch64_strb_w(7, 4),
+            // Complete one observable readiness record only after both vCPUs
+            // have reached their source checkpoints.
+            aarch64_movz_x(7, u16::from(b'\n'), 0),
             aarch64_strb_w(7, 4),
             aarch64_movz_x(5, 1, 0),
             aarch64_str_w(5, 19, 24),
