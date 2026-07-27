@@ -2862,6 +2862,52 @@ impl SharedPmemDeviceMetricsRegistry {
         })
     }
 
+    /// Builds a bounded registry by consuming already-validated owned IDs.
+    #[doc(hidden)]
+    pub fn from_owned_device_ids_with_capacity(
+        device_ids: Vec<String>,
+        capacity: usize,
+    ) -> Result<Self, PmemDeviceMetricsRegistryError> {
+        if device_ids.len() > capacity {
+            return Err(PmemDeviceMetricsRegistryError::Capacity);
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| PmemDeviceMetricsRegistryError::Capacity)?;
+        let mut reservations = Vec::new();
+        reservations
+            .try_reserve_exact(capacity)
+            .map_err(|_| PmemDeviceMetricsRegistryError::Capacity)?;
+        for device_id in device_ids {
+            if entries
+                .iter()
+                .any(|entry: &PmemDeviceMetricsRegistryEntry| entry.device_id == device_id)
+            {
+                return Err(PmemDeviceMetricsRegistryError::DuplicateDevice);
+            }
+            let generation = u64::try_from(entries.len())
+                .map_err(|_| PmemDeviceMetricsRegistryError::GenerationExhausted)?;
+            entries.push(PmemDeviceMetricsRegistryEntry {
+                generation,
+                device_id,
+                metrics: SharedPmemDeviceMetrics::default(),
+                lease_claimed: false,
+            });
+        }
+        let next_generation = u64::try_from(entries.len())
+            .map_err(|_| PmemDeviceMetricsRegistryError::GenerationExhausted)?;
+        Ok(Self {
+            aggregate: SharedPmemDeviceMetrics::default(),
+            per_device: Arc::new(Mutex::new(PmemDeviceMetricsRegistryState {
+                entries,
+                reservations,
+                next_generation,
+                capacity,
+            })),
+        })
+    }
+
     pub fn prepare_device(
         &self,
         device_id: impl Into<String>,

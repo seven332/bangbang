@@ -514,7 +514,8 @@ if contains native_v2_process "${selected_tests[@]}"; then
   for signed_snapshot_test in \
     vmm::tests::signed_native_v1_public_dispatch_restores_frozen_file_pair \
     vmm::tests::signed_native_v2_process_publishes_recaptures_and_resumes_private_pair \
-    vmm::tests::signed_native_v2_root_process_commits_complete_mmio_and_pci_owners_atomically; do
+    vmm::tests::signed_native_v2_root_process_commits_complete_mmio_and_pci_owners_atomically \
+    vmm::tests::signed_native_v2_storage_destination_stays_private_and_paused_through_commit; do
     if [[ "${#test_args[@]}" -eq 0 ]]; then
       "$native_v2_process_bin" \
         --test-threads=1 \

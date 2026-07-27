@@ -2350,6 +2350,12 @@ impl PmemConfigs {
         &self.configs
     }
 
+    /// Consumes the validated configuration set in canonical device order.
+    #[doc(hidden)]
+    pub fn into_vec(self) -> Vec<PmemConfig> {
+        self.configs
+    }
+
     pub(crate) fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
         self.configs.try_reserve_exact(additional)
     }
@@ -4220,6 +4226,12 @@ impl PmemMmioLayout {
         self
     }
 
+    /// Computes one canonical device region without registering a handler.
+    pub fn region_at(self, index: usize) -> Result<MmioRegion, PmemMmioRegistrationError> {
+        self.validate()?;
+        self.placement(index).map(|placement| placement.region)
+    }
+
     fn validate(self) -> Result<(), PmemMmioRegistrationError> {
         if self.address_stride < VIRTIO_MMIO_DEVICE_WINDOW_SIZE {
             return Err(PmemMmioRegistrationError::AddressStrideTooSmall {
@@ -4303,6 +4315,27 @@ pub struct PmemMmioDeviceRegistration {
 }
 
 impl PmemMmioDeviceRegistration {
+    /// Reconstructs registration metadata for an already installed retained
+    /// MMIO handler and mapped pmem owner.
+    #[doc(hidden)]
+    pub fn from_restored(
+        index: usize,
+        pmem_id: String,
+        region: MmioRegion,
+        guest_range: GuestMemoryRange,
+        file_len: u64,
+        config_space: VirtioPmemConfigSpace,
+    ) -> Self {
+        Self {
+            index,
+            pmem_id,
+            region,
+            guest_range,
+            file_len,
+            config_space,
+        }
+    }
+
     pub const fn index(&self) -> usize {
         self.index
     }

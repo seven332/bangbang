@@ -1359,7 +1359,7 @@ pub(crate) mod tests {
         graph
     }
 
-    fn product_mmio_platform(record_count: usize) -> HvfSnapshotV2PlatformState {
+    pub(crate) fn product_mmio_platform(record_count: usize) -> HvfSnapshotV2PlatformState {
         let (platform, root, _process) =
             crate::snapshot_v2_platform::tests::mmio_root_plan_fixture();
         drop(root);
@@ -1419,7 +1419,7 @@ pub(crate) mod tests {
         rebuild_product_platform(platform, 0, None, false)
     }
 
-    fn rebuild_product_platform(
+    pub(crate) fn rebuild_product_platform(
         platform: HvfSnapshotV2PlatformState,
         mmio_record_count: usize,
         exact_spi_count: Option<u32>,

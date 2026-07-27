@@ -38,7 +38,10 @@ mod restore;
 pub use restore::{
     PreparedSnapshotV2PmemRecord, PreparedSnapshotV2PmemRecordParts,
     PreparedSnapshotV2StorageBundle, PreparedSnapshotV2StorageBundleParts,
-    SnapshotV2StorageBundleError, SnapshotV2StorageCleanupError, SnapshotV2StorageRestorePlan,
+    PreparedSnapshotV2StorageMmioBundle, PreparedSnapshotV2StorageMmioBundleParts,
+    PreparedSnapshotV2StorageMmioPmemRecord, PreparedSnapshotV2StorageMmioPmemRecordParts,
+    SnapshotV2StorageBundleError, SnapshotV2StorageCleanupError,
+    SnapshotV2StorageMmioTransportError, SnapshotV2StorageRestorePlan,
     SnapshotV2StorageRestorePlanError,
 };
 

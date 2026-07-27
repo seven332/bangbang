@@ -44,15 +44,16 @@ use bangbang_hvf::{
     HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockProcessConfig,
     HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformRestoreError,
     HvfSnapshotV2PlatformState, HvfSnapshotV2RootProcessConfig, HvfSnapshotV2RootResourcePlan,
-    HvfSnapshotV2RootRestoreError, HvfSnapshotV2State, HvfVcpuRunControl,
-    HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
-    PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2MultiBlockPlatformPlanError,
-    PrepareHvfSnapshotV2RootPlanError, PreparedHvfArm64BootPciNetworkRemoval,
-    PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
-    decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_platform_state,
-    decode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_multi_block_state,
-    encode_hvf_snapshot_v2_state, prepare_hvf_snapshot_v2_multi_block_platform_plan,
-    prepare_hvf_snapshot_v2_root_plan, restore_hvf_snapshot_v2_process_platform,
+    HvfSnapshotV2RootRestoreError, HvfSnapshotV2State, HvfSnapshotV2StorageMmioPlatformPlan,
+    HvfSnapshotV2StorageMmioRestoreError, HvfVcpuRunControl, HvfVcpuRunCoordinatorError,
+    HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError,
+    PrepareHvfSnapshotV2MultiBlockPlatformPlanError, PrepareHvfSnapshotV2RootPlanError,
+    PreparedHvfArm64BootPciNetworkRemoval, PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State,
+    RestoredHvfSnapshotV2Platform, decode_hvf_snapshot_v2_multi_block_state,
+    decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_state,
+    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_state,
+    prepare_hvf_snapshot_v2_multi_block_platform_plan, prepare_hvf_snapshot_v2_root_plan,
+    restore_hvf_snapshot_v2_process_platform,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -213,9 +214,10 @@ use crate::snapshot_restore_resources::{
     PreparedSnapshotRootBackingLease, PreparedSnapshotRootRestoreCompletion,
     PreparedSnapshotRootRestoreCompletionError, PreparedSnapshotV2MultiBlockDestinationCommitError,
     PreparedSnapshotV2MultiBlockDestinationConstructionError,
-    PreparedSnapshotV2MultiBlockRestoreBundle, RequestedSnapshotRestoreResources,
-    SnapshotRestoreResourceDisposition, SnapshotRestoreResourceError,
-    SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
+    PreparedSnapshotV2MultiBlockRestoreBundle, PreparedSnapshotV2StorageDestinationCommitError,
+    PreparedSnapshotV2StorageDestinationConstructionError, PreparedSnapshotV2StorageRestoreBundle,
+    RequestedSnapshotRestoreResources, SnapshotRestoreResourceDisposition,
+    SnapshotRestoreResourceError, SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
     SnapshotV2MultiBlockRestoreBundleError,
 };
 #[cfg(target_os = "macos")]
@@ -7224,26 +7226,33 @@ impl fmt::Display for PreparedHvfSnapshotV2MultiBlockControllerError {
 impl std::error::Error for PreparedHvfSnapshotV2MultiBlockControllerError {}
 
 #[cfg(target_os = "macos")]
-trait HvfSnapshotV2MultiBlockRestoreDisposition {
+trait HvfSnapshotV2RestoreDisposition {
     fn is_terminal(&self) -> bool;
 }
 
 #[cfg(target_os = "macos")]
-impl HvfSnapshotV2MultiBlockRestoreDisposition for HvfSnapshotV2MultiBlockMmioRestoreError {
+impl HvfSnapshotV2RestoreDisposition for HvfSnapshotV2MultiBlockMmioRestoreError {
     fn is_terminal(&self) -> bool {
         self.is_terminal()
     }
 }
 
 #[cfg(target_os = "macos")]
-impl HvfSnapshotV2MultiBlockRestoreDisposition for HvfSnapshotV2MultiBlockPciRestoreError {
+impl HvfSnapshotV2RestoreDisposition for HvfSnapshotV2MultiBlockPciRestoreError {
     fn is_terminal(&self) -> bool {
         self.is_terminal()
     }
 }
 
 #[cfg(target_os = "macos")]
-enum HvfSnapshotV2MultiBlockProcessConstructionError<E> {
+impl HvfSnapshotV2RestoreDisposition for HvfSnapshotV2StorageMmioRestoreError {
+    fn is_terminal(&self) -> bool {
+        self.is_terminal()
+    }
+}
+
+#[cfg(target_os = "macos")]
+enum HvfSnapshotV2ProcessConstructionError<E> {
     Restore(E),
     RunReady {
         source: HvfVcpuRunCoordinatorError,
@@ -7256,10 +7265,9 @@ enum HvfSnapshotV2MultiBlockProcessConstructionError<E> {
 }
 
 #[cfg(target_os = "macos")]
-impl<E> HvfSnapshotV2MultiBlockRestoreDisposition
-    for HvfSnapshotV2MultiBlockProcessConstructionError<E>
+impl<E> HvfSnapshotV2RestoreDisposition for HvfSnapshotV2ProcessConstructionError<E>
 where
-    E: HvfSnapshotV2MultiBlockRestoreDisposition,
+    E: HvfSnapshotV2RestoreDisposition,
 {
     fn is_terminal(&self) -> bool {
         match self {
@@ -7270,9 +7278,9 @@ where
 }
 
 #[cfg(target_os = "macos")]
-impl<E> fmt::Debug for HvfSnapshotV2MultiBlockProcessConstructionError<E>
+impl<E> fmt::Debug for HvfSnapshotV2ProcessConstructionError<E>
 where
-    E: HvfSnapshotV2MultiBlockRestoreDisposition,
+    E: HvfSnapshotV2RestoreDisposition,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (stage, cleanup_failed) = match self {
@@ -7281,7 +7289,7 @@ where
             Self::WorkerStart { cleanup, .. } => ("worker-start", cleanup.is_some()),
         };
         formatter
-            .debug_struct("HvfSnapshotV2MultiBlockProcessConstructionError")
+            .debug_struct("HvfSnapshotV2ProcessConstructionError")
             .field("stage", &stage)
             .field("terminal", &self.is_terminal())
             .field("cleanup_failed", &cleanup_failed)
@@ -7291,19 +7299,19 @@ where
 }
 
 #[cfg(target_os = "macos")]
-impl<E> fmt::Display for HvfSnapshotV2MultiBlockProcessConstructionError<E>
+impl<E> fmt::Display for HvfSnapshotV2ProcessConstructionError<E>
 where
-    E: HvfSnapshotV2MultiBlockRestoreDisposition,
+    E: HvfSnapshotV2RestoreDisposition,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (message, cleanup_failed) = match self {
-            Self::Restore(_) => ("profile-2 HVF owner restore failed", false),
+            Self::Restore(_) => ("native-v2 HVF owner restore failed", false),
             Self::RunReady { cleanup, .. } => (
-                "profile-2 run coordinator preparation failed",
+                "native-v2 run coordinator preparation failed",
                 cleanup.is_some(),
             ),
             Self::WorkerStart { cleanup, .. } => {
-                ("profile-2 paused worker startup failed", cleanup.is_some())
+                ("native-v2 paused worker startup failed", cleanup.is_some())
             }
         };
         formatter.write_str(message)?;
@@ -7315,9 +7323,9 @@ where
 }
 
 #[cfg(target_os = "macos")]
-impl<E> std::error::Error for HvfSnapshotV2MultiBlockProcessConstructionError<E>
+impl<E> std::error::Error for HvfSnapshotV2ProcessConstructionError<E>
 where
-    E: HvfSnapshotV2MultiBlockRestoreDisposition + std::error::Error + 'static,
+    E: HvfSnapshotV2RestoreDisposition + std::error::Error + 'static,
 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -7342,7 +7350,7 @@ enum PrepareHvfSnapshotV2MultiBlockDestinationError<E> {
 #[cfg(target_os = "macos")]
 impl<E> PrepareHvfSnapshotV2MultiBlockDestinationError<E>
 where
-    E: HvfSnapshotV2MultiBlockRestoreDisposition,
+    E: HvfSnapshotV2RestoreDisposition,
 {
     fn is_terminal(&self) -> bool {
         match self {
@@ -7364,7 +7372,7 @@ where
 #[cfg(target_os = "macos")]
 impl<E> fmt::Debug for PrepareHvfSnapshotV2MultiBlockDestinationError<E>
 where
-    E: HvfSnapshotV2MultiBlockRestoreDisposition,
+    E: HvfSnapshotV2RestoreDisposition,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let stage = match self {
@@ -7383,7 +7391,7 @@ where
 #[cfg(target_os = "macos")]
 impl<E> fmt::Display for PrepareHvfSnapshotV2MultiBlockDestinationError<E>
 where
-    E: HvfSnapshotV2MultiBlockRestoreDisposition,
+    E: HvfSnapshotV2RestoreDisposition,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -7401,7 +7409,7 @@ where
 #[cfg(target_os = "macos")]
 impl<E> std::error::Error for PrepareHvfSnapshotV2MultiBlockDestinationError<E>
 where
-    E: HvfSnapshotV2MultiBlockRestoreDisposition + std::error::Error + 'static,
+    E: HvfSnapshotV2RestoreDisposition + std::error::Error + 'static,
 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -7439,7 +7447,7 @@ fn prepare_hvf_native_v2_multi_block_mmio_destination(
         SharedSerialOutput,
     ),
     PrepareHvfSnapshotV2MultiBlockDestinationError<
-        HvfSnapshotV2MultiBlockProcessConstructionError<HvfSnapshotV2MultiBlockMmioRestoreError>,
+        HvfSnapshotV2ProcessConstructionError<HvfSnapshotV2MultiBlockMmioRestoreError>,
     >,
 > {
     let PrepareHvfSnapshotV2MultiBlockMmioDestinationInput {
@@ -7466,17 +7474,14 @@ fn prepare_hvf_native_v2_multi_block_mmio_destination(
                 bundle,
                 plan,
             )
-            .map_err(HvfSnapshotV2MultiBlockProcessConstructionError::Restore)?;
+            .map_err(HvfSnapshotV2ProcessConstructionError::Restore)?;
             let (mut session, drive_configs) = owners.into_parts();
             if let Err(source) = session.resume_after_snapshot_v2_capture() {
                 let cleanup = session
                     .shutdown()
                     .err()
                     .map(|source| BackendError::Hypervisor(source.to_string()));
-                return Err(HvfSnapshotV2MultiBlockProcessConstructionError::RunReady {
-                    source,
-                    cleanup,
-                });
+                return Err(HvfSnapshotV2ProcessConstructionError::RunReady { source, cleanup });
             }
             let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
                 session,
@@ -7496,12 +7501,10 @@ fn prepare_hvf_native_v2_multi_block_mmio_destination(
                         .shutdown()
                         .err()
                         .map(|source| BackendError::Hypervisor(source.to_string()));
-                    return Err(
-                        HvfSnapshotV2MultiBlockProcessConstructionError::WorkerStart {
-                            source,
-                            cleanup,
-                        },
-                    );
+                    return Err(HvfSnapshotV2ProcessConstructionError::WorkerStart {
+                        source,
+                        cleanup,
+                    });
                 }
             };
             Ok(PreparedHvfSnapshotV2MultiBlockDestination {
@@ -7525,6 +7528,321 @@ fn prepare_hvf_native_v2_multi_block_mmio_destination(
             PreparedHvfSnapshotV2MultiBlockDestination::shutdown,
         )
         .map_err(PrepareHvfSnapshotV2MultiBlockDestinationError::Commit)?;
+    let (session, serial_output) = destination.into_parts();
+    Ok((session, controller, serial_output))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "exact-2.6 process restore remains private until the public activation slice"
+)]
+struct PreparedHvfSnapshotV2StorageControllerProjection {
+    machine: bangbang_runtime::machine::MachineConfig,
+    boot: bangbang_runtime::boot::BootSourceConfig,
+    configs: CaptureReadyStorageConfigs,
+    resume_requested: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for PreparedHvfSnapshotV2StorageControllerProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedHvfSnapshotV2StorageControllerProjection")
+            .field("block_count", &self.configs.drives().len())
+            .field("pmem_count", &self.configs.pmem().len())
+            .field("resume_requested", &self.resume_requested)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct PreparedHvfSnapshotV2StorageDestination {
+    session: Box<HvfProcessSession>,
+    configs: Option<CaptureReadyStorageConfigs>,
+    serial_output: SharedSerialOutput,
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedHvfSnapshotV2StorageDestination {
+    fn prepare_controller(
+        mut self,
+        machine: bangbang_runtime::machine::MachineConfig,
+        boot: bangbang_runtime::boot::BootSourceConfig,
+        resume_requested: bool,
+    ) -> Result<
+        (Self, PreparedHvfSnapshotV2StorageControllerProjection),
+        (Self, PreparedHvfSnapshotV2StorageControllerError),
+    > {
+        let Some(configs) = self.configs.take() else {
+            return Err((
+                self,
+                PreparedHvfSnapshotV2StorageControllerError::MissingConfigs,
+            ));
+        };
+        let projection = PreparedHvfSnapshotV2StorageControllerProjection {
+            machine,
+            boot,
+            configs,
+            resume_requested,
+        };
+        Ok((self, projection))
+    }
+
+    fn shutdown(mut self) -> Result<(), BackendError> {
+        let result = match self.session.as_mut() {
+            HvfProcessSession::Boot(supervisor) => supervisor
+                .run_command(|session| {
+                    session
+                        .session
+                        .shutdown()
+                        .map_err(|source| BackendError::Hypervisor(source.to_string()))
+                })
+                .map_err(lifecycle_error_from_boot_run_loop_command),
+            HvfProcessSession::SnapshotV2(_) => Err(BackendError::InvalidState(
+                "exact-2.6 storage destination has the wrong worker type",
+            )),
+        };
+        drop(self);
+        result
+    }
+
+    fn into_parts(self) -> (HvfProcessSession, SharedSerialOutput) {
+        let Self {
+            session,
+            configs,
+            serial_output,
+        } = self;
+        debug_assert!(configs.is_none());
+        (*session, serial_output)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for PreparedHvfSnapshotV2StorageDestination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedHvfSnapshotV2StorageDestination")
+            .field("state", &"<private-provisional>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedHvfSnapshotV2StorageControllerError {
+    MissingConfigs,
+    Cancelled,
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for PreparedHvfSnapshotV2StorageControllerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingConfigs => "profile-3 controller projection is unavailable",
+            Self::Cancelled => "profile-3 destination commit was cancelled",
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for PreparedHvfSnapshotV2StorageControllerError {}
+
+#[cfg(target_os = "macos")]
+enum PrepareHvfSnapshotV2StorageDestinationError {
+    Construction(
+        PreparedSnapshotV2StorageDestinationConstructionError<
+            HvfSnapshotV2ProcessConstructionError<HvfSnapshotV2StorageMmioRestoreError>,
+        >,
+    ),
+    Commit(
+        PreparedSnapshotV2StorageDestinationCommitError<
+            PreparedHvfSnapshotV2StorageControllerError,
+            BackendError,
+        >,
+    ),
+}
+
+#[cfg(target_os = "macos")]
+impl PrepareHvfSnapshotV2StorageDestinationError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Construction(source) => {
+                source.is_terminal()
+                    || matches!(
+                        source,
+                        PreparedSnapshotV2StorageDestinationConstructionError::Construction {
+                            source,
+                            ..
+                        } if source.is_terminal()
+                    )
+            }
+            Self::Commit(source) => source.is_terminal(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for PrepareHvfSnapshotV2StorageDestinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stage = match self {
+            Self::Construction(_) => "construction",
+            Self::Commit(_) => "completion",
+        };
+        formatter
+            .debug_struct("PrepareHvfSnapshotV2StorageDestinationError")
+            .field("stage", &stage)
+            .field("terminal", &self.is_terminal())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for PrepareHvfSnapshotV2StorageDestinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "profile-3 destination transaction failed ({})",
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for PrepareHvfSnapshotV2StorageDestinationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Construction(source) => Some(source),
+            Self::Commit(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "exact-2.6 process restore remains private until the public activation slice"
+)]
+struct PrepareHvfSnapshotV2StorageMmioDestinationInput {
+    platform: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    process_shell: HvfSnapshotV2DefaultProcessShell,
+    packet_io: ProcessNetworkPacketIoProvider,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    vmnet_authority: ProcessVmnetAuthority,
+    serial_output: SharedSerialOutput,
+    bundle: PreparedSnapshotV2StorageRestoreBundle,
+    plan: HvfSnapshotV2StorageMmioPlatformPlan,
+    machine: bangbang_runtime::machine::MachineConfig,
+    boot: bangbang_runtime::boot::BootSourceConfig,
+    resume_requested: bool,
+    cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
+/// Builds one complete exact-2.6 MMIO worker behind the private Paused gate.
+///
+/// This deliberately returns a provisional block+pmem controller projection
+/// instead of mutating the public controller. The activation slice owns that
+/// final publication.
+#[cfg(target_os = "macos")]
+#[allow(
+    dead_code,
+    reason = "exact-2.6 process restore remains private until the public activation slice"
+)]
+fn prepare_hvf_native_v2_storage_mmio_destination(
+    input: PrepareHvfSnapshotV2StorageMmioDestinationInput,
+) -> Result<
+    (
+        HvfProcessSession,
+        PreparedHvfSnapshotV2StorageControllerProjection,
+        SharedSerialOutput,
+    ),
+    PrepareHvfSnapshotV2StorageDestinationError,
+> {
+    let PrepareHvfSnapshotV2StorageMmioDestinationInput {
+        platform,
+        memory,
+        process_shell,
+        packet_io,
+        mmds_metrics,
+        vmnet_authority,
+        serial_output,
+        bundle,
+        plan,
+        machine,
+        boot,
+        resume_requested,
+        cancellation,
+    } = input;
+    let destination = bundle
+        .construct_destination(|bundle| {
+            let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_storage_mmio(
+                platform,
+                memory,
+                process_shell,
+                bundle,
+                plan,
+            )
+            .map_err(HvfSnapshotV2ProcessConstructionError::Restore)?;
+            let (mut session, configs) = owners.into_parts();
+            if let Err(source) = session.resume_after_snapshot_v2_capture() {
+                let cleanup = session
+                    .shutdown()
+                    .err()
+                    .map(|source| BackendError::Hypervisor(source.to_string()));
+                return Err(HvfSnapshotV2ProcessConstructionError::RunReady { source, cleanup });
+            }
+            let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
+                session,
+                packet_io,
+                mmds_metrics,
+                vmnet_authority,
+            );
+            let supervisor = match HvfBootRunLoopSupervisor::start_paused(
+                process_session,
+                default_hvf_boot_run_loop_step_limit(),
+            ) {
+                Ok(supervisor) => supervisor,
+                Err(error) => {
+                    let (source, mut failed_session) = error.into_parts();
+                    let cleanup = failed_session
+                        .session
+                        .shutdown()
+                        .err()
+                        .map(|source| BackendError::Hypervisor(source.to_string()));
+                    return Err(HvfSnapshotV2ProcessConstructionError::WorkerStart {
+                        source,
+                        cleanup,
+                    });
+                }
+            };
+            Ok(PreparedHvfSnapshotV2StorageDestination {
+                session: Box::new(HvfProcessSession::Boot(supervisor)),
+                configs: Some(configs),
+                serial_output,
+            })
+        })
+        .map_err(PrepareHvfSnapshotV2StorageDestinationError::Construction)?;
+    let (destination, controller) = destination
+        .commit(
+            |destination| {
+                if !cancellation.try_seal_commit() {
+                    return Err((
+                        destination,
+                        PreparedHvfSnapshotV2StorageControllerError::Cancelled,
+                    ));
+                }
+                destination.prepare_controller(machine, boot, resume_requested)
+            },
+            PreparedHvfSnapshotV2StorageDestination::shutdown,
+        )
+        .map_err(PrepareHvfSnapshotV2StorageDestinationError::Commit)?;
     let (session, serial_output) = destination.into_parts();
     Ok((session, controller, serial_output))
 }
@@ -7557,7 +7875,7 @@ fn prepare_hvf_native_v2_multi_block_pci_destination(
         SharedSerialOutput,
     ),
     PrepareHvfSnapshotV2MultiBlockDestinationError<
-        HvfSnapshotV2MultiBlockProcessConstructionError<HvfSnapshotV2MultiBlockPciRestoreError>,
+        HvfSnapshotV2ProcessConstructionError<HvfSnapshotV2MultiBlockPciRestoreError>,
     >,
 > {
     let PrepareHvfSnapshotV2MultiBlockPciDestinationInput {
@@ -7584,17 +7902,14 @@ fn prepare_hvf_native_v2_multi_block_pci_destination(
                 bundle,
                 plan,
             )
-            .map_err(HvfSnapshotV2MultiBlockProcessConstructionError::Restore)?;
+            .map_err(HvfSnapshotV2ProcessConstructionError::Restore)?;
             let (mut session, drive_configs) = owners.into_parts();
             if let Err(source) = session.resume_after_snapshot_v2_capture() {
                 let cleanup = session
                     .shutdown()
                     .err()
                     .map(|source| BackendError::Hypervisor(source.to_string()));
-                return Err(HvfSnapshotV2MultiBlockProcessConstructionError::RunReady {
-                    source,
-                    cleanup,
-                });
+                return Err(HvfSnapshotV2ProcessConstructionError::RunReady { source, cleanup });
             }
             let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
                 session,
@@ -7614,12 +7929,10 @@ fn prepare_hvf_native_v2_multi_block_pci_destination(
                         .shutdown()
                         .err()
                         .map(|source| BackendError::Hypervisor(source.to_string()));
-                    return Err(
-                        HvfSnapshotV2MultiBlockProcessConstructionError::WorkerStart {
-                            source,
-                            cleanup,
-                        },
-                    );
+                    return Err(HvfSnapshotV2ProcessConstructionError::WorkerStart {
+                        source,
+                        cleanup,
+                    });
                 }
             };
             Ok(PreparedHvfSnapshotV2MultiBlockDestination {
@@ -29858,6 +30171,267 @@ mod tests {
             assert_eq!(recaptured.device_graph(), &expected_graph);
             assert_eq!(destination.instance_info().state, InstanceState::Paused);
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires the signed native_v2_process integration group"]
+    fn signed_native_v2_storage_destination_stays_private_and_paused_through_commit() {
+        use bangbang_runtime::pmem::VIRTIO_PMEM_ALIGNMENT;
+
+        const ARM64_IMAGE_HEADER_SIZE: usize = 64;
+        const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
+        const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
+        const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+        const ARM64_BRANCH_TO_SELF: u32 = 0x1400_0000;
+
+        let mut image = vec![0_u8; ARM64_IMAGE_HEADER_SIZE];
+        image[..4].copy_from_slice(&ARM64_BRANCH_TO_SELF.to_le_bytes());
+        image[ARM64_IMAGE_SIZE_OFFSET..ARM64_IMAGE_SIZE_OFFSET + 8]
+            .copy_from_slice(&(ARM64_IMAGE_HEADER_SIZE as u64).to_le_bytes());
+        image[ARM64_IMAGE_MAGIC_OFFSET..ARM64_IMAGE_MAGIC_OFFSET + 4]
+            .copy_from_slice(&ARM64_IMAGE_MAGIC.to_le_bytes());
+        let kernel = TempFilePath::create_with_bytes("signed-native-v2-storage-kernel", &image);
+        let root = TempFilePath::create_with_bytes("signed-native-v2-storage-root", &[0_u8; 4096]);
+        let pmem = TempFilePath::create_with_bytes(
+            "signed-native-v2-storage-pmem",
+            &vec![
+                0_u8;
+                usize::try_from(VIRTIO_PMEM_ALIGNMENT).expect("pmem alignment should fit usize")
+            ],
+        );
+
+        let mut source_controller =
+            VmmController::new("native-v2-storage-source", "0.1.0", "bangbang");
+        source_controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(1, 16)))
+            .expect("storage source machine should configure");
+        source_controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.path(),
+            )))
+            .expect("storage source boot metadata should configure");
+        source_controller
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                    .with_is_read_only(true)
+                    .with_io_engine(DriveIoEngine::Sync),
+            ))
+            .expect("storage source block root should configure");
+        source_controller
+            .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                "pmem0",
+                pmem.path().to_string_lossy().into_owned(),
+            )))
+            .expect("storage source pmem should configure");
+
+        let source_serial = SharedSerialOutput::from(SharedSerialOutputBuffer::default());
+        let mut source_session = super::OwnedHvfArm64BootSession::new(
+            &source_controller,
+            default_hvf_boot_session_config(source_serial),
+        )
+        .expect("signed exact-2.6 source should prepare");
+        let expected_configs = CaptureReadyStorageConfigs::new(
+            source_controller.drive_configs().to_vec(),
+            source_controller.pmem_configs().to_vec(),
+        );
+        let capture_now = Instant::now();
+        let capture_guard = source_session
+            .quiesce_limiter_retry_wakeups()
+            .expect("storage source retry publishers should quiesce");
+        let graph = source_session
+            .capture_snapshot_v2_storage_device_graph_at(
+                &expected_configs,
+                &capture_guard,
+                capture_now,
+            )
+            .expect("signed exact-2.6 storage graph should capture");
+
+        let restored_layout =
+            GuestMemoryLayout::new(source_session.runtime_resources().layout.ranges().to_vec())
+                .expect("storage destination layout should validate");
+        let copy_source_memory = || {
+            let mut destination = GuestMemory::allocate(&restored_layout)
+                .expect("storage destination memory should allocate");
+            let source = source_session
+                .guest_memory()
+                .expect("storage source memory should remain mapped");
+            let mut buffer = vec![0_u8; 64 * 1024];
+            for range in restored_layout.ranges() {
+                let mut copied = 0_u64;
+                while copied < range.size() {
+                    let count = usize::try_from(
+                        (range.size() - copied).min(
+                            u64::try_from(buffer.len())
+                                .expect("storage copy buffer length should fit u64"),
+                        ),
+                    )
+                    .expect("storage memory copy length should fit usize");
+                    let address = range
+                        .start()
+                        .checked_add(copied)
+                        .expect("storage memory copy address should fit");
+                    source
+                        .read_slice(&mut buffer[..count], address)
+                        .expect("storage source memory should read");
+                    destination
+                        .write_slice(&buffer[..count], address)
+                        .expect("storage destination memory should write");
+                    copied += u64::try_from(count).expect("storage copy length should fit u64");
+                }
+            }
+            destination
+        };
+        let cancelled_memory = copy_source_memory();
+        let committed_memory = copy_source_memory();
+
+        source_session
+            .pause_for_snapshot_v2_capture()
+            .expect("storage source topology should pause");
+        let boot_state = HvfSnapshotV2BootState::try_new(
+            HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+                .expect("storage source kernel path should validate"),
+            None,
+            None,
+        )
+        .expect("storage source boot state should validate");
+        let mut memory_output = Cursor::new(Vec::new());
+        let platform = source_session
+            .capture_snapshot_v2_storage_platform_with_cancel(
+                HvfArm64BootSnapshotV2CaptureInput::new(boot_state),
+                &mut memory_output,
+                |_| false,
+            )
+            .expect("signed exact-2.6 storage platform should capture");
+        drop(capture_guard);
+        source_session
+            .shutdown()
+            .expect("storage source should shut down");
+
+        let machine = snapshot_destination_machine_config(platform.machine().machine(), false);
+        let boot = super::native_v2_boot_source_config(platform.machine().boot())
+            .expect("storage destination boot projection should validate");
+        let process = bangbang_hvf::HvfSnapshotV2StorageMmioProcessConfig::new(
+            BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
+            PmemMmioLayout::new(DEFAULT_PMEM_MMIO_BASE, DEFAULT_PMEM_MMIO_REGION_ID),
+        );
+
+        let cancelled_bundle =
+            super::RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
+                graph.clone(),
+                &cancelled_memory,
+                Instant::now(),
+                None,
+                || false,
+            )
+            .expect("cancelled storage bundle should prepare");
+        let cancelled_plan = bangbang_hvf::prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
+            &platform,
+            cancelled_bundle
+                .bundle()
+                .expect("cancelled storage bundle owner should remain present"),
+            process,
+        )
+        .expect("cancelled storage platform plan should prepare");
+        let cancelled_serial = SharedSerialOutput::from(SharedSerialOutputBuffer::default());
+        let cancelled_shell =
+            super::HvfSnapshotV2DefaultProcessShell::new(cancelled_serial.clone());
+        let (cancelled_packet_io, cancelled_mmds_metrics) =
+            ProcessNetworkPacketIoProvider::from_controller(
+                &source_controller,
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("cancelled storage packet I/O should prepare");
+        let cancellation = NativeV2SnapshotCaptureCancellation::default();
+        cancellation.cancel();
+        let cancelled = super::prepare_hvf_native_v2_storage_mmio_destination(
+            super::PrepareHvfSnapshotV2StorageMmioDestinationInput {
+                platform: platform.clone(),
+                memory: cancelled_memory,
+                process_shell: cancelled_shell,
+                packet_io: cancelled_packet_io,
+                mmds_metrics: cancelled_mmds_metrics,
+                vmnet_authority: ProcessVmnetAuthority::Direct,
+                serial_output: cancelled_serial,
+                bundle: cancelled_bundle,
+                plan: cancelled_plan,
+                machine,
+                boot: boot.clone(),
+                resume_requested: false,
+                cancellation,
+            },
+        )
+        .expect_err("cancellation should prevent private storage commit");
+        assert!(!cancelled.is_terminal());
+        assert!(matches!(
+            cancelled,
+            super::PrepareHvfSnapshotV2StorageDestinationError::Commit(_)
+        ));
+
+        let committed_bundle =
+            super::RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
+                graph,
+                &committed_memory,
+                Instant::now(),
+                None,
+                || false,
+            )
+            .expect("committed storage bundle should prepare after rollback");
+        let committed_plan = bangbang_hvf::prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
+            &platform,
+            committed_bundle
+                .bundle()
+                .expect("committed storage bundle owner should remain present"),
+            process,
+        )
+        .expect("committed storage platform plan should prepare");
+        let committed_serial = SharedSerialOutput::from(SharedSerialOutputBuffer::default());
+        let committed_shell =
+            super::HvfSnapshotV2DefaultProcessShell::new(committed_serial.clone());
+        let (committed_packet_io, committed_mmds_metrics) =
+            ProcessNetworkPacketIoProvider::from_controller(
+                &source_controller,
+                ProcessVmnetAuthority::Direct,
+            )
+            .expect("committed storage packet I/O should prepare");
+        let (session, projection, returned_serial) =
+            super::prepare_hvf_native_v2_storage_mmio_destination(
+                super::PrepareHvfSnapshotV2StorageMmioDestinationInput {
+                    platform,
+                    memory: committed_memory,
+                    process_shell: committed_shell,
+                    packet_io: committed_packet_io,
+                    mmds_metrics: committed_mmds_metrics,
+                    vmnet_authority: ProcessVmnetAuthority::Direct,
+                    serial_output: committed_serial,
+                    bundle: committed_bundle,
+                    plan: committed_plan,
+                    machine,
+                    boot: boot.clone(),
+                    resume_requested: false,
+                    cancellation: NativeV2SnapshotCaptureCancellation::default(),
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!("private exact-2.6 storage destination should commit: {error:?}")
+            });
+        assert_eq!(projection.machine, machine);
+        assert_eq!(projection.boot, boot);
+        assert_eq!(projection.configs, expected_configs);
+        assert!(!projection.resume_requested);
+        assert_eq!(
+            returned_serial.metrics(),
+            bangbang_runtime::serial::SerialOutputMetrics::default()
+        );
+        match &session {
+            super::HvfProcessSession::Boot(supervisor) => {
+                assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+            }
+            super::HvfProcessSession::SnapshotV2(_) => {
+                panic!("exact-2.6 storage handoff should use the boot supervisor");
+            }
+        }
+        drop(session);
     }
 
     #[cfg(target_os = "macos")]
