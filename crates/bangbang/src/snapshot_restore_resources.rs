@@ -4818,6 +4818,22 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TestPrivateStorageDestination {
+        bundle: Option<PreparedSnapshotV2StorageBundle>,
+        destroyed: Rc<Cell<bool>>,
+    }
+
+    impl TestPrivateStorageDestination {
+        fn destroy(mut self) -> Result<(), SnapshotV2StorageCleanupError> {
+            self.destroyed.set(true);
+            match self.bundle.take() {
+                Some(bundle) => bundle.abort(),
+                None => Ok(()),
+            }
+        }
+    }
+
     fn requested() -> RequestedSnapshotRestoreResources {
         RequestedSnapshotRestoreResources::try_from_native_v2_device_graph(&fixture_graph(
             SnapshotV2DeviceTransportKind::Mmio,
@@ -6138,6 +6154,106 @@ mod tests {
         let diagnostics = format!("{construction:?} {controller:?}");
         assert!(!diagnostics.contains(block.path().to_string_lossy().as_ref()));
         assert!(!diagnostics.contains(pmem.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn profile_3_completion_failure_destroys_destination_and_is_terminal() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let template = storage_fixture_graph(&block_path, &pmem_path);
+        let block = TempRoot::new_sized_at(
+            block_path,
+            template.block_records()[0].block().backing_bytes(),
+        );
+        let pmem =
+            TempRoot::new_sized_at(pmem_path, template.pmem_records()[0].pmem().file_bytes());
+        let graph = storage_fixture_graph(block.path(), pmem.path());
+        let memory = storage_restore_memory(&graph);
+        let mut prepared =
+            RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
+                graph,
+                &memory,
+                Instant::now(),
+                None,
+                || false,
+            )
+            .expect("profile-3 completion fixture should prepare");
+        prepared
+            .completion
+            .take()
+            .expect("direct completion should exist")
+            .abort()
+            .expect("direct completion should abort before injection");
+
+        let root = TempRoot::new("storage-completion", b"root");
+        let fixture = contained_restore_authority_for_test(root.path(), false);
+        let root_owner = contained_requested_root()
+            .prepare(Some(fixture.authority()), || false)
+            .expect("contained root should prepare")
+            .into_root()
+            .expect("contained root should take exactly");
+        let (backing, completion) = root_owner.into_parts();
+        drop(backing);
+        let PreparedSnapshotRootRestoreCompletion {
+            lease,
+            contained_transaction,
+        } = completion;
+        let PreparedSnapshotRootBackingLease {
+            selector: _,
+            claim,
+            consumed: _,
+        } = lease;
+        prepared.completion = Some(PreparedSnapshotDriveRestoreCompletion {
+            claims: claim.into_iter().collect(),
+            contained_transaction,
+        });
+
+        let destroyed = Rc::new(Cell::new(false));
+        let destination = prepared
+            .construct_destination({
+                let destroyed = Rc::clone(&destroyed);
+                move |bundle| {
+                    Ok::<_, std::convert::Infallible>(Box::new(TestPrivateStorageDestination {
+                        bundle: Some(bundle),
+                        destroyed,
+                    }))
+                }
+            })
+            .expect("private profile-3 destination should construct");
+        fixture.invalidate_generation();
+        let error = destination
+            .commit(
+                |destination| {
+                    Ok::<_, (Box<TestPrivateStorageDestination>, std::convert::Infallible)>((
+                        destination,
+                        (),
+                    ))
+                },
+                |destination| (*destination).destroy(),
+            )
+            .expect_err("stale contained completion should fail");
+        assert!(destroyed.get());
+        assert!(error.is_terminal());
+        assert!(matches!(
+            error,
+            PreparedSnapshotV2StorageDestinationCommitError::Completion {
+                destination_cleanup: None,
+                ..
+            }
+        ));
+
+        let retry_graph = storage_fixture_graph(block.path(), pmem.path());
+        let retry_memory = storage_restore_memory(&retry_graph);
+        RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
+            retry_graph,
+            &retry_memory,
+            Instant::now(),
+            None,
+            || false,
+        )
+        .expect("terminal completion failure should still release runtime owners")
+        .abort()
+        .expect("retried profile-3 bundle should abort cleanly");
     }
 
     #[test]
