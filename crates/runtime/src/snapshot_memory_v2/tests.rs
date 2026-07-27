@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRegionBacking};
+use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format_v2::{
     NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION, SnapshotV2ComponentKey, decode_snapshot_v2_state,
 };
@@ -145,7 +146,7 @@ fn canonical_binding_state_and_image_round_trip() {
 }
 
 #[test]
-fn current_minor_four_memory_image_and_structural_state_round_trip() {
+fn exact_minor_four_and_current_minor_five_memory_images_round_trip() {
     let memory = test_memory();
     let mut output = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -202,7 +203,7 @@ fn current_minor_four_memory_image_and_structural_state_round_trip() {
 
     for version in [
         NATIVE_V2_SNAPSHOT_FOUNDATION_VERSION,
-        SnapshotFormatVersion::new(2, 5, 0),
+        SnapshotFormatVersion::new(2, 6, 0),
         SnapshotFormatVersion::new(3, 4, 0),
     ] {
         let mut rejected = Cursor::new(Vec::new());
@@ -282,7 +283,7 @@ fn binding_mutations_reject_header_integrity_topology_and_trailing_bytes() {
     ));
 
     let mut invalid_version = encoded.clone();
-    replace_u16(&mut invalid_version, VERSION_MINOR_OFFSET, 5);
+    replace_u16(&mut invalid_version, VERSION_MINOR_OFFSET, 6);
     replace_binding_checksum(&mut invalid_version);
     assert!(matches!(
         decode_binding(&invalid_version),

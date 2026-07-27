@@ -139,9 +139,11 @@ pub use snapshot_v2::{
     HVF_SNAPSHOT_V2_MAX_PATH_BYTES, HVF_SNAPSHOT_V2_MAX_SME_SVL_BYTES, HvfSnapshotV2BootState,
     HvfSnapshotV2BuildError, HvfSnapshotV2DecodeError, HvfSnapshotV2EncodeError,
     HvfSnapshotV2FdtState, HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
-    HvfSnapshotV2NativePath, HvfSnapshotV2PlatformState, HvfSnapshotV2State,
-    HvfSnapshotV2VcpuState, decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_state,
-    encode_hvf_snapshot_v2_platform_state, encode_hvf_snapshot_v2_state,
+    HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformState,
+    HvfSnapshotV2State, HvfSnapshotV2VcpuState, decode_hvf_snapshot_v2_multi_block_state,
+    decode_hvf_snapshot_v2_platform_state, decode_hvf_snapshot_v2_state,
+    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_platform_state,
+    encode_hvf_snapshot_v2_state,
 };
 pub use snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockMmioRecordPlan, HvfSnapshotV2MultiBlockPciPlan,

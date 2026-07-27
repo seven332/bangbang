@@ -104,7 +104,7 @@ fn sandboxed_bundle_reports_current_native_v2_snapshot_version() {
         output.stdout,
         output.stderr
     );
-    assert_eq!(output.stdout.trim(), "v2.4.0");
+    assert_eq!(output.stdout.trim(), "v2.5.0");
     assert_eq!(output.stderr, "");
 }
 

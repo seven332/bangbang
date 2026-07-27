@@ -117,6 +117,12 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
     assert_eq!(state.version(), NATIVE_V2_SNAPSHOT_VERSION);
     assert_eq!(state.v2_bytes(), Some(bytes.as_slice()));
     assert_eq!(state.v2_memory_binding(), Some(&binding));
+    assert_eq!(
+        state
+            .v2_profile()
+            .expect("current state should classify as exact profile 2"),
+        NativeV2SnapshotArtifactProfile::MultiBlockDeviceGraphV2_5
+    );
     assert!(state.v1_record().is_none());
     let debug = format!("{state:?}");
     assert!(debug.contains(REDACTED));
@@ -239,29 +245,29 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn current_v2_artifact_boundary_rejects_graphless_minor_four() {
+fn current_v2_artifact_boundary_rejects_graphless_minor_five() {
     let memory = test_v2_memory();
     let mut image = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
         &memory,
         &mut image,
-        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        NATIVE_V2_SNAPSHOT_VERSION,
     )
-    .expect("graphless minor-four memory should encode internally");
+    .expect("graphless minor-five memory should encode internally");
     let binding_payload = binding
         .encode()
-        .expect("graphless minor-four binding should encode");
+        .expect("graphless minor-five binding should encode");
     let memory_component = SnapshotV2Component::new(
         NATIVE_V2_MEMORY_COMPONENT_KEY,
         SnapshotV2ComponentDisposition::Semantic,
         &binding_payload,
     );
     let bytes = encode_snapshot_v2_state_with_compatibility_version(
-        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        NATIVE_V2_SNAPSHOT_VERSION,
         &[],
         &[memory_component],
     )
-    .expect("graphless minor-four state should encode internally");
+    .expect("graphless minor-five state should encode internally");
 
     assert!(matches!(
         NativeSnapshotArtifactState::from_current_v2(bytes),
@@ -273,7 +279,7 @@ fn current_v2_artifact_boundary_rejects_graphless_minor_four() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn exact_minor_four_candidate_closes_memory_graph_and_current_publication() {
+fn exact_minor_four_candidate_closes_memory_graph_and_compatible_state() {
     let memory = test_v2_memory();
     let mut image = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -319,9 +325,25 @@ fn exact_minor_four_candidate_closes_memory_graph_and_current_publication() {
     assert!(debug.contains(REDACTED));
     assert!(!debug.contains("/srv/guests/rootfs.ext4"));
     assert!(!debug.contains("rootfs"));
-    let current = NativeSnapshotArtifactState::from_current_v2(bytes)
-        .expect("exact graph-bearing state should enter current publication");
-    assert_eq!(current.version(), NATIVE_V2_SNAPSHOT_VERSION);
+    let compatible = candidate.into_compatible_artifact_state();
+    assert_eq!(
+        compatible.version(),
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        compatible
+            .v2_profile()
+            .expect("exact minor-four profile should classify"),
+        NativeV2SnapshotArtifactProfile::DeviceGraphV2_4
+    );
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_current_v2(bytes),
+        Err(NativeSnapshotArtifactStateError::CurrentV2Profile(
+            NativeV2SnapshotCandidateStateError::UnexpectedVersion {
+                found: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            }
+        ))
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -420,6 +442,102 @@ fn exact_minor_four_candidate_rejects_missing_invalid_and_mismatched_graph_state
     assert!(matches!(
         NativeV2SnapshotCandidateState::from_device_graph_v2_4(invalid),
         Err(NativeV2SnapshotCandidateStateError::DeviceGraph(_))
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exact_profile_classifier_retains_minor_three_and_rejects_cross_minor_graphs() {
+    fn encoded_state(
+        version: SnapshotFormatVersion,
+        binding: &SnapshotV2MemoryBinding,
+        graph: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let binding = binding.encode().expect("fixture binding should encode");
+        let memory = SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding,
+        );
+        let graph = graph.map(|payload| {
+            SnapshotV2Component::new(
+                NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                payload,
+            )
+        });
+        let components = match graph {
+            Some(graph) => vec![memory, graph],
+            None => vec![memory],
+        };
+        encode_snapshot_v2_state_with_compatibility_version(version, &[], &components)
+            .expect("profile classifier fixture should encode")
+    }
+
+    let memory = test_v2_memory();
+    let mut legacy_image = Cursor::new(Vec::new());
+    let legacy_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut legacy_image,
+        NATIVE_V2_LEGACY_PLATFORM_VERSION,
+    )
+    .expect("legacy memory binding should encode");
+    let legacy = NativeSnapshotArtifactState::from_compatible_bytes(encoded_state(
+        NATIVE_V2_LEGACY_PLATFORM_VERSION,
+        &legacy_binding,
+        None,
+    ))
+    .expect("legacy graphless state should prepare");
+    assert_eq!(
+        legacy
+            .v2_profile()
+            .expect("legacy graphless state should classify"),
+        NativeV2SnapshotArtifactProfile::LegacyPlatformV2_3
+    );
+
+    let old_graph = fixture_bytes(include_str!("../snapshot_device_v2/fixtures/mmio.hex"));
+    let mut current_image = Cursor::new(Vec::new());
+    let current_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut current_image,
+        NATIVE_V2_SNAPSHOT_VERSION,
+    )
+    .expect("current memory binding should encode");
+    let current_with_old_graph = NativeSnapshotArtifactState::from_compatible_bytes(encoded_state(
+        NATIVE_V2_SNAPSHOT_VERSION,
+        &current_binding,
+        Some(&old_graph),
+    ))
+    .expect("cross-minor graph should remain structurally loadable");
+    assert!(matches!(
+        current_with_old_graph.v2_profile(),
+        Err(NativeSnapshotArtifactStateError::V2Profile(
+            NativeV2SnapshotCandidateStateError::MultiBlockDeviceGraph(_)
+        ))
+    ));
+
+    let new_graph = fixture_bytes(include_str!(
+        "../snapshot_device_v2_5/fixtures/root-mmio.hex"
+    ));
+    let mut compatibility_image = Cursor::new(Vec::new());
+    let compatibility_binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut compatibility_image,
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("compatibility memory binding should encode");
+    let compatibility_with_new_graph =
+        NativeSnapshotArtifactState::from_compatible_bytes(encoded_state(
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &compatibility_binding,
+            Some(&new_graph),
+        ))
+        .expect("reverse cross-minor graph should remain structurally loadable");
+    assert!(matches!(
+        compatibility_with_new_graph.v2_profile(),
+        Err(NativeSnapshotArtifactStateError::V2Profile(
+            NativeV2SnapshotCandidateStateError::DeviceGraph(_)
+        ))
     ));
 }
 
@@ -2453,7 +2571,9 @@ fn test_v2_memory() -> GuestMemory {
 #[cfg(target_os = "macos")]
 fn current_v2_state(binding: &SnapshotV2MemoryBinding) -> Result<Vec<u8>, String> {
     let binding_payload = binding.encode().map_err(|source| source.to_string())?;
-    let graph_payload = fixture_bytes(include_str!("../snapshot_device_v2/fixtures/mmio.hex"));
+    let graph_payload = fixture_bytes(include_str!(
+        "../snapshot_device_v2_5/fixtures/root-mmio.hex"
+    ));
     let components = [
         SnapshotV2Component::new(
             NATIVE_V2_MEMORY_COMPONENT_KEY,

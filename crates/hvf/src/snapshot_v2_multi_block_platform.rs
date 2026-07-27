@@ -619,12 +619,6 @@ fn prepare_hvf_snapshot_v2_multi_block_platform_plan_with(
         return Err(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::Cardinality);
     }
     let base_arguments = platform.machine().boot().boot_arguments();
-    let base_command_line =
-        canonical_process_block_command_line(base_arguments, process.pci_enabled)
-            .map_err(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::CommandLine)?;
-    if command_line_has_root_argument(&base_command_line) {
-        return Err(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::RecordIdentity);
-    }
     let command_line = match root_config {
         Some((partuuid, read_only)) => canonical_process_root_block_command_line(
             base_arguments,
@@ -632,7 +626,7 @@ fn prepare_hvf_snapshot_v2_multi_block_platform_plan_with(
             partuuid,
             read_only,
         ),
-        None => Ok(base_command_line),
+        None => canonical_process_block_command_line(base_arguments, process.pci_enabled),
     }
     .map_err(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::CommandLine)?;
 
@@ -980,14 +974,6 @@ const fn retry_rank(retry: StorageRetryState) -> Option<(u8, u64)> {
     }
 }
 
-fn command_line_has_root_argument(command_line: &str) -> bool {
-    command_line
-        .split_once(" -- ")
-        .map_or(command_line, |(kernel, _)| kernel)
-        .split_ascii_whitespace()
-        .any(|argument| argument.starts_with("root="))
-}
-
 fn try_clone(value: &str) -> Result<String, PrepareHvfSnapshotV2MultiBlockPlatformPlanError> {
     let mut cloned = String::new();
     cloned
@@ -1045,8 +1031,8 @@ pub(crate) mod tests {
 
     use crate::snapshot_bundle::HvfSnapshotV1CompatibilityState;
     use crate::snapshot_v2::{
-        HvfSnapshotV2FdtState, HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState,
-        HvfSnapshotV2TimeState,
+        HvfSnapshotV2BootState, HvfSnapshotV2FdtState, HvfSnapshotV2GlobalState,
+        HvfSnapshotV2MachineState, HvfSnapshotV2TimeState,
     };
 
     use super::*;
@@ -1511,6 +1497,28 @@ pub(crate) mod tests {
             .expect("rebuilt platform should validate")
     }
 
+    fn with_boot_arguments(
+        platform: HvfSnapshotV2PlatformState,
+        arguments: &str,
+    ) -> HvfSnapshotV2PlatformState {
+        let (memory, machine, global, topology, vcpus, time) = platform.into_parts();
+        let boot = HvfSnapshotV2BootState::try_new(
+            machine.boot().kernel_path().clone(),
+            machine.boot().initrd_path().cloned(),
+            Some(arguments),
+        )
+        .expect("replacement boot arguments should validate");
+        let machine = HvfSnapshotV2MachineState::try_new(
+            machine.machine(),
+            boot,
+            machine.fdt(),
+            machine.cpu_template().cloned(),
+        )
+        .expect("replacement machine state should validate");
+        HvfSnapshotV2PlatformState::try_new(memory, machine, global, topology, vcpus, time)
+            .expect("replacement platform should validate")
+    }
+
     fn mmio_process() -> HvfSnapshotV2MultiBlockProcessConfig {
         HvfSnapshotV2MultiBlockProcessConfig::new(
             BlockMmioLayout::new(GuestAddress::new(0xd000_0000), MmioRegionId::new(100)),
@@ -1593,6 +1601,27 @@ pub(crate) mod tests {
         )
         .expect("writable root MMIO plan should validate");
         assert!(writable_plan.command_line().contains("root=/dev/vda rw"));
+
+        let explicit_source_root = with_boot_arguments(
+            product_mmio_platform(1),
+            "console=null root=/dev/vda ro rootwait",
+        );
+        let explicit_source_plan = prepare_hvf_snapshot_v2_multi_block_platform_plan(
+            &explicit_source_root,
+            &writable.bundle,
+            mmio_process(),
+        )
+        .expect("source boot arguments with a root selector should remain reconstructible");
+        assert_eq!(
+            explicit_source_plan.command_line(),
+            canonical_process_root_block_command_line(
+                explicit_source_root.machine().boot().boot_arguments(),
+                false,
+                None,
+                false,
+            )
+            .expect("expected source command line should validate")
+        );
     }
 
     #[test]

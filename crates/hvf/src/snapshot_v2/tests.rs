@@ -23,7 +23,12 @@ pub(crate) const MMIO_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2/fixtures/mmio.hex");
 pub(crate) const PCI_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2/fixtures/pci.hex");
+const MULTI_BLOCK_MMIO_GRAPH_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_device_v2_5/fixtures/root-mmio.hex");
+const MULTI_BLOCK_PCI_GRAPH_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_device_v2_5/fixtures/rootless-pci.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
+const DETERMINISTIC_MULTI_BLOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.5-fixture-id!";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
     (4_887, 10_136_861_786_457_474_800),
     (4_983, 7_169_128_621_506_763_529),
@@ -301,6 +306,23 @@ pub(crate) fn fixture_bytes(hex: &str) -> Vec<u8> {
 }
 
 pub(crate) fn deterministic_minor_four_platform_fixture() -> HvfSnapshotV2PlatformState {
+    deterministic_device_graph_platform_fixture(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        DETERMINISTIC_MEMORY_IMAGE_ID,
+    )
+}
+
+fn deterministic_minor_five_platform_fixture() -> HvfSnapshotV2PlatformState {
+    deterministic_device_graph_platform_fixture(
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        DETERMINISTIC_MULTI_BLOCK_MEMORY_IMAGE_ID,
+    )
+}
+
+fn deterministic_device_graph_platform_fixture(
+    version: SnapshotFormatVersion,
+    image_id: [u8; 16],
+) -> HvfSnapshotV2PlatformState {
     let mut platform = platform_fixture(false);
     let legacy_fdt = platform.machine.fdt();
     platform.machine.fdt = HvfSnapshotV2FdtState::try_new_product_process_profile(
@@ -313,17 +335,9 @@ pub(crate) fn deterministic_minor_four_platform_fixture() -> HvfSnapshotV2Platfo
         .memory()
         .encode()
         .expect("fixture memory binding should encode");
-    binding[10..12].copy_from_slice(
-        &NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
-            .minor()
-            .to_le_bytes(),
-    );
-    binding[12..14].copy_from_slice(
-        &NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
-            .patch()
-            .to_le_bytes(),
-    );
-    binding[32..48].copy_from_slice(&DETERMINISTIC_MEMORY_IMAGE_ID);
+    binding[10..12].copy_from_slice(&version.minor().to_le_bytes());
+    binding[12..14].copy_from_slice(&version.patch().to_le_bytes());
+    binding[32..48].copy_from_slice(&image_id);
     binding[48..56].fill(0);
     let checksum = crc64::crc64(0, &binding);
     binding[48..56].copy_from_slice(&checksum.to_le_bytes());
@@ -333,19 +347,12 @@ pub(crate) fn deterministic_minor_four_platform_fixture() -> HvfSnapshotV2Platfo
         SnapshotV2ComponentDisposition::Semantic,
         &binding,
     );
-    let encoded = encode_snapshot_v2_state_with_compatibility_version(
-        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-        &[],
-        &[component],
-    )
-    .expect("deterministic minor-four memory state should encode");
-    let structural = decode_snapshot_v2_state_with_compatibility_version(
-        &encoded,
-        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-    )
-    .expect("deterministic minor-four memory state should decode");
+    let encoded = encode_snapshot_v2_state_with_compatibility_version(version, &[], &[component])
+        .expect("deterministic device-graph memory state should encode");
+    let structural = decode_snapshot_v2_state_with_compatibility_version(&encoded, version)
+        .expect("deterministic device-graph memory state should decode");
     platform.memory = decode_snapshot_v2_memory_binding(&structural)
-        .expect("deterministic minor-four binding should decode");
+        .expect("deterministic device-graph binding should decode");
     platform
 }
 
@@ -357,6 +364,16 @@ pub(crate) fn complete_state_fixture(graph_hex: &str) -> HvfSnapshotV2State {
     .expect("immutable graph payload should decode");
     HvfSnapshotV2State::try_new(deterministic_minor_four_platform_fixture(), graph)
         .expect("complete minor-four fixture should validate")
+}
+
+fn complete_multi_block_state_fixture(graph_hex: &str) -> HvfSnapshotV2MultiBlockState {
+    let graph = SnapshotV2MultiBlockDeviceGraph::decode(
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &fixture_bytes(graph_hex),
+    )
+    .expect("immutable profile-2 graph payload should decode");
+    HvfSnapshotV2MultiBlockState::try_new(deterministic_minor_five_platform_fixture(), graph)
+        .expect("complete minor-five fixture should validate")
 }
 
 fn decode_platform(bytes: &[u8]) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
@@ -645,6 +662,58 @@ fn exact_minor_four_mmio_and_pci_states_are_complete_immutable_fixtures() {
         assert_eq!(graph.transport_kind(), expected_transport);
     }
     assert_eq!(fingerprints, COMPLETE_STATE_FINGERPRINTS);
+}
+
+#[test]
+fn exact_minor_five_multi_block_mmio_and_pci_states_round_trip_separately() {
+    let cases = [
+        (
+            MULTI_BLOCK_MMIO_GRAPH_FIXTURE_HEX,
+            SnapshotV2DeviceTransportKind::Mmio,
+            true,
+        ),
+        (
+            MULTI_BLOCK_PCI_GRAPH_FIXTURE_HEX,
+            SnapshotV2DeviceTransportKind::Pci,
+            false,
+        ),
+    ];
+    for (graph_hex, expected_transport, has_root) in cases {
+        let original = complete_multi_block_state_fixture(graph_hex);
+        let encoded = encode_hvf_snapshot_v2_multi_block_state(&original)
+            .expect("complete minor-five state should encode");
+        let structural = decode_snapshot_v2_state(&encoded)
+            .expect("complete minor-five state should decode structurally");
+        assert_eq!(
+            structural.metadata().version(),
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        );
+        assert!(matches!(
+            decode_hvf_snapshot_v2_platform_state(&structural),
+            Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+        ));
+        assert!(matches!(
+            decode_hvf_snapshot_v2_state(&structural),
+            Err(HvfSnapshotV2DecodeError::UnsupportedProfile)
+        ));
+
+        let decoded = decode_hvf_snapshot_v2_multi_block_state(&structural)
+            .expect("complete minor-five state should decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.device_graph().transport_kind(), expected_transport);
+        assert_eq!(decoded.device_graph().root_key().is_some(), has_root);
+        assert_eq!(
+            encode_hvf_snapshot_v2_multi_block_state(&decoded)
+                .expect("decoded minor-five state should re-encode"),
+            encoded
+        );
+        let (platform, graph) = decoded.into_parts();
+        assert_eq!(
+            platform.memory().version(),
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        );
+        assert_eq!(graph.transport_kind(), expected_transport);
+    }
 }
 
 #[test]

@@ -8703,6 +8703,7 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
         debug_assert!(
             version == NATIVE_V2_LEGACY_PLATFORM_VERSION
                 || version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+                || version == NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
         );
         let (stable, captures, pvtime_capture) =
             self.runner
@@ -8735,7 +8736,9 @@ impl HvfArm64BootSnapshotV2CaptureOwner<'_, '_> {
             .read_slice(&mut fdt_bytes, fdt_write.address)
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::FdtRead { source })?;
         let fdt_checksum = crc64(0, &fdt_bytes);
-        let fdt = if version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION {
+        let fdt = if version == NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            || version == NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        {
             HvfSnapshotV2FdtState::try_new_product_process_profile(
                 fdt_write.address,
                 fdt_write.size,
@@ -10026,6 +10029,33 @@ impl HvfArm64BootSession<'_> {
             input,
             memory_writer,
             NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
+    }
+
+    /// Captures the exact native-v2 2.5 profile-2 platform.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_multi_block_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
             is_cancelled,
         )
     }
@@ -14563,6 +14593,33 @@ impl OwnedHvfArm64BootSession {
             input,
             memory_writer,
             NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            is_cancelled,
+        )
+    }
+
+    /// Captures the exact native-v2 2.5 profile-2 platform.
+    #[doc(hidden)]
+    pub fn capture_snapshot_v2_multi_block_platform_with_cancel<
+        W: std::io::Write + std::io::Seek,
+        C: FnMut(SnapshotV2MemoryIoStage) -> bool,
+    >(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        memory_writer: &mut W,
+        is_cancelled: C,
+    ) -> Result<HvfSnapshotV2PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        HvfArm64BootSnapshotV2CaptureOwner {
+            runner: &mut self.runner,
+            backend: &self.backend,
+            runtime_resources: &self.runtime_resources,
+            cpu_template_application: self.cpu_template_application.as_ref(),
+            cache_source: self.cache_source,
+            gic: self.gic,
+        }
+        .capture_with_compatibility_version_and_cancel(
+            input,
+            memory_writer,
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
             is_cancelled,
         )
     }

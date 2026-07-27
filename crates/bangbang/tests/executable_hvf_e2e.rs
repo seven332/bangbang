@@ -26,9 +26,10 @@ mod macos_arm64 {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use bangbang_hvf::decode_hvf_snapshot_v2_state;
-    use bangbang_runtime::snapshot_device_v2::{
-        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
+    use bangbang_hvf::decode_hvf_snapshot_v2_multi_block_state;
+    use bangbang_runtime::block::{DriveCacheType, DriveIoEngine};
+    use bangbang_runtime::snapshot_device_v2_5::{
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
     };
     use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version;
 
@@ -2729,7 +2730,7 @@ mod macos_arm64 {
         assert_bad_request_response(&snapshot_create, "vhost-user snapshot create");
         assert_response_contains(
             &snapshot_create,
-            "native-v2 capture-ready preflight failed: snapshot storage preflight failed: vhost-user block capture is unsupported",
+            "Snapshot and restore are not supported.",
             "vhost-user snapshot create",
         );
         for private_path in [
@@ -9019,16 +9020,16 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_resets_live_vsock_before_unsupported_snapshot_over_mmio() {
-        run_signed_vsock_snapshot_reset(false);
+    fn signed_executable_rejects_optional_vsock_before_live_reset_over_mmio() {
+        run_signed_vsock_snapshot_early_rejection(false);
     }
 
     #[test]
-    fn signed_executable_resets_live_vsock_before_unsupported_snapshot_over_product_pci() {
-        run_signed_vsock_snapshot_reset(true);
+    fn signed_executable_rejects_optional_vsock_before_live_reset_over_product_pci() {
+        run_signed_vsock_snapshot_early_rejection(true);
     }
 
-    fn run_signed_vsock_snapshot_reset(enable_pci: bool) {
+    fn run_signed_vsock_snapshot_early_rejection(enable_pci: bool) {
         let transport = if enable_pci { "product PCI" } else { "MMIO" };
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
@@ -9180,20 +9181,29 @@ mod macos_arm64 {
         assert_capture_ready_snapshot_rejected_without_artifacts(
             &socket_path,
             test_dir.path(),
-            &format!("paused {transport} vsock capture-ready preflight"),
+            &format!("paused {transport} vsock early profile rejection"),
         );
+        old_stream
+            .set_nonblocking(true)
+            .expect("rejected snapshot should leave the old vsock stream probeable");
+        match old_stream.read(&mut unexpected) {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(0) => {
+                panic!("{transport} early snapshot profile rejection closed the old vsock stream")
+            }
+            Ok(bytes) => panic!(
+                "{transport} old vsock stream produced {bytes} unexpected byte(s) after snapshot rejection"
+            ),
+            Err(err) => panic!(
+                "{transport} old vsock stream probe failed after snapshot rejection: {:?}",
+                err.kind()
+            ),
+        }
         assert_no_content_response(
             &http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
-            &format!("resume after vsock snapshot reset {transport}"),
+            &format!("resume after vsock snapshot early rejection {transport}"),
         );
-
-        if let Err(err) = read_unix_stream_eof(&mut old_stream) {
-            let output = bangbang.force_stop_and_collect();
-            panic!(
-                "{transport} host did not observe reset-driven EOF on the old vsock connection: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status, output.stdout, output.stderr
-            );
-        }
+        drop(old_stream);
 
         let mut fresh_stream =
             wait_for_unix_listener_accept(&fresh_listener, GUEST_EXECUTION_TIMEOUT)
@@ -9201,7 +9211,7 @@ mod macos_arm64 {
                     let prefix = file_prefix_lossy(&data_backing_path, 128);
                     let output = bangbang.force_stop_and_collect();
                     panic!(
-                        "{transport} guest did not establish a fresh vsock connection after reset: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                        "{transport} guest did not establish a fresh vsock connection after the host closed the preserved old stream: {err}; control prefix: {prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                         output.status, output.stdout, output.stderr
                     );
                 });
@@ -11136,7 +11146,7 @@ mod macos_arm64 {
             "native-v2 description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.4.0");
+        assert_eq!(described.stdout.trim(), "v2.5.0");
 
         let collision = http_json_with_io_timeout(
             &source_socket,
@@ -11491,8 +11501,16 @@ mod macos_arm64 {
         let recaptured_memory_path = test_root.join(format!("nvr-{transport}-recaptured.memory"));
         let metrics_path = test_root.join(format!("nvr-{transport}.metrics"));
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
-        let root_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let root_fixture_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let root_path = test_root.join(format!("nvr-{transport}-root.ext4"));
+        let data_path = test_root.join(format!("nvr-{transport}-data.img"));
+        let audit_path = test_root.join(format!("nvr-{transport}-audit.img"));
         let process_args: &[&str] = if enable_pci { &["--enable-pci"] } else { &[] };
+
+        fs::copy(&root_fixture_path, &root_path)
+            .expect("native-v2 writable root fixture should copy");
+        create_zeroed_block_backing_with_sectors(&data_path, 8);
+        create_zeroed_block_backing_with_sectors(&audit_path, 8);
 
         let source = BangbangProcess::start_with_extra_args(
             &source_socket,
@@ -11524,11 +11542,33 @@ mod macos_arm64 {
                 &source_socket,
                 "/drives/rootfs",
                 &format!(
-                    r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true,"io_engine":"Sync"}}"#,
+                    r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":false,"cache_type":"Unsafe","io_engine":"Async"}}"#,
                     json_string(path_text(&root_path))
                 ),
             ),
-            "PUT native-v2 root source read-only Sync rootfs",
+            "PUT native-v2 root source writable Async Unsafe rootfs",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/drives/data",
+                &format!(
+                    r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}}"#,
+                    json_string(path_text(&data_path))
+                ),
+            ),
+            "PUT native-v2 root source writable Sync Writeback data",
+        );
+        assert_no_content_response(
+            &http_put_json(
+                &source_socket,
+                "/drives/audit",
+                &format!(
+                    r#"{{"drive_id":"audit","path_on_host":{},"is_root_device":false,"is_read_only":true,"cache_type":"Unsafe","io_engine":"Async"}}"#,
+                    json_string(path_text(&audit_path))
+                ),
+            ),
+            "PUT native-v2 root source read-only Async Unsafe audit",
         );
         assert_no_content_response(
             &http_put_json(
@@ -11579,6 +11619,44 @@ mod macos_arm64 {
         let state_before = fs::read(&state_path).expect("native-v2 root state should read");
         let memory_before = fs::read(&memory_path).expect("native-v2 root memory should read");
         let graph_before = native_v2_device_graph(&state_path);
+        assert_eq!(
+            graph_before.records().len(),
+            3,
+            "{transport} public snapshot should capture every configured block record"
+        );
+        for (drive_id, is_root, is_read_only, cache_type, io_engine) in [
+            (
+                "rootfs",
+                true,
+                false,
+                DriveCacheType::Unsafe,
+                DriveIoEngine::Async,
+            ),
+            (
+                "data",
+                false,
+                false,
+                DriveCacheType::Writeback,
+                DriveIoEngine::Sync,
+            ),
+            (
+                "audit",
+                false,
+                true,
+                DriveCacheType::Unsafe,
+                DriveIoEngine::Async,
+            ),
+        ] {
+            let config = graph_before
+                .records()
+                .iter()
+                .find(|record| record.config().drive_id() == drive_id)
+                .unwrap_or_else(|| panic!("{transport} snapshot should contain {drive_id}"));
+            assert_eq!(config.config().is_root(), is_root);
+            assert_eq!(config.config().is_read_only(), is_read_only);
+            assert_eq!(config.config().cache_type(), cache_type);
+            assert_eq!(config.config().io_engine(), io_engine);
+        }
         let described = BangbangProcess::run_with_args_expect_exit(
             &[
                 std::ffi::OsStr::new("--describe-snapshot"),
@@ -11591,7 +11669,7 @@ mod macos_arm64 {
             "{transport} native-v2 root description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.4.0");
+        assert_eq!(described.stdout.trim(), "v2.5.0");
         let source_output = source.terminate();
         assert_clean_shutdown(
             source_output,
@@ -11623,12 +11701,23 @@ mod macos_arm64 {
         assert_ok_response(&paused_root, "GET restored native-v2 VM config");
         for expected in [
             r#""drive_id":"rootfs""#,
+            r#""drive_id":"data""#,
+            r#""drive_id":"audit""#,
             r#""is_root_device":true"#,
+            r#""is_read_only":false"#,
             r#""is_read_only":true"#,
+            r#""cache_type":"Unsafe""#,
+            r#""cache_type":"Writeback""#,
+            r#""io_engine":"Async""#,
             r#""io_engine":"Sync""#,
         ] {
             assert_response_contains(&paused_root, expected, "GET restored native-v2 VM config");
         }
+        assert_eq!(
+            paused_root.matches(r#""drive_id":"#).count(),
+            3,
+            "{transport} restore should publish the complete drive vector"
+        );
         let recapture_body = format!(
             r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
             json_string(path_text(&recaptured_state_path)),
@@ -11701,7 +11790,7 @@ mod macos_arm64 {
         assert_no_snapshot_staging(test_root);
     }
 
-    fn native_v2_device_graph(state_path: &Path) -> SnapshotV2DeviceGraph {
+    fn native_v2_device_graph(state_path: &Path) -> SnapshotV2MultiBlockDeviceGraph {
         let bytes = fs::read(state_path).unwrap_or_else(|error| {
             panic!(
                 "native-v2 state {} should read: {error}",
@@ -11710,10 +11799,10 @@ mod macos_arm64 {
         });
         let structural = decode_snapshot_v2_state_with_compatibility_version(
             &bytes,
-            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         )
         .expect("native-v2 state should decode structurally");
-        decode_hvf_snapshot_v2_state(&structural)
+        decode_hvf_snapshot_v2_multi_block_state(&structural)
             .expect("native-v2 state should decode semantically")
             .device_graph()
             .clone()

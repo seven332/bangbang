@@ -1,3 +1,4 @@
+use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format::{
     NativeSnapshotFormatError, NativeSnapshotState, decode_native_snapshot_state,
     encode_snapshot_envelope,
@@ -200,7 +201,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn device_graph_component_is_current_minor_four_and_rejects_downgrade() {
+fn device_graph_component_is_introduced_in_minor_four_and_ceiling_is_minor_five() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -209,7 +210,7 @@ fn device_graph_component_is_current_minor_four_and_rejects_downgrade() {
     );
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        SnapshotFormatVersion::new(2, 4, 0)
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
     );
 
     let graph = SnapshotV2Component::new(
@@ -217,8 +218,12 @@ fn device_graph_component_is_current_minor_four_and_rejects_downgrade() {
         SnapshotV2ComponentDisposition::Semantic,
         b"device-graph",
     );
-    let encoded =
-        encode_snapshot_v2_state(&[], &[graph]).expect("current graph component should encode");
+    let encoded = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &[graph],
+    )
+    .expect("minor-four graph component should encode");
     let decoded = decode_snapshot_v2_state_with_compatibility_version(
         &encoded,
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
@@ -238,6 +243,15 @@ fn device_graph_component_is_current_minor_four_and_rejects_downgrade() {
         decode_native_snapshot_state(&encoded),
         Ok(NativeSnapshotState::V2(_))
     ));
+    let current =
+        encode_snapshot_v2_state(&[], &[graph]).expect("current graph component should encode");
+    assert_eq!(
+        decode_snapshot_v2_state(&current)
+            .expect("current state should decode")
+            .metadata()
+            .version(),
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    );
 
     let downgraded = with_u16_field_and_checksum(&encoded, VERSION_MINOR_OFFSET, 3);
     assert_eq!(
@@ -279,19 +293,19 @@ fn device_graph_component_is_current_minor_four_and_rejects_downgrade() {
         Err(SnapshotV2EncodeError::UnknownRequiredFeature)
     ));
 
-    let future = SnapshotFormatVersion::new(2, 5, 0);
+    let future = SnapshotFormatVersion::new(2, 6, 0);
     assert!(matches!(
         encode_snapshot_v2_state_with_compatibility_version(future, &[], &[]),
         Err(SnapshotV2EncodeError::UnsupportedVersion {
             requested,
-            maximum: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            maximum: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         }) if requested == future
     ));
     assert_eq!(
         decode_snapshot_v2_state_with_compatibility_version(&EMPTY_V2_FIXTURE, future),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
             found: future,
-            supported: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         })
     );
 }
@@ -352,11 +366,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 5);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 6);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 5, 0),
+            found: SnapshotFormatVersion::new(2, 6, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );

@@ -20,7 +20,6 @@ use crate::pci::{
     PCI_BAR64_START, PCI_FIRST_ENDPOINT_DEVICE, PciBarAddressSpace, PciBarAllocator, PciBarLease,
     PciConfigFunction,
 };
-use crate::snapshot_format_v2::NATIVE_V2_SNAPSHOT_VERSION;
 use crate::storage_capture::{StorageMmioTransportState, StoragePciTransportState};
 use crate::virtio::{VirtioDeviceType, VirtioInterruptIntent};
 use crate::virtio_mmio::{VirtioMmioRegister, VirtioMmioRegisterHandler};
@@ -391,9 +390,9 @@ fn restore_manifest_derives_the_complete_current_graph_resource() {
 }
 
 #[test]
-fn exact_current_outer_version_is_required() {
+fn exact_compatibility_outer_version_is_required() {
     assert_eq!(
-        NATIVE_V2_SNAPSHOT_VERSION,
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         SnapshotFormatVersion::new(2, 4, 0)
     );
     let graph = mmio_graph();

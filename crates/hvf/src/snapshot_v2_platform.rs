@@ -661,7 +661,11 @@ impl fmt::Debug for HvfSnapshotV2PlatformRestoreFailure {
 
 impl fmt::Display for HvfSnapshotV2PlatformRestoreFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "native-v2 platform {} failed", self.category())
+        write!(f, "native-v2 platform {} failed", self.category())?;
+        if let Self::ProcessShellFdt { mismatch } = self {
+            write!(f, " ({mismatch})")?;
+        }
+        Ok(())
     }
 }
 
@@ -2200,6 +2204,10 @@ fn prepare_process_shell(
     }
     let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
         .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
+    // A booted Linux guest may reclaim its original FDT bytes. Product
+    // profiles therefore authenticate the exact captured byte range and
+    // product marker, then reconstruct devices from their typed restore plan;
+    // only the legacy device-free profile reparses the live FDT in detail.
     let (shell, block_plan, product_process_profile, validate_detailed, planned_interrupts) =
         match shell_restore {
             HvfSnapshotV2ProcessShellRestore::DeviceFree(shell) => {
@@ -2276,7 +2284,7 @@ fn prepare_process_shell(
                         records: plan.records,
                     },
                     true,
-                    true,
+                    false,
                     Some((
                         plan.serial_interrupt,
                         plan.vmgenid_interrupt,
@@ -2300,7 +2308,7 @@ fn prepare_process_shell(
                         pci: plan.pci,
                     },
                     true,
-                    true,
+                    false,
                     Some((
                         plan.serial_interrupt,
                         plan.vmgenid_interrupt,

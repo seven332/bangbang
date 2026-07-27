@@ -165,6 +165,8 @@ const VHOST_CONFIG_RESIZED_MARKER: &[u8] = b"BANGBANG_VHOST_CONFIG_RESIZED";
 const SNAPSHOT_KERNEL_ID: &str = "grant-snapshot-kernel-1368";
 const SNAPSHOT_METRICS_ID: &str = "grant-snapshot-metrics-1368";
 const SNAPSHOT_ROOT_ID: &str = "grant-snapshot-root-1589";
+const SNAPSHOT_DATA_ID: &str = "grant-snapshot-data-1616";
+const SNAPSHOT_AUDIT_ID: &str = "grant-snapshot-audit-1616";
 const SNAPSHOT_STATE_OUTPUT_ID: &str = "grant-snapshot-state-output-1368";
 const SNAPSHOT_MEMORY_OUTPUT_ID: &str = "grant-snapshot-memory-output-1368";
 const SNAPSHOT_STATE_INPUT_ID: &str = "grant-snapshot-state-input-1368";
@@ -173,6 +175,8 @@ const SNAPSHOT_DESCRIBE_INPUT_ID: &str = "grant-snapshot-describe-input-1368";
 const SNAPSHOT_KERNEL_REF: &str = "bangbang-grant:grant-snapshot-kernel-1368";
 const SNAPSHOT_METRICS_REF: &str = "bangbang-grant:grant-snapshot-metrics-1368";
 const SNAPSHOT_ROOT_REF: &str = "bangbang-grant:grant-snapshot-root-1589";
+const SNAPSHOT_DATA_REF: &str = "bangbang-grant:grant-snapshot-data-1616";
+const SNAPSHOT_AUDIT_REF: &str = "bangbang-grant:grant-snapshot-audit-1616";
 const SNAPSHOT_STATE_OUTPUT_REF: &str =
     "bangbang-grant:grant-snapshot-state-output-1368/state-1368.snap";
 const SNAPSHOT_MEMORY_OUTPUT_REF: &str =
@@ -1425,7 +1429,7 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
     assert_output_success(&describe_output, "granted snapshot description");
     assert_eq!(
         String::from_utf8_lossy(&describe_output.stdout).trim(),
-        "v2.4.0"
+        "v2.5.0"
     );
     assert_snapshot_output_redacted(&describe_output, &describe.sensitive_strings());
 
@@ -1459,6 +1463,34 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
     let paused_state = http_get(&paused.socket, "/");
     assert_http_status(&paused_state, 200, "read granted paused snapshot state");
     assert!(paused_state.contains(r#""state":"Paused""#));
+    let paused_config = http_get(&paused.socket, "/vm/config");
+    assert_http_status(
+        &paused_config,
+        200,
+        "read granted paused multi-block snapshot config",
+    );
+    for expected in [
+        r#""drive_id":"rootfs""#,
+        r#""drive_id":"data""#,
+        r#""drive_id":"audit""#,
+        r#""is_root_device":true"#,
+        r#""is_read_only":false"#,
+        r#""is_read_only":true"#,
+        r#""cache_type":"Unsafe""#,
+        r#""cache_type":"Writeback""#,
+        r#""io_engine":"Async""#,
+        r#""io_engine":"Sync""#,
+    ] {
+        assert!(
+            paused_config.contains(expected),
+            "{transport} contained restore should retain {expected}; response:\n{paused_config}"
+        );
+    }
+    assert_eq!(
+        paused_config.matches(r#""drive_id":"#).count(),
+        3,
+        "{transport} contained restore should commit the complete drive vector"
+    );
     assert_http_status(
         &http_request(&paused.socket, "PATCH", "/vm", r#"{"state":"Resumed"}"#),
         204,
@@ -6637,6 +6669,8 @@ struct SnapshotArtifactSet {
     state: PathBuf,
     memory: PathBuf,
     root: PathBuf,
+    data: PathBuf,
+    audit: PathBuf,
 }
 
 #[derive(Debug)]
@@ -6646,11 +6680,15 @@ struct SnapshotSourceGrantFixture {
     kernel: PathBuf,
     metrics: PathBuf,
     root_backing: PathBuf,
+    data_backing: PathBuf,
+    audit_backing: PathBuf,
     state_directory: PathBuf,
     memory_directory: PathBuf,
     opened_kernel: PathBuf,
     opened_metrics: PathBuf,
     opened_root_backing: PathBuf,
+    opened_data_backing: PathBuf,
+    opened_audit_backing: PathBuf,
     opened_state_directory: PathBuf,
     opened_memory_directory: PathBuf,
 }
@@ -6664,17 +6702,24 @@ impl SnapshotSourceGrantFixture {
         let kernel = canonical_root.join("snapshot-kernel.image");
         let metrics = canonical_root.join("snapshot.metrics");
         let root_backing = canonical_root.join("snapshot-root.img");
+        let data_backing = canonical_root.join("snapshot-data.img");
+        let audit_backing = canonical_root.join("snapshot-audit.img");
         let state_directory = canonical_root.join("state-output");
         let memory_directory = canonical_root.join("memory-output");
         let opened_kernel = canonical_root.join("opened-snapshot-kernel.image");
         let opened_metrics = canonical_root.join("opened-snapshot.metrics");
         let opened_root_backing = canonical_root.join("opened-snapshot-root.img");
+        let opened_data_backing = canonical_root.join("opened-snapshot-data.img");
+        let opened_audit_backing = canonical_root.join("opened-snapshot-audit.img");
         let opened_state_directory = canonical_root.join("opened-state-output");
         let opened_memory_directory = canonical_root.join("opened-memory-output");
 
         hard_link_or_copy_fixture(&guest_kernel(), &kernel, "snapshot guest kernel");
         fs::write(&metrics, b"").expect("snapshot metrics fixture should write");
-        hard_link_or_copy_fixture(&guest_ext4_rootfs(), &root_backing, "snapshot root backing");
+        fs::copy(guest_ext4_rootfs(), &root_backing)
+            .expect("writable snapshot root backing should copy");
+        create_sized_file(&data_backing, 4096);
+        create_sized_file(&audit_backing, 4096);
         fs::create_dir(&state_directory).expect("state output directory should create");
         fs::create_dir(&memory_directory).expect("memory output directory should create");
         let manifest_json = serde_json::json!({
@@ -6695,8 +6740,20 @@ impl SnapshotSourceGrantFixture {
                 {
                     "id": SNAPSHOT_ROOT_ID,
                     "role": "drive-backing",
-                    "access": "read-only",
+                    "access": "read-write",
                     "source": path_text(&root_backing),
+                },
+                {
+                    "id": SNAPSHOT_DATA_ID,
+                    "role": "drive-backing",
+                    "access": "read-write",
+                    "source": path_text(&data_backing),
+                },
+                {
+                    "id": SNAPSHOT_AUDIT_ID,
+                    "role": "drive-backing",
+                    "access": "read-only",
+                    "source": path_text(&audit_backing),
                 },
                 {
                     "id": SNAPSHOT_STATE_OUTPUT_ID,
@@ -6724,11 +6781,15 @@ impl SnapshotSourceGrantFixture {
             kernel,
             metrics,
             root_backing,
+            data_backing,
+            audit_backing,
             state_directory,
             memory_directory,
             opened_kernel,
             opened_metrics,
             opened_root_backing,
+            opened_data_backing,
+            opened_audit_backing,
             opened_state_directory,
             opened_memory_directory,
         }
@@ -6739,6 +6800,8 @@ impl SnapshotSourceGrantFixture {
             (&self.kernel, &self.opened_kernel),
             (&self.metrics, &self.opened_metrics),
             (&self.root_backing, &self.opened_root_backing),
+            (&self.data_backing, &self.opened_data_backing),
+            (&self.audit_backing, &self.opened_audit_backing),
         ] {
             fs::rename(source, opened).expect("launcher-opened snapshot file should move");
         }
@@ -6748,6 +6811,10 @@ impl SnapshotSourceGrantFixture {
             .expect("replacement metrics should write");
         fs::write(&self.root_backing, vec![0xff_u8; 4096])
             .expect("replacement snapshot root should write");
+        fs::write(&self.data_backing, vec![0xee_u8; 4096])
+            .expect("replacement snapshot data should write");
+        fs::write(&self.audit_backing, vec![0xdd_u8; 4096])
+            .expect("replacement snapshot audit should write");
     }
 
     fn artifacts(&self) -> SnapshotArtifactSet {
@@ -6767,6 +6834,8 @@ impl SnapshotSourceGrantFixture {
             state: self.state_directory.join(state_child),
             memory: self.memory_directory.join(memory_child),
             root: self.opened_root_backing.clone(),
+            data: self.opened_data_backing.clone(),
+            audit: self.opened_audit_backing.clone(),
         }
     }
 
@@ -6776,21 +6845,29 @@ impl SnapshotSourceGrantFixture {
             path_text(&self.kernel),
             path_text(&self.metrics),
             path_text(&self.root_backing),
+            path_text(&self.data_backing),
+            path_text(&self.audit_backing),
             path_text(&self.state_directory),
             path_text(&self.memory_directory),
             path_text(&self.opened_kernel),
             path_text(&self.opened_metrics),
             path_text(&self.opened_root_backing),
+            path_text(&self.opened_data_backing),
+            path_text(&self.opened_audit_backing),
             path_text(&self.opened_state_directory),
             path_text(&self.opened_memory_directory),
             SNAPSHOT_KERNEL_ID,
             SNAPSHOT_METRICS_ID,
             SNAPSHOT_ROOT_ID,
+            SNAPSHOT_DATA_ID,
+            SNAPSHOT_AUDIT_ID,
             SNAPSHOT_STATE_OUTPUT_ID,
             SNAPSHOT_MEMORY_OUTPUT_ID,
             SNAPSHOT_KERNEL_REF,
             SNAPSHOT_METRICS_REF,
             SNAPSHOT_ROOT_REF,
+            SNAPSHOT_DATA_REF,
+            SNAPSHOT_AUDIT_REF,
             SNAPSHOT_STATE_OUTPUT_REF,
             SNAPSHOT_MEMORY_OUTPUT_REF,
             SNAPSHOT_REPEAT_STATE_OUTPUT_REF,
@@ -6836,6 +6913,8 @@ impl SnapshotInputGrantFixture {
             state: replacement_opened_path(&sources.state, case),
             memory: replacement_opened_path(&sources.memory, case),
             root: replacement_opened_path(&sources.root, case),
+            data: replacement_opened_path(&sources.data, case),
+            audit: replacement_opened_path(&sources.audit, case),
         };
         let grants = vec![
             serde_json::json!({
@@ -6853,8 +6932,20 @@ impl SnapshotInputGrantFixture {
             serde_json::json!({
                 "id": SNAPSHOT_ROOT_ID,
                 "role": "drive-backing",
-                "access": "read-only",
+                "access": "read-write",
                 "source": path_text(&sources.root),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_DATA_ID,
+                "role": "drive-backing",
+                "access": "read-write",
+                "source": path_text(&sources.data),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_AUDIT_ID,
+                "role": "drive-backing",
+                "access": "read-only",
+                "source": path_text(&sources.audit),
             }),
         ];
         let manifest_json = serde_json::json!({
@@ -6879,6 +6970,8 @@ impl SnapshotInputGrantFixture {
             (&self.sources.state, &self.opened.state),
             (&self.sources.memory, &self.opened.memory),
             (&self.sources.root, &self.opened.root),
+            (&self.sources.data, &self.opened.data),
+            (&self.sources.audit, &self.opened.audit),
         ] {
             fs::rename(source, opened).expect("launcher-opened snapshot input should move");
         }
@@ -6888,6 +6981,10 @@ impl SnapshotInputGrantFixture {
             .expect("replacement snapshot memory should write");
         fs::write(&self.sources.root, vec![0xff_u8; 4096])
             .expect("replacement snapshot root must not load");
+        fs::write(&self.sources.data, vec![0xee_u8; 4096])
+            .expect("replacement snapshot data must not load");
+        fs::write(&self.sources.audit, vec![0xdd_u8; 4096])
+            .expect("replacement snapshot audit must not load");
         self.opened.clone()
     }
 
@@ -6897,15 +6994,23 @@ impl SnapshotInputGrantFixture {
             path_text(&self.sources.state),
             path_text(&self.sources.memory),
             path_text(&self.sources.root),
+            path_text(&self.sources.data),
+            path_text(&self.sources.audit),
             path_text(&self.opened.state),
             path_text(&self.opened.memory),
             path_text(&self.opened.root),
+            path_text(&self.opened.data),
+            path_text(&self.opened.audit),
             SNAPSHOT_STATE_INPUT_ID,
             SNAPSHOT_MEMORY_INPUT_ID,
             SNAPSHOT_ROOT_ID,
+            SNAPSHOT_DATA_ID,
+            SNAPSHOT_AUDIT_ID,
             SNAPSHOT_STATE_INPUT_REF,
             SNAPSHOT_MEMORY_INPUT_REF,
             SNAPSHOT_ROOT_REF,
+            SNAPSHOT_DATA_REF,
+            SNAPSHOT_AUDIT_REF,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -9637,10 +9742,35 @@ fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_pat
                 "drive_id": "rootfs",
                 "path_on_host": SNAPSHOT_ROOT_REF,
                 "is_root_device": true,
-                "is_read_only": true,
+                "is_read_only": false,
+                "cache_type": "Unsafe",
+                "io_engine": "Async",
+            }),
+            "PUT snapshot writable Async Unsafe rootfs",
+        ),
+        (
+            "/drives/data",
+            serde_json::json!({
+                "drive_id": "data",
+                "path_on_host": SNAPSHOT_DATA_REF,
+                "is_root_device": false,
+                "is_read_only": false,
+                "cache_type": "Writeback",
                 "io_engine": "Sync",
             }),
-            "PUT snapshot read-only Sync rootfs",
+            "PUT snapshot writable Sync Writeback data",
+        ),
+        (
+            "/drives/audit",
+            serde_json::json!({
+                "drive_id": "audit",
+                "path_on_host": SNAPSHOT_AUDIT_REF,
+                "is_root_device": false,
+                "is_read_only": true,
+                "cache_type": "Unsafe",
+                "io_engine": "Async",
+            }),
+            "PUT snapshot read-only Async Unsafe audit",
         ),
     ] {
         assert_http_status(
