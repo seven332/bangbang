@@ -1637,7 +1637,7 @@ impl std::error::Error for SnapshotV2RootTransportRestoreError {
     }
 }
 
-fn restore_mmio_transport_state(
+pub(crate) fn restore_mmio_transport_state(
     common: &SnapshotV2VirtioState,
     mmio: &SnapshotV2MmioDeviceState,
 ) -> Result<VirtioMmioTransportState, SnapshotV2RootTransportRestoreError> {

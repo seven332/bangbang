@@ -41,10 +41,11 @@ mod codec;
 mod restore;
 
 pub use restore::{
-    PreparedSnapshotV2MultiBlockBundle, PreparedSnapshotV2MultiBlockRecord,
+    PreparedSnapshotV2MultiBlockBundle, PreparedSnapshotV2MultiBlockMmioBundle,
+    PreparedSnapshotV2MultiBlockMmioRecord, PreparedSnapshotV2MultiBlockRecord,
     SnapshotV2MultiBlockBundleError, SnapshotV2MultiBlockCleanupError,
-    SnapshotV2MultiBlockRestorePlan, SnapshotV2MultiBlockRestorePlanError,
-    SnapshotV2MultiBlockRetryProjection,
+    SnapshotV2MultiBlockMmioTransportError, SnapshotV2MultiBlockRestorePlan,
+    SnapshotV2MultiBlockRestorePlanError, SnapshotV2MultiBlockRetryProjection,
 };
 
 #[cfg(test)]

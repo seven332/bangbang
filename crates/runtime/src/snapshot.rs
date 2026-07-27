@@ -100,6 +100,24 @@ impl SnapshotV2ControllerCommit {
         })
     }
 
+    /// Retains an already-validated complete drive vector without rebuilding
+    /// or cloning its authority projection.
+    #[doc(hidden)]
+    pub fn with_drive_configs(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        drive_configs: DriveConfigs,
+        resume_requested: bool,
+    ) -> Self {
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs,
+            serial_config: SerialConfig::default(),
+            resume_requested,
+        }
+    }
+
     pub const fn resume_requested(&self) -> bool {
         self.resume_requested
     }

@@ -67,6 +67,7 @@ use crate::snapshot_v2::{
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
     HvfSnapshotV2State, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
 };
+use crate::snapshot_v2_multi_block_platform::HvfSnapshotV2MultiBlockMmioRecordPlan;
 use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
@@ -347,12 +348,36 @@ impl fmt::Debug for HvfSnapshotV2DefaultProcessShell {
     }
 }
 
-enum HvfSnapshotV2ProcessShellRestore {
+pub(crate) struct HvfSnapshotV2MultiBlockMmioShellPlan<'a> {
+    pub(crate) command_line: &'a str,
+    pub(crate) records: &'a [HvfSnapshotV2MultiBlockMmioRecordPlan],
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
+enum HvfSnapshotV2ProcessShellRestore<'a> {
     DeviceFree(HvfSnapshotV2DefaultProcessShell),
     Root {
         shell: HvfSnapshotV2DefaultProcessShell,
         resources: HvfSnapshotV2RootResourcePlan,
         partuuid: Option<String>,
+    },
+    MultiBlockMmio {
+        shell: HvfSnapshotV2DefaultProcessShell,
+        plan: HvfSnapshotV2MultiBlockMmioShellPlan<'a>,
+    },
+}
+
+enum HvfSnapshotV2ProcessBlockFdtPlan<'a> {
+    None,
+    Root {
+        partuuid: Option<String>,
+        transport: HvfSnapshotV2RootTransportPlan,
+    },
+    MultiBlockMmio {
+        command_line: &'a str,
+        records: &'a [HvfSnapshotV2MultiBlockMmioRecordPlan],
     },
 }
 
@@ -831,6 +856,11 @@ pub enum HvfSnapshotV2PlatformShutdownError {
     Vcpu(HvfVcpuRunCoordinatorError),
     /// Guest-memory teardown or VM destruction failed.
     Backend(BackendError),
+    /// Both independent reverse-cleanup operations failed.
+    VcpuAndBackend {
+        vcpu: HvfVcpuRunCoordinatorError,
+        backend: BackendError,
+    },
 }
 
 impl fmt::Display for HvfSnapshotV2PlatformShutdownError {
@@ -838,6 +868,10 @@ impl fmt::Display for HvfSnapshotV2PlatformShutdownError {
         match self {
             Self::Vcpu(_) => f.write_str("native-v2 vCPU topology shutdown failed"),
             Self::Backend(_) => f.write_str("native-v2 backend shutdown failed"),
+            Self::VcpuAndBackend { vcpu, backend } => {
+                let _sources = (vcpu, backend);
+                f.write_str("native-v2 vCPU and backend shutdown both failed")
+            }
         }
     }
 }
@@ -847,6 +881,7 @@ impl std::error::Error for HvfSnapshotV2PlatformShutdownError {
         match self {
             Self::Vcpu(source) => Some(source),
             Self::Backend(source) => Some(source),
+            Self::VcpuAndBackend { vcpu, .. } => Some(vcpu),
         }
     }
 }
@@ -1090,6 +1125,12 @@ impl RestoredHvfSnapshotV2Platform {
         self.parts().backend.mapped_guest_memory_for_public_access()
     }
 
+    pub(crate) fn guest_memory_mut(
+        &mut self,
+    ) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
+        self.parts_mut().backend.mapped_guest_memory_mut()
+    }
+
     pub(crate) fn backend(&self) -> &HvfBackend {
         &self.parts().backend
     }
@@ -1118,12 +1159,16 @@ impl RestoredHvfSnapshotV2Platform {
         let Some(parts) = self.parts.as_mut() else {
             return Ok(());
         };
-        parts
-            .runner
-            .shutdown()
-            .map_err(HvfSnapshotV2PlatformShutdownError::Vcpu)?;
-        <HvfBackend as VmBackend>::destroy_vm(&mut parts.backend)
-            .map_err(HvfSnapshotV2PlatformShutdownError::Backend)
+        let vcpu = parts.runner.shutdown().err();
+        let backend = <HvfBackend as VmBackend>::destroy_vm(&mut parts.backend).err();
+        match (vcpu, backend) {
+            (None, None) => Ok(()),
+            (Some(source), None) => Err(HvfSnapshotV2PlatformShutdownError::Vcpu(source)),
+            (None, Some(source)) => Err(HvfSnapshotV2PlatformShutdownError::Backend(source)),
+            (Some(vcpu), Some(backend)) => {
+                Err(HvfSnapshotV2PlatformShutdownError::VcpuAndBackend { vcpu, backend })
+            }
+        }
     }
 }
 
@@ -1237,10 +1282,23 @@ pub(crate) fn restore_hvf_snapshot_v2_root_process_platform(
     )
 }
 
+pub(crate) fn restore_hvf_snapshot_v2_multi_block_mmio_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2DefaultProcessShell,
+    plan: HvfSnapshotV2MultiBlockMmioShellPlan<'_>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::MultiBlockMmio { shell, plan }),
+    )
+}
+
 fn restore_hvf_snapshot_v2_platform_with_shell(
     state: HvfSnapshotV2PlatformState,
     memory: GuestMemory,
-    process_shell: Option<HvfSnapshotV2ProcessShellRestore>,
+    process_shell: Option<HvfSnapshotV2ProcessShellRestore<'_>>,
 ) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
     debug_assert!(cleanup_sequence(RestoreOwnership::Empty).is_empty());
     let mut cleanup = Vec::new();
@@ -2092,7 +2150,7 @@ pub(crate) fn pci_msix_routes_match_gic(
 }
 
 fn prepare_process_shell(
-    shell: Option<HvfSnapshotV2ProcessShellRestore>,
+    shell: Option<HvfSnapshotV2ProcessShellRestore<'_>>,
     state: &HvfSnapshotV2PlatformState,
     fdt_bytes: &[u8],
 ) -> Result<(MmioDispatcher, Option<Arm64BootSerialDevice>), HvfSnapshotV2PlatformRestoreFailure> {
@@ -2111,44 +2169,91 @@ fn prepare_process_shell(
     }
     let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
         .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
-    let (shell, root, product_process_profile) = match shell_restore {
-        HvfSnapshotV2ProcessShellRestore::DeviceFree(shell) => {
-            if gic.msi.is_some() {
-                return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
-                    mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
-                });
+    let (shell, block_plan, product_process_profile, validate_detailed, planned_interrupts) =
+        match shell_restore {
+            HvfSnapshotV2ProcessShellRestore::DeviceFree(shell) => {
+                if gic.msi.is_some() {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                (
+                    shell,
+                    HvfSnapshotV2ProcessBlockFdtPlan::None,
+                    false,
+                    true,
+                    None,
+                )
             }
-            (shell, None, false)
-        }
-        HvfSnapshotV2ProcessShellRestore::Root {
-            shell,
-            resources,
-            partuuid,
-        } => {
-            match resources.transport() {
-                HvfSnapshotV2RootTransportPlan::Mmio { interrupt_line, .. } => {
-                    if gic.msi.is_some()
-                        || allocator
-                            .allocate()
-                            .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
-                            != interrupt_line
+            HvfSnapshotV2ProcessShellRestore::Root {
+                shell,
+                resources,
+                partuuid,
+            } => {
+                match resources.transport() {
+                    HvfSnapshotV2RootTransportPlan::Mmio { interrupt_line, .. } => {
+                        if gic.msi.is_some()
+                            || allocator.allocate().map_err(
+                                HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt,
+                            )? != interrupt_line
+                        {
+                            return Err(
+                                HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                            );
+                        }
+                    }
+                    HvfSnapshotV2RootTransportPlan::Pci { msi, .. } => {
+                        if gic.msi != Some(msi) {
+                            return Err(
+                                HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
+                            );
+                        }
+                    }
+                }
+                (
+                    shell,
+                    HvfSnapshotV2ProcessBlockFdtPlan::Root {
+                        partuuid,
+                        transport: resources.transport(),
+                    },
+                    true,
+                    false,
+                    None,
+                )
+            }
+            HvfSnapshotV2ProcessShellRestore::MultiBlockMmio { shell, plan } => {
+                if gic.msi.is_some() || plan.records.is_empty() {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                for record in plan.records {
+                    if allocator
+                        .allocate()
+                        .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?
+                        != record.interrupt_line()
                     {
                         return Err(
                             HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
                         );
                     }
                 }
-                HvfSnapshotV2RootTransportPlan::Pci { msi, .. } => {
-                    if gic.msi != Some(msi) {
-                        return Err(
-                            HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity,
-                        );
-                    }
-                }
+                (
+                    shell,
+                    HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockMmio {
+                        command_line: plan.command_line,
+                        records: plan.records,
+                    },
+                    true,
+                    true,
+                    Some((
+                        plan.serial_interrupt,
+                        plan.vmgenid_interrupt,
+                        plan.vmclock_interrupt,
+                    )),
+                )
             }
-            (shell, Some((partuuid, resources.transport())), true)
-        }
-    };
+        };
     let serial_interrupt = allocator
         .allocate()
         .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
@@ -2158,26 +2263,22 @@ fn prepare_process_shell(
     let vmclock_interrupt = allocator
         .allocate()
         .map_err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterrupt)?;
-    if state.time().vmgenid().interrupt_line() != vmgenid_interrupt
+    if planned_interrupts.is_some_and(|expected| {
+        expected != (serial_interrupt, vmgenid_interrupt, vmclock_interrupt)
+    }) || state.time().vmgenid().interrupt_line() != vmgenid_interrupt
         || state.time().vmclock().interrupt_line() != vmclock_interrupt
     {
         return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellInterruptIdentity);
     }
-    if product_process_profile {
-        if !state.machine().fdt().is_product_process_profile() {
-            return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
-                mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
-            });
-        }
-    } else {
-        validate_process_fdt(
-            fdt_bytes,
-            state,
-            serial_interrupt,
-            root.as_ref()
-                .map(|(partuuid, transport)| (partuuid.as_deref(), *transport)),
-        )
-        .map_err(|mismatch| HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt { mismatch })?;
+    if product_process_profile && !state.machine().fdt().is_product_process_profile() {
+        return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+            mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+        });
+    }
+    if validate_detailed {
+        validate_process_fdt(fdt_bytes, state, serial_interrupt, &block_plan).map_err(
+            |mismatch| HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt { mismatch },
+        )?;
     }
 
     let serial = register_arm64_boot_serial_mmio(
@@ -2199,7 +2300,12 @@ fn validate_default_process_fdt(
     state: &HvfSnapshotV2PlatformState,
     serial_interrupt: GuestInterruptLine,
 ) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
-    validate_process_fdt(bytes, state, serial_interrupt, None)
+    validate_process_fdt(
+        bytes,
+        state,
+        serial_interrupt,
+        &HvfSnapshotV2ProcessBlockFdtPlan::None,
+    )
 }
 
 #[cfg(test)]
@@ -2216,7 +2322,10 @@ fn validate_root_process_fdt(
         bytes,
         state,
         resources.serial_interrupt,
-        Some((root.partuuid(), resources.transport)),
+        &HvfSnapshotV2ProcessBlockFdtPlan::Root {
+            partuuid: root.partuuid().map(str::to_owned),
+            transport: resources.transport,
+        },
     )
 }
 
@@ -2248,7 +2357,7 @@ fn validate_process_fdt(
     bytes: &[u8],
     state: &HvfSnapshotV2PlatformState,
     serial_interrupt: GuestInterruptLine,
-    root: Option<(Option<&str>, HvfSnapshotV2RootTransportPlan)>,
+    block: &HvfSnapshotV2ProcessBlockFdtPlan<'_>,
 ) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
     let tree = DeviceTree::load(bytes).map_err(|_| HvfSnapshotV2ProcessFdtMismatch::Parse)?;
     let time = state.time();
@@ -2259,7 +2368,12 @@ fn validate_process_fdt(
         |name: &str| node_name_has_number(name, "rtc@", 16, PROCESS_RTC_MMIO_BASE.raw_value());
     let vmclock_name =
         |name: &str| node_name_has_number(name, "ptp@", 10, time.vmclock().fdt_region().base);
-    if tree.root.children.len() != 11 + usize::from(root.is_some())
+    let block_child_count = match block {
+        HvfSnapshotV2ProcessBlockFdtPlan::None => 0,
+        HvfSnapshotV2ProcessBlockFdtPlan::Root { .. } => 1,
+        HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockMmio { records, .. } => records.len(),
+    };
+    if tree.root.children.len() != 11 + block_child_count
         || [
             "cpus",
             "memory@ram",
@@ -2351,20 +2465,34 @@ fn validate_process_fdt(
     let Some(chosen) = child_named(&tree.root, "chosen") else {
         return Err(HvfSnapshotV2ProcessFdtMismatch::Boot);
     };
-    let expected_boot_args = match root {
-        Some((partuuid, transport)) => canonical_process_root_block_command_line(
-            state.machine().boot().boot_arguments(),
-            matches!(transport, HvfSnapshotV2RootTransportPlan::Pci { .. }),
+    let boot_arguments_match = match block {
+        HvfSnapshotV2ProcessBlockFdtPlan::Root {
             partuuid,
-            true,
-        )
-        .map_err(|_| HvfSnapshotV2ProcessFdtMismatch::Boot)?,
-        None => expected_process_boot_arguments(state.machine().boot().boot_arguments())
-            .ok_or(HvfSnapshotV2ProcessFdtMismatch::Boot)?,
+            transport,
+        } => {
+            let expected = canonical_process_root_block_command_line(
+                state.machine().boot().boot_arguments(),
+                matches!(transport, HvfSnapshotV2RootTransportPlan::Pci { .. }),
+                partuuid.as_deref(),
+                true,
+            )
+            .map_err(|_| HvfSnapshotV2ProcessFdtMismatch::Boot)?;
+            chosen
+                .prop_str("bootargs")
+                .is_ok_and(|arguments| arguments == expected.as_str())
+        }
+        HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockMmio { command_line, .. } => chosen
+            .prop_str("bootargs")
+            .is_ok_and(|arguments| arguments == *command_line),
+        HvfSnapshotV2ProcessBlockFdtPlan::None => {
+            let expected = expected_process_boot_arguments(state.machine().boot().boot_arguments())
+                .ok_or(HvfSnapshotV2ProcessFdtMismatch::Boot)?;
+            chosen
+                .prop_str("bootargs")
+                .is_ok_and(|arguments| arguments == expected.as_str())
+        }
     };
-    if !chosen
-        .prop_str("bootargs")
-        .is_ok_and(|arguments| arguments == expected_boot_args.as_str())
+    if !boot_arguments_match
         || chosen.has_prop("linux,initrd-start") != state.machine().boot().initrd_path().is_some()
         || chosen.has_prop("linux,initrd-end") != state.machine().boot().initrd_path().is_some()
     {
@@ -2375,8 +2503,11 @@ fn validate_process_fdt(
         return Err(HvfSnapshotV2ProcessFdtMismatch::Gic);
     };
     let expected_gic_children = usize::from(matches!(
-        root,
-        Some((_, HvfSnapshotV2RootTransportPlan::Pci { .. }))
+        block,
+        HvfSnapshotV2ProcessBlockFdtPlan::Root {
+            transport: HvfSnapshotV2RootTransportPlan::Pci { .. },
+            ..
+        }
     ));
     if intc.children.len() != expected_gic_children
         || !intc
@@ -2526,54 +2657,33 @@ fn validate_process_fdt(
         return Err(HvfSnapshotV2ProcessFdtMismatch::VmClock);
     }
 
-    validate_process_root_nodes(&tree.root, intc, root)
+    validate_process_block_nodes(&tree.root, intc, block)
 }
 
-fn validate_process_root_nodes(
+fn validate_process_block_nodes(
     root_node: &Node,
     intc: &Node,
-    root: Option<(Option<&str>, HvfSnapshotV2RootTransportPlan)>,
+    block: &HvfSnapshotV2ProcessBlockFdtPlan<'_>,
 ) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
-    let Some((_partuuid, resources)) = root else {
-        return Ok(());
+    let resources = match block {
+        HvfSnapshotV2ProcessBlockFdtPlan::None => return Ok(()),
+        HvfSnapshotV2ProcessBlockFdtPlan::Root { transport, .. } => *transport,
+        HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockMmio { records, .. } => {
+            for record in *records {
+                validate_process_mmio_block_node(
+                    root_node,
+                    record.region(),
+                    record.interrupt_line(),
+                )?;
+            }
+            return Ok(());
+        }
     };
     match resources {
         HvfSnapshotV2RootTransportPlan::Mmio {
             region,
             interrupt_line,
-        } => {
-            let node = child_matching(root_node, |node| {
-                node_name_has_number(
-                    &node.name,
-                    "virtio_mmio@",
-                    16,
-                    region.range().start().raw_value(),
-                )
-            })
-            .ok_or(HvfSnapshotV2ProcessFdtMismatch::Root)?;
-            let interrupt_cell = interrupt_line
-                .raw_value()
-                .checked_sub(32)
-                .ok_or(HvfSnapshotV2ProcessFdtMismatch::Root)?;
-            if !node.children.is_empty()
-                || !node
-                    .prop_str("compatible")
-                    .is_ok_and(|compatible| compatible == "virtio,mmio")
-                || !property_u64_cells_equal(
-                    node,
-                    "reg",
-                    &[region.range().start().raw_value(), region.range().size()],
-                )
-                || !property_u32_cells_equal(node, "interrupts", &[0, interrupt_cell, 1])
-                || !node
-                    .prop_u32("interrupt-parent")
-                    .is_ok_and(|phandle| phandle == 1)
-                || !property_is_null(node, "dma-coherent")
-            {
-                return Err(HvfSnapshotV2ProcessFdtMismatch::Root);
-            }
-            Ok(())
-        }
+        } => validate_process_mmio_block_node(root_node, region, interrupt_line),
         HvfSnapshotV2RootTransportPlan::Pci {
             sbdf: _,
             bar_region_id,
@@ -2589,6 +2699,44 @@ fn validate_process_root_nodes(
             Ok(())
         }
     }
+}
+
+fn validate_process_mmio_block_node(
+    root_node: &Node,
+    region: MmioRegion,
+    interrupt_line: GuestInterruptLine,
+) -> Result<(), HvfSnapshotV2ProcessFdtMismatch> {
+    let node = child_matching(root_node, |node| {
+        node_name_has_number(
+            &node.name,
+            "virtio_mmio@",
+            16,
+            region.range().start().raw_value(),
+        )
+    })
+    .ok_or(HvfSnapshotV2ProcessFdtMismatch::Root)?;
+    let interrupt_cell = interrupt_line
+        .raw_value()
+        .checked_sub(32)
+        .ok_or(HvfSnapshotV2ProcessFdtMismatch::Root)?;
+    if !node.children.is_empty()
+        || !node
+            .prop_str("compatible")
+            .is_ok_and(|compatible| compatible == "virtio,mmio")
+        || !property_u64_cells_equal(
+            node,
+            "reg",
+            &[region.range().start().raw_value(), region.range().size()],
+        )
+        || !property_u32_cells_equal(node, "interrupts", &[0, interrupt_cell, 1])
+        || !node
+            .prop_u32("interrupt-parent")
+            .is_ok_and(|phandle| phandle == 1)
+        || !property_is_null(node, "dma-coherent")
+    {
+        return Err(HvfSnapshotV2ProcessFdtMismatch::Root);
+    }
+    Ok(())
 }
 
 fn validate_process_gic_msi(intc: &Node, msi: crate::gic::HvfGicMsiMetadata) -> bool {
@@ -3731,6 +3879,170 @@ pub(crate) mod tests {
         assert_eq!(
             validate_root_process_fdt(&with_optional, &platform, &root, resources),
             Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory)
+        );
+    }
+
+    #[test]
+    fn multi_block_mmio_fdt_requires_exact_unique_node_set_and_command_line() {
+        let (platform, plan) =
+            crate::snapshot_v2_multi_block_platform::tests::mmio_fdt_plan_fixture();
+        let records = plan
+            .transport()
+            .mmio_records()
+            .expect("fixture plan should use MMIO");
+        let devices = records
+            .iter()
+            .map(|record| record.fdt_device())
+            .collect::<Vec<_>>();
+        assert_eq!(devices.len(), 2);
+        let shell = (
+            bangbang_runtime::fdt::Arm64FdtSerialDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: PROCESS_SERIAL_MMIO_BASE.raw_value(),
+                    size: SERIAL_MMIO_DEVICE_WINDOW_SIZE,
+                },
+                interrupt_line: plan.serial_interrupt(),
+            },
+            bangbang_runtime::fdt::Arm64FdtRtcDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: PROCESS_RTC_MMIO_BASE.raw_value(),
+                    size: RTC_MMIO_DEVICE_WINDOW_SIZE,
+                },
+            },
+            bangbang_runtime::fdt::Arm64FdtVmGenIdDevice {
+                region: platform.time().vmgenid().fdt_region(),
+                interrupt_line: plan.vmgenid_interrupt(),
+            },
+            bangbang_runtime::fdt::Arm64FdtVmClockDevice {
+                region: platform.time().vmclock().fdt_region(),
+                interrupt_line: plan.vmclock_interrupt(),
+            },
+        );
+        let block = HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockMmio {
+            command_line: plan.command_line(),
+            records,
+        };
+        let valid = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &devices,
+            plan.command_line(),
+            None,
+        );
+        assert_eq!(
+            validate_process_fdt(&valid, &platform, plan.serial_interrupt(), &block),
+            Ok(())
+        );
+
+        let mut reversed = devices.clone();
+        reversed.reverse();
+        let reordered = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &reversed,
+            plan.command_line(),
+            None,
+        );
+        assert_eq!(
+            validate_process_fdt(&reordered, &platform, plan.serial_interrupt(), &block),
+            Ok(())
+        );
+
+        let mut missing = devices.clone();
+        missing.pop();
+        let missing = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &missing,
+            plan.command_line(),
+            None,
+        );
+        assert_eq!(
+            validate_process_fdt(&missing, &platform, plan.serial_interrupt(), &block),
+            Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory)
+        );
+
+        let mut extra = devices.clone();
+        let mut extra_device = extra
+            .last()
+            .copied()
+            .expect("fixture should have a last device");
+        extra_device.region.base = extra_device
+            .region
+            .base
+            .checked_add(VIRTIO_MMIO_DEVICE_WINDOW_SIZE)
+            .expect("extra device address should fit");
+        extra_device.interrupt_line =
+            GuestInterruptLine::new(extra_device.interrupt_line.raw_value().saturating_add(1))
+                .expect("extra device interrupt should validate");
+        extra.push(extra_device);
+        let extra = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &extra,
+            plan.command_line(),
+            None,
+        );
+        assert_eq!(
+            validate_process_fdt(&extra, &platform, plan.serial_interrupt(), &block),
+            Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory)
+        );
+
+        let mut unexpected = devices.clone();
+        let last = unexpected
+            .last_mut()
+            .expect("fixture should have a last device");
+        last.region.base = last
+            .region
+            .base
+            .checked_add(VIRTIO_MMIO_DEVICE_WINDOW_SIZE)
+            .expect("unexpected device address should fit");
+        let unexpected = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &unexpected,
+            plan.command_line(),
+            None,
+        );
+        assert_eq!(
+            validate_process_fdt(&unexpected, &platform, plan.serial_interrupt(), &block),
+            Err(HvfSnapshotV2ProcessFdtMismatch::Root)
+        );
+
+        let mut wrong_interrupt = devices.clone();
+        let second = wrong_interrupt
+            .last_mut()
+            .expect("fixture should have a second device");
+        second.interrupt_line =
+            GuestInterruptLine::new(second.interrupt_line.raw_value().saturating_add(1))
+                .expect("mutated interrupt should validate");
+        let wrong_interrupt = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &wrong_interrupt,
+            plan.command_line(),
+            None,
+        );
+        assert_eq!(
+            validate_process_fdt(&wrong_interrupt, &platform, plan.serial_interrupt(), &block),
+            Err(HvfSnapshotV2ProcessFdtMismatch::Root)
+        );
+
+        let wrong_command_line = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &devices,
+            "console=ttyS0 pci=off",
+            None,
+        );
+        assert_eq!(
+            validate_process_fdt(
+                &wrong_command_line,
+                &platform,
+                plan.serial_interrupt(),
+                &block
+            ),
+            Err(HvfSnapshotV2ProcessFdtMismatch::Boot)
         );
     }
 

@@ -7473,6 +7473,1137 @@ fn native_v2_multi_block_graph_is_durable_and_recoverable_for_mmio_and_pci() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const NATIVE_V2_MULTI_BLOCK_QUEUE_SIZE: u16 = 8;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+struct NativeV2MultiBlockQueueFixture {
+    base: bangbang_runtime::memory::GuestAddress,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl NativeV2MultiBlockQueueFixture {
+    const fn new(base: u64) -> Self {
+        Self {
+            base: bangbang_runtime::memory::GuestAddress::new(base),
+        }
+    }
+
+    fn address(self, offset: u64) -> bangbang_runtime::memory::GuestAddress {
+        self.base
+            .checked_add(offset)
+            .expect("native-v2 multi-block fixture address should fit")
+    }
+
+    fn descriptor_table(self) -> bangbang_runtime::memory::GuestAddress {
+        self.address(0)
+    }
+
+    fn available_ring(self) -> bangbang_runtime::memory::GuestAddress {
+        self.address(0x1000)
+    }
+
+    fn used_ring(self) -> bangbang_runtime::memory::GuestAddress {
+        self.address(0x2000)
+    }
+
+    fn write_header(self) -> bangbang_runtime::memory::GuestAddress {
+        self.address(0x3000)
+    }
+
+    fn write_data(self) -> bangbang_runtime::memory::GuestAddress {
+        self.address(0x4000)
+    }
+
+    fn write_status(self) -> bangbang_runtime::memory::GuestAddress {
+        self.address(0x5000)
+    }
+
+    fn flush_header(self) -> bangbang_runtime::memory::GuestAddress {
+        self.address(0x6000)
+    }
+
+    fn flush_status(self) -> bangbang_runtime::memory::GuestAddress {
+        self.address(0x7000)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE: NativeV2MultiBlockQueueFixture =
+    NativeV2MultiBlockQueueFixture::new(0x8060_0000);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE: NativeV2MultiBlockQueueFixture =
+    NativeV2MultiBlockQueueFixture::new(0x8070_0000);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_native_v2_multi_block_mmio(
+    dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher,
+    address: bangbang_runtime::memory::GuestAddress,
+    data: &[u8],
+) {
+    use bangbang_runtime::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioOperation};
+
+    let access = dispatcher
+        .lookup(
+            address,
+            u64::try_from(data.len()).expect("multi-block MMIO write length should fit u64"),
+        )
+        .expect("multi-block MMIO write should resolve");
+    let outcome = dispatcher
+        .dispatch(
+            MmioOperation::write(
+                access,
+                MmioAccessBytes::new(data).expect("multi-block MMIO bytes should validate"),
+            )
+            .expect("multi-block MMIO write should validate"),
+        )
+        .expect("multi-block MMIO write should dispatch");
+    assert!(matches!(outcome, MmioDispatchOutcome::Write));
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn read_native_v2_multi_block_mmio_u32(
+    dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher,
+    address: bangbang_runtime::memory::GuestAddress,
+) -> u32 {
+    use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioOperation};
+
+    let access = dispatcher
+        .lookup(address, 4)
+        .expect("multi-block MMIO read should resolve");
+    let outcome = dispatcher
+        .dispatch(MmioOperation::read(access).expect("multi-block MMIO read should validate"))
+        .expect("multi-block MMIO read should dispatch");
+    let data = match outcome {
+        MmioDispatchOutcome::Read { data } => Some(data),
+        MmioDispatchOutcome::Write => None,
+    };
+    let data = data.expect("multi-block MMIO read should return data");
+    u32::from_le_bytes(
+        data.as_slice()
+            .try_into()
+            .expect("multi-block MMIO u32 should contain four bytes"),
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_native_v2_multi_block_descriptor(
+    memory: &mut bangbang_runtime::memory::GuestMemory,
+    fixture: NativeV2MultiBlockQueueFixture,
+    index: u16,
+    address: bangbang_runtime::memory::GuestAddress,
+    len: u32,
+    flags: u16,
+    next: u16,
+) {
+    use bangbang_runtime::virtio_queue::VIRTQUEUE_DESCRIPTOR_SIZE;
+
+    let descriptor = fixture
+        .descriptor_table()
+        .checked_add(
+            u64::from(index)
+                * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE)
+                    .expect("virtqueue descriptor size should fit u64"),
+        )
+        .expect("multi-block descriptor address should fit");
+    memory
+        .write_slice(&address.raw_value().to_le_bytes(), descriptor)
+        .expect("multi-block descriptor address should write");
+    memory
+        .write_slice(
+            &len.to_le_bytes(),
+            descriptor
+                .checked_add(8)
+                .expect("multi-block descriptor length address should fit"),
+        )
+        .expect("multi-block descriptor length should write");
+    memory
+        .write_slice(
+            &flags.to_le_bytes(),
+            descriptor
+                .checked_add(12)
+                .expect("multi-block descriptor flags address should fit"),
+        )
+        .expect("multi-block descriptor flags should write");
+    memory
+        .write_slice(
+            &next.to_le_bytes(),
+            descriptor
+                .checked_add(14)
+                .expect("multi-block descriptor next address should fit"),
+        )
+        .expect("multi-block descriptor next index should write");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_native_v2_multi_block_request_header(
+    memory: &mut bangbang_runtime::memory::GuestMemory,
+    address: bangbang_runtime::memory::GuestAddress,
+    request_type: u32,
+) {
+    memory
+        .write_slice(&request_type.to_le_bytes(), address)
+        .expect("multi-block request type should write");
+    memory
+        .write_slice(
+            &0_u32.to_le_bytes(),
+            address
+                .checked_add(4)
+                .expect("multi-block reserved header address should fit"),
+        )
+        .expect("multi-block reserved header should write");
+    memory
+        .write_slice(
+            &0_u64.to_le_bytes(),
+            address
+                .checked_add(8)
+                .expect("multi-block sector header address should fit"),
+        )
+        .expect("multi-block request sector should write");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn initialize_native_v2_multi_block_queue(
+    memory: &mut bangbang_runtime::memory::GuestMemory,
+    fixture: NativeV2MultiBlockQueueFixture,
+) {
+    memory
+        .write_slice(&[0; 4], fixture.available_ring())
+        .expect("multi-block available ring should initialize");
+    memory
+        .write_slice(&[0; 4], fixture.used_ring())
+        .expect("multi-block used ring should initialize");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn submit_native_v2_multi_block_write_and_flush(
+    memory: &mut bangbang_runtime::memory::GuestMemory,
+    fixture: NativeV2MultiBlockQueueFixture,
+    payload_byte: u8,
+) {
+    use bangbang_runtime::block::{
+        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_SIZE,
+    };
+    use bangbang_runtime::virtio_queue::{VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE};
+
+    write_native_v2_multi_block_request_header(
+        memory,
+        fixture.write_header(),
+        VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+    );
+    write_native_v2_multi_block_request_header(
+        memory,
+        fixture.flush_header(),
+        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+    );
+    memory
+        .write_slice(
+            &[payload_byte; VIRTIO_BLOCK_SECTOR_SIZE as usize],
+            fixture.write_data(),
+        )
+        .expect("multi-block write payload should write");
+    memory
+        .write_slice(&[u8::MAX], fixture.write_status())
+        .expect("multi-block write status should initialize");
+    memory
+        .write_slice(&[u8::MAX], fixture.flush_status())
+        .expect("multi-block flush status should initialize");
+
+    write_native_v2_multi_block_descriptor(
+        memory,
+        fixture,
+        0,
+        fixture.write_header(),
+        VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        VIRTQUEUE_DESC_F_NEXT,
+        1,
+    );
+    write_native_v2_multi_block_descriptor(
+        memory,
+        fixture,
+        1,
+        fixture.write_data(),
+        u32::try_from(VIRTIO_BLOCK_SECTOR_SIZE).expect("block sector size should fit u32"),
+        VIRTQUEUE_DESC_F_NEXT,
+        2,
+    );
+    write_native_v2_multi_block_descriptor(
+        memory,
+        fixture,
+        2,
+        fixture.write_status(),
+        VIRTIO_BLOCK_STATUS_SIZE,
+        VIRTQUEUE_DESC_F_WRITE,
+        0,
+    );
+    write_native_v2_multi_block_descriptor(
+        memory,
+        fixture,
+        3,
+        fixture.flush_header(),
+        VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        VIRTQUEUE_DESC_F_NEXT,
+        4,
+    );
+    write_native_v2_multi_block_descriptor(
+        memory,
+        fixture,
+        4,
+        fixture.flush_status(),
+        VIRTIO_BLOCK_STATUS_SIZE,
+        VIRTQUEUE_DESC_F_WRITE,
+        0,
+    );
+
+    memory
+        .write_slice(
+            &0_u16.to_le_bytes(),
+            fixture
+                .available_ring()
+                .checked_add(4)
+                .expect("first multi-block available head address should fit"),
+        )
+        .expect("first multi-block available head should write");
+    memory
+        .write_slice(
+            &3_u16.to_le_bytes(),
+            fixture
+                .available_ring()
+                .checked_add(6)
+                .expect("second multi-block available head address should fit"),
+        )
+        .expect("second multi-block available head should write");
+    memory
+        .write_slice(
+            &2_u16.to_le_bytes(),
+            fixture
+                .available_ring()
+                .checked_add(2)
+                .expect("multi-block available index address should fit"),
+        )
+        .expect("multi-block available index should write");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn activate_native_v2_multi_block_queue(
+    session: &bangbang_hvf::OwnedHvfArm64BootSession,
+    transport_base: bangbang_runtime::memory::GuestAddress,
+    fixture: NativeV2MultiBlockQueueFixture,
+) {
+    use bangbang_runtime::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+    };
+
+    let dispatcher = session.mmio_dispatcher();
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("multi-block MMIO dispatcher should not be poisoned");
+    let write = |dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher,
+                 register: VirtioMmioRegister,
+                 value: u32| {
+        write_native_v2_multi_block_mmio(
+            dispatcher,
+            transport_base
+                .checked_add(register.offset())
+                .expect("multi-block register address should fit"),
+            &value.to_le_bytes(),
+        );
+    };
+    let features_ok = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    for status in [
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+    ] {
+        write(&mut dispatcher, VirtioMmioRegister::Status, status);
+    }
+    write(&mut dispatcher, VirtioMmioRegister::DriverFeaturesSel, 1);
+    write(&mut dispatcher, VirtioMmioRegister::DriverFeatures, 1);
+    write(&mut dispatcher, VirtioMmioRegister::Status, features_ok);
+    write(&mut dispatcher, VirtioMmioRegister::QueueSel, 0);
+    write(
+        &mut dispatcher,
+        VirtioMmioRegister::QueueNum,
+        u32::from(NATIVE_V2_MULTI_BLOCK_QUEUE_SIZE),
+    );
+    write(
+        &mut dispatcher,
+        VirtioMmioRegister::QueueDescLow,
+        u32::try_from(fixture.descriptor_table().raw_value())
+            .expect("multi-block descriptor address should fit u32"),
+    );
+    write(
+        &mut dispatcher,
+        VirtioMmioRegister::QueueDriverLow,
+        u32::try_from(fixture.available_ring().raw_value())
+            .expect("multi-block available ring should fit u32"),
+    );
+    write(
+        &mut dispatcher,
+        VirtioMmioRegister::QueueDeviceLow,
+        u32::try_from(fixture.used_ring().raw_value())
+            .expect("multi-block used ring should fit u32"),
+    );
+    write(&mut dispatcher, VirtioMmioRegister::QueueReady, 1);
+    write(
+        &mut dispatcher,
+        VirtioMmioRegister::Status,
+        features_ok | VIRTIO_DEVICE_STATUS_DRIVER_OK,
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn notify_native_v2_multi_block_queue(
+    session: &bangbang_hvf::OwnedHvfArm64BootSession,
+    transport_base: bangbang_runtime::memory::GuestAddress,
+) {
+    use bangbang_runtime::virtio_mmio::VirtioMmioRegister;
+
+    let dispatcher = session.mmio_dispatcher();
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("multi-block MMIO dispatcher should not be poisoned");
+    write_native_v2_multi_block_mmio(
+        &mut dispatcher,
+        transport_base
+            .checked_add(VirtioMmioRegister::QueueNotify.offset())
+            .expect("multi-block queue-notify address should fit"),
+        &0_u32.to_le_bytes(),
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_v2_multi_block_interrupt_status(
+    session: &bangbang_hvf::OwnedHvfArm64BootSession,
+    transport_base: bangbang_runtime::memory::GuestAddress,
+) -> u32 {
+    use bangbang_runtime::virtio_mmio::VirtioMmioRegister;
+
+    let dispatcher = session.mmio_dispatcher();
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("multi-block MMIO dispatcher should not be poisoned");
+    read_native_v2_multi_block_mmio_u32(
+        &mut dispatcher,
+        transport_base
+            .checked_add(VirtioMmioRegister::InterruptStatus.offset())
+            .expect("multi-block interrupt-status address should fit"),
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn read_native_v2_multi_block_guest_u16(
+    memory: &bangbang_runtime::memory::GuestMemory,
+    address: bangbang_runtime::memory::GuestAddress,
+) -> u16 {
+    let mut bytes = [0_u8; 2];
+    memory
+        .read_slice(&mut bytes, address)
+        .expect("multi-block guest u16 should read");
+    u16::from_le_bytes(bytes)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn read_native_v2_multi_block_guest_u8(
+    memory: &bangbang_runtime::memory::GuestMemory,
+    address: bangbang_runtime::memory::GuestAddress,
+) -> u8 {
+    let mut byte = [0_u8; 1];
+    memory
+        .read_slice(&mut byte, address)
+        .expect("multi-block guest u8 should read");
+    byte.first()
+        .copied()
+        .expect("multi-block guest u8 should contain one byte")
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_v2_multi_block_used_index(
+    session: &bangbang_hvf::OwnedHvfArm64BootSession,
+    fixture: NativeV2MultiBlockQueueFixture,
+) -> u16 {
+    read_native_v2_multi_block_guest_u16(
+        session
+            .guest_memory()
+            .expect("multi-block guest memory should remain mapped"),
+        fixture
+            .used_ring()
+            .checked_add(2)
+            .expect("multi-block used index address should fit"),
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn wait_for_native_v2_multi_block_async_completion(
+    session: &bangbang_hvf::OwnedHvfArm64BootSession,
+) {
+    let completion_fd = session
+        .runtime_resources()
+        .block_async_completion_fd()
+        .expect("multi-block Async completion descriptor should inspect")
+        .expect("multi-block Async runtime should expose a completion descriptor");
+    let mut readiness = libc::pollfd {
+        fd: completion_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: One initialized pollfd is writable for the bounded wait.
+    let ready = unsafe { libc::poll(&raw mut readiness, 1, 5_000) };
+    assert_eq!(
+        ready, 1,
+        "multi-block Async request should complete before the deadline"
+    );
+    assert_ne!(
+        readiness.revents & libc::POLLIN,
+        0,
+        "multi-block Async completion descriptor should become readable"
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_v2_multi_block_dispatch_signaled(
+    dispatches: &bangbang_hvf::HvfArm64BootBlockNotificationDispatches,
+    drive_id: &str,
+) -> bool {
+    dispatches.as_slice().iter().any(|dispatch| {
+        dispatch.dispatch().device().registration.drive_id() == drive_id
+            && dispatch.queue_interrupt_signaled()
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
+    use std::fs::OpenOptions;
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState,
+        HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2MultiBlockProcessConfig,
+        HvfSnapshotV2NativePath, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
+        prepare_hvf_snapshot_v2_multi_block_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::{
+        BlockFileBacking, BlockMmioLayout, DriveCacheType, DriveConfigInput, DriveIoEngine,
+    };
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryLayout};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransport;
+    use bangbang_runtime::snapshot_device_v2_5::SnapshotV2MultiBlockRestorePlan;
+    use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+
+    for (case, rooted) in [
+        ("native-v2-multi-block-mmio-rooted-owner", true),
+        ("native-v2-multi-block-mmio-rootless-owner", false),
+    ] {
+        let kernel = TempFile::new(&format!("{case}-kernel"), &image)
+            .unwrap_or_else(|error| panic!("{case} kernel should create: {error}"));
+        let first = TempFile::new_len(&format!("{case}-sync"), 4096)
+            .unwrap_or_else(|error| panic!("{case} Sync backing should create: {error}"));
+        let second = TempFile::new_len(&format!("{case}-async"), 4096)
+            .unwrap_or_else(|error| panic!("{case} Async backing should create: {error}"));
+        let mut controller = bangbang_runtime::VmmController::new(case, "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.path(),
+            )))
+            .unwrap_or_else(|error| panic!("{case} boot source should configure: {error}"));
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(1, 16)))
+            .unwrap_or_else(|error| panic!("{case} machine should configure: {error}"));
+        controller
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new("sync", "sync", first.path(), rooted)
+                    .with_is_read_only(false)
+                    .with_cache_type(DriveCacheType::Unsafe)
+                    .with_io_engine(DriveIoEngine::Sync),
+            ))
+            .unwrap_or_else(|error| panic!("{case} Sync drive should configure: {error}"));
+        controller
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new("async", "async", second.path(), false)
+                    .with_is_read_only(false)
+                    .with_cache_type(DriveCacheType::Writeback)
+                    .with_io_engine(DriveIoEngine::Async),
+            ))
+            .unwrap_or_else(|error| panic!("{case} Async drive should configure: {error}"));
+
+        let block_layout =
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
+        let source_serial = SharedSerialOutputBuffer::default();
+        let session_config = HvfArm64BootSessionConfig::new(
+            block_layout,
+            PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            bangbang_runtime::rtc::RtcMmioLayout::new(
+                GuestAddress::new(0x4000_1000),
+                MmioRegionId::new(10),
+            ),
+        )
+        .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+            MmioRegionId::new(20),
+            GuestAddress::new(0x4000_2000),
+            SharedSerialOutput::from(source_serial),
+        ));
+        let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+            .unwrap_or_else(|error| panic!("{case} source should prepare: {error}"));
+
+        let source_entry = GuestAddress::new(
+            source
+                .capture_arm64_general_register_state()
+                .unwrap_or_else(|error| panic!("{case} source registers should capture: {error}"))
+                .pc(),
+        );
+        let guest_code = [
+            0xd503_4fdf, // msr daifset, #0xf (synthetic guest has no exception vectors)
+            0xd282_4685, // mov x5, #0x1234
+            0xd2a8_0001, // mov x1, #0x40000000
+            0xf284_00e1, // movk x1, #0x2007
+            0xd280_0b42, // mov x2, #0x5a
+            0x3900_0022, // strb w2, [x1]
+            0xd2b0_8000, // mov x0, #0x84000000 (PSCI_VERSION)
+            0xd400_0002, // hvc #0
+            0xd28a_cf06, // mov x6, #0x5678
+            0xd2b0_8000, // mov x0, #0x84000000 (PSCI_VERSION)
+            0xd400_0002, // hvc #0
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+        source
+            .guest_memory_mut()
+            .unwrap_or_else(|error| panic!("{case} source memory should map: {error}"))
+            .write_slice(&guest_code, source_entry)
+            .unwrap_or_else(|error| panic!("{case} guest continuation should write: {error}"));
+        assert!(matches!(
+            source.run_once_and_handle_mmio(),
+            Ok(HvfVcpuRunStepOutcome::Mmio { .. })
+        ));
+        assert!(matches!(
+            source.run_once_and_handle_mmio(),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                function_id: 0x8400_0000,
+                return_value: 0x0001_0000,
+                ..
+            })
+        ));
+        assert_eq!(
+            source
+                .capture_arm64_general_register_state()
+                .unwrap_or_else(|error| {
+                    panic!("{case} masked source registers should capture: {error}")
+                })
+                .cpsr()
+                & 0xc0,
+            0xc0,
+            "{case} synthetic source guest should mask IRQ and FIQ"
+        );
+
+        let source_configs =
+            CaptureReadyStorageConfigs::new(controller.drive_configs().to_vec(), Vec::new());
+        let source_guard = source
+            .quiesce_limiter_retry_wakeups()
+            .unwrap_or_else(|error| panic!("{case} retry publishers should quiesce: {error}"));
+        let graph = source
+            .capture_snapshot_v2_multi_block_device_graph_at(
+                &source_configs,
+                &source_guard,
+                Instant::now(),
+            )
+            .unwrap_or_else(|error| panic!("{case} graph should capture: {error}"));
+        assert_eq!(graph.records().len(), 2);
+        assert_eq!(graph.root_key().is_some(), rooted);
+        source
+            .pause_for_snapshot_v2_capture()
+            .unwrap_or_else(|error| panic!("{case} source should pause: {error}"));
+        let boot = HvfSnapshotV2BootState::try_new(
+            HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+                .unwrap_or_else(|error| panic!("{case} kernel path should validate: {error}")),
+            None,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{case} boot metadata should validate: {error}"));
+        let capture_input = HvfArm64BootSnapshotV2CaptureInput::new(boot);
+        let memory_artifact = TempFile::new_len(&format!("{case}-memory"), 0)
+            .unwrap_or_else(|error| panic!("{case} memory artifact should create: {error}"));
+        let mut memory_writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(memory_artifact.path())
+            .unwrap_or_else(|error| panic!("{case} memory artifact should open: {error}"));
+        let source_platform = source
+            .capture_snapshot_v2_device_graph_platform_with_cancel(
+                capture_input.clone(),
+                &mut memory_writer,
+                |_| false,
+            )
+            .unwrap_or_else(|error| panic!("{case} platform should capture: {error}"));
+
+        let layout = GuestMemoryLayout::new(source.runtime_resources().layout.ranges().to_vec())
+            .unwrap_or_else(|error| panic!("{case} destination layout should validate: {error}"));
+        let mut restored_memory = GuestMemory::allocate(&layout)
+            .unwrap_or_else(|error| panic!("{case} destination memory should allocate: {error}"));
+        let source_memory = source
+            .guest_memory()
+            .unwrap_or_else(|error| panic!("{case} source memory should remain mapped: {error}"));
+        let mut page = vec![0_u8; 64 * 1024];
+        for range in layout.ranges() {
+            let mut copied = 0_u64;
+            while copied < range.size() {
+                let remaining = range.size() - copied;
+                let count = usize::try_from(
+                    remaining.min(u64::try_from(page.len()).expect("page length should fit")),
+                )
+                .expect("copy count should fit");
+                let address = range
+                    .start()
+                    .checked_add(copied)
+                    .expect("copy address should fit");
+                source_memory
+                    .read_slice(&mut page[..count], address)
+                    .unwrap_or_else(|error| panic!("{case} source page should read: {error}"));
+                restored_memory
+                    .write_slice(&page[..count], address)
+                    .unwrap_or_else(|error| {
+                        panic!("{case} destination page should write: {error}")
+                    });
+                copied += u64::try_from(count).expect("copy count should fit u64");
+            }
+        }
+        drop(memory_writer);
+        drop(source_guard);
+        source
+            .shutdown()
+            .unwrap_or_else(|error| panic!("{case} source should shut down: {error}"));
+
+        let drive_configs = graph
+            .project_drive_configs()
+            .unwrap_or_else(|error| panic!("{case} configs should project: {error}"));
+        let backings = graph
+            .records()
+            .iter()
+            .map(|record| {
+                BlockFileBacking::open_snapshot(
+                    std::path::Path::new(record.config().selector()),
+                    record.config().is_read_only(),
+                )
+                .map(|(backing, _identity)| backing)
+                .unwrap_or_else(|error| panic!("{case} backing should reopen: {error}"))
+            })
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        let bundle = SnapshotV2MultiBlockRestorePlan::prepare(graph.clone(), &restored_memory, now)
+            .unwrap_or_else(|error| panic!("{case} restore plan should prepare: {error}"))
+            .prepare_backings(drive_configs.clone(), backings)
+            .unwrap_or_else(|error| panic!("{case} backing vector should prepare: {error}"));
+        let platform_plan = prepare_hvf_snapshot_v2_multi_block_platform_plan(
+            &source_platform,
+            &bundle,
+            HvfSnapshotV2MultiBlockProcessConfig::new(block_layout, false),
+        )
+        .unwrap_or_else(|error| panic!("{case} platform plan should prepare: {error}"));
+        let restored_serial = SharedSerialOutputBuffer::default();
+        let shell =
+            HvfSnapshotV2DefaultProcessShell::new(SharedSerialOutput::from(restored_serial));
+        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_multi_block_mmio(
+            source_platform.clone(),
+            restored_memory,
+            shell,
+            bundle,
+            platform_plan,
+        )
+        .unwrap_or_else(|error| panic!("{case} owner vector should restore: {error:?}"));
+        assert_eq!(owners.drive_configs(), &drive_configs);
+        let (mut restored, restored_drive_configs) = owners.into_parts();
+        assert_eq!(
+            restored
+                .capture_arm64_general_register_state()
+                .unwrap_or_else(|error| {
+                    panic!("{case} masked restored registers should capture: {error}")
+                })
+                .cpsr()
+                & 0xc0,
+            0xc0,
+            "{case} restored synthetic guest should retain IRQ and FIQ masks"
+        );
+        assert_eq!(restored.runtime_resources().block_devices.len(), 2);
+        for ((device, record), config) in restored
+            .runtime_resources()
+            .block_devices
+            .iter()
+            .zip(graph.records())
+            .zip(restored_drive_configs.as_slice())
+        {
+            let SnapshotV2DeviceTransport::Mmio(mmio) = record.transport() else {
+                panic!("{case} record should retain MMIO transport");
+            };
+            assert_eq!(
+                device.registration.index(),
+                record.key().instance() as usize
+            );
+            assert_eq!(device.registration.drive_id(), config.drive_id());
+            assert_eq!(device.registration.region(), mmio.region());
+            assert_eq!(device.fdt_device.interrupt_line, mmio.interrupt_line());
+        }
+
+        let metrics = restored.shared_block_device_metrics();
+        for config in restored_drive_configs.as_slice() {
+            assert!(
+                metrics
+                    .per_drive(config.drive_id())
+                    .expect("restored per-drive metrics entry should exist")
+                    .snapshot()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            metrics
+                .per_drive(restored_drive_configs.as_slice()[0].drive_id())
+                .expect("first metrics entry should exist")
+                .snapshot()
+                .update_count(),
+            0
+        );
+
+        {
+            let dispatcher = restored.mmio_dispatcher();
+            let mut dispatcher = dispatcher
+                .lock()
+                .expect("restored MMIO dispatcher should lock");
+            for config in restored_drive_configs.as_slice() {
+                let binding = restored
+                    .runtime_resources()
+                    .capture_ready_mmio_block_async_binding(&mut dispatcher, config.drive_id())
+                    .unwrap_or_else(|error| {
+                        panic!("{case} Async identity should inspect: {error}")
+                    });
+                match config.io_engine() {
+                    Some(DriveIoEngine::Sync) => assert!(binding.is_none()),
+                    Some(DriveIoEngine::Async) => {
+                        let (runtime, _generation) =
+                            binding.expect("Async record should retain one generation");
+                        assert!(
+                            runtime.same_runtime(&restored.runtime_resources().block_async_runtime)
+                        );
+                    }
+                    None => panic!("{case} restored local drive should have an I/O engine"),
+                }
+                let persistence = restored
+                    .runtime_resources()
+                    .capture_ready_mmio_block_snapshot_persistence_binding(&mut dispatcher, config)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{case} {} persistence binding should validate: {error}",
+                            config.drive_id()
+                        )
+                    });
+                assert!(!persistence.is_read_only());
+                assert_eq!(Some(persistence.io_engine()), config.io_engine());
+            }
+        }
+
+        let restored_configs =
+            CaptureReadyStorageConfigs::new(restored_drive_configs.as_slice().to_vec(), Vec::new());
+        let restored_guard = restored
+            .quiesce_limiter_retry_wakeups()
+            .unwrap_or_else(|error| {
+                panic!("{case} restored retry publishers should quiesce: {error}")
+            });
+        let recaptured_graph = restored
+            .capture_snapshot_v2_multi_block_device_graph_at(
+                &restored_configs,
+                &restored_guard,
+                now,
+            )
+            .unwrap_or_else(|error| panic!("{case} restored graph should recapture: {error}"));
+        assert_eq!(recaptured_graph, graph);
+        let recaptured_memory = TempFile::new_len(&format!("{case}-recapture"), 0)
+            .unwrap_or_else(|error| panic!("{case} recapture artifact should create: {error}"));
+        let mut recaptured_writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(recaptured_memory.path())
+            .unwrap_or_else(|error| panic!("{case} recapture artifact should open: {error}"));
+        let recaptured_platform = restored
+            .capture_snapshot_v2_device_graph_platform_with_cancel(
+                capture_input,
+                &mut recaptured_writer,
+                |_| false,
+            )
+            .unwrap_or_else(|error| panic!("{case} platform should recapture: {error}"));
+        assert_native_v2_platform_recapture_equivalent(&source_platform, &recaptured_platform);
+        drop(restored_guard);
+
+        let mut transport_bases = graph.records().iter().map(|record| {
+            let SnapshotV2DeviceTransport::Mmio(mmio) = record.transport() else {
+                panic!("{case} restored test record should use MMIO");
+            };
+            mmio.region().range().start()
+        });
+        let sync_transport_base = transport_bases
+            .next()
+            .expect("Sync transport base should exist");
+        let async_transport_base = transport_bases
+            .next()
+            .expect("Async transport base should exist");
+        assert!(
+            transport_bases.next().is_none(),
+            "{case} should restore exactly two block transports"
+        );
+        {
+            let memory = restored
+                .guest_memory_mut()
+                .unwrap_or_else(|error| panic!("{case} restored memory should map: {error}"));
+            initialize_native_v2_multi_block_queue(memory, NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE);
+            initialize_native_v2_multi_block_queue(memory, NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE);
+        }
+        activate_native_v2_multi_block_queue(
+            &restored,
+            sync_transport_base,
+            NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE,
+        );
+        activate_native_v2_multi_block_queue(
+            &restored,
+            async_transport_base,
+            NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE,
+        );
+
+        {
+            let memory = restored
+                .guest_memory_mut()
+                .unwrap_or_else(|error| panic!("{case} restored memory should map: {error}"));
+            submit_native_v2_multi_block_write_and_flush(
+                memory,
+                NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE,
+                0x5a,
+            );
+        }
+        notify_native_v2_multi_block_queue(&restored, sync_transport_base);
+        let sync_dispatches = restored
+            .dispatch_block_queue_notifications_and_signal_interrupts()
+            .unwrap_or_else(|error| panic!("{case} Sync requests should dispatch: {error}"));
+        assert_eq!(sync_dispatches.len(), 2);
+        assert!(native_v2_multi_block_dispatch_signaled(
+            &sync_dispatches,
+            restored_drive_configs.as_slice()[0].drive_id(),
+        ));
+        assert!(!native_v2_multi_block_dispatch_signaled(
+            &sync_dispatches,
+            restored_drive_configs.as_slice()[1].drive_id(),
+        ));
+        assert_eq!(
+            native_v2_multi_block_used_index(&restored, NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE),
+            2
+        );
+        {
+            let memory = restored
+                .guest_memory()
+                .unwrap_or_else(|error| panic!("{case} restored memory should map: {error}"));
+            assert_eq!(
+                read_native_v2_multi_block_guest_u8(
+                    memory,
+                    NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE.write_status(),
+                ),
+                bangbang_runtime::block::VIRTIO_BLOCK_STATUS_OK
+            );
+            assert_eq!(
+                read_native_v2_multi_block_guest_u8(
+                    memory,
+                    NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE.flush_status(),
+                ),
+                bangbang_runtime::block::VIRTIO_BLOCK_STATUS_OK
+            );
+        }
+
+        {
+            let memory = restored
+                .guest_memory_mut()
+                .unwrap_or_else(|error| panic!("{case} restored memory should map: {error}"));
+            submit_native_v2_multi_block_write_and_flush(
+                memory,
+                NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE,
+                0xa5,
+            );
+        }
+        notify_native_v2_multi_block_queue(&restored, async_transport_base);
+        let mut async_interrupt_signaled = false;
+        let initial_async_dispatches = restored
+            .dispatch_block_queue_notifications_and_signal_interrupts()
+            .unwrap_or_else(|error| panic!("{case} Async requests should schedule: {error}"));
+        async_interrupt_signaled |= native_v2_multi_block_dispatch_signaled(
+            &initial_async_dispatches,
+            restored_drive_configs.as_slice()[1].drive_id(),
+        );
+        for _ in 0..8 {
+            if native_v2_multi_block_used_index(&restored, NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE) == 2 {
+                break;
+            }
+            wait_for_native_v2_multi_block_async_completion(&restored);
+            let dispatches = restored
+                .dispatch_block_queue_notifications_and_signal_interrupts()
+                .unwrap_or_else(|error| panic!("{case} Async completion should dispatch: {error}"));
+            async_interrupt_signaled |= native_v2_multi_block_dispatch_signaled(
+                &dispatches,
+                restored_drive_configs.as_slice()[1].drive_id(),
+            );
+        }
+        assert_eq!(
+            native_v2_multi_block_used_index(&restored, NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE),
+            2,
+            "{case} Async write and flush should both publish"
+        );
+        assert!(
+            async_interrupt_signaled,
+            "{case} Async completion should signal its queue interrupt"
+        );
+        {
+            let memory = restored
+                .guest_memory()
+                .unwrap_or_else(|error| panic!("{case} restored memory should map: {error}"));
+            assert_eq!(
+                read_native_v2_multi_block_guest_u8(
+                    memory,
+                    NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE.write_status(),
+                ),
+                bangbang_runtime::block::VIRTIO_BLOCK_STATUS_OK
+            );
+            assert_eq!(
+                read_native_v2_multi_block_guest_u8(
+                    memory,
+                    NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE.flush_status(),
+                ),
+                bangbang_runtime::block::VIRTIO_BLOCK_STATUS_OK
+            );
+        }
+
+        let queue_interrupt = bangbang_runtime::interrupt::DeviceInterruptKind::Queue
+            .status()
+            .bits();
+        assert_eq!(
+            native_v2_multi_block_interrupt_status(&restored, sync_transport_base)
+                & queue_interrupt,
+            queue_interrupt
+        );
+        assert_eq!(
+            native_v2_multi_block_interrupt_status(&restored, async_transport_base)
+                & queue_interrupt,
+            queue_interrupt
+        );
+
+        for (config, expected_byte) in restored_drive_configs.as_slice().iter().zip([0x5a, 0xa5]) {
+            let snapshot = metrics
+                .per_drive(config.drive_id())
+                .expect("restored per-drive metrics entry should exist")
+                .snapshot();
+            assert_eq!(snapshot.write_count(), 1);
+            assert_eq!(
+                snapshot.write_bytes(),
+                bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE
+            );
+            assert_eq!(snapshot.flush_count(), 1);
+            let backing = std::fs::read(
+                config
+                    .path_on_host()
+                    .expect("restored local backing path should exist"),
+            )
+            .unwrap_or_else(|error| panic!("{case} backing should read: {error}"));
+            assert_eq!(
+                backing
+                    .get(..bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE as usize)
+                    .expect("restored backing should contain one sector"),
+                &[expected_byte; bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE as usize]
+            );
+        }
+
+        let post_io_guard = restored
+            .quiesce_limiter_retry_wakeups()
+            .unwrap_or_else(|error| {
+                panic!("{case} post-I/O retry publishers should quiesce: {error}")
+            });
+        let post_io_now = Instant::now();
+        let post_io_graph = restored
+            .capture_snapshot_v2_multi_block_device_graph_at(
+                &restored_configs,
+                &post_io_guard,
+                post_io_now,
+            )
+            .unwrap_or_else(|error| panic!("{case} post-I/O graph should capture: {error}"));
+        let continued_post_io_graph = restored
+            .capture_snapshot_v2_multi_block_device_graph_at(
+                &restored_configs,
+                &post_io_guard,
+                post_io_now,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{case} continued post-I/O graph should capture: {error}")
+            });
+        assert_ne!(post_io_graph, graph);
+        assert_eq!(continued_post_io_graph, post_io_graph);
+        for record in post_io_graph.records() {
+            assert!(record.virtio().is_activated());
+            assert!(
+                record
+                    .virtio()
+                    .queues()
+                    .first()
+                    .expect("restored block queue should exist")
+                    .ready()
+            );
+            let queue = record
+                .block()
+                .continuation()
+                .active_queue()
+                .expect("restored block queue cursor should capture");
+            assert_eq!(queue.next_available(), 2);
+            assert_eq!(queue.next_used(), 2);
+        }
+        drop(post_io_guard);
+
+        let resumed_step = restored.run_once_and_handle_mmio();
+        assert!(
+            matches!(
+                &resumed_step,
+                Ok(HvfVcpuRunStepOutcome::Hvc {
+                    function_id: 0x8400_0000,
+                    return_value: 0x0001_0000,
+                    ..
+                })
+            ),
+            "{case} should resume to the second HVC after block I/O: {resumed_step:?}"
+        );
+        assert_eq!(
+            restored
+                .capture_arm64_general_register_state()
+                .unwrap_or_else(|error| {
+                    panic!("{case} restored registers should capture: {error}")
+                })
+                .general_purpose_register(6),
+            Some(0x5678)
+        );
+        restored
+            .shutdown()
+            .unwrap_or_else(|error| panic!("{case} restored owner should shut down: {error}"));
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn native_v2_root_graph_converts_signed_mmio_and_pci_owners_canonically() {
     use std::fs::{File, OpenOptions};
