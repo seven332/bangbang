@@ -1265,7 +1265,7 @@ fn pending_rate_limit_state_requires_queue_limiter_and_retry() {
     retry_without_pending.pmem_records[0]
         .pmem
         .pending_rate_limited_queue = false;
-    assert!(validate_graph(&retry_without_pending).is_ok());
+    assert!(validate_graph(&retry_without_pending).is_err());
 }
 
 #[test]

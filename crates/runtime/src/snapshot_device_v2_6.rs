@@ -864,13 +864,13 @@ fn validate_pmem_state_local(state: &SnapshotV2PmemState) -> Result<(), GraphVal
     {
         return Err(GraphValidationError::Pmem);
     }
-    if state.pending_rate_limited_queue
-        && (state.active_queue.is_none()
-            || state.limiter.is_empty()
-            || state.retry == StorageRetryState::None
-            || state
-                .active_queue
-                .is_some_and(|queue| queue.next_available() == queue.next_used()))
+    if state.pending_rate_limited_queue != (state.retry != StorageRetryState::None)
+        || (state.pending_rate_limited_queue
+            && (state.active_queue.is_none()
+                || state.limiter.is_empty()
+                || state
+                    .active_queue
+                    .is_some_and(|queue| queue.next_available() == queue.next_used())))
     {
         return Err(GraphValidationError::Pmem);
     }

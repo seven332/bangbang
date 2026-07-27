@@ -1608,6 +1608,10 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioPmemDe
 }
 
 impl VirtioPmemMmioHandler {
+    pub fn has_pending_pmem_rate_limited_queue(&self) -> bool {
+        self.activation_handler().has_pending_rate_limited_queue()
+    }
+
     pub fn capture_pmem_device_state_at(
         &self,
         expected_file_len: u64,

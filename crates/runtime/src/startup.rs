@@ -3320,6 +3320,18 @@ impl Arm64BootRuntimeResources {
             .map(|handler| handler.block_async_binding())
     }
 
+    pub fn capture_ready_mmio_block_has_pending_rate_limited_queue(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        drive_id: &str,
+    ) -> Result<bool, Arm64BootStorageCaptureError> {
+        let device = unique_mmio_block_device(&self.block_devices, drive_id)?;
+        mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(device.registration.region_id())
+            .map_err(|_| Arm64BootStorageCaptureError::BlockHandler)
+            .map(|handler| handler.has_pending_block_rate_limited_queue())
+    }
+
     pub fn capture_ready_mmio_block_snapshot_persistence_binding(
         &self,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -3448,6 +3460,18 @@ impl Arm64BootRuntimeResources {
             retry,
             captured,
         ))
+    }
+
+    pub fn capture_ready_mmio_pmem_has_pending_rate_limited_queue(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        pmem_id: &str,
+    ) -> Result<bool, Arm64BootStorageCaptureError> {
+        let device = unique_mmio_pmem_device(&self.pmem_mmio_devices, pmem_id)?;
+        mmio_dispatcher
+            .handler_mut::<VirtioPmemMmioHandler>(device.registration.region_id())
+            .map_err(|_| Arm64BootStorageCaptureError::PmemHandler)
+            .map(|handler| handler.has_pending_pmem_rate_limited_queue())
     }
 
     pub fn capture_ready_pmem_snapshot_persistence_binding(
