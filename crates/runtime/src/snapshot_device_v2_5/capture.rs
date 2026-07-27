@@ -272,13 +272,8 @@ fn capture_multi_block_state(
         .map_err(|_| SnapshotV2MultiBlockDeviceGraphCaptureError::InconsistentBlockState)?;
     let active_queue = device.active_queue();
     let retry = state.retry();
-    if (retry != StorageRetryState::None && (active_queue.is_none() || limiter.is_empty()))
-        || matches!(retry, StorageRetryState::After { remaining_nanos: 0 })
-        || (retry != StorageRetryState::None
-            && active_queue.is_some_and(|queue| queue.next_available() == queue.next_used()))
-    {
-        return Err(SnapshotV2MultiBlockDeviceGraphCaptureError::InconsistentBlockState);
-    }
+    validate_block_retry_state(active_queue.is_some(), limiter, retry)
+        .map_err(|_| SnapshotV2MultiBlockDeviceGraphCaptureError::InconsistentBlockState)?;
     Ok(SnapshotV2MultiBlockState {
         backing_bytes: backing.len(),
         continuation: SnapshotV2BlockState::from_parts(
