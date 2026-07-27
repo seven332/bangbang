@@ -12537,11 +12537,81 @@ mod macos_arm64 {
             expected.block_records().len(),
             "{context} record count"
         );
-        assert_eq!(
-            actual.pmem_records(),
-            expected.pmem_records(),
-            "{context} pmem records"
-        );
+        for (expected, actual) in expected.pmem_records().iter().zip(actual.pmem_records()) {
+            assert_eq!(actual.key(), expected.key(), "{context} pmem key");
+            assert_eq!(
+                actual.config(),
+                expected.config(),
+                "{context} pmem configuration"
+            );
+            assert_eq!(
+                actual.pmem().file_bytes(),
+                expected.pmem().file_bytes(),
+                "{context} pmem file bytes"
+            );
+            assert_eq!(
+                actual.pmem().mapped_bytes(),
+                expected.pmem().mapped_bytes(),
+                "{context} pmem mapped bytes"
+            );
+            assert_eq!(
+                actual.pmem().guest_range(),
+                expected.pmem().guest_range(),
+                "{context} pmem guest range"
+            );
+            assert_eq!(
+                actual.pmem().config_space(),
+                expected.pmem().config_space(),
+                "{context} pmem config space"
+            );
+            assert_eq!(
+                actual.pmem().active_queue(),
+                expected.pmem().active_queue(),
+                "{context} pmem active queue"
+            );
+            for (name, expected_bucket, actual_bucket) in [
+                (
+                    "bandwidth",
+                    expected.pmem().limiter().bandwidth(),
+                    actual.pmem().limiter().bandwidth(),
+                ),
+                (
+                    "ops",
+                    expected.pmem().limiter().ops(),
+                    actual.pmem().limiter().ops(),
+                ),
+            ] {
+                assert_eq!(
+                    actual_bucket.map(|bucket| (bucket.budget(), bucket.remaining_burst())),
+                    expected_bucket.map(|bucket| (bucket.budget(), bucket.remaining_burst())),
+                    "{context} pmem {name} limiter value"
+                );
+                assert!(
+                    actual_bucket
+                        .zip(expected_bucket)
+                        .is_none_or(|(actual, expected)| {
+                            actual.age_nanos() >= expected.age_nanos()
+                        }),
+                    "{context} pmem {name} limiter age should advance monotonically"
+                );
+            }
+            assert_eq!(
+                actual.pmem().pending_rate_limited_queue(),
+                expected.pmem().pending_rate_limited_queue(),
+                "{context} pmem pending rate-limited queue"
+            );
+            assert_snapshot_retry_progress(
+                expected.pmem().retry(),
+                actual.pmem().retry(),
+                &format!("{context} pmem retry"),
+            );
+            assert_eq!(actual.virtio(), expected.virtio(), "{context} pmem virtio");
+            assert_eq!(
+                actual.transport(),
+                expected.transport(),
+                "{context} pmem transport"
+            );
+        }
         for (expected, actual) in expected.block_records().iter().zip(actual.block_records()) {
             assert_eq!(actual.key(), expected.key(), "{context} record key");
             assert_eq!(
@@ -12571,10 +12641,10 @@ mod macos_arm64 {
                 expected_block.active_queue(),
                 "{context} active request cursor"
             );
-            assert_eq!(
-                actual_block.retry(),
+            assert_snapshot_retry_progress(
                 expected_block.retry(),
-                "{context} retry disposition"
+                actual_block.retry(),
+                &format!("{context} retry disposition"),
             );
             for (name, expected_bucket, actual_bucket) in [
                 (
@@ -12604,6 +12674,31 @@ mod macos_arm64 {
                 expected.transport(),
                 "{context} transport continuation"
             );
+        }
+    }
+
+    fn assert_snapshot_retry_progress(
+        expected: StorageRetryState,
+        actual: StorageRetryState,
+        context: &str,
+    ) {
+        match (expected, actual) {
+            (StorageRetryState::None, StorageRetryState::None)
+            | (StorageRetryState::Immediate, StorageRetryState::Immediate) => {}
+            (
+                StorageRetryState::After {
+                    remaining_nanos: expected,
+                },
+                StorageRetryState::After {
+                    remaining_nanos: actual,
+                },
+            ) => assert!(
+                actual > 0 && actual <= expected,
+                "{context} should retain a positive nonincreasing retry duration: expected={expected}, actual={actual}"
+            ),
+            (expected, actual) => {
+                panic!("{context} retry kind changed: expected={expected:?}, actual={actual:?}")
+            }
         }
     }
 

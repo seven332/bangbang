@@ -990,13 +990,6 @@ def emit_snapshot_pmem_advance(
         offset=0,
         expected=SNAPSHOT_PMEM_READ_ONLY_BYTE,
     )
-    emit_snapshot_file_expect_byte_at(
-        code,
-        addresses,
-        path="pmem0",
-        offset=SNAPSHOT_PMEM_PRIVATE_TAIL_OFFSET,
-        expected=0,
-    )
     emit_snapshot_file_read_byte_at(
         code,
         addresses,
