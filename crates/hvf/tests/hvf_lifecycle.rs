@@ -6895,10 +6895,14 @@ fn prepares_internal_hvf_arm64_boot_session() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
+    use std::fs::OpenOptions;
     use std::time::Instant;
 
     use bangbang_hvf::{
-        HvfArm64BootSessionConfig, HvfArm64BootStorageCaptureErrorKind, OwnedHvfArm64BootSession,
+        HvfArm64BootSessionConfig, HvfArm64BootSnapshotV2CaptureInput,
+        HvfArm64BootStorageCaptureErrorKind, HvfArm64BootStorageCaptureStage,
+        HvfSnapshotV2BootState, HvfSnapshotV2NativePath, HvfSnapshotV2StorageState,
+        OwnedHvfArm64BootSession,
     };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::{
@@ -6911,6 +6915,12 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::pmem::{
         PmemConfig, PmemConfigInput, PmemFileBacking, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT,
+    };
+    use bangbang_runtime::snapshot_device_v2::{
+        SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
+    };
+    use bangbang_runtime::snapshot_device_v2_6::{
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     };
     use bangbang_runtime::storage_capture::{
         CaptureReadyStorageConfigs, StorageDeviceOrigin, StorageTransportState,
@@ -6930,6 +6940,9 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
         .expect("MMIO Async backing should create");
     let mmio_pmem = TempFile::new_len("capture-ready-mmio-pmem", VIRTIO_PMEM_ALIGNMENT)
         .expect("MMIO pmem backing should create");
+    let mmio_read_only_pmem =
+        TempFile::new_len("capture-ready-mmio-read-only-pmem", VIRTIO_PMEM_ALIGNMENT)
+            .expect("read-only MMIO pmem backing should create");
     let mut mmio_controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
     mmio_controller
         .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
@@ -6957,6 +6970,12 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
             path_text(mmio_pmem.path()),
         )))
         .expect("MMIO pmem should configure");
+    mmio_controller
+        .handle_action(VmmAction::PutPmem(
+            PmemConfigInput::new("pmem_ro", path_text(mmio_read_only_pmem.path()))
+                .with_read_only(true),
+        ))
+        .expect("read-only MMIO pmem should configure");
     let mmio_session_config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
         PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
@@ -6981,6 +7000,198 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
         HvfArm64BootStorageCaptureErrorKind::ProfilePreflight
     );
     assert!(!profile_error.terminal());
+
+    let mmio_pmem_mapping = mmio_session.runtime_resources().pmem_devices[0].mapping();
+    // SAFETY: the retained prepared mapping is writable, and this one-byte
+    // write stays inside its exact file-backed prefix.
+    unsafe {
+        mmio_pmem_mapping
+            .host_address()
+            .as_ptr()
+            .cast::<u8>()
+            .write(0x5a);
+    }
+    for cancelled_stage in [
+        HvfArm64BootStorageCaptureStage::Inventory,
+        HvfArm64BootStorageCaptureStage::StopAsync,
+        HvfArm64BootStorageCaptureStage::DrainAsync,
+        HvfArm64BootStorageCaptureStage::Persist,
+        HvfArm64BootStorageCaptureStage::PublishAsync,
+        HvfArm64BootStorageCaptureStage::Capture,
+        HvfArm64BootStorageCaptureStage::ComposeGraph,
+    ] {
+        let error = mmio_session
+            .capture_snapshot_v2_storage_device_graph_at_with_cancel(
+                &mmio_configs,
+                &mmio_guard,
+                Instant::now(),
+                |stage| stage == cancelled_stage,
+            )
+            .expect_err("profile-3 cancellation must not return a graph");
+        assert_eq!(error.kind(), HvfArm64BootStorageCaptureErrorKind::Cancelled);
+        assert!(!error.cleanup_failed());
+        assert!(!error.terminal());
+    }
+    let mut persistence_visits = 0_u8;
+    let between_devices_error = mmio_session
+        .capture_snapshot_v2_storage_device_graph_at_with_cancel(
+            &mmio_configs,
+            &mmio_guard,
+            Instant::now(),
+            |stage| {
+                if stage == HvfArm64BootStorageCaptureStage::Persist {
+                    persistence_visits += 1;
+                    persistence_visits == 4
+                } else {
+                    false
+                }
+            },
+        )
+        .expect_err("cancellation between pmem owners must not return a graph");
+    assert_eq!(
+        between_devices_error.kind(),
+        HvfArm64BootStorageCaptureErrorKind::Cancelled
+    );
+    assert_eq!(
+        persistence_visits, 4,
+        "cancellation should occur after both block owners and the first pmem owner"
+    );
+    assert!(!between_devices_error.cleanup_failed());
+    assert!(!between_devices_error.terminal());
+    let mut mmio_stages = Vec::new();
+    let mmio_graph = mmio_session
+        .capture_snapshot_v2_storage_device_graph_at_with_cancel(
+            &mmio_configs,
+            &mmio_guard,
+            Instant::now(),
+            |stage| {
+                mmio_stages.push(stage);
+                false
+            },
+        )
+        .expect("signed MMIO profile-3 storage graph should capture");
+    let last_drain = mmio_stages
+        .iter()
+        .rposition(|stage| *stage == HvfArm64BootStorageCaptureStage::DrainAsync)
+        .expect("profile-3 capture should observe Async drain");
+    let first_persist = mmio_stages
+        .iter()
+        .position(|stage| *stage == HvfArm64BootStorageCaptureStage::Persist)
+        .expect("profile-3 capture should observe persistence");
+    let first_publication = mmio_stages
+        .iter()
+        .position(|stage| *stage == HvfArm64BootStorageCaptureStage::PublishAsync)
+        .expect("profile-3 capture should observe completion publication");
+    let first_capture = mmio_stages
+        .iter()
+        .position(|stage| *stage == HvfArm64BootStorageCaptureStage::Capture)
+        .expect("profile-3 capture should observe live capture");
+    let first_composition = mmio_stages
+        .iter()
+        .position(|stage| *stage == HvfArm64BootStorageCaptureStage::ComposeGraph)
+        .expect("profile-3 capture should observe graph composition");
+    assert!(last_drain < first_persist);
+    assert!(first_persist < first_publication);
+    assert!(first_publication < first_capture);
+    assert!(first_capture < first_composition);
+    assert_eq!(
+        std::fs::read(mmio_pmem.path())
+            .expect("persisted MMIO pmem backing should read")
+            .first()
+            .copied(),
+        Some(0x5a)
+    );
+    assert_eq!(
+        mmio_graph.transport_kind(),
+        SnapshotV2DeviceTransportKind::Mmio
+    );
+    assert_eq!(mmio_graph.block_records().len(), 2);
+    assert_eq!(mmio_graph.pmem_records().len(), 2);
+    assert_eq!(
+        mmio_graph.root_key(),
+        Some(mmio_graph.block_records()[0].key())
+    );
+    assert_eq!(mmio_graph.pmem_records()[0].config().pmem_id(), "pmem0");
+    assert_eq!(
+        mmio_graph.pmem_records()[0].pmem().file_bytes(),
+        VIRTIO_PMEM_ALIGNMENT
+    );
+    assert!(mmio_graph.pmem_records()[1].config().is_read_only());
+    assert_eq!(
+        std::fs::read(mmio_read_only_pmem.path())
+            .expect("read-only MMIO pmem backing should read")
+            .first()
+            .copied(),
+        Some(0)
+    );
+    assert!(matches!(
+        mmio_graph.pmem_records()[0].transport(),
+        SnapshotV2DeviceTransport::Mmio(_)
+    ));
+    let mmio_graph_bytes = mmio_graph
+        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+        .expect("captured MMIO profile-3 graph should encode");
+    assert_eq!(
+        SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &mmio_graph_bytes,
+        )
+        .expect("captured MMIO profile-3 graph should decode"),
+        mmio_graph
+    );
+    assert_eq!(
+        mmio_session
+            .capture_snapshot_v2_storage_device_graph_at(
+                &mmio_configs,
+                &mmio_guard,
+                Instant::now(),
+            )
+            .expect("MMIO profile-3 capture should repeat"),
+        mmio_graph
+    );
+    mmio_session
+        .pause_for_snapshot_v2_capture()
+        .expect("MMIO profile-3 source should pause");
+    let mmio_boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(mmio_kernel.path().as_os_str())
+            .expect("MMIO profile-3 kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("MMIO profile-3 boot metadata should validate");
+    let mmio_memory = TempFile::new_len("capture-ready-mmio-profile-3-memory", 0)
+        .expect("MMIO profile-3 memory artifact should create");
+    let mut mmio_memory_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mmio_memory.path())
+        .expect("MMIO profile-3 memory artifact should open");
+    let mmio_platform = mmio_session
+        .capture_snapshot_v2_storage_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(mmio_boot),
+            &mut mmio_memory_writer,
+            |_| false,
+        )
+        .expect("MMIO exact 2.6 platform should capture");
+    assert_eq!(
+        mmio_platform.memory().version(),
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        mmio_memory_writer
+            .metadata()
+            .expect("MMIO profile-3 memory metadata should read")
+            .len(),
+        mmio_platform.memory().file_length()
+    );
+    let mmio_complete = HvfSnapshotV2StorageState::try_new(mmio_platform, mmio_graph.clone())
+        .expect("MMIO exact 2.6 platform and storage graph should compose");
+    assert_eq!(mmio_complete.device_graph(), &mmio_graph);
+    drop(mmio_memory_writer);
+    mmio_session
+        .resume_after_snapshot_v2_capture()
+        .expect("MMIO profile-3 source should resume after capture");
+
     let mmio_first = mmio_session
         .capture_ready_storage_state_at(&mmio_configs, &mmio_guard, Instant::now())
         .expect("signed MMIO storage should become capture-ready");
@@ -6989,7 +7200,7 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
         .expect("MMIO Async admission should reopen for a second capture");
 
     assert_eq!(mmio_first.block_devices().len(), 2);
-    assert_eq!(mmio_first.pmem_devices().len(), 1);
+    assert_eq!(mmio_first.pmem_devices().len(), 2);
     for (captured, configured) in mmio_first
         .block_devices()
         .iter()
@@ -7045,6 +7256,7 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
         path_text(mmio_root.path()),
         path_text(mmio_async.path()),
         path_text(mmio_pmem.path()),
+        path_text(mmio_read_only_pmem.path()),
     ] {
         assert!(!mmio_debug.contains(&private_path));
     }
@@ -7134,6 +7346,73 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
     let pci_guard = pci_session
         .quiesce_limiter_retry_wakeups()
         .expect("PCI retry publishers should quiesce");
+    for (index, byte) in [0x61_u8, 0x62].into_iter().enumerate() {
+        let mapping = pci_session.runtime_resources().pmem_devices[index].mapping();
+        // SAFETY: both retained prepared mappings are writable, and each
+        // one-byte write stays inside its exact file-backed prefix.
+        unsafe {
+            mapping.host_address().as_ptr().cast::<u8>().write(byte);
+        }
+    }
+    let pci_graph = pci_session
+        .capture_snapshot_v2_storage_device_graph_at(&pci_configs, &pci_guard, Instant::now())
+        .expect("signed startup/runtime PCI profile-3 graph should capture");
+    assert_eq!(
+        pci_graph.transport_kind(),
+        SnapshotV2DeviceTransportKind::Pci
+    );
+    assert_eq!(pci_graph.block_records().len(), 2);
+    assert_eq!(pci_graph.pmem_records().len(), 2);
+    assert_eq!(
+        pci_graph.root_key(),
+        Some(pci_graph.block_records()[0].key())
+    );
+    assert_eq!(
+        pci_graph
+            .pmem_records()
+            .iter()
+            .map(|record| match record.transport() {
+                SnapshotV2DeviceTransport::Pci(state) => state.origin(),
+                SnapshotV2DeviceTransport::Mmio(_) => {
+                    panic!("PCI pmem graph record must not use MMIO")
+                }
+            })
+            .collect::<Vec<_>>(),
+        vec![StorageDeviceOrigin::Startup, StorageDeviceOrigin::Runtime]
+    );
+    assert!(!pci_graph.pmem_records()[1].config().is_root());
+    assert_eq!(
+        std::fs::read(pci_startup_pmem.path())
+            .expect("persisted startup PCI pmem should read")
+            .first()
+            .copied(),
+        Some(0x61)
+    );
+    assert_eq!(
+        std::fs::read(pci_dynamic_pmem.path())
+            .expect("persisted runtime PCI pmem should read")
+            .first()
+            .copied(),
+        Some(0x62)
+    );
+    let pci_graph_bytes = pci_graph
+        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+        .expect("captured PCI profile-3 graph should encode");
+    assert_eq!(
+        SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &pci_graph_bytes,
+        )
+        .expect("captured PCI profile-3 graph should decode"),
+        pci_graph
+    );
+    assert_eq!(
+        pci_session
+            .capture_snapshot_v2_storage_device_graph_at(&pci_configs, &pci_guard, Instant::now(),)
+            .expect("PCI profile-3 capture should repeat"),
+        pci_graph
+    );
+
     let pci_first = pci_session
         .capture_ready_storage_state_at(&pci_configs, &pci_guard, Instant::now())
         .expect("signed startup/runtime PCI storage should become capture-ready");

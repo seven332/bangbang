@@ -50,39 +50,7 @@ fn capture_multi_block_graph(
         .map_err(|_| SnapshotV2MultiBlockDeviceGraphCaptureError::Allocation)?;
     let mut transport_kind = None;
     for (index, state) in states.iter().enumerate() {
-        let config = capture_multi_block_config(state)?;
-        let block = capture_multi_block_state(state, &config)?;
-        let expected_features = VirtioBlockConfigSpace::new(
-            block.backing_bytes,
-            config.is_read_only,
-            config.cache_type,
-        )
-        .available_features();
-        let (record_transport_kind, virtio, transport) = match state.transport() {
-            StorageTransportState::Mmio(mmio) => (
-                SnapshotV2DeviceTransportKind::Mmio,
-                capture_mmio_common(mmio.transport(), expected_features)
-                    .map_err(map_capture_error)?,
-                SnapshotV2DeviceTransport::Mmio(
-                    capture_mmio_transport(mmio.region(), mmio.interrupt_line(), mmio.transport())
-                        .map_err(map_capture_error)?,
-                ),
-            ),
-            StorageTransportState::Pci(pci) => (
-                SnapshotV2DeviceTransportKind::Pci,
-                capture_pci_common(pci.transport(), expected_features)
-                    .map_err(map_capture_error)?,
-                SnapshotV2DeviceTransport::Pci(
-                    capture_pci_transport_parts(
-                        pci.origin(),
-                        pci.sbdf(),
-                        pci.bar_range(),
-                        pci.transport(),
-                    )
-                    .map_err(map_capture_error)?,
-                ),
-            ),
-        };
+        let (record_transport_kind, record) = capture_multi_block_record(index, state)?;
         match transport_kind {
             None => transport_kind = Some(record_transport_kind),
             Some(expected) if expected == record_transport_kind => {}
@@ -90,15 +58,7 @@ fn capture_multi_block_graph(
                 return Err(SnapshotV2MultiBlockDeviceGraphCaptureError::UnsupportedInventory);
             }
         }
-        let instance = u32::try_from(index)
-            .map_err(|_| SnapshotV2MultiBlockDeviceGraphCaptureError::UnsupportedInventory)?;
-        records.push(SnapshotV2MultiBlockDeviceRecord {
-            key: SnapshotV2DeviceKey::block(instance),
-            config,
-            block,
-            virtio,
-            transport,
-        });
+        records.push(record);
     }
 
     let root_key = records
@@ -113,6 +73,58 @@ fn capture_multi_block_graph(
     .map_err(|_| SnapshotV2MultiBlockDeviceGraphCaptureError::InvalidGraph)
 }
 
+pub(crate) fn capture_multi_block_record(
+    index: usize,
+    state: &CaptureReadyBlockDeviceState,
+) -> Result<
+    (
+        SnapshotV2DeviceTransportKind,
+        SnapshotV2MultiBlockDeviceRecord,
+    ),
+    SnapshotV2MultiBlockDeviceGraphCaptureError,
+> {
+    let config = capture_multi_block_config(state)?;
+    let block = capture_multi_block_state(state, &config)?;
+    let expected_features =
+        VirtioBlockConfigSpace::new(block.backing_bytes, config.is_read_only, config.cache_type)
+            .available_features();
+    let (transport_kind, virtio, transport) = match state.transport() {
+        StorageTransportState::Mmio(mmio) => (
+            SnapshotV2DeviceTransportKind::Mmio,
+            capture_mmio_common(mmio.transport(), expected_features).map_err(map_capture_error)?,
+            SnapshotV2DeviceTransport::Mmio(
+                capture_mmio_transport(mmio.region(), mmio.interrupt_line(), mmio.transport())
+                    .map_err(map_capture_error)?,
+            ),
+        ),
+        StorageTransportState::Pci(pci) => (
+            SnapshotV2DeviceTransportKind::Pci,
+            capture_pci_common(pci.transport(), expected_features).map_err(map_capture_error)?,
+            SnapshotV2DeviceTransport::Pci(
+                capture_pci_transport_parts(
+                    pci.origin(),
+                    pci.sbdf(),
+                    pci.bar_range(),
+                    pci.transport(),
+                )
+                .map_err(map_capture_error)?,
+            ),
+        ),
+    };
+    let instance = u32::try_from(index)
+        .map_err(|_| SnapshotV2MultiBlockDeviceGraphCaptureError::UnsupportedInventory)?;
+    Ok((
+        transport_kind,
+        SnapshotV2MultiBlockDeviceRecord {
+            key: SnapshotV2DeviceKey::block(instance),
+            config,
+            block,
+            virtio,
+            transport,
+        },
+    ))
+}
+
 fn preflight_capture_configs(
     compatibility_version: SnapshotFormatVersion,
     configs: &[crate::block::DriveConfig],
@@ -124,7 +136,7 @@ fn preflight_capture_configs(
     preflight_capture_config_refs(compatibility_version, &refs)
 }
 
-fn preflight_capture_config_refs(
+pub(crate) fn preflight_capture_config_refs(
     compatibility_version: SnapshotFormatVersion,
     configs: &[&crate::block::DriveConfig],
 ) -> Result<(), SnapshotV2MultiBlockDeviceGraphCaptureError> {

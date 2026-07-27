@@ -83,9 +83,10 @@ use crate::pci::{
 };
 use crate::pmem::{
     PmemConfig, PmemFileBacking, PmemMmioDeviceRegistration, PmemMmioLayout,
-    PmemMmioRegistrationError, PmemUpdate, PmemUpdateError, PreparedPmemDevice,
-    PreparedPmemDeviceError, PreparedPmemDevices, VirtioPmemDeviceNotificationDispatch,
-    VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus, VirtioPmemMmioHandler,
+    PmemMmioRegistrationError, PmemSnapshotPersistenceBinding, PmemUpdate, PmemUpdateError,
+    PreparedPmemDevice, PreparedPmemDeviceError, PreparedPmemDevices,
+    VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus,
+    VirtioPmemMmioHandler,
 };
 use crate::pvtime::{
     Arm64PvTimeLayout, Arm64PvTimeLayoutError, initialize_arm64_pvtime_records_with,
@@ -3130,6 +3131,7 @@ pub enum Arm64BootStorageCaptureError {
     PmemMetadata,
     PmemHandler,
     PmemBacking,
+    PmemPersistencePreflight,
     PmemCapture,
 }
 
@@ -3147,6 +3149,7 @@ impl fmt::Debug for Arm64BootStorageCaptureError {
             Self::PmemMetadata => "PmemMetadata",
             Self::PmemHandler => "PmemHandler",
             Self::PmemBacking => "PmemBacking",
+            Self::PmemPersistencePreflight => "PmemPersistencePreflight",
             Self::PmemCapture => "PmemCapture",
         };
         formatter
@@ -3171,6 +3174,7 @@ impl Arm64BootStorageCaptureError {
             | Self::PmemMetadata
             | Self::PmemHandler
             | Self::PmemBacking
+            | Self::PmemPersistencePreflight
             | Self::PmemCapture => None,
         }
     }
@@ -3198,6 +3202,9 @@ impl fmt::Display for Arm64BootStorageCaptureError {
             Self::PmemMetadata => formatter.write_str("live MMIO pmem metadata is inconsistent"),
             Self::PmemHandler => formatter.write_str("live MMIO pmem handler is unavailable"),
             Self::PmemBacking => formatter.write_str("live pmem backing identity is unavailable"),
+            Self::PmemPersistencePreflight => {
+                formatter.write_str("live pmem persistence preflight failed")
+            }
             Self::PmemCapture => formatter.write_str("live MMIO pmem capture failed"),
         }
     }
@@ -3441,6 +3448,15 @@ impl Arm64BootRuntimeResources {
             retry,
             captured,
         ))
+    }
+
+    pub fn capture_ready_pmem_snapshot_persistence_binding(
+        &self,
+        config: &PmemConfig,
+    ) -> Result<PmemSnapshotPersistenceBinding, Arm64BootStorageCaptureError> {
+        unique_prepared_pmem_device(&self.pmem_devices, config.id())?
+            .snapshot_persistence_binding(config)
+            .map_err(|_| Arm64BootStorageCaptureError::PmemPersistencePreflight)
     }
 
     pub fn capture_snapshot_v1_device_state_at(
