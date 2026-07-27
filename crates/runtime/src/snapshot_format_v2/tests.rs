@@ -1,4 +1,5 @@
 use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+use crate::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format::{
     NativeSnapshotFormatError, NativeSnapshotState, decode_native_snapshot_state,
@@ -202,7 +203,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn device_graph_starts_at_four_current_is_five_and_explicit_ceiling_is_six() {
+fn device_graph_starts_at_four_and_storage_profile_is_current_at_six() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -211,7 +212,11 @@ fn device_graph_starts_at_four_current_is_five_and_explicit_ceiling_is_six() {
     );
     assert_eq!(
         NATIVE_V2_SNAPSHOT_VERSION,
-        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        SnapshotFormatVersion::new(2, 5, 0)
     );
 
     let graph = SnapshotV2Component::new(
@@ -251,7 +256,7 @@ fn device_graph_starts_at_four_current_is_five_and_explicit_ceiling_is_six() {
             .expect("current state should decode")
             .metadata()
             .version(),
-        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
     );
 
     let downgraded = with_u16_field_and_checksum(&encoded, VERSION_MINOR_OFFSET, 3);
@@ -311,11 +316,11 @@ fn device_graph_starts_at_four_current_is_five_and_explicit_ceiling_is_six() {
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
     );
     assert_eq!(
-        decode_snapshot_v2_state(&internal),
-        Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-            supported: NATIVE_V2_SNAPSHOT_VERSION,
-        })
+        decode_snapshot_v2_state(&internal)
+            .expect("exact 2.6 should decode through the current public seam")
+            .metadata()
+            .version(),
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
     );
 
     let future = SnapshotFormatVersion::new(2, 7, 0);
@@ -391,11 +396,11 @@ fn version_policy_rejects_major_and_newer_minor_but_accepts_patch() {
         })
     );
 
-    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 6);
+    let minor = with_u16_field(&EMPTY_V2_FIXTURE, VERSION_MINOR_OFFSET, 7);
     assert_eq!(
         decode_snapshot_v2_state(&minor),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
-            found: SnapshotFormatVersion::new(2, 6, 0),
+            found: SnapshotFormatVersion::new(2, 7, 0),
             supported: NATIVE_V2_SNAPSHOT_VERSION,
         })
     );

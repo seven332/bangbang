@@ -794,6 +794,11 @@ impl DriveConfigs {
         Ok(Self { configs })
     }
 
+    /// Retains an already-validated configuration set in canonical order.
+    pub(crate) fn from_validated(configs: Vec<DriveConfig>) -> Self {
+        Self { configs }
+    }
+
     pub fn insert(&mut self, input: DriveConfigInput) -> Result<(), DriveConfigError> {
         let config = self.validate_insert(input)?;
         self.commit_insert(config);

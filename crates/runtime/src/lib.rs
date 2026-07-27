@@ -1534,12 +1534,19 @@ impl VmmController {
         &mut self,
         commit: snapshot::SnapshotV2ControllerCommit,
     ) -> bool {
-        let (machine_config, boot_source_config, drive_configs, serial_config, resume_requested) =
-            commit.into_parts();
+        let (
+            machine_config,
+            boot_source_config,
+            drive_configs,
+            pmem_configs,
+            serial_config,
+            resume_requested,
+        ) = commit.into_parts();
         self.machine_config = machine_config;
         self.custom_cpu_template = None;
         self.boot_source_config = Some(boot_source_config);
         self.drive_configs = drive_configs;
+        self.pmem_configs = pmem_configs;
         self.serial_config = serial_config;
         self.snapshot_load_history_fresh = false;
         self.instance_info.state = InstanceState::Paused;
@@ -2238,14 +2245,15 @@ mod tests {
             NetworkRateLimiterConfig, NetworkRuntimeMutationError, NetworkTokenBucketConfig,
         },
         pmem::{
-            PmemConfigError, PmemConfigInput, PmemRateLimiterConfig, PmemTokenBucketConfig,
-            PmemUpdateError, PmemUpdateInput,
+            PmemConfig, PmemConfigError, PmemConfigInput, PmemRateLimiterConfig,
+            PmemTokenBucketConfig, PmemUpdateError, PmemUpdateInput,
         },
         serial::{SerialConfigError, SerialConfigInput, SerialRateLimiterConfig},
         snapshot::{
             SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend,
             SnapshotMemoryBackendType, SnapshotType, SnapshotV2ControllerCommit,
         },
+        storage_capture::CaptureReadyStorageConfigs,
         vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
     };
 
@@ -3521,6 +3529,50 @@ mod tests {
         assert!(!controller.commit_snapshot_v2_load(commit));
         assert_eq!(controller.instance_info().state, InstanceState::Paused);
         assert_eq!(controller.drive_configs(), &[root]);
+    }
+
+    #[test]
+    fn private_native_v2_storage_commit_atomically_publishes_block_and_pmem() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "stale",
+                "/private/stale.img",
+                true,
+            )))
+            .expect("stale drive fixture should configure");
+        controller
+            .handle_action(VmmAction::PutPmem(pmem_input(
+                "stale_pmem",
+                "/private/stale-pmem.img",
+            )))
+            .expect("stale pmem fixture should configure");
+
+        let machine = MachineConfigInput::new(2, 256)
+            .validate()
+            .expect("restored machine fixture should validate");
+        let boot = BootSourceConfigInput::new("/inert/source/kernel")
+            .validate()
+            .expect("inert boot metadata should validate");
+        let drive = drive_input("restored", "/private/restored.img", true)
+            .with_is_read_only(true)
+            .validate()
+            .expect("restored drive fixture should validate");
+        let pmem = PmemConfig::try_from(
+            pmem_input("restored_pmem", "/private/restored-pmem.img").with_read_only(true),
+        )
+        .expect("restored pmem fixture should validate");
+        let commit = SnapshotV2ControllerCommit::with_storage_configs(
+            machine,
+            boot,
+            CaptureReadyStorageConfigs::new(vec![drive.clone()], vec![pmem.clone()]),
+            true,
+        );
+
+        assert!(controller.commit_snapshot_v2_load(commit));
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert_eq!(controller.drive_configs(), &[drive]);
+        assert_eq!(controller.pmem_configs(), &[pmem]);
     }
 
     #[test]

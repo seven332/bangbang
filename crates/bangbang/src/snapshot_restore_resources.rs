@@ -3276,7 +3276,7 @@ impl RequestedSnapshotRestoreResources {
         }
     }
 
-    /// Dormant profile-3 pathless bundle producer. It performs pure loaded-
+    /// Active profile-3 pathless bundle producer. It performs pure loaded-
     /// memory planning before opening or taking one backing and retains the
     /// aggregate completion without publishing transport, controller, or VM
     /// state.
@@ -3450,8 +3450,8 @@ impl RequestedSnapshotRestoreResources {
         .into_drive_batch()
     }
 
-    /// Typed exact-2.6 resource producer retained for the pathless storage
-    /// reconstruction child.
+    /// Typed exact-2.6 resource producer used by the active pathless storage
+    /// restore transaction.
     pub(crate) fn prepare_native_v2_storage_device_graph<F>(
         graph: &SnapshotV2StorageDeviceGraph,
         authority: Option<&ContainedSnapshotRestoreAuthority>,
@@ -3473,8 +3473,8 @@ impl RequestedSnapshotRestoreResources {
     pub(crate) fn try_from_native_v2_device_graph(
         graph: &SnapshotV2DeviceGraph,
     ) -> Result<Self, SnapshotRestoreResourceError> {
-        // Keep the dormant typed producer linked without admitting profile 2
-        // to public dispatch.
+        // Keep every versioned producer linked; public dispatch selects one
+        // exact graph profile before reaching this compatibility projection.
         let _profile_2_producer = Self::prepare_native_v2_multi_block_device_graph::<fn() -> bool>;
         let _profile_2_bundle_producer =
             Self::prepare_native_v2_multi_block_restore_bundle::<fn() -> bool>;

@@ -122,8 +122,8 @@ fn closed_native_state_derives_v2_binding_and_redacts_owned_bytes() {
     assert_eq!(
         state
             .v2_profile()
-            .expect("current state should classify as exact profile 2"),
-        NativeV2SnapshotArtifactProfile::MultiBlockDeviceGraphV2_5
+            .expect("current state should classify as exact profile 3"),
+        NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6
     );
     assert!(state.v1_record().is_none());
     let debug = format!("{state:?}");
@@ -281,7 +281,7 @@ fn current_v2_artifact_boundary_rejects_graphless_minor_five() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn current_v2_artifact_boundary_rejects_internal_exact_minor_six() {
+fn current_v2_artifact_boundary_accepts_exact_minor_six_storage() {
     let memory = test_v2_memory();
     let mut image = Cursor::new(Vec::new());
     let binding = write_snapshot_v2_memory_image_with_compatibility_version(
@@ -315,17 +315,14 @@ fn current_v2_artifact_boundary_rejects_internal_exact_minor_six() {
     )
     .expect("internal minor-six state should encode explicitly");
 
-    assert!(matches!(
-        NativeSnapshotArtifactState::from_current_v2(bytes),
-        Err(NativeSnapshotArtifactStateError::CurrentV2Profile(
-            NativeV2SnapshotCandidateStateError::Format(
-                SnapshotV2DecodeError::UnsupportedVersion {
-                    found: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-                    supported: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-                }
-            )
-        ))
-    ));
+    let state = NativeSnapshotArtifactState::from_current_v2(bytes)
+        .expect("exact minor-six storage state should be current");
+    assert_eq!(
+        state
+            .v2_profile()
+            .expect("exact minor-six state should classify"),
+        NativeV2SnapshotArtifactProfile::StorageDeviceGraphV2_6
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -563,7 +560,7 @@ fn exact_profile_classifier_retains_minor_three_and_rejects_cross_minor_graphs()
     assert!(matches!(
         current_with_old_graph.v2_profile(),
         Err(NativeSnapshotArtifactStateError::V2Profile(
-            NativeV2SnapshotCandidateStateError::MultiBlockDeviceGraph(_)
+            NativeV2SnapshotCandidateStateError::StorageDeviceGraph(_)
         ))
     ));
 
@@ -2623,7 +2620,7 @@ fn test_v2_memory() -> GuestMemory {
 fn current_v2_state(binding: &SnapshotV2MemoryBinding) -> Result<Vec<u8>, String> {
     let binding_payload = binding.encode().map_err(|source| source.to_string())?;
     let graph_payload = fixture_bytes(include_str!(
-        "../snapshot_device_v2_5/fixtures/root-mmio.hex"
+        "../snapshot_device_v2_6/fixtures/block-root-mmio.hex"
     ));
     let components = [
         SnapshotV2Component::new(
