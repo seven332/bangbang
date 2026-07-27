@@ -647,6 +647,23 @@ fn pmem_strings_limiter_queue_interrupt_and_root_invariants_fail_closed() {
         .is_err()
     );
 
+    let mut unicode = fixture_graph(SnapshotV2DeviceTransportKind::Mmio, 0, 1, None);
+    unicode.pmem_records[0].config =
+        SnapshotV2PmemConfig::try_new("pmem_设备1", false, false, None, "unicode-selector")
+            .expect("public Unicode alphanumeric pmem ID should remain valid");
+    unicode.pmem_records[0].pmem.limiter = SnapshotV2PmemLimiterState::new(None, None);
+    unicode.pmem_records[0].pmem.pending_rate_limited_queue = false;
+    unicode.pmem_records[0].pmem.retry = StorageRetryState::None;
+    let bytes = encoded(&unicode);
+    assert_eq!(
+        SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &bytes,
+        )
+        .expect("Unicode pmem ID should decode"),
+        unicode
+    );
+
     let baseline = fixture_graph(
         SnapshotV2DeviceTransportKind::Mmio,
         0,

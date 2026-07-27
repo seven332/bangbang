@@ -928,14 +928,13 @@ fn preflight_pmem_config(bytes: &[u8]) -> Result<usize, SnapshotV2StorageDeviceG
     if aligned_length(semantic_length) != Some(bytes.len()) {
         return Err(SnapshotV2StorageDeviceGraphDecodeError::InvalidStructure);
     }
-    let pmem_id = reader.read_bytes(pmem_id_len)?;
-    let selector = reader.read_bytes(selector_len)?;
+    let pmem_id = std::str::from_utf8(reader.read_bytes(pmem_id_len)?)
+        .map_err(|_| SnapshotV2StorageDeviceGraphDecodeError::InvalidString)?;
+    std::str::from_utf8(reader.read_bytes(selector_len)?)
+        .map_err(|_| SnapshotV2StorageDeviceGraphDecodeError::InvalidString)?;
     if !pmem_id
-        .iter()
-        .copied()
-        .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-        || std::str::from_utf8(pmem_id).is_err()
-        || std::str::from_utf8(selector).is_err()
+        .chars()
+        .all(|character| character == '_' || character.is_alphanumeric())
     {
         return Err(SnapshotV2StorageDeviceGraphDecodeError::InvalidString);
     }

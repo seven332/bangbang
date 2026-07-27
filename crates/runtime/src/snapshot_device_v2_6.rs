@@ -761,8 +761,8 @@ fn validate_pmem_config(config: &SnapshotV2PmemConfig) -> Result<(), GraphValida
         || config.pmem_id.len() > NATIVE_V2_STORAGE_DEVICE_GRAPH_MAX_PMEM_ID_BYTES
         || !config
             .pmem_id
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+            .chars()
+            .all(|character| character == '_' || character.is_alphanumeric())
         || config.selector.is_empty()
         || config.selector.len() > NATIVE_V2_STORAGE_DEVICE_GRAPH_MAX_SELECTOR_BYTES
     {
