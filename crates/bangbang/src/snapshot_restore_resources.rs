@@ -22,7 +22,10 @@ use bangbang_runtime::snapshot_device_v2_5::{
     SnapshotV2MultiBlockCleanupError, SnapshotV2MultiBlockDeviceGraph,
     SnapshotV2MultiBlockRestorePlan, SnapshotV2MultiBlockRestorePlanError,
 };
-use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
+use bangbang_runtime::snapshot_device_v2_6::{
+    PreparedSnapshotV2StorageBundle, SnapshotV2StorageBundleError, SnapshotV2StorageCleanupError,
+    SnapshotV2StorageDeviceGraph, SnapshotV2StorageRestorePlan, SnapshotV2StorageRestorePlanError,
+};
 use bangbang_runtime::snapshot_restore::{
     PreparedSnapshotRestoreBindings, SnapshotRestoreBindingAllocationError,
     SnapshotRestoreBindingRejectionReason, SnapshotRestoreBindings, SnapshotRestoreManifest,
@@ -2285,6 +2288,16 @@ impl Drop for PreparedSnapshotDriveRestoreCompletion {
     }
 }
 
+fn abort_drive_completion_outcome(
+    completion: PreparedSnapshotDriveRestoreCompletion,
+) -> SnapshotRestoreAbortOutcome {
+    if completion.abort().is_err() {
+        SnapshotRestoreAbortOutcome::terminal(true)
+    } else {
+        SnapshotRestoreAbortOutcome::retryable()
+    }
+}
+
 impl fmt::Debug for PreparedSnapshotDriveRestoreCompletion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -2639,6 +2652,398 @@ impl std::error::Error for PreparedSnapshotV2MultiBlockRestoreAbortError {
     }
 }
 
+/// Process-owned composition of one pathless profile-3 storage bundle and
+/// its aggregate provisional backing authority.
+pub(crate) struct PreparedSnapshotV2StorageRestoreBundle {
+    bundle: Option<PreparedSnapshotV2StorageBundle>,
+    completion: Option<PreparedSnapshotDriveRestoreCompletion>,
+}
+
+impl PreparedSnapshotV2StorageRestoreBundle {
+    pub(crate) const fn bundle(&self) -> Option<&PreparedSnapshotV2StorageBundle> {
+        self.bundle.as_ref()
+    }
+
+    pub(crate) fn construct_destination<D, E>(
+        mut self,
+        construct: impl FnOnce(PreparedSnapshotV2StorageBundle) -> Result<D, E>,
+    ) -> Result<
+        PreparedSnapshotV2StorageDestination<D>,
+        PreparedSnapshotV2StorageDestinationConstructionError<E>,
+    > {
+        let Some(bundle) = self.bundle.take() else {
+            return Err(
+                PreparedSnapshotV2StorageDestinationConstructionError::InvalidState {
+                    bundle_cleanup: None,
+                },
+            );
+        };
+        let Some(completion) = self.completion.take() else {
+            return Err(
+                PreparedSnapshotV2StorageDestinationConstructionError::InvalidState {
+                    bundle_cleanup: bundle.abort().err(),
+                },
+            );
+        };
+        match construct(bundle) {
+            Ok(destination) => Ok(PreparedSnapshotV2StorageDestination {
+                destination: Some(destination),
+                completion: Some(completion),
+            }),
+            Err(source) => Err(
+                PreparedSnapshotV2StorageDestinationConstructionError::Construction {
+                    source,
+                    completion_abort: completion.abort().err(),
+                },
+            ),
+        }
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), PreparedSnapshotV2StorageRestoreAbortError> {
+        let bundle = self.bundle.take().and_then(|bundle| bundle.abort().err());
+        let completion = self
+            .completion
+            .take()
+            .and_then(|completion| completion.abort().err());
+        if bundle.is_some() || completion.is_some() {
+            Err(PreparedSnapshotV2StorageRestoreAbortError { bundle, completion })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for PreparedSnapshotV2StorageRestoreBundle {
+    fn drop(&mut self) {
+        if let Some(bundle) = self.bundle.take() {
+            let _ = bundle.abort();
+        }
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.abort();
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2StorageRestoreBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2StorageRestoreBundle")
+            .field(
+                "block_count",
+                &self
+                    .bundle
+                    .as_ref()
+                    .and_then(PreparedSnapshotV2StorageBundle::block_bundle)
+                    .map_or(0, |bundle| bundle.records().len()),
+            )
+            .field(
+                "pmem_count",
+                &self
+                    .bundle
+                    .as_ref()
+                    .map_or(0, |bundle| bundle.pmem_records().len()),
+            )
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One complete private profile-3 destination whose backing authority remains
+/// provisional until its controller projection is also ready.
+pub(crate) struct PreparedSnapshotV2StorageDestination<D> {
+    destination: Option<D>,
+    completion: Option<PreparedSnapshotDriveRestoreCompletion>,
+}
+
+impl<D> PreparedSnapshotV2StorageDestination<D> {
+    pub(crate) fn commit<C, E, T>(
+        mut self,
+        prepare_controller: impl FnOnce(D) -> Result<(D, C), (D, E)>,
+        destroy_destination: impl FnOnce(D) -> Result<(), T>,
+    ) -> Result<(D, C), PreparedSnapshotV2StorageDestinationCommitError<E, T>> {
+        let destination = self
+            .destination
+            .take()
+            .ok_or(PreparedSnapshotV2StorageDestinationCommitError::InvalidState)?;
+        let completion = self
+            .completion
+            .take()
+            .ok_or(PreparedSnapshotV2StorageDestinationCommitError::InvalidState)?;
+        let (destination, controller) = match prepare_controller(destination) {
+            Ok(prepared) => prepared,
+            Err((destination, source)) => {
+                let destination_cleanup = destroy_destination(destination).err();
+                let completion_abort = completion.abort().err();
+                return Err(
+                    PreparedSnapshotV2StorageDestinationCommitError::Controller {
+                        source,
+                        destination_cleanup,
+                        completion_abort,
+                    },
+                );
+            }
+        };
+        match completion.commit() {
+            Ok(()) => Ok((destination, controller)),
+            Err(source) => {
+                let destination_cleanup = destroy_destination(destination).err();
+                Err(
+                    PreparedSnapshotV2StorageDestinationCommitError::Completion {
+                        source,
+                        destination_cleanup,
+                    },
+                )
+            }
+        }
+    }
+}
+
+impl<D> fmt::Debug for PreparedSnapshotV2StorageDestination<D> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2StorageDestination")
+            .field("state", &"<private-provisional>")
+            .finish()
+    }
+}
+
+pub(crate) enum PreparedSnapshotV2StorageDestinationConstructionError<E> {
+    InvalidState {
+        bundle_cleanup: Option<SnapshotV2StorageCleanupError>,
+    },
+    Construction {
+        source: E,
+        completion_abort: Option<PreparedSnapshotDriveRestoreCompletionError>,
+    },
+}
+
+impl<E> PreparedSnapshotV2StorageDestinationConstructionError<E> {
+    pub(crate) const fn is_terminal(&self) -> bool {
+        match self {
+            Self::InvalidState { .. }
+            | Self::Construction {
+                completion_abort: Some(_),
+                ..
+            } => true,
+            Self::Construction {
+                completion_abort: None,
+                ..
+            } => false,
+        }
+    }
+}
+
+impl<E> fmt::Debug for PreparedSnapshotV2StorageDestinationConstructionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::InvalidState { .. } => "invalid-state",
+            Self::Construction { .. } => "construction",
+        };
+        formatter
+            .debug_struct("PreparedSnapshotV2StorageDestinationConstructionError")
+            .field("kind", &kind)
+            .field("terminal", &self.is_terminal())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<E> fmt::Display for PreparedSnapshotV2StorageDestinationConstructionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidState { .. } => {
+                "snapshot storage destination construction state is invalid"
+            }
+            Self::Construction { .. } => "snapshot storage destination construction failed",
+        })
+    }
+}
+
+impl<E> std::error::Error for PreparedSnapshotV2StorageDestinationConstructionError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidState { bundle_cleanup } => bundle_cleanup
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+            Self::Construction { source, .. } => Some(source),
+        }
+    }
+}
+
+pub(crate) enum PreparedSnapshotV2StorageDestinationCommitError<E, T> {
+    InvalidState,
+    Controller {
+        source: E,
+        destination_cleanup: Option<T>,
+        completion_abort: Option<PreparedSnapshotDriveRestoreCompletionError>,
+    },
+    Completion {
+        source: PreparedSnapshotDriveRestoreCompletionError,
+        destination_cleanup: Option<T>,
+    },
+}
+
+impl<E, T> PreparedSnapshotV2StorageDestinationCommitError<E, T> {
+    pub(crate) const fn is_terminal(&self) -> bool {
+        match self {
+            Self::InvalidState => true,
+            Self::Controller {
+                destination_cleanup,
+                completion_abort,
+                ..
+            } => destination_cleanup.is_some() || completion_abort.is_some(),
+            Self::Completion {
+                destination_cleanup,
+                ..
+            } => {
+                let _cleanup_failed = destination_cleanup.is_some();
+                true
+            }
+        }
+    }
+}
+
+impl<E, T> fmt::Debug for PreparedSnapshotV2StorageDestinationCommitError<E, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::InvalidState => "invalid-state",
+            Self::Controller { .. } => "controller",
+            Self::Completion { .. } => "completion",
+        };
+        formatter
+            .debug_struct("PreparedSnapshotV2StorageDestinationCommitError")
+            .field("kind", &kind)
+            .field("terminal", &self.is_terminal())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<E, T> fmt::Display for PreparedSnapshotV2StorageDestinationCommitError<E, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidState => "snapshot storage destination commit state is invalid",
+            Self::Controller { .. } => {
+                "snapshot storage controller preparation failed before completion"
+            }
+            Self::Completion { .. } => {
+                "snapshot storage backing completion failed after destination construction"
+            }
+        })
+    }
+}
+
+impl<E, T> std::error::Error for PreparedSnapshotV2StorageDestinationCommitError<E, T>
+where
+    E: std::error::Error + 'static,
+    T: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Controller { source, .. } => Some(source),
+            Self::Completion { source, .. } => Some(source),
+            Self::InvalidState => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedSnapshotV2StorageRestoreAbortError {
+    bundle: Option<SnapshotV2StorageCleanupError>,
+    completion: Option<PreparedSnapshotDriveRestoreCompletionError>,
+}
+
+impl fmt::Display for PreparedSnapshotV2StorageRestoreAbortError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("snapshot storage restore bundle cleanup failed")
+    }
+}
+
+impl std::error::Error for PreparedSnapshotV2StorageRestoreAbortError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.bundle
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.completion
+                    .as_ref()
+                    .map(|source| source as &(dyn std::error::Error + 'static))
+            })
+    }
+}
+
+pub(crate) enum SnapshotV2StorageRestoreBundleError {
+    Resources(SnapshotRestoreResourceError),
+    Plan(SnapshotV2StorageRestorePlanError),
+    Bundle {
+        source: SnapshotV2StorageBundleError,
+        completion_abort: Option<PreparedSnapshotDriveRestoreCompletionError>,
+    },
+}
+
+impl SnapshotV2StorageRestoreBundleError {
+    pub(crate) const fn disposition(&self) -> SnapshotRestoreResourceDisposition {
+        match self {
+            Self::Resources(source) => source.disposition(),
+            Self::Plan(
+                SnapshotV2StorageRestorePlanError::Allocation
+                | SnapshotV2StorageRestorePlanError::Block(
+                    SnapshotV2MultiBlockRestorePlanError::Allocation,
+                ),
+            ) => SnapshotRestoreResourceDisposition::Retryable,
+            Self::Plan(_) => SnapshotRestoreResourceDisposition::Terminal,
+            Self::Bundle {
+                completion_abort: Some(_),
+                ..
+            } => SnapshotRestoreResourceDisposition::Terminal,
+            Self::Bundle {
+                source,
+                completion_abort: None,
+            } if source.is_retryable() => SnapshotRestoreResourceDisposition::Retryable,
+            Self::Bundle { .. } => SnapshotRestoreResourceDisposition::Terminal,
+        }
+    }
+}
+
+impl fmt::Debug for SnapshotV2StorageRestoreBundleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Resources(_) => "Resources",
+            Self::Plan(_) => "Plan",
+            Self::Bundle { .. } => "Bundle",
+        };
+        formatter
+            .debug_struct("SnapshotV2StorageRestoreBundleError")
+            .field("kind", &kind)
+            .field("disposition", &self.disposition())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2StorageRestoreBundleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "snapshot storage restore bundle preparation failed ({:?})",
+            self.disposition()
+        )
+    }
+}
+
+impl std::error::Error for SnapshotV2StorageRestoreBundleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Resources(source) => Some(source),
+            Self::Plan(source) => Some(source),
+            Self::Bundle { source, .. } => Some(source),
+        }
+    }
+}
+
 pub(crate) enum SnapshotV2MultiBlockRestoreBundleError {
     Resources(SnapshotRestoreResourceError),
     Plan(SnapshotV2MultiBlockRestorePlanError),
@@ -2871,6 +3276,156 @@ impl RequestedSnapshotRestoreResources {
         }
     }
 
+    /// Dormant profile-3 pathless bundle producer. It performs pure loaded-
+    /// memory planning before opening or taking one backing and retains the
+    /// aggregate completion without publishing transport, controller, or VM
+    /// state.
+    pub(crate) fn prepare_native_v2_storage_restore_bundle<F>(
+        graph: SnapshotV2StorageDeviceGraph,
+        memory: &GuestMemory,
+        now: Instant,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: F,
+    ) -> Result<PreparedSnapshotV2StorageRestoreBundle, SnapshotV2StorageRestoreBundleError>
+    where
+        F: Fn() -> bool,
+    {
+        let _bundle = PreparedSnapshotV2StorageRestoreBundle::bundle;
+        let _construct = |prepared: PreparedSnapshotV2StorageRestoreBundle| {
+            prepared.construct_destination(Ok::<_, std::convert::Infallible>)
+        };
+        let _commit = |destination: PreparedSnapshotV2StorageDestination<()>| {
+            destination.commit(
+                |destination| Ok::<_, ((), std::convert::Infallible)>((destination, ())),
+                |_| Ok::<_, std::convert::Infallible>(()),
+            )
+        };
+        let _abort = PreparedSnapshotV2StorageRestoreBundle::abort;
+        Self::prepare_native_v2_storage_restore_bundle_with(
+            graph,
+            memory,
+            now,
+            authority,
+            cancelled,
+            |plan, blocks, pmems, cancelled| plan.prepare_backings(blocks, pmems, cancelled),
+        )
+    }
+
+    fn prepare_native_v2_storage_restore_bundle_with<F, B>(
+        graph: SnapshotV2StorageDeviceGraph,
+        memory: &GuestMemory,
+        now: Instant,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: F,
+        build_bundle: B,
+    ) -> Result<PreparedSnapshotV2StorageRestoreBundle, SnapshotV2StorageRestoreBundleError>
+    where
+        F: Fn() -> bool,
+        B: FnOnce(
+            SnapshotV2StorageRestorePlan,
+            Vec<BlockFileBacking>,
+            Vec<PmemFileBacking>,
+            &F,
+        ) -> Result<PreparedSnapshotV2StorageBundle, SnapshotV2StorageBundleError>,
+    {
+        let mut expected_keys = Vec::new();
+        expected_keys
+            .try_reserve_exact(graph.record_count())
+            .map_err(|_| {
+                SnapshotV2StorageRestoreBundleError::Plan(
+                    SnapshotV2StorageRestorePlanError::Allocation,
+                )
+            })?;
+        expected_keys.extend(
+            graph
+                .block_records()
+                .iter()
+                .map(|record| (record.key(), SnapshotRestoreResourceClass::BlockBacking))
+                .chain(
+                    graph
+                        .pmem_records()
+                        .iter()
+                        .map(|record| (record.key(), SnapshotRestoreResourceClass::PmemBacking)),
+                ),
+        );
+        let requested =
+            RequestedSnapshotStorageRestoreResources::try_from_native_v2_storage_device_graph(
+                &graph,
+            )
+            .map_err(SnapshotV2StorageRestoreBundleError::Resources)?;
+        let plan = SnapshotV2StorageRestorePlan::prepare(graph, memory, now)
+            .map_err(SnapshotV2StorageRestoreBundleError::Plan)?;
+        let batch = requested
+            .prepare(authority, &cancelled)
+            .and_then(PreparedSnapshotStorageRestoreResources::into_storage_batch)
+            .map_err(SnapshotV2StorageRestoreBundleError::Resources)?;
+        let (blocks, pmems, completion) = batch.into_parts();
+        let mut block_backings = Vec::new();
+        let mut pmem_backings = Vec::new();
+        if block_backings.try_reserve_exact(blocks.len()).is_err()
+            || pmem_backings.try_reserve_exact(pmems.len()).is_err()
+        {
+            drop(blocks);
+            drop(pmems);
+            let outcome = abort_drive_completion_outcome(completion);
+            return Err(SnapshotV2StorageRestoreBundleError::Resources(
+                SnapshotRestoreResourceError::retryable(
+                    SnapshotRestoreResourceStage::Finish,
+                    SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+                )
+                .with_abort_outcome(outcome),
+            ));
+        }
+
+        let mut expected = expected_keys.iter();
+        let mut valid = true;
+        for owner in blocks {
+            let (key, backing) = owner.into_parts();
+            valid &= expected.next().is_some_and(|(device_key, resource_class)| {
+                key.device_key() == *device_key
+                    && key.resource_class() == *resource_class
+                    && *resource_class == SnapshotRestoreResourceClass::BlockBacking
+            });
+            block_backings.push(backing);
+        }
+        for owner in pmems {
+            let (key, backing) = owner.into_parts();
+            valid &= expected.next().is_some_and(|(device_key, resource_class)| {
+                key.device_key() == *device_key
+                    && key.resource_class() == *resource_class
+                    && *resource_class == SnapshotRestoreResourceClass::PmemBacking
+            });
+            pmem_backings.push(backing);
+        }
+        valid &= expected.next().is_none();
+        if !valid {
+            drop(block_backings);
+            drop(pmem_backings);
+            let outcome = abort_drive_completion_outcome(completion);
+            return Err(SnapshotV2StorageRestoreBundleError::Resources(
+                SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Finish,
+                    SnapshotRestoreResourceErrorKind::InvalidStorageSet,
+                )
+                .with_abort_outcome(outcome),
+            ));
+        }
+
+        match build_bundle(plan, block_backings, pmem_backings, &cancelled) {
+            Ok(bundle) => Ok(PreparedSnapshotV2StorageRestoreBundle {
+                bundle: Some(bundle),
+                completion: Some(completion),
+            }),
+            Err(source) => {
+                let completion_abort = completion.abort().err();
+                Err(SnapshotV2StorageRestoreBundleError::Bundle {
+                    source,
+                    completion_abort,
+                })
+            }
+        }
+    }
+
     /// Typed profile-2 resource producer retained for focused handoff tests.
     ///
     /// Public activation consumes the composed restore-bundle variant above.
@@ -2924,6 +3479,8 @@ impl RequestedSnapshotRestoreResources {
         let _profile_2_bundle_producer =
             Self::prepare_native_v2_multi_block_restore_bundle::<fn() -> bool>;
         let _profile_3_producer = Self::prepare_native_v2_storage_device_graph::<fn() -> bool>;
+        let _profile_3_bundle_producer =
+            Self::prepare_native_v2_storage_restore_bundle::<fn() -> bool>;
         Self::try_from_native_v2_device_graph_and_vsock(graph, None)
     }
 
@@ -4049,6 +4606,75 @@ mod tests {
                     GuestAddress::new(queue.device_ring().raw_value() + 2),
                 )
                 .expect("profile-2 used cursor should write");
+        }
+        memory
+    }
+
+    fn storage_restore_memory(graph: &SnapshotV2StorageDeviceGraph) -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), 0x80_0000)
+                .expect("profile-3 restore memory range should validate"),
+        ])
+        .expect("profile-3 restore memory layout should validate");
+        let mut memory =
+            GuestMemory::allocate(&layout).expect("profile-3 restore memory should allocate");
+        for record in graph.block_records() {
+            let Some(cursor) = record.block().continuation().active_queue() else {
+                continue;
+            };
+            let queue = record
+                .virtio()
+                .queues()
+                .first()
+                .expect("profile-3 block queue should exist");
+            let available_index = if record.block().continuation().retry()
+                == bangbang_runtime::storage_capture::StorageRetryState::None
+            {
+                cursor.next_available()
+            } else {
+                cursor.next_available().wrapping_add(1)
+            };
+            memory
+                .write_slice(
+                    &available_index.to_le_bytes(),
+                    GuestAddress::new(queue.driver_ring().raw_value() + 2),
+                )
+                .expect("profile-3 block available cursor should write");
+            memory
+                .write_slice(
+                    &cursor.next_used().to_le_bytes(),
+                    GuestAddress::new(queue.device_ring().raw_value() + 2),
+                )
+                .expect("profile-3 block used cursor should write");
+        }
+        for record in graph.pmem_records() {
+            let Some(cursor) = record.pmem().active_queue() else {
+                continue;
+            };
+            let queue = record
+                .virtio()
+                .queues()
+                .first()
+                .expect("profile-3 pmem queue should exist");
+            let available_index = if record.pmem().retry()
+                == bangbang_runtime::storage_capture::StorageRetryState::None
+            {
+                cursor.next_available()
+            } else {
+                cursor.next_available().wrapping_add(1)
+            };
+            memory
+                .write_slice(
+                    &available_index.to_le_bytes(),
+                    GuestAddress::new(queue.driver_ring().raw_value() + 2),
+                )
+                .expect("profile-3 pmem available cursor should write");
+            memory
+                .write_slice(
+                    &cursor.next_used().to_le_bytes(),
+                    GuestAddress::new(queue.device_ring().raw_value() + 2),
+                )
+                .expect("profile-3 pmem used cursor should write");
         }
         memory
     }
@@ -5385,6 +6011,306 @@ mod tests {
             block_reference.as_path(),
             pmem_reference.as_path(),
         ] {
+            assert!(!diagnostics.contains(private.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[test]
+    fn profile_3_process_bundle_retains_runtime_owners_until_explicit_commit() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let template = storage_fixture_graph(&block_path, &pmem_path);
+        let block = TempRoot::new_sized_at(
+            block_path,
+            template.block_records()[0].block().backing_bytes(),
+        );
+        let pmem =
+            TempRoot::new_sized_at(pmem_path, template.pmem_records()[0].pmem().file_bytes());
+        let graph = storage_fixture_graph(block.path(), pmem.path());
+        let expected_root = graph.root_key();
+        let memory = storage_restore_memory(&graph);
+        let prepared = RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
+            graph,
+            &memory,
+            Instant::now(),
+            None,
+            || false,
+        )
+        .expect("profile-3 process bundle should prepare");
+        let retained = prepared
+            .bundle()
+            .expect("profile-3 process owner should retain its bundle");
+        assert_eq!(retained.root_key(), expected_root);
+        assert_eq!(
+            retained
+                .block_bundle()
+                .expect("mixed storage should retain block owners")
+                .records()
+                .len(),
+            1
+        );
+        assert_eq!(retained.pmem_records().len(), 1);
+        assert_eq!(retained.pmem_configs().as_slice().len(), 1);
+        assert_eq!(
+            retained.pmem_records()[0].prepared_device().guest_range(),
+            template.pmem_records()[0].pmem().guest_range()
+        );
+        let diagnostics = format!("{prepared:?}");
+        assert!(!diagnostics.contains(block.path().to_string_lossy().as_ref()));
+        assert!(!diagnostics.contains(pmem.path().to_string_lossy().as_ref()));
+
+        let destination = prepared
+            .construct_destination(|bundle| Ok::<_, std::convert::Infallible>(Box::new(bundle)))
+            .expect("private profile-3 destination should construct");
+        let (bundle, ()) = destination
+            .commit(
+                |bundle| {
+                    Ok::<
+                        _,
+                        (
+                            Box<PreparedSnapshotV2StorageBundle>,
+                            std::convert::Infallible,
+                        ),
+                    >((bundle, ()))
+                },
+                |_| Ok::<_, std::convert::Infallible>(()),
+            )
+            .expect("profile-3 completion should commit after controller preparation");
+        (*bundle)
+            .abort()
+            .expect("committed detached profile-3 owners should abort cleanly");
+    }
+
+    #[test]
+    fn profile_3_destination_failures_and_drop_preserve_clean_retry() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let template = storage_fixture_graph(&block_path, &pmem_path);
+        let block = TempRoot::new_sized_at(
+            block_path,
+            template.block_records()[0].block().backing_bytes(),
+        );
+        let pmem =
+            TempRoot::new_sized_at(pmem_path, template.pmem_records()[0].pmem().file_bytes());
+        let prepare = || {
+            let graph = storage_fixture_graph(block.path(), pmem.path());
+            let memory = storage_restore_memory(&graph);
+            RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
+                graph,
+                &memory,
+                Instant::now(),
+                None,
+                || false,
+            )
+            .expect("profile-3 failure fixture should prepare")
+        };
+
+        let construction = prepare()
+            .construct_destination(|bundle| {
+                drop(bundle);
+                Err::<(), _>(io::Error::other(
+                    "scripted destination construction failure",
+                ))
+            })
+            .expect_err("destination construction failure should abort completion");
+        assert!(!construction.is_terminal());
+
+        let destination = prepare()
+            .construct_destination(|bundle| Ok::<_, std::convert::Infallible>(Box::new(bundle)))
+            .expect("controller failure destination should construct");
+        let controller = destination
+            .commit(
+                |destination| {
+                    Err::<(Box<PreparedSnapshotV2StorageBundle>, ()), _>((
+                        destination,
+                        io::Error::other("scripted controller preparation failure"),
+                    ))
+                },
+                |destination| (*destination).abort(),
+            )
+            .expect_err("controller failure should destroy the destination and abort completion");
+        assert!(!controller.is_terminal());
+
+        drop(prepare());
+        prepare()
+            .abort()
+            .expect("construction, controller, and drop failures should leave a clean retry");
+        let diagnostics = format!("{construction:?} {controller:?}");
+        assert!(!diagnostics.contains(block.path().to_string_lossy().as_ref()));
+        assert!(!diagnostics.contains(pmem.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn profile_3_plan_failure_precedes_backing_access_and_bundle_failure_aborts_completion() {
+        let missing_block = unique_short_path();
+        let missing_pmem = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&missing_block, &missing_pmem);
+        let tiny_layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), 0x4000)
+                .expect("tiny restore range should validate"),
+        ])
+        .expect("tiny restore layout should validate");
+        let tiny_memory =
+            GuestMemory::allocate(&tiny_layout).expect("tiny restore memory should allocate");
+        let error = RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
+            graph,
+            &tiny_memory,
+            Instant::now(),
+            None,
+            || false,
+        )
+        .expect_err("loaded-memory failure must precede missing backing access");
+        assert!(matches!(
+            error,
+            SnapshotV2StorageRestoreBundleError::Plan(_)
+        ));
+        assert_eq!(
+            error.disposition(),
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let template = storage_fixture_graph(&block_path, &pmem_path);
+        let block = TempRoot::new_sized_at(
+            block_path,
+            template.block_records()[0].block().backing_bytes(),
+        );
+        let pmem =
+            TempRoot::new_sized_at(pmem_path, template.pmem_records()[0].pmem().file_bytes());
+        let graph = storage_fixture_graph(block.path(), pmem.path());
+        let memory = storage_restore_memory(&graph);
+        let error =
+            RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle_with(
+                graph,
+                &memory,
+                Instant::now(),
+                None,
+                || false,
+                |plan, blocks, pmems, _| {
+                    drop(blocks);
+                    plan.prepare_backings(Vec::new(), pmems, || false)
+                },
+            )
+            .expect_err("wrong runtime cardinality should abort aggregate completion");
+        assert!(matches!(
+            error,
+            SnapshotV2StorageRestoreBundleError::Bundle { .. }
+        ));
+        assert_eq!(
+            error.disposition(),
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+
+        let retry_graph = storage_fixture_graph(block.path(), pmem.path());
+        let retry_memory = storage_restore_memory(&retry_graph);
+        RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
+            retry_graph,
+            &retry_memory,
+            Instant::now(),
+            None,
+            || false,
+        )
+        .expect("bundle failure should leave direct backings reusable")
+        .abort()
+        .expect("retried profile-3 bundle should abort cleanly");
+    }
+
+    #[test]
+    fn profile_3_runtime_cancellation_and_contained_abort_release_all_authority() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let template = storage_fixture_graph(&block_path, &pmem_path);
+        let block = TempRoot::new_sized_at(
+            block_path,
+            template.block_records()[0].block().backing_bytes(),
+        );
+        let pmem =
+            TempRoot::new_sized_at(pmem_path, template.pmem_records()[0].pmem().file_bytes());
+        let graph = storage_fixture_graph(block.path(), pmem.path());
+        let memory = storage_restore_memory(&graph);
+        let cancellation =
+            RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle_with(
+                graph,
+                &memory,
+                Instant::now(),
+                None,
+                || false,
+                |plan, blocks, pmems, _| plan.prepare_backings(blocks, pmems, || true),
+            )
+            .expect_err("runtime cancellation should unwind the complete direct batch");
+        assert!(matches!(
+            cancellation,
+            SnapshotV2StorageRestoreBundleError::Bundle { .. }
+        ));
+        assert_eq!(
+            cancellation.disposition(),
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+
+        let block_reference = PathBuf::from("bangbang-grant:blk");
+        let pmem_reference = PathBuf::from("bangbang-grant:pm");
+        let base = storage_fixture_graph(&block_reference, pmem.path());
+        let captured_pmem = &base.pmem_records()[0];
+        let pmem_config = bangbang_runtime::snapshot_device_v2_6::SnapshotV2PmemConfig::try_new(
+            captured_pmem.config().pmem_id(),
+            captured_pmem.config().is_root(),
+            captured_pmem.config().is_read_only(),
+            captured_pmem.config().rate_limiter(),
+            pmem_reference.to_string_lossy(),
+        )
+        .expect("contained pmem configuration should validate");
+        let pmem_record =
+            bangbang_runtime::snapshot_device_v2_6::SnapshotV2PmemDeviceRecord::try_new(
+                captured_pmem.key().instance(),
+                pmem_config,
+                captured_pmem.pmem().clone(),
+                captured_pmem.virtio().clone(),
+                captured_pmem.transport().clone(),
+            )
+            .expect("contained pmem record should validate");
+        let graph = SnapshotV2StorageDeviceGraph::try_from_parts(
+            base.root_key(),
+            base.transport_kind(),
+            base.block_records().to_vec(),
+            vec![pmem_record],
+        )
+        .expect("contained storage graph should validate");
+        let block_access = grant_access(graph.block_records()[0].config().is_read_only());
+        let pmem_access = grant_access(graph.pmem_records()[0].config().is_read_only());
+        let fixture = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[
+                (
+                    "blk",
+                    ResourceRole::DriveBacking,
+                    block_access,
+                    block.path(),
+                ),
+                ("pm", ResourceRole::PmemBacking, pmem_access, pmem.path()),
+            ]),
+            false,
+        );
+        let memory = storage_restore_memory(&graph);
+        let prepared = RequestedSnapshotRestoreResources::prepare_native_v2_storage_restore_bundle(
+            graph,
+            &memory,
+            Instant::now(),
+            Some(fixture.authority()),
+            || false,
+        )
+        .expect("contained profile-3 process bundle should prepare");
+        prepared
+            .abort()
+            .expect("contained profile-3 abort should release runtime then authority");
+        assert_storage_grants_reusable(
+            &fixture,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            pmem_access,
+        );
+        let diagnostics = format!("{cancellation:?}");
+        for private in [block.path(), pmem.path()] {
             assert!(!diagnostics.contains(private.to_string_lossy().as_ref()));
         }
     }

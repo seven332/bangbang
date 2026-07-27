@@ -25,7 +25,9 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
-use crate::token_bucket::{PersistedTokenBucketState, TokenBucket, TokenBucketConfig};
+use crate::token_bucket::{
+    PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
+};
 use crate::virtio::VirtioInterruptIntent;
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
@@ -481,6 +483,82 @@ impl VirtioPmemQueue {
         Ok(Self { available, used })
     }
 
+    pub(crate) fn from_snapshot_state(
+        queue: &VirtioMmioQueueState,
+        state: VirtioPmemQueueState,
+    ) -> Result<Self, VirtioPmemQueueSnapshotError> {
+        if !queue.ready() {
+            return Err(VirtioPmemQueueSnapshotError::QueueNotReady);
+        }
+
+        let available = VirtqueueAvailableRing::with_next_avail(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+            state.next_available(),
+        )
+        .map_err(|_| VirtioPmemQueueSnapshotError::AvailableRingInvalid)?;
+        let used =
+            VirtqueueUsedRing::with_next_used(queue.device_ring(), queue.size(), state.next_used())
+                .map_err(|_| VirtioPmemQueueSnapshotError::UsedRingInvalid)?;
+
+        Ok(Self { available, used })
+    }
+
+    pub(crate) fn validate_snapshot_state(
+        &self,
+        memory: &GuestMemory,
+        has_retry: bool,
+    ) -> Result<(), VirtioPmemQueueSnapshotError> {
+        self.available
+            .validate_mapped(memory)
+            .map_err(|_| VirtioPmemQueueSnapshotError::AvailableRingInvalid)?;
+        self.used
+            .validate_mapped(memory)
+            .map_err(|_| VirtioPmemQueueSnapshotError::UsedRingInvalid)?;
+
+        let descriptor_range = self
+            .available
+            .descriptor_table_range()
+            .map_err(|_| VirtioPmemQueueSnapshotError::QueueRangeInvalid)?;
+        let available_range = self
+            .available
+            .available_ring_range()
+            .map_err(|_| VirtioPmemQueueSnapshotError::QueueRangeInvalid)?;
+        let used_range = self
+            .used
+            .used_ring_range()
+            .map_err(|_| VirtioPmemQueueSnapshotError::QueueRangeInvalid)?;
+        if descriptor_range.overlaps(available_range)
+            || descriptor_range.overlaps(used_range)
+            || available_range.overlaps(used_range)
+        {
+            return Err(VirtioPmemQueueSnapshotError::QueueRangesOverlap);
+        }
+
+        let used_index = self
+            .used
+            .used_index(memory)
+            .map_err(|_| VirtioPmemQueueSnapshotError::UsedRingInvalid)?;
+        if used_index != self.used.next_used() {
+            return Err(VirtioPmemQueueSnapshotError::UsedCursorMismatch);
+        }
+
+        let available_index = self
+            .available
+            .available_index(memory)
+            .map_err(|_| VirtioPmemQueueSnapshotError::AvailableRingInvalid)?;
+        let pending = available_index.wrapping_sub(self.available.next_avail());
+        if pending > self.available.queue_size() {
+            return Err(VirtioPmemQueueSnapshotError::AvailableCursorOutOfBounds);
+        }
+        if has_retry && pending == 0 {
+            return Err(VirtioPmemQueueSnapshotError::RetryWithoutPendingDescriptor);
+        }
+
+        Ok(())
+    }
+
     pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
         &self.available
     }
@@ -601,6 +679,39 @@ impl std::error::Error for VirtioPmemQueueBuildError {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtioPmemQueueSnapshotError {
+    QueueNotReady,
+    AvailableRingInvalid,
+    UsedRingInvalid,
+    QueueRangeInvalid,
+    QueueRangesOverlap,
+    UsedCursorMismatch,
+    AvailableCursorOutOfBounds,
+    RetryWithoutPendingDescriptor,
+}
+
+impl fmt::Display for VirtioPmemQueueSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::QueueNotReady => "snapshot virtio-pmem queue is not ready",
+            Self::AvailableRingInvalid => "snapshot virtio-pmem available ring is invalid",
+            Self::UsedRingInvalid => "snapshot virtio-pmem used ring is invalid",
+            Self::QueueRangeInvalid => "snapshot virtio-pmem queue range is invalid",
+            Self::QueueRangesOverlap => "snapshot virtio-pmem queue ranges overlap",
+            Self::UsedCursorMismatch => "snapshot virtio-pmem used cursor is inconsistent",
+            Self::AvailableCursorOutOfBounds => {
+                "snapshot virtio-pmem available cursor is out of bounds"
+            }
+            Self::RetryWithoutPendingDescriptor => {
+                "snapshot virtio-pmem retry has no pending descriptor"
+            }
+        })
+    }
+}
+
+impl std::error::Error for VirtioPmemQueueSnapshotError {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VirtioPmemQueueDispatch {
@@ -845,6 +956,35 @@ impl VirtioPmemRateLimiter {
         }
     }
 
+    fn from_persisted_state_at(
+        config: Option<PmemRateLimiterConfig>,
+        state: VirtioPmemRateLimiterState,
+        now: Instant,
+    ) -> Result<Option<Self>, VirtioPmemRateLimiterStateError> {
+        let bandwidth = restore_pmem_bucket_state(
+            config.and_then(PmemRateLimiterConfig::bandwidth),
+            state.bandwidth(),
+            now,
+            VirtioPmemRateLimiterStateError::MissingBandwidth,
+            VirtioPmemRateLimiterStateError::UnexpectedBandwidth,
+            VirtioPmemRateLimiterStateError::InvalidBandwidth,
+        )?;
+        let ops = restore_pmem_bucket_state(
+            config.and_then(PmemRateLimiterConfig::ops),
+            state.ops(),
+            now,
+            VirtioPmemRateLimiterStateError::MissingOps,
+            VirtioPmemRateLimiterStateError::UnexpectedOps,
+            VirtioPmemRateLimiterStateError::InvalidOps,
+        )?;
+
+        if bandwidth.is_none() && ops.is_none() {
+            Ok(None)
+        } else {
+            Ok(Some(Self { bandwidth, ops }))
+        }
+    }
+
     fn reduce_at(&mut self, bytes: u64, now: Instant) -> VirtioPmemRateLimiterReduction {
         let ops_snapshot = self.ops.as_ref().map(TokenBucket::snapshot);
 
@@ -877,16 +1017,30 @@ pub struct VirtioPmemTokenBucketState {
 }
 
 impl VirtioPmemTokenBucketState {
+    pub const fn new(
+        config: PmemTokenBucketConfig,
+        budget: u64,
+        remaining_burst: u64,
+        age_nanos: u64,
+    ) -> Self {
+        Self {
+            config,
+            budget,
+            remaining_burst,
+            age_nanos,
+        }
+    }
+
     const fn from_persisted(
         config: PmemTokenBucketConfig,
         state: PersistedTokenBucketState,
     ) -> Self {
-        Self {
+        Self::new(
             config,
-            budget: state.budget(),
-            remaining_burst: state.one_time_burst(),
-            age_nanos: state.age_nanos(),
-        }
+            state.budget(),
+            state.one_time_burst(),
+            state.age_nanos(),
+        )
     }
 
     pub const fn config(self) -> PmemTokenBucketConfig {
@@ -903,6 +1057,15 @@ impl VirtioPmemTokenBucketState {
 
     pub const fn age_nanos(self) -> u64 {
         self.age_nanos
+    }
+
+    const fn into_persisted(self) -> PersistedTokenBucketState {
+        PersistedTokenBucketState::new(
+            self.config.token_bucket_config(),
+            self.budget,
+            self.remaining_burst,
+            self.age_nanos,
+        )
     }
 }
 
@@ -922,12 +1085,23 @@ pub struct VirtioPmemRateLimiterState {
 }
 
 impl VirtioPmemRateLimiterState {
+    pub const fn new(
+        bandwidth: Option<VirtioPmemTokenBucketState>,
+        ops: Option<VirtioPmemTokenBucketState>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
     pub const fn bandwidth(self) -> Option<VirtioPmemTokenBucketState> {
         self.bandwidth
     }
 
     pub const fn ops(self) -> Option<VirtioPmemTokenBucketState> {
         self.ops
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.bandwidth.is_none() && self.ops.is_none()
     }
 }
 
@@ -937,6 +1111,53 @@ impl fmt::Debug for VirtioPmemRateLimiterState {
             .debug_struct("VirtioPmemRateLimiterState")
             .field("state", &"<redacted>")
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtioPmemRateLimiterStateError {
+    MissingBandwidth,
+    UnexpectedBandwidth,
+    InvalidBandwidth,
+    MissingOps,
+    UnexpectedOps,
+    InvalidOps,
+}
+
+impl fmt::Display for VirtioPmemRateLimiterStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingBandwidth => "snapshot pmem bandwidth bucket is missing",
+            Self::UnexpectedBandwidth => "snapshot pmem bandwidth bucket is unexpected",
+            Self::InvalidBandwidth => "snapshot pmem bandwidth bucket is invalid",
+            Self::MissingOps => "snapshot pmem ops bucket is missing",
+            Self::UnexpectedOps => "snapshot pmem ops bucket is unexpected",
+            Self::InvalidOps => "snapshot pmem ops bucket is invalid",
+        })
+    }
+}
+
+impl std::error::Error for VirtioPmemRateLimiterStateError {}
+
+fn restore_pmem_bucket_state(
+    config: Option<PmemTokenBucketConfig>,
+    state: Option<VirtioPmemTokenBucketState>,
+    now: Instant,
+    missing: VirtioPmemRateLimiterStateError,
+    unexpected: VirtioPmemRateLimiterStateError,
+    invalid: VirtioPmemRateLimiterStateError,
+) -> Result<Option<TokenBucket>, VirtioPmemRateLimiterStateError> {
+    match (config, state) {
+        (Some(config), Some(state)) if config.is_enabled() && state.config() == config => {
+            TokenBucket::from_persisted_state_at(state.into_persisted(), now)
+                .map(Some)
+                .map_err(|_: PersistedTokenBucketStateError| invalid)
+        }
+        (Some(config), None) if config.is_enabled() => Err(missing),
+        (Some(config), Some(_)) if !config.is_enabled() => Err(unexpected),
+        (Some(_), None) | (None, None) => Ok(None),
+        (None, Some(_)) => Err(unexpected),
+        (Some(_), Some(_)) => Err(invalid),
     }
 }
 
@@ -1086,6 +1307,38 @@ impl VirtioPmemDevice {
                 .and_then(|rate_limiter| VirtioPmemRateLimiter::new_at(rate_limiter, now)),
             pending_rate_limited_queue: false,
         }
+    }
+
+    pub(crate) fn from_snapshot_state_at(
+        file_len: u64,
+        active_queue: Option<VirtioPmemQueue>,
+        rate_limiter_config: Option<PmemRateLimiterConfig>,
+        rate_limiter_state: VirtioPmemRateLimiterState,
+        pending_rate_limited_queue: bool,
+        now: Instant,
+    ) -> Result<Self, VirtioPmemDeviceSnapshotError> {
+        if file_len == 0
+            || (pending_rate_limited_queue
+                && (active_queue.is_none() || rate_limiter_state.is_empty()))
+        {
+            return Err(VirtioPmemDeviceSnapshotError::InvalidState);
+        }
+        let rate_limiter = VirtioPmemRateLimiter::from_persisted_state_at(
+            rate_limiter_config,
+            rate_limiter_state,
+            now,
+        )
+        .map_err(VirtioPmemDeviceSnapshotError::RateLimiter)?;
+        if pending_rate_limited_queue && rate_limiter.is_none() {
+            return Err(VirtioPmemDeviceSnapshotError::InvalidState);
+        }
+
+        Ok(Self {
+            active_queue,
+            file_len,
+            rate_limiter,
+            pending_rate_limited_queue,
+        })
     }
 
     pub fn is_activated(&self) -> bool {
@@ -1293,6 +1546,30 @@ impl VirtioPmemDevice {
     pub fn reset(&mut self) {
         self.active_queue = None;
         self.pending_rate_limited_queue = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtioPmemDeviceSnapshotError {
+    InvalidState,
+    RateLimiter(VirtioPmemRateLimiterStateError),
+}
+
+impl fmt::Display for VirtioPmemDeviceSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidState => "snapshot virtio-pmem device state is invalid",
+            Self::RateLimiter(_) => "snapshot virtio-pmem rate limiter is invalid",
+        })
+    }
+}
+
+impl std::error::Error for VirtioPmemDeviceSnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RateLimiter(source) => Some(source),
+            Self::InvalidState => None,
+        }
     }
 }
 
@@ -2071,6 +2348,10 @@ impl PmemConfigs {
 
     pub fn as_slice(&self) -> &[PmemConfig] {
         &self.configs
+    }
+
+    pub(crate) fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        self.configs.try_reserve_exact(additional)
     }
 
     pub fn insert(&mut self, input: PmemConfigInput) -> Result<(), PmemConfigError> {
@@ -3083,6 +3364,38 @@ pub enum PmemBackingMappingError {
     },
 }
 
+impl PmemBackingMappingError {
+    /// Returns whether a failed mapping also failed to release a temporary
+    /// reservation that was still owned by the constructor.
+    pub const fn cleanup_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::MapFileOverReservation {
+                cleanup_source: Some(_),
+                ..
+            } | Self::FileMappingReturnedNull {
+                cleanup_source: Some(_),
+                ..
+            } | Self::FixedMappingMoved {
+                cleanup_source: Some(_),
+            }
+        )
+    }
+
+    /// Returns whether this is an ordinary clean host mapping failure.
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::MapFile { .. }
+                | Self::ReserveAlignedMapping { .. }
+                | Self::MapFileOverReservation {
+                    cleanup_source: None,
+                    ..
+                }
+        )
+    }
+}
+
 impl fmt::Display for PmemBackingMappingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3368,6 +3681,26 @@ impl PmemBackingMapper for SystemPmemBackingMapper {
     }
 }
 
+pub(crate) struct PreparedSnapshotPmemDeviceParts {
+    pub(crate) id: String,
+    pub(crate) is_read_only: bool,
+    pub(crate) rate_limiter: Option<PmemRateLimiterConfig>,
+    pub(crate) expected_file_len: u64,
+    pub(crate) expected_mapped_len: u64,
+    pub(crate) guest_range: GuestMemoryRange,
+    pub(crate) config_space: VirtioPmemConfigSpace,
+    pub(crate) backing: PmemFileBacking,
+}
+
+impl fmt::Debug for PreparedSnapshotPmemDeviceParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotPmemDeviceParts")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedPmemDevice {
     id: String,
@@ -3379,6 +3712,67 @@ pub struct PreparedPmemDevice {
 }
 
 impl PreparedPmemDevice {
+    pub(crate) fn from_snapshot_parts(
+        parts: PreparedSnapshotPmemDeviceParts,
+    ) -> Result<Self, PreparedSnapshotPmemDeviceError> {
+        Self::from_snapshot_parts_with_mapper(parts, &mut SystemPmemBackingMapper)
+    }
+
+    fn from_snapshot_parts_with_mapper(
+        parts: PreparedSnapshotPmemDeviceParts,
+        mapper: &mut impl PmemBackingMapper,
+    ) -> Result<Self, PreparedSnapshotPmemDeviceError> {
+        let PreparedSnapshotPmemDeviceParts {
+            id,
+            is_read_only,
+            rate_limiter,
+            expected_file_len,
+            expected_mapped_len,
+            guest_range,
+            config_space,
+            backing,
+        } = parts;
+        if id.is_empty() {
+            return Err(PreparedSnapshotPmemDeviceError::Configuration);
+        }
+        if backing.is_read_only() != is_read_only {
+            return Err(PreparedSnapshotPmemDeviceError::BackingMode);
+        }
+        if backing.len() != expected_file_len
+            || aligned_pmem_mapping_len(expected_file_len) != Some(expected_mapped_len)
+            || guest_range.size() != expected_mapped_len
+        {
+            return Err(PreparedSnapshotPmemDeviceError::Geometry);
+        }
+        let expected_config_space =
+            VirtioPmemConfigSpace::new(guest_range.start().raw_value(), guest_range.size());
+        if guest_range
+            .validate_alignment(VIRTIO_PMEM_ALIGNMENT)
+            .is_err()
+            || config_space != expected_config_space
+        {
+            return Err(PreparedSnapshotPmemDeviceError::Range);
+        }
+        let mapping = mapper
+            .map(&backing)
+            .map_err(PreparedSnapshotPmemDeviceError::Mapping)?;
+        if mapping.file_len() != expected_file_len
+            || mapping.mapped_len() != expected_mapped_len
+            || mapping.is_read_only() != is_read_only
+        {
+            return Err(PreparedSnapshotPmemDeviceError::Geometry);
+        }
+
+        Ok(Self {
+            id,
+            backing,
+            mapping,
+            guest_range,
+            config_space,
+            rate_limiter,
+        })
+    }
+
     /// Prepares one runtime pmem device from an already-opened backing and the
     /// owner thread's current reserved guest ranges.
     pub fn from_config_with_backing_and_reserved_ranges(
@@ -3528,6 +3922,64 @@ impl PreparedPmemDevice {
             self.config_space,
             self.rate_limiter,
         )
+    }
+}
+
+pub enum PreparedSnapshotPmemDeviceError {
+    Configuration,
+    BackingMode,
+    Geometry,
+    Range,
+    Mapping(PmemBackingMappingError),
+}
+
+impl PreparedSnapshotPmemDeviceError {
+    /// Returns whether mapping failure also left temporary cleanup uncertain.
+    pub const fn cleanup_failed(&self) -> bool {
+        matches!(self, Self::Mapping(source) if source.cleanup_failed())
+    }
+
+    /// Returns whether the failed snapshot owner construction may be retried.
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Mapping(source) if source.is_retryable())
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotPmemDeviceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Configuration => "Configuration",
+            Self::BackingMode => "BackingMode",
+            Self::Geometry => "Geometry",
+            Self::Range => "Range",
+            Self::Mapping(_) => "Mapping",
+        };
+        formatter
+            .debug_struct("PreparedSnapshotPmemDeviceError")
+            .field("kind", &kind)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for PreparedSnapshotPmemDeviceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Configuration => "snapshot pmem configuration is invalid",
+            Self::BackingMode => "snapshot pmem backing access mode is invalid",
+            Self::Geometry => "snapshot pmem backing geometry is invalid",
+            Self::Range => "snapshot pmem guest range is invalid",
+            Self::Mapping(_) => "snapshot pmem backing mapping failed",
+        })
+    }
+}
+
+impl std::error::Error for PreparedSnapshotPmemDeviceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Mapping(source) => Some(source),
+            Self::Configuration | Self::BackingMode | Self::Geometry | Self::Range => None,
+        }
     }
 }
 
@@ -5067,6 +5519,21 @@ mod tests {
         VirtioPmemQueue::new(available, used)
     }
 
+    fn pmem_mmio_queue_state(
+        descriptor_table: GuestAddress,
+        available_ring: GuestAddress,
+        used_ring: GuestAddress,
+    ) -> VirtioMmioQueueState {
+        VirtioMmioQueueState::from_parts(
+            TEST_QUEUE_SIZE,
+            TEST_QUEUE_SIZE,
+            true,
+            descriptor_table,
+            available_ring,
+            used_ring,
+        )
+    }
+
     fn write_pmem_flush_chain(memory: &mut GuestMemory) {
         write_pmem_flush_chain_at(memory, 0, 1, TEST_PMEM_REQUEST_ADDR, TEST_PMEM_STATUS_ADDR);
         write_available_heads(memory, &[0]);
@@ -5283,6 +5750,112 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 0);
         assert!(!dispatch.needs_queue_interrupt());
         assert_eq!(read_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn snapshot_queue_restores_exact_cursors_and_validates_loaded_indices() {
+        let mut memory = request_memory();
+        write_guest_u16(&mut memory, available_ring_idx_address(), 6);
+        write_guest_u16(&mut memory, used_ring_idx_address(), 4);
+        let state = VirtioPmemQueueState::new(5, 4);
+        let queue = VirtioPmemQueue::from_snapshot_state(
+            &pmem_mmio_queue_state(TEST_DESCRIPTOR_TABLE, TEST_AVAILABLE_RING, TEST_USED_RING),
+            state,
+        )
+        .expect("saved pmem queue should rebuild");
+
+        queue
+            .validate_snapshot_state(&memory, true)
+            .expect("saved queue indices should match loaded memory");
+        assert_eq!(queue.snapshot_state(), state);
+
+        write_guest_u16(&mut memory, used_ring_idx_address(), 3);
+        assert_eq!(
+            queue.validate_snapshot_state(&memory, true),
+            Err(VirtioPmemQueueSnapshotError::UsedCursorMismatch)
+        );
+    }
+
+    #[test]
+    fn snapshot_queue_rejects_overlap_cursor_overflow_and_retry_without_work() {
+        let mut memory = request_memory();
+        write_guest_u16(&mut memory, available_ring_idx_address(), 5);
+        write_guest_u16(&mut memory, used_ring_idx_address(), 4);
+        let queue = VirtioPmemQueue::from_snapshot_state(
+            &pmem_mmio_queue_state(TEST_DESCRIPTOR_TABLE, TEST_AVAILABLE_RING, TEST_USED_RING),
+            VirtioPmemQueueState::new(5, 4),
+        )
+        .expect("saved pmem queue should rebuild");
+        assert_eq!(
+            queue.validate_snapshot_state(&memory, true),
+            Err(VirtioPmemQueueSnapshotError::RetryWithoutPendingDescriptor)
+        );
+
+        write_guest_u16(
+            &mut memory,
+            available_ring_idx_address(),
+            TEST_QUEUE_SIZE + 6,
+        );
+        assert_eq!(
+            queue.validate_snapshot_state(&memory, false),
+            Err(VirtioPmemQueueSnapshotError::AvailableCursorOutOfBounds)
+        );
+
+        let overlapping = VirtioPmemQueue::from_snapshot_state(
+            &pmem_mmio_queue_state(TEST_DESCRIPTOR_TABLE, TEST_DESCRIPTOR_TABLE, TEST_USED_RING),
+            VirtioPmemQueueState::new(0, 0),
+        )
+        .expect("aligned overlapping queue addresses should rebuild");
+        assert_eq!(
+            overlapping.validate_snapshot_state(&memory, false),
+            Err(VirtioPmemQueueSnapshotError::QueueRangesOverlap)
+        );
+    }
+
+    #[test]
+    fn snapshot_device_restores_limiter_budget_burst_and_age_at_fixed_clock() {
+        let now = Instant::now();
+        let bandwidth = PmemTokenBucketConfig::new(100, Some(20), 100);
+        let ops = PmemTokenBucketConfig::new(8, None, 200);
+        let config = PmemRateLimiterConfig::new(Some(bandwidth), Some(ops));
+        let state = VirtioPmemRateLimiterState::new(
+            Some(VirtioPmemTokenBucketState::new(bandwidth, 75, 11, 10_000)),
+            Some(VirtioPmemTokenBucketState::new(ops, 6, 0, 20_000)),
+        );
+        let device = VirtioPmemDevice::from_snapshot_state_at(
+            VIRTIO_PMEM_ALIGNMENT,
+            None,
+            Some(config),
+            state,
+            false,
+            now,
+        )
+        .expect("saved limiter should restore");
+        let captured = device
+            .capture_state_at(
+                VirtioPmemConfigSpace::new(TEST_PMEM_START, VIRTIO_PMEM_ALIGNMENT),
+                VIRTIO_PMEM_ALIGNMENT,
+                Some(config),
+                now,
+            )
+            .expect("restored limiter should recapture");
+
+        assert_eq!(captured.rate_limiter(), state);
+        let invalid = VirtioPmemRateLimiterState::new(
+            Some(VirtioPmemTokenBucketState::new(bandwidth, 101, 11, 10_000)),
+            Some(VirtioPmemTokenBucketState::new(ops, 6, 0, 20_000)),
+        );
+        assert!(matches!(
+            VirtioPmemDevice::from_snapshot_state_at(
+                VIRTIO_PMEM_ALIGNMENT,
+                None,
+                Some(config),
+                invalid,
+                false,
+                now,
+            ),
+            Err(VirtioPmemDeviceSnapshotError::RateLimiter(_))
+        ));
     }
 
     #[test]
@@ -6727,6 +7300,98 @@ mod tests {
         );
         assert!(!mapping.is_read_only());
         assert_eq!(&bytes, b"pmem");
+    }
+
+    #[test]
+    fn snapshot_mapping_error_retryability_requires_complete_temporary_cleanup() {
+        let clean = PmemBackingMappingError::MapFile {
+            len: 4096,
+            source: io::Error::from_raw_os_error(libc::ENOMEM),
+        };
+        assert!(clean.is_retryable());
+        assert!(!clean.cleanup_failed());
+
+        let uncertain = PmemBackingMappingError::MapFileOverReservation {
+            file_len: 4096,
+            mapped_len: usize::try_from(VIRTIO_PMEM_ALIGNMENT)
+                .expect("pmem alignment should fit usize"),
+            source: io::Error::from_raw_os_error(libc::ENOMEM),
+            cleanup_source: Some(io::Error::from_raw_os_error(libc::EIO)),
+        };
+        assert!(!uncertain.is_retryable());
+        assert!(uncertain.cleanup_failed());
+        let prepared = PreparedSnapshotPmemDeviceError::Mapping(uncertain);
+        assert!(!prepared.is_retryable());
+        assert!(prepared.cleanup_failed());
+    }
+
+    #[test]
+    fn snapshot_mapping_recreates_a_zeroed_private_tail_after_prior_tail_writes() {
+        let first = temp_file("snapshot-first-tail-pmem.img", b"old!");
+        let first_mapping = map_backing(first.as_path(), false);
+        let tail_offset =
+            usize::try_from(first_mapping.file_len()).expect("file length should fit usize");
+
+        // SAFETY: the retained mapping extends through `mapped_len`, and the
+        // selected byte is the first byte of its anonymous private tail.
+        unsafe {
+            first_mapping
+                .host_address()
+                .as_ptr()
+                .cast::<u8>()
+                .add(tail_offset)
+                .write(0x7f);
+        }
+        drop(first_mapping);
+
+        let second = temp_file("snapshot-second-tail-pmem.img", b"next");
+        let second_mapping = map_backing(second.as_path(), false);
+        // SAFETY: the second mapping independently owns the same bounded tail
+        // offset after its four-byte file prefix.
+        let first_tail_byte = unsafe {
+            second_mapping
+                .host_address()
+                .as_ptr()
+                .cast::<u8>()
+                .add(tail_offset)
+                .read()
+        };
+        assert_eq!(first_tail_byte, 0);
+    }
+
+    #[test]
+    fn snapshot_prepared_device_retains_the_recorded_range_without_allocation() {
+        let file = temp_file("snapshot-exact-range-pmem.img", b"pmem");
+        let backing = open_backing(file.as_path(), false).expect("pmem backing should open");
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = ScriptedPmemBackingMapper::new(Arc::clone(&drop_count), usize::MAX);
+        let range = guest_range(
+            TEST_PMEM_START + VIRTIO_PMEM_ALIGNMENT * 4,
+            VIRTIO_PMEM_ALIGNMENT,
+        );
+        let prepared = PreparedPmemDevice::from_snapshot_parts_with_mapper(
+            PreparedSnapshotPmemDeviceParts {
+                id: "pmem0".to_string(),
+                is_read_only: false,
+                rate_limiter: None,
+                expected_file_len: 4,
+                expected_mapped_len: VIRTIO_PMEM_ALIGNMENT,
+                guest_range: range,
+                config_space: VirtioPmemConfigSpace::new(range.start().raw_value(), range.size()),
+                backing,
+            },
+            &mut mapper,
+        )
+        .expect("snapshot pmem owner should retain its exact range");
+
+        assert_eq!(prepared.guest_range(), range);
+        assert_eq!(
+            prepared.config_space(),
+            VirtioPmemConfigSpace::new(range.start().raw_value(), range.size())
+        );
+        assert_eq!(mapper.calls, 1);
+        drop(prepared);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

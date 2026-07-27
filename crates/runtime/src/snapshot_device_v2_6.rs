@@ -33,6 +33,14 @@ use crate::storage_capture::{StorageDeviceOrigin, StorageRetryState};
 
 mod capture;
 mod codec;
+mod restore;
+
+pub use restore::{
+    PreparedSnapshotV2PmemRecord, PreparedSnapshotV2PmemRecordParts,
+    PreparedSnapshotV2StorageBundle, PreparedSnapshotV2StorageBundleParts,
+    SnapshotV2StorageBundleError, SnapshotV2StorageCleanupError, SnapshotV2StorageRestorePlan,
+    SnapshotV2StorageRestorePlanError,
+};
 
 #[cfg(test)]
 mod tests;
