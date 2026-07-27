@@ -134,6 +134,7 @@ const PCI_PENDING_WORD_BYTES: usize = 8;
 const PCI_QUEUE_VECTOR_BYTES: usize = 2;
 
 const DEVICE_KIND_BLOCK: u32 = 1;
+const DEVICE_KIND_PMEM: u32 = 2;
 const DEVICE_INSTANCE_ROOT: u32 = 0;
 const SECTION_KIND_CONFIG: u16 = 1;
 const SECTION_KIND_BLOCK: u16 = 2;
@@ -181,6 +182,13 @@ impl SnapshotV2DeviceKey {
     pub(crate) const fn block(instance: u32) -> Self {
         Self {
             kind: DEVICE_KIND_BLOCK,
+            instance,
+        }
+    }
+
+    pub(crate) const fn pmem(instance: u32) -> Self {
+        Self {
+            kind: DEVICE_KIND_PMEM,
             instance,
         }
     }

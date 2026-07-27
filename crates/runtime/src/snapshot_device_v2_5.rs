@@ -37,7 +37,7 @@ use crate::virtio_pci::{
 };
 
 mod capture;
-mod codec;
+pub(crate) mod codec;
 mod restore;
 
 pub use restore::{
@@ -85,12 +85,12 @@ pub const NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_RECORD_ENTRY_BYTES: usize = 32;
 /// Fixed encoded size of one profile-2 section-directory entry.
 pub const NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_SECTION_ENTRY_BYTES: usize = 32;
 
-const CONFIG_FIXED_BYTES: usize = 80;
-const BLOCK_SECTION_BYTES: usize = 112;
-const COMMON_FIXED_BYTES: usize = 32;
-const COMMON_QUEUE_BYTES: usize = 32;
-const MMIO_SECTION_BYTES: usize = 48;
-const PCI_SECTION_BYTES: usize = 144;
+pub(crate) const CONFIG_FIXED_BYTES: usize = 80;
+pub(crate) const BLOCK_SECTION_BYTES: usize = 112;
+pub(crate) const COMMON_FIXED_BYTES: usize = 32;
+pub(crate) const COMMON_QUEUE_BYTES: usize = 32;
+pub(crate) const MMIO_SECTION_BYTES: usize = 48;
+pub(crate) const PCI_SECTION_BYTES: usize = 144;
 const SECTION_COUNT_PER_RECORD: usize = 4;
 const ALIGNMENT: usize = 8;
 const DEVICE_KIND_BLOCK: u32 = 1;
@@ -249,6 +249,23 @@ pub struct SnapshotV2MultiBlockDeviceRecord {
 }
 
 impl SnapshotV2MultiBlockDeviceRecord {
+    /// Reassembles one decoded record before graph-wide validation.
+    pub(crate) const fn from_parts(
+        key: SnapshotV2DeviceKey,
+        config: SnapshotV2MultiBlockConfig,
+        block: SnapshotV2MultiBlockState,
+        virtio: SnapshotV2VirtioState,
+        transport: SnapshotV2DeviceTransport,
+    ) -> Self {
+        Self {
+            key,
+            config,
+            block,
+            virtio,
+            transport,
+        }
+    }
+
     /// Returns the stable typed record key.
     pub const fn key(&self) -> SnapshotV2DeviceKey {
         self.key
@@ -722,7 +739,9 @@ fn validate_config(config: &SnapshotV2MultiBlockConfig) -> Result<(), GraphValid
     validate_limiter_config(config.rate_limiter)
 }
 
-fn validate_record(record: &SnapshotV2MultiBlockDeviceRecord) -> Result<(), GraphValidationError> {
+pub(crate) fn validate_record(
+    record: &SnapshotV2MultiBlockDeviceRecord,
+) -> Result<(), GraphValidationError> {
     let block = &record.block.continuation;
     if block.capacity_sectors() != record.block.backing_bytes >> 9
         || block.device_id().as_bytes().iter().all(|byte| *byte == 0)
@@ -819,7 +838,7 @@ fn validate_bucket_relationship(
     }
 }
 
-fn validate_virtio(
+pub(crate) fn validate_virtio(
     state: &SnapshotV2VirtioState,
     expected_features: u64,
 ) -> Result<(), GraphValidationError> {
@@ -902,7 +921,9 @@ fn validate_virtio(
     Ok(())
 }
 
-fn validate_queue(queue: &SnapshotV2VirtioQueueState) -> Result<(), GraphValidationError> {
+pub(crate) fn validate_queue(
+    queue: &SnapshotV2VirtioQueueState,
+) -> Result<(), GraphValidationError> {
     if queue.max_size() != VIRTIO_BLOCK_QUEUE_SIZE
         || (queue.size() != 0
             && (!queue.size().is_power_of_two() || queue.size() > queue.max_size()))
@@ -932,7 +953,7 @@ fn validate_queue(queue: &SnapshotV2VirtioQueueState) -> Result<(), GraphValidat
     Ok(())
 }
 
-fn queue_ranges(
+pub(crate) fn queue_ranges(
     queue: &SnapshotV2VirtioQueueState,
 ) -> Result<Option<[GuestMemoryRange; 3]>, GraphValidationError> {
     if queue.size() == 0 {
@@ -960,7 +981,7 @@ fn range_error(_: GuestMemoryError) -> GraphValidationError {
     GraphValidationError::Virtio
 }
 
-fn validate_mmio(state: &SnapshotV2MmioDeviceState) -> Result<(), GraphValidationError> {
+pub(crate) fn validate_mmio(state: &SnapshotV2MmioDeviceState) -> Result<(), GraphValidationError> {
     if state.device_feature_select() > 1
         || state.driver_feature_select() > 1
         || state.queue_select() != 0
@@ -979,7 +1000,7 @@ fn validate_mmio(state: &SnapshotV2MmioDeviceState) -> Result<(), GraphValidatio
     }
 }
 
-fn validate_pci(state: &SnapshotV2PciDeviceState) -> Result<(), GraphValidationError> {
+pub(crate) fn validate_pci(state: &SnapshotV2PciDeviceState) -> Result<(), GraphValidationError> {
     const WRITABLE_OFFSETS: [u16; 4] = [0x04, 0x05, 0x0c, 0x3c];
     let aperture_end = PCI_BAR64_START
         .checked_add(PCI_BAR64_SIZE)

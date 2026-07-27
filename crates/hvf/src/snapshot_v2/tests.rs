@@ -4,6 +4,9 @@ use bangbang_runtime::machine::MachineConfigInput;
 use bangbang_runtime::memory::{GuestMemory, aarch64};
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
 use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_BYTES;
+use bangbang_runtime::snapshot_device_v2_6::{
+    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
+};
 use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_COMPONENT_DIRECTORY_ENTRY_BYTES, NATIVE_V2_LEGACY_PLATFORM_VERSION,
     NATIVE_V2_SNAPSHOT_INTEGRITY_BYTES, NATIVE_V2_SNAPSHOT_MAX_FILE_BYTES,
@@ -27,8 +30,13 @@ const MULTI_BLOCK_MMIO_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2_5/fixtures/root-mmio.hex");
 const MULTI_BLOCK_PCI_GRAPH_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_device_v2_5/fixtures/rootless-pci.hex");
+const STORAGE_MMIO_GRAPH_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_device_v2_6/fixtures/pmem-root-mmio.hex");
+const STORAGE_PCI_GRAPH_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_device_v2_6/fixtures/mixed-pmem-root-pci.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
 const DETERMINISTIC_MULTI_BLOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.5-fixture-id!";
+const DETERMINISTIC_STORAGE_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.6-fixture-id!";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
     (4_887, 10_136_861_786_457_474_800),
     (4_983, 7_169_128_621_506_763_529),
@@ -319,6 +327,13 @@ fn deterministic_minor_five_platform_fixture() -> HvfSnapshotV2PlatformState {
     )
 }
 
+fn deterministic_minor_six_platform_fixture() -> HvfSnapshotV2PlatformState {
+    deterministic_device_graph_platform_fixture(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        DETERMINISTIC_STORAGE_MEMORY_IMAGE_ID,
+    )
+}
+
 fn deterministic_device_graph_platform_fixture(
     version: SnapshotFormatVersion,
     image_id: [u8; 16],
@@ -374,6 +389,16 @@ fn complete_multi_block_state_fixture(graph_hex: &str) -> HvfSnapshotV2MultiBloc
     .expect("immutable profile-2 graph payload should decode");
     HvfSnapshotV2MultiBlockState::try_new(deterministic_minor_five_platform_fixture(), graph)
         .expect("complete minor-five fixture should validate")
+}
+
+fn complete_storage_state_fixture(graph_hex: &str) -> HvfSnapshotV2StorageState {
+    let graph = SnapshotV2StorageDeviceGraph::decode(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &fixture_bytes(graph_hex),
+    )
+    .expect("immutable profile-3 graph payload should decode");
+    HvfSnapshotV2StorageState::try_new(deterministic_minor_six_platform_fixture(), graph)
+        .expect("complete minor-six fixture should validate")
 }
 
 fn decode_platform(bytes: &[u8]) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
@@ -506,6 +531,69 @@ fn rebuild_complete_without_component(encoded: &[u8], excluded: SnapshotV2Compon
         &components,
     )
     .expect("reduced complete components should re-encode")
+}
+
+fn rebuild_storage_components<F>(encoded: &[u8], mut transform: F) -> Vec<u8>
+where
+    F: FnMut(&mut SnapshotV2ComponentKey, &mut SnapshotV2ComponentDisposition, &mut Vec<u8>),
+{
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        encoded,
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("storage fixture should decode structurally");
+    let mut owned = state
+        .components()
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (key, disposition, payload) in &mut owned {
+        transform(key, disposition, payload);
+    }
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("mutated storage components should re-encode")
+}
+
+fn rebuild_storage_without_component(encoded: &[u8], excluded: SnapshotV2ComponentKey) -> Vec<u8> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        encoded,
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("storage fixture should decode structurally");
+    let owned = state
+        .components()
+        .filter(|component| component.key() != excluded)
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("reduced storage components should re-encode")
 }
 
 fn replace_state_checksum(bytes: &mut [u8]) {
@@ -714,6 +802,162 @@ fn exact_minor_five_multi_block_mmio_and_pci_states_round_trip_separately() {
         );
         assert_eq!(graph.transport_kind(), expected_transport);
     }
+}
+
+#[test]
+fn internal_exact_minor_six_storage_mmio_and_pci_states_round_trip_separately() {
+    let cases = [
+        (
+            STORAGE_MMIO_GRAPH_FIXTURE_HEX,
+            SnapshotV2DeviceTransportKind::Mmio,
+            0,
+            1,
+        ),
+        (
+            STORAGE_PCI_GRAPH_FIXTURE_HEX,
+            SnapshotV2DeviceTransportKind::Pci,
+            1,
+            1,
+        ),
+    ];
+    for (graph_hex, expected_transport, block_count, pmem_count) in cases {
+        let original = complete_storage_state_fixture(graph_hex);
+        let encoded = encode_hvf_snapshot_v2_storage_state(&original)
+            .expect("complete internal minor-six state should encode");
+        assert!(matches!(
+            decode_snapshot_v2_state(&encoded),
+            Err(SnapshotV2DecodeError::UnsupportedVersion {
+                found: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                supported: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            })
+        ));
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &encoded,
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        )
+        .expect("internal minor-six state should decode explicitly");
+        assert!(matches!(
+            decode_hvf_snapshot_v2_platform_state(&structural),
+            Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+        ));
+        assert!(matches!(
+            decode_hvf_snapshot_v2_multi_block_state(&structural),
+            Err(HvfSnapshotV2DecodeError::UnsupportedProfile)
+        ));
+
+        let decoded = decode_hvf_snapshot_v2_storage_state(&structural)
+            .expect("internal minor-six HVF state should decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.device_graph().transport_kind(), expected_transport);
+        assert_eq!(decoded.device_graph().block_records().len(), block_count);
+        assert_eq!(decoded.device_graph().pmem_records().len(), pmem_count);
+        assert_eq!(
+            encode_hvf_snapshot_v2_storage_state(&decoded)
+                .expect("decoded minor-six state should re-encode"),
+            encoded
+        );
+        let (platform, graph) = decoded.into_parts();
+        assert_eq!(
+            platform.memory().version(),
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        );
+        assert_eq!(graph.transport_kind(), expected_transport);
+    }
+}
+
+#[test]
+fn internal_exact_minor_six_wrapper_rejects_missing_nonsemantic_and_invalid_graphs() {
+    let original = complete_storage_state_fixture(STORAGE_MMIO_GRAPH_FIXTURE_HEX);
+    let encoded = encode_hvf_snapshot_v2_storage_state(&original)
+        .expect("complete internal minor-six state should encode");
+
+    let missing = rebuild_storage_without_component(&encoded, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY);
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &missing,
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("missing graph mutation should remain structural");
+    assert!(matches!(
+        decode_hvf_snapshot_v2_storage_state(&structural),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &encoded,
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("storage fixture should decode structurally");
+    let mut owned = structural
+        .components()
+        .map(|component| {
+            (
+                component.key(),
+                component.disposition(),
+                component.payload().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let graph_payload = structural
+        .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
+        .expect("storage fixture should contain a graph")
+        .payload()
+        .to_vec();
+    owned.push((
+        SnapshotV2ComponentKey::new(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 1),
+        SnapshotV2ComponentDisposition::Semantic,
+        graph_payload,
+    ));
+    let components = owned
+        .iter()
+        .map(|(key, disposition, payload)| SnapshotV2Component::new(*key, *disposition, payload))
+        .collect::<Vec<_>>();
+    let duplicate = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("duplicate graph mutation should encode structurally");
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &duplicate,
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("duplicate graph mutation should decode structurally");
+    assert!(matches!(
+        decode_hvf_snapshot_v2_storage_state(&structural),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let nonsemantic = rebuild_storage_components(&encoded, |key, disposition, _| {
+        if *key == NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY {
+            *disposition = SnapshotV2ComponentDisposition::NonSemantic;
+        }
+    });
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &nonsemantic,
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("nonsemantic mutation should remain structural");
+    assert!(matches!(
+        decode_hvf_snapshot_v2_storage_state(&structural),
+        Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)
+    ));
+
+    let invalid_graph = rebuild_storage_components(&encoded, |key, _, payload| {
+        if *key == NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY {
+            payload[10..12].copy_from_slice(&2_u16.to_le_bytes());
+        }
+    });
+    let structural = decode_snapshot_v2_state_with_compatibility_version(
+        &invalid_graph,
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("invalid graph mutation should remain structural");
+    assert!(matches!(
+        decode_hvf_snapshot_v2_storage_state(&structural),
+        Err(HvfSnapshotV2DecodeError::StorageDeviceGraph(
+            SnapshotV2StorageDeviceGraphDecodeError::UnsupportedProfile
+        ))
+    ));
 }
 
 #[test]

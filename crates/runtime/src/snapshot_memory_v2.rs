@@ -18,7 +18,7 @@ use crate::memory::{
     GuestMemory, GuestMemoryAccessError, GuestMemoryAllocationError, GuestMemoryBacking,
     GuestMemoryRange, aarch64,
 };
-use crate::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::snapshot_format_v2::{
     NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2Component,
@@ -1286,8 +1286,8 @@ fn decode_binding(bytes: &[u8]) -> Result<SnapshotV2MemoryBinding, SnapshotV2Mem
 fn validate_memory_version(
     version: SnapshotFormatVersion,
 ) -> Result<(), SnapshotV2MemoryBindingError> {
-    if version.major() == NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
-        && (1..=NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor())
+    if version.major() == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
+        && (1..=NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor())
             .contains(&version.minor())
     {
         Ok(())

@@ -9,6 +9,8 @@ use crate::snapshot_device_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceTransportKind,
 };
 #[cfg(target_os = "macos")]
+use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+#[cfg(target_os = "macos")]
 use crate::snapshot_format_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component,
     SnapshotV2ComponentDisposition, encode_snapshot_v2_state_with_compatibility_version,
@@ -273,6 +275,55 @@ fn current_v2_artifact_boundary_rejects_graphless_minor_five() {
         NativeSnapshotArtifactState::from_current_v2(bytes),
         Err(NativeSnapshotArtifactStateError::CurrentV2Profile(
             NativeV2SnapshotCandidateStateError::MissingDeviceGraph
+        ))
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn current_v2_artifact_boundary_rejects_internal_exact_minor_six() {
+    let memory = test_v2_memory();
+    let mut image = Cursor::new(Vec::new());
+    let binding = write_snapshot_v2_memory_image_with_compatibility_version(
+        &memory,
+        &mut image,
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .expect("internal minor-six memory should encode");
+    let binding_payload = binding
+        .encode()
+        .expect("internal minor-six binding should encode");
+    let graph_payload = fixture_bytes(include_str!(
+        "../snapshot_device_v2_6/fixtures/pmem-root-mmio.hex"
+    ));
+    let components = [
+        SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding_payload,
+        ),
+        SnapshotV2Component::new(
+            NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &graph_payload,
+        ),
+    ];
+    let bytes = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &components,
+    )
+    .expect("internal minor-six state should encode explicitly");
+
+    assert!(matches!(
+        NativeSnapshotArtifactState::from_current_v2(bytes),
+        Err(NativeSnapshotArtifactStateError::CurrentV2Profile(
+            NativeV2SnapshotCandidateStateError::Format(
+                SnapshotV2DecodeError::UnsupportedVersion {
+                    found: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                    supported: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                }
+            )
         ))
     ));
 }

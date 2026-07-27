@@ -1,4 +1,5 @@
 use crate::snapshot_device_v2::NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format::{
     NativeSnapshotFormatError, NativeSnapshotState, decode_native_snapshot_state,
     encode_snapshot_envelope,
@@ -201,7 +202,7 @@ fn production_catalog_accepts_all_current_semantic_kinds_and_nonsemantic_extensi
 }
 
 #[test]
-fn device_graph_component_is_introduced_in_minor_four_and_ceiling_is_minor_five() {
+fn device_graph_starts_at_four_current_is_five_and_explicit_ceiling_is_six() {
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind(), 7);
     assert_eq!(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.instance(), 0);
     assert_eq!(
@@ -293,19 +294,43 @@ fn device_graph_component_is_introduced_in_minor_four_and_ceiling_is_minor_five(
         Err(SnapshotV2EncodeError::UnknownRequiredFeature)
     ));
 
-    let future = SnapshotFormatVersion::new(2, 6, 0);
+    let internal = encode_snapshot_v2_state_with_compatibility_version(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &[],
+        &[graph],
+    )
+    .expect("exact 2.6 should encode through the explicit seam");
+    assert_eq!(
+        decode_snapshot_v2_state_with_compatibility_version(
+            &internal,
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        )
+        .expect("exact 2.6 should decode through the explicit seam")
+        .metadata()
+        .version(),
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    );
+    assert_eq!(
+        decode_snapshot_v2_state(&internal),
+        Err(SnapshotV2DecodeError::UnsupportedVersion {
+            found: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_SNAPSHOT_VERSION,
+        })
+    );
+
+    let future = SnapshotFormatVersion::new(2, 7, 0);
     assert!(matches!(
         encode_snapshot_v2_state_with_compatibility_version(future, &[], &[]),
         Err(SnapshotV2EncodeError::UnsupportedVersion {
             requested,
-            maximum: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            maximum: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         }) if requested == future
     ));
     assert_eq!(
         decode_snapshot_v2_state_with_compatibility_version(&EMPTY_V2_FIXTURE, future),
         Err(SnapshotV2DecodeError::UnsupportedVersion {
             found: future,
-            supported: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         })
     );
 }
