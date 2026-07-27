@@ -1,8 +1,13 @@
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use super::codec;
 use super::*;
 
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::{GuestAddress, GuestMemoryRange};
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::PciSbdf;
 use crate::pmem::{PmemRateLimiterConfig, PmemTokenBucketConfig};
@@ -49,6 +54,39 @@ const HEALTHY_DRIVER_OK: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
     | VIRTIO_DEVICE_STATUS_DRIVER
     | VIRTIO_DEVICE_STATUS_FEATURES_OK
     | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+static NEXT_RESTORE_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+struct RestoreTempBacking {
+    path: PathBuf,
+}
+
+impl RestoreTempBacking {
+    fn new(name: &str, len: u64) -> Self {
+        let sequence = NEXT_RESTORE_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bangbang-profile-3-restore-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("restore backing should create");
+        file.set_len(len).expect("restore backing should resize");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RestoreTempBacking {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 fn decode_hex(hex: &str) -> Vec<u8> {
     let hex = hex.trim();
@@ -272,6 +310,390 @@ fn encoded(graph: &SnapshotV2StorageDeviceGraph) -> Vec<u8> {
     graph
         .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
         .expect("fixture graph should encode")
+}
+
+fn restore_memory_for(graph: &SnapshotV2StorageDeviceGraph) -> GuestMemory {
+    let layout = GuestMemoryLayout::new(vec![
+        GuestMemoryRange::new(GuestAddress::new(0), 0x80_0000)
+            .expect("restore memory range should validate"),
+    ])
+    .expect("restore memory layout should validate");
+    let mut memory = GuestMemory::allocate(&layout).expect("restore memory should allocate");
+    for record in graph.block_records() {
+        let Some(cursor) = record.block().continuation().active_queue() else {
+            continue;
+        };
+        let queue = record
+            .virtio()
+            .queues()
+            .first()
+            .expect("block queue should exist");
+        let available_index = if record.block().continuation().retry() == StorageRetryState::None {
+            cursor.next_available()
+        } else {
+            cursor.next_available().wrapping_add(1)
+        };
+        memory
+            .write_slice(
+                &available_index.to_le_bytes(),
+                GuestAddress::new(queue.driver_ring().raw_value() + 2),
+            )
+            .expect("block available index should write");
+        memory
+            .write_slice(
+                &cursor.next_used().to_le_bytes(),
+                GuestAddress::new(queue.device_ring().raw_value() + 2),
+            )
+            .expect("block used index should write");
+    }
+    for record in graph.pmem_records() {
+        let Some(cursor) = record.pmem().active_queue() else {
+            continue;
+        };
+        let queue = record
+            .virtio()
+            .queues()
+            .first()
+            .expect("pmem queue should exist");
+        let available_index = if record.pmem().retry() == StorageRetryState::None {
+            cursor.next_available()
+        } else {
+            cursor.next_available().wrapping_add(1)
+        };
+        memory
+            .write_slice(
+                &available_index.to_le_bytes(),
+                GuestAddress::new(queue.driver_ring().raw_value() + 2),
+            )
+            .expect("pmem available index should write");
+        memory
+            .write_slice(
+                &cursor.next_used().to_le_bytes(),
+                GuestAddress::new(queue.device_ring().raw_value() + 2),
+            )
+            .expect("pmem used index should write");
+    }
+    memory
+}
+
+fn restore_backings(
+    graph: &SnapshotV2StorageDeviceGraph,
+) -> (
+    Vec<RestoreTempBacking>,
+    Vec<crate::block::BlockFileBacking>,
+    Vec<crate::pmem::PmemFileBacking>,
+) {
+    let mut files = Vec::new();
+    let mut blocks = Vec::new();
+    let mut pmems = Vec::new();
+    for (index, record) in graph.block_records().iter().enumerate() {
+        let file =
+            RestoreTempBacking::new(&format!("block-{index}"), record.block().backing_bytes());
+        let backing = crate::block::BlockFileBacking::open_snapshot(
+            file.path(),
+            record.config().is_read_only(),
+        )
+        .expect("block restore backing should open")
+        .0;
+        files.push(file);
+        blocks.push(backing);
+    }
+    for (index, record) in graph.pmem_records().iter().enumerate() {
+        let file = RestoreTempBacking::new(&format!("pmem-{index}"), record.pmem().file_bytes());
+        let host_file = OpenOptions::new()
+            .read(true)
+            .write(!record.config().is_read_only())
+            .open(file.path())
+            .expect("pmem restore file should open");
+        let backing =
+            crate::pmem::PmemFileBacking::from_file(host_file, record.config().is_read_only())
+                .expect("pmem restore backing should validate");
+        files.push(file);
+        pmems.push(backing);
+    }
+    (files, blocks, pmems)
+}
+
+#[test]
+fn restore_plan_prepares_all_root_transport_and_class_combinations() {
+    for (transport, blocks, pmems, root) in [
+        (
+            SnapshotV2DeviceTransportKind::Mmio,
+            1,
+            0,
+            Some(DEVICE_KIND_BLOCK),
+        ),
+        (SnapshotV2DeviceTransportKind::Pci, 1, 0, None),
+        (
+            SnapshotV2DeviceTransportKind::Mmio,
+            0,
+            1,
+            Some(DEVICE_KIND_PMEM),
+        ),
+        (SnapshotV2DeviceTransportKind::Pci, 0, 1, None),
+        (
+            SnapshotV2DeviceTransportKind::Mmio,
+            1,
+            1,
+            Some(DEVICE_KIND_BLOCK),
+        ),
+        (
+            SnapshotV2DeviceTransportKind::Pci,
+            1,
+            1,
+            Some(DEVICE_KIND_PMEM),
+        ),
+    ] {
+        let graph = fixture_graph(transport, blocks, pmems, root);
+        let memory = restore_memory_for(&graph);
+        let expected_root = graph.root_key();
+        let (_files, block_backings, pmem_backings) = restore_backings(&graph);
+        let plan = SnapshotV2StorageRestorePlan::prepare(graph, &memory, Instant::now())
+            .expect("profile-3 restore plan should validate");
+
+        assert_eq!(plan.root_key(), expected_root);
+        assert_eq!(plan.transport_kind(), transport);
+        assert_eq!(plan.block_len(), blocks);
+        assert_eq!(plan.pmem_len(), pmems);
+        assert_eq!(plan.pmem_configs().as_slice().len(), pmems);
+        let bundle = plan
+            .prepare_backings(block_backings, pmem_backings, || false)
+            .expect("profile-3 restore bundle should prepare");
+        assert_eq!(
+            bundle
+                .block_bundle()
+                .map_or(0, |block| block.records().len()),
+            blocks
+        );
+        assert_eq!(bundle.pmem_records().len(), pmems);
+        bundle
+            .abort()
+            .expect("profile-3 restore bundle should cleanly abort");
+    }
+}
+
+#[test]
+fn pmem_restore_bundle_retains_exact_range_queue_limiter_retry_and_value_state() {
+    let graph = fixture_graph(
+        SnapshotV2DeviceTransportKind::Mmio,
+        0,
+        1,
+        Some(DEVICE_KIND_PMEM),
+    );
+    let expected = graph.clone();
+    let memory = restore_memory_for(&graph);
+    let now = Instant::now();
+    let (_files, blocks, pmems) = restore_backings(&graph);
+    let bundle = SnapshotV2StorageRestorePlan::prepare(graph, &memory, now)
+        .expect("pmem restore plan should prepare")
+        .prepare_backings(blocks, pmems, || false)
+        .expect("pmem restore bundle should prepare");
+
+    assert_eq!(bundle.root_key(), expected.root_key());
+    assert_eq!(bundle.transport_kind(), SnapshotV2DeviceTransportKind::Mmio);
+    assert!(bundle.block_bundle().is_none());
+    assert_eq!(bundle.pmem_configs().as_slice().len(), 1);
+    let prepared = &bundle.pmem_records()[0];
+    let expected_record = &expected.pmem_records()[0];
+    assert_eq!(prepared.key(), expected_record.key());
+    assert!(prepared.is_root_device());
+    assert_eq!(
+        prepared.prepared_device().guest_range(),
+        expected_record.pmem().guest_range()
+    );
+    assert_eq!(
+        prepared.prepared_device().config_space(),
+        expected_record.pmem().config_space()
+    );
+    assert_eq!(
+        prepared
+            .device()
+            .active_queue()
+            .map(crate::pmem::VirtioPmemQueue::snapshot_state),
+        expected_record.pmem().active_queue()
+    );
+    assert!(prepared.device().has_pending_rate_limited_queue());
+    assert_eq!(prepared.retry(), expected_record.pmem().retry());
+    assert_eq!(
+        prepared.retry_deadline(),
+        Some(now + Duration::from_nanos(99))
+    );
+    assert_eq!(prepared.virtio(), expected_record.virtio());
+    assert_eq!(prepared.transport(), expected_record.transport());
+
+    let recaptured = prepared
+        .device()
+        .capture_state_at(
+            prepared.prepared_device().config_space(),
+            expected_record.pmem().file_bytes(),
+            expected_record.config().rate_limiter(),
+            now,
+        )
+        .expect("restored pmem semantics should recapture");
+    assert_eq!(
+        recaptured.active_queue(),
+        expected_record.pmem().active_queue()
+    );
+    assert_eq!(
+        recaptured.pending_rate_limited_queue(),
+        expected_record.pmem().pending_rate_limited_queue()
+    );
+    assert_eq!(
+        recaptured.rate_limiter().bandwidth().map(|bucket| (
+            bucket.budget(),
+            bucket.remaining_burst(),
+            bucket.age_nanos(),
+        )),
+        expected_record.pmem().limiter().bandwidth().map(|bucket| (
+            bucket.budget(),
+            bucket.remaining_burst(),
+            bucket.age_nanos(),
+        ))
+    );
+    assert_eq!(
+        format!("{bundle:?}"),
+        "PreparedSnapshotV2StorageBundle { block_count: 0, pmem_count: 1, transport: Mmio, state: \"<redacted>\" }"
+    );
+    bundle
+        .abort()
+        .expect("pmem-only cleanup should be infallible");
+}
+
+#[test]
+fn mixed_pmem_root_restore_keeps_the_block_subgraph_rootless() {
+    let graph = fixture_graph(
+        SnapshotV2DeviceTransportKind::Pci,
+        1,
+        1,
+        Some(DEVICE_KIND_PMEM),
+    );
+    let memory = restore_memory_for(&graph);
+    let now = Instant::now();
+    let (_files, blocks, pmems) = restore_backings(&graph);
+    let bundle = SnapshotV2StorageRestorePlan::prepare(graph, &memory, now)
+        .expect("mixed restore plan should prepare")
+        .prepare_backings(blocks, pmems, || false)
+        .expect("mixed restore bundle should prepare");
+
+    let block = bundle
+        .block_bundle()
+        .expect("mixed bundle should retain its block sub-bundle");
+    assert_eq!(block.records().len(), 1);
+    assert!(!block.records()[0].is_root_device());
+    assert_eq!(bundle.pmem_records().len(), 1);
+    assert!(bundle.pmem_records()[0].is_root_device());
+    bundle.abort().expect("mixed bundle should cleanly abort");
+}
+
+#[test]
+fn restore_plan_rejects_loaded_ram_overlap_and_stale_queue_indices() {
+    let mut overlapping = fixture_graph(
+        SnapshotV2DeviceTransportKind::Mmio,
+        0,
+        1,
+        Some(DEVICE_KIND_PMEM),
+    );
+    let range = GuestMemoryRange::new(GuestAddress::new(0x40_0000), VIRTIO_PMEM_ALIGNMENT * 2)
+        .expect("overlapping pmem range should validate");
+    overlapping.pmem_records[0].pmem.guest_range = range;
+    overlapping.pmem_records[0].pmem.config_space =
+        VirtioPmemConfigSpace::new(range.start().raw_value(), range.size());
+    let memory = restore_memory_for(&overlapping);
+    assert!(matches!(
+        SnapshotV2StorageRestorePlan::prepare(overlapping, &memory, Instant::now()),
+        Err(SnapshotV2StorageRestorePlanError::PmemRange)
+    ));
+
+    let graph = fixture_graph(
+        SnapshotV2DeviceTransportKind::Mmio,
+        0,
+        1,
+        Some(DEVICE_KIND_PMEM),
+    );
+    let mut memory = restore_memory_for(&graph);
+    let used_ring = graph.pmem_records()[0].virtio().queues()[0].device_ring();
+    memory
+        .write_slice(
+            &0_u16.to_le_bytes(),
+            GuestAddress::new(used_ring.raw_value() + 2),
+        )
+        .expect("stale used index should write");
+    assert!(matches!(
+        SnapshotV2StorageRestorePlan::prepare(graph, &memory, Instant::now()),
+        Err(SnapshotV2StorageRestorePlanError::QueueContinuation)
+    ));
+}
+
+#[test]
+fn restore_plan_and_bundle_allocation_faults_precede_owner_construction() {
+    let graph = fixture_graph(
+        SnapshotV2DeviceTransportKind::Mmio,
+        0,
+        1,
+        Some(DEVICE_KIND_PMEM),
+    );
+    let memory = restore_memory_for(&graph);
+    for fail_at in 0..2 {
+        assert!(matches!(
+            super::restore::prepare_with_failing_reserve_for_test(
+                graph.clone(),
+                &memory,
+                Instant::now(),
+                fail_at,
+            ),
+            Err(SnapshotV2StorageRestorePlanError::Allocation)
+        ));
+    }
+
+    let (_files, blocks, pmems) = restore_backings(&graph);
+    let plan = SnapshotV2StorageRestorePlan::prepare(graph, &memory, Instant::now())
+        .expect("allocation bundle plan should prepare");
+    let error =
+        super::restore::prepare_backings_with_failing_reserve_for_test(plan, blocks, pmems, 0)
+            .expect_err("bundle reserve failure should precede mapping");
+    assert!(error.is_retryable());
+    assert!(!error.cleanup_failed());
+}
+
+#[test]
+fn later_pmem_construction_fault_releases_the_prepared_prefix_and_allows_retry() {
+    let graph = fixture_graph(
+        SnapshotV2DeviceTransportKind::Mmio,
+        0,
+        2,
+        Some(DEVICE_KIND_PMEM),
+    );
+    let expected = graph.clone();
+    let memory = restore_memory_for(&graph);
+    let (_files, blocks, pmems) = restore_backings(&graph);
+    let plan = SnapshotV2StorageRestorePlan::prepare(graph, &memory, Instant::now())
+        .expect("pmem fault plan should prepare");
+    let error = super::restore::prepare_backings_with_pmem_fault_for_test(plan, blocks, pmems, 1)
+        .expect_err("second pmem construction should fail after the first mapping");
+    assert!(!error.is_retryable());
+    assert!(!error.cleanup_failed());
+
+    let (_retry_files, blocks, pmems) = restore_backings(&expected);
+    let retry = SnapshotV2StorageRestorePlan::prepare(expected, &memory, Instant::now())
+        .expect("pmem retry plan should prepare")
+        .prepare_backings(blocks, pmems, || false)
+        .expect("pmem backings should remain reusable after prefix cleanup");
+    assert_eq!(retry.pmem_records().len(), 2);
+    assert!(
+        retry.pmem_records()[0]
+            .prepared_device()
+            .backing()
+            .is_read_only()
+    );
+    assert!(
+        !retry.pmem_records()[1]
+            .prepared_device()
+            .backing()
+            .is_read_only()
+    );
+    retry
+        .abort()
+        .expect("pmem retry bundle should abort cleanly");
 }
 
 #[test]
