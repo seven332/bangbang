@@ -10,17 +10,22 @@ use crate::block::async_executor::{
 };
 use crate::block::{
     PreparedBlockDevice, PreparedSnapshotBlockDeviceError, PreparedSnapshotBlockDeviceParts,
-    VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace,
+    VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_RING_FEATURE_EVENT_IDX,
+    VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace, VirtioBlockDevice,
     VirtioBlockMmioHandler, VirtioBlockQueue, VirtioBlockRateLimiter, VirtioBlockRateLimiterState,
     VirtioBlockTokenBucketState, restore_prepared_block_mmio_handler,
 };
 use crate::interrupt::GuestInterruptLine;
-use crate::memory::GuestMemory;
-use crate::mmio::MmioRegion;
+use crate::memory::{GuestMemory, GuestMemoryRange};
+use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::mmio::{MmioRegion, MmioRegionId};
+use crate::pci::PciSbdf;
 use crate::snapshot_device_v2::{
     SnapshotV2BlockBucketState, SnapshotV2RootTransportRestoreError, restore_mmio_transport_state,
 };
+use crate::virtio::VirtioDeviceType;
 use crate::virtio_mmio::VirtioMmioQueueState;
+use crate::virtio_pci::{PreparedVirtioPciEndpoint, VirtioPciIdentity, VirtioPciTransportState};
 
 /// Complete pure destination proof for one detached profile-2 graph.
 pub struct SnapshotV2MultiBlockRestorePlan {
@@ -595,6 +600,229 @@ impl fmt::Debug for PreparedSnapshotV2MultiBlockMmioBundle {
     }
 }
 
+/// One exact detached profile-2 PCI block owner awaiting live route resources.
+pub struct PreparedSnapshotV2MultiBlockPciRecord {
+    key: SnapshotV2DeviceKey,
+    drive_id: String,
+    is_root_device: bool,
+    retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
+    origin: StorageDeviceOrigin,
+    sbdf: PciSbdf,
+    bar_range: GuestMemoryRange,
+    async_generation: Option<BlockAsyncDriveGeneration>,
+    config_space: VirtioBlockConfigSpace,
+    device: VirtioBlockDevice,
+    identity: VirtioPciIdentity,
+    retained: VirtioPciTransportState,
+}
+
+impl PreparedSnapshotV2MultiBlockPciRecord {
+    pub const fn key(&self) -> SnapshotV2DeviceKey {
+        self.key
+    }
+
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    pub const fn is_root_device(&self) -> bool {
+        self.is_root_device
+    }
+
+    pub const fn retry(&self) -> StorageRetryState {
+        self.retry
+    }
+
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    pub const fn sbdf(&self) -> PciSbdf {
+        self.sbdf
+    }
+
+    pub const fn bar_range(&self) -> GuestMemoryRange {
+        self.bar_range
+    }
+
+    pub const fn async_generation(&self) -> Option<BlockAsyncDriveGeneration> {
+        self.async_generation
+    }
+
+    /// Completes retained endpoint preparation against the destination's live
+    /// shared message registry without publishing a BAR or PCI function.
+    pub fn prepare_endpoint(
+        self,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+    ) -> Result<PreparedSnapshotV2MultiBlockPciEndpoint, SnapshotV2RootTransportRestoreError> {
+        let endpoint = PreparedVirtioPciEndpoint::new(
+            self.identity,
+            &VIRTIO_BLOCK_QUEUE_SIZES,
+            self.config_space,
+            self.device,
+            self.retained.is_device_activated(),
+            false,
+            &self.retained,
+            self.sbdf,
+            self.bar_range,
+            region_id,
+            messages,
+        )
+        .map_err(SnapshotV2RootTransportRestoreError::Pci)?;
+        Ok(PreparedSnapshotV2MultiBlockPciEndpoint {
+            key: self.key,
+            drive_id: self.drive_id,
+            is_root_device: self.is_root_device,
+            retry: self.retry,
+            retry_deadline: self.retry_deadline,
+            origin: self.origin,
+            async_generation: self.async_generation,
+            endpoint,
+        })
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MultiBlockPciRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MultiBlockPciRecord")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One fully checked, still-unpublished profile-2 PCI endpoint and owner
+/// metadata.
+pub struct PreparedSnapshotV2MultiBlockPciEndpoint {
+    key: SnapshotV2DeviceKey,
+    drive_id: String,
+    is_root_device: bool,
+    retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
+    origin: StorageDeviceOrigin,
+    async_generation: Option<BlockAsyncDriveGeneration>,
+    endpoint: PreparedVirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice>,
+}
+
+/// Consumed exact owner metadata and unpublished retained PCI endpoint.
+pub type PreparedSnapshotV2MultiBlockPciEndpointParts = (
+    SnapshotV2DeviceKey,
+    String,
+    bool,
+    StorageRetryState,
+    Option<Instant>,
+    StorageDeviceOrigin,
+    Option<BlockAsyncDriveGeneration>,
+    PreparedVirtioPciEndpoint<VirtioBlockConfigSpace, VirtioBlockDevice>,
+);
+
+impl PreparedSnapshotV2MultiBlockPciEndpoint {
+    /// Returns the canonical graph key before publication consumes the value.
+    pub const fn key(&self) -> SnapshotV2DeviceKey {
+        self.key
+    }
+
+    /// Returns the public drive identifier used to claim its metrics lease.
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    /// Consumes the endpoint and its exact manager metadata.
+    pub fn into_parts(self) -> PreparedSnapshotV2MultiBlockPciEndpointParts {
+        (
+            self.key,
+            self.drive_id,
+            self.is_root_device,
+            self.retry,
+            self.retry_deadline,
+            self.origin,
+            self.async_generation,
+            self.endpoint,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MultiBlockPciEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MultiBlockPciEndpoint")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Move-only exact profile-2 PCI vector awaiting one private manager.
+pub struct PreparedSnapshotV2MultiBlockPciBundle {
+    drive_configs: DriveConfigs,
+    records: Vec<PreparedSnapshotV2MultiBlockPciRecord>,
+    async_runtime: Option<SharedBlockAsyncRuntime>,
+    async_generations: Vec<BlockAsyncDriveGeneration>,
+}
+
+impl PreparedSnapshotV2MultiBlockPciBundle {
+    pub const fn drive_configs(&self) -> &DriveConfigs {
+        &self.drive_configs
+    }
+
+    pub fn records(&self) -> &[PreparedSnapshotV2MultiBlockPciRecord] {
+        &self.records
+    }
+
+    pub const fn async_runtime(&self) -> Option<&SharedBlockAsyncRuntime> {
+        self.async_runtime.as_ref()
+    }
+
+    /// Transfers every detached endpoint owner, generation and controller
+    /// value into the destination transaction.
+    pub fn into_parts(
+        mut self,
+    ) -> (
+        DriveConfigs,
+        Vec<PreparedSnapshotV2MultiBlockPciRecord>,
+        Option<SharedBlockAsyncRuntime>,
+        Vec<BlockAsyncDriveGeneration>,
+    ) {
+        (
+            std::mem::take(&mut self.drive_configs),
+            std::mem::take(&mut self.records),
+            self.async_runtime.take(),
+            std::mem::take(&mut self.async_generations),
+        )
+    }
+
+    /// Explicitly releases every transferred fresh Async generation.
+    pub fn abort(mut self) -> Result<(), SnapshotV2MultiBlockCleanupError> {
+        let result =
+            cleanup_async_generations(self.async_runtime.as_ref(), &self.async_generations);
+        self.async_generations.clear();
+        self.async_runtime = None;
+        result
+    }
+}
+
+impl Drop for PreparedSnapshotV2MultiBlockPciBundle {
+    fn drop(&mut self) {
+        let _ = cleanup_async_generations(self.async_runtime.as_ref(), &self.async_generations);
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2MultiBlockPciBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2MultiBlockPciBundle")
+            .field("record_count", &self.records.len())
+            .field("has_async_runtime", &self.async_runtime.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 enum SnapshotV2MultiBlockMmioTransportErrorKind {
     TransportPolicy,
@@ -607,6 +835,88 @@ enum SnapshotV2MultiBlockMmioTransportErrorKind {
 pub struct SnapshotV2MultiBlockMmioTransportError {
     kind: SnapshotV2MultiBlockMmioTransportErrorKind,
     cleanup: Option<SnapshotV2MultiBlockCleanupError>,
+}
+
+#[derive(Debug)]
+enum SnapshotV2MultiBlockPciTransportErrorKind {
+    TransportPolicy,
+    Allocation,
+    AsyncBinding,
+    Transport(SnapshotV2RootTransportRestoreError),
+}
+
+/// Redacted failure while consuming profile-2 devices into detached exact PCI
+/// transports.
+pub struct SnapshotV2MultiBlockPciTransportError {
+    kind: SnapshotV2MultiBlockPciTransportErrorKind,
+    cleanup: Option<SnapshotV2MultiBlockCleanupError>,
+}
+
+impl SnapshotV2MultiBlockPciTransportError {
+    fn new(
+        kind: SnapshotV2MultiBlockPciTransportErrorKind,
+        cleanup: Option<SnapshotV2MultiBlockCleanupError>,
+    ) -> Self {
+        Self { kind, cleanup }
+    }
+
+    pub const fn cleanup_failed(&self) -> bool {
+        self.cleanup.is_some()
+    }
+}
+
+impl fmt::Debug for SnapshotV2MultiBlockPciTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind {
+            SnapshotV2MultiBlockPciTransportErrorKind::TransportPolicy => "transport-policy",
+            SnapshotV2MultiBlockPciTransportErrorKind::Allocation => "allocation",
+            SnapshotV2MultiBlockPciTransportErrorKind::AsyncBinding => "async-binding",
+            SnapshotV2MultiBlockPciTransportErrorKind::Transport(_) => "transport",
+        };
+        formatter
+            .debug_struct("SnapshotV2MultiBlockPciTransportError")
+            .field("kind", &kind)
+            .field("cleanup_failed", &self.cleanup_failed())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2MultiBlockPciTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.kind {
+            SnapshotV2MultiBlockPciTransportErrorKind::TransportPolicy => {
+                "snapshot multi-block PCI transport policy is invalid"
+            }
+            SnapshotV2MultiBlockPciTransportErrorKind::Allocation => {
+                "snapshot multi-block PCI transport allocation failed"
+            }
+            SnapshotV2MultiBlockPciTransportErrorKind::AsyncBinding => {
+                "snapshot multi-block PCI Async ownership is invalid"
+            }
+            SnapshotV2MultiBlockPciTransportErrorKind::Transport(_) => {
+                "snapshot multi-block PCI transport reconstruction failed"
+            }
+        })?;
+        if self.cleanup_failed() {
+            formatter.write_str("; Async cleanup also failed")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SnapshotV2MultiBlockPciTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            SnapshotV2MultiBlockPciTransportErrorKind::Transport(source) => Some(source),
+            SnapshotV2MultiBlockPciTransportErrorKind::TransportPolicy
+            | SnapshotV2MultiBlockPciTransportErrorKind::Allocation
+            | SnapshotV2MultiBlockPciTransportErrorKind::AsyncBinding => self
+                .cleanup
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+        }
+    }
 }
 
 impl SnapshotV2MultiBlockMmioTransportError {
@@ -760,7 +1070,7 @@ impl PreparedSnapshotV2MultiBlockBundle {
                 self.mmio_transport_error(SnapshotV2MultiBlockMmioTransportErrorKind::Allocation)
             );
         }
-        if !validate_mmio_async_ownership(
+        if !validate_async_ownership(
             &self.records,
             self.async_runtime.as_ref(),
             &mut async_generations,
@@ -844,12 +1154,128 @@ impl PreparedSnapshotV2MultiBlockBundle {
         }
     }
 
+    /// Reconstructs the complete detached exact PCI vector without publishing
+    /// a BAR, function, message route or dispatcher handler.
+    pub fn prepare_pci_transport(
+        mut self,
+    ) -> Result<PreparedSnapshotV2MultiBlockPciBundle, SnapshotV2MultiBlockPciTransportError> {
+        let mut async_generations = Vec::new();
+        if async_generations
+            .try_reserve_exact(self.records.len())
+            .is_err()
+        {
+            return Err(
+                self.pci_transport_error(SnapshotV2MultiBlockPciTransportErrorKind::Allocation)
+            );
+        }
+        if !validate_async_ownership(
+            &self.records,
+            self.async_runtime.as_ref(),
+            &mut async_generations,
+        ) {
+            return Err(
+                self.pci_transport_error(SnapshotV2MultiBlockPciTransportErrorKind::AsyncBinding)
+            );
+        }
+        if self
+            .records
+            .iter()
+            .any(|record| !matches!(record.transport, SnapshotV2DeviceTransport::Pci(_)))
+        {
+            return Err(self
+                .pci_transport_error(SnapshotV2MultiBlockPciTransportErrorKind::TransportPolicy));
+        }
+
+        let mut prepared = Vec::new();
+        if prepared.try_reserve_exact(self.records.len()).is_err() {
+            return Err(
+                self.pci_transport_error(SnapshotV2MultiBlockPciTransportErrorKind::Allocation)
+            );
+        }
+
+        let drive_configs = std::mem::take(&mut self.drive_configs);
+        let records = std::mem::take(&mut self.records);
+        let async_runtime = self.async_runtime.take();
+        self.retry_projection.clear();
+        let result = (|| {
+            for record in records {
+                let PreparedSnapshotV2MultiBlockRecord {
+                    key,
+                    queue_ranges: _,
+                    retry,
+                    retry_deadline,
+                    virtio,
+                    transport,
+                    async_generation,
+                    device,
+                } = record;
+                let SnapshotV2DeviceTransport::Pci(pci) = transport else {
+                    return Err(SnapshotV2MultiBlockPciTransportErrorKind::TransportPolicy);
+                };
+                let device_type =
+                    VirtioDeviceType::new(VIRTIO_BLOCK_DEVICE_ID).map_err(|source| {
+                        SnapshotV2MultiBlockPciTransportErrorKind::Transport(
+                            SnapshotV2RootTransportRestoreError::DeviceType(source),
+                        )
+                    })?;
+                let identity = VirtioPciIdentity::new(device_type, virtio.available_features())
+                    .with_config_generation(virtio.config_generation());
+                let retained =
+                    VirtioPciTransportState::from_snapshot_v2_parts(identity, &virtio, &pci, false)
+                        .map_err(|source| {
+                            SnapshotV2MultiBlockPciTransportErrorKind::Transport(
+                                SnapshotV2RootTransportRestoreError::Pci(source),
+                            )
+                        })?;
+                let (drive_id, is_root_device, config_space, device) = device.into_parts();
+                prepared.push(PreparedSnapshotV2MultiBlockPciRecord {
+                    key,
+                    drive_id,
+                    is_root_device,
+                    retry,
+                    retry_deadline,
+                    origin: pci.origin(),
+                    sbdf: pci.sbdf(),
+                    bar_range: pci.bar_range(),
+                    async_generation,
+                    config_space,
+                    device,
+                    identity,
+                    retained,
+                });
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(PreparedSnapshotV2MultiBlockPciBundle {
+                drive_configs,
+                records: prepared,
+                async_runtime,
+                async_generations,
+            }),
+            Err(kind) => {
+                drop(prepared);
+                let cleanup =
+                    cleanup_async_generations(async_runtime.as_ref(), &async_generations).err();
+                Err(SnapshotV2MultiBlockPciTransportError::new(kind, cleanup))
+            }
+        }
+    }
+
     fn mmio_transport_error(
         self,
         kind: SnapshotV2MultiBlockMmioTransportErrorKind,
     ) -> SnapshotV2MultiBlockMmioTransportError {
         let cleanup = self.abort().err();
         SnapshotV2MultiBlockMmioTransportError::new(kind, cleanup)
+    }
+
+    fn pci_transport_error(
+        self,
+        kind: SnapshotV2MultiBlockPciTransportErrorKind,
+    ) -> SnapshotV2MultiBlockPciTransportError {
+        let cleanup = self.abort().err();
+        SnapshotV2MultiBlockPciTransportError::new(kind, cleanup)
     }
 
     /// Explicitly releases every fresh Async generation in reverse order.
@@ -1021,7 +1447,7 @@ fn async_binding_failure(
     }
 }
 
-fn validate_mmio_async_ownership(
+fn validate_async_ownership(
     records: &[PreparedSnapshotV2MultiBlockRecord],
     runtime: Option<&SharedBlockAsyncRuntime>,
     generations: &mut Vec<BlockAsyncDriveGeneration>,
@@ -1613,6 +2039,198 @@ mod tests {
                 .expect("runtime should remain observable"),
             0
         );
+    }
+
+    #[test]
+    fn consuming_pci_handoff_preserves_exact_transport_and_async_identity() {
+        let graph = crate::snapshot_device_v2_5::tests::fixture_graph(
+            SnapshotV2DeviceTransportKind::Pci,
+            true,
+        );
+        let expected = graph.clone();
+        let memory = memory_for(&graph);
+        let now = Instant::now();
+        let configs = graph
+            .project_drive_configs()
+            .expect("fixture configs should project");
+        let (_files, backings) = open_backings(&graph);
+        let bundle = SnapshotV2MultiBlockRestorePlan::prepare(graph, &memory, now)
+            .expect("fixture graph should prepare")
+            .prepare_backings(configs.clone(), backings)
+            .expect("fixture backings should prepare");
+        let expected_runtime = bundle
+            .async_runtime()
+            .expect("mixed fixture should own one runtime")
+            .clone();
+
+        let pci = bundle
+            .prepare_pci_transport()
+            .expect("exact PCI vector should reconstruct");
+        assert_eq!(pci.drive_configs(), &configs);
+        assert_eq!(pci.records().len(), expected.records().len());
+        assert!(
+            pci.async_runtime()
+                .is_some_and(|runtime| runtime.same_runtime(&expected_runtime))
+        );
+        for (record, expected) in pci.records().iter().zip(expected.records()) {
+            let SnapshotV2DeviceTransport::Pci(expected_pci) = expected.transport() else {
+                panic!("fixture transport should be PCI");
+            };
+            let device_type = VirtioDeviceType::new(VIRTIO_BLOCK_DEVICE_ID)
+                .expect("block device type should validate");
+            let identity =
+                VirtioPciIdentity::new(device_type, expected.virtio().available_features())
+                    .with_config_generation(expected.virtio().config_generation());
+            let expected_transport = VirtioPciTransportState::from_snapshot_v2_parts(
+                identity,
+                expected.virtio(),
+                expected_pci,
+                false,
+            )
+            .expect("retained transport should restore");
+
+            assert_eq!(record.key(), expected.key());
+            assert_eq!(record.drive_id(), expected.config().drive_id());
+            assert_eq!(record.is_root_device(), expected.is_root());
+            assert_eq!(record.retry(), expected.block().continuation().retry());
+            assert_eq!(
+                record.retry_deadline().is_some(),
+                record.retry() != StorageRetryState::None
+            );
+            assert_eq!(record.origin(), expected_pci.origin());
+            assert_eq!(record.sbdf(), expected_pci.sbdf());
+            assert_eq!(record.bar_range(), expected_pci.bar_range());
+            assert_eq!(
+                record.config_space,
+                VirtioBlockConfigSpace::new(
+                    expected.block().backing_bytes(),
+                    expected.config().is_read_only(),
+                    expected.config().cache_type(),
+                )
+            );
+            assert_eq!(record.identity, identity);
+            assert_eq!(record.retained, expected_transport);
+            match expected.config().io_engine() {
+                DriveIoEngine::Sync => {
+                    assert_eq!(record.async_generation(), None);
+                    assert!(record.device.async_binding().is_none());
+                }
+                DriveIoEngine::Async => {
+                    let generation = record
+                        .async_generation()
+                        .expect("Async generation should transfer");
+                    let (record_runtime, record_generation) = record
+                        .device
+                        .async_binding()
+                        .expect("Async device should retain its binding");
+                    assert_eq!(record_generation, generation);
+                    assert!(record_runtime.same_runtime(&expected_runtime));
+                }
+            }
+        }
+        let (returned_configs, records, runtime, generations) = pci.into_parts();
+        assert_eq!(returned_configs, configs);
+        assert_eq!(records.len(), expected.records().len());
+        assert_eq!(generations.len(), 1);
+        drop(records);
+        cleanup_async_generations(runtime.as_ref(), &generations)
+            .expect("transferred Async runtime should cleanly release");
+        assert_eq!(
+            expected_runtime
+                .generation_count()
+                .expect("runtime should remain observable"),
+            0
+        );
+    }
+
+    #[test]
+    fn consuming_pci_handoff_preserves_rootless_sync_only_ownership() {
+        let fixture = crate::snapshot_device_v2_5::tests::fixture_graph(
+            SnapshotV2DeviceTransportKind::Pci,
+            false,
+        );
+        let graph = SnapshotV2MultiBlockDeviceGraph::try_from_parts(
+            None,
+            SnapshotV2DeviceTransportKind::Pci,
+            vec![fixture.records()[0].clone()],
+        )
+        .expect("one rootless Sync PCI record should remain graph-valid");
+        assert_eq!(graph.records()[0].config().io_engine(), DriveIoEngine::Sync);
+        let memory = memory_for(&graph);
+        let configs = graph
+            .project_drive_configs()
+            .expect("rootless Sync config should project");
+        let (_files, backings) = open_backings(&graph);
+        let bundle = SnapshotV2MultiBlockRestorePlan::prepare(graph, &memory, Instant::now())
+            .expect("rootless Sync graph should prepare")
+            .prepare_backings(configs.clone(), backings)
+            .expect("rootless Sync backing should prepare")
+            .prepare_pci_transport()
+            .expect("rootless Sync PCI handoff should prepare");
+
+        assert_eq!(bundle.drive_configs(), &configs);
+        assert!(bundle.async_runtime().is_none());
+        assert_eq!(bundle.records().len(), 1);
+        assert!(!bundle.records()[0].is_root_device());
+        assert_eq!(bundle.records()[0].async_generation(), None);
+        bundle
+            .abort()
+            .expect("rootless Sync handoff should cleanly abort");
+    }
+
+    #[test]
+    fn consuming_pci_handoff_rejects_foreign_transport_and_invalid_generation_set() {
+        let mmio_graph = crate::snapshot_device_v2_5::tests::fixture_graph(
+            SnapshotV2DeviceTransportKind::Mmio,
+            true,
+        );
+        let memory = memory_for(&mmio_graph);
+        let configs = mmio_graph
+            .project_drive_configs()
+            .expect("fixture configs should project");
+        let (_files, backings) = open_backings(&mmio_graph);
+        let bundle = SnapshotV2MultiBlockRestorePlan::prepare(mmio_graph, &memory, Instant::now())
+            .expect("MMIO graph should prepare")
+            .prepare_backings(configs, backings)
+            .expect("MMIO bundle should prepare");
+        let runtime = bundle
+            .async_runtime()
+            .expect("mixed fixture should own one runtime")
+            .clone();
+        let error = bundle
+            .prepare_pci_transport()
+            .expect_err("MMIO vector must not enter the PCI handoff");
+        assert!(!error.cleanup_failed());
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
+
+        let graph = crate::snapshot_device_v2_5::tests::fixture_graph(
+            SnapshotV2DeviceTransportKind::Pci,
+            true,
+        );
+        let memory = memory_for(&graph);
+        let configs = graph
+            .project_drive_configs()
+            .expect("fixture configs should project");
+        let (_files, backings) = open_backings(&graph);
+        let mut bundle = SnapshotV2MultiBlockRestorePlan::prepare(graph, &memory, Instant::now())
+            .expect("PCI graph should prepare")
+            .prepare_backings(configs, backings)
+            .expect("PCI bundle should prepare");
+        let runtime = bundle
+            .async_runtime()
+            .expect("mixed fixture should own one runtime")
+            .clone();
+        let async_record = bundle
+            .records
+            .iter_mut()
+            .find(|record| record.async_generation.is_some())
+            .expect("fixture should contain one Async record");
+        async_record.async_generation = None;
+        let error = bundle
+            .prepare_pci_transport()
+            .expect_err("missing generation ownership must be rejected");
+        assert!(!error.cleanup_failed());
+        assert_eq!(runtime.generation_count().expect("runtime should lock"), 0);
     }
 
     #[test]

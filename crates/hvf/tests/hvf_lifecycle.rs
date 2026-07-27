@@ -7876,6 +7876,140 @@ fn notify_native_v2_multi_block_queue(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn activate_native_v2_multi_block_pci_queue(
+    session: &bangbang_hvf::OwnedHvfArm64BootSession,
+    bar_base: bangbang_runtime::memory::GuestAddress,
+    fixture: NativeV2MultiBlockQueueFixture,
+    message_address: u64,
+    message_data: u32,
+) {
+    use bangbang_runtime::virtio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
+    };
+    use bangbang_runtime::virtio_pci::VIRTIO_PCI_MSIX_TABLE_OFFSET;
+
+    const DRIVER_FEATURE_SELECT: u64 = 0x08;
+    const DRIVER_FEATURE: u64 = 0x0c;
+    const DEVICE_STATUS: u64 = 0x14;
+    const QUEUE_SELECT: u64 = 0x16;
+    const QUEUE_SIZE: u64 = 0x18;
+    const QUEUE_MSIX_VECTOR: u64 = 0x1a;
+    const QUEUE_ENABLE: u64 = 0x1c;
+    const QUEUE_DESC_LOW: u64 = 0x20;
+    const QUEUE_AVAIL_LOW: u64 = 0x28;
+    const QUEUE_USED_LOW: u64 = 0x30;
+
+    let dispatcher = session.mmio_dispatcher();
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("multi-block PCI dispatcher should not be poisoned");
+    let write =
+        |dispatcher: &mut bangbang_runtime::mmio::MmioDispatcher, offset: u64, data: &[u8]| {
+            write_native_v2_multi_block_mmio(
+                dispatcher,
+                bar_base
+                    .checked_add(offset)
+                    .expect("multi-block PCI BAR address should fit"),
+                data,
+            );
+        };
+
+    write(
+        &mut dispatcher,
+        VIRTIO_PCI_MSIX_TABLE_OFFSET,
+        &message_address.to_le_bytes(),
+    );
+    write(
+        &mut dispatcher,
+        VIRTIO_PCI_MSIX_TABLE_OFFSET + 8,
+        &u64::from(message_data).to_le_bytes(),
+    );
+    for status in [
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+    ] {
+        write(
+            &mut dispatcher,
+            DEVICE_STATUS,
+            &[u8::try_from(status).expect("virtio status should fit u8")],
+        );
+    }
+    write(&mut dispatcher, DRIVER_FEATURE_SELECT, &1_u32.to_le_bytes());
+    write(&mut dispatcher, DRIVER_FEATURE, &1_u32.to_le_bytes());
+    write(
+        &mut dispatcher,
+        DEVICE_STATUS,
+        &[u8::try_from(
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                | VIRTIO_DEVICE_STATUS_DRIVER
+                | VIRTIO_DEVICE_STATUS_FEATURES_OK,
+        )
+        .expect("virtio status should fit u8")],
+    );
+    write(&mut dispatcher, QUEUE_SELECT, &0_u16.to_le_bytes());
+    write(
+        &mut dispatcher,
+        QUEUE_SIZE,
+        &NATIVE_V2_MULTI_BLOCK_QUEUE_SIZE.to_le_bytes(),
+    );
+    write(&mut dispatcher, QUEUE_MSIX_VECTOR, &0_u16.to_le_bytes());
+    write(
+        &mut dispatcher,
+        QUEUE_DESC_LOW,
+        &u32::try_from(fixture.descriptor_table().raw_value())
+            .expect("multi-block descriptor address should fit u32")
+            .to_le_bytes(),
+    );
+    write(
+        &mut dispatcher,
+        QUEUE_AVAIL_LOW,
+        &u32::try_from(fixture.available_ring().raw_value())
+            .expect("multi-block available ring should fit u32")
+            .to_le_bytes(),
+    );
+    write(
+        &mut dispatcher,
+        QUEUE_USED_LOW,
+        &u32::try_from(fixture.used_ring().raw_value())
+            .expect("multi-block used ring should fit u32")
+            .to_le_bytes(),
+    );
+    write(&mut dispatcher, QUEUE_ENABLE, &1_u16.to_le_bytes());
+    write(
+        &mut dispatcher,
+        DEVICE_STATUS,
+        &[u8::try_from(
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                | VIRTIO_DEVICE_STATUS_DRIVER
+                | VIRTIO_DEVICE_STATUS_FEATURES_OK
+                | VIRTIO_DEVICE_STATUS_DRIVER_OK,
+        )
+        .expect("virtio status should fit u8")],
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn notify_native_v2_multi_block_pci_queue(
+    session: &bangbang_hvf::OwnedHvfArm64BootSession,
+    bar_base: bangbang_runtime::memory::GuestAddress,
+) {
+    use bangbang_runtime::virtio_pci::VIRTIO_PCI_NOTIFICATION_OFFSET;
+
+    let dispatcher = session.mmio_dispatcher();
+    let mut dispatcher = dispatcher
+        .lock()
+        .expect("multi-block PCI dispatcher should not be poisoned");
+    write_native_v2_multi_block_mmio(
+        &mut dispatcher,
+        bar_base
+            .checked_add(VIRTIO_PCI_NOTIFICATION_OFFSET)
+            .expect("multi-block PCI notification address should fit"),
+        &0_u16.to_le_bytes(),
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_v2_multi_block_interrupt_status(
     session: &bangbang_hvf::OwnedHvfArm64BootSession,
     transport_base: bangbang_runtime::memory::GuestAddress,
@@ -7976,7 +8110,7 @@ fn native_v2_multi_block_dispatch_signaled(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
+fn native_v2_multi_block_reconstructs_rooted_and_rootless_mmio_and_pci_owners() {
     use std::fs::OpenOptions;
     use std::time::Instant;
 
@@ -7990,6 +8124,7 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::{
         BlockFileBacking, BlockMmioLayout, DriveCacheType, DriveConfigInput, DriveIoEngine,
+        PreparedBlockDevice,
     };
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::machine::MachineConfigInput;
@@ -8000,7 +8135,7 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransport;
     use bangbang_runtime::snapshot_device_v2_5::SnapshotV2MultiBlockRestorePlan;
-    use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
+    use bangbang_runtime::storage_capture::{CaptureReadyStorageConfigs, StorageDeviceOrigin};
     use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
@@ -8008,9 +8143,11 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
         .expect("HVF lifecycle test lock should not be poisoned");
     let image = arm64_image().expect("test arm64 image should build");
 
-    for (case, rooted) in [
-        ("native-v2-multi-block-mmio-rooted-owner", true),
-        ("native-v2-multi-block-mmio-rootless-owner", false),
+    for (case, rooted, pci_enabled) in [
+        ("native-v2-multi-block-mmio-rooted-owner", true, false),
+        ("native-v2-multi-block-mmio-rootless-owner", false, false),
+        ("native-v2-multi-block-pci-rooted-owner", true, true),
+        ("native-v2-multi-block-pci-rootless-owner", false, true),
     ] {
         let kernel = TempFile::new(&format!("{case}-kernel"), &image)
             .unwrap_or_else(|error| panic!("{case} kernel should create: {error}"));
@@ -8035,19 +8172,20 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
                     .with_io_engine(DriveIoEngine::Sync),
             ))
             .unwrap_or_else(|error| panic!("{case} Sync drive should configure: {error}"));
-        controller
-            .handle_action(VmmAction::PutDrive(
-                DriveConfigInput::new("async", "async", second.path(), false)
-                    .with_is_read_only(false)
-                    .with_cache_type(DriveCacheType::Writeback)
-                    .with_io_engine(DriveIoEngine::Async),
-            ))
-            .unwrap_or_else(|error| panic!("{case} Async drive should configure: {error}"));
+        let async_input = DriveConfigInput::new("async", "async", second.path(), false)
+            .with_is_read_only(false)
+            .with_cache_type(DriveCacheType::Writeback)
+            .with_io_engine(DriveIoEngine::Async);
+        if !pci_enabled {
+            controller
+                .handle_action(VmmAction::PutDrive(async_input.clone()))
+                .unwrap_or_else(|error| panic!("{case} Async drive should configure: {error}"));
+        }
 
         let block_layout =
             BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1));
         let source_serial = SharedSerialOutputBuffer::default();
-        let session_config = HvfArm64BootSessionConfig::new(
+        let mut session_config = HvfArm64BootSessionConfig::new(
             block_layout,
             PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
             NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
@@ -8062,8 +8200,30 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
             GuestAddress::new(0x4000_2000),
             SharedSerialOutput::from(source_serial),
         ));
+        if pci_enabled {
+            session_config = session_config.with_pci_enabled();
+        }
         let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
             .unwrap_or_else(|error| panic!("{case} source should prepare: {error}"));
+        if pci_enabled {
+            let async_config = async_input
+                .clone()
+                .validate()
+                .unwrap_or_else(|error| panic!("{case} Async config should validate: {error}"));
+            controller
+                .handle_action(VmmAction::PutDrive(async_input))
+                .unwrap_or_else(|error| panic!("{case} Async drive should configure: {error}"));
+            source
+                .insert_runtime_block_device(
+                    PreparedBlockDevice::from_config_with_backing(&async_config, None)
+                        .unwrap_or_else(|error| {
+                            panic!("{case} runtime Async drive should prepare: {error}")
+                        }),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{case} runtime Async drive should publish: {error}")
+                });
+        }
 
         let source_entry = GuestAddress::new(
             source
@@ -8130,6 +8290,13 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
             .unwrap_or_else(|error| panic!("{case} graph should capture: {error}"));
         assert_eq!(graph.records().len(), 2);
         assert_eq!(graph.root_key().is_some(), rooted);
+        if pci_enabled {
+            let SnapshotV2DeviceTransport::Pci(second_transport) = graph.records()[1].transport()
+            else {
+                panic!("{case} runtime record should use PCI");
+            };
+            assert_eq!(second_transport.origin(), StorageDeviceOrigin::Runtime);
+        }
         source
             .pause_for_snapshot_v2_capture()
             .unwrap_or_else(|error| panic!("{case} source should pause: {error}"));
@@ -8216,22 +8383,35 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
         let platform_plan = prepare_hvf_snapshot_v2_multi_block_platform_plan(
             &source_platform,
             &bundle,
-            HvfSnapshotV2MultiBlockProcessConfig::new(block_layout, false),
+            HvfSnapshotV2MultiBlockProcessConfig::new(block_layout, pci_enabled),
         )
         .unwrap_or_else(|error| panic!("{case} platform plan should prepare: {error}"));
         let restored_serial = SharedSerialOutputBuffer::default();
         let shell =
             HvfSnapshotV2DefaultProcessShell::new(SharedSerialOutput::from(restored_serial));
-        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_multi_block_mmio(
-            source_platform.clone(),
-            restored_memory,
-            shell,
-            bundle,
-            platform_plan,
-        )
-        .unwrap_or_else(|error| panic!("{case} owner vector should restore: {error:?}"));
-        assert_eq!(owners.drive_configs(), &drive_configs);
-        let (mut restored, restored_drive_configs) = owners.into_parts();
+        let (mut restored, restored_drive_configs) = if pci_enabled {
+            let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_multi_block_pci(
+                source_platform.clone(),
+                restored_memory,
+                shell,
+                bundle,
+                platform_plan,
+            )
+            .unwrap_or_else(|error| panic!("{case} PCI owner vector should restore: {error:?}"));
+            assert_eq!(owners.drive_configs(), &drive_configs);
+            owners.into_parts()
+        } else {
+            let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_multi_block_mmio(
+                source_platform.clone(),
+                restored_memory,
+                shell,
+                bundle,
+                platform_plan,
+            )
+            .unwrap_or_else(|error| panic!("{case} MMIO owner vector should restore: {error:?}"));
+            assert_eq!(owners.drive_configs(), &drive_configs);
+            owners.into_parts()
+        };
         assert_eq!(
             restored
                 .capture_arm64_general_register_state()
@@ -8243,24 +8423,57 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
             0xc0,
             "{case} restored synthetic guest should retain IRQ and FIQ masks"
         );
-        assert_eq!(restored.runtime_resources().block_devices.len(), 2);
-        for ((device, record), config) in restored
-            .runtime_resources()
-            .block_devices
-            .iter()
-            .zip(graph.records())
-            .zip(restored_drive_configs.as_slice())
-        {
-            let SnapshotV2DeviceTransport::Mmio(mmio) = record.transport() else {
-                panic!("{case} record should retain MMIO transport");
-            };
+        assert_eq!(restored.uses_pci_data_devices(), pci_enabled);
+        if pci_enabled {
+            assert!(restored.runtime_resources().block_devices.is_empty());
+            assert!(restored.runtime_resources().pci_block_devices.is_empty());
+            assert!(restored.block_interrupt_lines().is_empty());
+            let diagnostics = restored
+                .pci_data_device_diagnostics()
+                .expect("restored PCI manager should exist")
+                .unwrap_or_else(|error| panic!("{case} PCI diagnostics should inspect: {error}"));
+            assert_eq!(diagnostics.len(), 2);
+            for (diagnostics, config) in diagnostics.iter().zip(restored_drive_configs.as_slice()) {
+                assert_eq!(
+                    diagnostics.kind,
+                    bangbang_hvf::HvfArm64BootPciDataDeviceKind::Block
+                );
+                assert_eq!(diagnostics.id, config.drive_id());
+                assert_eq!(
+                    diagnostics.transport.phase,
+                    bangbang_runtime::virtio_pci::VirtioPciEndpointPhase::Active
+                );
+                assert!(!diagnostics.transport.device_activated);
+                assert_eq!(diagnostics.queue_deliveries, 0);
+            }
             assert_eq!(
-                device.registration.index(),
-                record.key().instance() as usize
+                restored
+                    .runtime_resources()
+                    .block_async_runtime
+                    .generation_count()
+                    .expect("restored PCI Async runtime should inspect"),
+                1
             );
-            assert_eq!(device.registration.drive_id(), config.drive_id());
-            assert_eq!(device.registration.region(), mmio.region());
-            assert_eq!(device.fdt_device.interrupt_line, mmio.interrupt_line());
+        } else {
+            assert_eq!(restored.runtime_resources().block_devices.len(), 2);
+            for ((device, record), config) in restored
+                .runtime_resources()
+                .block_devices
+                .iter()
+                .zip(graph.records())
+                .zip(restored_drive_configs.as_slice())
+            {
+                let SnapshotV2DeviceTransport::Mmio(mmio) = record.transport() else {
+                    panic!("{case} record should retain MMIO transport");
+                };
+                assert_eq!(
+                    device.registration.index(),
+                    record.key().instance() as usize
+                );
+                assert_eq!(device.registration.drive_id(), config.drive_id());
+                assert_eq!(device.registration.region(), mmio.region());
+                assert_eq!(device.fdt_device.interrupt_line, mmio.interrupt_line());
+            }
         }
 
         let metrics = restored.shared_block_device_metrics();
@@ -8282,7 +8495,7 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
             0
         );
 
-        {
+        if !pci_enabled {
             let dispatcher = restored.mmio_dispatcher();
             let mut dispatcher = dispatcher
                 .lock()
@@ -8351,12 +8564,16 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
         assert_native_v2_platform_recapture_equivalent(&source_platform, &recaptured_platform);
         drop(restored_guard);
 
-        let mut transport_bases = graph.records().iter().map(|record| {
-            let SnapshotV2DeviceTransport::Mmio(mmio) = record.transport() else {
-                panic!("{case} restored test record should use MMIO");
-            };
-            mmio.region().range().start()
-        });
+        let mut transport_bases = graph
+            .records()
+            .iter()
+            .map(|record| match record.transport() {
+                SnapshotV2DeviceTransport::Mmio(mmio) if !pci_enabled => {
+                    mmio.region().range().start()
+                }
+                SnapshotV2DeviceTransport::Pci(pci) if pci_enabled => pci.bar_range().start(),
+                _ => panic!("{case} restored test record should use the selected transport"),
+            });
         let sync_transport_base = transport_bases
             .next()
             .expect("Sync transport base should exist");
@@ -8374,16 +8591,45 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
             initialize_native_v2_multi_block_queue(memory, NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE);
             initialize_native_v2_multi_block_queue(memory, NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE);
         }
-        activate_native_v2_multi_block_queue(
-            &restored,
-            sync_transport_base,
-            NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE,
-        );
-        activate_native_v2_multi_block_queue(
-            &restored,
-            async_transport_base,
-            NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE,
-        );
+        if pci_enabled {
+            let msi = restored
+                .gic_metadata()
+                .msi
+                .expect("restored PCI GIC should retain MSI metadata");
+            let message_address = msi
+                .region
+                .base
+                .checked_add(bangbang_runtime::fdt::ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET)
+                .expect("GICv2m message address should fit");
+            activate_native_v2_multi_block_pci_queue(
+                &restored,
+                sync_transport_base,
+                NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE,
+                message_address,
+                msi.interrupt_range.base,
+            );
+            activate_native_v2_multi_block_pci_queue(
+                &restored,
+                async_transport_base,
+                NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE,
+                message_address,
+                msi.interrupt_range
+                    .base
+                    .checked_add(1)
+                    .expect("second GICv2m INTID should fit"),
+            );
+        } else {
+            activate_native_v2_multi_block_queue(
+                &restored,
+                sync_transport_base,
+                NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE,
+            );
+            activate_native_v2_multi_block_queue(
+                &restored,
+                async_transport_base,
+                NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE,
+            );
+        }
 
         {
             let memory = restored
@@ -8395,19 +8641,33 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
                 0x5a,
             );
         }
-        notify_native_v2_multi_block_queue(&restored, sync_transport_base);
+        if pci_enabled {
+            notify_native_v2_multi_block_pci_queue(&restored, sync_transport_base);
+        } else {
+            notify_native_v2_multi_block_queue(&restored, sync_transport_base);
+        }
         let sync_dispatches = restored
             .dispatch_block_queue_notifications_and_signal_interrupts()
             .unwrap_or_else(|error| panic!("{case} Sync requests should dispatch: {error}"));
-        assert_eq!(sync_dispatches.len(), 2);
-        assert!(native_v2_multi_block_dispatch_signaled(
-            &sync_dispatches,
-            restored_drive_configs.as_slice()[0].drive_id(),
-        ));
-        assert!(!native_v2_multi_block_dispatch_signaled(
-            &sync_dispatches,
-            restored_drive_configs.as_slice()[1].drive_id(),
-        ));
+        if pci_enabled {
+            assert!(sync_dispatches.is_empty());
+            let diagnostics = restored
+                .pci_data_device_diagnostics()
+                .expect("restored PCI manager should exist")
+                .unwrap_or_else(|error| panic!("{case} PCI diagnostics should inspect: {error}"));
+            assert_eq!(diagnostics[0].queue_deliveries, 1);
+            assert_eq!(diagnostics[1].queue_deliveries, 0);
+        } else {
+            assert_eq!(sync_dispatches.len(), 2);
+            assert!(native_v2_multi_block_dispatch_signaled(
+                &sync_dispatches,
+                restored_drive_configs.as_slice()[0].drive_id(),
+            ));
+            assert!(!native_v2_multi_block_dispatch_signaled(
+                &sync_dispatches,
+                restored_drive_configs.as_slice()[1].drive_id(),
+            ));
+        }
         assert_eq!(
             native_v2_multi_block_used_index(&restored, NATIVE_V2_MULTI_BLOCK_SYNC_QUEUE),
             2
@@ -8442,15 +8702,28 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
                 0xa5,
             );
         }
-        notify_native_v2_multi_block_queue(&restored, async_transport_base);
-        let mut async_interrupt_signaled = false;
+        if pci_enabled {
+            notify_native_v2_multi_block_pci_queue(&restored, async_transport_base);
+        } else {
+            notify_native_v2_multi_block_queue(&restored, async_transport_base);
+        }
         let initial_async_dispatches = restored
             .dispatch_block_queue_notifications_and_signal_interrupts()
             .unwrap_or_else(|error| panic!("{case} Async requests should schedule: {error}"));
-        async_interrupt_signaled |= native_v2_multi_block_dispatch_signaled(
-            &initial_async_dispatches,
-            restored_drive_configs.as_slice()[1].drive_id(),
-        );
+        let mut async_interrupt_signaled = if pci_enabled {
+            assert!(initial_async_dispatches.is_empty());
+            restored
+                .pci_data_device_diagnostics()
+                .expect("restored PCI manager should exist")
+                .unwrap_or_else(|error| panic!("{case} PCI diagnostics should inspect: {error}"))[1]
+                .queue_deliveries
+                > 0
+        } else {
+            native_v2_multi_block_dispatch_signaled(
+                &initial_async_dispatches,
+                restored_drive_configs.as_slice()[1].drive_id(),
+            )
+        };
         for _ in 0..8 {
             if native_v2_multi_block_used_index(&restored, NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE) == 2 {
                 break;
@@ -8459,10 +8732,22 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
             let dispatches = restored
                 .dispatch_block_queue_notifications_and_signal_interrupts()
                 .unwrap_or_else(|error| panic!("{case} Async completion should dispatch: {error}"));
-            async_interrupt_signaled |= native_v2_multi_block_dispatch_signaled(
-                &dispatches,
-                restored_drive_configs.as_slice()[1].drive_id(),
-            );
+            if pci_enabled {
+                assert!(dispatches.is_empty());
+                async_interrupt_signaled |= restored
+                    .pci_data_device_diagnostics()
+                    .expect("restored PCI manager should exist")
+                    .unwrap_or_else(|error| {
+                        panic!("{case} PCI diagnostics should inspect: {error}")
+                    })[1]
+                    .queue_deliveries
+                    > 0;
+            } else {
+                async_interrupt_signaled |= native_v2_multi_block_dispatch_signaled(
+                    &dispatches,
+                    restored_drive_configs.as_slice()[1].drive_id(),
+                );
+            }
         }
         assert_eq!(
             native_v2_multi_block_used_index(&restored, NATIVE_V2_MULTI_BLOCK_ASYNC_QUEUE),
@@ -8493,19 +8778,35 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
             );
         }
 
-        let queue_interrupt = bangbang_runtime::interrupt::DeviceInterruptKind::Queue
-            .status()
-            .bits();
-        assert_eq!(
-            native_v2_multi_block_interrupt_status(&restored, sync_transport_base)
-                & queue_interrupt,
-            queue_interrupt
-        );
-        assert_eq!(
-            native_v2_multi_block_interrupt_status(&restored, async_transport_base)
-                & queue_interrupt,
-            queue_interrupt
-        );
+        if pci_enabled {
+            let diagnostics = restored
+                .pci_data_device_diagnostics()
+                .expect("restored PCI manager should exist")
+                .unwrap_or_else(|error| panic!("{case} PCI diagnostics should inspect: {error}"));
+            for endpoint in diagnostics {
+                assert!(endpoint.transport.device_activated);
+                assert!(endpoint.transport.driver_ready);
+                assert!(endpoint.transport.msix_enabled);
+                assert_eq!(endpoint.transport.programmed_msix_entries, 1);
+                assert_eq!(endpoint.transport.unmasked_msix_entries, 1);
+                assert_eq!(endpoint.transport.queue_vectors, [Some(0)]);
+                assert!(endpoint.queue_deliveries > 0);
+            }
+        } else {
+            let queue_interrupt = bangbang_runtime::interrupt::DeviceInterruptKind::Queue
+                .status()
+                .bits();
+            assert_eq!(
+                native_v2_multi_block_interrupt_status(&restored, sync_transport_base)
+                    & queue_interrupt,
+                queue_interrupt
+            );
+            assert_eq!(
+                native_v2_multi_block_interrupt_status(&restored, async_transport_base)
+                    & queue_interrupt,
+                queue_interrupt
+            );
+        }
 
         for (config, expected_byte) in restored_drive_configs.as_slice().iter().zip([0x5a, 0xa5]) {
             let snapshot = metrics
@@ -8556,7 +8857,7 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
             });
         assert_ne!(post_io_graph, graph);
         assert_eq!(continued_post_io_graph, post_io_graph);
-        for record in post_io_graph.records() {
+        for (index, record) in post_io_graph.records().iter().enumerate() {
             assert!(record.virtio().is_activated());
             assert!(
                 record
@@ -8573,6 +8874,47 @@ fn native_v2_multi_block_mmio_reconstructs_rooted_and_rootless_owners() {
                 .expect("restored block queue cursor should capture");
             assert_eq!(queue.next_available(), 2);
             assert_eq!(queue.next_used(), 2);
+            if pci_enabled {
+                let SnapshotV2DeviceTransport::Pci(pci) = record.transport() else {
+                    panic!("{case} post-I/O record should retain PCI");
+                };
+                let SnapshotV2DeviceTransport::Pci(original) = graph.records()[index].transport()
+                else {
+                    panic!("{case} original record should retain PCI");
+                };
+                assert_eq!(pci.origin(), original.origin());
+                assert_eq!(pci.sbdf(), original.sbdf());
+                assert_eq!(pci.bar_range(), original.bar_range());
+                assert_eq!(pci.msix().queue_vectors(), [0]);
+                let entry = pci.msix().entries()[0];
+                let msi = restored
+                    .gic_metadata()
+                    .msi
+                    .expect("restored PCI GIC should retain MSI metadata");
+                let message_address = msi
+                    .region
+                    .base
+                    .checked_add(bangbang_runtime::fdt::ARM64_GICV2M_MSI_SET_SPI_NSR_OFFSET)
+                    .expect("GICv2m message address should fit");
+                assert_eq!(
+                    entry.message_address_low(),
+                    u32::try_from(message_address & u64::from(u32::MAX))
+                        .expect("GICv2m message low word should fit")
+                );
+                assert_eq!(
+                    entry.message_address_high(),
+                    u32::try_from(message_address >> 32)
+                        .expect("GICv2m message high word should fit")
+                );
+                assert_eq!(
+                    entry.message_data(),
+                    msi.interrupt_range
+                        .base
+                        .checked_add(u32::try_from(index).expect("record index should fit"))
+                        .expect("GICv2m message INTID should fit")
+                );
+                assert_eq!(entry.vector_control(), 0);
+            }
         }
         drop(post_io_guard);
 

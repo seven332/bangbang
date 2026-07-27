@@ -197,10 +197,12 @@ pub use startup::{
     HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockTransportState,
     HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure, HvfSnapshotV2MultiBlockMmioRestoreError,
     HvfSnapshotV2MultiBlockMmioRestoreFailure, HvfSnapshotV2MultiBlockMmioRestoreStage,
+    HvfSnapshotV2MultiBlockPciRestoreCleanupFailure, HvfSnapshotV2MultiBlockPciRestoreError,
+    HvfSnapshotV2MultiBlockPciRestoreFailure, HvfSnapshotV2MultiBlockPciRestoreStage,
     HvfSnapshotV2RootRestoreCleanupFailure, HvfSnapshotV2RootRestoreError,
     HvfSnapshotV2RootRestoreFailure, HvfSnapshotV2RootRestoreStage, OwnedHvfArm64BootSession,
     PreparedHvfArm64BootPciNetworkRemoval, RestoredHvfArm64BootSession,
-    RestoredHvfSnapshotV2MultiBlockMmioOwners,
+    RestoredHvfSnapshotV2MultiBlockMmioOwners, RestoredHvfSnapshotV2MultiBlockPciOwners,
 };
 pub use topology::{
     HvfVcpuTopology, HvfVcpuTopologyAllocation, HvfVcpuTopologyCreateStage, HvfVcpuTopologyError,
