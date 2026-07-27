@@ -82,7 +82,7 @@ const MAX_AGGREGATE_STRING_BYTES: usize = MAX_RECORDS
         + NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_PARTUUID_BYTES
         + NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_SELECTOR_BYTES);
 
-pub(super) trait ReservePolicy {
+pub(crate) trait ReservePolicy {
     fn reserve_vec<T>(&mut self, values: &mut Vec<T>, additional: usize) -> Result<(), ()>;
     fn reserve_string(&mut self, value: &mut String, additional: usize) -> Result<(), ()>;
 }
@@ -393,7 +393,7 @@ fn write_section_directory(
     Ok(())
 }
 
-fn encode_config(
+pub(crate) fn encode_config(
     output: &mut Vec<u8>,
     config: &SnapshotV2MultiBlockConfig,
     section_length: usize,
@@ -481,7 +481,7 @@ fn encode_bucket_config(
     write_zeroes(output, 7)
 }
 
-fn encode_block(
+pub(crate) fn encode_block(
     output: &mut Vec<u8>,
     block: &SnapshotV2MultiBlockState,
     section_length: usize,
@@ -536,7 +536,7 @@ fn encode_bucket_state(
     Ok(())
 }
 
-fn encode_common(
+pub(crate) fn encode_common(
     output: &mut Vec<u8>,
     common: &SnapshotV2VirtioState,
     section_length: usize,
@@ -588,7 +588,7 @@ fn encode_common(
     pad_section(output, start, section_length)
 }
 
-fn encode_transport(
+pub(crate) fn encode_transport(
     output: &mut Vec<u8>,
     transport: &SnapshotV2DeviceTransport,
     section_length: usize,
@@ -1057,7 +1057,9 @@ fn preflight(
     })
 }
 
-fn preflight_config(bytes: &[u8]) -> Result<usize, SnapshotV2MultiBlockDeviceGraphDecodeError> {
+pub(crate) fn preflight_config(
+    bytes: &[u8],
+) -> Result<usize, SnapshotV2MultiBlockDeviceGraphDecodeError> {
     if bytes.len() < CONFIG_FIXED_BYTES {
         return Err(SnapshotV2MultiBlockDeviceGraphDecodeError::Truncated);
     }
@@ -1147,7 +1149,9 @@ fn preflight_bucket_config(
     Ok(())
 }
 
-fn preflight_block(bytes: &[u8]) -> Result<(), SnapshotV2MultiBlockDeviceGraphDecodeError> {
+pub(crate) fn preflight_block(
+    bytes: &[u8],
+) -> Result<(), SnapshotV2MultiBlockDeviceGraphDecodeError> {
     if bytes.len() != BLOCK_SECTION_BYTES {
         return Err(SnapshotV2MultiBlockDeviceGraphDecodeError::InvalidStructure);
     }
@@ -1194,7 +1198,9 @@ fn preflight_bucket_state(
     Ok(())
 }
 
-fn preflight_common(bytes: &[u8]) -> Result<(), SnapshotV2MultiBlockDeviceGraphDecodeError> {
+pub(crate) fn preflight_common(
+    bytes: &[u8],
+) -> Result<(), SnapshotV2MultiBlockDeviceGraphDecodeError> {
     if bytes.len() < COMMON_FIXED_BYTES + COMMON_QUEUE_BYTES {
         return Err(SnapshotV2MultiBlockDeviceGraphDecodeError::Truncated);
     }
@@ -1247,7 +1253,9 @@ fn preflight_common(bytes: &[u8]) -> Result<(), SnapshotV2MultiBlockDeviceGraphD
     reader.finish_padded()
 }
 
-fn preflight_mmio(bytes: &[u8]) -> Result<(), SnapshotV2MultiBlockDeviceGraphDecodeError> {
+pub(crate) fn preflight_mmio(
+    bytes: &[u8],
+) -> Result<(), SnapshotV2MultiBlockDeviceGraphDecodeError> {
     if bytes.len() != MMIO_SECTION_BYTES {
         return Err(SnapshotV2MultiBlockDeviceGraphDecodeError::InvalidStructure);
     }
@@ -1263,7 +1271,9 @@ fn preflight_mmio(bytes: &[u8]) -> Result<(), SnapshotV2MultiBlockDeviceGraphDec
     reader.finish_exact()
 }
 
-fn preflight_pci(bytes: &[u8]) -> Result<(), SnapshotV2MultiBlockDeviceGraphDecodeError> {
+pub(crate) fn preflight_pci(
+    bytes: &[u8],
+) -> Result<(), SnapshotV2MultiBlockDeviceGraphDecodeError> {
     if bytes.len() != PCI_SECTION_BYTES {
         return Err(SnapshotV2MultiBlockDeviceGraphDecodeError::InvalidStructure);
     }
@@ -1338,7 +1348,7 @@ fn preflight_pci(bytes: &[u8]) -> Result<(), SnapshotV2MultiBlockDeviceGraphDeco
     reader.finish_padded()
 }
 
-fn decode_config<R: ReservePolicy>(
+pub(crate) fn decode_config<R: ReservePolicy>(
     bytes: &[u8],
     reserve: &mut R,
 ) -> Result<SnapshotV2MultiBlockConfig, SnapshotV2MultiBlockDeviceGraphDecodeError> {
@@ -1411,7 +1421,7 @@ fn decode_bucket_config(
     )))
 }
 
-fn decode_block(
+pub(crate) fn decode_block(
     bytes: &[u8],
 ) -> Result<SnapshotV2MultiBlockState, SnapshotV2MultiBlockDeviceGraphDecodeError> {
     let mut reader = Reader::new(bytes);
@@ -1467,7 +1477,7 @@ fn decode_bucket_state(
     )))
 }
 
-fn decode_common<R: ReservePolicy>(
+pub(crate) fn decode_common<R: ReservePolicy>(
     bytes: &[u8],
     reserve: &mut R,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2MultiBlockDeviceGraphDecodeError> {
@@ -1534,7 +1544,7 @@ fn decode_common<R: ReservePolicy>(
     ))
 }
 
-fn decode_mmio(
+pub(crate) fn decode_mmio(
     bytes: &[u8],
 ) -> Result<SnapshotV2MmioDeviceState, SnapshotV2MultiBlockDeviceGraphDecodeError> {
     let mut reader = Reader::new(bytes);
@@ -1559,7 +1569,7 @@ fn decode_mmio(
     ))
 }
 
-fn decode_pci<R: ReservePolicy>(
+pub(crate) fn decode_pci<R: ReservePolicy>(
     bytes: &[u8],
     reserve: &mut R,
 ) -> Result<SnapshotV2PciDeviceState, SnapshotV2MultiBlockDeviceGraphDecodeError> {

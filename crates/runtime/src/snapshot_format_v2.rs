@@ -6,6 +6,7 @@ use std::fmt;
 use crc64::crc64;
 
 use crate::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
 use crate::snapshot_format::{SnapshotArchitecture, SnapshotFormatVersion, SnapshotIntegrity};
 
 pub(crate) const NATIVE_V2_ARM64_MAGIC: [u8; 8] = *b"BANGV2A\0";
@@ -643,8 +644,9 @@ pub fn decode_snapshot_v2_state(
 ///
 /// This cross-crate seam lets retained legacy and exact-profile consumers
 /// validate their own version without changing [`decode_snapshot_v2_state`].
-/// Versions newer than the current multi-block profile are rejected rather
-/// than inheriting its catalog.
+/// Versions newer than the latest explicitly known internal profile are
+/// rejected rather than inheriting its catalog. The default decoder remains
+/// capped by [`NATIVE_V2_SNAPSHOT_VERSION`].
 pub fn decode_snapshot_v2_state_with_compatibility_version(
     bytes: &[u8],
     supported_version: SnapshotFormatVersion,
@@ -652,7 +654,7 @@ pub fn decode_snapshot_v2_state_with_compatibility_version(
     if !is_known_compatibility_version(supported_version) {
         return Err(SnapshotV2DecodeError::UnsupportedVersion {
             found: supported_version,
-            supported: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            supported: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         });
     }
     decode_snapshot_v2_state_with_catalog(
@@ -688,7 +690,7 @@ pub fn encode_snapshot_v2_state_with_compatibility_version(
     if !is_known_compatibility_version(version) {
         return Err(SnapshotV2EncodeError::UnsupportedVersion {
             requested: version,
-            maximum: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            maximum: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         });
     }
     encode_snapshot_v2_state_with_catalog_and_reserve(
@@ -702,8 +704,8 @@ pub fn encode_snapshot_v2_state_with_compatibility_version(
 }
 
 fn is_known_compatibility_version(version: SnapshotFormatVersion) -> bool {
-    version.major() == NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
-        && version.minor() <= NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor()
+    version.major() == NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.major()
+        && version.minor() <= NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION.minor()
 }
 
 fn decode_snapshot_v2_state_with_catalog<'state>(

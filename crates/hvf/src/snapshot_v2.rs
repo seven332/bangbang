@@ -26,6 +26,10 @@ use bangbang_runtime::snapshot_device_v2_5::{
     NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
     SnapshotV2MultiBlockDeviceGraphDecodeError, SnapshotV2MultiBlockDeviceGraphEncodeError,
 };
+use bangbang_runtime::snapshot_device_v2_6::{
+    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
+    SnapshotV2StorageDeviceGraphDecodeError, SnapshotV2StorageDeviceGraphEncodeError,
+};
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_GLOBAL_COMPONENT_KEY,
@@ -913,6 +917,67 @@ impl fmt::Debug for HvfSnapshotV2MultiBlockState {
     }
 }
 
+/// Complete exact native-v2 2.6 HVF state with one profile-3 storage graph.
+///
+/// This wrapper is an internal structural capability. Public snapshot
+/// creation and loading remain on exact native-v2 2.5 until the complete pmem
+/// ownership transaction is activated.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HvfSnapshotV2StorageState {
+    platform: HvfSnapshotV2PlatformState,
+    device_graph: SnapshotV2StorageDeviceGraph,
+}
+
+impl HvfSnapshotV2StorageState {
+    /// Constructs one exact 2.6 composition after validating version agreement.
+    pub fn try_new(
+        platform: HvfSnapshotV2PlatformState,
+        device_graph: SnapshotV2StorageDeviceGraph,
+    ) -> Result<Self, HvfSnapshotV2BuildError> {
+        validate_platform(&platform)?;
+        if platform.memory().version() != NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            || device_graph.compatibility_version()
+                != NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        {
+            return Err(HvfSnapshotV2BuildError::Version);
+        }
+        Ok(Self {
+            platform,
+            device_graph,
+        })
+    }
+
+    /// Returns the complete platform state.
+    pub const fn platform(&self) -> &HvfSnapshotV2PlatformState {
+        &self.platform
+    }
+
+    /// Returns the required profile-3 storage graph.
+    pub const fn device_graph(&self) -> &SnapshotV2StorageDeviceGraph {
+        &self.device_graph
+    }
+
+    /// Consumes the complete state without discarding either owned graph.
+    pub fn into_parts(self) -> (HvfSnapshotV2PlatformState, SnapshotV2StorageDeviceGraph) {
+        (self.platform, self.device_graph)
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2StorageState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2StorageState")
+            .field("vcpu_count", &self.platform.vcpus.len())
+            .field(
+                "block_record_count",
+                &self.device_graph.block_records().len(),
+            )
+            .field("pmem_record_count", &self.device_graph.pmem_records().len())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
 /// Value-free rejection while constructing a native-v2 platform graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfSnapshotV2BuildError {
@@ -1031,6 +1096,8 @@ fn validate_platform(state: &HvfSnapshotV2PlatformState) -> Result<(), HvfSnapsh
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
             if state.machine.fdt.is_product_process_profile() => {}
         NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            if state.machine.fdt.is_product_process_profile() => {}
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
             if state.machine.fdt.is_product_process_profile() => {}
         _ => return Err(HvfSnapshotV2BuildError::Version),
     }
@@ -1459,6 +1526,8 @@ pub enum HvfSnapshotV2EncodeError {
     DeviceGraph(SnapshotV2DeviceGraphEncodeError),
     /// Multi-block device-graph encoding failed.
     MultiBlockDeviceGraph(SnapshotV2MultiBlockDeviceGraphEncodeError),
+    /// Storage device-graph encoding failed.
+    StorageDeviceGraph(SnapshotV2StorageDeviceGraphEncodeError),
     /// Nested mandatory-vCPU encoding failed.
     Mandatory(HvfSnapshotV1EncodeError),
     /// A bounded component allocation failed.
@@ -1484,6 +1553,9 @@ impl fmt::Display for HvfSnapshotV2EncodeError {
             Self::MultiBlockDeviceGraph(_) => {
                 f.write_str("native-v2 multi-block device graph encoding failed")
             }
+            Self::StorageDeviceGraph(_) => {
+                f.write_str("native-v2 storage device graph encoding failed")
+            }
             Self::Mandatory(_) => f.write_str("native-v2 mandatory vCPU state encoding failed"),
             Self::Allocation(_) => f.write_str("native-v2 HVF component allocation failed"),
             Self::LengthOverflow => {
@@ -1501,6 +1573,7 @@ impl std::error::Error for HvfSnapshotV2EncodeError {
             Self::Memory(source) => Some(source),
             Self::DeviceGraph(source) => Some(source),
             Self::MultiBlockDeviceGraph(source) => Some(source),
+            Self::StorageDeviceGraph(source) => Some(source),
             Self::Mandatory(source) => Some(source),
             Self::Allocation(source) => Some(source),
             Self::Container(source) => Some(source),
@@ -1547,6 +1620,8 @@ pub enum HvfSnapshotV2DecodeError {
     DeviceGraph(SnapshotV2DeviceGraphDecodeError),
     /// Multi-block device-graph decoding failed.
     MultiBlockDeviceGraph(SnapshotV2MultiBlockDeviceGraphDecodeError),
+    /// Storage device-graph decoding failed.
+    StorageDeviceGraph(SnapshotV2StorageDeviceGraphDecodeError),
     /// Nested mandatory-vCPU decoding failed.
     Mandatory(HvfSnapshotV1DecodeError),
     /// A complete locally valid graph failed cross-validation.
@@ -1580,6 +1655,7 @@ impl fmt::Display for HvfSnapshotV2DecodeError {
             Self::Memory(_) => "native-v2 HVF memory binding is invalid",
             Self::DeviceGraph(_) => "native-v2 HVF device graph is invalid",
             Self::MultiBlockDeviceGraph(_) => "native-v2 HVF multi-block device graph is invalid",
+            Self::StorageDeviceGraph(_) => "native-v2 HVF storage device graph is invalid",
             Self::Mandatory(_) => "native-v2 HVF mandatory vCPU state is invalid",
             Self::Build(_) => "native-v2 HVF platform graph is inconsistent",
         };
@@ -1594,6 +1670,7 @@ impl std::error::Error for HvfSnapshotV2DecodeError {
             Self::Memory(source) => Some(source),
             Self::DeviceGraph(source) => Some(source),
             Self::MultiBlockDeviceGraph(source) => Some(source),
+            Self::StorageDeviceGraph(source) => Some(source),
             Self::Mandatory(source) => Some(source),
             Self::Build(source) => Some(source),
             _ => None,
@@ -1630,10 +1707,22 @@ pub fn encode_hvf_snapshot_v2_multi_block_state(
     )
 }
 
+/// Encodes one complete internal exact native-v2 2.6 HVF storage state.
+pub fn encode_hvf_snapshot_v2_storage_state(
+    state: &HvfSnapshotV2StorageState,
+) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+    encode_hvf_snapshot_v2_components(
+        state.platform(),
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        Some(HvfSnapshotV2DeviceGraphRef::V2_6(state.device_graph())),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum HvfSnapshotV2DeviceGraphRef<'a> {
     V2_4(&'a SnapshotV2DeviceGraph),
     V2_5(&'a SnapshotV2MultiBlockDeviceGraph),
+    V2_6(&'a SnapshotV2StorageDeviceGraph),
 }
 
 impl HvfSnapshotV2DeviceGraphRef<'_> {
@@ -1641,6 +1730,7 @@ impl HvfSnapshotV2DeviceGraphRef<'_> {
         match self {
             Self::V2_4(_) => NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
             Self::V2_5(_) => NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            Self::V2_6(_) => NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         }
     }
 
@@ -1652,6 +1742,9 @@ impl HvfSnapshotV2DeviceGraphRef<'_> {
             Self::V2_5(graph) => graph
                 .encode(NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION)
                 .map_err(HvfSnapshotV2EncodeError::MultiBlockDeviceGraph),
+            Self::V2_6(graph) => graph
+                .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                .map_err(HvfSnapshotV2EncodeError::StorageDeviceGraph),
         }
     }
 }
@@ -1793,6 +1886,24 @@ pub fn decode_hvf_snapshot_v2_multi_block_state(
     )
     .map_err(HvfSnapshotV2DecodeError::MultiBlockDeviceGraph)?;
     HvfSnapshotV2MultiBlockState::try_new(platform, device_graph)
+        .map_err(HvfSnapshotV2DecodeError::Build)
+}
+
+/// Decodes and cross-validates one internal exact native-v2 2.6 storage state.
+pub fn decode_hvf_snapshot_v2_storage_state(
+    state: &SnapshotV2State<'_>,
+) -> Result<HvfSnapshotV2StorageState, HvfSnapshotV2DecodeError> {
+    if state.metadata().version() != NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION {
+        return Err(HvfSnapshotV2DecodeError::UnsupportedProfile);
+    }
+    let vcpu_count = scan_component_profile(state, true)?;
+    let platform = decode_hvf_snapshot_v2_platform_components(state, vcpu_count, true)?;
+    let device_graph = SnapshotV2StorageDeviceGraph::decode(
+        state.metadata().version(),
+        component_payload(state, NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)?,
+    )
+    .map_err(HvfSnapshotV2DecodeError::StorageDeviceGraph)?;
+    HvfSnapshotV2StorageState::try_new(platform, device_graph)
         .map_err(HvfSnapshotV2DecodeError::Build)
 }
 
