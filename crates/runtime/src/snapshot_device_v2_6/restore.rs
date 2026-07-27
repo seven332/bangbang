@@ -9,26 +9,31 @@ use crate::block::async_executor::BlockAsyncRuntimeError;
 use crate::block::{BlockFileBacking, DriveConfigs};
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestMemory, GuestMemoryRange};
-use crate::mmio::MmioRegion;
+use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::mmio::{MmioRegion, MmioRegionId};
+use crate::pci::PciSbdf;
 use crate::pmem::{
     PmemConfigInput, PmemConfigs, PmemFileBacking, PreparedPmemDevice,
     PreparedSnapshotPmemDeviceError, PreparedSnapshotPmemDeviceParts, VIRTIO_PMEM_DEVICE_ID,
-    VIRTIO_PMEM_QUEUE_SIZES, VirtioPmemDevice, VirtioPmemMmioHandler, VirtioPmemRateLimiterState,
-    VirtioPmemTokenBucketState,
+    VIRTIO_PMEM_QUEUE_SIZES, VirtioPmemConfigSpace, VirtioPmemDevice, VirtioPmemMmioHandler,
+    VirtioPmemRateLimiterState, VirtioPmemTokenBucketState,
 };
 use crate::snapshot_device_v2::{
     SnapshotV2RootTransportRestoreError, restore_mmio_transport_state_for_device,
 };
 use crate::snapshot_device_v2_5::{
     PreparedSnapshotV2MultiBlockBundle, PreparedSnapshotV2MultiBlockMmioBundle,
-    SnapshotV2MultiBlockBundleError, SnapshotV2MultiBlockCleanupError,
-    SnapshotV2MultiBlockDeviceGraph, SnapshotV2MultiBlockMmioTransportError,
+    PreparedSnapshotV2MultiBlockPciBundle, SnapshotV2MultiBlockBundleError,
+    SnapshotV2MultiBlockCleanupError, SnapshotV2MultiBlockDeviceGraph,
+    SnapshotV2MultiBlockMmioTransportError, SnapshotV2MultiBlockPciTransportError,
     SnapshotV2MultiBlockRestorePlan, SnapshotV2MultiBlockRestorePlanError,
 };
+use crate::virtio::VirtioDeviceType;
 use crate::virtio_mmio::{
     VirtioMmioQueueState, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
     VirtioMmioTransportStateError,
 };
+use crate::virtio_pci::{PreparedVirtioPciEndpoint, VirtioPciIdentity, VirtioPciTransportState};
 
 /// Complete pure destination proof for one detached profile-3 graph.
 pub struct SnapshotV2StorageRestorePlan {
@@ -636,6 +641,159 @@ impl fmt::Debug for PreparedSnapshotV2StorageMmioPmemRecord {
     }
 }
 
+/// One exact detached profile-3 PCI pmem owner awaiting live route resources.
+pub struct PreparedSnapshotV2StoragePciPmemRecord {
+    key: SnapshotV2DeviceKey,
+    is_root: bool,
+    retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
+    origin: StorageDeviceOrigin,
+    sbdf: PciSbdf,
+    bar_range: GuestMemoryRange,
+    prepared_device: PreparedPmemDevice,
+    config_space: VirtioPmemConfigSpace,
+    device: VirtioPmemDevice,
+    identity: VirtioPciIdentity,
+    retained: VirtioPciTransportState,
+}
+
+impl PreparedSnapshotV2StoragePciPmemRecord {
+    pub const fn key(&self) -> SnapshotV2DeviceKey {
+        self.key
+    }
+
+    pub fn pmem_id(&self) -> &str {
+        self.prepared_device.id()
+    }
+
+    pub const fn is_root_device(&self) -> bool {
+        self.is_root
+    }
+
+    pub const fn retry(&self) -> StorageRetryState {
+        self.retry
+    }
+
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    pub const fn sbdf(&self) -> PciSbdf {
+        self.sbdf
+    }
+
+    pub const fn bar_range(&self) -> GuestMemoryRange {
+        self.bar_range
+    }
+
+    pub const fn prepared_device(&self) -> &PreparedPmemDevice {
+        &self.prepared_device
+    }
+
+    /// Completes retained endpoint preparation against the destination's
+    /// fresh shared message registry without publishing live resources.
+    pub fn prepare_endpoint(
+        self,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+    ) -> Result<PreparedSnapshotV2StoragePciPmemEndpoint, SnapshotV2RootTransportRestoreError> {
+        let endpoint = PreparedVirtioPciEndpoint::new(
+            self.identity,
+            &VIRTIO_PMEM_QUEUE_SIZES,
+            self.config_space,
+            self.device,
+            self.retained.is_device_activated(),
+            false,
+            &self.retained,
+            self.sbdf,
+            self.bar_range,
+            region_id,
+            messages,
+        )
+        .map_err(SnapshotV2RootTransportRestoreError::Pci)?;
+        Ok(PreparedSnapshotV2StoragePciPmemEndpoint {
+            key: self.key,
+            is_root: self.is_root,
+            retry: self.retry,
+            retry_deadline: self.retry_deadline,
+            origin: self.origin,
+            prepared_device: self.prepared_device,
+            endpoint,
+        })
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2StoragePciPmemRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2StoragePciPmemRecord")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One fully checked, still-unpublished exact-2.6 PCI pmem endpoint and
+/// authoritative mapping owner.
+pub struct PreparedSnapshotV2StoragePciPmemEndpoint {
+    key: SnapshotV2DeviceKey,
+    is_root: bool,
+    retry: StorageRetryState,
+    retry_deadline: Option<Instant>,
+    origin: StorageDeviceOrigin,
+    prepared_device: PreparedPmemDevice,
+    endpoint: PreparedVirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice>,
+}
+
+/// Consumed exact pmem owner metadata, mapping, and retained PCI endpoint.
+pub type PreparedSnapshotV2StoragePciPmemEndpointParts = (
+    SnapshotV2DeviceKey,
+    bool,
+    StorageRetryState,
+    Option<Instant>,
+    StorageDeviceOrigin,
+    PreparedPmemDevice,
+    PreparedVirtioPciEndpoint<VirtioPmemConfigSpace, VirtioPmemDevice>,
+);
+
+impl PreparedSnapshotV2StoragePciPmemEndpoint {
+    pub const fn key(&self) -> SnapshotV2DeviceKey {
+        self.key
+    }
+
+    pub fn pmem_id(&self) -> &str {
+        self.prepared_device.id()
+    }
+
+    pub const fn prepared_device(&self) -> &PreparedPmemDevice {
+        &self.prepared_device
+    }
+
+    pub fn into_parts(self) -> PreparedSnapshotV2StoragePciPmemEndpointParts {
+        (
+            self.key,
+            self.is_root,
+            self.retry,
+            self.retry_deadline,
+            self.origin,
+            self.prepared_device,
+            self.endpoint,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2StoragePciPmemEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2StoragePciPmemEndpoint")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Canonical move-only pathless profile-3 block-and-pmem vector.
 pub struct PreparedSnapshotV2StorageBundle {
     root_key: Option<SnapshotV2DeviceKey>,
@@ -803,6 +961,126 @@ impl PreparedSnapshotV2StorageBundle {
         })
     }
 
+    /// Reconstructs every exact PCI endpoint owner without publishing a BAR,
+    /// function, route, dispatcher handler, or pmem mapping.
+    pub fn prepare_pci_transport(
+        self,
+    ) -> Result<PreparedSnapshotV2StoragePciBundle, SnapshotV2StoragePciTransportError> {
+        self.prepare_pci_transport_with_reserve(&mut SystemRestoreReserve)
+    }
+
+    fn prepare_pci_transport_with_reserve(
+        mut self,
+        reserve: &mut impl StorageRestoreReserve,
+    ) -> Result<PreparedSnapshotV2StoragePciBundle, SnapshotV2StoragePciTransportError> {
+        if self.transport_kind != SnapshotV2DeviceTransportKind::Pci {
+            return Err(
+                self.pci_transport_error(SnapshotV2StoragePciTransportErrorKind::TransportPolicy)
+            );
+        }
+
+        let block = match self.block.take() {
+            Some(block) => match block.prepare_pci_transport() {
+                Ok(block) => Some(block),
+                Err(source) => {
+                    return Err(SnapshotV2StoragePciTransportError::new(
+                        SnapshotV2StoragePciTransportErrorKind::Block(source),
+                        None,
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        let mut prepared_pmem = Vec::new();
+        if reserve
+            .reserve_vec(&mut prepared_pmem, self.pmem_records.len())
+            .is_err()
+        {
+            return Err(storage_pci_transport_error_after_block(
+                SnapshotV2StoragePciTransportErrorKind::Allocation,
+                block,
+            ));
+        }
+
+        let root_key = self.root_key;
+        let pmem_configs = std::mem::take(&mut self.pmem_configs);
+        let records = std::mem::take(&mut self.pmem_records);
+        for record in records {
+            let (
+                key,
+                is_root,
+                _queue_ranges,
+                retry,
+                retry_deadline,
+                virtio,
+                transport,
+                prepared_device,
+                device,
+            ) = record.into_parts();
+            let SnapshotV2DeviceTransport::Pci(pci) = transport else {
+                release_storage_pci_pmem_records(&mut prepared_pmem);
+                drop(prepared_device);
+                return Err(storage_pci_transport_error_after_block(
+                    SnapshotV2StoragePciTransportErrorKind::TransportPolicy,
+                    block,
+                ));
+            };
+            let device_type = match VirtioDeviceType::new(VIRTIO_PMEM_DEVICE_ID) {
+                Ok(device_type) => device_type,
+                Err(source) => {
+                    release_storage_pci_pmem_records(&mut prepared_pmem);
+                    drop(prepared_device);
+                    return Err(storage_pci_transport_error_after_block(
+                        SnapshotV2StoragePciTransportErrorKind::PmemState(
+                            SnapshotV2RootTransportRestoreError::DeviceType(source),
+                        ),
+                        block,
+                    ));
+                }
+            };
+            let identity = VirtioPciIdentity::new(device_type, virtio.available_features())
+                .with_config_generation(virtio.config_generation());
+            let retained = match VirtioPciTransportState::from_snapshot_v2_parts(
+                identity, &virtio, &pci, false,
+            ) {
+                Ok(retained) => retained,
+                Err(source) => {
+                    release_storage_pci_pmem_records(&mut prepared_pmem);
+                    drop(prepared_device);
+                    return Err(storage_pci_transport_error_after_block(
+                        SnapshotV2StoragePciTransportErrorKind::PmemState(
+                            SnapshotV2RootTransportRestoreError::Pci(source),
+                        ),
+                        block,
+                    ));
+                }
+            };
+            let config_space = prepared_device.config_space();
+            prepared_pmem.push(PreparedSnapshotV2StoragePciPmemRecord {
+                key,
+                is_root,
+                retry,
+                retry_deadline,
+                origin: pci.origin(),
+                sbdf: pci.sbdf(),
+                bar_range: pci.bar_range(),
+                prepared_device,
+                config_space,
+                device,
+                identity,
+                retained,
+            });
+        }
+
+        Ok(PreparedSnapshotV2StoragePciBundle {
+            root_key,
+            block,
+            pmem_configs,
+            pmem_records: prepared_pmem,
+        })
+    }
+
     /// Transfers every detached storage owner to the transport layer.
     pub fn into_parts(mut self) -> PreparedSnapshotV2StorageBundleParts {
         (
@@ -833,6 +1111,17 @@ impl PreparedSnapshotV2StorageBundle {
             .err()
             .map(SnapshotV2StorageCleanupError::into_source);
         SnapshotV2StorageMmioTransportError::new(kind, cleanup)
+    }
+
+    fn pci_transport_error(
+        self,
+        kind: SnapshotV2StoragePciTransportErrorKind,
+    ) -> SnapshotV2StoragePciTransportError {
+        let cleanup = self
+            .abort()
+            .err()
+            .map(SnapshotV2StorageCleanupError::into_source);
+        SnapshotV2StoragePciTransportError::new(kind, cleanup)
     }
 }
 
@@ -925,6 +1214,84 @@ impl fmt::Debug for PreparedSnapshotV2StorageMmioBundle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedSnapshotV2StorageMmioBundle")
+            .field(
+                "block_count",
+                &self
+                    .block
+                    .as_ref()
+                    .map_or(0, |bundle| bundle.records().len()),
+            )
+            .field("pmem_count", &self.pmem_records.len())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Move-only exact profile-3 PCI storage product awaiting one private
+/// heterogeneous manager and hypervisor mapping transaction.
+pub struct PreparedSnapshotV2StoragePciBundle {
+    root_key: Option<SnapshotV2DeviceKey>,
+    block: Option<PreparedSnapshotV2MultiBlockPciBundle>,
+    pmem_configs: PmemConfigs,
+    pmem_records: Vec<PreparedSnapshotV2StoragePciPmemRecord>,
+}
+
+/// Consumed exact PCI storage bundle parts.
+pub type PreparedSnapshotV2StoragePciBundleParts = (
+    Option<SnapshotV2DeviceKey>,
+    Option<PreparedSnapshotV2MultiBlockPciBundle>,
+    PmemConfigs,
+    Vec<PreparedSnapshotV2StoragePciPmemRecord>,
+);
+
+impl PreparedSnapshotV2StoragePciBundle {
+    pub const fn root_key(&self) -> Option<SnapshotV2DeviceKey> {
+        self.root_key
+    }
+
+    pub const fn block_bundle(&self) -> Option<&PreparedSnapshotV2MultiBlockPciBundle> {
+        self.block.as_ref()
+    }
+
+    pub const fn pmem_configs(&self) -> &PmemConfigs {
+        &self.pmem_configs
+    }
+
+    pub fn pmem_records(&self) -> &[PreparedSnapshotV2StoragePciPmemRecord] {
+        &self.pmem_records
+    }
+
+    pub fn into_parts(mut self) -> PreparedSnapshotV2StoragePciBundleParts {
+        (
+            self.root_key,
+            self.block.take(),
+            std::mem::take(&mut self.pmem_configs),
+            std::mem::take(&mut self.pmem_records),
+        )
+    }
+
+    pub fn abort(mut self) -> Result<(), SnapshotV2StorageCleanupError> {
+        release_storage_pci_pmem_records(&mut self.pmem_records);
+        self.block
+            .take()
+            .map_or(Ok(()), PreparedSnapshotV2MultiBlockPciBundle::abort)
+            .map_err(SnapshotV2StorageCleanupError::new)
+    }
+}
+
+impl Drop for PreparedSnapshotV2StoragePciBundle {
+    fn drop(&mut self) {
+        release_storage_pci_pmem_records(&mut self.pmem_records);
+        if let Some(block) = self.block.take() {
+            let _ = block.abort();
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2StoragePciBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2StoragePciBundle")
             .field(
                 "block_count",
                 &self
@@ -1032,6 +1399,95 @@ impl std::error::Error for SnapshotV2StorageMmioTransportError {
             SnapshotV2StorageMmioTransportErrorKind::PmemTransport(source) => Some(source),
             SnapshotV2StorageMmioTransportErrorKind::TransportPolicy
             | SnapshotV2StorageMmioTransportErrorKind::Allocation => self
+                .cleanup
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+        }
+    }
+}
+
+enum SnapshotV2StoragePciTransportErrorKind {
+    TransportPolicy,
+    Allocation,
+    Block(SnapshotV2MultiBlockPciTransportError),
+    PmemState(SnapshotV2RootTransportRestoreError),
+}
+
+/// Redacted failure while consuming profile-3 storage owners into exact PCI
+/// endpoint state.
+pub struct SnapshotV2StoragePciTransportError {
+    kind: Box<SnapshotV2StoragePciTransportErrorKind>,
+    cleanup: Option<SnapshotV2MultiBlockCleanupError>,
+}
+
+impl SnapshotV2StoragePciTransportError {
+    fn new(
+        kind: SnapshotV2StoragePciTransportErrorKind,
+        cleanup: Option<SnapshotV2MultiBlockCleanupError>,
+    ) -> Self {
+        Self {
+            kind: Box::new(kind),
+            cleanup,
+        }
+    }
+
+    pub fn cleanup_failed(&self) -> bool {
+        self.cleanup.is_some()
+            || matches!(
+                self.kind.as_ref(),
+                SnapshotV2StoragePciTransportErrorKind::Block(source)
+                    if source.cleanup_failed()
+            )
+    }
+}
+
+impl fmt::Debug for SnapshotV2StoragePciTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind.as_ref() {
+            SnapshotV2StoragePciTransportErrorKind::TransportPolicy => "transport-policy",
+            SnapshotV2StoragePciTransportErrorKind::Allocation => "allocation",
+            SnapshotV2StoragePciTransportErrorKind::Block(_) => "block",
+            SnapshotV2StoragePciTransportErrorKind::PmemState(_) => "pmem-state",
+        };
+        formatter
+            .debug_struct("SnapshotV2StoragePciTransportError")
+            .field("kind", &kind)
+            .field("cleanup_failed", &self.cleanup_failed())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2StoragePciTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.kind.as_ref() {
+            SnapshotV2StoragePciTransportErrorKind::TransportPolicy => {
+                "snapshot storage PCI transport policy is invalid"
+            }
+            SnapshotV2StoragePciTransportErrorKind::Allocation => {
+                "snapshot storage PCI transport allocation failed"
+            }
+            SnapshotV2StoragePciTransportErrorKind::Block(_) => {
+                "snapshot storage block PCI reconstruction failed"
+            }
+            SnapshotV2StoragePciTransportErrorKind::PmemState(_) => {
+                "snapshot storage pmem PCI retained state is invalid"
+            }
+        })?;
+        if self.cleanup_failed() {
+            formatter.write_str("; cleanup also failed")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SnapshotV2StoragePciTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.kind.as_ref() {
+            SnapshotV2StoragePciTransportErrorKind::Block(source) => Some(source),
+            SnapshotV2StoragePciTransportErrorKind::PmemState(source) => Some(source),
+            SnapshotV2StoragePciTransportErrorKind::TransportPolicy
+            | SnapshotV2StoragePciTransportErrorKind::Allocation => self
                 .cleanup
                 .as_ref()
                 .map(|source| source as &(dyn std::error::Error + 'static)),
@@ -1382,11 +1838,22 @@ pub(super) fn prepare_mmio_transport_with_failing_reserve_for_test(
     bundle.prepare_mmio_transport_with_reserve(&mut FailingStorageRestoreReserve::new(0))
 }
 
+#[cfg(test)]
+pub(super) fn prepare_pci_transport_with_failing_reserve_for_test(
+    bundle: PreparedSnapshotV2StorageBundle,
+) -> Result<PreparedSnapshotV2StoragePciBundle, SnapshotV2StoragePciTransportError> {
+    bundle.prepare_pci_transport_with_reserve(&mut FailingStorageRestoreReserve::new(0))
+}
+
 fn release_pmem_records(records: &mut Vec<PreparedSnapshotV2PmemRecord>) {
     while records.pop().is_some() {}
 }
 
 fn release_storage_mmio_pmem_records(records: &mut Vec<PreparedSnapshotV2StorageMmioPmemRecord>) {
+    while records.pop().is_some() {}
+}
+
+fn release_storage_pci_pmem_records(records: &mut Vec<PreparedSnapshotV2StoragePciPmemRecord>) {
     while records.pop().is_some() {}
 }
 
@@ -1399,6 +1866,17 @@ fn storage_mmio_transport_error_after_block(
         .transpose()
         .err();
     SnapshotV2StorageMmioTransportError::new(kind, cleanup)
+}
+
+fn storage_pci_transport_error_after_block(
+    kind: SnapshotV2StoragePciTransportErrorKind,
+    block: Option<PreparedSnapshotV2MultiBlockPciBundle>,
+) -> SnapshotV2StoragePciTransportError {
+    let cleanup = block
+        .map(PreparedSnapshotV2MultiBlockPciBundle::abort)
+        .transpose()
+        .err();
+    SnapshotV2StoragePciTransportError::new(kind, cleanup)
 }
 
 fn abort_block_bundle(

@@ -40,8 +40,11 @@ pub use restore::{
     PreparedSnapshotV2StorageBundle, PreparedSnapshotV2StorageBundleParts,
     PreparedSnapshotV2StorageMmioBundle, PreparedSnapshotV2StorageMmioBundleParts,
     PreparedSnapshotV2StorageMmioPmemRecord, PreparedSnapshotV2StorageMmioPmemRecordParts,
-    SnapshotV2StorageBundleError, SnapshotV2StorageCleanupError,
-    SnapshotV2StorageMmioTransportError, SnapshotV2StorageRestorePlan,
+    PreparedSnapshotV2StoragePciBundle, PreparedSnapshotV2StoragePciBundleParts,
+    PreparedSnapshotV2StoragePciPmemEndpoint, PreparedSnapshotV2StoragePciPmemEndpointParts,
+    PreparedSnapshotV2StoragePciPmemRecord, SnapshotV2StorageBundleError,
+    SnapshotV2StorageCleanupError, SnapshotV2StorageMmioTransportError,
+    SnapshotV2StoragePciTransportError, SnapshotV2StorageRestorePlan,
     SnapshotV2StorageRestorePlanError,
 };
 
