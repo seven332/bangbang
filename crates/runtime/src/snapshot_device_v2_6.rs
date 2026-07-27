@@ -1,8 +1,7 @@
 //! Canonical detached native-v2 2.6 storage device-graph profile.
 //!
-//! This exact profile is an internal compatibility capability. The production
-//! writer remains exact native-v2 2.5 until the complete pmem capture and
-//! restore transaction is activated.
+//! This exact block-and-pmem profile is the current production writer and
+//! loader capability. Exact native-v2 2.5 remains a compatibility reader.
 
 use std::fmt;
 

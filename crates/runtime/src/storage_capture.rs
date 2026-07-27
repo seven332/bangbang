@@ -344,6 +344,11 @@ impl CaptureReadyStorageConfigs {
     pub fn pmem(&self) -> &[PmemConfig] {
         &self.pmem
     }
+
+    /// Consumes the complete canonical block and pmem configuration projection.
+    pub(crate) fn into_parts(self) -> (Vec<DriveConfig>, Vec<PmemConfig>) {
+        (self.drives, self.pmem)
+    }
 }
 
 impl fmt::Debug for CaptureReadyStorageConfigs {

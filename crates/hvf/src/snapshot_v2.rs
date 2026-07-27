@@ -919,9 +919,8 @@ impl fmt::Debug for HvfSnapshotV2MultiBlockState {
 
 /// Complete exact native-v2 2.6 HVF state with one profile-3 storage graph.
 ///
-/// This wrapper is an internal structural capability. Public snapshot
-/// creation and loading remain on exact native-v2 2.5 until the complete pmem
-/// ownership transaction is activated.
+/// The public snapshot lifecycle uses this wrapper after the complete pmem
+/// ownership transaction has been validated.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HvfSnapshotV2StorageState {
     platform: HvfSnapshotV2PlatformState,

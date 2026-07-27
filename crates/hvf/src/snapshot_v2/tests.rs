@@ -805,7 +805,7 @@ fn exact_minor_five_multi_block_mmio_and_pci_states_round_trip_separately() {
 }
 
 #[test]
-fn internal_exact_minor_six_storage_mmio_and_pci_states_round_trip_separately() {
+fn current_exact_minor_six_storage_mmio_and_pci_states_round_trip_separately() {
     let cases = [
         (
             STORAGE_MMIO_GRAPH_FIXTURE_HEX,
@@ -823,19 +823,13 @@ fn internal_exact_minor_six_storage_mmio_and_pci_states_round_trip_separately() 
     for (graph_hex, expected_transport, block_count, pmem_count) in cases {
         let original = complete_storage_state_fixture(graph_hex);
         let encoded = encode_hvf_snapshot_v2_storage_state(&original)
-            .expect("complete internal minor-six state should encode");
-        assert!(matches!(
-            decode_snapshot_v2_state(&encoded),
-            Err(SnapshotV2DecodeError::UnsupportedVersion {
-                found: NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-                supported: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-            })
-        ));
-        let structural = decode_snapshot_v2_state_with_compatibility_version(
-            &encoded,
-            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
-        )
-        .expect("internal minor-six state should decode explicitly");
+            .expect("complete current minor-six state should encode");
+        let structural =
+            decode_snapshot_v2_state(&encoded).expect("current minor-six state should decode");
+        assert_eq!(
+            structural.metadata().version(),
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION
+        );
         assert!(matches!(
             decode_hvf_snapshot_v2_platform_state(&structural),
             Err(HvfSnapshotV2DecodeError::InvalidComponentProfile)

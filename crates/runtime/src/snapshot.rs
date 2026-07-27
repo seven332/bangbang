@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use crate::block::{DriveConfig, DriveConfigs};
 use crate::boot::BootSourceConfig;
 use crate::machine::MachineConfig;
+use crate::pmem::PmemConfigs;
 use crate::serial::SerialConfig;
+use crate::storage_capture::CaptureReadyStorageConfigs;
 use crate::vsock::{VsockBackendSelector, VsockBackendSelectorError};
 
 const REDACTED: &str = "<redacted>";
@@ -63,6 +65,7 @@ pub struct SnapshotV2ControllerCommit {
     machine_config: MachineConfig,
     boot_source_config: BootSourceConfig,
     drive_configs: DriveConfigs,
+    pmem_configs: PmemConfigs,
     serial_config: SerialConfig,
     resume_requested: bool,
 }
@@ -78,6 +81,7 @@ impl SnapshotV2ControllerCommit {
             machine_config,
             boot_source_config,
             drive_configs: DriveConfigs::new(),
+            pmem_configs: PmemConfigs::new(),
             serial_config: SerialConfig::default(),
             resume_requested,
         }
@@ -95,6 +99,7 @@ impl SnapshotV2ControllerCommit {
             machine_config,
             boot_source_config,
             drive_configs: DriveConfigs::from_validated_single(drive_config)?,
+            pmem_configs: PmemConfigs::new(),
             serial_config: SerialConfig::default(),
             resume_requested,
         })
@@ -113,6 +118,27 @@ impl SnapshotV2ControllerCommit {
             machine_config,
             boot_source_config,
             drive_configs,
+            pmem_configs: PmemConfigs::new(),
+            serial_config: SerialConfig::default(),
+            resume_requested,
+        }
+    }
+
+    /// Retains an already-validated complete block-and-pmem projection without
+    /// rebuilding or cloning its authority.
+    #[doc(hidden)]
+    pub fn with_storage_configs(
+        machine_config: MachineConfig,
+        boot_source_config: BootSourceConfig,
+        storage_configs: CaptureReadyStorageConfigs,
+        resume_requested: bool,
+    ) -> Self {
+        let (drive_configs, pmem_configs) = storage_configs.into_parts();
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs: DriveConfigs::from_validated(drive_configs),
+            pmem_configs: PmemConfigs::from_validated(pmem_configs),
             serial_config: SerialConfig::default(),
             resume_requested,
         }
@@ -128,6 +154,7 @@ impl SnapshotV2ControllerCommit {
         MachineConfig,
         BootSourceConfig,
         DriveConfigs,
+        PmemConfigs,
         SerialConfig,
         bool,
     ) {
@@ -135,6 +162,7 @@ impl SnapshotV2ControllerCommit {
             self.machine_config,
             self.boot_source_config,
             self.drive_configs,
+            self.pmem_configs,
             self.serial_config,
             self.resume_requested,
         )

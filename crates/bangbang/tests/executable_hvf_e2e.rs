@@ -26,11 +26,11 @@ mod macos_arm64 {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use bangbang_hvf::decode_hvf_snapshot_v2_multi_block_state;
+    use bangbang_hvf::decode_hvf_snapshot_v2_storage_state;
     use bangbang_runtime::block::{DriveCacheType, DriveIoEngine};
     use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
-    use bangbang_runtime::snapshot_device_v2_5::{
-        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
+    use bangbang_runtime::snapshot_device_v2_6::{
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     };
     use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version;
 
@@ -11167,7 +11167,7 @@ mod macos_arm64 {
             "native-v2 description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.5.0");
+        assert_eq!(described.stdout.trim(), "v2.6.0");
 
         let collision = http_json_with_io_timeout(
             &source_socket,
@@ -11641,7 +11641,7 @@ mod macos_arm64 {
         let memory_before = fs::read(&memory_path).expect("native-v2 root memory should read");
         let graph_before = native_v2_device_graph(&state_path);
         assert_eq!(
-            graph_before.records().len(),
+            graph_before.block_records().len(),
             3,
             "{transport} public snapshot should capture every configured block record"
         );
@@ -11669,7 +11669,7 @@ mod macos_arm64 {
             ),
         ] {
             let config = graph_before
-                .records()
+                .block_records()
                 .iter()
                 .find(|record| record.config().drive_id() == drive_id)
                 .unwrap_or_else(|| panic!("{transport} snapshot should contain {drive_id}"));
@@ -11690,7 +11690,7 @@ mod macos_arm64 {
             "{transport} native-v2 root description should succeed; stderr:\n{}",
             described.stderr
         );
-        assert_eq!(described.stdout.trim(), "v2.5.0");
+        assert_eq!(described.stdout.trim(), "v2.6.0");
         let source_output = source.terminate();
         assert_clean_shutdown(
             source_output,
@@ -12207,13 +12207,13 @@ mod macos_arm64 {
     }
 
     fn assert_snapshot_block_graph(
-        graph: &SnapshotV2MultiBlockDeviceGraph,
+        graph: &SnapshotV2StorageDeviceGraph,
         enable_pci: bool,
         rooted: bool,
         case: &str,
     ) {
         assert_eq!(
-            graph.records().len(),
+            graph.block_records().len(),
             3,
             "{case} should capture three drives"
         );
@@ -12227,7 +12227,7 @@ mod macos_arm64 {
             "{case} should retain the selected transport"
         );
         let primary = graph
-            .records()
+            .block_records()
             .iter()
             .find(|record| record.config().drive_id() == "primary")
             .expect("epoch graph should contain primary");
@@ -12238,7 +12238,7 @@ mod macos_arm64 {
         assert!(primary.config().rate_limiter().is_some());
 
         let data = graph
-            .records()
+            .block_records()
             .iter()
             .find(|record| record.config().drive_id() == "data")
             .expect("epoch graph should contain data");
@@ -12249,7 +12249,7 @@ mod macos_arm64 {
         assert_eq!(data.config().partuuid(), Some(SNAPSHOT_BLOCK_PARTUUID));
 
         let audit = graph
-            .records()
+            .block_records()
             .iter()
             .find(|record| record.config().drive_id() == "audit")
             .expect("epoch graph should contain audit");
@@ -12259,8 +12259,8 @@ mod macos_arm64 {
     }
 
     fn assert_snapshot_block_stable_graph(
-        expected: &SnapshotV2MultiBlockDeviceGraph,
-        actual: &SnapshotV2MultiBlockDeviceGraph,
+        expected: &SnapshotV2StorageDeviceGraph,
+        actual: &SnapshotV2StorageDeviceGraph,
         context: &str,
     ) {
         assert_eq!(actual.root_key(), expected.root_key(), "{context} root");
@@ -12270,11 +12270,16 @@ mod macos_arm64 {
             "{context} transport"
         );
         assert_eq!(
-            actual.records().len(),
-            expected.records().len(),
+            actual.block_records().len(),
+            expected.block_records().len(),
             "{context} record count"
         );
-        for (expected, actual) in expected.records().iter().zip(actual.records()) {
+        assert_eq!(
+            actual.pmem_records(),
+            expected.pmem_records(),
+            "{context} pmem records"
+        );
+        for (expected, actual) in expected.block_records().iter().zip(actual.block_records()) {
             assert_eq!(actual.key(), expected.key(), "{context} record key");
             assert_eq!(
                 actual.config(),
@@ -12393,7 +12398,7 @@ mod macos_arm64 {
             .fold(0, u64::saturating_add)
     }
 
-    fn native_v2_device_graph(state_path: &Path) -> SnapshotV2MultiBlockDeviceGraph {
+    fn native_v2_device_graph(state_path: &Path) -> SnapshotV2StorageDeviceGraph {
         let bytes = fs::read(state_path).unwrap_or_else(|error| {
             panic!(
                 "native-v2 state {} should read: {error}",
@@ -12402,10 +12407,10 @@ mod macos_arm64 {
         });
         let structural = decode_snapshot_v2_state_with_compatibility_version(
             &bytes,
-            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
         )
         .expect("native-v2 state should decode structurally");
-        decode_hvf_snapshot_v2_multi_block_state(&structural)
+        decode_hvf_snapshot_v2_storage_state(&structural)
             .expect("native-v2 state should decode semantically")
             .device_graph()
             .clone()

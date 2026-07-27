@@ -2356,6 +2356,11 @@ impl PmemConfigs {
         self.configs
     }
 
+    /// Retains an already-validated configuration set in canonical order.
+    pub(crate) fn from_validated(configs: Vec<PmemConfig>) -> Self {
+        Self { configs }
+    }
+
     pub(crate) fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
         self.configs.try_reserve_exact(additional)
     }
