@@ -40,6 +40,8 @@ mod capture;
 pub(crate) mod codec;
 mod restore;
 
+pub(crate) use capture::{capture_multi_block_record, preflight_capture_config_refs};
+
 pub use restore::{
     PreparedSnapshotV2MultiBlockBundle, PreparedSnapshotV2MultiBlockMmioBundle,
     PreparedSnapshotV2MultiBlockMmioRecord, PreparedSnapshotV2MultiBlockPciBundle,

@@ -2124,6 +2124,14 @@ pub(crate) fn capture_mmio_common(
     state: &VirtioMmioTransportState,
     expected_features: u64,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
+    capture_mmio_common_for_device(state, VIRTIO_BLOCK_DEVICE_ID, expected_features)
+}
+
+pub(crate) fn capture_mmio_common_for_device(
+    state: &VirtioMmioTransportState,
+    expected_device_id: u32,
+    expected_features: u64,
+) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
     if !state.requires_device_config_write_status() {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidMmioState);
     }
@@ -2149,12 +2157,21 @@ pub(crate) fn capture_mmio_common(
         state.pending_notifications(),
         state.is_device_activated(),
         intents,
+        expected_device_id,
         expected_features,
     )
 }
 
 pub(crate) fn capture_pci_common(
     state: &VirtioPciTransportState,
+    expected_features: u64,
+) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
+    capture_pci_common_for_device(state, VIRTIO_BLOCK_DEVICE_ID, expected_features)
+}
+
+pub(crate) fn capture_pci_common_for_device(
+    state: &VirtioPciTransportState,
+    expected_device_id: u32,
     expected_features: u64,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
     if state.requires_device_config_write_status() {
@@ -2217,6 +2234,7 @@ pub(crate) fn capture_pci_common(
         pending,
         state.is_device_activated(),
         intents,
+        expected_device_id,
         expected_features,
     )
 }
@@ -2227,6 +2245,7 @@ fn capture_common_state(
     pending_notifications: &[bool],
     activated: bool,
     intents: Vec<SnapshotV2InterruptIntent>,
+    expected_device_id: u32,
     expected_features: u64,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
     if queues.len() != 1 || pending_notifications.len() != 1 || intents.len() > 2 {
@@ -2257,6 +2276,7 @@ fn capture_common_state(
         pending,
         activated,
         intents,
+        expected_device_id,
         expected_features,
     )
 }
@@ -2267,12 +2287,13 @@ fn capture_common_state_from_owned_queues(
     pending_notifications: Vec<u16>,
     activated: bool,
     intents: Vec<SnapshotV2InterruptIntent>,
+    expected_device_id: u32,
     expected_features: u64,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
     if queues.len() != 1 || pending_notifications.len() > 1 || intents.len() > 2 {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidVirtioState);
     }
-    if registers.device_id() != VIRTIO_BLOCK_DEVICE_ID
+    if registers.device_id() != expected_device_id
         || registers.vendor_id() != VIRTIO_MMIO_VENDOR_ID
         || registers.device_features() != expected_features
     {

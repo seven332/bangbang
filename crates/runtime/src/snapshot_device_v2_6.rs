@@ -31,6 +31,7 @@ use crate::snapshot_restore::{
 };
 use crate::storage_capture::{StorageDeviceOrigin, StorageRetryState};
 
+mod capture;
 mod codec;
 
 #[cfg(test)]
@@ -540,6 +541,59 @@ impl fmt::Display for SnapshotV2StorageDeviceGraphBuildError {
 }
 
 impl std::error::Error for SnapshotV2StorageDeviceGraphBuildError {}
+
+/// Failure while converting one complete live storage inventory into profile 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2StorageDeviceGraphCaptureError {
+    /// The supplied compatibility context is not exact 2.6.
+    UnsupportedVersion,
+    /// The combined inventory is empty, too large, or transport-mixed.
+    UnsupportedInventory,
+    /// A block or pmem configuration lies outside profile 3.
+    UnsupportedConfiguration,
+    /// Bounded live string metadata is invalid.
+    InvalidString,
+    /// Repeated block-local facts disagree.
+    InconsistentBlockState,
+    /// Repeated pmem-local facts disagree.
+    InconsistentPmemState,
+    /// Common virtio continuation is invalid.
+    InvalidVirtioState,
+    /// MMIO placement or selectors are invalid.
+    InvalidMmioState,
+    /// PCI placement, configuration, or MSI-X state is invalid.
+    InvalidPciState,
+    /// The complete config-ordered graph violates profile 3.
+    InvalidGraph,
+    /// A bounded artifact allocation failed.
+    Allocation,
+}
+
+impl fmt::Display for SnapshotV2StorageDeviceGraphCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedVersion => {
+                "native-v2 storage graph compatibility version is unsupported"
+            }
+            Self::UnsupportedInventory => {
+                "live storage inventory is outside the native-v2 storage profile"
+            }
+            Self::UnsupportedConfiguration => {
+                "live storage configuration is outside the native-v2 storage profile"
+            }
+            Self::InvalidString => "live storage string metadata is invalid",
+            Self::InconsistentBlockState => "live block continuation state is inconsistent",
+            Self::InconsistentPmemState => "live pmem continuation state is inconsistent",
+            Self::InvalidVirtioState => "live common virtio state is invalid",
+            Self::InvalidMmioState => "live virtio-mmio state is invalid",
+            Self::InvalidPciState => "live virtio-pci state is invalid",
+            Self::InvalidGraph => "captured native-v2 storage graph is invalid",
+            Self::Allocation => "failed to allocate a native-v2 storage graph",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2StorageDeviceGraphCaptureError {}
 
 /// Failure while encoding one validated profile-3 graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

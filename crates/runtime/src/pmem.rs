@@ -2250,6 +2250,18 @@ impl PmemFileBackingIdentity {
         self.mode
     }
 
+    pub const fn is_regular_file(self) -> bool {
+        #[cfg(unix)]
+        {
+            self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+        }
+
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     pub const fn modified_seconds(self) -> i64 {
         self.modified_seconds
     }
@@ -2721,6 +2733,106 @@ impl std::error::Error for PmemBackingFlushError {
     }
 }
 
+/// Retained authoritative mapping lease for one snapshot persistence phase.
+#[derive(Clone)]
+pub struct PmemSnapshotPersistenceBinding {
+    mapping: PmemBackingMapping,
+}
+
+impl PmemSnapshotPersistenceBinding {
+    pub fn is_read_only(&self) -> bool {
+        self.mapping.is_read_only()
+    }
+
+    pub fn file_len(&self) -> u64 {
+        self.mapping.file_len()
+    }
+
+    pub fn mapped_len(&self) -> u64 {
+        self.mapping.mapped_len()
+    }
+
+    pub fn same_mapping(&self, identity: &PmemBackingMappingIdentity) -> bool {
+        Arc::ptr_eq(&self.mapping.inner, &identity.mapping.inner)
+    }
+
+    /// Synchronizes the exact writable file-backed prefix retained by this lease.
+    pub fn persist(&self) -> Result<(), PmemSnapshotPersistenceError> {
+        if self.is_read_only() {
+            return Err(PmemSnapshotPersistenceError::ReadOnly);
+        }
+        self.mapping
+            .flush()
+            .map_err(|source| PmemSnapshotPersistenceError::Flush { source })
+    }
+}
+
+impl fmt::Debug for PmemSnapshotPersistenceBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PmemSnapshotPersistenceBinding")
+            .field("is_read_only", &self.is_read_only())
+            .field("file_len", &self.file_len())
+            .field("mapped_len", &self.mapped_len())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Value-redacted failure while validating or persisting one live pmem owner.
+pub enum PmemSnapshotPersistenceError {
+    ConfigurationMismatch,
+    UnsupportedBacking,
+    Identity {
+        source: PmemFileBackingIdentityError,
+    },
+    ReadOnly,
+    Flush {
+        source: PmemBackingFlushError,
+    },
+}
+
+impl fmt::Debug for PmemSnapshotPersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::ConfigurationMismatch => "ConfigurationMismatch",
+            Self::UnsupportedBacking => "UnsupportedBacking",
+            Self::Identity { .. } => "Identity",
+            Self::ReadOnly => "ReadOnly",
+            Self::Flush { .. } => "Flush",
+        };
+        formatter
+            .debug_struct("PmemSnapshotPersistenceError")
+            .field("kind", &kind)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for PmemSnapshotPersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ConfigurationMismatch => {
+                "live pmem owner does not match its snapshot configuration"
+            }
+            Self::UnsupportedBacking => "live pmem snapshot backing is unsupported",
+            Self::Identity { .. } => "failed to validate live pmem snapshot backing identity",
+            Self::ReadOnly => "read-only pmem snapshot backing cannot be persisted",
+            Self::Flush { .. } => "failed to persist live pmem snapshot backing",
+        })
+    }
+}
+
+impl std::error::Error for PmemSnapshotPersistenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Identity { source } => Some(source),
+            Self::Flush { source } => Some(source),
+            Self::ConfigurationMismatch | Self::UnsupportedBacking | Self::ReadOnly => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PmemBackingMappingError {
     MappedLengthOverflow {
@@ -3154,6 +3266,45 @@ impl PreparedPmemDevice {
 
     pub const fn rate_limiter(&self) -> Option<PmemRateLimiterConfig> {
         self.rate_limiter
+    }
+
+    /// Validates and retains the authoritative mapping before snapshot mutation.
+    pub fn snapshot_persistence_binding(
+        &self,
+        config: &PmemConfig,
+    ) -> Result<PmemSnapshotPersistenceBinding, PmemSnapshotPersistenceError> {
+        let identity = self
+            .backing
+            .capture_identity()
+            .map_err(|source| PmemSnapshotPersistenceError::Identity { source })?;
+        if !identity.is_regular_file() || identity.is_empty() {
+            return Err(PmemSnapshotPersistenceError::UnsupportedBacking);
+        }
+        let expected_mapped = align_pmem_mapping_len(self.backing.len())
+            .map_err(|_| PmemSnapshotPersistenceError::ConfigurationMismatch)?;
+        let expected_config_space = VirtioPmemConfigSpace::new(
+            self.guest_range.start().raw_value(),
+            self.guest_range.size(),
+        );
+        if self.id != config.id()
+            || self.backing.is_read_only() != config.read_only()
+            || self.mapping.is_read_only() != config.read_only()
+            || identity.len() != self.backing.len()
+            || self.mapping.file_len() != self.backing.len()
+            || self.mapping.mapped_len() != expected_mapped
+            || self.mapping.mapped_len() != self.guest_range.size()
+            || self
+                .guest_range
+                .validate_alignment(VIRTIO_PMEM_ALIGNMENT)
+                .is_err()
+            || self.config_space != expected_config_space
+            || self.rate_limiter != config.rate_limiter()
+        {
+            return Err(PmemSnapshotPersistenceError::ConfigurationMismatch);
+        }
+        Ok(PmemSnapshotPersistenceBinding {
+            mapping: self.mapping.clone(),
+        })
     }
 
     pub fn into_parts(
@@ -6498,6 +6649,139 @@ mod tests {
 
         assert!(rendered.contains("failed to synchronize pmem backing mapping"));
         assert!(!rendered.contains("0x"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn snapshot_persistence_binding_flushes_only_the_exact_writable_prefix() {
+        let file = temp_file("snapshot-binding-writable-secret.img", b"pmem");
+        let config = config_for_path(file.as_path(), false);
+        let backing = PmemFileBacking::open(&config).expect("pmem backing should open");
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let flush_calls = Arc::new(Mutex::new(Vec::new()));
+        let mapping = PmemBackingMapping::test_mapping_with_flush(
+            4,
+            VIRTIO_PMEM_ALIGNMENT,
+            false,
+            Arc::clone(&drop_count),
+            Some(Arc::clone(&flush_calls)),
+            None,
+        );
+        let mapping_identity = mapping.capture_identity();
+        let range = guest_range(TEST_PMEM_START, VIRTIO_PMEM_ALIGNMENT);
+        let prepared = PreparedPmemDevice {
+            id: config.id().to_string(),
+            backing,
+            mapping,
+            guest_range: range,
+            config_space: VirtioPmemConfigSpace::new(range.start().raw_value(), range.size()),
+            rate_limiter: config.rate_limiter(),
+        };
+
+        let binding = prepared
+            .snapshot_persistence_binding(&config)
+            .expect("writable pmem binding should validate");
+        assert!(!binding.is_read_only());
+        assert_eq!(binding.file_len(), 4);
+        assert_eq!(binding.mapped_len(), VIRTIO_PMEM_ALIGNMENT);
+        assert!(binding.same_mapping(&mapping_identity));
+        binding
+            .persist()
+            .expect("writable pmem prefix should synchronize");
+
+        let calls = flush_calls
+            .lock()
+            .expect("pmem flush call recorder should not be poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len, 4);
+        assert_eq!(calls[0].flags, libc::MS_SYNC);
+        drop(calls);
+        drop(prepared);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+        drop(binding);
+        drop(mapping_identity);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn snapshot_persistence_binding_rejects_read_only_flush_without_calling_msync() {
+        let file = temp_file("snapshot-binding-read-only-secret.img", b"pmem");
+        let config = config_for_path(file.as_path(), true);
+        let backing = PmemFileBacking::open(&config).expect("pmem backing should open");
+        let flush_calls = Arc::new(Mutex::new(Vec::new()));
+        let mapping = PmemBackingMapping::test_mapping_with_flush(
+            4,
+            VIRTIO_PMEM_ALIGNMENT,
+            true,
+            Arc::new(AtomicUsize::new(0)),
+            Some(Arc::clone(&flush_calls)),
+            None,
+        );
+        let range = guest_range(TEST_PMEM_START, VIRTIO_PMEM_ALIGNMENT);
+        let prepared = PreparedPmemDevice {
+            id: config.id().to_string(),
+            backing,
+            mapping,
+            guest_range: range,
+            config_space: VirtioPmemConfigSpace::new(range.start().raw_value(), range.size()),
+            rate_limiter: config.rate_limiter(),
+        };
+
+        let binding = prepared
+            .snapshot_persistence_binding(&config)
+            .expect("read-only pmem binding should validate");
+        assert!(binding.is_read_only());
+        let err = binding
+            .persist()
+            .expect_err("read-only persistence should be rejected");
+        assert!(matches!(err, PmemSnapshotPersistenceError::ReadOnly));
+        assert!(
+            flush_calls
+                .lock()
+                .expect("pmem flush call recorder should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapshot_persistence_binding_reports_mismatch_and_flush_failure_without_secrets() {
+        let file = temp_file("snapshot-binding-failure-secret.img", b"pmem");
+        let config = config_for_path(file.as_path(), false);
+        let backing = PmemFileBacking::open(&config).expect("pmem backing should open");
+        let mapping = PmemBackingMapping::test_mapping_with_flush(
+            4,
+            VIRTIO_PMEM_ALIGNMENT,
+            false,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            Some(libc::EIO),
+        );
+        let range = guest_range(TEST_PMEM_START, VIRTIO_PMEM_ALIGNMENT);
+        let prepared = PreparedPmemDevice {
+            id: config.id().to_string(),
+            backing,
+            mapping,
+            guest_range: range,
+            config_space: VirtioPmemConfigSpace::new(range.start().raw_value(), range.size()),
+            rate_limiter: config.rate_limiter(),
+        };
+        let mismatched = config_for_path(file.as_path(), true);
+        assert!(matches!(
+            prepared.snapshot_persistence_binding(&mismatched),
+            Err(PmemSnapshotPersistenceError::ConfigurationMismatch)
+        ));
+
+        let binding = prepared
+            .snapshot_persistence_binding(&config)
+            .expect("matching pmem binding should validate");
+        let err = binding
+            .persist()
+            .expect_err("scripted pmem persistence should fail");
+        assert!(matches!(err, PmemSnapshotPersistenceError::Flush { .. }));
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(!rendered.contains("snapshot-binding-failure-secret"));
+            assert!(!rendered.contains("0x"));
+        }
         assert!(err.source().is_some());
     }
 
