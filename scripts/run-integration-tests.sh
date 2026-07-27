@@ -568,6 +568,7 @@ if contains production_bundle "${selected_tests[@]}"; then
     BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
       BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH="$production_grant_test_bundle_path" \
       BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
+      BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
       BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \
       cargo test \
         -p bangbang-launcher \
@@ -581,6 +582,7 @@ if contains production_bundle "${selected_tests[@]}"; then
     BANGBANG_PRODUCTION_BUNDLE_PATH="$production_bundle_path" \
       BANGBANG_PRODUCTION_GRANT_TEST_BUNDLE_PATH="$production_grant_test_bundle_path" \
       BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
+      BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
       BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \
       cargo test \
         -p bangbang-launcher \

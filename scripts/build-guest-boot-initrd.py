@@ -46,6 +46,20 @@ SERIAL_RX_INPUT = b"BANGBANG_SERIAL_RX_" + (b"A" * 80) + b"_END\n"
 SERIAL_RX_READY_MARKER = b"BANGBANG_SERIAL_RX_READY\n"
 SERIAL_RX_SUCCESS_MARKER = b"BANGBANG_SERIAL_RX_OK\n"
 SERIAL_RX_FAILURE_MARKER = b"BANGBANG_SERIAL_RX_FAIL\n"
+SNAPSHOT_BLOCK_READY_MARKER = b"BANGBANG_SNAPSHOT_BLOCK_READY\n"
+SNAPSHOT_BLOCK_SUCCESS_MARKER = b"BANGBANG_SNAPSHOT_BLOCK_OK\n"
+SNAPSHOT_BLOCK_FAILURE_MARKER = b"BANGBANG_SNAPSHOT_BLOCK_FAIL\n"
+SNAPSHOT_BLOCK_SECTOR_SIZE = 512
+SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE = 0x11
+SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE = 0x12
+SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE = 0x13
+SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE = 0x14
+SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE = 0x21
+SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE = 0x22
+SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE = 0x23
+SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE = 0x24
+SNAPSHOT_BLOCK_AUDIT_BYTE = 0x31
+SNAPSHOT_BLOCK_DELAY_SECONDS = 5
 SERIAL_TTY_PATH = b"/dev/ttyS0\0"
 SERIAL_TTY_RAW_TERMIOS = (
     struct.pack("<IIII", 0, 0, 0x08BF, 0)
@@ -66,6 +80,8 @@ VIRTIO_PCI_RNG_DEVICE_PATH = b"/dev/hwrng\0"
 CPU1_ONLINE_PATH = b"/sys/devices/system/cpu/cpu1/online\0"
 SQUASHFS_NAME = b"squashfs\0"
 VDA_PATH = b"/dev/vda\0"
+VDB_PATH = b"/dev/vdb\0"
+VDC_PATH = b"/dev/vdc\0"
 ROOTFS_OS_RELEASE_PATH = b"/mnt/etc/os-release\0"
 DEFAULT_RELATIVE_OUTPUT = Path("bangbang/guest-boot/initrd.cpio")
 CPIO_NEWC_HEADER_SIZE = 110
@@ -567,6 +583,400 @@ def build_guest_init_elf() -> bytes:
         raise RuntimeError("guest init code size changed after address assignment")
 
     data = b"".join(data for _name, data in guest_init_data())
+    return build_guest_elf(code, data)
+
+
+def snapshot_block_sector(value: int) -> bytes:
+    return bytes([value]) * SNAPSHOT_BLOCK_SECTOR_SIZE
+
+
+def emit_snapshot_block_open(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    path: str,
+    flags: int,
+) -> None:
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses[path]),
+                movz_64(2, flags),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_MI)
+    code.emit(mov_reg_64(19, 0))
+
+
+def emit_snapshot_block_close(code: Aarch64CodeBuilder) -> None:
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                movz_64(8, LINUX_AARCH64_SYSCALL_CLOSE),
+                svc_0(),
+            )
+        )
+    )
+
+
+def emit_snapshot_block_read_byte(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    path: str,
+) -> None:
+    emit_snapshot_block_open(code, addresses, path=path, flags=0)
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                mov_imm_64(1, addresses["read_buffer"]),
+                movz_64(2, SNAPSHOT_BLOCK_SECTOR_SIZE),
+                movz_64(8, LINUX_AARCH64_SYSCALL_READ),
+                svc_0(),
+                cmp_imm_64(0, SNAPSHOT_BLOCK_SECTOR_SIZE),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    emit_snapshot_block_close(code)
+    code.emit(mov_imm_64(1, addresses["read_buffer"]))
+    code.emit(ldrb_u32(0, 1))
+
+
+def emit_snapshot_block_expect_byte(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    path: str,
+    expected: int,
+) -> None:
+    emit_snapshot_block_read_byte(code, addresses, path=path)
+    code.emit(cmp_imm_64(0, expected))
+    code.branch_cond("failure", AARCH64_COND_NE)
+
+
+def emit_snapshot_block_write_sector(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    path: str,
+    sector: str,
+) -> None:
+    emit_snapshot_block_open(code, addresses, path=path, flags=LINUX_OPEN_FLAG_RDWR)
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                write_from_open_fd(
+                    addresses[sector],
+                    SNAPSHOT_BLOCK_SECTOR_SIZE,
+                ),
+                cmp_imm_64(0, SNAPSHOT_BLOCK_SECTOR_SIZE),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                movz_64(8, LINUX_AARCH64_SYSCALL_FSYNC),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    emit_snapshot_block_close(code)
+
+
+def emit_snapshot_block_audit_check(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    label_prefix: str,
+) -> None:
+    emit_snapshot_block_expect_byte(
+        code,
+        addresses,
+        path="vdc",
+        expected=SNAPSHOT_BLOCK_AUDIT_BYTE,
+    )
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses["vdc"]),
+                movz_64(2, LINUX_OPEN_FLAG_RDWR),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond(f"{label_prefix}_open_rejected", AARCH64_COND_MI)
+    code.emit(mov_reg_64(19, 0))
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                write_from_open_fd(
+                    addresses["audit_write_sector"],
+                    SNAPSHOT_BLOCK_SECTOR_SIZE,
+                ),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond(f"{label_prefix}_write_rejected", AARCH64_COND_MI)
+    emit_snapshot_block_close(code)
+    code.branch("failure")
+    code.label(f"{label_prefix}_write_rejected")
+    emit_snapshot_block_close(code)
+    code.label(f"{label_prefix}_open_rejected")
+
+
+def emit_snapshot_block_advance(
+    code: Aarch64CodeBuilder,
+    addresses: dict[str, int],
+    *,
+    path: str,
+    pre_capture: int,
+    destination_one: int,
+    destination_one_sector: str,
+    destination_two_sector: str,
+    label_prefix: str,
+) -> None:
+    emit_snapshot_block_read_byte(code, addresses, path=path)
+    code.emit(cmp_imm_64(0, pre_capture))
+    code.branch_cond(f"{label_prefix}_destination_one", AARCH64_COND_EQ)
+    code.emit(cmp_imm_64(0, destination_one))
+    code.branch_cond(f"{label_prefix}_destination_two", AARCH64_COND_EQ)
+    code.branch("failure")
+
+    code.label(f"{label_prefix}_destination_one")
+    emit_snapshot_block_write_sector(
+        code,
+        addresses,
+        path=path,
+        sector=destination_one_sector,
+    )
+    code.branch(f"{label_prefix}_complete")
+
+    code.label(f"{label_prefix}_destination_two")
+    emit_snapshot_block_write_sector(
+        code,
+        addresses,
+        path=path,
+        sector=destination_two_sector,
+    )
+    code.label(f"{label_prefix}_complete")
+
+
+def emit_snapshot_block_poweroff(code: Aarch64CodeBuilder) -> None:
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, LINUX_REBOOT_MAGIC1),
+                mov_imm_64(1, LINUX_REBOOT_MAGIC2),
+                mov_imm_64(2, LINUX_REBOOT_CMD_POWER_OFF),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_REBOOT),
+                svc_0(),
+                branch_to_self(),
+            )
+        )
+    )
+
+
+def build_snapshot_block_init_code(addresses: dict[str, int]) -> bytes:
+    code = Aarch64CodeBuilder()
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, addresses["devtmpfs"]),
+                mov_imm_64(1, addresses["dev"]),
+                mov_imm_64(2, addresses["devtmpfs"]),
+                movz_64(3, 0),
+                movz_64(4, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_MOUNT),
+                svc_0(),
+            )
+        )
+    )
+    emit_snapshot_block_expect_byte(
+        code,
+        addresses,
+        path="vda",
+        expected=SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE,
+    )
+    emit_snapshot_block_expect_byte(
+        code,
+        addresses,
+        path="vda",
+        expected=SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE,
+    )
+    emit_snapshot_block_expect_byte(
+        code,
+        addresses,
+        path="vda",
+        expected=SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE,
+    )
+    emit_snapshot_block_expect_byte(
+        code,
+        addresses,
+        path="vdb",
+        expected=SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE,
+    )
+    emit_snapshot_block_audit_check(code, addresses, label_prefix="source_audit")
+    emit_snapshot_block_write_sector(
+        code,
+        addresses,
+        path="vda",
+        sector="drive_a_pre_capture_sector",
+    )
+    emit_snapshot_block_write_sector(
+        code,
+        addresses,
+        path="vdb",
+        sector="drive_b_pre_capture_sector",
+    )
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["ready_marker"],
+            len(SNAPSHOT_BLOCK_READY_MARKER),
+        )
+    )
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, addresses["capture_delay"]),
+                movz_64(1, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_NANOSLEEP),
+                svc_0(),
+            )
+        )
+    )
+
+    emit_snapshot_block_audit_check(code, addresses, label_prefix="destination_audit")
+    emit_snapshot_block_advance(
+        code,
+        addresses,
+        path="vda",
+        pre_capture=SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
+        destination_one=SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE,
+        destination_one_sector="drive_a_destination_one_sector",
+        destination_two_sector="drive_a_destination_two_sector",
+        label_prefix="drive_a",
+    )
+    emit_snapshot_block_advance(
+        code,
+        addresses,
+        path="vdb",
+        pre_capture=SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+        destination_one=SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE,
+        destination_one_sector="drive_b_destination_one_sector",
+        destination_two_sector="drive_b_destination_two_sector",
+        label_prefix="drive_b",
+    )
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["success_marker"],
+            len(SNAPSHOT_BLOCK_SUCCESS_MARKER),
+        )
+    )
+    emit_snapshot_block_poweroff(code)
+
+    code.label("failure")
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["failure_marker"],
+            len(SNAPSHOT_BLOCK_FAILURE_MARKER),
+        )
+    )
+    emit_snapshot_block_poweroff(code)
+    return code.build()
+
+
+def snapshot_block_init_data() -> list[tuple[str, bytes]]:
+    return [
+        ("devtmpfs", DEV_TMPFS_NAME),
+        ("dev", DEV_PATH),
+        ("vda", VDA_PATH),
+        ("vdb", VDB_PATH),
+        ("vdc", VDC_PATH),
+        ("read_buffer", bytes(SNAPSHOT_BLOCK_SECTOR_SIZE)),
+        (
+            "drive_a_pre_capture_sector",
+            snapshot_block_sector(SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE),
+        ),
+        (
+            "drive_a_destination_one_sector",
+            snapshot_block_sector(SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE),
+        ),
+        (
+            "drive_a_destination_two_sector",
+            snapshot_block_sector(SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE),
+        ),
+        (
+            "drive_b_pre_capture_sector",
+            snapshot_block_sector(SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE),
+        ),
+        (
+            "drive_b_destination_one_sector",
+            snapshot_block_sector(SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE),
+        ),
+        (
+            "drive_b_destination_two_sector",
+            snapshot_block_sector(SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE),
+        ),
+        (
+            "audit_write_sector",
+            snapshot_block_sector(SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE),
+        ),
+        (
+            "capture_delay",
+            struct.pack("<QQ", SNAPSHOT_BLOCK_DELAY_SECONDS, 0),
+        ),
+        ("ready_marker", SNAPSHOT_BLOCK_READY_MARKER),
+        ("success_marker", SNAPSHOT_BLOCK_SUCCESS_MARKER),
+        ("failure_marker", SNAPSHOT_BLOCK_FAILURE_MARKER),
+    ]
+
+
+def snapshot_block_init_addresses(code_size: int) -> dict[str, int]:
+    addresses: dict[str, int] = {}
+    data_offset = ELF_CODE_OFFSET + code_size
+    for name, data in snapshot_block_init_data():
+        addresses[name] = ELF_BASE_VADDR + data_offset
+        data_offset += len(data)
+    return addresses
+
+
+def build_snapshot_block_init_elf() -> bytes:
+    placeholder_addresses = {
+        name: ELF_BASE_VADDR for name, _data in snapshot_block_init_data()
+    }
+    code_size = len(build_snapshot_block_init_code(placeholder_addresses))
+    addresses = snapshot_block_init_addresses(code_size)
+    code = build_snapshot_block_init_code(addresses)
+    if len(code) != code_size:
+        raise RuntimeError(
+            "guest snapshot block init code size changed after address assignment"
+        )
+    data = b"".join(data for _name, data in snapshot_block_init_data())
     return build_guest_elf(code, data)
 
 
@@ -1774,6 +2184,7 @@ def cpio_entry(
 
 def build_initrd() -> bytes:
     guest_init = build_guest_init_elf()
+    snapshot_block_init = build_snapshot_block_init_elf()
     serial_rx_init = build_serial_rx_init_elf()
     pci_rng_init = build_pci_rng_init_elf()
     smp_init = build_smp_init_elf()
@@ -1844,7 +2255,13 @@ def build_initrd() -> bytes:
                 mode=S_IFREG | 0o755,
                 data=serial_rx_init,
             ),
-            cpio_entry(name="TRAILER!!!", ino=15, mode=0, nlink=1),
+            cpio_entry(
+                name="snapshot-block-init",
+                ino=15,
+                mode=S_IFREG | 0o755,
+                data=snapshot_block_init,
+            ),
+            cpio_entry(name="TRAILER!!!", ino=16, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -2118,6 +2535,71 @@ def validate_serial_rx_init_entry(entries: dict[str, dict[str, object]]) -> None
         raise RuntimeError("guest initrd serial-rx-init payload does not contain SVC #0")
 
 
+def validate_snapshot_block_init_entry(
+    entries: dict[str, dict[str, object]],
+) -> None:
+    entry = required_entry(entries, "snapshot-block-init")
+    if file_type(entry["mode"]) != S_IFREG:
+        raise RuntimeError("guest initrd snapshot-block-init entry is not a regular file")
+    payload = bytes(entry["payload"])
+    if not payload.startswith(b"\x7fELF"):
+        raise RuntimeError("guest initrd snapshot-block-init payload is not an ELF file")
+    for marker in (
+        SNAPSHOT_BLOCK_READY_MARKER,
+        SNAPSHOT_BLOCK_SUCCESS_MARKER,
+        SNAPSHOT_BLOCK_FAILURE_MARKER,
+    ):
+        if marker not in payload:
+            raise RuntimeError(
+                f"guest initrd snapshot-block-init payload does not contain {marker!r}"
+            )
+    for guest_path in (
+        DEV_TMPFS_NAME,
+        DEV_PATH,
+        VDA_PATH,
+        VDB_PATH,
+        VDC_PATH,
+    ):
+        if guest_path not in payload:
+            raise RuntimeError(
+                f"guest initrd snapshot-block-init payload does not contain {guest_path!r}"
+            )
+    for value in (
+        SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
+        SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE,
+        SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE,
+        SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+        SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE,
+        SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE,
+    ):
+        if snapshot_block_sector(value) not in payload:
+            raise RuntimeError(
+                "guest initrd snapshot-block-init payload omits a writable epoch sector"
+            )
+    if struct.pack("<QQ", SNAPSHOT_BLOCK_DELAY_SECONDS, 0) not in payload:
+        raise RuntimeError(
+            "guest initrd snapshot-block-init payload omits the capture delay"
+        )
+    for syscall, description in (
+        (LINUX_AARCH64_SYSCALL_MOUNT, "mount"),
+        (LINUX_AARCH64_SYSCALL_OPENAT, "openat"),
+        (LINUX_AARCH64_SYSCALL_CLOSE, "close"),
+        (LINUX_AARCH64_SYSCALL_READ, "read"),
+        (LINUX_AARCH64_SYSCALL_WRITE, "write"),
+        (LINUX_AARCH64_SYSCALL_FSYNC, "fsync"),
+        (LINUX_AARCH64_SYSCALL_NANOSLEEP, "nanosleep"),
+        (LINUX_AARCH64_SYSCALL_REBOOT, "reboot"),
+    ):
+        if movz_64(8, syscall) not in payload:
+            raise RuntimeError(
+                f"guest initrd snapshot-block-init payload does not load {description}"
+            )
+    if svc_0() not in payload:
+        raise RuntimeError(
+            "guest initrd snapshot-block-init payload does not contain SVC #0"
+        )
+
+
 def validate_initrd(data: bytes) -> None:
     if not data:
         raise RuntimeError("guest initrd is empty")
@@ -2142,6 +2624,7 @@ def validate_initrd(data: bytes) -> None:
         "smp-hotplug-init",
         "pci-rng-init",
         "serial-rx-init",
+        "snapshot-block-init",
         CPIO_TRAILER,
     ]
     if names != expected_names:
@@ -2267,6 +2750,7 @@ def validate_initrd(data: bytes) -> None:
     validate_smp_progress_init_entry(entries)
     validate_smp_hotplug_init_entry(entries)
     validate_serial_rx_init_entry(entries)
+    validate_snapshot_block_init_entry(entries)
 
 
 def default_output_path() -> Path:

@@ -561,10 +561,12 @@ Native-v2 structural state tests pin an independent exact 72-byte empty
 private catalog-aware test codec exercises multiple required features,
 semantic components, instances, and an ignorable nonsemantic extension. The
 production catalog admits semantic memory kind 1 introduced in minor 1; the
-current `2.4.0` writer additionally admits machine/global/topology kinds 2–4
+current `2.5.0` writer additionally admits machine/global/topology kinds 2–4
 and per-vCPU kind 5 introduced in minor 2, singleton time kind 6 introduced in
 minor 3, and mandatory singleton device-graph kind 7 introduced in minor 4.
-Exact `2.3.0` remains the legacy device-free platform profile. The mutation corpus
+Exact `2.4.0` retains device-graph profile 1's singleton root, while `2.5.0`
+uses profile 2's bounded ordered block vector. Exact `2.3.0` remains the legacy
+device-free platform profile. The mutation corpus
 covers every fixed header field, both count caps, exact/trailing/oversized
 lengths, all three offsets, CRC and every truncation, feature
 zero/order/duplicate/unknown cases, and component
@@ -576,7 +578,7 @@ resource action. Run the focused surface with
 `cargo test -p bangbang-runtime snapshot_format --locked`.
 
 Native-v2 lazy-memory tests retain exact multi-extent binding and complete
-`2.1.0` compatibility fixtures while proving that new output uses `2.4.0`.
+`2.1.0` compatibility fixtures while proving that new output uses `2.5.0`.
 They cover canonical 64-KiB metadata/data offsets and sparse gaps, every
 binding/header/topology/length mutation, exact admitted-version retention,
 typed state profiles,
@@ -654,8 +656,9 @@ The wrapper builds the `bangbang` binary unit-test harness, locates and signs
 that exact test executable, and runs only the ignored private-seam proof. Its
 minimal two-vCPU guest does not touch serial or optional devices beyond the
 required read-only root. The first test starts and pauses the real
-process-owned HVF supervisor, publishes one current 2.4 MMIO-root pair, resumes
-and repauses the source, publishes a fresh recapture, and drops the source. It
+process-owned HVF supervisor, publishes one current 2.5 profile-2 MMIO-root
+pair, resumes and repauses the source, publishes a fresh recapture, and drops
+the source. It
 restores the first immutable pair into one fresh normal process initially
 `Paused`, proves the exact root configuration plus fresh destination
 UART/metrics state, explicitly resumes and repauses it, then shuts it down. A
@@ -667,6 +670,39 @@ exercises complete MMIO and PCI root-owner commit/rollback boundaries. This
 group is part of the default integration set and must run without
 `--allow-unsupported` on supported Apple Silicon. It adds no API, CLI,
 config-file, or environment activation for native-v2.
+
+### Native-v2 2.5 finite transaction failure matrix
+
+Profile-2 certification treats “every stage” as the following finite public
+transaction boundaries. It does not multiply pre-HVF failures across every
+root/transport cell. Test names below are exact anchors in
+[`vmm.rs`](../crates/bangbang/src/vmm.rs),
+[`snapshot_restore_resources.rs`](../crates/bangbang/src/snapshot_restore_resources.rs),
+[`startup.rs`](../crates/hvf/src/startup.rs), and the signed executable and
+production targets. Retryable means the source or pristine destination remains
+eligible only after complete reverse cleanup; terminal means the process may
+not accept another load/create even when no final artifact escaped.
+
+| Create boundary | Required classification | Exact anchors |
+| --- | --- | --- |
+| Product and output preflight | Unsupported profile, vhost-user, cancellation, and collision reject before pause, authority claim, or staging; fresh retry remains possible. | `native_v2_multi_block_product_profile_accepts_rootless_mixed_vector`, `storage_preflight_failure_precedes_contained_claim_and_publication`, `vhost_user_snapshot_rejects_before_session_barrier_or_artifact_staging`, `native_v2_pre_cancel_and_collision_do_not_pause_and_fresh_retry_succeeds` |
+| Pause admission and auxiliary quiescence | Failure releases snapshot admission and recovers the original source before retry. | `boot_run_loop_supervisor_snapshot_scope_rejects_ordinary_commands_until_release`, `boot_run_loop_snapshot_barrier_recovers_after_auxiliary_quiescence_failure`, `boot_run_loop_supervisor_snapshot_error_releases_admission_once` |
+| Block drain, platform capture, and memory streaming | A mutation-free capture/output failure is retryable only after source recovery; source damage or incomplete recovery is terminal and publishes nothing. | `native_v2_root_candidate_recovers_from_memory_write_failure_and_retries`, `native_v2_platform_terminal_policy_separates_source_damage_from_output_failure`, `native_v2_topology_and_recovery_failures_are_terminal_without_publication` |
+| Graph composition, state encoding, and artifact staging | Graph/codec/write/sync/collision/cancellation failures clean all staging and recover the source before a fresh retry. | `native_v2_root_candidate_recovers_graph_and_closed_state_failures`, `native_v2_root_candidate_commit_cancellation_recovers_before_retry`, `native_v2_supervisor_recovers_after_cancellation_before_seal` |
+| Panic and recovery | A panic first runs the same reverse recovery; incomplete or post-mutation recovery latches terminal and leaves no final pair. | `native_v2_panic_recovers_then_terminates_without_publication` |
+| Visible memory-first/state-last commit | Once state is visibly committed the pair is success; later bookkeeping failure may terminate the source but must not retract or corrupt the pair. | `native_v2_visible_commit_survives_terminal_post_publication_failure` |
+| End-to-end source recovery and recapture | A successful create returns the source Paused and permits resume or another complete capture. | `public_snapshot_create_publishes_native_v2_pair_without_legacy_barrier`, `native_v2_supervisor_publishes_loadable_pairs_and_recaptures_one_paused_source` |
+
+| Load boundary | Required classification | Exact anchors |
+| --- | --- | --- |
+| State/memory inspection and profile dispatch | Unknown/corrupt/incomplete/legacy-mismatched input rejects before resource use or VM construction and keeps a pristine process retryable. | `native_v2_process_rejects_other_family_and_incomplete_profile_before_construction`, `public_native_v2_dispatch_retains_exact_minor_three_and_minor_four_profiles` |
+| Complete request derivation and authority transaction | Missing, extra, swapped, aliased, wrong-access, wrong-role/kind, wrong-size, changed-geometry, consumed, or canceled claims reject as one vector before construction; reverse abort makes valid authority reusable and diagnostics remain redacted. | `profile_2_derives_one_exact_request_and_config_per_record`, `profile_2_contained_authority_failures_are_preconstruction_retryable_and_reusable`, `profile_2_direct_preflight_rejects_alias_geometry_grants_and_cancellation`, `profile_2_contained_batch_has_no_path_fallback_and_aborts_as_one_vector` |
+| Async plan and aggregate process bundle | Partial preparation never publishes an owner; every prepared drive and fresh Async generation is released in reverse order. | `profile_2_process_bundle_failure_aborts_aggregate_completion`, `profile_2_process_bundle_retains_completion_until_explicit_commit` |
+| VM and memory construction | Construction failure destroys the incomplete destination, aborts all drive completion, and remains retryable only when cleanup is complete. | `profile_2_destination_construction_failure_aborts_completion_and_runtime` |
+| MMIO/PCI device, scheduler, and controller construction | Injected owner/transport/controller failures preserve exact retryable-versus-terminal disposition and retain cleanup failures without leaking identifiers or generations. | `profile_2_controller_failure_destroys_destination_before_completion_abort`, `native_v2_multi_block_mmio_errors_preserve_terminality_and_redact_cleanup`, `native_v2_multi_block_pci_errors_preserve_terminality_and_redact_cleanup` |
+| Aggregate completion and Paused publication | Completion failure after irreversible resource commit destroys the destination and is terminal; successful completion publishes exactly one Paused session/controller. | `profile_2_completion_failure_destroys_destination_and_is_terminal`, `public_native_v2_load_commits_one_paused_session`, `native_v2_resource_adoption_failure_latches_all_process_construction_paths` |
+| Optional resume | Resume occurs only after Paused publication; failure is terminal and the destination never returns to pristine eligibility. | `public_native_v2_load_resumes_only_after_paused_commit`, `native_v2_requested_resume_failure_latches_after_paused_publication` |
+| Public signed continuation and process death | Rooted/rootless MMIO/PCI active I/O, recapture, immutable state/memory, shared writable backings, and exact worker-first/launcher-first cleanup are certified at the real direct and normal bundle boundaries. | `signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci`, `normal_bundle_certifies_native_v2_multi_block_epochs_over_mmio_and_pci` |
 
 Native snapshot commit/publication tests pin the fixed 32-byte `BANGCMT\0`
 record, preserve kind-1 bytes exactly, and pin kind 2's exact nested binding,
@@ -1536,13 +1572,23 @@ may skip execution. On supported Apple Silicon it proves:
   registries, apply mutually exclusive logger module filters, start real guests,
   and write logger/metrics/serial output only to their own opened objects while
   planted replacement paths remain unchanged;
-- exact external snapshot grants creating native-v2 2.4 single-root MMIO and
-  PCI pairs into separate output directories, reusing both retained directories
-  for a second successful pair, preserving all finals on collision, and keeping
-  same-GrantId concurrent source workers in their own directories; granted
-  early description and two fresh state/memory/root File/COW loads per
-  transport then prove exact root reconstruction, explicit and automatic
-  resume, and a root-read-conditional guest `SYSTEM_OFF`;
+- exact external snapshot grants creating native-v2 2.5 rooted three-drive
+  MMIO and PCI pairs into separate output directories, reusing both retained
+  directories for a second successful pair, preserving all finals on
+  collision, and keeping same-GrantId concurrent source workers in their own
+  directories; granted early description and two fresh complete-set
+  state/memory/drive File/COW loads per transport then prove exact graph
+  reconstruction, explicit and automatic resume, and a root-read-conditional
+  guest `SYSTEM_OFF`;
+- a deterministic native-v2 2.5 block certifier running rooted and rootless
+  graphs over MMIO and PCI through the normal launcher/worker boundary. It
+  validates all three seeded drives, persists two writable pre-capture epochs,
+  rejects audit-drive writes, observes limiter retry metrics, recaptures a
+  Paused destination, explicitly resumes one destination, and automatically
+  resumes a second rootless destination against the same shared writable
+  backings. Representative rootless-MMIO worker-first and launcher-first
+  deaths after Paused publication prove exact API socket, session, staging,
+  artifact, backing, and replacement cleanup;
 - a feature-gated root-plus-vsock restore-resource probe that uses the real
   coherent contained-session authority, exact typed take/adopt/commit, reverse
   reservation abort and reuse, and all nine deterministic cancellation points;
@@ -1704,9 +1750,10 @@ punctuation, exact UTF-8 byte boundaries, and ignored non-UTF-8 bytes after the
 separator as a bangbang robustness extension.
 
 The process suite covers native snapshot inspection without starting HVF. It
-checks exact `v2.4.0` output for `--snapshot-version`, exact description of
-native-v1, legacy `2.3.0`, and current/compatible native-v2 fixtures, and explicit pinned
-Firecracker/unknown incompatibility. It also covers missing, non-regular,
+checks exact `v2.5.0` output for `--snapshot-version`, exact description of
+native-v1, legacy `2.3.0` and `2.4.0`, and current/compatible native-v2
+fixtures, and explicit pinned Firecracker/unknown incompatibility. It also
+covers missing, non-regular,
 oversized, malformed, truncated, trailing/inconsistent-length, corrupt,
 unsupported-version, incompatible-architecture, and incompatible-page-size
 files. Fixtures use unique temporary paths; failures must use the
@@ -1751,15 +1798,15 @@ and signs a temporary `bangbang` executable, prepares the pinned Firecracker
 kernel, deterministic tiny initrd, and generated direct-boot ext4 rootfs,
 starts `bangbang` as a child process, configures the VM through the Unix-socket
 API or a Firecracker-shaped config file depending on the scenario, and waits
-for the guest to write deterministic markers to host-observable outputs. The
-native-v2 snapshot scenarios configure exactly one read-only Sync root and run
-the public lifecycle over both default MMIO and `--enable-pci`. The real-root
-case waits until a positive root-read metric is stable for 500 ms before
+for deterministic guest progress in host-observable outputs and backings. The
+retained real-root native-v2 smoke configures one read-only Sync root and runs
+the public lifecycle over both default MMIO and `--enable-pci`. It waits until
+a positive root-read metric is stable for 500 ms before
 pausing, proving the source has already followed live MMIO or PCI root I/O.
 The source UART must remain canonical, while its Linux-consumed FDT bytes are
 captured and CRC-bound without being reparsed as trusted post-boot topology.
 Creation through `/snapshot/create` then verifies the real CLI reports
-`v2.4.0`. Fresh signed processes repeatedly load the same immutable pair: one
+`v2.5.0`. Fresh signed processes repeatedly load the same immutable pair: one
 remains paused until public `PATCH /vm`, and one uses `resume_vm: true`. The
 paused destination is also publicly recaptured and its decoded root graph must
 equal the source graph. After resume Linux reads the known root marker through
@@ -1773,11 +1820,36 @@ checkpoints, collision/no-clobber redaction, all-vCPU private-COW continuation,
 recapture, and root-owner rollback. Its terminal destination closes the sole
 stdout reader before resume; deterministic guest UART output reaches the
 ordinary `BrokenPipe` terminal path without SIGPIPE killing the process, and
-the API socket is cleaned. Run just the real-root proof with:
+the API socket is cleaned.
+
+The profile-2 completion case
+`macos_arm64::signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci`
+runs one deterministic `snapshot-block-init` protocol in four signed cells:
+rooted/rootless × MMIO/PCI. Each cell carries three regular-file drives with
+mixed read-only/read-write, Sync/Async, Unsafe/Writeback, partuuid, and limiter
+configuration. The guest validates seeded bytes, drives limiter retry, writes
+and flushes both writable pre-capture epochs, and proves the audit drive
+rejects writes before the source is paused. A fresh process loads the pair
+initially Paused, exposes the exact graph and a fresh metrics owner, recaptures
+an equivalent stable graph, then resumes and advances both writable epochs.
+Rootless cells add a second automatically resumed fresh process against the
+same immutable state/memory pair and shared external drive files. This proves
+that guest memory is private while writable backings deliberately are not
+COW-isolated. State/memory inputs stay byte-identical throughout.
+
+Run just the retained real-root smoke with:
 
 ```sh
 scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
   macos_arm64::signed_executable_restores_native_v2_root_io_over_mmio_and_pci \
+  --exact
+```
+
+Run just the profile-2 completion matrix with:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  macos_arm64::signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci \
   --exact
 ```
 

@@ -284,10 +284,12 @@ block/PMEM/network/entropy retry quiescence, and every required runner operation
 domain through non-memory encoding, complete memory streaming, artifact
 verification and synchronization, exclusive memory-first/state-last commit,
 and the successful-publication hook. The current public writer is native-v2
-2.4 with a mandatory exact single-root device graph; native-v2 2.3 is the
-explicit legacy device-free process profile, and the native-v1 publisher
-remains only as a frozen compatibility/fixture
-implementation. Cancellation is checked between fixed stages and 1 MiB chunks
+2.5 with a mandatory exact profile-2 graph of 1–64 ordered regular-file block
+records. It may be rooted or rootless and may mix access, engine, cache,
+partuuid, and limiter configuration. Exact native-v2 2.4 remains the legacy
+single-root graph profile, native-v2 2.3 remains the device-free process
+profile, and the native-v1 publisher remains only as a frozen
+compatibility/fixture implementation. Cancellation is checked between fixed stages and 1 MiB chunks
 and competes with one atomic commit seal. Before the seal it returns no binding
 or bundle, publishes no final state marker, and drops the consumed writer and
 auxiliary guard before admission release. After the seal, signal-triggered
@@ -365,21 +367,23 @@ opaque bytes, identities, or guest contents.
 For native-v2, state family classification, retained File/COW memory binding,
 the live-FDT identity, default-UART shell, cache/platform state, topology, and
 every time/identity guest destination validate before HVF construction. Legacy
-2.3 parses its retained bytes as the exact default process FDT. Current 2.4
-requires a versioned source-product marker instead, because a booted guest may
-have consumed or reclaimed those bytes, then validates the exact root
-configuration, block/common-virtio state, MMIO or PCI transport placement, and
-the agreement between machine state, memory, and device graph. The live bytes
+2.3 parses its retained bytes as the exact default process FDT. Exact 2.4 and
+current 2.5 require a versioned source-product marker instead, because a booted
+guest may have consumed or reclaimed those bytes. Exact 2.4 validates its
+singleton root; current 2.5 validates the complete ordered block
+configuration, runtime/limiter/queue/common-virtio state, MMIO or PCI transport
+placement, and agreement between machine state, memory, and device graph. The live bytes
 still must match the retained address, length, and CRC. The memory descriptor
 must remain read-only and close-on-exec; guest
 mappings are private, so destination writes do not mutate the pair. Recorded
-kernel/initrd paths remain inert metadata and are never reopened. The root
+kernel/initrd paths remain inert metadata and are never reopened. Every graph
 selector is likewise inert until destination policy treats it as a direct path
-or resolves it through an exact read-only `DriveBacking` grant. The backing
-lease remains provisional through root/platform construction and commits only
-with Paused session/controller publication. The restorer creates no other
-device owner and installs fresh destination serial output without stdin
-authority.
+or resolves the complete keyed vector through exact drive-backing authority.
+The backing batch remains provisional through block/platform construction and
+commits only with Paused session/controller publication. The restorer creates
+no optional-device owner and installs fresh destination serial output without
+stdin authority. Writable external drive files remain shared rather than COW
+clones and require operator serialization.
 
 The restored session is handed to a worker whose pause gate is closed before it
 can receive the session. Controller and process ownership commit only after
@@ -1274,9 +1278,14 @@ is resource-specific:
   untrusted, preserve redaction, and prevent one process from cleaning up or
   overwriting another process's resources. In contained mode, state
   preinspection is non-consuming and the eventual native-v2 state/memory claim
-  is atomic; current 2.4 then resolves the root selector only through the
-  destination's exact read-only drive-backing authority, while frozen native-v1
-  additionally adopts any persisted-root grant.
+  is atomic; current 2.5 then derives every ordered block request from the
+  decoded graph and resolves the entire keyed vector through one exact
+  destination authority transaction. Missing, extra, reordered, aliased,
+  wrong-access, wrong-role/kind, wrong-size, changed-geometry, and consumed
+  claims fail before VM construction, with no ambient pathname fallback or
+  per-drive load override. Exact 2.4 resolves its singleton read-only root
+  through the same authority, while frozen native-v1 additionally adopts any
+  persisted-root grant.
   Create uses only exact retained output anchors and validated children. Direct
   mode retains ordinary path adapters. The current boundary is documented in
   [Snapshot Feasibility](snapshot-feasibility.md).
@@ -1301,8 +1310,9 @@ is resource-specific:
   performs no count-proportional allocation. The immutable `2.0.0` catalogs are
   empty; minor 1 adds semantic memory kind 1, minor 2 adds exact singleton
   machine/global/topology kinds 2–4 plus contiguous per-vCPU kind 5, minor 3
-  appends singleton time/clone-identity kind 6, and the current `2.4.0` writer
-  requires singleton device-graph kind 7. The
+  appends singleton time/clone-identity kind 6, exact `2.4.0` introduces
+  singleton device-graph kind 7 with one read-only File/Sync root, and current
+  `2.5.0` retains kind 7 with the bounded profile-2 multi-block graph. The
   platform decoder verifies that complete directory profile without
   payload-dependent allocation, caps every inner count and length before
   reservation, allocation-free scans the closed optional debug/SME registry,
@@ -1310,9 +1320,12 @@ is resource-specific:
   fixed policies, exact canonical placements and notification lines, a valid
   VMClock ABI, and topology-ordered PVTime records; source VMGenID bytes,
   pointers, `Instant` values, and absolute time anchors never enter the format.
-  The device graph's single root selector remains inert during decode; only the
-  destination authority layer may resolve it after complete graph/memory
-  validation. Unknown mandatory behavior
+  Every device-graph selector remains inert during decode; only the
+  destination authority layer may resolve the complete vector after graph and
+  memory validation. State/memory inputs stay immutable and File/COW memory is
+  private to each destination, but writable external drive files are not
+  copied or authenticated by the snapshot. Repeated destinations deliberately
+  share those bytes and require operator serialization. Unknown mandatory behavior
   fails closed, while explicitly nonsemantic structural extensions can survive
   complete structural validation outside the exact platform profile. Errors
   and `Debug` omit identifiers, paths, arguments, CPU/register values,
@@ -1324,9 +1337,10 @@ is resource-specific:
   kernel, initrd, or memory path. Exact memory ranges, mapped live-FDT
   address/length/checksum, destination cache identity, guest VMClock/PVTime
   bytes, and identity destinations are checked before VM creation. Exact 2.3
-  parses the retained FDT shell; exact 2.4 instead requires its versioned
-  source-product marker and reconstructs product semantics from the typed
-  machine/device graph because the guest may have reclaimed those bytes. The
+  parses the retained FDT shell; graph-bearing 2.4/2.5 instead require their
+  versioned source-product marker and reconstruct singleton-root or complete
+  profile-2 block product semantics from the typed machine/device graph because
+  the guest may have reclaimed those bytes. The
   guard owns VM, memory, GIC,
   all never-run vCPU owners, CPU replay, global GIC, per-vCPU state, fresh
   PL031, PVTime accounting, VMGenID/VMClock resources, and lifecycle import
@@ -2009,9 +2023,11 @@ PCI manager's manual rescan/removal lifecycle and capacity reuse; pmem adds
 exact direct-mapping/range reuse, while network adds packet-I/O/metrics teardown and
 real MMDS exchange without vmnet authority. This evidence does not prove
 interrupt remapping, external vmnet connectivity, or Firecracker's KVM ITS
-behavior. Current native-v2 2.4 reconstructs only the exact GICv2m/MSI-X state
-needed by its single PCI root; mismatched or additional MSI-bearing ownership
-is rejected rather than silently omitted.
+behavior. Current native-v2 2.5 reconstructs the exact GICv2m/MSI-X state for
+every admitted profile-2 PCI block endpoint under the same product capacity;
+mismatched, aliased, reordered, or unmodeled MSI-bearing ownership is rejected
+rather than silently omitted. Exact 2.4 retains only its singleton PCI-root
+profile.
 
 ## PCI Ownership Boundary
 

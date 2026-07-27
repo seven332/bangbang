@@ -9175,7 +9175,7 @@
     {
       "id": "corpus:snapshot-versioning",
       "family": "snapshots",
-      "summary": "Native-v2 provides bounded compatible-minor decoding, exact legacy device-free 2.3 loading, a current graph-required 2.4.0 public writer for one read-only File/Sync root over MMIO or PCI, exact CLI version/description output, immutable repeated File/COW loads, and explicit Firecracker incompatibility. Continue auditing editor/rebase tooling, optional/general device-schema evolution, Firecracker artifact interoperability, and broad portability owned by the pinned snapshot-versioning corpus.",
+      "summary": "Native-v2 provides bounded compatible-minor decoding, exact legacy device-free 2.3 and singleton-root 2.4 loading, a current graph-required 2.5.0 public writer for rooted or rootless ordered regular-file block vectors over MMIO or the product PCI budget, exact CLI version/description output, immutable repeated File/COW state-memory loads, deliberate shared writable external backings, and explicit Firecracker incompatibility. Continue auditing editor/rebase tooling, optional/general device-schema evolution, Firecracker artifact interoperability, and broad portability owned by the pinned snapshot-versioning corpus.",
       "source_refs": [
         "corpus:snapshot-versioning"
       ],
@@ -9809,7 +9809,7 @@
     {
       "id": "firecracker-argument:snapshot-version",
       "family": "process",
-      "summary": "Report the current bangbang-native public writer version v2.4.0 through the early --snapshot-version command, while exact description and load retain legacy device-free 2.3.0, without claiming Firecracker v10 artifact compatibility.",
+      "summary": "Report the current bangbang-native public writer version v2.5.0 through the early --snapshot-version command, while exact description and load retain singleton-root 2.4.0 and device-free 2.3.0, without claiming Firecracker v10 artifact compatibility.",
       "source_refs": [
         "firecracker-argument:snapshot-version"
       ],
@@ -10712,7 +10712,7 @@
     {
       "id": "semantic.snapshot:full-create-load-and-public-lifecycle",
       "family": "snapshots",
-      "summary": "Implement and verify the narrow bangbang-native v2.4 Full/File public lifecycle: paused 1–32-vCPU canonical-default-serial creation with exactly one read-only File/Sync root over MMIO or PCI, graph-required no-clobber paired publication, one-open version/profile dispatch, retained private File/COW memory, newly authorized root backing, Paused commit, optional resume, immutable repeated destinations, terminal postcommit failure, direct/contained authority, cleanup, redaction, legacy device-free 2.3 loading, and frozen native-v1 reading.",
+      "summary": "Implement and verify the bangbang-native v2.5 Full/File public lifecycle: paused 1–32-vCPU canonical-default-serial creation with a rooted or rootless ordered vector of 1–64 regular-file block devices over MMIO or the product PCI budget; mixed access, Sync/Async, cache, partuuid, limiter/retry, queue, interrupt, and transport state; graph-required no-clobber paired publication; one-open version/profile dispatch; retained private File/COW memory; one exact keyed complete-set backing transaction without fallback or overrides; Paused commit; optional resume; recapture; immutable repeated state/memory destinations with deliberately shared writable external backings; finite retryable/terminal failure classification; direct/contained authority; death-order cleanup and redaction; exact singleton-root 2.4 and device-free 2.3 loading; and frozen native-v1 reading.",
       "source_refs": [
         "corpus:snapshot-support",
         "corpus:snapshot-versioning"
@@ -10733,8 +10733,18 @@
       "validation": [
         {
           "kind": "local",
+          "path": "crates/bangbang/src/snapshot_restore_resources.rs",
+          "anchor": "profile_2_contained_authority_failures_are_preconstruction_retryable_and_reusable"
+        },
+        {
+          "kind": "local",
           "path": "crates/bangbang/src/vmm.rs",
           "anchor": "signed_native_v1_public_dispatch_restores_frozen_file_pair"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci"
         },
         {
           "kind": "local",
@@ -10750,13 +10760,18 @@
           "kind": "local",
           "path": "crates/launcher/tests/production_bundle_e2e.rs",
           "anchor": "normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restore"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_multi_block_epochs_over_mmio_and_pci"
         }
       ]
     },
     {
       "id": "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
       "family": "snapshots",
-      "summary": "The current native-v2 2.4 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, applied CPU evidence, and exactly one read-only File/Sync root including exact MMIO or PCI transport state and destination backing authority. It deliberately excludes extra/writable/non-Sync/vhost-user roots, optional devices, MMDS, boot timer, and mutated/general serial state. Generalized typed restore-resource preparation and signed exact contained root-plus-vsock transaction evidence now cover coherent authority, failure atomicity, one-time adoption, cleanup, replacement, redaction, and concurrency. Complete live-owner handoffs exist for many remaining devices, but their codecs, artifact placement, public load invocation, resource binding, and restored-guest outcomes remain under audit.",
+      "summary": "The current native-v2 2.5 Full/File profile serializes and restores a complete typed 1–32-vCPU platform with GIC, topology, timers, portable time/identity, applied CPU evidence, and a rooted or rootless ordered vector of 1–64 regular-file block devices including mixed access/engine/cache/partuuid/limiter/retry state, queues, interrupts, exact MMIO or PCI transport state, and complete destination backing authority. Signed direct and contained product matrices certify active all-drive persistence, recapture, fresh destination ownership, deliberate shared writable external backings, finite failure classification, and cleanup. It deliberately excludes vhost-user, optional devices, MMDS, boot timer, and mutated/general serial state. Generalized typed optional-device restore-resource preparation and signed exact contained root-plus-vsock transaction evidence cover coherent authority, failure atomicity, one-time adoption, cleanup, replacement, redaction, and concurrency, but optional-device/MMDS codecs, artifact placement, public load invocation, resource binding, and restored-guest outcomes remain under audit.",
       "source_refs": [
         "corpus:snapshot-support"
       ],
@@ -10864,7 +10879,7 @@
     {
       "id": "semantic.transport:pci-msi-and-coexistence",
       "family": "device-transport",
-      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and current native-v2 2.4 create/load persists and reconstructs the exact first read-only File/Sync root endpoint, including its BAR/capability/common configuration, queue, MSI-X, registry, and GICv2m placement. Optional, multi-device, and runtime-attached PCI snapshot persistence remains outside this terminal transport aggregate.",
+      "summary": "Implement the supported macOS arm64/HVF optional PCI profile with one segment-0 host bridge, ECAM and 32/64-bit BAR apertures, generation-bound endpoint leases, modern virtio-pci capabilities, GICv2m-backed independent MSI-X queue/configuration delivery, and exact preflight for all 31 endpoint BAR/dispatcher identities plus fixed demand and worst-case runtime vectors. Public `--enable-pci` selects all virtio devices onto PCI while platform devices remain MMIO; the default remains all-virtio-MMIO with no PCI state. Startup classes coexist in one signed guest, runtime block/pmem/network share the retained capacity, and current native-v2 2.5 create/load persists and reconstructs every endpoint in a rooted or rootless regular-file profile-2 vector, including configuration, runtime, limiter/retry, common virtio, queue, BAR/capability, MSI-X, registry, and GICv2m placement under the same product budget. Signed direct and contained three-drive matrices prove active I/O, recapture, and cleanup. Optional-device PCI snapshot persistence remains outside this terminal transport aggregate.",
       "source_refs": [
         "corpus:device-api",
         "corpus:device-hotplug"
@@ -10898,6 +10913,11 @@
         },
         {
           "kind": "local",
+          "path": "crates/runtime/src/snapshot_device_v2_5.rs",
+          "anchor": "exact native-v2 multi-block graph and PCI reconstruction"
+        },
+        {
+          "kind": "local",
           "path": "crates/runtime/src/virtio_pci.rs",
           "anchor": "modern virtio-pci transport and PublishedVirtioPciEndpoint"
         }
@@ -10910,6 +10930,11 @@
         },
         {
           "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci"
+        },
+        {
+          "kind": "local",
           "path": "crates/hvf/src/startup.rs",
           "anchor": "mixed 31-endpoint resource demand and product preflight tests"
         },
@@ -10917,6 +10942,11 @@
           "kind": "local",
           "path": "crates/hvf/tests/guest_boot.rs",
           "anchor": "signed modern virtio-pci MSI-X discovery, I/O, teardown, and exact resource reuse"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "normal_bundle_certifies_native_v2_multi_block_epochs_over_mmio_and_pci"
         },
         {
           "kind": "local",

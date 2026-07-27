@@ -82,7 +82,7 @@ terminal. The directly reviewed identities that do not change disposition are:
 | --- | --- | --- |
 | Exported configuration | `api-operation:GET /vm/config`; `api-path:/vm/config`; `api-schema:FullVmConfiguration` | `audit-required`; Wave 8 owns final cross-capability certification after every exported device field has a terminal result. |
 | Snapshot API aggregates | `api-operation:PUT /snapshot/create`; `api-operation:PUT /snapshot/load`; `api-path:/snapshot/create`; `api-path:/snapshot/load`; `api-schema:SnapshotCreateParams`; `api-schema:SnapshotLoadParams` | `audit-required`; Wave 6 owns Diff artifacts, merge/restore, overrides, additional backends, optional-device schemas, and portability beyond the current native-v2 Full/File profile. |
-| Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; #1578 certifies the initial device-free native-v2 2.3 Full/File multi-vCPU public lifecycle, and #1589 advances current output to exact native-v2 2.4 with one read-only File/Sync root over MMIO or PCI while retaining 2.3 and frozen native-v1 reading. |
+| Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; #1578 certifies the initial device-free native-v2 2.3 Full/File multi-vCPU public lifecycle, #1589 adds exact native-v2 2.4 with one read-only File/Sync root, and #1616/#1617 advance current output and certification to native-v2 2.5 rooted/rootless ordered regular-file block vectors over MMIO or PCI while retaining exact 2.4, 2.3, and frozen native-v1 reading. |
 | Remaining snapshot semantics | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `semantic.snapshot:multi-vcpu-drives-devices-and-mmds`; `semantic.snapshot:network-vsock-overrides-portability-and-clones` | `audit-required`; Wave 6 owns Diff/native-v2-Uffd, optional devices and general serial, overrides/tools, and broader portability. |
 | Snapshot tracking leaves | `api-property:SnapshotLoadParams.enable_diff_snapshots`; `api-property:SnapshotLoadParams.track_dirty_pages` | Already `implemented-and-verified`; they select complete destination dirty tracking but do not imply Diff artifact support. |
 | Broad specifications | `corpus:specification`; `semantic.specification:api-availability-stability-and-failure-information`; `semantic.specification:performance-resource-and-telemetry-outcomes` | `audit-required`; applicable repository-wide outcomes remain Wave 7 work after their producers stabilize. |
@@ -91,9 +91,10 @@ terminal. The directly reviewed identities that do not change disposition are:
 
 Those exact identities establish the following non-overlapping handoffs:
 
-- Wave 6 has terminal narrow native-v2 Full/File create/load, single-root
-  MMIO/PCI, and multi-vCPU lifecycle evidence. It still owns Diff artifacts,
-  optional-device/general
+- Wave 6 has terminal native-v2 Full/File create/load for current rooted or
+  rootless regular-file profile-2 vectors over MMIO/PCI, plus exact legacy
+  singleton-root 2.4 and multi-vCPU lifecycle evidence. It still owns Diff
+  artifacts, optional-device/general
   serial state, dirty-image serialization and merging, native-v2 Uffd, restore
   overrides, tools, broader portability, and schema evolution. The terminal
   load tracking properties and complete dirty epochs are prerequisites, not
