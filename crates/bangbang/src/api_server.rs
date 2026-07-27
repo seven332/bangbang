@@ -2308,14 +2308,14 @@ mod tests {
     };
     use bangbang_runtime::snapshot_artifact::{
         LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactState,
-        NativeSnapshotPublicationOutcome, NativeV2SnapshotCandidateState, SnapshotArtifactPaths,
-        SnapshotPublicationOutcome, publish_native_snapshot_artifacts_with,
+        NativeSnapshotPublicationOutcome, NativeV2MultiBlockSnapshotCandidateState,
+        SnapshotArtifactPaths, SnapshotPublicationOutcome, publish_native_snapshot_artifacts_with,
         publish_snapshot_artifacts_with,
     };
     use bangbang_runtime::snapshot_commit::SnapshotCommitRecord;
-    use bangbang_runtime::snapshot_device_v2::{
-        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
-        SnapshotV2DeviceTransportKind,
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
+    use bangbang_runtime::snapshot_device_v2_5::{
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
     };
     use bangbang_runtime::snapshot_format_v2::{
         NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component,
@@ -2335,9 +2335,11 @@ mod tests {
         NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
         NativeV2SnapshotCaptureError, NativeV2SnapshotLoadError, NativeV2SnapshotPublicationError,
         NativeV2SnapshotPublicationProducerError, NativeV2SnapshotPublicationRequest,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSnapshotV2RootLoadCompletion,
-        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess, ProcessVmm,
-        ProcessVmnetAuthority, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus,
+        ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
+        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
+        ProcessSnapshotV2RootLoadSuccess, ProcessVmm, ProcessVmnetAuthority, SnapshotV1LoadSuccess,
+        SnapshotV2LoadSuccess,
     };
 
     use super::*;
@@ -3012,6 +3014,53 @@ mod tests {
                 ProcessSnapshotV2RootLoadCompletion::empty_for_test(),
             ))
         }
+
+        fn load_prepared_snapshot_v2_multi_block(
+            &mut self,
+            request: ProcessSnapshotV2MultiBlockLoadRequest<'_>,
+        ) -> Result<ProcessSnapshotV2MultiBlockLoadSuccess<Self::Session>, NativeV2SnapshotLoadError>
+        {
+            let ProcessSnapshotV2MultiBlockLoadRequest {
+                controller: _,
+                vmnet_authority: _,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled: _,
+                input,
+                candidate,
+                memory: _,
+                cancellation,
+            } = request;
+            if !self.snapshot_operations_succeed {
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::InvalidState("test snapshot load failed"),
+                ));
+            }
+            let boot_source = BootSourceConfigInput::new("/private/fake-api-restored-vmlinux")
+                .validate()
+                .map_err(|_| {
+                    NativeV2SnapshotLoadError::ProcessPreparation(BackendError::InvalidState(
+                        "fake snapshot boot configuration failed",
+                    ))
+                })?;
+            let drives = candidate
+                .device_graph()
+                .project_drive_configs()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            let commit = SnapshotV2ControllerCommit::with_drive_configs(
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages()),
+                boot_source,
+                drives,
+                input.resume_vm(),
+            );
+            Ok(ProcessSnapshotV2MultiBlockLoadSuccess::new(
+                TestSession::without_boot_run_loop_status(),
+                commit,
+            ))
+        }
     }
 
     fn test_controller() -> ProcessVmm<TestInstanceStarter> {
@@ -3090,10 +3139,10 @@ mod tests {
     ) -> NativeSnapshotArtifactState {
         let fixture = match transport {
             SnapshotV2DeviceTransportKind::Mmio => {
-                include_str!("../../runtime/src/snapshot_device_v2/fixtures/mmio.hex")
+                include_str!("../../runtime/src/snapshot_device_v2_5/fixtures/root-mmio.hex")
             }
             SnapshotV2DeviceTransportKind::Pci => {
-                include_str!("../../runtime/src/snapshot_device_v2/fixtures/pci.hex")
+                include_str!("../../runtime/src/snapshot_device_v2_5/fixtures/root-pci.hex")
             }
         };
         let fixture = fixture.trim();
@@ -3105,12 +3154,12 @@ mod tests {
                 u8::from_str_radix(pair, 16).expect("fixture hex should decode")
             })
             .collect::<Vec<_>>();
-        let graph = SnapshotV2DeviceGraph::decode(
-            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        let graph = SnapshotV2MultiBlockDeviceGraph::decode(
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
             &graph_bytes,
         )
         .expect("fixed native-v2 graph should decode")
-        .encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+        .encode(NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION)
         .expect("fixed native-v2 graph should encode");
         let memory = binding
             .encode()
@@ -3128,12 +3177,12 @@ mod tests {
             ),
         ];
         let encoded = encode_snapshot_v2_state_with_compatibility_version(
-            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
             &[],
             &components,
         )
         .expect("native-v2 fixture state should encode");
-        NativeV2SnapshotCandidateState::from_device_graph_v2_4(encoded)
+        NativeV2MultiBlockSnapshotCandidateState::from_device_graph_v2_5(encoded)
             .expect("native-v2 fixture candidate should close")
             .into_current_artifact_state()
     }

@@ -2108,7 +2108,7 @@ enum SnapshotRestoreReservationSource<'a> {
 }
 
 impl RequestedSnapshotRestoreResources {
-    /// Dormant profile-2 pathless bundle producer. It performs pure loaded-
+    /// Active profile-2 pathless bundle producer. It performs pure loaded-
     /// memory planning before opening or taking one backing and retains the
     /// aggregate completion without publishing controller or VM state.
     pub(crate) fn prepare_native_v2_multi_block_restore_bundle<F>(
@@ -2121,8 +2121,8 @@ impl RequestedSnapshotRestoreResources {
     where
         F: Fn() -> bool,
     {
-        // Keep the complete dormant ownership contract type-checked before
-        // later profile-2 activation consumes it.
+        // Keep the complete ownership transaction contract explicit at the
+        // public profile-2 activation seam.
         let _bundle = PreparedSnapshotV2MultiBlockRestoreBundle::bundle;
         let _construct = |prepared: PreparedSnapshotV2MultiBlockRestoreBundle| {
             prepared.construct_destination(Ok::<_, std::convert::Infallible>)
@@ -2188,8 +2188,9 @@ impl RequestedSnapshotRestoreResources {
         }
     }
 
-    /// Dormant typed profile-2 resource producer. Public native-v2 dispatch
-    /// remains exact 2.4 until the later activation slice.
+    /// Typed profile-2 resource producer retained for focused handoff tests.
+    ///
+    /// Public activation consumes the composed restore-bundle variant above.
     pub(crate) fn prepare_native_v2_multi_block_device_graph<F>(
         graph: &SnapshotV2MultiBlockDeviceGraph,
         authority: Option<&ContainedSnapshotRestoreAuthority>,
@@ -2198,8 +2199,8 @@ impl RequestedSnapshotRestoreResources {
     where
         F: Fn() -> bool,
     {
-        // Keep the complete dormant handoff contract type-checked before the
-        // dependent pathless-device slice consumes it.
+        // Keep the lower-level handoff contract type-checked alongside the
+        // composed public restore-bundle path.
         let _batch_parts = PreparedSnapshotRestoreDriveBatch::into_parts;
         let _commit = PreparedSnapshotDriveRestoreCompletion::commit;
         let _abort = PreparedSnapshotDriveRestoreCompletion::abort;

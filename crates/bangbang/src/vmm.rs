@@ -30,27 +30,29 @@ use bangbang_hvf::{
     HvfArm64BootPciNetworkDeviceUpdater, HvfArm64BootPciPmemDeviceUpdater,
     HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialCaptureError, HvfArm64BootSerialDeviceConfig,
-    HvfArm64BootSessionConfig, HvfArm64BootSessionShutdownError,
-    HvfArm64BootSnapshotV1CaptureStage, HvfArm64BootSnapshotV1DeviceCaptureError,
-    HvfArm64BootSnapshotV1StateCaptureError, HvfArm64BootSnapshotV2CaptureError,
-    HvfArm64BootSnapshotV2CaptureInput, HvfArm64BootStorageCaptureError,
-    HvfArm64BootStorageCaptureErrorKind, HvfArm64BootStorageCaptureStage,
-    HvfArm64BootTimerDeviceConfig, HvfArm64BootVcpuError, HvfArm64BootVsockCaptureDisposition,
-    HvfArm64BootVsockCaptureError, HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState,
-    HvfBackend, HvfSnapshotV1Bundle, HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup,
-    HvfSnapshotV1RestoreDisposition, HvfSnapshotV1RestoreError, HvfSnapshotV1State,
-    HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2DecodeError,
-    HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
+    HvfArm64BootSessionConfig, HvfArm64BootSnapshotV1CaptureStage,
+    HvfArm64BootSnapshotV1DeviceCaptureError, HvfArm64BootSnapshotV1StateCaptureError,
+    HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureInput,
+    HvfArm64BootStorageCaptureError, HvfArm64BootStorageCaptureErrorKind,
+    HvfArm64BootStorageCaptureStage, HvfArm64BootTimerDeviceConfig, HvfArm64BootVcpuError,
+    HvfArm64BootVsockCaptureDisposition, HvfArm64BootVsockCaptureError,
+    HvfArm64BootVsockCaptureStage, HvfArm64BootVsockCaptureState, HvfBackend, HvfSnapshotV1Bundle,
+    HvfSnapshotV1BundleError, HvfSnapshotV1RestoreCleanup, HvfSnapshotV1RestoreDisposition,
+    HvfSnapshotV1RestoreError, HvfSnapshotV1State, HvfSnapshotV2BootState, HvfSnapshotV2BuildError,
+    HvfSnapshotV2DecodeError, HvfSnapshotV2DefaultProcessShell, HvfSnapshotV2EncodeError,
     HvfSnapshotV2MultiBlockMmioRestoreError, HvfSnapshotV2MultiBlockPciRestoreError,
-    HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2NativePath,
-    HvfSnapshotV2PlatformRestoreError, HvfSnapshotV2PlatformState, HvfSnapshotV2RootProcessConfig,
-    HvfSnapshotV2RootResourcePlan, HvfSnapshotV2RootRestoreError, HvfSnapshotV2State,
-    HvfVcpuRunControl, HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
-    PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2RootPlanError,
-    PreparedHvfArm64BootPciNetworkRemoval, PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State,
-    RestoredHvfSnapshotV2Platform, decode_hvf_snapshot_v2_platform_state,
-    decode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_state, prepare_hvf_snapshot_v2_root_plan,
-    restore_hvf_snapshot_v2_process_platform,
+    HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockProcessConfig,
+    HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformRestoreError,
+    HvfSnapshotV2PlatformState, HvfSnapshotV2RootProcessConfig, HvfSnapshotV2RootResourcePlan,
+    HvfSnapshotV2RootRestoreError, HvfSnapshotV2State, HvfVcpuRunControl,
+    HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
+    PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2MultiBlockPlatformPlanError,
+    PrepareHvfSnapshotV2RootPlanError, PreparedHvfArm64BootPciNetworkRemoval,
+    PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
+    decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_platform_state,
+    decode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_multi_block_state,
+    encode_hvf_snapshot_v2_state, prepare_hvf_snapshot_v2_multi_block_platform_plan,
+    prepare_hvf_snapshot_v2_root_plan, restore_hvf_snapshot_v2_process_platform,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -104,6 +106,7 @@ use bangbang_runtime::network::{
     VirtioNetworkTxFrame, VirtioNetworkTxPacketDisposition, VirtioNetworkTxPacketSink,
     VirtioNetworkTxPacketSinkError,
 };
+use bangbang_runtime::pci::{PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE};
 use bangbang_runtime::pmem::{
     PmemConfig, PmemConfigInput, PmemFileBacking, PmemMmioLayout, PmemRuntimeMutationError,
     PmemUpdate, PmemUpdateError, PmemUpdateInput,
@@ -122,6 +125,7 @@ use bangbang_runtime::snapshot_artifact::SnapshotStagingTracker;
 use bangbang_runtime::snapshot_artifact::{
     LoadedNativeSnapshotArtifacts, NativeSnapshotArtifactFamily, NativeSnapshotArtifactState,
     NativeSnapshotArtifactStateError, NativeSnapshotPublicationOutcome,
+    NativeV2MultiBlockSnapshotCandidateState, NativeV2SnapshotArtifactProfile,
     NativeV2SnapshotCandidateState, NativeV2SnapshotCandidateStateError,
     PreparedNativeSnapshotState, SnapshotArtifactLoadError, SnapshotArtifactOutput,
     SnapshotArtifactOutputs, SnapshotArtifactPaths, SnapshotCommitDurability,
@@ -139,11 +143,15 @@ use bangbang_runtime::snapshot_device_v2::{
     SnapshotV2DeviceGraph, SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransportKind,
     SnapshotV2RootBackingError,
 };
+use bangbang_runtime::snapshot_device_v2_5::{
+    NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
+    SnapshotV2MultiBlockDeviceGraphCaptureError,
+};
 use bangbang_runtime::snapshot_format::{
     NativeSnapshotFormatError, NativeSnapshotState, decode_native_snapshot_state,
 };
 use bangbang_runtime::snapshot_format_v2::{
-    NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2DecodeError,
+    NATIVE_V2_LEGACY_PLATFORM_VERSION, SnapshotV2DecodeError,
     decode_snapshot_v2_state_with_compatibility_version,
 };
 use bangbang_runtime::snapshot_memory::{
@@ -208,6 +216,7 @@ use crate::snapshot_restore_resources::{
     PreparedSnapshotV2MultiBlockRestoreBundle, RequestedSnapshotRestoreResources,
     SnapshotRestoreResourceDisposition, SnapshotRestoreResourceError,
     SnapshotRootBackingLeaseError, SnapshotRootSelectorPolicy,
+    SnapshotV2MultiBlockRestoreBundleError,
 };
 #[cfg(target_os = "macos")]
 use crate::vsock_restore::{
@@ -329,6 +338,18 @@ pub(crate) struct ProcessSnapshotV2RootLoadRequest<'a> {
     pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
+pub(crate) struct ProcessSnapshotV2MultiBlockLoadRequest<'a> {
+    pub(crate) controller: &'a VmmController,
+    pub(crate) vmnet_authority: ProcessVmnetAuthority,
+    #[cfg(target_os = "macos")]
+    pub(crate) contained_restore_authority: Option<&'a ContainedSnapshotRestoreAuthority>,
+    pub(crate) pci_enabled: bool,
+    pub(crate) input: &'a SnapshotLoadInput,
+    pub(crate) candidate: NativeV2MultiBlockSnapshotCandidateState,
+    pub(crate) memory: GuestMemory,
+    pub(crate) cancellation: NativeV2SnapshotCaptureCancellation,
+}
+
 pub(crate) trait InstanceStartExecutor {
     type Session: ProcessSessionDiagnostics;
 
@@ -385,9 +406,12 @@ pub(crate) trait InstanceStartExecutor {
     fn preflight_snapshot_v1_serial(
         &mut self,
         _session: &mut Self::Session,
-        _config: SerialConfig,
-    ) -> Result<(), HvfArm64BootSerialCaptureError> {
-        Ok(())
+        config: SerialConfig,
+    ) -> Result<CaptureReadySerialState, HvfArm64BootSerialCaptureError> {
+        let device = SerialMmioDevice::discarding()
+            .capture_state()
+            .map_err(|_| HvfArm64BootSerialCaptureError::OwnerUnavailable)?;
+        Ok(CaptureReadySerialState::new(config, device))
     }
 
     fn preflight_snapshot_v1_network(
@@ -436,6 +460,14 @@ pub(crate) trait InstanceStartExecutor {
 
     fn preflight_snapshot_v2_root_process(&self, _pci_enabled: bool) -> Result<(), VmmActionError> {
         self.preflight_snapshot_v2_process()
+    }
+
+    fn preflight_snapshot_v2_artifact_profile(
+        &self,
+        _state: &PreparedNativeSnapshotState,
+        _profile: NativeV2SnapshotArtifactProfile,
+    ) -> Result<(), NativeV2SnapshotLoadError> {
+        Ok(())
     }
 
     fn publish_snapshot_v2(
@@ -490,6 +522,16 @@ pub(crate) trait InstanceStartExecutor {
     ) -> Result<ProcessSnapshotV2RootLoadSuccess<Self::Session>, NativeV2SnapshotLoadError> {
         Err(NativeV2SnapshotLoadError::ProcessPreparation(
             BackendError::InvalidState("native-v2 root snapshot loading is unavailable"),
+        ))
+    }
+
+    fn load_prepared_snapshot_v2_multi_block(
+        &mut self,
+        _request: ProcessSnapshotV2MultiBlockLoadRequest<'_>,
+    ) -> Result<ProcessSnapshotV2MultiBlockLoadSuccess<Self::Session>, NativeV2SnapshotLoadError>
+    {
+        Err(NativeV2SnapshotLoadError::ProcessPreparation(
+            BackendError::InvalidState("native-v2 multi-block snapshot loading is unavailable"),
         ))
     }
 
@@ -560,9 +602,20 @@ enum NativeV2SnapshotCaptureProfile {
         storage_configs: CaptureReadyStorageConfigs,
         expected_transport: SnapshotV2DeviceTransportKind,
     },
+    MultiBlock {
+        storage_configs: CaptureReadyStorageConfigs,
+        expected_transport: SnapshotV2DeviceTransportKind,
+    },
 }
 
 struct NativeV2RootCandidateProductProfile {
+    input: HvfArm64BootSnapshotV2CaptureInput,
+    serial_config: SerialConfig,
+    storage_configs: CaptureReadyStorageConfigs,
+    expected_transport: SnapshotV2DeviceTransportKind,
+}
+
+struct NativeV2MultiBlockCandidateProductProfile {
     input: HvfArm64BootSnapshotV2CaptureInput,
     serial_config: SerialConfig,
     storage_configs: CaptureReadyStorageConfigs,
@@ -603,6 +656,54 @@ impl fmt::Display for NativeV2RootCandidateProfileError {
 }
 
 impl std::error::Error for NativeV2RootCandidateProfileError {}
+
+#[derive(Debug)]
+pub(crate) enum NativeV2MultiBlockCandidateProfileError {
+    MissingBootSource,
+    InvalidBootMetadata,
+    DriveProfile(SnapshotV2MultiBlockDeviceGraphCaptureError),
+    TransportCapacity,
+    NonCanonicalSerial,
+    OptionalDevices,
+    MmdsStateUnavailable,
+    IncompatibleProcessMode,
+}
+
+impl fmt::Display for NativeV2MultiBlockCandidateProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingBootSource => formatter.write_str("boot source is not configured"),
+            Self::InvalidBootMetadata => formatter.write_str("boot metadata is invalid"),
+            Self::DriveProfile(_) => {
+                formatter.write_str("regular-file block inventory is unsupported")
+            }
+            Self::TransportCapacity => formatter.write_str("block transport capacity is exceeded"),
+            Self::NonCanonicalSerial => formatter.write_str("serial configuration is noncanonical"),
+            Self::OptionalDevices => {
+                formatter.write_str("optional device or MMDS state is configured")
+            }
+            Self::MmdsStateUnavailable => formatter.write_str("MMDS state is unavailable"),
+            Self::IncompatibleProcessMode => {
+                formatter.write_str("process boot mode is incompatible")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeV2MultiBlockCandidateProfileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DriveProfile(source) => Some(source),
+            Self::MissingBootSource
+            | Self::InvalidBootMetadata
+            | Self::TransportCapacity
+            | Self::NonCanonicalSerial
+            | Self::OptionalDevices
+            | Self::MmdsStateUnavailable
+            | Self::IncompatibleProcessMode => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 enum NativeV2RootCandidateProcessError {
@@ -678,6 +779,9 @@ pub(crate) enum NativeV2SnapshotCaptureError {
     Root {
         source: NativeV2SnapshotRootCaptureError,
     },
+    MultiBlock {
+        source: NativeV2SnapshotMultiBlockCaptureError,
+    },
     TopologyPause {
         source: HvfArm64BootVcpuError,
     },
@@ -707,6 +811,7 @@ impl NativeV2SnapshotCaptureError {
         match self {
             Self::TopologyPause { .. } | Self::CoordinatorRecovery { .. } | Self::Panic => true,
             Self::Root { source } => source.is_terminal(),
+            Self::MultiBlock { source } => source.is_terminal(),
             Self::Platform { source } => native_v2_platform_capture_is_terminal(source),
             Self::Supervisor { .. }
             | Self::Auxiliary { .. }
@@ -779,6 +884,58 @@ impl std::error::Error for NativeV2SnapshotRootCaptureError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum NativeV2SnapshotMultiBlockCaptureError {
+    Storage {
+        source: HvfArm64BootStorageCaptureError,
+    },
+    Cancelled {
+        stage: HvfArm64BootStorageCaptureStage,
+    },
+    Transport {
+        expected: SnapshotV2DeviceTransportKind,
+        actual: SnapshotV2DeviceTransportKind,
+    },
+}
+
+impl NativeV2SnapshotMultiBlockCaptureError {
+    const fn is_terminal(&self) -> bool {
+        match self {
+            Self::Storage { source } => source.terminal(),
+            Self::Cancelled { .. } | Self::Transport { .. } => false,
+        }
+    }
+}
+
+impl fmt::Display for NativeV2SnapshotMultiBlockCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage { source } => {
+                write!(formatter, "multi-block storage capture failed: {source}")
+            }
+            Self::Cancelled { stage } => {
+                write!(
+                    formatter,
+                    "multi-block storage capture was cancelled at {stage:?}"
+                )
+            }
+            Self::Transport { expected, actual } => write!(
+                formatter,
+                "captured multi-block transport {actual:?} does not match product transport {expected:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeV2SnapshotMultiBlockCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Storage { source } => Some(source),
+            Self::Cancelled { .. } | Self::Transport { .. } => None,
+        }
+    }
+}
+
 fn native_v2_platform_capture_is_terminal(source: &HvfArm64BootSnapshotV2CaptureError) -> bool {
     match source {
         HvfArm64BootSnapshotV2CaptureError::Topology { .. }
@@ -819,6 +976,9 @@ impl fmt::Display for NativeV2SnapshotCaptureError {
             Self::Root { source } => {
                 write!(formatter, "native-v2 root capture failed: {source}")
             }
+            Self::MultiBlock { source } => {
+                write!(formatter, "native-v2 multi-block capture failed: {source}")
+            }
             Self::TopologyPause { source } => {
                 write!(formatter, "native-v2 topology pause failed: {source}")
             }
@@ -854,6 +1014,7 @@ impl std::error::Error for NativeV2SnapshotCaptureError {
             Self::Supervisor { source } | Self::Auxiliary { source } => Some(source),
             Self::Serial { source } => Some(source),
             Self::Root { source } => Some(source),
+            Self::MultiBlock { source } => Some(source),
             Self::TopologyPause { source } => Some(source),
             Self::Platform { source } => Some(source),
             Self::Encode { source } => Some(source),
@@ -994,7 +1155,7 @@ pub(crate) enum NativeV1SnapshotPublicationProducerError {
 pub(crate) enum NativeV2SnapshotPublicationError {
     Preflight(VmmActionError),
     CaptureReadyPreflight(SnapshotCaptureReadyPreflightError),
-    Profile(NativeV2RootCandidateProfileError),
+    Profile(NativeV2MultiBlockCandidateProfileError),
     Resource(GrantClaimError),
     SessionUnavailable,
     ConfigurationUnavailable,
@@ -1017,7 +1178,10 @@ impl fmt::Display for NativeV2SnapshotPublicationError {
                 )
             }
             Self::Profile(source) => {
-                write!(formatter, "native-v2 root profile is unsupported: {source}")
+                write!(
+                    formatter,
+                    "native-v2 multi-block profile is unsupported: {source}"
+                )
             }
             Self::Resource(source) => {
                 write!(
@@ -1270,6 +1434,34 @@ impl<S> fmt::Debug for ProcessSnapshotV2RootLoadSuccess<S> {
     }
 }
 
+pub(crate) struct ProcessSnapshotV2MultiBlockLoadSuccess<S> {
+    session: S,
+    controller_commit: SnapshotV2ControllerCommit,
+}
+
+impl<S> ProcessSnapshotV2MultiBlockLoadSuccess<S> {
+    pub(crate) const fn new(session: S, controller_commit: SnapshotV2ControllerCommit) -> Self {
+        Self {
+            session,
+            controller_commit,
+        }
+    }
+
+    fn into_parts(self) -> (S, SnapshotV2ControllerCommit) {
+        (self.session, self.controller_commit)
+    }
+}
+
+impl<S> fmt::Debug for ProcessSnapshotV2MultiBlockLoadSuccess<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessSnapshotV2MultiBlockLoadSuccess")
+            .field("session", &"<redacted>")
+            .field("controller_commit", &self.controller_commit)
+            .finish()
+    }
+}
+
 #[cfg(not(test))]
 pub(crate) struct ProcessSnapshotV2RootLoadCompletion {
     #[cfg(target_os = "macos")]
@@ -1409,6 +1601,80 @@ fn native_v2_error_after_process_root_completion_abort(
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) struct NativeV2MultiBlockDestinationLoadError {
+    transport: SnapshotV2DeviceTransportKind,
+    terminal: bool,
+    detail: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeV2MultiBlockDestinationLoadError {
+    const fn new(transport: SnapshotV2DeviceTransportKind, terminal: bool) -> Self {
+        Self {
+            transport,
+            terminal,
+            detail: None,
+        }
+    }
+
+    fn with_source(
+        transport: SnapshotV2DeviceTransportKind,
+        terminal: bool,
+        source: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        let mut leaf = source;
+        while let Some(next) = leaf.source() {
+            leaf = next;
+        }
+        Self {
+            transport,
+            terminal,
+            detail: Some(leaf.to_string()),
+        }
+    }
+
+    const fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for NativeV2MultiBlockDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2MultiBlockDestinationLoadError")
+            .field("transport", &self.transport)
+            .field("terminal", &self.terminal)
+            .field("has_detail", &self.detail.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for NativeV2MultiBlockDestinationLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "native-v2 profile-2 {:?} destination transaction failed ({})",
+            self.transport,
+            if self.terminal {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for NativeV2MultiBlockDestinationLoadError {}
+
 #[allow(
     dead_code,
     reason = "native-v2 process restore is target-gated and exercised by signed integration coverage"
@@ -1421,6 +1687,15 @@ pub(crate) enum NativeV2SnapshotLoadError {
     Resource(GrantClaimError),
     #[cfg(target_os = "macos")]
     RestoreResources(SnapshotRestoreResourceError),
+    #[cfg(target_os = "macos")]
+    MultiBlockBundle(SnapshotV2MultiBlockRestoreBundleError),
+    #[cfg(target_os = "macos")]
+    MultiBlockPlatformPlan {
+        source: PrepareHvfSnapshotV2MultiBlockPlatformPlanError,
+        cleanup_failed: bool,
+    },
+    #[cfg(target_os = "macos")]
+    MultiBlockDestination(NativeV2MultiBlockDestinationLoadError),
     AfterResourceAdoption {
         source: Box<NativeV2SnapshotLoadError>,
     },
@@ -1474,6 +1749,14 @@ impl NativeV2SnapshotLoadError {
             #[cfg(target_os = "macos")]
             Self::RootResourceCleanup { .. } => true,
             Self::RootResourceCommit(_) => true,
+            #[cfg(target_os = "macos")]
+            Self::MultiBlockBundle(source) => {
+                source.disposition() == SnapshotRestoreResourceDisposition::Terminal
+            }
+            #[cfg(target_os = "macos")]
+            Self::MultiBlockPlatformPlan { cleanup_failed, .. } => *cleanup_failed,
+            #[cfg(target_os = "macos")]
+            Self::MultiBlockDestination(source) => source.is_terminal(),
             Self::Restore(source) => source.is_committed() || !source.cleanup_failures().is_empty(),
             Self::RootRestore(source) => source.is_terminal(),
             Self::Preflight(_)
@@ -1521,6 +1804,29 @@ impl fmt::Display for NativeV2SnapshotLoadError {
                     "native-v2 restore resource preparation failed: {source}"
                 )
             }
+            #[cfg(target_os = "macos")]
+            Self::MultiBlockBundle(source) => {
+                write!(
+                    formatter,
+                    "native-v2 profile-2 resource bundle preparation failed: {source}"
+                )
+            }
+            #[cfg(target_os = "macos")]
+            Self::MultiBlockPlatformPlan {
+                source,
+                cleanup_failed,
+            } => {
+                write!(
+                    formatter,
+                    "native-v2 profile-2 platform planning failed: {source}"
+                )?;
+                if *cleanup_failed {
+                    formatter.write_str("; provisional resource cleanup also failed")?;
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "macos")]
+            Self::MultiBlockDestination(source) => source.fmt(formatter),
             Self::AfterResourceAdoption { source } => {
                 write!(
                     formatter,
@@ -1643,6 +1949,12 @@ impl std::error::Error for NativeV2SnapshotLoadError {
             Self::Resource(source) => Some(source),
             #[cfg(target_os = "macos")]
             Self::RestoreResources(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::MultiBlockBundle(source) => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::MultiBlockPlatformPlan { source, .. } => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::MultiBlockDestination(source) => Some(source),
             Self::AfterResourceAdoption { source } => Some(source.as_ref()),
             #[cfg(target_os = "macos")]
             Self::RootResourceCleanup { source, .. } => Some(source.as_ref()),
@@ -5203,18 +5515,27 @@ where
         self.controller
             .preflight_load_snapshot_v2(input)
             .map_err(NativeV2SnapshotLoadError::Preflight)?;
-        let current_root_profile = prepared.state.state().version() == NATIVE_V2_SNAPSHOT_VERSION;
-        if current_root_profile {
-            self.starter
-                .preflight_snapshot_v2_root_process(self.pci_enabled)
-                .map_err(NativeV2SnapshotLoadError::Preflight)?;
-            if !self.snapshot_capture_cancellation.begin_operation() {
-                return Err(NativeV2SnapshotLoadError::Cancelled);
+        let profile = prepared
+            .state
+            .v2_profile()
+            .map_err(NativeV2SnapshotLoadError::ArtifactState)?;
+        self.starter
+            .preflight_snapshot_v2_artifact_profile(&prepared.state, profile)?;
+        match profile {
+            NativeV2SnapshotArtifactProfile::LegacyPlatformV2_3 => {
+                self.starter
+                    .preflight_snapshot_v2_process()
+                    .map_err(NativeV2SnapshotLoadError::Preflight)?;
             }
-        } else {
-            self.starter
-                .preflight_snapshot_v2_process()
-                .map_err(NativeV2SnapshotLoadError::Preflight)?;
+            NativeV2SnapshotArtifactProfile::DeviceGraphV2_4
+            | NativeV2SnapshotArtifactProfile::MultiBlockDeviceGraphV2_5 => {
+                self.starter
+                    .preflight_snapshot_v2_root_process(self.pci_enabled)
+                    .map_err(NativeV2SnapshotLoadError::Preflight)?;
+                if !self.snapshot_capture_cancellation.begin_operation() {
+                    return Err(NativeV2SnapshotLoadError::Cancelled);
+                }
+            }
         }
 
         let (state, state_id, memory_id) = prepared.into_parts();
@@ -5262,78 +5583,120 @@ where
                 source
             }
         })?;
-        if current_root_profile {
-            let (candidate, memory) = artifacts
-                .into_current_v2_candidate()
-                .map_err(NativeV2SnapshotLoadError::ArtifactState)
-                .map_err(|source| {
-                    if resource_adopted {
-                        NativeV2SnapshotLoadError::AfterResourceAdoption {
-                            source: Box::new(source),
+        match profile {
+            NativeV2SnapshotArtifactProfile::LegacyPlatformV2_3 => {
+                let restored = self
+                    .starter
+                    .load_prepared_snapshot_v2(input, artifacts)
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
                         }
-                    } else {
-                        source
-                    }
-                })?;
-            let restored = self
-                .starter
-                .load_prepared_snapshot_v2_root(ProcessSnapshotV2RootLoadRequest {
-                    controller: &self.controller,
-                    vmnet_authority: self.vmnet_authority,
-                    #[cfg(target_os = "macos")]
-                    contained_restore_authority: self.contained_restore_authority.as_ref(),
-                    pci_enabled: self.pci_enabled,
-                    input,
-                    candidate,
-                    memory,
-                    cancellation: self.snapshot_capture_cancellation.clone(),
-                })
-                .map_err(|source| {
-                    if resource_adopted {
-                        NativeV2SnapshotLoadError::AfterResourceAdoption {
-                            source: Box::new(source),
-                        }
-                    } else {
-                        source
-                    }
-                })?;
-            let (session, controller_commit, completion) = restored.into_parts();
-            if !self.snapshot_capture_cancellation.try_seal_commit() {
-                drop(session);
-                let source = native_v2_error_after_process_root_completion_abort(
-                    NativeV2SnapshotLoadError::Cancelled,
-                    completion,
-                );
-                return Err(if resource_adopted {
-                    NativeV2SnapshotLoadError::AfterResourceAdoption {
-                        source: Box::new(source),
-                    }
-                } else {
-                    source
-                });
+                    })?;
+                let (session, controller_commit) = restored.into_parts();
+                self.started_session = Some(session);
+                Ok(self.controller.commit_snapshot_v2_load(controller_commit))
             }
-            self.started_session = Some(session);
-            let resume_requested = self.controller.commit_snapshot_v2_load(controller_commit);
-            self.starter
-                .commit_prepared_snapshot_v2_root_load(completion)
-                .map_err(NativeV2SnapshotLoadError::RootResourceCommit)?;
-            Ok(resume_requested)
-        } else {
-            let restored = self
-                .starter
-                .load_prepared_snapshot_v2(input, artifacts)
-                .map_err(|source| {
-                    if resource_adopted {
+            NativeV2SnapshotArtifactProfile::DeviceGraphV2_4 => {
+                let (candidate, memory) = artifacts
+                    .into_v2_4_candidate()
+                    .map_err(NativeV2SnapshotLoadError::ArtifactState)
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let restored = self
+                    .starter
+                    .load_prepared_snapshot_v2_root(ProcessSnapshotV2RootLoadRequest {
+                        controller: &self.controller,
+                        vmnet_authority: self.vmnet_authority,
+                        #[cfg(target_os = "macos")]
+                        contained_restore_authority: self.contained_restore_authority.as_ref(),
+                        pci_enabled: self.pci_enabled,
+                        input,
+                        candidate,
+                        memory,
+                        cancellation: self.snapshot_capture_cancellation.clone(),
+                    })
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let (session, controller_commit, completion) = restored.into_parts();
+                if !self.snapshot_capture_cancellation.try_seal_commit() {
+                    drop(session);
+                    let source = native_v2_error_after_process_root_completion_abort(
+                        NativeV2SnapshotLoadError::Cancelled,
+                        completion,
+                    );
+                    return Err(if resource_adopted {
                         NativeV2SnapshotLoadError::AfterResourceAdoption {
                             source: Box::new(source),
                         }
                     } else {
                         source
-                    }
-                })?;
-            let (session, controller_commit) = restored.into_parts();
-            self.started_session = Some(session);
-            Ok(self.controller.commit_snapshot_v2_load(controller_commit))
+                    });
+                }
+                self.started_session = Some(session);
+                let resume_requested = self.controller.commit_snapshot_v2_load(controller_commit);
+                self.starter
+                    .commit_prepared_snapshot_v2_root_load(completion)
+                    .map_err(NativeV2SnapshotLoadError::RootResourceCommit)?;
+                Ok(resume_requested)
+            }
+            NativeV2SnapshotArtifactProfile::MultiBlockDeviceGraphV2_5 => {
+                let (candidate, memory) = artifacts
+                    .into_current_v2_candidate()
+                    .map_err(NativeV2SnapshotLoadError::ArtifactState)
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let restored = self
+                    .starter
+                    .load_prepared_snapshot_v2_multi_block(ProcessSnapshotV2MultiBlockLoadRequest {
+                        controller: &self.controller,
+                        vmnet_authority: self.vmnet_authority,
+                        #[cfg(target_os = "macos")]
+                        contained_restore_authority: self.contained_restore_authority.as_ref(),
+                        pci_enabled: self.pci_enabled,
+                        input,
+                        candidate,
+                        memory,
+                        cancellation: self.snapshot_capture_cancellation.clone(),
+                    })
+                    .map_err(|source| {
+                        if resource_adopted {
+                            NativeV2SnapshotLoadError::AfterResourceAdoption {
+                                source: Box::new(source),
+                            }
+                        } else {
+                            source
+                        }
+                    })?;
+                let (session, controller_commit) = restored.into_parts();
+                self.started_session = Some(session);
+                Ok(self.controller.commit_snapshot_v2_load(controller_commit))
+            }
         }
     }
 
@@ -5925,7 +6288,7 @@ where
     fn preflight_snapshot_capture_ready(
         &mut self,
         cancellation: NativeV1SnapshotCaptureCancellation,
-    ) -> Result<(), SnapshotCaptureReadyPreflightError> {
+    ) -> Result<CaptureReadySerialState, SnapshotCaptureReadyPreflightError> {
         let storage_configs = CaptureReadyStorageConfigs::new(
             self.controller.drive_configs().to_vec(),
             self.controller.pmem_configs().to_vec(),
@@ -5959,7 +6322,8 @@ where
         self.starter
             .preflight_snapshot_v1_entropy(session, entropy_config)
             .map_err(SnapshotCaptureReadyPreflightError::Entropy)?;
-        self.starter
+        let serial = self
+            .starter
             .preflight_snapshot_v1_serial(session, serial_config)
             .map_err(SnapshotCaptureReadyPreflightError::Serial)?;
         self.starter
@@ -5974,7 +6338,7 @@ where
         self.starter
             .preflight_snapshot_v1_vsock(session, vsock_config, cancellation)
             .map_err(SnapshotCaptureReadyPreflightError::Vsock)?;
-        Ok(())
+        Ok(serial)
     }
 
     /// Publishes one admitted paused source as a native-v1 composite pair.
@@ -5987,7 +6351,8 @@ where
             .map_err(NativeV1SnapshotPublicationError::Preflight)?;
 
         let cancellation = self.snapshot_capture_cancellation.clone();
-        self.preflight_snapshot_capture_ready(cancellation.clone())
+        let _serial = self
+            .preflight_snapshot_capture_ready(cancellation.clone())
             .map_err(SnapshotCaptureReadyPreflightError::into_native_v1)?;
 
         self.controller
@@ -6113,7 +6478,72 @@ where
         })
     }
 
-    /// Publishes one strictly admitted paused source as a native-v2 2.4 pair.
+    fn native_v2_multi_block_candidate_product_profile(
+        &self,
+    ) -> Result<NativeV2MultiBlockCandidateProductProfile, NativeV2MultiBlockCandidateProfileError>
+    {
+        self.starter
+            .preflight_snapshot_v2_root_process(self.pci_enabled)
+            .map_err(|_| NativeV2MultiBlockCandidateProfileError::IncompatibleProcessMode)?;
+
+        let boot = self
+            .controller
+            .boot_source_config()
+            .ok_or(NativeV2MultiBlockCandidateProfileError::MissingBootSource)?;
+        let kernel = HvfSnapshotV2NativePath::try_new(boot.kernel_image_path().as_os_str())
+            .map_err(|_| NativeV2MultiBlockCandidateProfileError::InvalidBootMetadata)?;
+        let initrd = boot
+            .initrd_path()
+            .map(|path| HvfSnapshotV2NativePath::try_new(path.as_os_str()))
+            .transpose()
+            .map_err(|_| NativeV2MultiBlockCandidateProfileError::InvalidBootMetadata)?;
+        let boot = HvfSnapshotV2BootState::try_new(kernel, initrd, boot.boot_args())
+            .map_err(|_| NativeV2MultiBlockCandidateProfileError::InvalidBootMetadata)?;
+
+        let drives = self.controller.drive_configs();
+        SnapshotV2MultiBlockDeviceGraph::preflight_capture_configs(
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            drives,
+        )
+        .map_err(NativeV2MultiBlockCandidateProfileError::DriveProfile)?;
+        let pci_capacity = usize::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE + 1);
+        if self.pci_enabled && drives.len() > pci_capacity {
+            return Err(NativeV2MultiBlockCandidateProfileError::TransportCapacity);
+        }
+        if self.controller.serial_config() != &SerialConfig::default() {
+            return Err(NativeV2MultiBlockCandidateProfileError::NonCanonicalSerial);
+        }
+        if !self.controller.network_interface_configs().is_empty()
+            || self.controller.vsock_config().is_some()
+            || !self.controller.pmem_configs().is_empty()
+            || self.controller.balloon_config().is_some()
+            || self.controller.memory_hotplug_config().is_some()
+            || self.controller.entropy_config().is_some()
+        {
+            return Err(NativeV2MultiBlockCandidateProfileError::OptionalDevices);
+        }
+        let has_mmds_state = self
+            .controller
+            .mmds_state_handle()
+            .with(|state| state.config().is_some() || state.data_store_present())
+            .map_err(|_| NativeV2MultiBlockCandidateProfileError::MmdsStateUnavailable)?;
+        if has_mmds_state {
+            return Err(NativeV2MultiBlockCandidateProfileError::OptionalDevices);
+        }
+
+        Ok(NativeV2MultiBlockCandidateProductProfile {
+            input: HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            serial_config: self.controller.serial_config().clone(),
+            storage_configs: CaptureReadyStorageConfigs::new(drives.to_vec(), Vec::new()),
+            expected_transport: if self.pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            },
+        })
+    }
+
+    /// Publishes one strictly admitted paused source as a native-v2 2.5 pair.
     ///
     /// The public create action reaches this seam after request normalization.
     pub(crate) fn publish_native_v2_snapshot(
@@ -6123,17 +6553,30 @@ where
         self.controller
             .preflight_create_snapshot_v2_request(input)
             .map_err(NativeV2SnapshotPublicationError::Preflight)?;
-        let cancellation = self.snapshot_capture_cancellation.clone();
-        self.preflight_snapshot_capture_ready(cancellation.clone())
-            .map_err(SnapshotCaptureReadyPreflightError::into_native_v2)?;
-        let NativeV2RootCandidateProductProfile {
+        let NativeV2MultiBlockCandidateProductProfile {
             input: capture_input,
             serial_config,
             storage_configs,
             expected_transport,
         } = self
-            .native_v2_root_candidate_product_profile()
+            .native_v2_multi_block_candidate_product_profile()
             .map_err(NativeV2SnapshotPublicationError::Profile)?;
+        let cancellation = self.snapshot_capture_cancellation.clone();
+        let serial = self
+            .preflight_snapshot_capture_ready(cancellation.clone())
+            .map_err(SnapshotCaptureReadyPreflightError::into_native_v2)?;
+        let canonical_serial = SerialMmioDevice::discarding()
+            .capture_state()
+            .map_err(|_| {
+                NativeV2SnapshotPublicationError::Profile(
+                    NativeV2MultiBlockCandidateProfileError::NonCanonicalSerial,
+                )
+            })?;
+        if serial.config() != &SerialConfig::default() || serial.device() != &canonical_serial {
+            return Err(NativeV2SnapshotPublicationError::Profile(
+                NativeV2MultiBlockCandidateProfileError::NonCanonicalSerial,
+            ));
+        }
         if self.started_session.is_none() {
             return Err(NativeV2SnapshotPublicationError::SessionUnavailable);
         }
@@ -6453,6 +6896,47 @@ impl HvfInstanceStartExecutor {
         }
     }
 
+    fn validate_snapshot_v2_artifact_profile(
+        &self,
+        state: &PreparedNativeSnapshotState,
+        profile: NativeV2SnapshotArtifactProfile,
+    ) -> Result<(), NativeV2SnapshotLoadError> {
+        let bytes = state
+            .state()
+            .v2_bytes()
+            .ok_or(NativeV2SnapshotLoadError::UnexpectedFamily(
+                NativeSnapshotArtifactFamily::V1,
+            ))?;
+        let version = match profile {
+            NativeV2SnapshotArtifactProfile::LegacyPlatformV2_3 => {
+                NATIVE_V2_LEGACY_PLATFORM_VERSION
+            }
+            NativeV2SnapshotArtifactProfile::DeviceGraphV2_4 => {
+                NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            }
+            NativeV2SnapshotArtifactProfile::MultiBlockDeviceGraphV2_5 => {
+                NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+            }
+        };
+        let structural = decode_snapshot_v2_state_with_compatibility_version(bytes, version)
+            .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
+        match profile {
+            NativeV2SnapshotArtifactProfile::LegacyPlatformV2_3 => {
+                decode_hvf_snapshot_v2_platform_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
+            }
+            NativeV2SnapshotArtifactProfile::DeviceGraphV2_4 => {
+                decode_hvf_snapshot_v2_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
+            }
+            NativeV2SnapshotArtifactProfile::MultiBlockDeviceGraphV2_5 => {
+                decode_hvf_snapshot_v2_multi_block_state(&structural)
+                    .map_err(NativeV2SnapshotLoadError::Decode)?;
+            }
+        }
+        Ok(())
+    }
+
     fn serial_output_for_controller(
         &self,
         controller: &VmmController,
@@ -6662,8 +7146,9 @@ fn native_v2_boot_source_config(
 
 #[cfg(target_os = "macos")]
 struct PreparedHvfSnapshotV2MultiBlockDestination {
-    session: Box<OwnedHvfArm64BootSession>,
+    session: Box<HvfProcessSession>,
     drive_configs: Option<DriveConfigs>,
+    serial_output: SharedSerialOutput,
 }
 
 #[cfg(target_os = "macos")]
@@ -6692,13 +7177,19 @@ impl PreparedHvfSnapshotV2MultiBlockDestination {
         Ok((self, controller))
     }
 
-    fn shutdown(mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
-        self.session.shutdown()
+    fn shutdown(self) -> Result<(), std::convert::Infallible> {
+        drop(self);
+        Ok(())
     }
 
-    fn into_session(self) -> OwnedHvfArm64BootSession {
-        debug_assert!(self.drive_configs.is_none());
-        *self.session
+    fn into_parts(self) -> (HvfProcessSession, SharedSerialOutput) {
+        let Self {
+            session,
+            drive_configs,
+            serial_output,
+        } = self;
+        debug_assert!(drive_configs.is_none());
+        (*session, serial_output)
     }
 }
 
@@ -6716,12 +7207,16 @@ impl fmt::Debug for PreparedHvfSnapshotV2MultiBlockDestination {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedHvfSnapshotV2MultiBlockControllerError {
     MissingDriveConfigs,
+    Cancelled,
 }
 
 #[cfg(target_os = "macos")]
 impl fmt::Display for PreparedHvfSnapshotV2MultiBlockControllerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("profile-2 controller projection is unavailable")
+        formatter.write_str(match self {
+            Self::MissingDriveConfigs => "profile-2 controller projection is unavailable",
+            Self::Cancelled => "profile-2 destination commit was cancelled",
+        })
     }
 }
 
@@ -6748,12 +7243,98 @@ impl HvfSnapshotV2MultiBlockRestoreDisposition for HvfSnapshotV2MultiBlockPciRes
 }
 
 #[cfg(target_os = "macos")]
+enum HvfSnapshotV2MultiBlockProcessConstructionError<E> {
+    Restore(E),
+    RunReady {
+        source: HvfVcpuRunCoordinatorError,
+        cleanup: Option<BackendError>,
+    },
+    WorkerStart {
+        source: BackendError,
+        cleanup: Option<BackendError>,
+    },
+}
+
+#[cfg(target_os = "macos")]
+impl<E> HvfSnapshotV2MultiBlockRestoreDisposition
+    for HvfSnapshotV2MultiBlockProcessConstructionError<E>
+where
+    E: HvfSnapshotV2MultiBlockRestoreDisposition,
+{
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Restore(source) => source.is_terminal(),
+            Self::RunReady { .. } | Self::WorkerStart { .. } => true,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<E> fmt::Debug for HvfSnapshotV2MultiBlockProcessConstructionError<E>
+where
+    E: HvfSnapshotV2MultiBlockRestoreDisposition,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (stage, cleanup_failed) = match self {
+            Self::Restore(_) => ("restore", false),
+            Self::RunReady { cleanup, .. } => ("run-ready", cleanup.is_some()),
+            Self::WorkerStart { cleanup, .. } => ("worker-start", cleanup.is_some()),
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2MultiBlockProcessConstructionError")
+            .field("stage", &stage)
+            .field("terminal", &self.is_terminal())
+            .field("cleanup_failed", &cleanup_failed)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<E> fmt::Display for HvfSnapshotV2MultiBlockProcessConstructionError<E>
+where
+    E: HvfSnapshotV2MultiBlockRestoreDisposition,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (message, cleanup_failed) = match self {
+            Self::Restore(_) => ("profile-2 HVF owner restore failed", false),
+            Self::RunReady { cleanup, .. } => (
+                "profile-2 run coordinator preparation failed",
+                cleanup.is_some(),
+            ),
+            Self::WorkerStart { cleanup, .. } => {
+                ("profile-2 paused worker startup failed", cleanup.is_some())
+            }
+        };
+        formatter.write_str(message)?;
+        if cleanup_failed {
+            formatter.write_str("; platform cleanup also failed")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<E> std::error::Error for HvfSnapshotV2MultiBlockProcessConstructionError<E>
+where
+    E: HvfSnapshotV2MultiBlockRestoreDisposition + std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Restore(source) => Some(source),
+            Self::RunReady { source, .. } => Some(source),
+            Self::WorkerStart { source, .. } => Some(source),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 enum PrepareHvfSnapshotV2MultiBlockDestinationError<E> {
     Construction(PreparedSnapshotV2MultiBlockDestinationConstructionError<E>),
     Commit(
         PreparedSnapshotV2MultiBlockDestinationCommitError<
             PreparedHvfSnapshotV2MultiBlockControllerError,
-            HvfArm64BootSessionShutdownError,
+            std::convert::Infallible,
         >,
     ),
 }
@@ -6835,61 +7416,117 @@ struct PrepareHvfSnapshotV2MultiBlockMmioDestinationInput {
     platform: HvfSnapshotV2PlatformState,
     memory: GuestMemory,
     process_shell: HvfSnapshotV2DefaultProcessShell,
+    packet_io: ProcessNetworkPacketIoProvider,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    vmnet_authority: ProcessVmnetAuthority,
+    serial_output: SharedSerialOutput,
     bundle: PreparedSnapshotV2MultiBlockRestoreBundle,
     plan: HvfSnapshotV2MultiBlockPlatformPlan,
     machine: bangbang_runtime::machine::MachineConfig,
     boot: bangbang_runtime::boot::BootSourceConfig,
     resume_requested: bool,
+    cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
-/// Dormant profile-2 process transaction. Public native-v2 dispatch remains
-/// exact 2.4 until the activation slice consumes this boundary.
+/// Builds and atomically publishes one exact profile-2 MMIO process.
 #[cfg(target_os = "macos")]
-#[allow(
-    dead_code,
-    reason = "profile-2 public native-v2 activation is owned by the dependent delivery slice"
-)]
 fn prepare_hvf_native_v2_multi_block_mmio_destination(
     input: PrepareHvfSnapshotV2MultiBlockMmioDestinationInput,
 ) -> Result<
-    (OwnedHvfArm64BootSession, SnapshotV2ControllerCommit),
-    PrepareHvfSnapshotV2MultiBlockDestinationError<HvfSnapshotV2MultiBlockMmioRestoreError>,
+    (
+        HvfProcessSession,
+        SnapshotV2ControllerCommit,
+        SharedSerialOutput,
+    ),
+    PrepareHvfSnapshotV2MultiBlockDestinationError<
+        HvfSnapshotV2MultiBlockProcessConstructionError<HvfSnapshotV2MultiBlockMmioRestoreError>,
+    >,
 > {
     let PrepareHvfSnapshotV2MultiBlockMmioDestinationInput {
         platform,
         memory,
         process_shell,
+        packet_io,
+        mmds_metrics,
+        vmnet_authority,
+        serial_output,
         bundle,
         plan,
         machine,
         boot,
         resume_requested,
+        cancellation,
     } = input;
     let destination = bundle
         .construct_destination(|bundle| {
-            OwnedHvfArm64BootSession::restore_snapshot_v2_multi_block_mmio(
+            let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_multi_block_mmio(
                 platform,
                 memory,
                 process_shell,
                 bundle,
                 plan,
             )
-            .map(|owners| {
-                let (session, drive_configs) = owners.into_parts();
-                PreparedHvfSnapshotV2MultiBlockDestination {
-                    session: Box::new(session),
-                    drive_configs: Some(drive_configs),
+            .map_err(HvfSnapshotV2MultiBlockProcessConstructionError::Restore)?;
+            let (mut session, drive_configs) = owners.into_parts();
+            if let Err(source) = session.resume_after_snapshot_v2_capture() {
+                let cleanup = session
+                    .shutdown()
+                    .err()
+                    .map(|source| BackendError::Hypervisor(source.to_string()));
+                return Err(HvfSnapshotV2MultiBlockProcessConstructionError::RunReady {
+                    source,
+                    cleanup,
+                });
+            }
+            let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
+                session,
+                packet_io,
+                mmds_metrics,
+                vmnet_authority,
+            );
+            let supervisor = match HvfBootRunLoopSupervisor::start_paused(
+                process_session,
+                default_hvf_boot_run_loop_step_limit(),
+            ) {
+                Ok(supervisor) => supervisor,
+                Err(error) => {
+                    let (source, mut failed_session) = error.into_parts();
+                    let cleanup = failed_session
+                        .session
+                        .shutdown()
+                        .err()
+                        .map(|source| BackendError::Hypervisor(source.to_string()));
+                    return Err(
+                        HvfSnapshotV2MultiBlockProcessConstructionError::WorkerStart {
+                            source,
+                            cleanup,
+                        },
+                    );
                 }
+            };
+            Ok(PreparedHvfSnapshotV2MultiBlockDestination {
+                session: Box::new(HvfProcessSession::Boot(supervisor)),
+                drive_configs: Some(drive_configs),
+                serial_output,
             })
         })
         .map_err(PrepareHvfSnapshotV2MultiBlockDestinationError::Construction)?;
     let (destination, controller) = destination
         .commit(
-            |destination| destination.prepare_controller(machine, boot, resume_requested),
+            |destination| {
+                if !cancellation.try_seal_commit() {
+                    return Err((
+                        destination,
+                        PreparedHvfSnapshotV2MultiBlockControllerError::Cancelled,
+                    ));
+                }
+                destination.prepare_controller(machine, boot, resume_requested)
+            },
             PreparedHvfSnapshotV2MultiBlockDestination::shutdown,
         )
         .map_err(PrepareHvfSnapshotV2MultiBlockDestinationError::Commit)?;
-    Ok((destination.into_session(), controller))
+    let (session, serial_output) = destination.into_parts();
+    Ok((session, controller, serial_output))
 }
 
 #[cfg(target_os = "macos")]
@@ -6897,61 +7534,117 @@ struct PrepareHvfSnapshotV2MultiBlockPciDestinationInput {
     platform: HvfSnapshotV2PlatformState,
     memory: GuestMemory,
     process_shell: HvfSnapshotV2DefaultProcessShell,
+    packet_io: ProcessNetworkPacketIoProvider,
+    mmds_metrics: Option<SharedMmdsMetrics>,
+    vmnet_authority: ProcessVmnetAuthority,
+    serial_output: SharedSerialOutput,
     bundle: PreparedSnapshotV2MultiBlockRestoreBundle,
     plan: HvfSnapshotV2MultiBlockPlatformPlan,
     machine: bangbang_runtime::machine::MachineConfig,
     boot: bangbang_runtime::boot::BootSourceConfig,
     resume_requested: bool,
+    cancellation: NativeV2SnapshotCaptureCancellation,
 }
 
-/// Dormant profile-2 PCI process transaction. Public native-v2 dispatch
-/// remains exact 2.4 until the activation slice consumes this boundary.
+/// Builds and atomically publishes one exact profile-2 PCI process.
 #[cfg(target_os = "macos")]
-#[allow(
-    dead_code,
-    reason = "profile-2 public native-v2 activation is owned by the dependent delivery slice"
-)]
 fn prepare_hvf_native_v2_multi_block_pci_destination(
     input: PrepareHvfSnapshotV2MultiBlockPciDestinationInput,
 ) -> Result<
-    (OwnedHvfArm64BootSession, SnapshotV2ControllerCommit),
-    PrepareHvfSnapshotV2MultiBlockDestinationError<HvfSnapshotV2MultiBlockPciRestoreError>,
+    (
+        HvfProcessSession,
+        SnapshotV2ControllerCommit,
+        SharedSerialOutput,
+    ),
+    PrepareHvfSnapshotV2MultiBlockDestinationError<
+        HvfSnapshotV2MultiBlockProcessConstructionError<HvfSnapshotV2MultiBlockPciRestoreError>,
+    >,
 > {
     let PrepareHvfSnapshotV2MultiBlockPciDestinationInput {
         platform,
         memory,
         process_shell,
+        packet_io,
+        mmds_metrics,
+        vmnet_authority,
+        serial_output,
         bundle,
         plan,
         machine,
         boot,
         resume_requested,
+        cancellation,
     } = input;
     let destination = bundle
         .construct_destination(|bundle| {
-            OwnedHvfArm64BootSession::restore_snapshot_v2_multi_block_pci(
+            let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_multi_block_pci(
                 platform,
                 memory,
                 process_shell,
                 bundle,
                 plan,
             )
-            .map(|owners| {
-                let (session, drive_configs) = owners.into_parts();
-                PreparedHvfSnapshotV2MultiBlockDestination {
-                    session: Box::new(session),
-                    drive_configs: Some(drive_configs),
+            .map_err(HvfSnapshotV2MultiBlockProcessConstructionError::Restore)?;
+            let (mut session, drive_configs) = owners.into_parts();
+            if let Err(source) = session.resume_after_snapshot_v2_capture() {
+                let cleanup = session
+                    .shutdown()
+                    .err()
+                    .map(|source| BackendError::Hypervisor(source.to_string()));
+                return Err(HvfSnapshotV2MultiBlockProcessConstructionError::RunReady {
+                    source,
+                    cleanup,
+                });
+            }
+            let process_session = ProcessHvfBootSession::new_with_vmnet_authority(
+                session,
+                packet_io,
+                mmds_metrics,
+                vmnet_authority,
+            );
+            let supervisor = match HvfBootRunLoopSupervisor::start_paused(
+                process_session,
+                default_hvf_boot_run_loop_step_limit(),
+            ) {
+                Ok(supervisor) => supervisor,
+                Err(error) => {
+                    let (source, mut failed_session) = error.into_parts();
+                    let cleanup = failed_session
+                        .session
+                        .shutdown()
+                        .err()
+                        .map(|source| BackendError::Hypervisor(source.to_string()));
+                    return Err(
+                        HvfSnapshotV2MultiBlockProcessConstructionError::WorkerStart {
+                            source,
+                            cleanup,
+                        },
+                    );
                 }
+            };
+            Ok(PreparedHvfSnapshotV2MultiBlockDestination {
+                session: Box::new(HvfProcessSession::Boot(supervisor)),
+                drive_configs: Some(drive_configs),
+                serial_output,
             })
         })
         .map_err(PrepareHvfSnapshotV2MultiBlockDestinationError::Construction)?;
     let (destination, controller) = destination
         .commit(
-            |destination| destination.prepare_controller(machine, boot, resume_requested),
+            |destination| {
+                if !cancellation.try_seal_commit() {
+                    return Err((
+                        destination,
+                        PreparedHvfSnapshotV2MultiBlockControllerError::Cancelled,
+                    ));
+                }
+                destination.prepare_controller(machine, boot, resume_requested)
+            },
             PreparedHvfSnapshotV2MultiBlockDestination::shutdown,
         )
         .map_err(PrepareHvfSnapshotV2MultiBlockDestinationError::Commit)?;
-    Ok((destination.into_session(), controller))
+    let (session, serial_output) = destination.into_parts();
+    Ok((session, controller, serial_output))
 }
 
 #[cfg(target_os = "macos")]
@@ -7456,12 +8149,11 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         &mut self,
         session: &mut Self::Session,
         config: SerialConfig,
-    ) -> Result<(), HvfArm64BootSerialCaptureError> {
+    ) -> Result<CaptureReadySerialState, HvfArm64BootSerialCaptureError> {
         session
             .boot_mut()
             .ok_or(HvfArm64BootSerialCaptureError::OwnerUnavailable)?
             .capture_ready_serial_state(config)
-            .map(|_| ())
     }
 
     fn preflight_snapshot_v1_network(
@@ -7540,6 +8232,14 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         } else {
             Ok(())
         }
+    }
+
+    fn preflight_snapshot_v2_artifact_profile(
+        &self,
+        state: &PreparedNativeSnapshotState,
+        profile: NativeV2SnapshotArtifactProfile,
+    ) -> Result<(), NativeV2SnapshotLoadError> {
+        self.validate_snapshot_v2_artifact_profile(state, profile)
     }
 
     fn publish_snapshot_v2(
@@ -7714,6 +8414,189 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             session,
             controller_commit,
             ProcessSnapshotV2RootLoadCompletion::new(root_completion, serial_output),
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_prepared_snapshot_v2_multi_block(
+        &mut self,
+        request: ProcessSnapshotV2MultiBlockLoadRequest<'_>,
+    ) -> Result<ProcessSnapshotV2MultiBlockLoadSuccess<Self::Session>, NativeV2SnapshotLoadError>
+    {
+        let ProcessSnapshotV2MultiBlockLoadRequest {
+            controller,
+            vmnet_authority,
+            contained_restore_authority,
+            pci_enabled,
+            input,
+            candidate,
+            memory,
+            cancellation,
+        } = request;
+        self.preflight_snapshot_v2_root_process(pci_enabled)
+            .map_err(NativeV2SnapshotLoadError::Preflight)?;
+
+        let (bytes, binding, candidate_graph) = candidate.into_parts();
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &bytes,
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        )
+        .map_err(NativeV2SnapshotLoadError::CandidateFormat)?;
+        let decoded = decode_hvf_snapshot_v2_multi_block_state(&structural)
+            .map_err(NativeV2SnapshotLoadError::Decode)?;
+        if decoded.platform().memory() != &binding || decoded.device_graph() != &candidate_graph {
+            return Err(NativeV2SnapshotLoadError::CandidateMismatch);
+        }
+        let (platform, graph) = decoded.into_parts();
+        drop(candidate_graph);
+
+        let expected_transport = if pci_enabled {
+            SnapshotV2DeviceTransportKind::Pci
+        } else {
+            SnapshotV2DeviceTransportKind::Mmio
+        };
+        if graph.transport_kind() != expected_transport {
+            return Err(NativeV2SnapshotLoadError::Preflight(
+                VmmActionError::SnapshotUnsupported,
+            ));
+        }
+
+        let boot = native_v2_boot_source_config(platform.machine().boot())
+            .map_err(NativeV2SnapshotLoadError::BootMetadata)?;
+        let machine = snapshot_destination_machine_config(
+            platform.machine().machine(),
+            input.track_dirty_pages(),
+        );
+        let rate_limiter = SerialConfig::default().rate_limiter();
+        let serial_output = if self.process_serial_stdio {
+            let output = SerialStdio::output_from_process_standard_stream().map_err(|source| {
+                NativeV2SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(format!(
+                    "failed to initialize native-v2 serial standard output: {source}"
+                )))
+            })?;
+            SharedSerialOutput::with_rate_limiter(output, rate_limiter)
+        } else {
+            SharedSerialOutput::with_rate_limiter(self.serial_output.clone(), rate_limiter)
+        };
+        let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone());
+
+        let bundle =
+            RequestedSnapshotRestoreResources::prepare_native_v2_multi_block_restore_bundle(
+                graph,
+                &memory,
+                Instant::now(),
+                contained_restore_authority,
+                || cancellation.is_cancelled(),
+            )
+            .map_err(NativeV2SnapshotLoadError::MultiBlockBundle)?;
+        let process = HvfSnapshotV2MultiBlockProcessConfig::new(
+            BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
+            pci_enabled,
+        );
+        let plan = match bundle.bundle() {
+            Some(prepared) => {
+                prepare_hvf_snapshot_v2_multi_block_platform_plan(&platform, prepared, process)
+            }
+            None => {
+                let _ = bundle.abort();
+                return Err(NativeV2SnapshotLoadError::MultiBlockDestination(
+                    NativeV2MultiBlockDestinationLoadError::new(expected_transport, true),
+                ));
+            }
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(source) => {
+                let cleanup_failed = bundle.abort().is_err();
+                return Err(NativeV2SnapshotLoadError::MultiBlockPlatformPlan {
+                    source,
+                    cleanup_failed,
+                });
+            }
+        };
+        let (packet_io, mmds_metrics) =
+            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
+                Ok(prepared) => prepared,
+                Err(source) => {
+                    let cleanup_failed = bundle.abort().is_err();
+                    if cleanup_failed {
+                        return Err(NativeV2SnapshotLoadError::MultiBlockDestination(
+                            NativeV2MultiBlockDestinationLoadError::new(expected_transport, true),
+                        ));
+                    }
+                    return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                        BackendError::Hypervisor(format!(
+                            "failed to build native-v2 network packet I/O provider: {source}"
+                        )),
+                    ));
+                }
+            };
+
+        let restored = match expected_transport {
+            SnapshotV2DeviceTransportKind::Mmio => {
+                prepare_hvf_native_v2_multi_block_mmio_destination(
+                    PrepareHvfSnapshotV2MultiBlockMmioDestinationInput {
+                        platform,
+                        memory,
+                        process_shell,
+                        packet_io,
+                        mmds_metrics,
+                        vmnet_authority,
+                        serial_output,
+                        bundle,
+                        plan,
+                        machine,
+                        boot,
+                        resume_requested: input.resume_vm(),
+                        cancellation,
+                    },
+                )
+                .map_err(|source| {
+                    let terminal = source.is_terminal();
+                    NativeV2SnapshotLoadError::MultiBlockDestination(
+                        NativeV2MultiBlockDestinationLoadError::with_source(
+                            SnapshotV2DeviceTransportKind::Mmio,
+                            terminal,
+                            &source,
+                        ),
+                    )
+                })?
+            }
+            SnapshotV2DeviceTransportKind::Pci => {
+                prepare_hvf_native_v2_multi_block_pci_destination(
+                    PrepareHvfSnapshotV2MultiBlockPciDestinationInput {
+                        platform,
+                        memory,
+                        process_shell,
+                        packet_io,
+                        mmds_metrics,
+                        vmnet_authority,
+                        serial_output,
+                        bundle,
+                        plan,
+                        machine,
+                        boot,
+                        resume_requested: input.resume_vm(),
+                        cancellation,
+                    },
+                )
+                .map_err(|source| {
+                    let terminal = source.is_terminal();
+                    NativeV2SnapshotLoadError::MultiBlockDestination(
+                        NativeV2MultiBlockDestinationLoadError::with_source(
+                            SnapshotV2DeviceTransportKind::Pci,
+                            terminal,
+                            &source,
+                        ),
+                    )
+                })?
+            }
+        };
+        let (session, controller_commit, serial_output) = restored;
+        self.active_serial_output = Some(serial_output);
+        Ok(ProcessSnapshotV2MultiBlockLoadSuccess::new(
+            session,
+            controller_commit,
         ))
     }
 
@@ -8017,7 +8900,7 @@ impl SnapshotCaptureCancellation {
         self.state.operation.load(Ordering::Acquire) == SNAPSHOT_OPERATION_CANCELLED
     }
 
-    fn try_seal_commit(&self) -> bool {
+    pub(crate) fn try_seal_commit(&self) -> bool {
         self.state
             .operation
             .compare_exchange(
@@ -8169,6 +9052,7 @@ pub(crate) trait NativeV1SnapshotCaptureSession: BootRunLoopSession {
 pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     type PlatformState: Send + 'static;
     type RootState: Send + 'static;
+    type MultiBlockState: Send + 'static;
 
     fn capture_native_v2_serial(
         &self,
@@ -8187,7 +9071,23 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         cancellation: &NativeV2SnapshotCaptureCancellation,
     ) -> Result<SnapshotV2DeviceGraph, NativeV2SnapshotRootCaptureError>;
 
+    fn capture_native_v2_multi_block(
+        &mut self,
+        configs: &CaptureReadyStorageConfigs,
+        expected_transport: SnapshotV2DeviceTransportKind,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        now: Instant,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<SnapshotV2MultiBlockDeviceGraph, NativeV2SnapshotMultiBlockCaptureError>;
+
     fn capture_native_v2_device_graph_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError>;
+
+    fn capture_native_v2_multi_block_platform(
         &mut self,
         input: HvfArm64BootSnapshotV2CaptureInput,
         output: &mut BoxedNativeV2SnapshotMemoryOutput,
@@ -8203,6 +9103,17 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     fn encode_native_v2_root(
         &self,
         state: &Self::RootState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
+
+    fn compose_native_v2_multi_block(
+        &self,
+        platform: Self::PlatformState,
+        graph: SnapshotV2MultiBlockDeviceGraph,
+    ) -> Result<Self::MultiBlockState, HvfSnapshotV2BuildError>;
+
+    fn encode_native_v2_multi_block(
+        &self,
+        state: &Self::MultiBlockState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError>;
@@ -8640,6 +9551,7 @@ where
 {
     type PlatformState = HvfSnapshotV2PlatformState;
     type RootState = HvfSnapshotV2State;
+    type MultiBlockState = HvfSnapshotV2MultiBlockState;
 
     fn capture_native_v2_serial(
         &self,
@@ -8705,6 +9617,49 @@ where
         Ok(graph)
     }
 
+    fn capture_native_v2_multi_block(
+        &mut self,
+        configs: &CaptureReadyStorageConfigs,
+        expected_transport: SnapshotV2DeviceTransportKind,
+        guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+        now: Instant,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<SnapshotV2MultiBlockDeviceGraph, NativeV2SnapshotMultiBlockCaptureError> {
+        let mut cancelled_stage = None;
+        let graph = self
+            .session
+            .capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
+                configs,
+                guard,
+                now,
+                |stage| {
+                    let cancelled = cancellation.is_cancelled();
+                    if cancelled && cancelled_stage.is_none() {
+                        cancelled_stage = Some(stage);
+                    }
+                    cancelled
+                },
+            )
+            .map_err(|source| {
+                if source.kind() == HvfArm64BootStorageCaptureErrorKind::Cancelled {
+                    NativeV2SnapshotMultiBlockCaptureError::Cancelled {
+                        stage: cancelled_stage
+                            .unwrap_or(HvfArm64BootStorageCaptureStage::Inventory),
+                    }
+                } else {
+                    NativeV2SnapshotMultiBlockCaptureError::Storage { source }
+                }
+            })?;
+        let actual = graph.transport_kind();
+        if actual != expected_transport {
+            return Err(NativeV2SnapshotMultiBlockCaptureError::Transport {
+                expected: expected_transport,
+                actual,
+            });
+        }
+        Ok(graph)
+    }
+
     fn capture_native_v2_device_graph_platform(
         &mut self,
         input: HvfArm64BootSnapshotV2CaptureInput,
@@ -8713,6 +9668,18 @@ where
     ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError> {
         self.session
             .capture_snapshot_v2_device_graph_platform_with_cancel(input, output, |_| {
+                cancellation.is_cancelled()
+            })
+    }
+
+    fn capture_native_v2_multi_block_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        self.session
+            .capture_snapshot_v2_multi_block_platform_with_cancel(input, output, |_| {
                 cancellation.is_cancelled()
             })
     }
@@ -8730,6 +9697,21 @@ where
         state: &Self::RootState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
         encode_hvf_snapshot_v2_state(state)
+    }
+
+    fn compose_native_v2_multi_block(
+        &self,
+        platform: Self::PlatformState,
+        graph: SnapshotV2MultiBlockDeviceGraph,
+    ) -> Result<Self::MultiBlockState, HvfSnapshotV2BuildError> {
+        HvfSnapshotV2MultiBlockState::try_new(platform, graph)
+    }
+
+    fn encode_native_v2_multi_block(
+        &self,
+        state: &Self::MultiBlockState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+        encode_hvf_snapshot_v2_multi_block_state(state)
     }
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
@@ -14049,6 +15031,48 @@ where
                     .encode_native_v2_root(&state)
                     .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
             }
+            NativeV2SnapshotCaptureProfile::MultiBlock {
+                storage_configs,
+                expected_transport,
+            } => {
+                let graph = session
+                    .capture_native_v2_multi_block(
+                        &storage_configs,
+                        expected_transport,
+                        guard,
+                        Instant::now(),
+                        cancellation,
+                    )
+                    .map_err(|source| match source {
+                        NativeV2SnapshotMultiBlockCaptureError::Cancelled { stage } => {
+                            native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Device(
+                                stage,
+                            ))
+                        }
+                        source => NativeV2SnapshotCaptureError::MultiBlock { source },
+                    })?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Memory(
+                            SnapshotV2MemoryIoStage::InitialPosition,
+                        ),
+                    ));
+                }
+                let platform = session
+                    .capture_native_v2_multi_block_platform(input, &mut output, cancellation)
+                    .map_err(native_v2_platform_capture_error)?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Encode,
+                    ));
+                }
+                let state = session
+                    .compose_native_v2_multi_block(platform, graph)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Compose { source })?;
+                session
+                    .encode_native_v2_multi_block(&state)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
+            }
         };
         if cancellation.is_cancelled() {
             return Err(native_v2_snapshot_cancelled(
@@ -14267,7 +15291,7 @@ where
                     let state = capture_and_recover_native_v2_state(
                         session,
                         input,
-                        NativeV2SnapshotCaptureProfile::Root {
+                        NativeV2SnapshotCaptureProfile::MultiBlock {
                             storage_configs,
                             expected_transport,
                         },
@@ -14275,11 +15299,15 @@ where
                         Box::new(writer),
                         &cancellation,
                         |encoded| {
-                            NativeV2SnapshotCandidateState::from_device_graph_v2_4(encoded)
-                                .map(NativeV2SnapshotCandidateState::into_current_artifact_state)
-                                .map_err(|source| NativeV2SnapshotCaptureError::CandidateState {
-                                    source,
-                                })
+                            NativeV2MultiBlockSnapshotCandidateState::from_device_graph_v2_5(
+                                encoded,
+                            )
+                            .map(
+                                NativeV2MultiBlockSnapshotCandidateState::into_current_artifact_state,
+                            )
+                            .map_err(|source| NativeV2SnapshotCaptureError::CandidateState {
+                                source,
+                            })
                         },
                     )
                     .map_err(NativeV2SnapshotPublicationProducerError::Capture)?;
@@ -15524,9 +16552,13 @@ mod tests {
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
         SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransportKind,
     };
+    use bangbang_runtime::snapshot_device_v2_5::{
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
+    };
     use bangbang_runtime::snapshot_format_v2::{
-        NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component,
-        SnapshotV2ComponentDisposition, decode_snapshot_v2_state_with_compatibility_version,
+        NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
+        NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
+        decode_snapshot_v2_state_with_compatibility_version,
         encode_snapshot_v2_state_with_compatibility_version,
     };
     use bangbang_runtime::snapshot_memory::{SnapshotMemoryBinding, write_snapshot_memory_image};
@@ -15593,13 +16625,15 @@ mod tests {
         HvfArm64BootVsockCaptureErrorKind, HvfArm64BootVsockCaptureStage, HvfInstanceStartExecutor,
         HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2EncodeError,
         HvfSnapshotV2NativePath, HvfVcpuRunCoordinatorError, InstanceStartError,
-        InstanceStartExecutor, NativeV1SnapshotCaptureCancellation, NativeV1SnapshotCaptureError,
-        NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage, NativeV1SnapshotLoadError,
-        NativeV1SnapshotPublicationError, NativeV1SnapshotPublicationProducerError,
-        NativeV1SnapshotPublicationTransactionError, NativeV2RootCandidateProcessError,
-        NativeV2RootCandidateProfileError, NativeV2SnapshotCaptureCancellation,
-        NativeV2SnapshotCaptureError, NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage,
-        NativeV2SnapshotLoadError, NativeV2SnapshotPublicationDestination,
+        InstanceStartExecutor, NativeSnapshotLoadError, NativeV1SnapshotCaptureCancellation,
+        NativeV1SnapshotCaptureError, NativeV1SnapshotCaptureSession, NativeV1SnapshotCaptureStage,
+        NativeV1SnapshotLoadError, NativeV1SnapshotPublicationError,
+        NativeV1SnapshotPublicationProducerError, NativeV1SnapshotPublicationTransactionError,
+        NativeV2MultiBlockCandidateProfileError, NativeV2MultiBlockSnapshotCandidateState,
+        NativeV2RootCandidateProcessError, NativeV2RootCandidateProfileError,
+        NativeV2SnapshotCaptureCancellation, NativeV2SnapshotCaptureError,
+        NativeV2SnapshotCaptureSession, NativeV2SnapshotCaptureStage, NativeV2SnapshotLoadError,
+        NativeV2SnapshotMultiBlockCaptureError, NativeV2SnapshotPublicationDestination,
         NativeV2SnapshotPublicationError, NativeV2SnapshotPublicationProducerError,
         NativeV2SnapshotPublicationRequest, NativeV2SnapshotRootCaptureError,
         NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink,
@@ -15607,13 +16641,15 @@ mod tests {
         ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
         ProcessNetworkPacketIoRegistry, ProcessNetworkPacketIoRegistryError,
         ProcessNetworkPacketIoStopError, ProcessRuntimeNetworkPacketIoProvider,
-        ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessSnapshotV2RootLoadCompletion,
-        ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess, ProcessVmm,
-        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
-        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        native_v2_platform_capture_is_terminal, require_native_v1_composite_record,
-        snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
+        ProcessSessionDiagnostics, ProcessSessionExitStatus,
+        ProcessSnapshotV2MultiBlockLoadRequest, ProcessSnapshotV2MultiBlockLoadSuccess,
+        ProcessSnapshotV2RootLoadCompletion, ProcessSnapshotV2RootLoadRequest,
+        ProcessSnapshotV2RootLoadSuccess, ProcessVmm, ProcessVmnetAuthority,
+        ProcessVmnetPacketIoBackendFactory, SerialGrantState, SnapshotCreateSession,
+        SnapshotV1LoadSuccess, SnapshotV2LoadSuccess, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, native_v2_platform_capture_is_terminal,
+        require_native_v1_composite_record, snapshot_destination_machine_config,
+        vsock_capture_error_from_boot_run_loop_command,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -16767,8 +17803,8 @@ mod tests {
                         },
                     )
                 })?;
-                let graph = fake_native_v2_device_graph(transport)
-                    .encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                let graph = fake_native_v2_multi_block_device_graph(transport)
+                    .encode(NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION)
                     .expect("fixed fake native-v2 graph should encode");
                 let components = [
                     SnapshotV2Component::new(
@@ -16783,7 +17819,7 @@ mod tests {
                     ),
                 ];
                 let encoded = encode_snapshot_v2_state_with_compatibility_version(
-                    NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                    NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
                     &[],
                     &components,
                 )
@@ -16794,8 +17830,8 @@ mod tests {
                         },
                     )
                 })?;
-                NativeV2SnapshotCandidateState::from_device_graph_v2_4(encoded)
-                    .map(NativeV2SnapshotCandidateState::into_current_artifact_state)
+                NativeV2MultiBlockSnapshotCandidateState::from_device_graph_v2_5(encoded)
+                    .map(NativeV2MultiBlockSnapshotCandidateState::into_current_artifact_state)
                     .map_err(|source| {
                         NativeV2SnapshotPublicationProducerError::Capture(
                             NativeV2SnapshotCaptureError::CandidateState { source },
@@ -16915,6 +17951,7 @@ mod tests {
         snapshot_serial_preflight_calls: usize,
         last_snapshot_serial_config: Option<SerialConfig>,
         snapshot_serial_preflight_failure: bool,
+        snapshot_serial_preflight_canonical: bool,
         snapshot_network_preflight_calls: usize,
         last_snapshot_vmnet_authority: Option<ProcessVmnetAuthority>,
         last_snapshot_network_configs: Option<Vec<NetworkInterfaceConfig>>,
@@ -16956,6 +17993,7 @@ mod tests {
                 snapshot_serial_preflight_calls: 0,
                 last_snapshot_serial_config: None,
                 snapshot_serial_preflight_failure: false,
+                snapshot_serial_preflight_canonical: true,
                 snapshot_network_preflight_calls: 0,
                 last_snapshot_vmnet_authority: None,
                 last_snapshot_network_configs: None,
@@ -17039,6 +18077,7 @@ mod tests {
                 snapshot_serial_preflight_calls: 0,
                 last_snapshot_serial_config: None,
                 snapshot_serial_preflight_failure: false,
+                snapshot_serial_preflight_canonical: true,
                 snapshot_network_preflight_calls: 0,
                 last_snapshot_vmnet_authority: None,
                 last_snapshot_network_configs: None,
@@ -17076,6 +18115,7 @@ mod tests {
                 snapshot_serial_preflight_calls: 0,
                 last_snapshot_serial_config: None,
                 snapshot_serial_preflight_failure: false,
+                snapshot_serial_preflight_canonical: true,
                 snapshot_network_preflight_calls: 0,
                 last_snapshot_vmnet_authority: None,
                 last_snapshot_network_configs: None,
@@ -17192,14 +18232,23 @@ mod tests {
             &mut self,
             _session: &mut Self::Session,
             config: SerialConfig,
-        ) -> Result<(), HvfArm64BootSerialCaptureError> {
+        ) -> Result<CaptureReadySerialState, HvfArm64BootSerialCaptureError> {
             self.snapshot_preflight_trace.push("serial");
             self.snapshot_serial_preflight_calls += 1;
-            self.last_snapshot_serial_config = Some(config);
+            self.last_snapshot_serial_config = Some(config.clone());
             if self.snapshot_serial_preflight_failure {
                 Err(HvfArm64BootSerialCaptureError::OwnerUnavailable)
             } else {
-                Ok(())
+                let mut device = SerialMmioDevice::discarding();
+                if !self.snapshot_serial_preflight_canonical {
+                    device
+                        .inject_receive_bytes(b"x")
+                        .map_err(|_| HvfArm64BootSerialCaptureError::OwnerUnavailable)?;
+                }
+                let state = device
+                    .capture_state()
+                    .map_err(|_| HvfArm64BootSerialCaptureError::OwnerUnavailable)?;
+                Ok(CaptureReadySerialState::new(config, state))
             }
         }
 
@@ -17494,6 +18543,67 @@ mod tests {
                 commit,
                 ProcessSnapshotV2RootLoadCompletion::empty_for_test(),
             ))
+        }
+
+        fn load_prepared_snapshot_v2_multi_block(
+            &mut self,
+            request: ProcessSnapshotV2MultiBlockLoadRequest<'_>,
+        ) -> Result<ProcessSnapshotV2MultiBlockLoadSuccess<Self::Session>, NativeV2SnapshotLoadError>
+        {
+            let ProcessSnapshotV2MultiBlockLoadRequest {
+                controller,
+                vmnet_authority,
+                #[cfg(target_os = "macos")]
+                    contained_restore_authority: _,
+                pci_enabled,
+                input,
+                candidate,
+                memory: _,
+                cancellation,
+            } = request;
+            let expected_transport = if pci_enabled {
+                SnapshotV2DeviceTransportKind::Pci
+            } else {
+                SnapshotV2DeviceTransportKind::Mmio
+            };
+            if candidate.device_graph().transport_kind() != expected_transport {
+                return Err(NativeV2SnapshotLoadError::Preflight(
+                    VmmActionError::SnapshotUnsupported,
+                ));
+            }
+            let drive_configs = candidate
+                .device_graph()
+                .project_drive_configs()
+                .map_err(|_| NativeV2SnapshotLoadError::CandidateMismatch)?;
+            if !cancellation.try_seal_commit() {
+                return Err(NativeV2SnapshotLoadError::Cancelled);
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_vmnet_authority = Some(vmnet_authority);
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            if self.result == FakeSnapshotLoadResult::Terminal {
+                return Err(NativeV2SnapshotLoadError::ProcessTerminal);
+            }
+
+            let boot_source = BootSourceConfigInput::new("/private/restored-vmlinux")
+                .validate()
+                .expect("fake restored boot source should validate");
+            let commit = SnapshotV2ControllerCommit::with_drive_configs(
+                MachineConfig::default().with_track_dirty_pages(input.track_dirty_pages()),
+                boot_source,
+                drive_configs,
+                input.resume_vm(),
+            );
+            let session = match self.result {
+                FakeSnapshotLoadResult::ResumeFailure => FakeSession::with_resume_result(
+                    77,
+                    BackendError::Hypervisor("private-resume-sentinel".to_owned()),
+                ),
+                FakeSnapshotLoadResult::Success | FakeSnapshotLoadResult::Terminal => {
+                    FakeSession::new(77)
+                }
+            };
+            Ok(ProcessSnapshotV2MultiBlockLoadSuccess::new(session, commit))
         }
     }
 
@@ -17836,6 +18946,12 @@ mod tests {
     struct FakeNativeV2RootState {
         binding: SnapshotV2MemoryBinding,
         graph: SnapshotV2DeviceGraph,
+    }
+
+    #[derive(Debug)]
+    struct FakeNativeV2MultiBlockState {
+        binding: SnapshotV2MemoryBinding,
+        graph: SnapshotV2MultiBlockDeviceGraph,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18743,6 +19859,7 @@ mod tests {
     impl NativeV2SnapshotCaptureSession for FakeRunLoopSession {
         type PlatformState = SnapshotV2MemoryBinding;
         type RootState = FakeNativeV2RootState;
+        type MultiBlockState = FakeNativeV2MultiBlockState;
 
         fn capture_native_v2_serial(
             &self,
@@ -18840,6 +19957,53 @@ mod tests {
             Ok(fake_native_v2_device_graph(actual))
         }
 
+        fn capture_native_v2_multi_block(
+            &mut self,
+            configs: &CaptureReadyStorageConfigs,
+            expected_transport: SnapshotV2DeviceTransportKind,
+            _guard: &Self::SnapshotAuxiliaryQuiescenceGuard,
+            _now: Instant,
+            cancellation: &NativeV2SnapshotCaptureCancellation,
+        ) -> Result<SnapshotV2MultiBlockDeviceGraph, NativeV2SnapshotMultiBlockCaptureError>
+        {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-multi-normalize");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("multi", self.native_v2_topology_generation));
+            if cancellation.is_cancelled() {
+                return Err(NativeV2SnapshotMultiBlockCaptureError::Cancelled {
+                    stage: super::HvfArm64BootStorageCaptureStage::Inventory,
+                });
+            }
+            if configs.drives().is_empty() || !configs.pmem().is_empty() {
+                return Err(NativeV2SnapshotMultiBlockCaptureError::Transport {
+                    expected: expected_transport,
+                    actual: match expected_transport {
+                        SnapshotV2DeviceTransportKind::Mmio => SnapshotV2DeviceTransportKind::Pci,
+                        SnapshotV2DeviceTransportKind::Pci => SnapshotV2DeviceTransportKind::Mmio,
+                    },
+                });
+            }
+            let actual = self
+                .native_v2_root_transport
+                .expect("fake native-v2 transport should be configured");
+            if actual != expected_transport {
+                return Err(NativeV2SnapshotMultiBlockCaptureError::Transport {
+                    expected: expected_transport,
+                    actual,
+                });
+            }
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-multi-transport");
+            Ok(fake_native_v2_multi_block_device_graph(actual))
+        }
+
         fn capture_native_v2_device_graph_platform(
             &mut self,
             _input: HvfArm64BootSnapshotV2CaptureInput,
@@ -18866,6 +20030,41 @@ mod tests {
                 memory,
                 output,
                 NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                |_| cancellation.is_cancelled(),
+            )
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
+            if let Some(cancel) = &self.native_snapshot_cancel_before_seal {
+                cancel.cancel();
+            }
+            Ok(binding)
+        }
+
+        fn capture_native_v2_multi_block_platform(
+            &mut self,
+            _input: HvfArm64BootSnapshotV2CaptureInput,
+            output: &mut super::BoxedNativeV2SnapshotMemoryOutput,
+            cancellation: &NativeV2SnapshotCaptureCancellation,
+        ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+            assert!(
+                !self.native_snapshot_panic,
+                "fake native-v2 snapshot capture panic"
+            );
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-multi-platform");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("platform", self.native_v2_topology_generation));
+            let memory = self
+                .native_snapshot_memory
+                .as_ref()
+                .expect("fake native-v2 memory should be configured");
+            let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+                memory,
+                output,
+                NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
                 |_| cancellation.is_cancelled(),
             )
             .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
@@ -18931,6 +20130,68 @@ mod tests {
             };
             encode_snapshot_v2_state_with_compatibility_version(
                 NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                &[],
+                &components,
+            )
+            .map_err(HvfSnapshotV2EncodeError::Container)
+        }
+
+        fn compose_native_v2_multi_block(
+            &self,
+            platform: Self::PlatformState,
+            graph: SnapshotV2MultiBlockDeviceGraph,
+        ) -> Result<Self::MultiBlockState, HvfSnapshotV2BuildError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-multi-compose");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("compose", self.native_v2_topology_generation));
+            Ok(FakeNativeV2MultiBlockState {
+                binding: platform,
+                graph,
+            })
+        }
+
+        fn encode_native_v2_multi_block(
+            &self,
+            state: &Self::MultiBlockState,
+        ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-multi-encode");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("encode", self.native_v2_topology_generation));
+            let memory = state
+                .binding
+                .encode()
+                .map_err(HvfSnapshotV2EncodeError::Memory)?;
+            let graph = state
+                .graph
+                .encode(NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                .map_err(HvfSnapshotV2EncodeError::MultiBlockDeviceGraph)?;
+            let memory_component = SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &memory,
+            );
+            let graph_component = SnapshotV2Component::new(
+                NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &graph,
+            );
+            let components = if self.native_v2_invalid_candidate_state {
+                vec![memory_component]
+            } else {
+                vec![memory_component, graph_component]
+            };
+            encode_snapshot_v2_state_with_compatibility_version(
+                NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
                 &[],
                 &components,
             )
@@ -19838,6 +21099,25 @@ mod tests {
             .expect("fake native-v2 graph fixture should decode")
     }
 
+    fn fake_native_v2_multi_block_device_graph(
+        transport: SnapshotV2DeviceTransportKind,
+    ) -> SnapshotV2MultiBlockDeviceGraph {
+        let hex = match transport {
+            SnapshotV2DeviceTransportKind::Mmio => {
+                include_str!("../../runtime/src/snapshot_device_v2_5/fixtures/root-mmio.hex")
+            }
+            SnapshotV2DeviceTransportKind::Pci => {
+                include_str!("../../runtime/src/snapshot_device_v2_5/fixtures/root-pci.hex")
+            }
+        };
+        let bytes = fixture_hex_bytes(hex);
+        SnapshotV2MultiBlockDeviceGraph::decode(
+            NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &bytes,
+        )
+        .expect("fake native-v2 multi-block graph fixture should decode")
+    }
+
     fn fixture_hex_bytes(hex: &str) -> Vec<u8> {
         let hex = hex.trim();
         assert!(hex.len().is_multiple_of(2));
@@ -19957,6 +21237,62 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn compatible_native_v2_snapshot_load_fixture(
+        name: &str,
+        version: bangbang_runtime::snapshot_format::SnapshotFormatVersion,
+        graph: Option<Vec<u8>>,
+    ) -> (TempSnapshotDirectory, SnapshotLoadInput) {
+        let directory = TempSnapshotDirectory::new(name);
+        let paths = directory.paths();
+        let range = GuestMemoryRange::new(GuestAddress::new(0x8000_0000), 16 * 1024)
+            .expect("compatible fixture memory range should validate");
+        let layout = GuestMemoryLayout::new(vec![range])
+            .expect("compatible fixture memory layout should validate");
+        let memory =
+            GuestMemory::allocate(&layout).expect("compatible fixture memory should allocate");
+        let mut memory_image = Cursor::new(Vec::new());
+        let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+            &memory,
+            &mut memory_image,
+            version,
+            |_| false,
+        )
+        .expect("compatible fixture memory should encode");
+        fs::write(paths.memory(), memory_image.into_inner())
+            .expect("compatible fixture memory should publish");
+        let binding = binding
+            .encode()
+            .expect("compatible fixture binding should encode");
+        let memory = SnapshotV2Component::new(
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            SnapshotV2ComponentDisposition::Semantic,
+            &binding,
+        );
+        let graph = graph.as_deref().map(|payload| {
+            SnapshotV2Component::new(
+                NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                payload,
+            )
+        });
+        let components = match graph {
+            Some(graph) => vec![memory, graph],
+            None => vec![memory],
+        };
+        let state = encode_snapshot_v2_state_with_compatibility_version(version, &[], &components)
+            .expect("compatible fixture state should encode");
+        fs::write(paths.state(), state).expect("compatible fixture state should publish");
+        let input = SnapshotLoadInput::new(
+            paths.state().to_path_buf(),
+            SnapshotMemoryBackend::new(
+                paths.memory().to_path_buf(),
+                SnapshotMemoryBackendType::File,
+            ),
+        );
+        (directory, input)
+    }
+
+    #[cfg(target_os = "macos")]
     fn fake_native_v1_snapshot_load_fixture(
         name: &str,
         resume_vm: bool,
@@ -20064,7 +21400,7 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(load_vmm.instance_info().state, InstanceState::Paused);
-        assert_eq!(load_vmm.drive_configs().len(), 1);
+        assert_eq!(load_vmm.drive_configs().len(), 2);
         assert!(load_vmm.has_started_session());
 
         let directory = TempSnapshotDirectory::new("native-v2-pci-public-create");
@@ -20119,6 +21455,56 @@ mod tests {
             SnapshotV2DeviceTransportKind::Pci
         );
         directory.assert_no_staging();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_native_v2_dispatch_retains_exact_minor_three_and_minor_four_profiles() {
+        let (legacy_directory, legacy_input) = compatible_native_v2_snapshot_load_fixture(
+            "native-v2-public-legacy-2-3",
+            NATIVE_V2_LEGACY_PLATFORM_VERSION,
+            None,
+        );
+        let legacy_starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let legacy_calls = legacy_starter.calls();
+        let mut legacy_destination =
+            ProcessVmm::with_starter("legacy-2-3", "0.1.0", "bangbang", legacy_starter);
+        assert_eq!(
+            legacy_destination.handle_action(VmmAction::LoadSnapshot(legacy_input)),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            legacy_destination.instance_info().state,
+            InstanceState::Paused
+        );
+        assert!(legacy_destination.drive_configs().is_empty());
+        legacy_directory.assert_no_staging();
+
+        let graph = fake_native_v2_device_graph(SnapshotV2DeviceTransportKind::Mmio)
+            .encode(NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+            .expect("exact minor-four fixture graph should encode");
+        let (root_directory, root_input) = compatible_native_v2_snapshot_load_fixture(
+            "native-v2-public-root-2-4",
+            NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            Some(graph),
+        );
+        let root_starter = FakeSnapshotLoadStarter::new(FakeSnapshotLoadResult::Success);
+        let root_calls = root_starter.calls();
+        let mut root_destination =
+            ProcessVmm::with_starter("root-2-4", "0.1.0", "bangbang", root_starter);
+        assert_eq!(
+            root_destination.handle_action(VmmAction::LoadSnapshot(root_input)),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(root_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            root_destination.instance_info().state,
+            InstanceState::Paused
+        );
+        assert_eq!(root_destination.drive_configs().len(), 1);
+        assert!(root_destination.drive_configs()[0].is_root_device());
+        root_directory.assert_no_staging();
     }
 
     #[test]
@@ -20214,8 +21600,9 @@ mod tests {
         assert_eq!(session.id, 77);
         assert_eq!(session.resume_count, 0);
         assert!(vmm.machine_config().track_dirty_pages());
-        assert_eq!(vmm.drive_configs().len(), 1);
-        assert_eq!(vmm.drive_configs()[0].drive_id(), "root");
+        assert_eq!(vmm.drive_configs().len(), 2);
+        assert_eq!(vmm.drive_configs()[0].drive_id(), "rootfs");
+        assert_eq!(vmm.drive_configs()[1].drive_id(), "data_1");
         assert!(vmm.controller.boot_source_config().is_some());
         vmm.handle_initial_metrics_flush();
         vmm.handle_initial_metrics_flush();
@@ -27025,13 +28412,10 @@ mod tests {
 
         let mut unsupported_profile = configured_vmm(FakeStarter::success(16));
         unsupported_profile
-            .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
-                "data",
-                "data",
-                "/private/data",
-                false,
-            )))
-            .expect("unsupported native-v2 drive should configure");
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+            ))
+            .expect("unsupported native-v2 network should configure");
         unsupported_profile
             .handle_action(VmmAction::InstanceStart)
             .expect("startup should succeed");
@@ -27855,14 +29239,24 @@ mod tests {
             ))
             .expect("memory-only native-v2 fixture should publish");
         drop(v2_source);
+        let retained_memory = v2_paths.memory().with_file_name("unopened.memory");
+        fs::rename(v2_paths.memory(), &retained_memory)
+            .expect("incomplete profile memory should move out of reach");
 
         let v2_error = destination
-            .restore_native_v2_snapshot(&SnapshotLoadInput::new(
+            .restore_native_snapshot(&SnapshotLoadInput::new(
                 v2_paths.state(),
                 SnapshotMemoryBackend::new(v2_paths.memory(), SnapshotMemoryBackendType::File),
             ))
-            .expect_err("incomplete native-v2 profile must fail before process construction");
-        assert!(matches!(&v2_error, NativeV2SnapshotLoadError::Decode(_)));
+            .expect_err("incomplete native-v2 profile must fail before memory access");
+        assert!(matches!(
+            &v2_error,
+            NativeSnapshotLoadError::NativeV2(NativeV2SnapshotLoadError::Decode(_))
+        ));
+        assert!(
+            retained_memory.exists(),
+            "preflight must not need the inaccessible memory path"
+        );
         let diagnostics = format!("{v1_error:?} {v1_error} {v2_error:?} {v2_error}");
         assert!(!diagnostics.contains("native-v2-reject-v1-family"));
         assert!(!diagnostics.contains("native-v2-reject-incomplete-profile"));
@@ -28025,7 +29419,9 @@ mod tests {
     #[test]
     #[ignore = "requires the signed native_v2_process integration group"]
     fn signed_native_v2_process_publishes_recaptures_and_resumes_private_pair() {
-        use bangbang_hvf::{HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_state};
+        use bangbang_hvf::{
+            HvfArm64StableVcpuDisposition, decode_hvf_snapshot_v2_multi_block_state,
+        };
         use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state;
 
         const ARM64_IMAGE_HEADER_SIZE: usize = 64;
@@ -28091,8 +29487,8 @@ mod tests {
                 .expect("native-v2 load should retain structural bytes"),
         )
         .expect("real process native-v2 state should decode structurally");
-        let first_state = decode_hvf_snapshot_v2_state(&first_structural)
-            .expect("real process native-v2 root state should cross-validate");
+        let first_state = decode_hvf_snapshot_v2_multi_block_state(&first_structural)
+            .expect("real process native-v2 multi-block state should cross-validate");
         let first_platform = first_state.platform();
         assert_eq!(first_platform.topology().members().len(), 2);
         assert!(matches!(
@@ -28103,7 +29499,8 @@ mod tests {
             first_platform.topology().members()[1].disposition(),
             HvfArm64StableVcpuDisposition::Offline
         ));
-        assert!(first_state.device_graph().record_is_root());
+        assert_eq!(first_state.device_graph().records().len(), 1);
+        assert!(first_state.device_graph().records()[0].is_root());
         assert_eq!(
             first_state.device_graph().transport_kind(),
             SnapshotV2DeviceTransportKind::Mmio
@@ -28518,25 +29915,17 @@ mod tests {
             drive_paths.state(),
             drive_paths.memory(),
         );
-        let mut drive = snapshot_profile_vmm(FakeStarter::success(174));
-        drive
-            .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
-                "data",
-                "data",
-                "/tmp/data",
-                false,
-            )))
-            .expect("second drive should configure");
+        let mut drive = configured_vmm(FakeStarter::success(174));
         drive
             .handle_action(VmmAction::InstanceStart)
-            .expect("drive source should start");
+            .expect("empty-drive source should start");
         drive
             .handle_action(VmmAction::Pause)
-            .expect("drive source should pause");
+            .expect("empty-drive source should pause");
         assert!(matches!(
             drive.publish_native_v2_snapshot(&drive_input),
             Err(NativeV2SnapshotPublicationError::Profile(
-                NativeV2RootCandidateProfileError::DriveInventory
+                NativeV2MultiBlockCandidateProfileError::DriveProfile(_)
             ))
         ));
         assert_eq!(
@@ -28547,7 +29936,77 @@ mod tests {
                 .native_snapshot_publication_count,
             0
         );
+        assert_eq!(
+            drive.starter.snapshot_storage_preflight_calls, 0,
+            "invalid drive inventory must reject before capture-owner preflight"
+        );
         drive_directory.assert_no_staging();
+
+        let mut vhost = configured_vmm(FakeStarter::success(186));
+        vhost
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new_without_path_on_host("root", "root", true)
+                    .with_socket("/private/native-v2-vhost.sock"),
+            ))
+            .expect("vhost-user source should configure");
+        assert!(matches!(
+            vhost.native_v2_multi_block_candidate_product_profile(),
+            Err(NativeV2MultiBlockCandidateProfileError::DriveProfile(_))
+        ));
+
+        let mut pmem = configured_vmm(FakeStarter::success(187));
+        pmem.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "root",
+            "root",
+            "/tmp/pmem-rootfs",
+            true,
+        )))
+        .expect("pmem source root should configure");
+        pmem.handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            "/private/native-v2-pmem",
+        )))
+        .expect("pmem source should configure");
+        assert!(matches!(
+            pmem.native_v2_multi_block_candidate_product_profile(),
+            Err(NativeV2MultiBlockCandidateProfileError::OptionalDevices)
+        ));
+
+        let optional_directory = TempSnapshotDirectory::new("native-v2-process-optional");
+        let optional_paths = optional_directory.paths();
+        let mut optional = configured_vmm(FakeStarter::success(188));
+        optional
+            .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                "root",
+                "root",
+                "/tmp/optional-rootfs",
+                true,
+            )))
+            .expect("optional-device source root should configure");
+        optional
+            .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(64, false)))
+            .expect("optional balloon should configure");
+        optional
+            .handle_action(VmmAction::InstanceStart)
+            .expect("optional-device source should start");
+        optional
+            .handle_action(VmmAction::Pause)
+            .expect("optional-device source should pause");
+        assert!(matches!(
+            optional.publish_native_v2_snapshot(&SnapshotCreateInput::new(
+                SnapshotType::Full,
+                optional_paths.state(),
+                optional_paths.memory(),
+            )),
+            Err(NativeV2SnapshotPublicationError::Profile(
+                NativeV2MultiBlockCandidateProfileError::OptionalDevices
+            ))
+        ));
+        assert_eq!(
+            optional.starter.snapshot_storage_preflight_calls, 0,
+            "optional-device rejection must precede capture-owner preflight"
+        );
+        optional_directory.assert_no_staging();
 
         let serial_directory = TempSnapshotDirectory::new("native-v2-process-serial");
         let serial_paths = serial_directory.paths();
@@ -28572,7 +30031,7 @@ mod tests {
         assert!(matches!(
             serial.publish_native_v2_snapshot(&serial_input),
             Err(NativeV2SnapshotPublicationError::Profile(
-                NativeV2RootCandidateProfileError::NonCanonicalSerial
+                NativeV2MultiBlockCandidateProfileError::NonCanonicalSerial
             ))
         ));
         assert_eq!(
@@ -28583,7 +30042,36 @@ mod tests {
                 .native_snapshot_publication_count,
             0
         );
+        assert_eq!(
+            serial.starter.snapshot_storage_preflight_calls, 0,
+            "serial rejection must precede capture-owner preflight"
+        );
         serial_directory.assert_no_staging();
+
+        let live_serial_directory = TempSnapshotDirectory::new("native-v2-process-live-serial");
+        let live_serial_paths = live_serial_directory.paths();
+        let mut live_serial = paused_native_v2_profile_vmm(FakeStarter::success(189));
+        live_serial.starter.snapshot_serial_preflight_canonical = false;
+        assert!(matches!(
+            live_serial.publish_native_v2_snapshot(&SnapshotCreateInput::new(
+                SnapshotType::Full,
+                live_serial_paths.state(),
+                live_serial_paths.memory(),
+            )),
+            Err(NativeV2SnapshotPublicationError::Profile(
+                NativeV2MultiBlockCandidateProfileError::NonCanonicalSerial
+            ))
+        ));
+        assert_eq!(live_serial.starter.snapshot_serial_preflight_calls, 1);
+        let live_serial_session = live_serial
+            .started_session
+            .as_ref()
+            .expect("live serial rejection should retain the source");
+        assert_eq!(live_serial_session.native_snapshot_publication_count, 0);
+        assert_eq!(live_serial_session.native_snapshot_producer_count, 0);
+        assert!(!live_serial_paths.state().exists());
+        assert!(!live_serial_paths.memory().exists());
+        live_serial_directory.assert_no_staging();
 
         let unavailable_directory = TempSnapshotDirectory::new("native-v2-process-no-session");
         let unavailable_paths = unavailable_directory.paths();
@@ -32319,6 +33807,54 @@ mod tests {
     }
 
     #[test]
+    fn native_v2_multi_block_product_profile_accepts_rootless_mixed_vector() {
+        let mut vmm = ProcessVmm::with_starter(
+            "multi-block-profile",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/private/vmlinux",
+        )))
+        .expect("rootless profile boot source should configure");
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("data", "data", "/private/data.img", false)
+                .with_is_read_only(false)
+                .with_cache_type(DriveCacheType::Unsafe)
+                .with_io_engine(DriveIoEngine::Async),
+        ))
+        .expect("rootless writable Async drive should configure");
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("audit", "audit", "/private/audit.img", false)
+                .with_is_read_only(true)
+                .with_cache_type(DriveCacheType::Writeback)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("rootless read-only Sync drive should configure");
+
+        let mmio = vmm
+            .native_v2_multi_block_candidate_product_profile()
+            .expect("rootless mixed MMIO vector should validate");
+        assert_eq!(mmio.expected_transport, SnapshotV2DeviceTransportKind::Mmio);
+        assert_eq!(mmio.storage_configs.drives().len(), 2);
+        assert!(
+            mmio.storage_configs
+                .drives()
+                .iter()
+                .all(|drive| !drive.is_root_device())
+        );
+
+        vmm.pci_enabled = true;
+        vmm.starter.pci_enabled = true;
+        let pci = vmm
+            .native_v2_multi_block_candidate_product_profile()
+            .expect("rootless mixed PCI vector should validate");
+        assert_eq!(pci.expected_transport, SnapshotV2DeviceTransportKind::Pci);
+        assert_eq!(pci.storage_configs.drives(), mmio.storage_configs.drives());
+    }
+
+    #[test]
     fn native_v2_root_candidate_profile_requires_boot_and_boot_session() {
         let missing_boot = ProcessVmm::with_starter(
             "candidate-profile",
@@ -33204,11 +34740,11 @@ mod tests {
                 "aux-acquire",
                 "v2-serial",
                 "v2-pause",
-                "v2-root-normalize",
-                "v2-root-transport",
-                "v2-root-platform",
-                "v2-root-compose",
-                "v2-root-encode",
+                "v2-multi-normalize",
+                "v2-multi-transport",
+                "v2-multi-platform",
+                "v2-multi-compose",
+                "v2-multi-encode",
                 "v2-recover",
                 "v2-published",
                 "aux-drop",

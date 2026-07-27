@@ -20,6 +20,10 @@ use crate::snapshot_device_v2::{
     NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceGraph,
     SnapshotV2DeviceGraphDecodeError,
 };
+use crate::snapshot_device_v2_5::{
+    NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2MultiBlockDeviceGraph,
+    SnapshotV2MultiBlockDeviceGraphDecodeError,
+};
 #[cfg(target_os = "macos")]
 use crate::snapshot_format::NATIVE_V1_SNAPSHOT_MAX_FILE_BYTES;
 use crate::snapshot_format::{
@@ -27,8 +31,8 @@ use crate::snapshot_format::{
     SnapshotFormatVersion, decode_native_snapshot_state,
 };
 use crate::snapshot_format_v2::{
-    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_SNAPSHOT_VERSION,
-    SnapshotV2ComponentDisposition, SnapshotV2DecodeError,
+    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
+    NATIVE_V2_SNAPSHOT_VERSION, SnapshotV2ComponentDisposition, SnapshotV2DecodeError,
     decode_snapshot_v2_state_with_compatibility_version,
 };
 #[cfg(target_os = "macos")]
@@ -67,6 +71,17 @@ impl fmt::Display for NativeSnapshotArtifactFamily {
     }
 }
 
+/// One complete, exact native-v2 state profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeV2SnapshotArtifactProfile {
+    /// Exact 2.3 platform state without a device graph.
+    LegacyPlatformV2_3,
+    /// Exact 2.4 singleton block-device graph profile 1.
+    DeviceGraphV2_4,
+    /// Exact 2.5 multi-block device graph profile 2.
+    MultiBlockDeviceGraphV2_5,
+}
+
 /// Validation failure for one owned native snapshot artifact state.
 #[derive(Debug)]
 pub enum NativeSnapshotArtifactStateError {
@@ -91,6 +106,8 @@ pub enum NativeSnapshotArtifactStateError {
         state: SnapshotFormatVersion,
         memory: SnapshotFormatVersion,
     },
+    /// A compatible native-v2 state does not satisfy one exact state profile.
+    V2Profile(NativeV2SnapshotCandidateStateError),
     /// The exact current native-v2 state does not satisfy its required device profile.
     CurrentV2Profile(NativeV2SnapshotCandidateStateError),
 }
@@ -112,6 +129,9 @@ impl fmt::Display for NativeSnapshotArtifactStateError {
                 formatter,
                 "native-v2 publication requires current state and memory versions; found state {state} and memory {memory}"
             ),
+            Self::V2Profile(source) => {
+                write!(formatter, "invalid compatible native-v2 profile: {source}")
+            }
             Self::CurrentV2Profile(source) => {
                 write!(
                     formatter,
@@ -128,6 +148,7 @@ impl std::error::Error for NativeSnapshotArtifactStateError {
             Self::Format(source) => Some(source),
             Self::Commit(source) => Some(source),
             Self::Memory(source) => Some(source),
+            Self::V2Profile(source) => Some(source),
             Self::CurrentV2Profile(source) => Some(source),
             Self::UnexpectedFamily { .. }
             | Self::V2VersionMismatch { .. }
@@ -163,8 +184,8 @@ impl NativeSnapshotArtifactState {
 
     /// Validates exact current-version native-v2 bytes for publication.
     pub fn from_current_v2(bytes: Vec<u8>) -> Result<Self, NativeSnapshotArtifactStateError> {
-        NativeV2SnapshotCandidateState::from_device_graph_v2_4(bytes)
-            .map(NativeV2SnapshotCandidateState::into_current_artifact_state)
+        NativeV2MultiBlockSnapshotCandidateState::from_device_graph_v2_5(bytes)
+            .map(NativeV2MultiBlockSnapshotCandidateState::into_current_artifact_state)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)
     }
 
@@ -239,6 +260,23 @@ impl NativeSnapshotArtifactState {
         }
     }
 
+    /// Classifies one compatible native-v2 state into its exact typed profile.
+    ///
+    /// This inspects only the already-retained immutable state and embedded
+    /// memory commitment. It does not open memory or device backing resources.
+    pub fn v2_profile(
+        &self,
+    ) -> Result<NativeV2SnapshotArtifactProfile, NativeSnapshotArtifactStateError> {
+        let NativeSnapshotArtifactStateInner::V2 { bytes, binding, .. } = &self.inner else {
+            return Err(NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V2,
+                actual: NativeSnapshotArtifactFamily::V1,
+            });
+        };
+        classify_native_v2_profile(bytes, binding)
+            .map_err(NativeSnapshotArtifactStateError::V2Profile)
+    }
+
     /// Consumes a native-v1 value into its exact commit record.
     pub fn into_v1_record(self) -> Result<SnapshotCommitRecord, Self> {
         match self.inner {
@@ -279,7 +317,7 @@ impl NativeSnapshotArtifactState {
         };
         if *version == NATIVE_V2_SNAPSHOT_VERSION && binding.version() == NATIVE_V2_SNAPSHOT_VERSION
         {
-            let (actual_binding, _) = decode_device_graph_v2_4(bytes)
+            let (actual_binding, _) = decode_device_graph_v2_5(bytes)
                 .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
             if &actual_binding == binding {
                 Ok(())
@@ -360,16 +398,96 @@ impl NativeV2SnapshotCandidateState {
         (self.bytes, self.binding, self.device_graph)
     }
 
-    /// Consumes this exact current candidate into the native artifact authority.
+    /// Consumes this exact 2.4 candidate into compatible artifact state.
+    pub fn into_compatible_artifact_state(self) -> NativeSnapshotArtifactState {
+        let (bytes, binding, _) = self.into_parts();
+        NativeSnapshotArtifactState {
+            inner: NativeSnapshotArtifactStateInner::V2 {
+                bytes,
+                version: NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                binding,
+            },
+        }
+    }
+}
+
+/// One closed exact native-v2 2.5 multi-block candidate.
+///
+/// This value retains the original state bytes, their derived memory
+/// commitment, and the validated profile-2 graph. It is the only native-v2
+/// candidate that can enter the current publication authority.
+pub struct NativeV2MultiBlockSnapshotCandidateState {
+    bytes: Vec<u8>,
+    binding: SnapshotV2MemoryBinding,
+    device_graph: SnapshotV2MultiBlockDeviceGraph,
+}
+
+impl NativeV2MultiBlockSnapshotCandidateState {
+    /// Validates and retains one exact graph-bearing native-v2 2.5 state.
+    pub fn from_device_graph_v2_5(
+        bytes: Vec<u8>,
+    ) -> Result<Self, NativeV2SnapshotCandidateStateError> {
+        let (binding, device_graph) = decode_device_graph_v2_5(&bytes)?;
+        Ok(Self {
+            bytes,
+            binding,
+            device_graph,
+        })
+    }
+
+    /// Returns the exact candidate compatibility version.
+    pub const fn version(&self) -> SnapshotFormatVersion {
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION
+    }
+
+    /// Returns the immutable encoded state bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the memory commitment derived from the encoded state.
+    pub const fn memory_binding(&self) -> &SnapshotV2MemoryBinding {
+        &self.binding
+    }
+
+    /// Returns the required validated profile-2 device graph.
+    pub const fn device_graph(&self) -> &SnapshotV2MultiBlockDeviceGraph {
+        &self.device_graph
+    }
+
+    /// Consumes the closed candidate into its exact committed components.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<u8>,
+        SnapshotV2MemoryBinding,
+        SnapshotV2MultiBlockDeviceGraph,
+    ) {
+        (self.bytes, self.binding, self.device_graph)
+    }
+
+    /// Consumes this exact current candidate into artifact authority.
     pub fn into_current_artifact_state(self) -> NativeSnapshotArtifactState {
         let (bytes, binding, _) = self.into_parts();
         NativeSnapshotArtifactState {
             inner: NativeSnapshotArtifactStateInner::V2 {
                 bytes,
-                version: NATIVE_V2_SNAPSHOT_VERSION,
+                version: NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
                 binding,
             },
         }
+    }
+}
+
+impl fmt::Debug for NativeV2MultiBlockSnapshotCandidateState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeV2MultiBlockSnapshotCandidateState")
+            .field("version", &self.version())
+            .field("state", &REDACTED)
+            .field("memory_binding", &REDACTED)
+            .field("device_graph", &REDACTED)
+            .finish()
     }
 }
 
@@ -404,6 +522,92 @@ fn decode_device_graph_v2_4(
     Ok((binding, device_graph))
 }
 
+fn decode_device_graph_v2_5(
+    bytes: &[u8],
+) -> Result<
+    (SnapshotV2MemoryBinding, SnapshotV2MultiBlockDeviceGraph),
+    NativeV2SnapshotCandidateStateError,
+> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        bytes,
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .map_err(NativeV2SnapshotCandidateStateError::Format)?;
+    let version = state.metadata().version();
+    if version != NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION {
+        return Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version });
+    }
+    let binding = decode_snapshot_v2_memory_binding(&state)
+        .map_err(NativeV2SnapshotCandidateStateError::Memory)?;
+    if binding.version() != version {
+        return Err(NativeV2SnapshotCandidateStateError::VersionMismatch {
+            state: version,
+            memory: binding.version(),
+        });
+    }
+    let graph = state
+        .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
+        .ok_or(NativeV2SnapshotCandidateStateError::MissingDeviceGraph)?;
+    if graph.disposition() != SnapshotV2ComponentDisposition::Semantic {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidDeviceGraphComponent);
+    }
+    let device_graph = SnapshotV2MultiBlockDeviceGraph::decode(version, graph.payload())
+        .map_err(NativeV2SnapshotCandidateStateError::MultiBlockDeviceGraph)?;
+    Ok((binding, device_graph))
+}
+
+fn classify_native_v2_profile(
+    bytes: &[u8],
+    expected_binding: &SnapshotV2MemoryBinding,
+) -> Result<NativeV2SnapshotArtifactProfile, NativeV2SnapshotCandidateStateError> {
+    let state = decode_snapshot_v2_state_with_compatibility_version(
+        bytes,
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+    )
+    .map_err(NativeV2SnapshotCandidateStateError::Format)?;
+    let version = state.metadata().version();
+    let binding = decode_snapshot_v2_memory_binding(&state)
+        .map_err(NativeV2SnapshotCandidateStateError::Memory)?;
+    if binding.version() != version || &binding != expected_binding {
+        return Err(NativeV2SnapshotCandidateStateError::VersionMismatch {
+            state: version,
+            memory: binding.version(),
+        });
+    }
+
+    let mut graph_components = state
+        .components()
+        .filter(|component| component.key().kind() == NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY.kind());
+    let graph = graph_components.next();
+    if graph_components.next().is_some()
+        || graph.is_some_and(|component| {
+            component.key() != NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY
+                || component.disposition() != SnapshotV2ComponentDisposition::Semantic
+        })
+    {
+        return Err(NativeV2SnapshotCandidateStateError::InvalidDeviceGraphComponent);
+    }
+
+    match version {
+        NATIVE_V2_LEGACY_PLATFORM_VERSION if graph.is_none() => {
+            Ok(NativeV2SnapshotArtifactProfile::LegacyPlatformV2_3)
+        }
+        NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION => {
+            let graph = graph.ok_or(NativeV2SnapshotCandidateStateError::MissingDeviceGraph)?;
+            SnapshotV2DeviceGraph::decode(version, graph.payload())
+                .map_err(NativeV2SnapshotCandidateStateError::DeviceGraph)?;
+            Ok(NativeV2SnapshotArtifactProfile::DeviceGraphV2_4)
+        }
+        NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_COMPATIBILITY_VERSION => {
+            let graph = graph.ok_or(NativeV2SnapshotCandidateStateError::MissingDeviceGraph)?;
+            SnapshotV2MultiBlockDeviceGraph::decode(version, graph.payload())
+                .map_err(NativeV2SnapshotCandidateStateError::MultiBlockDeviceGraph)?;
+            Ok(NativeV2SnapshotArtifactProfile::MultiBlockDeviceGraphV2_5)
+        }
+        _ => Err(NativeV2SnapshotCandidateStateError::UnexpectedVersion { found: version }),
+    }
+}
+
 impl fmt::Debug for NativeV2SnapshotCandidateState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -416,7 +620,7 @@ impl fmt::Debug for NativeV2SnapshotCandidateState {
     }
 }
 
-/// Validation failure for one exact native-v2 2.4 candidate.
+/// Validation failure for one exact native-v2 block-bearing candidate.
 #[derive(Debug)]
 pub enum NativeV2SnapshotCandidateStateError {
     /// The bytes do not form a known compatible native-v2 state.
@@ -441,6 +645,8 @@ pub enum NativeV2SnapshotCandidateStateError {
     InvalidDeviceGraphComponent,
     /// The required device-graph payload is invalid.
     DeviceGraph(SnapshotV2DeviceGraphDecodeError),
+    /// The required multi-block device-graph payload is invalid.
+    MultiBlockDeviceGraph(SnapshotV2MultiBlockDeviceGraphDecodeError),
 }
 
 impl fmt::Display for NativeV2SnapshotCandidateStateError {
@@ -473,6 +679,12 @@ impl fmt::Display for NativeV2SnapshotCandidateStateError {
                     "invalid native-v2 candidate device graph: {source}"
                 )
             }
+            Self::MultiBlockDeviceGraph(source) => {
+                write!(
+                    formatter,
+                    "invalid native-v2 candidate multi-block device graph: {source}"
+                )
+            }
         }
     }
 }
@@ -483,6 +695,7 @@ impl std::error::Error for NativeV2SnapshotCandidateStateError {
             Self::Format(source) => Some(source),
             Self::Memory(source) => Some(source),
             Self::DeviceGraph(source) => Some(source),
+            Self::MultiBlockDeviceGraph(source) => Some(source),
             Self::UnexpectedVersion { .. }
             | Self::VersionMismatch { .. }
             | Self::MissingDeviceGraph
@@ -1385,11 +1598,11 @@ impl LoadedNativeSnapshotArtifacts {
         (self.state, self.memory)
     }
 
-    /// Consumes one exact current graph-bearing pair into the root-load handoff.
+    /// Consumes one exact 2.4 graph-bearing pair into the root-load handoff.
     ///
     /// The state bytes are neither reopened nor re-encoded, and the already
     /// loaded guest memory remains bound to the candidate derived from them.
-    pub fn into_current_v2_candidate(
+    pub fn into_v2_4_candidate(
         self,
     ) -> Result<(NativeV2SnapshotCandidateState, GuestMemory), NativeSnapshotArtifactStateError>
     {
@@ -1402,6 +1615,30 @@ impl LoadedNativeSnapshotArtifacts {
             }
         })?;
         let candidate = NativeV2SnapshotCandidateState::from_device_graph_v2_4(bytes)
+            .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
+        debug_assert_eq!(candidate.memory_binding(), &binding);
+        Ok((candidate, memory))
+    }
+
+    /// Consumes one exact current 2.5 pair into the multi-block load handoff.
+    ///
+    /// The state bytes are neither reopened nor re-encoded, and the already
+    /// loaded guest memory remains bound to the candidate derived from them.
+    pub fn into_current_v2_candidate(
+        self,
+    ) -> Result<
+        (NativeV2MultiBlockSnapshotCandidateState, GuestMemory),
+        NativeSnapshotArtifactStateError,
+    > {
+        let actual = self.family();
+        let (state, memory) = self.into_parts();
+        let (bytes, binding) = state.into_v2_parts().map_err(|_| {
+            NativeSnapshotArtifactStateError::UnexpectedFamily {
+                expected: NativeSnapshotArtifactFamily::V2,
+                actual,
+            }
+        })?;
+        let candidate = NativeV2MultiBlockSnapshotCandidateState::from_device_graph_v2_5(bytes)
             .map_err(NativeSnapshotArtifactStateError::CurrentV2Profile)?;
         debug_assert_eq!(candidate.memory_binding(), &binding);
         Ok((candidate, memory))
@@ -1455,6 +1692,13 @@ impl PreparedNativeSnapshotState {
     /// Returns the prepared native family.
     pub const fn family(&self) -> NativeSnapshotArtifactFamily {
         self.state.family()
+    }
+
+    /// Classifies the retained state into one exact native-v2 profile.
+    pub fn v2_profile(
+        &self,
+    ) -> Result<NativeV2SnapshotArtifactProfile, NativeSnapshotArtifactStateError> {
+        self.state.v2_profile()
     }
 
     /// Consumes the prepared value into its state commitment.
