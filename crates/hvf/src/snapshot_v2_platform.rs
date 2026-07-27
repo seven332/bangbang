@@ -70,7 +70,9 @@ use crate::snapshot_v2::{
 use crate::snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockMmioRecordPlan, HvfSnapshotV2MultiBlockPciPlan,
 };
-use crate::snapshot_v2_storage_platform::HvfSnapshotV2StorageMmioRecordPlan;
+use crate::snapshot_v2_storage_platform::{
+    HvfSnapshotV2StorageMmioRecordPlan, HvfSnapshotV2StoragePciHostPlan,
+};
 use crate::startup::{
     HvfArm64BootSnapshotV2CaptureError, HvfArm64BootSnapshotV2CaptureStage,
     HvfArm64BootVmClockRestoreError, HvfArm64BootVmGenIdRestoreError,
@@ -376,6 +378,14 @@ pub(crate) struct HvfSnapshotV2StorageMmioShellPlan<'a> {
     pub(crate) vmclock_interrupt: GuestInterruptLine,
 }
 
+pub(crate) struct HvfSnapshotV2StoragePciShellPlan<'a> {
+    pub(crate) command_line: &'a str,
+    pub(crate) pci: &'a HvfSnapshotV2StoragePciHostPlan,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
 enum HvfSnapshotV2ProcessShellRestore<'a> {
     DeviceFree(HvfSnapshotV2DefaultProcessShell),
     Root {
@@ -394,6 +404,10 @@ enum HvfSnapshotV2ProcessShellRestore<'a> {
     StorageMmio {
         shell: HvfSnapshotV2DefaultProcessShell,
         plan: HvfSnapshotV2StorageMmioShellPlan<'a>,
+    },
+    StoragePci {
+        shell: HvfSnapshotV2DefaultProcessShell,
+        plan: HvfSnapshotV2StoragePciShellPlan<'a>,
     },
 }
 
@@ -415,6 +429,10 @@ enum HvfSnapshotV2ProcessBlockFdtPlan<'a> {
         command_line: &'a str,
         block_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
         pmem_records: &'a [HvfSnapshotV2StorageMmioRecordPlan],
+    },
+    StoragePci {
+        command_line: &'a str,
+        pci: &'a HvfSnapshotV2StoragePciHostPlan,
     },
 }
 
@@ -1363,6 +1381,19 @@ pub(crate) fn restore_hvf_snapshot_v2_storage_mmio_process_platform(
         state,
         memory,
         Some(HvfSnapshotV2ProcessShellRestore::StorageMmio { shell, plan }),
+    )
+}
+
+pub(crate) fn restore_hvf_snapshot_v2_storage_pci_process_platform(
+    state: HvfSnapshotV2PlatformState,
+    memory: GuestMemory,
+    shell: HvfSnapshotV2DefaultProcessShell,
+    plan: HvfSnapshotV2StoragePciShellPlan<'_>,
+) -> Result<RestoredHvfSnapshotV2Platform, HvfSnapshotV2PlatformRestoreError> {
+    restore_hvf_snapshot_v2_platform_with_shell(
+        state,
+        memory,
+        Some(HvfSnapshotV2ProcessShellRestore::StoragePci { shell, plan }),
     )
 }
 
@@ -2385,6 +2416,30 @@ fn prepare_process_shell(
                     )),
                 )
             }
+            HvfSnapshotV2ProcessShellRestore::StoragePci { shell, plan } => {
+                if plan.pci.record_count() == 0
+                    || plan.pci.route_demand() == 0
+                    || gic.msi != Some(plan.pci.msi())
+                {
+                    return Err(HvfSnapshotV2PlatformRestoreFailure::ProcessShellFdt {
+                        mismatch: HvfSnapshotV2ProcessFdtMismatch::Profile,
+                    });
+                }
+                (
+                    shell,
+                    HvfSnapshotV2ProcessBlockFdtPlan::StoragePci {
+                        command_line: plan.command_line,
+                        pci: plan.pci,
+                    },
+                    true,
+                    false,
+                    Some((
+                        plan.serial_interrupt,
+                        plan.vmgenid_interrupt,
+                        plan.vmclock_interrupt,
+                    )),
+                )
+            }
         };
     let serial_interrupt = allocator
         .allocate()
@@ -2505,6 +2560,7 @@ fn validate_process_fdt(
         HvfSnapshotV2ProcessBlockFdtPlan::Root { .. } => 1,
         HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockMmio { records, .. } => records.len(),
         HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci { .. } => 1,
+        HvfSnapshotV2ProcessBlockFdtPlan::StoragePci { .. } => 1,
         HvfSnapshotV2ProcessBlockFdtPlan::StorageMmio {
             block_records,
             pmem_records,
@@ -2628,6 +2684,9 @@ fn validate_process_fdt(
         HvfSnapshotV2ProcessBlockFdtPlan::StorageMmio { command_line, .. } => chosen
             .prop_str("bootargs")
             .is_ok_and(|arguments| arguments == *command_line),
+        HvfSnapshotV2ProcessBlockFdtPlan::StoragePci { command_line, .. } => chosen
+            .prop_str("bootargs")
+            .is_ok_and(|arguments| arguments == *command_line),
         HvfSnapshotV2ProcessBlockFdtPlan::None => {
             let expected = expected_process_boot_arguments(state.machine().boot().boot_arguments())
                 .ok_or(HvfSnapshotV2ProcessFdtMismatch::Boot)?;
@@ -2652,6 +2711,7 @@ fn validate_process_fdt(
             transport: HvfSnapshotV2RootTransportPlan::Pci { .. },
             ..
         } | HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci { .. }
+            | HvfSnapshotV2ProcessBlockFdtPlan::StoragePci { .. }
     ));
     if intc.children.len() != expected_gic_children
         || !intc
@@ -2823,6 +2883,18 @@ fn validate_process_block_nodes(
             return Ok(());
         }
         HvfSnapshotV2ProcessBlockFdtPlan::MultiBlockPci { pci, .. } => {
+            let canonical_host = Arm64PciAddressPlan::firecracker_v1_16()
+                .map(bangbang_runtime::fdt::Arm64FdtPciHost::from_address_plan)
+                .ok();
+            if canonical_host != Some(pci.host())
+                || !validate_process_pci_host(root_node)
+                || !validate_process_gic_msi(intc, pci.msi())
+            {
+                return Err(HvfSnapshotV2ProcessFdtMismatch::Pci);
+            }
+            return Ok(());
+        }
+        HvfSnapshotV2ProcessBlockFdtPlan::StoragePci { pci, .. } => {
             let canonical_host = Arm64PciAddressPlan::firecracker_v1_16()
                 .map(bangbang_runtime::fdt::Arm64FdtPciHost::from_address_plan)
                 .ok();
@@ -4288,6 +4360,63 @@ pub(crate) mod tests {
                 &block
             ),
             Err(HvfSnapshotV2ProcessFdtMismatch::Boot)
+        );
+    }
+
+    #[test]
+    fn storage_pci_fdt_requires_one_host_for_the_heterogeneous_vector() {
+        let (platform, plan) = crate::snapshot_v2_storage_platform::tests::pci_fdt_plan_fixture();
+        let pci = plan.pci();
+        assert_eq!(pci.block_records().len(), 1);
+        assert_eq!(pci.pmem_records().len(), 1);
+        let shell = (
+            bangbang_runtime::fdt::Arm64FdtSerialDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: PROCESS_SERIAL_MMIO_BASE.raw_value(),
+                    size: SERIAL_MMIO_DEVICE_WINDOW_SIZE,
+                },
+                interrupt_line: plan.serial_interrupt(),
+            },
+            bangbang_runtime::fdt::Arm64FdtRtcDevice {
+                region: bangbang_runtime::fdt::Arm64FdtRegion {
+                    base: PROCESS_RTC_MMIO_BASE.raw_value(),
+                    size: RTC_MMIO_DEVICE_WINDOW_SIZE,
+                },
+            },
+            bangbang_runtime::fdt::Arm64FdtVmGenIdDevice {
+                region: platform.time().vmgenid().fdt_region(),
+                interrupt_line: plan.vmgenid_interrupt(),
+            },
+            bangbang_runtime::fdt::Arm64FdtVmClockDevice {
+                region: platform.time().vmclock().fdt_region(),
+                interrupt_line: plan.vmclock_interrupt(),
+            },
+        );
+        let block = HvfSnapshotV2ProcessBlockFdtPlan::StoragePci {
+            command_line: plan.command_line(),
+            pci,
+        };
+        let valid = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &[],
+            plan.command_line(),
+            Some(pci.host()),
+        );
+        assert_eq!(
+            validate_process_fdt(&valid, &platform, plan.serial_interrupt(), &block),
+            Ok(())
+        );
+        let missing_host = build_process_fdt_fixture_with_profile(
+            &platform,
+            shell,
+            &[],
+            plan.command_line(),
+            None,
+        );
+        assert_eq!(
+            validate_process_fdt(&missing_host, &platform, plan.serial_interrupt(), &block),
+            Err(HvfSnapshotV2ProcessFdtMismatch::RootInventory)
         );
     }
 

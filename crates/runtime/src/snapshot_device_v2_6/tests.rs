@@ -830,6 +830,111 @@ fn mmio_handoff_rejects_pci_and_allocation_faults_with_clean_owner_release() {
 }
 
 #[test]
+fn pci_handoff_preserves_exact_pmem_placement_and_storage_order() {
+    for (blocks, pmems, root) in [
+        (1, 0, Some(DEVICE_KIND_BLOCK)),
+        (0, 1, Some(DEVICE_KIND_PMEM)),
+        (1, 1, Some(DEVICE_KIND_BLOCK)),
+        (0, 1, None),
+    ] {
+        let graph = fixture_graph(SnapshotV2DeviceTransportKind::Pci, blocks, pmems, root);
+        let expected = graph.clone();
+        let memory = restore_memory_for(&graph);
+        let now = Instant::now();
+        let (_files, block_backings, pmem_backings) = restore_backings(&graph);
+        let bundle = SnapshotV2StorageRestorePlan::prepare(graph, &memory, now)
+            .expect("PCI handoff plan should prepare")
+            .prepare_backings(block_backings, pmem_backings, || false)
+            .expect("PCI handoff bundle should prepare");
+
+        let pci = bundle
+            .prepare_pci_transport()
+            .expect("PCI handoff should reconstruct");
+        assert_eq!(pci.root_key(), expected.root_key());
+        assert_eq!(
+            pci.block_bundle()
+                .map_or(0, |bundle| bundle.records().len()),
+            blocks
+        );
+        assert_eq!(pci.pmem_records().len(), pmems);
+        assert_eq!(pci.pmem_configs().as_slice().len(), pmems);
+        for (record, expected) in pci.pmem_records().iter().zip(expected.pmem_records()) {
+            let SnapshotV2DeviceTransport::Pci(expected_pci) = expected.transport() else {
+                panic!("fixture pmem transport should be PCI");
+            };
+            assert_eq!(record.key(), expected.key());
+            assert_eq!(record.pmem_id(), expected.config().pmem_id());
+            assert_eq!(record.is_root_device(), expected.is_root());
+            assert_eq!(record.retry(), expected.pmem().retry());
+            assert_eq!(
+                record.retry_deadline(),
+                Some(now + Duration::from_nanos(99))
+            );
+            assert_eq!(record.origin(), expected_pci.origin());
+            assert_eq!(record.sbdf(), expected_pci.sbdf());
+            assert_eq!(record.bar_range(), expected_pci.bar_range());
+            assert_eq!(
+                record.prepared_device().guest_range(),
+                expected.pmem().guest_range()
+            );
+            assert_eq!(
+                record.prepared_device().config_space(),
+                expected.pmem().config_space()
+            );
+        }
+        let debug = format!("{pci:?}");
+        for secret in ["pmem-selector", "root=", "PARTUUID"] {
+            assert!(!debug.contains(secret));
+        }
+        pci.abort()
+            .expect("PCI handoff should release every unpublished owner");
+    }
+}
+
+#[test]
+fn pci_handoff_rejects_mmio_and_allocation_faults_with_clean_owner_release() {
+    let mmio = fixture_graph(SnapshotV2DeviceTransportKind::Mmio, 0, 1, None);
+    let memory = restore_memory_for(&mmio);
+    let (_files, blocks, pmems) = restore_backings(&mmio);
+    let bundle = SnapshotV2StorageRestorePlan::prepare(mmio, &memory, Instant::now())
+        .expect("MMIO rejection plan should prepare")
+        .prepare_backings(blocks, pmems, || false)
+        .expect("MMIO rejection bundle should prepare");
+    let error = bundle
+        .prepare_pci_transport()
+        .expect_err("MMIO storage must not fall back to PCI");
+    assert!(!error.cleanup_failed());
+
+    let graph = fixture_graph(
+        SnapshotV2DeviceTransportKind::Pci,
+        2,
+        1,
+        Some(DEVICE_KIND_BLOCK),
+    );
+    let memory = restore_memory_for(&graph);
+    let (_files, blocks, pmems) = restore_backings(&graph);
+    let bundle = SnapshotV2StorageRestorePlan::prepare(graph, &memory, Instant::now())
+        .expect("allocation handoff plan should prepare")
+        .prepare_backings(blocks, pmems, || false)
+        .expect("allocation handoff bundle should prepare");
+    let async_runtime = bundle
+        .block_bundle()
+        .and_then(|bundle| bundle.async_runtime())
+        .cloned();
+    let error = super::restore::prepare_pci_transport_with_failing_reserve_for_test(bundle)
+        .expect_err("pmem PCI record reservation should fail explicitly");
+    assert!(!error.cleanup_failed());
+    if let Some(runtime) = async_runtime {
+        assert_eq!(
+            runtime
+                .generation_count()
+                .expect("Async runtime should remain observable"),
+            0
+        );
+    }
+}
+
+#[test]
 fn profile_identity_is_exact_distinct_and_bounded() {
     assert_eq!(
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,

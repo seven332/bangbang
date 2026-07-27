@@ -3,16 +3,19 @@
 use std::fmt;
 use std::time::Instant;
 
-use bangbang_runtime::block::{BlockMmioLayout, BlockMmioRegistrationError};
+use bangbang_runtime::block::{
+    BlockMmioLayout, BlockMmioRegistrationError, VIRTIO_BLOCK_QUEUE_SIZES,
+};
 use bangbang_runtime::boot::{
     BootCommandLineError, canonical_process_block_command_line,
     canonical_process_root_block_command_line, canonical_process_root_pmem_command_line,
 };
-use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
+use bangbang_runtime::fdt::{Arm64FdtPciHost, Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
 use bangbang_runtime::interrupt::GuestInterruptLine;
 use bangbang_runtime::memory::{GuestAddress, GuestMemoryRange};
-use bangbang_runtime::mmio::MmioRegion;
-use bangbang_runtime::pmem::{PmemMmioLayout, PmemMmioRegistrationError};
+use bangbang_runtime::mmio::{MmioRegion, MmioRegionId};
+use bangbang_runtime::pci::{Arm64PciAddressPlan, PCI_FIRST_ENDPOINT_DEVICE, PciSbdf};
+use bangbang_runtime::pmem::{PmemMmioLayout, PmemMmioRegistrationError, VIRTIO_PMEM_QUEUE_SIZES};
 use bangbang_runtime::pvtime::ARM64_PVTIME_STRUCTURE_SIZE;
 use bangbang_runtime::rtc::{RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use bangbang_runtime::serial::SERIAL_MMIO_DEVICE_WINDOW_SIZE;
@@ -22,14 +25,22 @@ use bangbang_runtime::snapshot_device_v2::{
 use bangbang_runtime::snapshot_device_v2_6::{
     NATIVE_V2_STORAGE_DEVICE_GRAPH_MAX_RECORDS, PreparedSnapshotV2StorageBundle,
 };
-use bangbang_runtime::storage_capture::StorageRetryState;
+use bangbang_runtime::storage_capture::{StorageDeviceOrigin, StorageRetryState};
 
-use crate::gic::{HvfGicInterruptLineAllocator, HvfGicMetadata, HvfInterruptLineAllocationError};
+use crate::gic::{
+    HvfGicInterruptLineAllocator, HvfGicMetadata, HvfGicMsiMetadata,
+    HvfInterruptLineAllocationError,
+};
 use crate::snapshot_v2::HvfSnapshotV2PlatformState;
+use crate::snapshot_v2_multi_block_platform::{
+    snapshot_v2_pci_endpoint_placement, snapshot_v2_pci_endpoint_route_count,
+    valid_snapshot_v2_pci_record,
+};
 use crate::snapshot_v2_platform::{
     PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID, PROCESS_SERIAL_MMIO_BASE,
     PROCESS_SERIAL_MMIO_REGION_ID,
 };
+use crate::startup::{PCI_ENDPOINT_SLOT_COUNT, pci_root_restore_gic_msi_configuration};
 
 const REDACTED: &str = "<redacted>";
 
@@ -251,6 +262,209 @@ impl fmt::Debug for HvfSnapshotV2StorageMmioPlatformPlan {
     }
 }
 
+/// One canonical exact-2.6 PCI endpoint in combined block-then-pmem order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HvfSnapshotV2StoragePciRecordPlan {
+    key: SnapshotV2DeviceKey,
+    origin: StorageDeviceOrigin,
+    sbdf: PciSbdf,
+    bar_region_id: MmioRegionId,
+    bar_range: GuestMemoryRange,
+    route_count: usize,
+}
+
+impl HvfSnapshotV2StoragePciRecordPlan {
+    pub const fn key(self) -> SnapshotV2DeviceKey {
+        self.key
+    }
+
+    pub const fn origin(self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    pub const fn sbdf(self) -> PciSbdf {
+        self.sbdf
+    }
+
+    pub const fn bar_region_id(self) -> MmioRegionId {
+        self.bar_region_id
+    }
+
+    pub const fn bar_range(self) -> GuestMemoryRange {
+        self.bar_range
+    }
+
+    pub const fn route_count(self) -> usize {
+        self.route_count
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2StoragePciRecordPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2StoragePciRecordPlan")
+            .field("origin", &self.origin)
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// One canonical PCI host shared by every exact-2.6 storage endpoint.
+pub struct HvfSnapshotV2StoragePciHostPlan {
+    host: Arm64FdtPciHost,
+    msi: HvfGicMsiMetadata,
+    route_demand: usize,
+    block_records: Vec<HvfSnapshotV2StoragePciRecordPlan>,
+    pmem_records: Vec<HvfSnapshotV2StoragePciRecordPlan>,
+}
+
+impl HvfSnapshotV2StoragePciHostPlan {
+    pub const fn host(&self) -> Arm64FdtPciHost {
+        self.host
+    }
+
+    pub const fn msi(&self) -> HvfGicMsiMetadata {
+        self.msi
+    }
+
+    pub const fn route_demand(&self) -> usize {
+        self.route_demand
+    }
+
+    pub fn block_records(&self) -> &[HvfSnapshotV2StoragePciRecordPlan] {
+        &self.block_records
+    }
+
+    pub fn pmem_records(&self) -> &[HvfSnapshotV2StoragePciRecordPlan] {
+        &self.pmem_records
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.block_records.len() + self.pmem_records.len()
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2StoragePciHostPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2StoragePciHostPlan")
+            .field("block_count", &self.block_records.len())
+            .field("pmem_count", &self.pmem_records.len())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Complete pre-HVF exact-2.6 heterogeneous PCI storage proof.
+pub struct HvfSnapshotV2StoragePciPlatformPlan {
+    root_key: Option<SnapshotV2DeviceKey>,
+    command_line: String,
+    block_metrics_ids: Vec<String>,
+    pmem_metrics_ids: Vec<String>,
+    block_retries: Vec<HvfSnapshotV2StorageRetryPlan>,
+    pmem_retries: Vec<HvfSnapshotV2StorageRetryPlan>,
+    pci: HvfSnapshotV2StoragePciHostPlan,
+    serial_interrupt: GuestInterruptLine,
+    vmgenid_interrupt: GuestInterruptLine,
+    vmclock_interrupt: GuestInterruptLine,
+}
+
+pub(crate) struct HvfSnapshotV2StoragePciPlatformPlanParts {
+    pub(crate) root_key: Option<SnapshotV2DeviceKey>,
+    pub(crate) command_line: String,
+    pub(crate) block_metrics_ids: Vec<String>,
+    pub(crate) pmem_metrics_ids: Vec<String>,
+    pub(crate) block_retries: Vec<HvfSnapshotV2StorageRetryPlan>,
+    pub(crate) pmem_retries: Vec<HvfSnapshotV2StorageRetryPlan>,
+    pub(crate) pci: HvfSnapshotV2StoragePciHostPlan,
+    pub(crate) serial_interrupt: GuestInterruptLine,
+    pub(crate) vmgenid_interrupt: GuestInterruptLine,
+    pub(crate) vmclock_interrupt: GuestInterruptLine,
+}
+
+impl HvfSnapshotV2StoragePciPlatformPlan {
+    pub const fn root_key(&self) -> Option<SnapshotV2DeviceKey> {
+        self.root_key
+    }
+
+    pub fn command_line(&self) -> &str {
+        &self.command_line
+    }
+
+    pub fn block_metrics_ids(&self) -> &[String] {
+        &self.block_metrics_ids
+    }
+
+    pub fn pmem_metrics_ids(&self) -> &[String] {
+        &self.pmem_metrics_ids
+    }
+
+    pub fn block_retries(&self) -> &[HvfSnapshotV2StorageRetryPlan] {
+        &self.block_retries
+    }
+
+    pub fn pmem_retries(&self) -> &[HvfSnapshotV2StorageRetryPlan] {
+        &self.pmem_retries
+    }
+
+    pub fn earliest_block_retry_deadline(&self) -> Option<Instant> {
+        self.block_retries
+            .iter()
+            .filter_map(|retry| retry.retry_deadline)
+            .min()
+    }
+
+    pub fn earliest_pmem_retry_deadline(&self) -> Option<Instant> {
+        self.pmem_retries
+            .iter()
+            .filter_map(|retry| retry.retry_deadline)
+            .min()
+    }
+
+    pub const fn pci(&self) -> &HvfSnapshotV2StoragePciHostPlan {
+        &self.pci
+    }
+
+    pub const fn serial_interrupt(&self) -> GuestInterruptLine {
+        self.serial_interrupt
+    }
+
+    pub const fn vmgenid_interrupt(&self) -> GuestInterruptLine {
+        self.vmgenid_interrupt
+    }
+
+    pub const fn vmclock_interrupt(&self) -> GuestInterruptLine {
+        self.vmclock_interrupt
+    }
+
+    pub(crate) fn into_parts(self) -> HvfSnapshotV2StoragePciPlatformPlanParts {
+        HvfSnapshotV2StoragePciPlatformPlanParts {
+            root_key: self.root_key,
+            command_line: self.command_line,
+            block_metrics_ids: self.block_metrics_ids,
+            pmem_metrics_ids: self.pmem_metrics_ids,
+            block_retries: self.block_retries,
+            pmem_retries: self.pmem_retries,
+            pci: self.pci,
+            serial_interrupt: self.serial_interrupt,
+            vmgenid_interrupt: self.vmgenid_interrupt,
+            vmclock_interrupt: self.vmclock_interrupt,
+        }
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2StoragePciPlatformPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2StoragePciPlatformPlan")
+            .field("block_count", &self.pci.block_records.len())
+            .field("pmem_count", &self.pci.pmem_records.len())
+            .field("has_root", &self.root_key.is_some())
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
 /// Redacted rejection from exact-2.6 host-free MMIO platform planning.
 pub enum PrepareHvfSnapshotV2StorageMmioPlatformPlanError {
     PlatformProfile,
@@ -331,6 +545,88 @@ impl std::error::Error for PrepareHvfSnapshotV2StorageMmioPlatformPlanError {
             | Self::QueuePlatformConflict
             | Self::PmemRangeConflict
             | Self::ResourcePlan => None,
+        }
+    }
+}
+
+/// Redacted rejection from exact-2.6 host-free PCI platform planning.
+pub enum PrepareHvfSnapshotV2StoragePciPlatformPlanError {
+    PlatformProfile,
+    Cardinality,
+    Allocation,
+    RecordIdentity,
+    RootIdentity,
+    TransportPolicy,
+    CommandLine(BootCommandLineError),
+    QueuePlatformConflict,
+    PmemRangeConflict,
+    Interrupt(HvfInterruptLineAllocationError),
+    ResourcePlan,
+    PciCapacity { count: usize, maximum: usize },
+}
+
+impl fmt::Debug for PrepareHvfSnapshotV2StoragePciPlatformPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let category = match self {
+            Self::PlatformProfile => "platform-profile",
+            Self::Cardinality => "cardinality",
+            Self::Allocation => "allocation",
+            Self::RecordIdentity => "record-identity",
+            Self::RootIdentity => "root-identity",
+            Self::TransportPolicy => "transport-policy",
+            Self::CommandLine(_) => "command-line",
+            Self::QueuePlatformConflict => "queue-platform-conflict",
+            Self::PmemRangeConflict => "pmem-range-conflict",
+            Self::Interrupt(_) => "interrupt",
+            Self::ResourcePlan => "resource-plan",
+            Self::PciCapacity { .. } => "pci-capacity",
+        };
+        formatter
+            .debug_struct("PrepareHvfSnapshotV2StoragePciPlatformPlanError")
+            .field("category", &category)
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+impl fmt::Display for PrepareHvfSnapshotV2StoragePciPlatformPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PlatformProfile => "native-v2 storage PCI platform profile is not canonical",
+            Self::Cardinality => "native-v2 storage PCI platform cardinality is inconsistent",
+            Self::Allocation => "native-v2 storage PCI platform allocation failed",
+            Self::RecordIdentity => "native-v2 storage PCI record identity is inconsistent",
+            Self::RootIdentity => "native-v2 storage PCI root identity is inconsistent",
+            Self::TransportPolicy => "native-v2 storage PCI transport policy is inconsistent",
+            Self::CommandLine(_) => "native-v2 storage PCI process command line is invalid",
+            Self::QueuePlatformConflict => {
+                "native-v2 storage PCI queue overlaps platform-owned memory"
+            }
+            Self::PmemRangeConflict => {
+                "native-v2 storage PCI pmem mapping overlaps platform-owned resources"
+            }
+            Self::Interrupt(_) => "native-v2 storage PCI interrupt demand is invalid",
+            Self::ResourcePlan => "native-v2 storage PCI platform resources are inconsistent",
+            Self::PciCapacity { .. } => "native-v2 storage PCI endpoint capacity is exceeded",
+        })
+    }
+}
+
+impl std::error::Error for PrepareHvfSnapshotV2StoragePciPlatformPlanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CommandLine(source) => Some(source),
+            Self::Interrupt(source) => Some(source),
+            Self::PlatformProfile
+            | Self::Cardinality
+            | Self::Allocation
+            | Self::RecordIdentity
+            | Self::RootIdentity
+            | Self::TransportPolicy
+            | Self::QueuePlatformConflict
+            | Self::PmemRangeConflict
+            | Self::ResourcePlan
+            | Self::PciCapacity { .. } => None,
         }
     }
 }
@@ -606,6 +902,388 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
     })
 }
 
+/// Proves one complete exact-2.6 block-then-pmem PCI product before any live
+/// Hypervisor.framework construction.
+pub fn prepare_hvf_snapshot_v2_storage_pci_platform_plan(
+    platform: &HvfSnapshotV2PlatformState,
+    bundle: &PreparedSnapshotV2StorageBundle,
+) -> Result<HvfSnapshotV2StoragePciPlatformPlan, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+    prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
+        platform,
+        bundle,
+        &mut SystemStoragePciPlatformPlanReserve,
+    )
+}
+
+fn prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
+    platform: &HvfSnapshotV2PlatformState,
+    bundle: &PreparedSnapshotV2StorageBundle,
+    reserve: &mut impl StoragePciPlatformPlanReserve,
+) -> Result<HvfSnapshotV2StoragePciPlatformPlan, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+    if !platform.machine().fdt().is_product_process_profile()
+        || platform.time().rtc_layout()
+            != RtcMmioLayout::new(PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID)
+    {
+        return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::PlatformProfile);
+    }
+    if bundle.transport_kind() != SnapshotV2DeviceTransportKind::Pci {
+        return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::TransportPolicy);
+    }
+
+    let block_records = bundle
+        .block_bundle()
+        .map_or(&[][..], |block| block.records());
+    let block_configs = bundle
+        .block_bundle()
+        .map_or(&[][..], |block| block.drive_configs().as_slice());
+    let block_retry_projection = bundle
+        .block_bundle()
+        .map_or(&[][..], |block| block.retry_projection());
+    let pmem_records = bundle.pmem_records();
+    let pmem_configs = bundle.pmem_configs().as_slice();
+    let record_count = block_records
+        .len()
+        .checked_add(pmem_records.len())
+        .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::Cardinality)?;
+    if record_count == 0
+        || record_count > usize::from(NATIVE_V2_STORAGE_DEVICE_GRAPH_MAX_RECORDS)
+        || block_records.len() != block_configs.len()
+        || block_records.len() != block_retry_projection.len()
+        || pmem_records.len() != pmem_configs.len()
+    {
+        return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::Cardinality);
+    }
+    if record_count > PCI_ENDPOINT_SLOT_COUNT {
+        return Err(
+            PrepareHvfSnapshotV2StoragePciPlatformPlanError::PciCapacity {
+                count: record_count,
+                maximum: PCI_ENDPOINT_SLOT_COUNT,
+            },
+        );
+    }
+
+    let gic = platform.global().compatibility().gic_metadata();
+    let msi = gic
+        .msi
+        .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    let expected_msi = pci_root_restore_gic_msi_configuration()
+        .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    if msi.interrupt_range.count != expected_msi.interrupt_count().get() {
+        return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan);
+    }
+    let address_plan = Arm64PciAddressPlan::firecracker_v1_16()
+        .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+
+    let block_route_count = snapshot_v2_pci_endpoint_route_count(VIRTIO_BLOCK_QUEUE_SIZES.len())
+        .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    let pmem_route_count = snapshot_v2_pci_endpoint_route_count(VIRTIO_PMEM_QUEUE_SIZES.len())
+        .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    let route_demand = block_records
+        .len()
+        .checked_mul(block_route_count)
+        .and_then(|demand| {
+            pmem_records
+                .len()
+                .checked_mul(pmem_route_count)
+                .and_then(|pmem| demand.checked_add(pmem))
+        })
+        .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    if route_demand
+        > usize::try_from(msi.interrupt_range.count)
+            .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?
+    {
+        return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan);
+    }
+
+    let mut block_metrics_ids = Vec::new();
+    let mut pmem_metrics_ids = Vec::new();
+    let mut block_retries = Vec::new();
+    let mut pmem_retries = Vec::new();
+    let mut planned_block = Vec::new();
+    let mut planned_pmem = Vec::new();
+    let mut planned_pmem_ranges = Vec::new();
+    let mut all_queue_ranges = Vec::new();
+    let mut active_msi_routes = Vec::new();
+    let mut used_pci_slots = Vec::new();
+    reserve.reserve(&mut block_metrics_ids, block_records.len())?;
+    reserve.reserve(&mut pmem_metrics_ids, pmem_records.len())?;
+    reserve.reserve(&mut block_retries, block_records.len())?;
+    reserve.reserve(&mut pmem_retries, pmem_records.len())?;
+    reserve.reserve(&mut planned_block, block_records.len())?;
+    reserve.reserve(&mut planned_pmem, pmem_records.len())?;
+    reserve.reserve(&mut planned_pmem_ranges, pmem_records.len())?;
+    reserve.reserve(&mut all_queue_ranges, record_count.saturating_mul(3))?;
+    reserve.reserve(&mut active_msi_routes, route_demand)?;
+    reserve.reserve(&mut used_pci_slots, record_count)?;
+
+    for ranges in block_records
+        .iter()
+        .filter_map(|record| record.queue_ranges())
+        .chain(
+            pmem_records
+                .iter()
+                .filter_map(|record| record.queue_ranges()),
+        )
+    {
+        all_queue_ranges.extend(ranges);
+    }
+
+    let mut root_key = None;
+    let mut root = None;
+    for ((record, config), projected_retry) in block_records
+        .iter()
+        .zip(block_configs)
+        .zip(block_retry_projection)
+    {
+        let read_only = config
+            .is_read_only()
+            .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::RecordIdentity)?;
+        if record.transport().kind() != SnapshotV2DeviceTransportKind::Pci
+            || record.key() != projected_retry.key()
+            || record.retry() != projected_retry.retry()
+            || record.retry_deadline() != projected_retry.retry_deadline()
+            || record.drive_id() != config.drive_id()
+            || record.is_root_device() != config.is_root_device()
+            || record.config_space().is_read_only() != read_only
+            || record.device().device().io_engine() != config.io_engine()
+            || record.device().cache_type() != config.cache_type()
+            || config.is_vhost_user()
+            || block_metrics_ids
+                .iter()
+                .any(|candidate| candidate == config.drive_id())
+        {
+            return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::RecordIdentity);
+        }
+        if queue_ranges_conflict_with_pci_platform(
+            platform,
+            record.queue_ranges(),
+            &gic,
+            address_plan,
+        )? {
+            return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::QueuePlatformConflict);
+        }
+        if config.is_root_device() {
+            if root_key.replace(record.key()).is_some() || root.is_some() {
+                return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::RootIdentity);
+            }
+            root = Some(StorageRoot::Block {
+                partuuid: config.partuuid(),
+                read_only,
+            });
+        }
+        block_metrics_ids.push(pci_try_clone(config.drive_id())?);
+        block_retries.push(HvfSnapshotV2StorageRetryPlan {
+            key: record.key(),
+            retry: record.retry(),
+            retry_deadline: record.retry_deadline(),
+        });
+        let planned = plan_pci_record(
+            record.key(),
+            record.transport(),
+            block_route_count,
+            VIRTIO_BLOCK_QUEUE_SIZES.len(),
+            msi,
+            address_plan,
+            &mut active_msi_routes,
+            &mut used_pci_slots,
+        )?;
+        planned_block.push(planned);
+    }
+
+    for (pmem_index, (record, config)) in pmem_records.iter().zip(pmem_configs).enumerate() {
+        let prepared = record.prepared_device();
+        let guest_range = prepared.guest_range();
+        if record.transport().kind() != SnapshotV2DeviceTransportKind::Pci
+            || record.pmem_id() != config.id()
+            || record.is_root_device() != config.root_device()
+            || prepared.id() != config.id()
+            || prepared.backing().is_read_only() != config.read_only()
+            || prepared.mapping().is_read_only() != config.read_only()
+            || prepared.rate_limiter() != config.rate_limiter()
+            || prepared.config_space().available_features() != record.virtio().available_features()
+            || prepared.mapping().mapped_len() != guest_range.size()
+            || pmem_metrics_ids
+                .iter()
+                .any(|candidate| candidate == config.id())
+        {
+            return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::RecordIdentity);
+        }
+        if mapping_range_conflicts_with_pci_platform(platform, guest_range, &gic, address_plan)?
+            || planned_pmem_ranges
+                .iter()
+                .any(|planned: &GuestMemoryRange| planned.overlaps(guest_range))
+            || all_queue_ranges
+                .iter()
+                .any(|queue| queue.overlaps(guest_range))
+        {
+            return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::PmemRangeConflict);
+        }
+        if queue_ranges_conflict_with_pci_platform(
+            platform,
+            record.queue_ranges(),
+            &gic,
+            address_plan,
+        )? {
+            return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::QueuePlatformConflict);
+        }
+        if config.root_device() {
+            if root_key.replace(record.key()).is_some() || root.is_some() {
+                return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::RootIdentity);
+            }
+            root = Some(StorageRoot::Pmem {
+                index: pmem_index,
+                read_only: config.read_only(),
+            });
+        }
+        pmem_metrics_ids.push(pci_try_clone(config.id())?);
+        pmem_retries.push(HvfSnapshotV2StorageRetryPlan {
+            key: record.key(),
+            retry: record.retry(),
+            retry_deadline: record.retry_deadline(),
+        });
+        let planned = plan_pci_record(
+            record.key(),
+            record.transport(),
+            pmem_route_count,
+            VIRTIO_PMEM_QUEUE_SIZES.len(),
+            msi,
+            address_plan,
+            &mut active_msi_routes,
+            &mut used_pci_slots,
+        )?;
+        planned_pmem_ranges.push(guest_range);
+        planned_pmem.push(planned);
+    }
+
+    if bundle.root_key() != root_key || bundle.root_key().is_some() != root.is_some() {
+        return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::RootIdentity);
+    }
+    let base_arguments = platform.machine().boot().boot_arguments();
+    let command_line = match root {
+        Some(StorageRoot::Block {
+            partuuid,
+            read_only,
+        }) => canonical_process_root_block_command_line(base_arguments, true, partuuid, read_only),
+        Some(StorageRoot::Pmem { index, read_only }) => {
+            canonical_process_root_pmem_command_line(base_arguments, true, index, read_only)
+        }
+        None => canonical_process_block_command_line(base_arguments, true),
+    }
+    .map_err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::CommandLine)?;
+
+    let mut interrupt_allocator = HvfGicInterruptLineAllocator::from_metadata(&gic)
+        .map_err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::Interrupt)?;
+    let serial_interrupt = interrupt_allocator
+        .allocate()
+        .map_err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::Interrupt)?;
+    let vmgenid_interrupt = interrupt_allocator
+        .allocate()
+        .map_err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::Interrupt)?;
+    let vmclock_interrupt = interrupt_allocator
+        .allocate()
+        .map_err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::Interrupt)?;
+    if platform.time().vmgenid().interrupt_line() != vmgenid_interrupt
+        || platform.time().vmclock().interrupt_line() != vmclock_interrupt
+        || planned_block.len() + planned_pmem.len() != record_count
+    {
+        return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan);
+    }
+
+    Ok(HvfSnapshotV2StoragePciPlatformPlan {
+        root_key,
+        command_line,
+        block_metrics_ids,
+        pmem_metrics_ids,
+        block_retries,
+        pmem_retries,
+        pci: HvfSnapshotV2StoragePciHostPlan {
+            host: Arm64FdtPciHost::from_address_plan(address_plan),
+            msi,
+            route_demand,
+            block_records: planned_block,
+            pmem_records: planned_pmem,
+        },
+        serial_interrupt,
+        vmgenid_interrupt,
+        vmclock_interrupt,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_pci_record(
+    key: SnapshotV2DeviceKey,
+    transport: &SnapshotV2DeviceTransport,
+    route_count: usize,
+    queue_count: usize,
+    msi: HvfGicMsiMetadata,
+    address_plan: Arm64PciAddressPlan,
+    active_routes: &mut Vec<(u64, u32)>,
+    used_slots: &mut Vec<usize>,
+) -> Result<HvfSnapshotV2StoragePciRecordPlan, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+    let SnapshotV2DeviceTransport::Pci(captured) = transport else {
+        return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::TransportPolicy);
+    };
+    let slot = captured
+        .sbdf()
+        .device()
+        .checked_sub(PCI_FIRST_ENDPOINT_DEVICE)
+        .map(usize::from)
+        .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    let placement = snapshot_v2_pci_endpoint_placement(address_plan, slot)
+        .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    if captured.sbdf() != placement.sbdf
+        || captured.bar_range() != placement.bar_range
+        || used_slots.contains(&slot)
+        || !valid_snapshot_v2_pci_record(captured, msi, queue_count)
+        || !register_active_pci_routes(captured, active_routes)
+    {
+        return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan);
+    }
+    used_slots.push(slot);
+    Ok(HvfSnapshotV2StoragePciRecordPlan {
+        key,
+        origin: captured.origin(),
+        sbdf: placement.sbdf,
+        bar_region_id: placement.bar_region_id,
+        bar_range: placement.bar_range,
+        route_count,
+    })
+}
+
+fn register_active_pci_routes(
+    state: &bangbang_runtime::snapshot_device_v2::SnapshotV2PciDeviceState,
+    active_routes: &mut Vec<(u64, u32)>,
+) -> bool {
+    state
+        .msix()
+        .entries()
+        .iter()
+        .enumerate()
+        .all(|(index, entry)| {
+            let Ok(vector) = u16::try_from(index) else {
+                return false;
+            };
+            let referenced = state.msix().config_vector() == vector
+                || state.msix().queue_vectors().contains(&vector);
+            let pending = state
+                .msix()
+                .pending_words()
+                .get(index / u64::BITS as usize)
+                .is_some_and(|word| word & (1_u64 << (index % u64::BITS as usize)) != 0);
+            if entry.vector_control() & 1 != 0 || (!referenced && !pending) {
+                return true;
+            }
+            let address = (u64::from(entry.message_address_high()) << 32)
+                | u64::from(entry.message_address_low());
+            let route = (address, entry.message_data());
+            if active_routes.contains(&route) {
+                return false;
+            }
+            active_routes.push(route);
+            true
+        })
+}
+
 fn validate_platform_profile(
     platform: &HvfSnapshotV2PlatformState,
 ) -> Result<(), PrepareHvfSnapshotV2StorageMmioPlatformPlanError> {
@@ -786,6 +1464,103 @@ fn mmio_region_conflicts_with_platform(
     Ok(false)
 }
 
+fn queue_ranges_conflict_with_pci_platform(
+    platform: &HvfSnapshotV2PlatformState,
+    queue_ranges: Option<[GuestMemoryRange; 3]>,
+    gic: &HvfGicMetadata,
+    address_plan: Arm64PciAddressPlan,
+) -> Result<bool, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+    let Some(queue_ranges) = queue_ranges else {
+        return Ok(false);
+    };
+    let fdt = platform.machine().fdt();
+    let fdt_range = GuestMemoryRange::new(fdt.address(), u64::from(fdt.size()))
+        .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    let msi = gic
+        .msi
+        .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    let fixed = [
+        fdt_range,
+        platform.time().vmgenid().range(),
+        platform.time().vmclock().range(),
+        gic_region_range(gic.distributor)
+            .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?,
+        gic_region_range(gic.redistributor.region)
+            .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?,
+        gic_region_range(msi.region)
+            .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?,
+        address_plan.ecam_reservation(),
+        address_plan.bar32(),
+        address_plan.bar64(),
+    ];
+    if queue_ranges
+        .iter()
+        .any(|queue| fixed.into_iter().any(|reserved| queue.overlaps(reserved)))
+    {
+        return Ok(true);
+    }
+    let pvtime_size = u64::try_from(ARM64_PVTIME_STRUCTURE_SIZE)
+        .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    for record in platform.time().pvtime_vcpus() {
+        let range = GuestMemoryRange::new(record.record_ipa(), pvtime_size)
+            .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+        if queue_ranges.iter().any(|queue| queue.overlaps(range)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn mapping_range_conflicts_with_pci_platform(
+    platform: &HvfSnapshotV2PlatformState,
+    range: GuestMemoryRange,
+    gic: &HvfGicMetadata,
+    address_plan: Arm64PciAddressPlan,
+) -> Result<bool, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+    if platform
+        .memory()
+        .extents()
+        .iter()
+        .any(|extent| range.overlaps(extent.range()))
+    {
+        return Ok(true);
+    }
+    let fdt = platform.machine().fdt();
+    let msi = gic
+        .msi
+        .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    let fixed = [
+        GuestMemoryRange::new(fdt.address(), u64::from(fdt.size())),
+        Ok(platform.time().vmgenid().range()),
+        Ok(platform.time().vmclock().range()),
+        GuestMemoryRange::new(PROCESS_SERIAL_MMIO_BASE, SERIAL_MMIO_DEVICE_WINDOW_SIZE),
+        GuestMemoryRange::new(PROCESS_RTC_MMIO_BASE, RTC_MMIO_DEVICE_WINDOW_SIZE),
+        gic_region_range(gic.distributor),
+        gic_region_range(gic.redistributor.region),
+        gic_region_range(msi.region),
+        Ok(address_plan.ecam_reservation()),
+        Ok(address_plan.bar32()),
+        Ok(address_plan.bar64()),
+    ];
+    for fixed in fixed {
+        let fixed =
+            fixed.map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+        if range.overlaps(fixed) {
+            return Ok(true);
+        }
+    }
+    let pvtime_size = u64::try_from(ARM64_PVTIME_STRUCTURE_SIZE)
+        .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+    for record in platform.time().pvtime_vcpus() {
+        let pvtime = GuestMemoryRange::new(record.record_ipa(), pvtime_size)
+            .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
+        if range.overlaps(pvtime) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn gic_region_range(
     region: crate::gic::HvfGicRegion,
 ) -> Result<GuestMemoryRange, bangbang_runtime::memory::GuestMemoryError> {
@@ -797,6 +1572,15 @@ fn try_clone(value: &str) -> Result<String, PrepareHvfSnapshotV2StorageMmioPlatf
     cloned
         .try_reserve_exact(value.len())
         .map_err(|_| PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Allocation)?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
+fn pci_try_clone(value: &str) -> Result<String, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve_exact(value.len())
+        .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::Allocation)?;
     cloned.push_str(value);
     Ok(cloned)
 }
@@ -823,8 +1607,30 @@ impl StoragePlatformPlanReserve for SystemStoragePlatformPlanReserve {
     }
 }
 
+trait StoragePciPlatformPlanReserve {
+    fn reserve<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        additional: usize,
+    ) -> Result<(), PrepareHvfSnapshotV2StoragePciPlatformPlanError>;
+}
+
+struct SystemStoragePciPlatformPlanReserve;
+
+impl StoragePciPlatformPlanReserve for SystemStoragePciPlatformPlanReserve {
+    fn reserve<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        additional: usize,
+    ) -> Result<(), PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+        values
+            .try_reserve_exact(additional)
+            .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::Allocation)
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs::{self, OpenOptions};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -856,6 +1662,10 @@ mod tests {
         include_str!("../../runtime/src/snapshot_device_v2_6/fixtures/mixed-block-root-mmio.hex");
     const PMEM_ROOTLESS_PCI_HEX: &str =
         include_str!("../../runtime/src/snapshot_device_v2_6/fixtures/pmem-rootless-pci.hex");
+    const BLOCK_ROOTLESS_PCI_HEX: &str =
+        include_str!("../../runtime/src/snapshot_device_v2_6/fixtures/block-rootless-pci.hex");
+    const MIXED_PMEM_ROOT_PCI_HEX: &str =
+        include_str!("../../runtime/src/snapshot_device_v2_6/fixtures/mixed-pmem-root-pci.hex");
     const PROFILE_2_ROOTLESS_MMIO_HEX: &str =
         include_str!("../../runtime/src/snapshot_device_v2_5/fixtures/rootless-mmio.hex");
 
@@ -1146,6 +1956,32 @@ mod tests {
         }
     }
 
+    fn pci_fixture(hex: &str) -> StorageFixture {
+        let graph = storage_graph(hex);
+        let platform = crate::snapshot_v2_multi_block_platform::tests::product_pci_platform();
+        let (bundle, files) = bundle_from_graph(graph);
+        StorageFixture {
+            platform,
+            bundle,
+            _files: files,
+        }
+    }
+
+    pub(crate) fn pci_fdt_plan_fixture() -> (
+        HvfSnapshotV2PlatformState,
+        HvfSnapshotV2StoragePciPlatformPlan,
+    ) {
+        let fixture = pci_fixture(MIXED_PMEM_ROOT_PCI_HEX);
+        let plan =
+            prepare_hvf_snapshot_v2_storage_pci_platform_plan(&fixture.platform, &fixture.bundle)
+                .expect("storage PCI FDT plan should validate");
+        fixture
+            .bundle
+            .abort()
+            .expect("storage PCI FDT bundle should abort");
+        (fixture.platform, plan)
+    }
+
     const fn process_config() -> HvfSnapshotV2StorageMmioProcessConfig {
         HvfSnapshotV2StorageMmioProcessConfig::new(
             BlockMmioLayout::new(BLOCK_MMIO_BASE, BLOCK_MMIO_REGION_ID),
@@ -1247,6 +2083,62 @@ mod tests {
     }
 
     #[test]
+    fn pci_shape_matrix_projects_one_combined_host_and_endpoint_order() {
+        for (hex, block_count, pmem_count, has_root) in [
+            (BLOCK_ROOTLESS_PCI_HEX, 1, 0, false),
+            (PMEM_ROOTLESS_PCI_HEX, 0, 1, false),
+            (MIXED_PMEM_ROOT_PCI_HEX, 1, 1, true),
+        ] {
+            let fixture = pci_fixture(hex);
+            let plan = prepare_hvf_snapshot_v2_storage_pci_platform_plan(
+                &fixture.platform,
+                &fixture.bundle,
+            )
+            .expect("storage PCI matrix entry should plan");
+            assert_eq!(plan.pci().block_records().len(), block_count);
+            assert_eq!(plan.pci().pmem_records().len(), pmem_count);
+            assert_eq!(plan.pci().record_count(), block_count + pmem_count);
+            assert_eq!(plan.root_key().is_some(), has_root);
+            assert!(!plan.command_line().contains("pci=off"));
+            if has_root {
+                assert!(plan.command_line().contains("root=/dev/pmem0"));
+            } else {
+                assert!(!plan.command_line().contains("root="));
+            }
+            let address_plan =
+                Arm64PciAddressPlan::firecracker_v1_16().expect("PCI plan should build");
+            let mut expected_routes = 0;
+            for (index, record) in plan
+                .pci()
+                .block_records()
+                .iter()
+                .chain(plan.pci().pmem_records())
+                .enumerate()
+            {
+                let placement = snapshot_v2_pci_endpoint_placement(address_plan, index)
+                    .expect("combined endpoint placement should exist");
+                assert_eq!(record.sbdf(), placement.sbdf);
+                assert_eq!(record.bar_region_id(), placement.bar_region_id);
+                assert_eq!(record.bar_range(), placement.bar_range);
+                expected_routes += record.route_count();
+            }
+            assert_eq!(plan.pci().route_demand(), expected_routes);
+            assert_eq!(
+                plan.pci().host(),
+                Arm64FdtPciHost::from_address_plan(address_plan)
+            );
+            let debug = format!("{plan:?}");
+            for secret in ["rootfs", "pmem_0", "PARTUUID", "root=/dev/pmem"] {
+                assert!(!debug.contains(secret));
+            }
+            fixture
+                .bundle
+                .abort()
+                .expect("planned PCI storage bundle should abort cleanly");
+        }
+    }
+
+    #[test]
     fn placement_interrupt_and_fixed_range_conflicts_fail_before_construction() {
         let fixture = fixture(FixtureShape::MixedBlockRoot);
         let shifted = HvfSnapshotV2StorageMmioProcessConfig::new(
@@ -1318,6 +2210,24 @@ mod tests {
         }
     }
 
+    impl StoragePciPlatformPlanReserve for FailingReserve {
+        fn reserve<T>(
+            &mut self,
+            values: &mut Vec<T>,
+            additional: usize,
+        ) -> Result<(), PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+            let call = self.calls;
+            self.calls = self.calls.saturating_add(1);
+            if call == self.fail_at {
+                Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::Allocation)
+            } else {
+                values
+                    .try_reserve_exact(additional)
+                    .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::Allocation)
+            }
+        }
+    }
+
     #[test]
     fn every_platform_inventory_reservation_reports_explicit_allocation_failure() {
         for fail_at in 0..7 {
@@ -1335,6 +2245,25 @@ mod tests {
                 .bundle
                 .abort()
                 .expect("allocation fixture should abort cleanly");
+        }
+    }
+
+    #[test]
+    fn every_pci_platform_inventory_reservation_reports_explicit_allocation_failure() {
+        for fail_at in 0..10 {
+            let fixture = pci_fixture(MIXED_PMEM_ROOT_PCI_HEX);
+            assert!(matches!(
+                prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
+                    &fixture.platform,
+                    &fixture.bundle,
+                    &mut FailingReserve { calls: 0, fail_at },
+                ),
+                Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::Allocation)
+            ));
+            fixture
+                .bundle
+                .abort()
+                .expect("PCI allocation fixture should abort cleanly");
         }
     }
 }

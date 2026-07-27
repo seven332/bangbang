@@ -49,6 +49,13 @@ use crate::startup::{
 const REDACTED: &str = "<redacted>";
 const PCI_GENERIC_WRITABLE_OFFSETS: [u16; 4] = [0x04, 0x05, 0x0c, 0x3c];
 
+#[derive(Clone, Copy)]
+pub(crate) struct HvfSnapshotV2PciEndpointPlacement {
+    pub(crate) sbdf: PciSbdf,
+    pub(crate) bar_region_id: MmioRegionId,
+    pub(crate) bar_range: GuestMemoryRange,
+}
+
 /// Destination process policy for a profile-2 block vector.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct HvfSnapshotV2MultiBlockProcessConfig {
@@ -828,46 +835,23 @@ fn prepare_pci_plan(
     let mut planned = Vec::new();
     reserve.reserve(&mut planned, records.len())?;
     for (index, record) in records.iter().enumerate() {
-        let device = PCI_FIRST_ENDPOINT_DEVICE
-            .checked_add(
-                u8::try_from(index)
-                    .map_err(|_| PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan)?,
-            )
+        let placement = snapshot_v2_pci_endpoint_placement(address_plan, index)
             .ok_or(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan)?;
-        let sbdf = PciSbdf::new(PCI_SEGMENT_ZERO, PCI_BUS_ZERO, device, PCI_FUNCTION_ZERO)
-            .map_err(|_| PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan)?;
-        let offset = u64::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_mul(VIRTIO_PCI_CAPABILITY_BAR_SIZE))
-            .ok_or(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan)?;
-        let bar_start = address_plan
-            .bar64()
-            .start()
-            .checked_add(offset)
-            .ok_or(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan)?;
-        let bar_range = GuestMemoryRange::new(bar_start, VIRTIO_PCI_CAPABILITY_BAR_SIZE)
-            .map_err(|_| PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan)?;
-        if bar_range.end_exclusive().raw_value() > address_plan.bar64().end_exclusive().raw_value()
-        {
-            return Err(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan);
-        }
-        let bar_region_id = pci_data_region_id(index)
-            .map_err(|_| PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan)?;
         let SnapshotV2DeviceTransport::Pci(captured) = record.transport() else {
             return Err(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::TransportPolicy);
         };
-        if captured.sbdf() != sbdf
-            || captured.bar_range() != bar_range
-            || !valid_pci_record(captured, msi)
+        if captured.sbdf() != placement.sbdf
+            || captured.bar_range() != placement.bar_range
+            || !valid_snapshot_v2_pci_record(captured, msi, VIRTIO_BLOCK_QUEUE_SIZES.len())
         {
             return Err(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan);
         }
         planned.push(HvfSnapshotV2MultiBlockPciRecordPlan {
             key: record.key(),
             origin: captured.origin(),
-            sbdf,
-            bar_region_id,
-            bar_range,
+            sbdf: placement.sbdf,
+            bar_region_id: placement.bar_region_id,
+            bar_range: placement.bar_range,
             route_count: routes_per_record,
         });
     }
@@ -893,9 +877,7 @@ fn pci_route_demand(
             },
         );
     }
-    let routes_per_record = VIRTIO_BLOCK_QUEUE_SIZES
-        .len()
-        .checked_add(1)
+    let routes_per_record = snapshot_v2_pci_endpoint_route_count(VIRTIO_BLOCK_QUEUE_SIZES.len())
         .ok_or(PrepareHvfSnapshotV2MultiBlockPlatformPlanError::ResourcePlan)?;
     let route_demand = record_count
         .checked_mul(routes_per_record)
@@ -909,7 +891,40 @@ fn pci_route_demand(
     Ok((routes_per_record, route_demand))
 }
 
-fn valid_pci_record(state: &SnapshotV2PciDeviceState, msi: HvfGicMsiMetadata) -> bool {
+pub(crate) fn snapshot_v2_pci_endpoint_placement(
+    address_plan: Arm64PciAddressPlan,
+    index: usize,
+) -> Option<HvfSnapshotV2PciEndpointPlacement> {
+    if index >= PCI_ENDPOINT_SLOT_COUNT {
+        return None;
+    }
+    let device = PCI_FIRST_ENDPOINT_DEVICE.checked_add(u8::try_from(index).ok()?)?;
+    let sbdf = PciSbdf::new(PCI_SEGMENT_ZERO, PCI_BUS_ZERO, device, PCI_FUNCTION_ZERO).ok()?;
+    let offset = u64::try_from(index)
+        .ok()?
+        .checked_mul(VIRTIO_PCI_CAPABILITY_BAR_SIZE)?;
+    let bar_start = address_plan.bar64().start().checked_add(offset)?;
+    let bar_range = GuestMemoryRange::new(bar_start, VIRTIO_PCI_CAPABILITY_BAR_SIZE).ok()?;
+    if bar_range.end_exclusive().raw_value() > address_plan.bar64().end_exclusive().raw_value() {
+        return None;
+    }
+    let bar_region_id = pci_data_region_id(index).ok()?;
+    Some(HvfSnapshotV2PciEndpointPlacement {
+        sbdf,
+        bar_region_id,
+        bar_range,
+    })
+}
+
+pub(crate) const fn snapshot_v2_pci_endpoint_route_count(queue_count: usize) -> Option<usize> {
+    queue_count.checked_add(1)
+}
+
+pub(crate) fn valid_snapshot_v2_pci_record(
+    state: &SnapshotV2PciDeviceState,
+    msi: HvfGicMsiMetadata,
+    queue_count: usize,
+) -> bool {
     state.phase() == VirtioPciEndpointPhase::Active
         && state.bar_index() == VIRTIO_PCI_CAPABILITY_BAR_INDEX
         && state.bar_address_space() == PciBarAddressSpace::Memory64
@@ -924,15 +939,15 @@ fn valid_pci_record(state: &SnapshotV2PciDeviceState, msi: HvfGicMsiMetadata) ->
             .iter()
             .map(|probe| probe.index())
             .eq([0, 1])
-        && valid_pci_msix(state.msix())
+        && valid_pci_msix(state.msix(), queue_count)
         && pci_msix_routes_match_gic(state.msix(), msi)
 }
 
-fn valid_pci_msix(state: &SnapshotV2PciMsixState) -> bool {
-    state.entries().len() == VIRTIO_BLOCK_QUEUE_SIZES.len() + 1
+fn valid_pci_msix(state: &SnapshotV2PciMsixState, queue_count: usize) -> bool {
+    state.entries().len() == queue_count + 1
         && state.entries().len() <= VIRTIO_PCI_MAX_MSIX_VECTORS
         && state.pending_words().len() == 1
-        && state.queue_vectors().len() == VIRTIO_BLOCK_QUEUE_SIZES.len()
+        && state.queue_vectors().len() == queue_count
         && state
             .pending_words()
             .first()
@@ -1412,7 +1427,7 @@ pub(crate) mod tests {
         (platform, fixture.bundle, plan)
     }
 
-    fn product_pci_platform() -> HvfSnapshotV2PlatformState {
+    pub(crate) fn product_pci_platform() -> HvfSnapshotV2PlatformState {
         let (platform, root, _process) =
             crate::snapshot_v2_platform::tests::pci_root_plan_fixture();
         drop(root);

@@ -6906,6 +6906,7 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
         HvfSnapshotV2NativePath, HvfSnapshotV2StorageMmioProcessConfig, HvfSnapshotV2StorageState,
         HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
         prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
+        prepare_hvf_snapshot_v2_storage_pci_platform_plan,
     };
     use bangbang_runtime::VmmAction;
     use bangbang_runtime::block::{
@@ -7565,14 +7566,23 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
             path_text(pci_startup_pmem.path()),
         )))
         .expect("startup PCI pmem should configure");
+    let pci_serial = SharedSerialOutputBuffer::default();
     let pci_session_config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
         PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
         NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
         VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
-        test_rtc_mmio_layout(),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
     )
-    .with_pci_enabled();
+    .with_pci_enabled()
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(pci_serial),
+    ));
     let mut pci_session = OwnedHvfArm64BootSession::new(&pci_controller, pci_session_config)
         .expect("signed startup PCI storage session should prepare");
 
@@ -7764,10 +7774,250 @@ fn capture_ready_storage_traverses_signed_mmio_and_pci_owners() {
     ] {
         assert!(!pci_debug.contains(&private_path));
     }
+
+    let pci_restored_layout =
+        GuestMemoryLayout::new(pci_session.runtime_resources().layout.ranges().to_vec())
+            .expect("PCI profile-3 destination layout should validate");
+    let mut pci_fault_memory = GuestMemory::allocate(&pci_restored_layout)
+        .expect("PCI profile-3 fault destination memory should allocate");
+    let mut pci_restored_memory = GuestMemory::allocate(&pci_restored_layout)
+        .expect("PCI profile-3 destination memory should allocate");
+    let pci_source_memory = pci_session
+        .guest_memory()
+        .expect("PCI profile-3 source memory should remain mapped");
+    let mut pci_copy_buffer = vec![0_u8; 64 * 1024];
+    for range in pci_restored_layout.ranges() {
+        let mut copied = 0_u64;
+        while copied < range.size() {
+            let count = usize::try_from(
+                (range.size() - copied).min(
+                    u64::try_from(pci_copy_buffer.len())
+                        .expect("PCI copy buffer length should fit u64"),
+                ),
+            )
+            .expect("PCI profile-3 copy count should fit usize");
+            let address = range
+                .start()
+                .checked_add(copied)
+                .expect("PCI profile-3 copy address should fit");
+            pci_source_memory
+                .read_slice(&mut pci_copy_buffer[..count], address)
+                .expect("PCI profile-3 source memory should read");
+            pci_fault_memory
+                .write_slice(&pci_copy_buffer[..count], address)
+                .expect("PCI profile-3 fault destination memory should write");
+            pci_restored_memory
+                .write_slice(&pci_copy_buffer[..count], address)
+                .expect("PCI profile-3 destination memory should write");
+            copied += u64::try_from(count).expect("PCI copy count should fit u64");
+        }
+    }
+    pci_session
+        .pause_for_snapshot_v2_capture()
+        .expect("PCI profile-3 source should pause");
+    let pci_boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(pci_kernel.path().as_os_str())
+            .expect("PCI profile-3 kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("PCI profile-3 boot metadata should validate");
+    let pci_memory = TempFile::new_len("capture-ready-pci-profile-3-memory", 0)
+        .expect("PCI profile-3 memory artifact should create");
+    let mut pci_memory_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pci_memory.path())
+        .expect("PCI profile-3 memory artifact should open");
+    let pci_platform = pci_session
+        .capture_snapshot_v2_storage_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(pci_boot),
+            &mut pci_memory_writer,
+            |_| false,
+        )
+        .expect("PCI exact 2.6 platform should capture");
+    assert_eq!(
+        pci_memory_writer
+            .metadata()
+            .expect("PCI profile-3 memory metadata should read")
+            .len(),
+        pci_platform.memory().file_length()
+    );
+    drop(pci_memory_writer);
     drop(pci_guard);
     pci_session
         .shutdown()
         .expect("signed PCI storage session should shut down");
+
+    let reopen_pci_block_backings = || {
+        pci_graph
+            .block_records()
+            .iter()
+            .map(|record| {
+                BlockFileBacking::open_snapshot(
+                    std::path::Path::new(record.config().selector()),
+                    record.config().is_read_only(),
+                )
+                .map(|(backing, _identity)| backing)
+                .expect("PCI profile-3 block backing should reopen")
+            })
+            .collect::<Vec<_>>()
+    };
+    let reopen_pci_pmem_backings = || {
+        pci_controller
+            .pmem_configs()
+            .iter()
+            .map(|config| {
+                PmemFileBacking::open(config).expect("PCI profile-3 pmem backing should reopen")
+            })
+            .collect::<Vec<_>>()
+    };
+    let pci_restore_now = Instant::now();
+    let pci_fault_bundle = SnapshotV2StorageRestorePlan::prepare(
+        pci_graph.clone(),
+        &pci_fault_memory,
+        pci_restore_now,
+    )
+    .expect("PCI profile-3 fault restore plan should validate")
+    .prepare_backings(
+        reopen_pci_block_backings(),
+        reopen_pci_pmem_backings(),
+        || false,
+    )
+    .expect("PCI profile-3 fault backings should prepare");
+    let pci_fault_plan =
+        prepare_hvf_snapshot_v2_storage_pci_platform_plan(&pci_platform, &pci_fault_bundle)
+            .expect("PCI profile-3 fault platform plan should validate");
+    let pci_fault_shell = HvfSnapshotV2DefaultProcessShell::new(SharedSerialOutput::from(
+        SharedSerialOutputBuffer::default(),
+    ));
+    let pci_fault =
+        OwnedHvfArm64BootSession::restore_snapshot_v2_storage_pci_with_pmem_publication_fault(
+            pci_platform.clone(),
+            pci_fault_memory,
+            pci_fault_shell,
+            pci_fault_bundle,
+            pci_fault_plan,
+            0,
+        )
+        .expect_err("injected PCI post-mapping publication fault should reject");
+    assert_eq!(
+        pci_fault.stage(),
+        bangbang_hvf::HvfSnapshotV2StoragePciRestoreStage::Publication {
+            index: pci_graph.block_records().len(),
+        }
+    );
+    assert!(
+        pci_fault.cleanup_failures().is_empty(),
+        "PCI publication rollback should be complete: {:?}",
+        pci_fault.cleanup_failures()
+    );
+    assert!(!pci_fault.is_terminal());
+    let pci_fault_diagnostics = format!("{pci_fault:?} {pci_fault}");
+    for private_path in [
+        path_text(pci_root.path()),
+        path_text(pci_startup_pmem.path()),
+        path_text(pci_dynamic_async.path()),
+        path_text(pci_dynamic_pmem.path()),
+    ] {
+        assert!(!pci_fault_diagnostics.contains(&private_path));
+    }
+
+    let pci_restore_bundle = SnapshotV2StorageRestorePlan::prepare(
+        pci_graph.clone(),
+        &pci_restored_memory,
+        pci_restore_now,
+    )
+    .expect("PCI profile-3 restore plan should validate")
+    .prepare_backings(
+        reopen_pci_block_backings(),
+        reopen_pci_pmem_backings(),
+        || false,
+    )
+    .expect("PCI profile-3 backings should prepare");
+    let pci_restore_plan =
+        prepare_hvf_snapshot_v2_storage_pci_platform_plan(&pci_platform, &pci_restore_bundle)
+            .expect("PCI profile-3 platform plan should validate");
+    let pci_restore_shell = HvfSnapshotV2DefaultProcessShell::new(SharedSerialOutput::from(
+        SharedSerialOutputBuffer::default(),
+    ));
+    let pci_restored_owners = OwnedHvfArm64BootSession::restore_snapshot_v2_storage_pci(
+        pci_platform,
+        pci_restored_memory,
+        pci_restore_shell,
+        pci_restore_bundle,
+        pci_restore_plan,
+    )
+    .unwrap_or_else(|error| panic!("PCI profile-3 owners should restore: {error:?}"));
+    assert_eq!(pci_restored_owners.configs(), &pci_configs);
+    let (mut pci_restored, pci_restored_configs) = pci_restored_owners.into_parts();
+    assert_eq!(pci_restored_configs, pci_configs);
+    assert!(pci_restored.uses_pci_data_devices());
+    assert!(pci_restored.runtime_resources().block_devices.is_empty());
+    assert_eq!(pci_restored.runtime_resources().pmem_devices.len(), 2);
+    assert!(
+        pci_restored
+            .runtime_resources()
+            .pmem_mmio_devices
+            .is_empty()
+    );
+    let pci_restored_guard = pci_restored
+        .quiesce_limiter_retry_wakeups()
+        .expect("restored PCI profile-3 retry publishers should quiesce");
+    let pci_recaptured_graph = pci_restored
+        .capture_snapshot_v2_storage_device_graph_at(
+            &pci_restored_configs,
+            &pci_restored_guard,
+            pci_restore_now,
+        )
+        .expect("restored PCI profile-3 graph should recapture");
+    assert_eq!(pci_recaptured_graph, pci_graph);
+    drop(pci_restored_guard);
+
+    const RESTORED_PCI_PMEM_WRITE_OFFSET: u64 = 8192;
+    const RESTORED_PCI_PMEM_WRITE_VALUE: u32 = 0x1632_cafe;
+    let pci_restored_entry = GuestAddress::new(
+        pci_restored
+            .capture_arm64_general_register_state()
+            .expect("restored PCI profile-3 registers should capture")
+            .pc(),
+    );
+    let pci_restored_target = pci_restored.runtime_resources().pmem_devices[0]
+        .guest_range()
+        .start()
+        .checked_add(RESTORED_PCI_PMEM_WRITE_OFFSET)
+        .expect("restored PCI profile-3 pmem target should fit");
+    let pci_restored_program = arm64_store_u32_and_hvc_program(
+        pci_restored_target.raw_value(),
+        RESTORED_PCI_PMEM_WRITE_VALUE,
+    );
+    pci_restored
+        .guest_memory_mut()
+        .expect("restored PCI profile-3 guest memory should map")
+        .write_slice(&pci_restored_program, pci_restored_entry)
+        .expect("restored PCI profile-3 guest program should write");
+    pci_restored
+        .resume_after_snapshot_v2_capture()
+        .expect("restored PCI profile-3 runner should resume");
+    assert!(matches!(
+        pci_restored
+            .run_once_and_handle_mmio()
+            .expect("restored PCI guest should reach HVC through its pmem mapping"),
+        HvfVcpuRunStepOutcome::Hvc { exit, .. } if exit.immediate() == 0
+    ));
+    let pci_observer =
+        std::fs::File::open(pci_startup_pmem.path()).expect("restored PCI pmem should open");
+    let mut pci_observed = [0_u8; std::mem::size_of::<u32>()];
+    pci_observer
+        .read_exact_at(&mut pci_observed, RESTORED_PCI_PMEM_WRITE_OFFSET)
+        .expect("restored PCI pmem observer should read");
+    assert_eq!(
+        u32::from_le_bytes(pci_observed),
+        RESTORED_PCI_PMEM_WRITE_VALUE
+    );
+    pci_restored
+        .shutdown()
+        .expect("restored PCI profile-3 session should tear down in ownership order");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

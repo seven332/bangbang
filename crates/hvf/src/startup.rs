@@ -31,7 +31,7 @@ use bangbang_runtime::block::{
 };
 use bangbang_runtime::boot::{
     BootSourceFiles, canonical_process_block_command_line,
-    canonical_process_root_block_command_line,
+    canonical_process_root_block_command_line, canonical_process_root_pmem_command_line,
 };
 use bangbang_runtime::boot_timer::{
     BootTimerMmioLayout, BootTimerMmioRegistrationError, register_boot_timer_mmio,
@@ -117,8 +117,10 @@ use bangbang_runtime::snapshot_device_v2_5::{
 };
 use bangbang_runtime::snapshot_device_v2_6::{
     NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, PreparedSnapshotV2StorageBundle,
-    PreparedSnapshotV2StorageMmioBundle, SnapshotV2StorageCleanupError,
+    PreparedSnapshotV2StorageMmioBundle, PreparedSnapshotV2StoragePciBundle,
+    PreparedSnapshotV2StoragePciPmemEndpoint, SnapshotV2StorageCleanupError,
     SnapshotV2StorageDeviceGraph, SnapshotV2StorageMmioTransportError,
+    SnapshotV2StoragePciTransportError,
 };
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
@@ -241,13 +243,16 @@ use crate::snapshot_v2_platform::{
     HvfSnapshotV2MultiBlockPciShellPlan, HvfSnapshotV2PlatformRestoreError,
     HvfSnapshotV2PlatformShutdownError, HvfSnapshotV2RootResourcePlan,
     HvfSnapshotV2RootTransportPlan, HvfSnapshotV2StorageMmioShellPlan,
-    RestoredHvfSnapshotV2Platform, restore_hvf_snapshot_v2_multi_block_mmio_process_platform,
+    HvfSnapshotV2StoragePciShellPlan, RestoredHvfSnapshotV2Platform,
+    restore_hvf_snapshot_v2_multi_block_mmio_process_platform,
     restore_hvf_snapshot_v2_multi_block_pci_process_platform,
     restore_hvf_snapshot_v2_root_process_platform,
     restore_hvf_snapshot_v2_storage_mmio_process_platform,
+    restore_hvf_snapshot_v2_storage_pci_process_platform,
 };
 use crate::snapshot_v2_storage_platform::{
     HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioPlatformPlanParts,
+    HvfSnapshotV2StoragePciPlatformPlan, HvfSnapshotV2StoragePciPlatformPlanParts,
 };
 use crate::topology::{HvfVcpuTopologyError, prepare_ordered_mpidrs};
 use crate::vcpu::{
@@ -3415,6 +3420,7 @@ pub struct OwnedHvfArm64BootSession {
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
     restored_snapshot_v2_mmio_registrations: Option<HvfSnapshotV2MultiBlockMmioRegistrations>,
+    restored_snapshot_v2_pci_pmem_ranges: Option<Vec<GuestMemoryRange>>,
     restored_snapshot_v2_memory_binding: Option<SnapshotV2MemoryBinding>,
     restored_snapshot_v2_machine: Option<HvfSnapshotV2MachineState>,
     cpu_template_application: Option<crate::cpu_template::HvfArm64CpuTemplateApplicationState>,
@@ -4160,6 +4166,363 @@ impl fmt::Display for HvfSnapshotV2StorageMmioRestoreError {
 }
 
 impl std::error::Error for HvfSnapshotV2StorageMmioRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.failure.as_ref())
+    }
+}
+
+/// One complete, still-private exact-2.6 PCI storage destination and ordered
+/// controller projection.
+pub struct RestoredHvfSnapshotV2StoragePciOwners {
+    session: OwnedHvfArm64BootSession,
+    configs: CaptureReadyStorageConfigs,
+}
+
+impl RestoredHvfSnapshotV2StoragePciOwners {
+    pub const fn session(&self) -> &OwnedHvfArm64BootSession {
+        &self.session
+    }
+
+    pub const fn configs(&self) -> &CaptureReadyStorageConfigs {
+        &self.configs
+    }
+
+    pub fn into_parts(self) -> (OwnedHvfArm64BootSession, CaptureReadyStorageConfigs) {
+        (self.session, self.configs)
+    }
+}
+
+impl fmt::Debug for RestoredHvfSnapshotV2StoragePciOwners {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredHvfSnapshotV2StoragePciOwners")
+            .field("block_count", &self.configs.drives().len())
+            .field("pmem_count", &self.configs.pmem().len())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Stage at which exact-2.6 heterogeneous PCI owner reconstruction stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2StoragePciRestoreStage {
+    MemoryLayout,
+    Transport,
+    ResourcePlan,
+    BlockMetrics,
+    PmemMetrics,
+    Platform,
+    PciHost,
+    PciRoutes,
+    EndpointPreparation { index: usize },
+    Mapping { index: usize },
+    Publication { index: usize },
+    BlockRetryScheduler,
+    PmemRetryScheduler,
+}
+
+/// Primary failure from exact-2.6 heterogeneous PCI reconstruction.
+pub enum HvfSnapshotV2StoragePciRestoreFailure {
+    Allocation,
+    MemoryLayout,
+    Transport(SnapshotV2StoragePciTransportError),
+    ResourcePlan,
+    BlockMetrics(BlockDeviceMetricsRegistryError),
+    PmemMetrics(PmemDeviceMetricsRegistryError),
+    Platform(Box<HvfSnapshotV2PlatformRestoreError>),
+    DispatcherUnavailable,
+    PciHost(Arm64BootResourceError),
+    PciData(HvfArm64BootPciDataError),
+    PciRoutes(HvfGicMsiDeviceInterruptResourceError),
+    PciEndpoint(SnapshotV2RootTransportRestoreError),
+    Mapping(HvfGuestMemoryMappingError),
+    PciPublication(VirtioPciPublicationError),
+    InjectedPublication,
+    RetryScheduler(io::ErrorKind),
+}
+
+impl fmt::Debug for HvfSnapshotV2StoragePciRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Allocation => "allocation",
+            Self::MemoryLayout => "memory-layout",
+            Self::Transport(_) => "transport",
+            Self::ResourcePlan => "resource-plan",
+            Self::BlockMetrics(_) => "block-metrics",
+            Self::PmemMetrics(_) => "pmem-metrics",
+            Self::Platform(_) => "platform",
+            Self::DispatcherUnavailable => "dispatcher",
+            Self::PciHost(_) => "pci-host",
+            Self::PciData(_) => "pci-data",
+            Self::PciRoutes(_) => "pci-routes",
+            Self::PciEndpoint(_) => "pci-endpoint",
+            Self::Mapping(_) => "mapping",
+            Self::PciPublication(_) => "pci-publication",
+            Self::InjectedPublication => "injected-publication",
+            Self::RetryScheduler(_) => "retry-scheduler",
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2StoragePciRestoreFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2StoragePciRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation => "exact-2.6 PCI owner allocation failed",
+            Self::MemoryLayout => "restored memory layout is invalid",
+            Self::Transport(_) => "exact-2.6 PCI transport reconstruction failed",
+            Self::ResourcePlan => "exact-2.6 PCI resource plan diverged",
+            Self::BlockMetrics(_) => "exact-2.6 block metrics ownership failed",
+            Self::PmemMetrics(_) => "exact-2.6 pmem metrics ownership failed",
+            Self::Platform(_) => "HVF platform reconstruction failed",
+            Self::DispatcherUnavailable => "exact-2.6 PCI dispatcher is unavailable",
+            Self::PciHost(_) => "exact-2.6 PCI host reconstruction failed",
+            Self::PciData(_) => "exact-2.6 PCI manager reconstruction failed",
+            Self::PciRoutes(_) => "exact-2.6 PCI route reconstruction failed",
+            Self::PciEndpoint(_) => "exact-2.6 PCI endpoint preparation failed",
+            Self::Mapping(_) => "exact-2.6 pmem mapping reconstruction failed",
+            Self::PciPublication(_) => "exact-2.6 PCI endpoint publication failed",
+            Self::InjectedPublication => {
+                "exact-2.6 PCI publication certification fault was injected"
+            }
+            Self::RetryScheduler(kind) => {
+                return write!(
+                    formatter,
+                    "storage retry scheduler startup failed: {kind:?}"
+                );
+            }
+        })
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2StoragePciRestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(source) => Some(source),
+            Self::BlockMetrics(source) => Some(source),
+            Self::PmemMetrics(source) => Some(source),
+            Self::Platform(source) => Some(source.as_ref()),
+            Self::PciHost(source) => Some(source),
+            Self::PciData(source) => Some(source),
+            Self::PciRoutes(HvfGicMsiDeviceInterruptResourceError::Rollback { .. })
+            | Self::PciPublication(VirtioPciPublicationError::Rollback { .. }) => None,
+            Self::PciRoutes(source) => Some(source),
+            Self::PciEndpoint(source) => Some(source),
+            Self::Mapping(source) => Some(source),
+            Self::PciPublication(source) => Some(source),
+            Self::Allocation
+            | Self::MemoryLayout
+            | Self::ResourcePlan
+            | Self::DispatcherUnavailable
+            | Self::InjectedPublication
+            | Self::RetryScheduler(_) => None,
+        }
+    }
+}
+
+/// Cleanup uncertainty retained after exact-2.6 PCI reconstruction failed.
+pub enum HvfSnapshotV2StoragePciRestoreCleanupFailure {
+    PreparedBundle(SnapshotV2StorageCleanupError),
+    BlockRetryScheduler,
+    PmemRetryScheduler,
+    AsyncGuestMemory(HvfGuestMemoryMappingError),
+    Async(BlockAsyncRuntimeError),
+    Pci(HvfArm64BootPciDataError),
+    Mapping {
+        index: usize,
+        source: HvfGuestMemoryMappingError,
+    },
+    Platform(HvfSnapshotV2PlatformShutdownError),
+}
+
+impl fmt::Debug for HvfSnapshotV2StoragePciRestoreCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::PreparedBundle(_) => "prepared-bundle",
+            Self::BlockRetryScheduler => "block-retry-scheduler",
+            Self::PmemRetryScheduler => "pmem-retry-scheduler",
+            Self::AsyncGuestMemory(_) => "async-guest-memory",
+            Self::Async(_) => "async-runtime",
+            Self::Pci(_) => "pci-owner",
+            Self::Mapping { .. } => "mapping",
+            Self::Platform(_) => "platform",
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2StoragePciRestoreCleanupFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2StoragePciRestoreCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PreparedBundle(_) => "prepared storage bundle cleanup failed",
+            Self::BlockRetryScheduler => "block retry scheduler cleanup failed",
+            Self::PmemRetryScheduler => "pmem retry scheduler cleanup failed",
+            Self::AsyncGuestMemory(_) => "Async cleanup could not borrow guest memory",
+            Self::Async(_) => "Async runtime cleanup failed",
+            Self::Pci(_) => "PCI owner cleanup failed",
+            Self::Mapping { .. } => "pmem mapping cleanup failed",
+            Self::Platform(_) => "HVF platform cleanup failed",
+        })
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2StoragePciRestoreCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PreparedBundle(source) => Some(source),
+            Self::AsyncGuestMemory(source) => Some(source),
+            Self::Async(source) => Some(source),
+            Self::Pci(source) => Some(source),
+            Self::Mapping { source, .. } => Some(source),
+            Self::Platform(source) => Some(source),
+            Self::BlockRetryScheduler | Self::PmemRetryScheduler => None,
+        }
+    }
+}
+
+/// Redacted exact-2.6 PCI reconstruction failure with ordered cleanup evidence.
+pub struct HvfSnapshotV2StoragePciRestoreError {
+    stage: HvfSnapshotV2StoragePciRestoreStage,
+    failure: Box<HvfSnapshotV2StoragePciRestoreFailure>,
+    cleanup: Vec<HvfSnapshotV2StoragePciRestoreCleanupFailure>,
+}
+
+impl HvfSnapshotV2StoragePciRestoreError {
+    fn preflight(
+        stage: HvfSnapshotV2StoragePciRestoreStage,
+        failure: HvfSnapshotV2StoragePciRestoreFailure,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            cleanup: Vec::new(),
+        }
+    }
+
+    fn with_prepared_bundle_abort(
+        stage: HvfSnapshotV2StoragePciRestoreStage,
+        failure: HvfSnapshotV2StoragePciRestoreFailure,
+        bundle: PreparedSnapshotV2StoragePciBundle,
+    ) -> Self {
+        let cleanup = bundle
+            .abort()
+            .err()
+            .map(HvfSnapshotV2StoragePciRestoreCleanupFailure::PreparedBundle)
+            .into_iter()
+            .collect();
+        Self {
+            stage,
+            failure: Box::new(failure),
+            cleanup,
+        }
+    }
+
+    fn platform(
+        source: HvfSnapshotV2PlatformRestoreError,
+        bundle: PreparedSnapshotV2StoragePciBundle,
+    ) -> Self {
+        Self::with_prepared_bundle_abort(
+            HvfSnapshotV2StoragePciRestoreStage::Platform,
+            HvfSnapshotV2StoragePciRestoreFailure::Platform(Box::new(source)),
+            bundle,
+        )
+    }
+
+    fn after_platform(
+        stage: HvfSnapshotV2StoragePciRestoreStage,
+        failure: HvfSnapshotV2StoragePciRestoreFailure,
+        cleanup: Vec<HvfSnapshotV2StoragePciRestoreCleanupFailure>,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            cleanup,
+        }
+    }
+
+    pub const fn stage(&self) -> HvfSnapshotV2StoragePciRestoreStage {
+        self.stage
+    }
+
+    pub fn cleanup_failures(&self) -> &[HvfSnapshotV2StoragePciRestoreCleanupFailure] {
+        &self.cleanup
+    }
+
+    pub fn has_incomplete_cleanup(&self) -> bool {
+        !self.cleanup.is_empty()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2StoragePciRestoreFailure::Transport(source)
+                    if source.cleanup_failed()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2StoragePciRestoreFailure::Platform(source)
+                    if !source.cleanup_failures().is_empty()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2StoragePciRestoreFailure::PciRoutes(
+                    HvfGicMsiDeviceInterruptResourceError::Rollback { .. }
+                )
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2StoragePciRestoreFailure::PciPublication(
+                    VirtioPciPublicationError::Rollback { .. }
+                )
+            )
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.has_incomplete_cleanup()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2StoragePciRestoreFailure::Platform(source)
+                    if source.is_committed()
+            )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2StoragePciRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2StoragePciRestoreError")
+            .field("stage", &self.stage)
+            .field("failure", &"<redacted>")
+            .field("cleanup_count", &self.cleanup.len())
+            .field("terminal", &self.is_terminal())
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2StoragePciRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.6 PCI owner reconstruction failed at {:?}: {}",
+            self.stage, self.failure
+        )?;
+        if !self.cleanup.is_empty() {
+            write!(
+                formatter,
+                "; {} cleanup failure(s) retained",
+                self.cleanup.len()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2StoragePciRestoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.failure.as_ref())
     }
@@ -12584,6 +12947,163 @@ fn validate_snapshot_v2_storage_mmio_resource_plan(
     bundle.root_key() == root_key && bundle.root_key() == plan.root_key
 }
 
+fn validate_snapshot_v2_storage_pci_resource_plan(
+    bundle: &PreparedSnapshotV2StoragePciBundle,
+    plan: &HvfSnapshotV2StoragePciPlatformPlanParts,
+    base_arguments: Option<&str>,
+) -> bool {
+    let block_records = bundle
+        .block_bundle()
+        .map_or(&[][..], PreparedSnapshotV2MultiBlockPciBundle::records);
+    let block_configs = bundle
+        .block_bundle()
+        .map_or(&[][..], |block| block.drive_configs().as_slice());
+    let pmem_records = bundle.pmem_records();
+    let pmem_configs = bundle.pmem_configs().as_slice();
+    let planned_block = plan.pci.block_records();
+    let planned_pmem = plan.pci.pmem_records();
+    let record_count = block_records.len().saturating_add(pmem_records.len());
+    if record_count == 0
+        || record_count > PCI_ENDPOINT_SLOT_COUNT
+        || block_records.len() != block_configs.len()
+        || block_records.len() != planned_block.len()
+        || block_records.len() != plan.block_metrics_ids.len()
+        || block_records.len() != plan.block_retries.len()
+        || pmem_records.len() != pmem_configs.len()
+        || pmem_records.len() != planned_pmem.len()
+        || pmem_records.len() != plan.pmem_metrics_ids.len()
+        || pmem_records.len() != plan.pmem_retries.len()
+        || plan.pci.record_count() != record_count
+    {
+        return false;
+    }
+
+    let mut root_key = None;
+    let mut block_root = None;
+    let mut pmem_root = None;
+    let mut route_demand = 0_usize;
+    let expected_block_routes = VIRTIO_BLOCK_QUEUE_SIZES.len().checked_add(1);
+    for (index, ((((record, config), planned), retry), metrics_id)) in block_records
+        .iter()
+        .zip(block_configs)
+        .zip(planned_block)
+        .zip(&plan.block_retries)
+        .zip(&plan.block_metrics_ids)
+        .enumerate()
+    {
+        let async_binding_matches = match config.io_engine() {
+            Some(DriveIoEngine::Sync) => record.async_generation().is_none(),
+            Some(DriveIoEngine::Async) => record.async_generation().is_some(),
+            None => false,
+        };
+        if record.key() != planned.key()
+            || record.key() != retry.key()
+            || record.drive_id() != config.drive_id()
+            || record.drive_id() != metrics_id
+            || record.is_root_device() != config.is_root_device()
+            || record.origin() != planned.origin()
+            || record.sbdf() != planned.sbdf()
+            || record.bar_range() != planned.bar_range()
+            || snapshot_v2_storage_pci_region_id(record.sbdf()) != Some(planned.bar_region_id())
+            || Some(planned.route_count()) != expected_block_routes
+            || record.retry() != retry.retry()
+            || record.retry_deadline() != retry.retry_deadline()
+            || record.retry_deadline().is_some()
+                == matches!(record.retry(), StorageRetryState::None)
+            || !async_binding_matches
+            || (record.is_root_device() && index != 0)
+        {
+            return false;
+        }
+        route_demand = match route_demand.checked_add(planned.route_count()) {
+            Some(demand) => demand,
+            None => return false,
+        };
+        if record.is_root_device() {
+            if root_key.replace(record.key()).is_some() {
+                return false;
+            }
+            block_root = Some(config);
+        }
+    }
+
+    let expected_pmem_routes = VIRTIO_PMEM_QUEUE_SIZES.len().checked_add(1);
+    for (pmem_index, ((((record, config), planned), retry), metrics_id)) in pmem_records
+        .iter()
+        .zip(pmem_configs)
+        .zip(planned_pmem)
+        .zip(&plan.pmem_retries)
+        .zip(&plan.pmem_metrics_ids)
+        .enumerate()
+    {
+        let prepared = record.prepared_device();
+        if record.key() != planned.key()
+            || record.key() != retry.key()
+            || record.pmem_id() != config.id()
+            || record.pmem_id() != metrics_id
+            || record.is_root_device() != config.root_device()
+            || record.origin() != planned.origin()
+            || record.sbdf() != planned.sbdf()
+            || record.bar_range() != planned.bar_range()
+            || snapshot_v2_storage_pci_region_id(record.sbdf()) != Some(planned.bar_region_id())
+            || Some(planned.route_count()) != expected_pmem_routes
+            || record.retry() != retry.retry()
+            || record.retry_deadline() != retry.retry_deadline()
+            || record.retry_deadline().is_some()
+                == matches!(record.retry(), StorageRetryState::None)
+            || prepared.backing().is_read_only() != config.read_only()
+            || prepared.mapping().is_read_only() != config.read_only()
+            || prepared.rate_limiter() != config.rate_limiter()
+        {
+            return false;
+        }
+        route_demand = match route_demand.checked_add(planned.route_count()) {
+            Some(demand) => demand,
+            None => return false,
+        };
+        if record.is_root_device() {
+            if root_key.replace(record.key()).is_some() {
+                return false;
+            }
+            pmem_root = Some((pmem_index, config));
+        }
+    }
+
+    let expected_command_line = match (block_root, pmem_root) {
+        (Some(config), None) => {
+            let Some(read_only) = config.is_read_only() else {
+                return false;
+            };
+            canonical_process_root_block_command_line(
+                base_arguments,
+                true,
+                config.partuuid(),
+                read_only,
+            )
+        }
+        (None, Some((index, config))) => canonical_process_root_pmem_command_line(
+            base_arguments,
+            true,
+            index,
+            config.read_only(),
+        ),
+        (None, None) => canonical_process_block_command_line(base_arguments, true),
+        (Some(_), Some(_)) => return false,
+    };
+    expected_command_line.is_ok_and(|expected| expected == plan.command_line)
+        && bundle.root_key() == root_key
+        && bundle.root_key() == plan.root_key
+        && route_demand == plan.pci.route_demand()
+}
+
+fn snapshot_v2_storage_pci_region_id(sbdf: PciSbdf) -> Option<MmioRegionId> {
+    let slot = sbdf
+        .device()
+        .checked_sub(PCI_FIRST_ENDPOINT_DEVICE)
+        .map(usize::from)?;
+    pci_data_region_id(slot).ok()
+}
+
 fn validate_snapshot_v2_multi_block_pci_resource_plan(
     bundle: &PreparedSnapshotV2MultiBlockPciBundle,
     plan: &HvfSnapshotV2MultiBlockPlatformPlanParts,
@@ -12887,6 +13407,162 @@ fn failed_snapshot_v2_storage_mmio_after_platform(
     HvfSnapshotV2StorageMmioRestoreError::after_platform(stage, failure, cleanup)
 }
 
+enum PreparedHvfSnapshotV2StoragePciPublication {
+    Block {
+        endpoint: PreparedSnapshotV2MultiBlockPciEndpoint,
+        interrupts: HvfGicMsiDeviceInterruptResources,
+        metrics_lease: BlockDeviceMetricsLease,
+    },
+    Pmem {
+        endpoint: PreparedSnapshotV2StoragePciPmemEndpoint,
+        interrupts: HvfGicMsiDeviceInterruptResources,
+        metrics_lease: PmemDeviceMetricsLease,
+    },
+}
+
+fn release_unpublished_snapshot_v2_storage_pci_interrupts<I: GuestMessageInterruptResources>(
+    index: usize,
+    interrupts: &mut I,
+    cleanup: &mut Vec<HvfSnapshotV2StoragePciRestoreCleanupFailure>,
+) {
+    if let Err(source) = interrupts.release() {
+        cleanup.push(HvfSnapshotV2StoragePciRestoreCleanupFailure::Pci(
+            HvfArm64BootPciDataError::new(format!(
+                "failed to release unpublished exact-2.6 PCI endpoint {index} routes: {source}"
+            )),
+        ));
+    }
+}
+
+fn release_unpublished_snapshot_v2_storage_pci_publications(
+    publications: &mut [Option<PreparedHvfSnapshotV2StoragePciPublication>],
+    cleanup: &mut Vec<HvfSnapshotV2StoragePciRestoreCleanupFailure>,
+) {
+    for (index, publication) in publications.iter_mut().enumerate().rev() {
+        let Some(publication) = publication.take() else {
+            continue;
+        };
+        release_unpublished_snapshot_v2_storage_pci_publication(index, publication, cleanup);
+    }
+}
+
+fn release_unpublished_snapshot_v2_storage_pci_publication(
+    index: usize,
+    publication: PreparedHvfSnapshotV2StoragePciPublication,
+    cleanup: &mut Vec<HvfSnapshotV2StoragePciRestoreCleanupFailure>,
+) {
+    match publication {
+        PreparedHvfSnapshotV2StoragePciPublication::Block {
+            endpoint,
+            mut interrupts,
+            metrics_lease,
+        } => {
+            drop(endpoint);
+            drop(metrics_lease);
+            release_unpublished_snapshot_v2_storage_pci_interrupts(index, &mut interrupts, cleanup);
+        }
+        PreparedHvfSnapshotV2StoragePciPublication::Pmem {
+            endpoint,
+            mut interrupts,
+            metrics_lease,
+        } => {
+            drop(endpoint);
+            drop(metrics_lease);
+            release_unpublished_snapshot_v2_storage_pci_interrupts(index, &mut interrupts, cleanup);
+        }
+    }
+}
+
+struct HvfSnapshotV2StoragePciCleanup<'a> {
+    block_scheduler: &'a mut Option<HvfArm64BootLimiterRetryWakeupScheduler>,
+    pmem_scheduler: &'a mut Option<HvfArm64BootLimiterRetryWakeupScheduler>,
+    async_runtime: Option<&'a SharedBlockAsyncRuntime>,
+    pci_data_devices: &'a mut Option<HvfArm64BootPciDataDevices>,
+    pmem_devices: &'a mut Vec<PreparedPmemDevice>,
+    failures: Vec<HvfSnapshotV2StoragePciRestoreCleanupFailure>,
+}
+
+fn failed_snapshot_v2_storage_pci_after_platform(
+    mut platform: RestoredHvfSnapshotV2Platform,
+    stage: HvfSnapshotV2StoragePciRestoreStage,
+    failure: HvfSnapshotV2StoragePciRestoreFailure,
+    cleanup: HvfSnapshotV2StoragePciCleanup<'_>,
+) -> HvfSnapshotV2StoragePciRestoreError {
+    let HvfSnapshotV2StoragePciCleanup {
+        block_scheduler,
+        pmem_scheduler,
+        async_runtime,
+        pci_data_devices,
+        pmem_devices,
+        mut failures,
+    } = cleanup;
+    if pmem_scheduler
+        .as_mut()
+        .is_some_and(|scheduler| scheduler.stop_with_result().is_err())
+    {
+        failures.push(HvfSnapshotV2StoragePciRestoreCleanupFailure::PmemRetryScheduler);
+    }
+    drop(pmem_scheduler.take());
+    if block_scheduler
+        .as_mut()
+        .is_some_and(|scheduler| scheduler.stop_with_result().is_err())
+    {
+        failures.push(HvfSnapshotV2StoragePciRestoreCleanupFailure::BlockRetryScheduler);
+    }
+    drop(block_scheduler.take());
+
+    if let Some(runtime) = async_runtime {
+        let needs_memory = match runtime.shutdown_if_idle() {
+            Ok(idle) => !idle,
+            Err(source) => {
+                failures.push(HvfSnapshotV2StoragePciRestoreCleanupFailure::Async(source));
+                true
+            }
+        };
+        if needs_memory {
+            match platform.guest_memory_mut() {
+                Ok(memory) => {
+                    if let Err(source) = runtime.shutdown(memory) {
+                        failures.push(HvfSnapshotV2StoragePciRestoreCleanupFailure::Async(source));
+                    }
+                }
+                Err(source) => failures
+                    .push(HvfSnapshotV2StoragePciRestoreCleanupFailure::AsyncGuestMemory(source)),
+            }
+        }
+    }
+
+    let mut pci_clean = true;
+    if let Some(manager) = pci_data_devices.as_mut() {
+        manager.teardown_exhaustive(|source| {
+            pci_clean = false;
+            failures.push(HvfSnapshotV2StoragePciRestoreCleanupFailure::Pci(source));
+        });
+    }
+    drop(pci_data_devices.take());
+
+    if pci_clean {
+        for (index, device) in pmem_devices.iter().enumerate().rev() {
+            if let Err(source) = platform
+                .backend_mut()
+                .take_runtime_pmem_mapping(device.guest_range(), false)
+            {
+                failures
+                    .push(HvfSnapshotV2StoragePciRestoreCleanupFailure::Mapping { index, source });
+            }
+        }
+        pmem_devices.clear();
+    }
+
+    if let Err(source) = platform.shutdown() {
+        failures.push(HvfSnapshotV2StoragePciRestoreCleanupFailure::Platform(
+            source,
+        ));
+    }
+
+    HvfSnapshotV2StoragePciRestoreError::after_platform(stage, failure, failures)
+}
+
 struct PreparedHvfSnapshotV2MultiBlockPciPublication {
     endpoint: PreparedSnapshotV2MultiBlockPciEndpoint,
     interrupts: HvfGicMsiDeviceInterruptResources,
@@ -13075,6 +13751,7 @@ impl OwnedHvfArm64BootSession {
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
+            restored_snapshot_v2_pci_pmem_ranges: None,
             restored_snapshot_v2_memory_binding: None,
             restored_snapshot_v2_machine: None,
             cpu_template_application: prepared.cpu_template_application,
@@ -13340,6 +14017,7 @@ impl OwnedHvfArm64BootSession {
             mmio_dispatcher: parts.mmio_dispatcher,
             runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
+            restored_snapshot_v2_pci_pmem_ranges: None,
             restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
@@ -13708,6 +14386,7 @@ impl OwnedHvfArm64BootSession {
                     pmem_ranges: Vec::new(),
                 },
             ),
+            restored_snapshot_v2_pci_pmem_ranges: None,
             restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
@@ -14279,6 +14958,7 @@ impl OwnedHvfArm64BootSession {
                     pmem_ranges,
                 },
             ),
+            restored_snapshot_v2_pci_pmem_ranges: None,
             restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
@@ -14321,6 +15001,994 @@ impl OwnedHvfArm64BootSession {
         let configs =
             CaptureReadyStorageConfigs::new(drive_configs.into_vec(), pmem_configs.into_vec());
         Ok(RestoredHvfSnapshotV2StorageMmioOwners { session, configs })
+    }
+
+    /// Reconstructs one exact-2.6 heterogeneous PCI vector without publishing
+    /// a process session, controller, or public load path.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_storage_pci(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2DefaultProcessShell,
+        bundle: PreparedSnapshotV2StorageBundle,
+        plan: HvfSnapshotV2StoragePciPlatformPlan,
+    ) -> Result<RestoredHvfSnapshotV2StoragePciOwners, HvfSnapshotV2StoragePciRestoreError> {
+        Self::restore_snapshot_v2_storage_pci_inner(
+            state,
+            memory,
+            process_shell,
+            bundle,
+            plan,
+            None,
+        )
+    }
+
+    /// Deterministically fails after one pmem mapping is installed but before
+    /// its PCI endpoint becomes reachable.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_storage_pci_with_pmem_publication_fault(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2DefaultProcessShell,
+        bundle: PreparedSnapshotV2StorageBundle,
+        plan: HvfSnapshotV2StoragePciPlatformPlan,
+        pmem_index: usize,
+    ) -> Result<RestoredHvfSnapshotV2StoragePciOwners, HvfSnapshotV2StoragePciRestoreError> {
+        Self::restore_snapshot_v2_storage_pci_inner(
+            state,
+            memory,
+            process_shell,
+            bundle,
+            plan,
+            Some(pmem_index),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn restore_snapshot_v2_storage_pci_inner(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2DefaultProcessShell,
+        bundle: PreparedSnapshotV2StorageBundle,
+        plan: HvfSnapshotV2StoragePciPlatformPlan,
+        publication_fault_pmem_index: Option<usize>,
+    ) -> Result<RestoredHvfSnapshotV2StoragePciOwners, HvfSnapshotV2StoragePciRestoreError> {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(memory.regions().len())
+            .map_err(|_| {
+                HvfSnapshotV2StoragePciRestoreError::preflight(
+                    HvfSnapshotV2StoragePciRestoreStage::MemoryLayout,
+                    HvfSnapshotV2StoragePciRestoreFailure::Allocation,
+                )
+            })?;
+        ranges.extend(memory.regions().iter().map(|region| region.range()));
+        let layout = GuestMemoryLayout::new(ranges).map_err(|_| {
+            HvfSnapshotV2StoragePciRestoreError::preflight(
+                HvfSnapshotV2StoragePciRestoreStage::MemoryLayout,
+                HvfSnapshotV2StoragePciRestoreFailure::MemoryLayout,
+            )
+        })?;
+        let source_fdt = state.machine().fdt();
+        let retained_fdt = Arm64FdtGuestMemoryWrite {
+            address: source_fdt.address(),
+            size: usize::try_from(source_fdt.size()).map_err(|_| {
+                HvfSnapshotV2StoragePciRestoreError::preflight(
+                    HvfSnapshotV2StoragePciRestoreStage::MemoryLayout,
+                    HvfSnapshotV2StoragePciRestoreFailure::Allocation,
+                )
+            })?,
+        };
+        let prepared = bundle.prepare_pci_transport().map_err(|source| {
+            HvfSnapshotV2StoragePciRestoreError::preflight(
+                HvfSnapshotV2StoragePciRestoreStage::Transport,
+                HvfSnapshotV2StoragePciRestoreFailure::Transport(source),
+            )
+        })?;
+        let plan = plan.into_parts();
+        if !validate_snapshot_v2_storage_pci_resource_plan(
+            &prepared,
+            &plan,
+            state.machine().boot().boot_arguments(),
+        ) {
+            return Err(
+                HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
+                    HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan,
+                    prepared,
+                ),
+            );
+        }
+
+        let HvfSnapshotV2StoragePciPlatformPlanParts {
+            root_key: _,
+            command_line,
+            block_metrics_ids,
+            pmem_metrics_ids,
+            block_retries,
+            pmem_retries,
+            pci: pci_plan,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        } = plan;
+        let block_count = pci_plan.block_records().len();
+        let pmem_count = pci_plan.pmem_records().len();
+        let record_count = block_count.saturating_add(pmem_count);
+        if publication_fault_pmem_index.is_some_and(|index| index >= pmem_count) {
+            return Err(
+                HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
+                    HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan,
+                    prepared,
+                ),
+            );
+        }
+        let earliest_block_retry_deadline = block_retries
+            .iter()
+            .filter_map(|retry| retry.retry_deadline())
+            .min();
+        let earliest_pmem_retry_deadline = pmem_retries
+            .iter()
+            .filter_map(|retry| retry.retry_deadline())
+            .min();
+        let block_device_metrics =
+            match SharedBlockDeviceMetricsRegistry::from_owned_drive_ids_with_capacity(
+                block_metrics_ids,
+                PCI_ENDPOINT_SLOT_COUNT,
+            ) {
+                Ok(metrics) => metrics,
+                Err(source) => {
+                    return Err(
+                        HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
+                            HvfSnapshotV2StoragePciRestoreStage::BlockMetrics,
+                            HvfSnapshotV2StoragePciRestoreFailure::BlockMetrics(source),
+                            prepared,
+                        ),
+                    );
+                }
+            };
+        let pmem_device_metrics =
+            match SharedPmemDeviceMetricsRegistry::from_owned_device_ids_with_capacity(
+                pmem_metrics_ids,
+                PCI_ENDPOINT_SLOT_COUNT,
+            ) {
+                Ok(metrics) => metrics,
+                Err(source) => {
+                    return Err(
+                        HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
+                            HvfSnapshotV2StoragePciRestoreStage::PmemMetrics,
+                            HvfSnapshotV2StoragePciRestoreFailure::PmemMetrics(source),
+                            prepared,
+                        ),
+                    );
+                }
+            };
+
+        let mut pmem_static_reserved_ranges = Vec::new();
+        let mut block = Vec::new();
+        let mut network = Vec::new();
+        let mut pmem = Vec::new();
+        let mut prepared_publications = Vec::new();
+        let mut pmem_devices = Vec::new();
+        let mut pmem_ranges = Vec::new();
+        let route_count = match usize::try_from(pci_plan.msi().interrupt_range.count) {
+            Ok(route_count) => route_count,
+            Err(_) => {
+                return Err(
+                    HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
+                        HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
+                        HvfSnapshotV2StoragePciRestoreFailure::Allocation,
+                        prepared,
+                    ),
+                );
+            }
+        };
+        let mut exact_intids = Vec::new();
+        let mut cleanup = Vec::new();
+        let capacity_ok = pmem_static_reserved_ranges
+            .try_reserve_exact(layout.ranges().len())
+            .is_ok()
+            && block.try_reserve_exact(PCI_ENDPOINT_SLOT_COUNT).is_ok()
+            && network.try_reserve_exact(PCI_ENDPOINT_SLOT_COUNT).is_ok()
+            && pmem.try_reserve_exact(PCI_ENDPOINT_SLOT_COUNT).is_ok()
+            && prepared_publications
+                .try_reserve_exact(record_count)
+                .is_ok()
+            && pmem_devices.try_reserve_exact(pmem_count).is_ok()
+            && pmem_ranges.try_reserve_exact(pmem_count).is_ok()
+            && exact_intids.try_reserve_exact(route_count).is_ok()
+            && cleanup
+                .try_reserve_exact(record_count.saturating_mul(2).saturating_add(10))
+                .is_ok();
+        if !capacity_ok {
+            return Err(
+                HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
+                    HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
+                    HvfSnapshotV2StoragePciRestoreFailure::Allocation,
+                    prepared,
+                ),
+            );
+        }
+        pmem_static_reserved_ranges.extend(layout.ranges().iter().copied());
+        for offset in 0..pci_plan.msi().interrupt_range.count {
+            let Some(intid) = pci_plan.msi().interrupt_range.base.checked_add(offset) else {
+                return Err(
+                    HvfSnapshotV2StoragePciRestoreError::with_prepared_bundle_abort(
+                        HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
+                        HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan,
+                        prepared,
+                    ),
+                );
+            };
+            exact_intids.push(intid);
+        }
+
+        let shell_plan = HvfSnapshotV2StoragePciShellPlan {
+            command_line: &command_line,
+            pci: &pci_plan,
+            serial_interrupt,
+            vmgenid_interrupt,
+            vmclock_interrupt,
+        };
+        let mut platform = match restore_hvf_snapshot_v2_storage_pci_process_platform(
+            state,
+            memory,
+            process_shell,
+            shell_plan,
+        ) {
+            Ok(platform) => platform,
+            Err(source) => {
+                return Err(HvfSnapshotV2StoragePciRestoreError::platform(
+                    source, prepared,
+                ));
+            }
+        };
+        let (_root_key, block_bundle, pmem_configs, pmem_records) = prepared.into_parts();
+        let mut drive_configs = DriveConfigs::new();
+        let mut block_records = Vec::new();
+        let mut async_runtime = None;
+        if let Some(block_bundle) = block_bundle {
+            let (configs, records, runtime, async_generations) = block_bundle.into_parts();
+            debug_assert_eq!(
+                async_generations.len(),
+                records
+                    .iter()
+                    .filter(|record| record.async_generation().is_some())
+                    .count()
+            );
+            drop(async_generations);
+            drive_configs = configs;
+            block_records = records;
+            async_runtime = runtime;
+        }
+
+        let mut block_retry_wakeup_scheduler = None;
+        let mut pmem_retry_wakeup_scheduler = None;
+        let mut pci_data_devices = None;
+        macro_rules! fail_after_platform {
+            ($stage:expr, $failure:expr) => {{
+                release_unpublished_snapshot_v2_storage_pci_publications(
+                    &mut prepared_publications,
+                    &mut cleanup,
+                );
+                return Err(failed_snapshot_v2_storage_pci_after_platform(
+                    platform,
+                    $stage,
+                    $failure,
+                    HvfSnapshotV2StoragePciCleanup {
+                        block_scheduler: &mut block_retry_wakeup_scheduler,
+                        pmem_scheduler: &mut pmem_retry_wakeup_scheduler,
+                        async_runtime: async_runtime.as_ref(),
+                        pci_data_devices: &mut pci_data_devices,
+                        pmem_devices: &mut pmem_devices,
+                        failures: cleanup,
+                    },
+                ));
+            }};
+        }
+
+        let validation = {
+            let dispatcher_owner = Arc::clone(platform.mmio_dispatcher());
+            let mut dispatcher = match dispatcher_owner.lock() {
+                Ok(dispatcher) => dispatcher,
+                Err(_) => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::PciHost,
+                    HvfSnapshotV2StoragePciRestoreFailure::DispatcherUnavailable
+                ),
+            };
+            match prepare_restored_pci_validation(&mut dispatcher) {
+                Ok(validation) => validation,
+                Err(source) => {
+                    drop(dispatcher);
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::PciHost,
+                        HvfSnapshotV2StoragePciRestoreFailure::PciHost(source)
+                    )
+                }
+            }
+        };
+        let available_slots = match validation
+            .segment()
+            .with_segment(|segment| segment.available_endpoint_slots())
+        {
+            Ok(available_slots) => available_slots,
+            Err(source) => fail_after_platform!(
+                HvfSnapshotV2StoragePciRestoreStage::PciHost,
+                HvfSnapshotV2StoragePciRestoreFailure::PciData(HvfArm64BootPciDataError::new(
+                    format!("failed to inspect restored PCI endpoint capacity: {source}")
+                ))
+            ),
+        };
+        if available_slots < PCI_ENDPOINT_SLOT_COUNT {
+            fail_after_platform!(
+                HvfSnapshotV2StoragePciRestoreStage::PciHost,
+                HvfSnapshotV2StoragePciRestoreFailure::PciData(HvfArm64BootPciDataError::new(
+                    "restored PCI segment cannot retain complete endpoint headroom"
+                ))
+            );
+        }
+        let available_bars = match pci_data_available_bar_count(validation.bar_allocator()) {
+            Ok(available_bars) => available_bars,
+            Err(source) => fail_after_platform!(
+                HvfSnapshotV2StoragePciRestoreStage::PciHost,
+                HvfSnapshotV2StoragePciRestoreFailure::PciData(source)
+            ),
+        };
+        if available_bars < PCI_ENDPOINT_SLOT_COUNT {
+            fail_after_platform!(
+                HvfSnapshotV2StoragePciRestoreStage::PciHost,
+                HvfSnapshotV2StoragePciRestoreFailure::PciData(HvfArm64BootPciDataError::new(
+                    "restored PCI BAR allocator cannot retain complete endpoint headroom"
+                ))
+            );
+        }
+        let bar_plan = match pci_data_bar_plan(validation.bar_allocator(), PCI_ENDPOINT_SLOT_COUNT)
+        {
+            Ok(bar_plan) => bar_plan,
+            Err(source) => fail_after_platform!(
+                HvfSnapshotV2StoragePciRestoreStage::PciHost,
+                HvfSnapshotV2StoragePciRestoreFailure::PciData(source)
+            ),
+        };
+        {
+            let dispatcher_owner = Arc::clone(platform.mmio_dispatcher());
+            let dispatcher = match dispatcher_owner.lock() {
+                Ok(dispatcher) => dispatcher,
+                Err(_) => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::PciHost,
+                    HvfSnapshotV2StoragePciRestoreFailure::DispatcherUnavailable
+                ),
+            };
+            if let Err(source) = preflight_pci_data_dispatcher(&dispatcher, &bar_plan) {
+                drop(dispatcher);
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::PciHost,
+                    HvfSnapshotV2StoragePciRestoreFailure::PciData(source)
+                );
+            }
+        }
+        let signaler = match platform.backend().gic_msi_signaler() {
+            Some(signaler) => signaler,
+            None => fail_after_platform!(
+                HvfSnapshotV2StoragePciRestoreStage::PciRoutes,
+                HvfSnapshotV2StoragePciRestoreFailure::PciData(HvfArm64BootPciDataError::new(
+                    "restored PCI vector requires a GICv2m MSI signaler"
+                ))
+            ),
+        };
+        let msi_interrupts =
+            match HvfGicMsiDeviceInterruptResources::allocate_exact(signaler, &exact_intids) {
+                Ok(interrupts) => interrupts,
+                Err(source) => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::PciRoutes,
+                    HvfSnapshotV2StoragePciRestoreFailure::PciRoutes(source)
+                ),
+            };
+        pci_data_devices = Some(HvfArm64BootPciDataDevices {
+            validation,
+            dispatcher: Arc::clone(platform.mmio_dispatcher()),
+            msi_interrupts: Some(msi_interrupts),
+            balloon: None,
+            block,
+            network,
+            pmem,
+            vsock: None,
+            entropy: None,
+            memory_hotplug: None,
+            pmem_static_reserved_ranges,
+            runtime_hotplug: true,
+        });
+
+        for (index, (record, planned)) in block_records
+            .into_iter()
+            .zip(pci_plan.block_records())
+            .enumerate()
+        {
+            let manager = match pci_data_devices.as_mut() {
+                Some(manager) => manager,
+                None => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::PciRoutes,
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                ),
+            };
+            let mut interrupts = match manager.shared_msi_registry() {
+                Ok(interrupts) => interrupts,
+                Err(source) => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::PciData(source)
+                ),
+            };
+            let endpoint =
+                match record.prepare_endpoint(planned.bar_region_id(), interrupts.registry()) {
+                    Ok(endpoint) => endpoint,
+                    Err(source) => {
+                        release_unpublished_snapshot_v2_storage_pci_interrupts(
+                            index,
+                            &mut interrupts,
+                            &mut cleanup,
+                        );
+                        fail_after_platform!(
+                            HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index },
+                            HvfSnapshotV2StoragePciRestoreFailure::PciEndpoint(source)
+                        )
+                    }
+                };
+            let metrics_lease = match block_device_metrics.claim_drive_lease(endpoint.drive_id()) {
+                Ok(lease) => lease,
+                Err(source) => {
+                    drop(endpoint);
+                    release_unpublished_snapshot_v2_storage_pci_interrupts(
+                        index,
+                        &mut interrupts,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::BlockMetrics(source)
+                    )
+                }
+            };
+            prepared_publications.push(Some(PreparedHvfSnapshotV2StoragePciPublication::Block {
+                endpoint,
+                interrupts,
+                metrics_lease,
+            }));
+        }
+        for (pmem_index, (record, planned)) in pmem_records
+            .into_iter()
+            .zip(pci_plan.pmem_records())
+            .enumerate()
+        {
+            let index = block_count.saturating_add(pmem_index);
+            let manager = match pci_data_devices.as_mut() {
+                Some(manager) => manager,
+                None => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::PciRoutes,
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                ),
+            };
+            let mut interrupts = match manager.shared_msi_registry() {
+                Ok(interrupts) => interrupts,
+                Err(source) => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::PciData(source)
+                ),
+            };
+            let endpoint =
+                match record.prepare_endpoint(planned.bar_region_id(), interrupts.registry()) {
+                    Ok(endpoint) => endpoint,
+                    Err(source) => {
+                        release_unpublished_snapshot_v2_storage_pci_interrupts(
+                            index,
+                            &mut interrupts,
+                            &mut cleanup,
+                        );
+                        fail_after_platform!(
+                            HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index },
+                            HvfSnapshotV2StoragePciRestoreFailure::PciEndpoint(source)
+                        )
+                    }
+                };
+            let metrics_lease = match pmem_device_metrics.claim_device_lease(endpoint.pmem_id()) {
+                Ok(lease) => lease,
+                Err(source) => {
+                    drop(endpoint);
+                    release_unpublished_snapshot_v2_storage_pci_interrupts(
+                        index,
+                        &mut interrupts,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::PmemMetrics(source)
+                    )
+                }
+            };
+            prepared_publications.push(Some(PreparedHvfSnapshotV2StoragePciPublication::Pmem {
+                endpoint,
+                interrupts,
+                metrics_lease,
+            }));
+        }
+
+        let block_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        if block_count == 0 {
+            block_retry_wakeup_scheduler =
+                Some(HvfArm64BootLimiterRetryWakeupScheduler::inactive());
+        } else {
+            let vcpu_control = platform.control();
+            block_retry_wakeup_scheduler =
+                match HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                    BLOCK_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                    block_retry_wakeup.clone(),
+                    move || vcpu_control.request_wakeup(),
+                ) {
+                    Ok(scheduler) => Some(scheduler),
+                    Err(source) => {
+                        release_unpublished_snapshot_v2_storage_pci_publications(
+                            &mut prepared_publications,
+                            &mut cleanup,
+                        );
+                        fail_after_platform!(
+                            HvfSnapshotV2StoragePciRestoreStage::BlockRetryScheduler,
+                            HvfSnapshotV2StoragePciRestoreFailure::RetryScheduler(source.kind())
+                        )
+                    }
+                };
+        }
+        let pmem_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        if pmem_count == 0 {
+            pmem_retry_wakeup_scheduler = Some(HvfArm64BootLimiterRetryWakeupScheduler::inactive());
+        } else {
+            let vcpu_control = platform.control();
+            pmem_retry_wakeup_scheduler =
+                match HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                    PMEM_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                    pmem_retry_wakeup.clone(),
+                    move || vcpu_control.request_wakeup(),
+                ) {
+                    Ok(scheduler) => Some(scheduler),
+                    Err(source) => {
+                        release_unpublished_snapshot_v2_storage_pci_publications(
+                            &mut prepared_publications,
+                            &mut cleanup,
+                        );
+                        fail_after_platform!(
+                            HvfSnapshotV2StoragePciRestoreStage::PmemRetryScheduler,
+                            HvfSnapshotV2StoragePciRestoreFailure::RetryScheduler(source.kind())
+                        )
+                    }
+                };
+        }
+
+        for index in 0..block_count {
+            let planned = match pci_plan.block_records().get(index) {
+                Some(planned) => planned,
+                None => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                ),
+            };
+            let publication = match prepared_publications.get_mut(index).and_then(Option::take) {
+                Some(PreparedHvfSnapshotV2StoragePciPublication::Block {
+                    endpoint,
+                    interrupts,
+                    metrics_lease,
+                }) => (endpoint, interrupts, metrics_lease),
+                Some(other) => {
+                    release_unpublished_snapshot_v2_storage_pci_publication(
+                        index,
+                        other,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                    )
+                }
+                None => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                ),
+            };
+            let (endpoint, mut interrupts, metrics_lease) = publication;
+            if endpoint.key() != planned.key() {
+                drop(endpoint);
+                drop(metrics_lease);
+                release_unpublished_snapshot_v2_storage_pci_interrupts(
+                    index,
+                    &mut interrupts,
+                    &mut cleanup,
+                );
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                );
+            }
+            let (
+                _key,
+                drive_id,
+                is_root_device,
+                _retry,
+                retry_deadline,
+                origin,
+                _async_generation,
+                endpoint,
+            ) = endpoint.into_parts();
+            let (dispatcher_owner, segment) = match pci_data_devices.as_ref() {
+                Some(manager) if manager.block.len() == index => (
+                    Arc::clone(&manager.dispatcher),
+                    manager.validation.segment().clone(),
+                ),
+                _ => {
+                    drop(endpoint);
+                    drop(metrics_lease);
+                    release_unpublished_snapshot_v2_storage_pci_interrupts(
+                        index,
+                        &mut interrupts,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                    )
+                }
+            };
+            let mut dispatcher = match dispatcher_owner.lock() {
+                Ok(dispatcher) => dispatcher,
+                Err(_) => {
+                    drop(endpoint);
+                    drop(metrics_lease);
+                    release_unpublished_snapshot_v2_storage_pci_interrupts(
+                        index,
+                        &mut interrupts,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::DispatcherUnavailable
+                    )
+                }
+            };
+            let publication = match pci_data_devices.as_mut() {
+                Some(manager) => endpoint.publish(
+                    manager.validation.bar_allocator_mut(),
+                    segment,
+                    &mut dispatcher,
+                    interrupts,
+                ),
+                None => {
+                    drop(dispatcher);
+                    drop(endpoint);
+                    drop(metrics_lease);
+                    release_unpublished_snapshot_v2_storage_pci_interrupts(
+                        index,
+                        &mut interrupts,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                    )
+                }
+            };
+            drop(dispatcher);
+            let published = match publication {
+                Ok(published) => published,
+                Err(source) => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::PciPublication(source)
+                ),
+            };
+            let Some(manager) = pci_data_devices.as_mut() else {
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                );
+            };
+            manager.block.push(HvfArm64BootPciBlockDevice {
+                drive_id,
+                is_root_device,
+                origin,
+                published,
+                queue_deliveries: 0,
+                retry_deadline,
+                _metrics_lease: Some(metrics_lease),
+            });
+        }
+
+        for pmem_index in 0..pmem_count {
+            let index = block_count.saturating_add(pmem_index);
+            let planned = match pci_plan.pmem_records().get(pmem_index) {
+                Some(planned) => planned,
+                None => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                ),
+            };
+            let publication = match prepared_publications.get_mut(index).and_then(Option::take) {
+                Some(PreparedHvfSnapshotV2StoragePciPublication::Pmem {
+                    endpoint,
+                    interrupts,
+                    metrics_lease,
+                }) => (endpoint, interrupts, metrics_lease),
+                Some(other) => {
+                    release_unpublished_snapshot_v2_storage_pci_publication(
+                        index,
+                        other,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                    )
+                }
+                None => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                ),
+            };
+            let (endpoint, mut interrupts, metrics_lease) = publication;
+            if endpoint.key() != planned.key() {
+                drop(endpoint);
+                drop(metrics_lease);
+                release_unpublished_snapshot_v2_storage_pci_interrupts(
+                    index,
+                    &mut interrupts,
+                    &mut cleanup,
+                );
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                );
+            }
+            let (_key, _is_root_device, _retry, retry_deadline, origin, prepared_device, endpoint) =
+                endpoint.into_parts();
+            let mut pmem_id = String::new();
+            if pmem_id
+                .try_reserve_exact(prepared_device.id().len())
+                .is_err()
+            {
+                drop(endpoint);
+                drop(metrics_lease);
+                release_unpublished_snapshot_v2_storage_pci_interrupts(
+                    index,
+                    &mut interrupts,
+                    &mut cleanup,
+                );
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::Allocation
+                );
+            }
+            pmem_id.push_str(prepared_device.id());
+            let guest_range = prepared_device.guest_range();
+            if let Err(source) = platform
+                .backend_mut()
+                .map_runtime_pmem_device(&prepared_device)
+            {
+                drop(endpoint);
+                drop(metrics_lease);
+                release_unpublished_snapshot_v2_storage_pci_interrupts(
+                    index,
+                    &mut interrupts,
+                    &mut cleanup,
+                );
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Mapping { index: pmem_index },
+                    HvfSnapshotV2StoragePciRestoreFailure::Mapping(source)
+                );
+            }
+            pmem_ranges.push(guest_range);
+            pmem_devices.push(prepared_device);
+            if publication_fault_pmem_index == Some(pmem_index) {
+                drop(endpoint);
+                drop(metrics_lease);
+                release_unpublished_snapshot_v2_storage_pci_interrupts(
+                    index,
+                    &mut interrupts,
+                    &mut cleanup,
+                );
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::InjectedPublication
+                );
+            }
+            let (dispatcher_owner, segment) = match pci_data_devices.as_ref() {
+                Some(manager) if manager.pmem.len() == pmem_index => (
+                    Arc::clone(&manager.dispatcher),
+                    manager.validation.segment().clone(),
+                ),
+                _ => {
+                    drop(endpoint);
+                    drop(metrics_lease);
+                    release_unpublished_snapshot_v2_storage_pci_interrupts(
+                        index,
+                        &mut interrupts,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                    )
+                }
+            };
+            let mut dispatcher = match dispatcher_owner.lock() {
+                Ok(dispatcher) => dispatcher,
+                Err(_) => {
+                    drop(endpoint);
+                    drop(metrics_lease);
+                    release_unpublished_snapshot_v2_storage_pci_interrupts(
+                        index,
+                        &mut interrupts,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::DispatcherUnavailable
+                    )
+                }
+            };
+            let publication = match pci_data_devices.as_mut() {
+                Some(manager) => endpoint.publish(
+                    manager.validation.bar_allocator_mut(),
+                    segment,
+                    &mut dispatcher,
+                    interrupts,
+                ),
+                None => {
+                    drop(dispatcher);
+                    drop(endpoint);
+                    drop(metrics_lease);
+                    release_unpublished_snapshot_v2_storage_pci_interrupts(
+                        index,
+                        &mut interrupts,
+                        &mut cleanup,
+                    );
+                    fail_after_platform!(
+                        HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                        HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                    )
+                }
+            };
+            drop(dispatcher);
+            let published = match publication {
+                Ok(published) => published,
+                Err(source) => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::PciPublication(source)
+                ),
+            };
+            let Some(manager) = pci_data_devices.as_mut() else {
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::Publication { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                );
+            };
+            manager.pmem.push(HvfArm64BootPciPmemDevice {
+                pmem_id,
+                guest_range,
+                origin,
+                published,
+                queue_deliveries: 0,
+                retry_deadline,
+                _metrics_lease: Some(metrics_lease),
+            });
+        }
+
+        release_unpublished_snapshot_v2_storage_pci_publications(
+            &mut prepared_publications,
+            &mut cleanup,
+        );
+        if !cleanup.is_empty() {
+            fail_after_platform!(
+                HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
+                HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+            );
+        }
+
+        let Some(block_retry_wakeup_scheduler) = block_retry_wakeup_scheduler.take() else {
+            std::process::abort();
+        };
+        let Some(pmem_retry_wakeup_scheduler) = pmem_retry_wakeup_scheduler.take() else {
+            std::process::abort();
+        };
+        block_retry_wakeup_scheduler.schedule_deadline(earliest_block_retry_deadline);
+        pmem_retry_wakeup_scheduler.schedule_deadline(earliest_pmem_retry_deadline);
+
+        let parts = platform.into_parts();
+        let machine_config = parts.machine.machine();
+        let cpu_template_application = parts.machine.cpu_template().cloned();
+        let cache_source = crate::vcpu_config::HvfArm64VcpuCacheFdtSource::new(
+            parts.compatibility.identification().id_aa64mmfr2_el1(),
+            parts.compatibility.cache_manifest(),
+        );
+        let gic = parts.compatibility.gic_metadata();
+        let serial_interrupt_line = parts
+            .serial_device
+            .as_ref()
+            .map(|device| device.fdt_device.interrupt_line);
+        let vmgenid_interrupt_line = parts.vmgenid_device.fdt_device.interrupt_line;
+        let vmclock_interrupt_line = parts.vmclock_device.fdt_device.interrupt_line;
+        let runtime_resources = Arm64BootRuntimeResources {
+            machine_config,
+            layout,
+            boot_origin: None,
+            retained_fdt: Some(retained_fdt),
+            rtc_device: Some(parts.rtc_device),
+            serial_device: parts.serial_device,
+            vmgenid_device: parts.vmgenid_device,
+            vmclock_device: parts.vmclock_device,
+            pvtime_state: Arm64BootPvTimeState::restored(parts.pvtime_layout),
+            block_devices: Vec::new(),
+            block_async_runtime: async_runtime.unwrap_or_default(),
+            pci_block_devices: Vec::new(),
+            pmem_devices,
+            pmem_mmio_devices: Vec::new(),
+            network_devices: Vec::new(),
+            pci_network_devices: Vec::new(),
+            vsock_device: None,
+            pci_vsock_device: None,
+            balloon_device: None,
+            pci_balloon_device: None,
+            memory_hotplug_device: None,
+            pci_memory_hotplug_device: None,
+            entropy_device: None,
+            pci_entropy_device: None,
+            pci_validation: None,
+        };
+        let network_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        let session = Self {
+            runner: parts.runner,
+            backend: parts.backend,
+            mmio_dispatcher: parts.mmio_dispatcher,
+            runtime_resources,
+            restored_snapshot_v2_mmio_registrations: None,
+            restored_snapshot_v2_pci_pmem_ranges: Some(pmem_ranges),
+            restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
+            restored_snapshot_v2_machine: Some(parts.machine),
+            cpu_template_application,
+            pci_validation_endpoint: None,
+            pci_data_devices,
+            cache_source,
+            cache_hierarchy: None,
+            control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
+            run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
+            block_retry_wakeup,
+            block_retry_wakeup_scheduler,
+            pmem_retry_wakeup,
+            pmem_retry_wakeup_scheduler,
+            network_retry_wakeup,
+            network_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            entropy_retry_wakeup,
+            entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler::inactive(),
+            entropy_source: VirtioRngOsEntropySource::new(),
+            block_device_metrics,
+            pmem_device_metrics,
+            balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+            memory_hotplug_device_metrics: None,
+            network_interface_metrics: SharedNetworkInterfaceMetricsRegistry::default(),
+            vsock_device_metrics: SharedVsockDeviceMetrics::default(),
+            entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
+            gic,
+            block_interrupt_lines: Vec::new(),
+            pmem_interrupt_lines: Vec::new(),
+            network_interrupt_lines: Vec::new(),
+            vsock_interrupt_line: None,
+            balloon_interrupt_line: None,
+            entropy_interrupt_line: None,
+            memory_hotplug_interrupt_line: None,
+            serial_interrupt_line,
+            serial_input: None,
+            vmgenid_interrupt_line,
+            vmclock_interrupt_line,
+            boot_registers: None,
+        };
+        let configs =
+            CaptureReadyStorageConfigs::new(drive_configs.into_vec(), pmem_configs.into_vec());
+        Ok(RestoredHvfSnapshotV2StoragePciOwners { session, configs })
     }
 
     /// Reconstructs one exact profile-2 PCI vector inside a private canonical
@@ -15003,6 +16671,7 @@ impl OwnedHvfArm64BootSession {
             mmio_dispatcher: parts.mmio_dispatcher,
             runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
+            restored_snapshot_v2_pci_pmem_ranges: None,
             restored_snapshot_v2_memory_binding: Some(parts.memory_binding),
             restored_snapshot_v2_machine: Some(parts.machine),
             cpu_template_application,
@@ -15343,6 +17012,7 @@ impl OwnedHvfArm64BootSession {
             mmio_dispatcher,
             runtime_resources,
             restored_snapshot_v2_mmio_registrations: None,
+            restored_snapshot_v2_pci_pmem_ranges: None,
             restored_snapshot_v2_memory_binding: None,
             restored_snapshot_v2_machine: None,
             cpu_template_application: None,
@@ -15784,6 +17454,29 @@ impl OwnedHvfArm64BootSession {
         Ok(())
     }
 
+    fn teardown_restored_snapshot_v2_pci_pmem(
+        &mut self,
+    ) -> Result<(), HvfSnapshotV2StoragePciRestoreCleanupFailure> {
+        let Some(ranges) = self.restored_snapshot_v2_pci_pmem_ranges.as_mut() else {
+            return Ok(());
+        };
+        while let Some(range) = ranges.last().copied() {
+            let index = ranges.len() - 1;
+            self.backend
+                .take_runtime_pmem_mapping(range, false)
+                .map_err(
+                    |source| HvfSnapshotV2StoragePciRestoreCleanupFailure::Mapping {
+                        index,
+                        source,
+                    },
+                )?;
+            ranges.pop();
+        }
+        self.runtime_resources.pmem_devices.clear();
+        self.restored_snapshot_v2_pci_pmem_ranges = None;
+        Ok(())
+    }
+
     pub fn shutdown(&mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
         self.block_retry_wakeup_scheduler.stop();
         self.pmem_retry_wakeup_scheduler.stop();
@@ -15791,6 +17484,7 @@ impl OwnedHvfArm64BootSession {
         self.entropy_retry_wakeup_scheduler.stop();
         let runner_result = self.runner.shutdown();
         let had_restored_snapshot_v2_mmio = self.restored_snapshot_v2_mmio_registrations.is_some();
+        let had_restored_snapshot_v2_pci_pmem = self.restored_snapshot_v2_pci_pmem_ranges.is_some();
         let restored_snapshot_v2_mmio_result = if runner_result.is_ok() {
             self.teardown_restored_snapshot_v2_mmio()
         } else {
@@ -15813,6 +17507,23 @@ impl OwnedHvfArm64BootSession {
             self.pmem_device_metrics = SharedPmemDeviceMetricsRegistry::default();
         }
         let pci_data_result = self.teardown_pci_data_devices();
+        let restored_snapshot_v2_pci_pmem_result = if runner_result.is_ok()
+            && restored_snapshot_v2_mmio_result.is_ok()
+            && block_async_result.is_ok()
+            && pci_data_result.is_ok()
+        {
+            self.teardown_restored_snapshot_v2_pci_pmem()
+        } else {
+            Ok(())
+        };
+        if had_restored_snapshot_v2_pci_pmem
+            && block_async_result.is_ok()
+            && pci_data_result.is_ok()
+            && restored_snapshot_v2_pci_pmem_result.is_ok()
+        {
+            self.block_device_metrics = SharedBlockDeviceMetricsRegistry::default();
+            self.pmem_device_metrics = SharedPmemDeviceMetricsRegistry::default();
+        }
         let pci_result = self.teardown_pci_validation_endpoint();
         let result = if let Err(source) = runner_result {
             Err(HvfArm64BootSessionShutdownError::Vcpu { source })
@@ -15822,6 +17533,8 @@ impl OwnedHvfArm64BootSession {
             Err(source)
         } else if let Err(source) = pci_data_result {
             Err(HvfArm64BootSessionShutdownError::PciData { source })
+        } else if let Err(source) = restored_snapshot_v2_pci_pmem_result {
+            Err(HvfArm64BootSessionShutdownError::RestoredSnapshotV2PciPmem { source })
         } else if let Err(source) = pci_result {
             Err(HvfArm64BootSessionShutdownError::PciValidation { source })
         } else {
@@ -22375,6 +24088,9 @@ pub enum HvfArm64BootSessionShutdownError {
     RestoredSnapshotV2Mmio {
         source: HvfSnapshotV2StorageMmioRestoreCleanupFailure,
     },
+    RestoredSnapshotV2PciPmem {
+        source: HvfSnapshotV2StoragePciRestoreCleanupFailure,
+    },
     BlockAsyncGuestMemory {
         source: HvfGuestMemoryMappingError,
     },
@@ -22405,6 +24121,10 @@ impl fmt::Display for HvfArm64BootSessionShutdownError {
                 f,
                 "failed to tear down restored snapshot MMIO ownership: {source}"
             ),
+            Self::RestoredSnapshotV2PciPmem { source } => write!(
+                f,
+                "failed to tear down restored snapshot PCI pmem ownership: {source}"
+            ),
             Self::BlockAsyncGuestMemory { source } => {
                 write!(
                     f,
@@ -22432,6 +24152,7 @@ impl std::error::Error for HvfArm64BootSessionShutdownError {
         match self {
             Self::Vcpu { source } => Some(source),
             Self::RestoredSnapshotV2Mmio { source } => Some(source),
+            Self::RestoredSnapshotV2PciPmem { source } => Some(source),
             Self::BlockAsyncGuestMemory { source } => Some(source),
             Self::BlockAsync { source } => Some(source),
             Self::PciValidation { source } => Some(source),
@@ -35380,6 +37101,73 @@ mod tests {
         assert!(cleanup_debug.contains("<redacted>"));
         for diagnostics in [debug, incomplete.to_string(), cleanup_debug] {
             assert!(!diagnostics.contains("secret-cleanup"));
+        }
+    }
+
+    #[test]
+    fn native_v2_storage_pci_errors_preserve_terminality_and_redact_cleanup() {
+        let retryable = super::HvfSnapshotV2StoragePciRestoreError::preflight(
+            super::HvfSnapshotV2StoragePciRestoreStage::ResourcePlan,
+            super::HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan,
+        );
+        assert!(!retryable.has_incomplete_cleanup());
+        assert!(!retryable.is_terminal());
+
+        let clean_rollback = super::HvfSnapshotV2StoragePciRestoreError::after_platform(
+            super::HvfSnapshotV2StoragePciRestoreStage::Publication { index: 1 },
+            super::HvfSnapshotV2StoragePciRestoreFailure::InjectedPublication,
+            Vec::new(),
+        );
+        assert!(!clean_rollback.has_incomplete_cleanup());
+        assert!(!clean_rollback.is_terminal());
+
+        let publication_rollback = super::HvfSnapshotV2StoragePciRestoreError::after_platform(
+            super::HvfSnapshotV2StoragePciRestoreStage::Publication { index: 1 },
+            super::HvfSnapshotV2StoragePciRestoreFailure::PciPublication(
+                super::VirtioPciPublicationError::Rollback {
+                    primary: "secret-primary/path".to_owned(),
+                    cleanup: "secret-publication-cleanup/path".to_owned(),
+                },
+            ),
+            Vec::new(),
+        );
+        assert!(publication_rollback.has_incomplete_cleanup());
+        assert!(publication_rollback.is_terminal());
+        assert!(!format!("{publication_rollback:?}").contains("secret-primary"));
+        assert!(
+            !publication_rollback
+                .to_string()
+                .contains("secret-publication-cleanup")
+        );
+        let publication_failure =
+            std::error::Error::source(&publication_rollback).expect("failure should be retained");
+        assert!(publication_failure.source().is_none());
+
+        let incomplete = super::HvfSnapshotV2StoragePciRestoreError::after_platform(
+            super::HvfSnapshotV2StoragePciRestoreStage::PmemRetryScheduler,
+            super::HvfSnapshotV2StoragePciRestoreFailure::RetryScheduler(
+                io::ErrorKind::PermissionDenied,
+            ),
+            vec![
+                super::HvfSnapshotV2StoragePciRestoreCleanupFailure::Pci(
+                    super::HvfArm64BootPciDataError::new("secret-pci-cleanup/path"),
+                ),
+                super::HvfSnapshotV2StoragePciRestoreCleanupFailure::Platform(
+                    crate::snapshot_v2_platform::HvfSnapshotV2PlatformShutdownError::Backend(
+                        super::BackendError::Hypervisor("secret-platform-cleanup/path".to_string()),
+                    ),
+                ),
+            ],
+        );
+        assert!(incomplete.has_incomplete_cleanup());
+        assert!(incomplete.is_terminal());
+        let debug = format!("{incomplete:?}");
+        let cleanup_debug = format!("{:?}", incomplete.cleanup_failures());
+        assert!(debug.contains("<redacted>"));
+        assert!(cleanup_debug.contains("<redacted>"));
+        for diagnostics in [debug, incomplete.to_string(), cleanup_debug] {
+            assert!(!diagnostics.contains("secret-pci"));
+            assert!(!diagnostics.contains("secret-platform"));
         }
     }
 
