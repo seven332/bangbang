@@ -654,6 +654,26 @@ pub fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
         platform,
         bundle,
         process,
+        None,
+        &mut SystemStoragePlatformPlanReserve,
+    )
+}
+
+/// Proves a complete exact-2.8 storage-plus-MMIO-entropy product before live
+/// Hypervisor.framework construction.
+#[doc(hidden)]
+pub fn prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan(
+    platform: &HvfSnapshotV2PlatformState,
+    bundle: &PreparedSnapshotV2StorageBundle,
+    process: HvfSnapshotV2StorageMmioProcessConfig,
+    entropy_interrupt: GuestInterruptLine,
+) -> Result<HvfSnapshotV2StorageMmioPlatformPlan, PrepareHvfSnapshotV2StorageMmioPlatformPlanError>
+{
+    prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
+        platform,
+        bundle,
+        process,
+        Some(entropy_interrupt),
         &mut SystemStoragePlatformPlanReserve,
     )
 }
@@ -662,6 +682,7 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
     platform: &HvfSnapshotV2PlatformState,
     bundle: &PreparedSnapshotV2StorageBundle,
     process: HvfSnapshotV2StorageMmioProcessConfig,
+    entropy_interrupt: Option<GuestInterruptLine>,
     reserve: &mut impl StoragePlatformPlanReserve,
 ) -> Result<HvfSnapshotV2StorageMmioPlatformPlan, PrepareHvfSnapshotV2StorageMmioPlatformPlanError>
 {
@@ -872,6 +893,14 @@ fn prepare_hvf_snapshot_v2_storage_mmio_platform_plan_with(
     }
     .map_err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::CommandLine)?;
 
+    if let Some(expected) = entropy_interrupt
+        && interrupt_allocator
+            .allocate()
+            .map_err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Interrupt)?
+            != expected
+    {
+        return Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan);
+    }
     let serial_interrupt = interrupt_allocator
         .allocate()
         .map_err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Interrupt)?;
@@ -1982,6 +2011,24 @@ pub(crate) mod tests {
         (fixture.platform, plan)
     }
 
+    pub(crate) fn mmio_fdt_plan_fixture() -> (
+        HvfSnapshotV2PlatformState,
+        HvfSnapshotV2StorageMmioPlatformPlan,
+    ) {
+        let fixture = fixture(FixtureShape::MixedBlockRoot);
+        let plan = prepare_hvf_snapshot_v2_storage_mmio_platform_plan(
+            &fixture.platform,
+            &fixture.bundle,
+            process_config(),
+        )
+        .expect("storage MMIO FDT plan should validate");
+        fixture
+            .bundle
+            .abort()
+            .expect("storage MMIO FDT bundle should abort");
+        (fixture.platform, plan)
+    }
+
     const fn process_config() -> HvfSnapshotV2StorageMmioProcessConfig {
         HvfSnapshotV2StorageMmioProcessConfig::new(
             BlockMmioLayout::new(BLOCK_MMIO_BASE, BLOCK_MMIO_REGION_ID),
@@ -2062,6 +2109,61 @@ pub(crate) mod tests {
                 .abort()
                 .expect("planned storage bundle should abort cleanly");
         }
+    }
+
+    #[test]
+    fn entropy_mmio_plan_consumes_one_interrupt_between_storage_and_serial() {
+        let fixture = fixture(FixtureShape::MixedBlockRoot);
+        let prefix = fixture
+            .bundle
+            .block_bundle()
+            .into_iter()
+            .flat_map(|bundle| bundle.records())
+            .map(|record| {
+                let SnapshotV2DeviceTransport::Mmio(mmio) = record.transport() else {
+                    panic!("entropy fixture block should use MMIO");
+                };
+                mmio.interrupt_line()
+            })
+            .chain(fixture.bundle.pmem_records().iter().map(|record| {
+                let SnapshotV2DeviceTransport::Mmio(mmio) = record.transport() else {
+                    panic!("entropy fixture pmem should use MMIO");
+                };
+                mmio.interrupt_line()
+            }))
+            .collect::<Vec<_>>();
+        let (platform, entropy_interrupt, serial_interrupt, vmgenid_interrupt, vmclock_interrupt) =
+            crate::snapshot_v2_platform::tests::product_entropy_interrupt_platform_fixture(
+                fixture.platform,
+                &prefix,
+            );
+        let plan = prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan(
+            &platform,
+            &fixture.bundle,
+            process_config(),
+            entropy_interrupt,
+        )
+        .expect("storage entropy platform plan should validate");
+        assert_eq!(plan.serial_interrupt(), serial_interrupt);
+        assert_eq!(plan.vmgenid_interrupt(), vmgenid_interrupt);
+        assert_eq!(plan.vmclock_interrupt(), vmclock_interrupt);
+
+        let wrong_entropy =
+            GuestInterruptLine::new(entropy_interrupt.raw_value().saturating_add(1))
+                .expect("wrong entropy interrupt should validate structurally");
+        assert!(matches!(
+            prepare_hvf_snapshot_v2_storage_entropy_mmio_platform_plan(
+                &platform,
+                &fixture.bundle,
+                process_config(),
+                wrong_entropy,
+            ),
+            Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::ResourcePlan)
+        ));
+        fixture
+            .bundle
+            .abort()
+            .expect("storage entropy fixture should abort");
     }
 
     #[test]
@@ -2237,6 +2339,7 @@ pub(crate) mod tests {
                     &fixture.platform,
                     &fixture.bundle,
                     process_config(),
+                    None,
                     &mut FailingReserve { calls: 0, fail_at },
                 ),
                 Err(PrepareHvfSnapshotV2StorageMmioPlatformPlanError::Allocation)
