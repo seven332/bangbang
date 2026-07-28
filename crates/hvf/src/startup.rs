@@ -60,7 +60,9 @@ use bangbang_runtime::memory_hotplug::{
     VirtioMemDevice, VirtioMemMmioCaptureState, VirtioMemMmioLayout, VirtioMemMutationExecutor,
     VirtioMemPciCaptureError, VirtioMemPciCaptureState,
 };
-use bangbang_runtime::message_interrupt::GuestMessageInterruptResources;
+use bangbang_runtime::message_interrupt::{
+    GuestMessageInterruptResources, GuestMessageInterruptResourcesError,
+};
 use bangbang_runtime::metrics::{
     BlockDeviceMetricsLease, BlockDeviceMetricsRegistryError, NetworkInterfaceMetricsLease,
     PmemDeviceMetricsLease, PmemDeviceMetricsRegistryError, SharedBalloonDeviceMetrics,
@@ -125,8 +127,8 @@ use bangbang_runtime::snapshot_device_v2_6::{
 };
 use bangbang_runtime::snapshot_entropy_v2_8::{
     NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, PreparedSnapshotV2EntropyMmioHandler,
-    SnapshotV2EntropyMmioHandlerError, SnapshotV2EntropyRestorePlan, SnapshotV2EntropyState,
-    SnapshotV2EntropyStateCaptureError,
+    SnapshotV2EntropyMmioHandlerError, SnapshotV2EntropyPciEndpointError,
+    SnapshotV2EntropyRestorePlan, SnapshotV2EntropyState, SnapshotV2EntropyStateCaptureError,
 };
 use bangbang_runtime::snapshot_format::SnapshotFormatVersion;
 use bangbang_runtime::snapshot_format_v2::NATIVE_V2_LEGACY_PLATFORM_VERSION;
@@ -240,6 +242,9 @@ use crate::snapshot_v2::{
     HvfSnapshotV2BootState, HvfSnapshotV2BuildError, HvfSnapshotV2FdtState,
     HvfSnapshotV2GlobalState, HvfSnapshotV2MachineState, HvfSnapshotV2PlatformState,
     HvfSnapshotV2PvTimeVcpuState, HvfSnapshotV2TimeState, HvfSnapshotV2VcpuState,
+};
+use crate::snapshot_v2_entropy_platform::{
+    HvfSnapshotV2EntropyPciEndpointPlan, HvfSnapshotV2StorageEntropyPciPlatformPlan,
 };
 use crate::snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockPlatformPlanParts,
@@ -3771,6 +3776,286 @@ impl fmt::Display for HvfSnapshotV2EntropyMmioRestoreError {
 }
 
 impl std::error::Error for HvfSnapshotV2EntropyMmioRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.failure.as_ref())
+    }
+}
+
+/// One complete, still-unpublished exact-2.8 PCI entropy destination.
+#[doc(hidden)]
+pub struct RestoredHvfSnapshotV2EntropyPciOwners {
+    session: OwnedHvfArm64BootSession,
+    entropy_config: EntropyConfig,
+    storage_configs: Option<CaptureReadyStorageConfigs>,
+}
+
+impl RestoredHvfSnapshotV2EntropyPciOwners {
+    /// Returns the complete Paused destination session.
+    pub const fn session(&self) -> &OwnedHvfArm64BootSession {
+        &self.session
+    }
+
+    /// Returns the exact public entropy configuration.
+    pub const fn entropy_config(&self) -> EntropyConfig {
+        self.entropy_config
+    }
+
+    /// Returns restored storage configuration when storage shares the owner.
+    pub const fn storage_configs(&self) -> Option<&CaptureReadyStorageConfigs> {
+        self.storage_configs.as_ref()
+    }
+
+    /// Consumes all restored owners without discarding configuration.
+    pub fn into_parts(
+        self,
+    ) -> (
+        OwnedHvfArm64BootSession,
+        EntropyConfig,
+        Option<CaptureReadyStorageConfigs>,
+    ) {
+        (self.session, self.entropy_config, self.storage_configs)
+    }
+}
+
+impl fmt::Debug for RestoredHvfSnapshotV2EntropyPciOwners {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredHvfSnapshotV2EntropyPciOwners")
+            .field("has_storage", &self.storage_configs.is_some())
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Stage at which exact-2.8 PCI entropy owner reconstruction stopped.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSnapshotV2EntropyPciRestoreStage {
+    SerialPlatform,
+    StoragePlatform,
+    ResourcePlan,
+    InterruptRoutes,
+    Endpoint,
+    Publication,
+    RetryScheduler,
+}
+
+/// Primary exact-2.8 PCI entropy owner reconstruction failure.
+#[doc(hidden)]
+pub enum HvfSnapshotV2EntropyPciRestoreFailure {
+    SerialPlatform(Box<HvfSnapshotV2SerialOnlyRestoreError>),
+    StoragePlatform(Box<HvfSnapshotV2StoragePciRestoreError>),
+    ResourcePlan,
+    ResourcePlanCleanup {
+        cleanup: Option<GuestMessageInterruptResourcesError>,
+    },
+    PciData(HvfArm64BootPciDataError),
+    Endpoint {
+        source: SnapshotV2EntropyPciEndpointError,
+        cleanup: Option<GuestMessageInterruptResourcesError>,
+    },
+    DispatcherUnavailable {
+        cleanup: Option<GuestMessageInterruptResourcesError>,
+    },
+    Publication(VirtioPciPublicationError),
+    RetryScheduler(io::ErrorKind),
+    InjectedRetryScheduler,
+}
+
+impl HvfSnapshotV2EntropyPciRestoreFailure {
+    fn interrupt_cleanup_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::Endpoint {
+                cleanup: Some(_),
+                ..
+            } | Self::DispatcherUnavailable { cleanup: Some(_) }
+                | Self::ResourcePlanCleanup { cleanup: Some(_) }
+        )
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2EntropyPciRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::SerialPlatform(_) => "serial-platform",
+            Self::StoragePlatform(_) => "storage-platform",
+            Self::ResourcePlan | Self::ResourcePlanCleanup { .. } => "resource-plan",
+            Self::PciData(_) => "pci-data",
+            Self::Endpoint { .. } => "endpoint",
+            Self::DispatcherUnavailable { .. } => "dispatcher",
+            Self::Publication(_) => "publication",
+            Self::RetryScheduler(_) => "retry-scheduler",
+            Self::InjectedRetryScheduler => "injected-retry-scheduler",
+        };
+        formatter
+            .debug_struct("HvfSnapshotV2EntropyPciRestoreFailure")
+            .field("kind", &kind)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2EntropyPciRestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SerialPlatform(_) => "serial-only HVF platform reconstruction failed",
+            Self::StoragePlatform(_) => "storage-bearing HVF platform reconstruction failed",
+            Self::ResourcePlan | Self::ResourcePlanCleanup { .. } => {
+                "exact-2.8 PCI entropy resource plan diverged"
+            }
+            Self::PciData(_) => "exact-2.8 PCI entropy manager is unavailable",
+            Self::Endpoint { .. } => "exact-2.8 PCI entropy endpoint reconstruction failed",
+            Self::DispatcherUnavailable { .. } => "exact-2.8 PCI entropy dispatcher is unavailable",
+            Self::Publication(_) => "exact-2.8 PCI entropy endpoint publication failed",
+            Self::RetryScheduler(kind) => {
+                return write!(
+                    formatter,
+                    "exact-2.8 PCI entropy retry scheduler startup failed: {kind:?}"
+                );
+            }
+            Self::InjectedRetryScheduler => {
+                "exact-2.8 PCI entropy retry scheduler certification fault was injected"
+            }
+        })
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2EntropyPciRestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SerialPlatform(source) => Some(source.as_ref()),
+            Self::StoragePlatform(source) => Some(source.as_ref()),
+            Self::PciData(source) => Some(source),
+            Self::Endpoint { source, .. } => Some(source),
+            Self::Publication(source) => Some(source),
+            Self::ResourcePlan
+            | Self::ResourcePlanCleanup { .. }
+            | Self::DispatcherUnavailable { .. }
+            | Self::RetryScheduler(_)
+            | Self::InjectedRetryScheduler => None,
+        }
+    }
+}
+
+/// Redacted exact-2.8 PCI entropy owner failure and cleanup evidence.
+#[doc(hidden)]
+pub struct HvfSnapshotV2EntropyPciRestoreError {
+    stage: HvfSnapshotV2EntropyPciRestoreStage,
+    failure: Box<HvfSnapshotV2EntropyPciRestoreFailure>,
+    committed: bool,
+    cleanup: Option<Box<HvfArm64BootSessionShutdownError>>,
+}
+
+impl HvfSnapshotV2EntropyPciRestoreError {
+    fn preflight(
+        stage: HvfSnapshotV2EntropyPciRestoreStage,
+        failure: HvfSnapshotV2EntropyPciRestoreFailure,
+    ) -> Self {
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: false,
+            cleanup: None,
+        }
+    }
+
+    fn serial_platform(source: HvfSnapshotV2SerialOnlyRestoreError) -> Self {
+        Self {
+            stage: HvfSnapshotV2EntropyPciRestoreStage::SerialPlatform,
+            committed: source.is_terminal(),
+            failure: Box::new(HvfSnapshotV2EntropyPciRestoreFailure::SerialPlatform(
+                Box::new(source),
+            )),
+            cleanup: None,
+        }
+    }
+
+    fn storage_platform(source: HvfSnapshotV2StoragePciRestoreError) -> Self {
+        Self {
+            stage: HvfSnapshotV2EntropyPciRestoreStage::StoragePlatform,
+            committed: source.is_terminal(),
+            failure: Box::new(HvfSnapshotV2EntropyPciRestoreFailure::StoragePlatform(
+                Box::new(source),
+            )),
+            cleanup: None,
+        }
+    }
+
+    fn after_platform(
+        mut session: OwnedHvfArm64BootSession,
+        stage: HvfSnapshotV2EntropyPciRestoreStage,
+        failure: HvfSnapshotV2EntropyPciRestoreFailure,
+    ) -> Self {
+        let cleanup = session.shutdown().err().map(Box::new);
+        Self {
+            stage,
+            failure: Box::new(failure),
+            committed: true,
+            cleanup,
+        }
+    }
+
+    pub const fn stage(&self) -> HvfSnapshotV2EntropyPciRestoreStage {
+        self.stage
+    }
+
+    /// Returns whether reverse cleanup did not complete.
+    pub fn has_incomplete_cleanup(&self) -> bool {
+        self.cleanup.is_some()
+            || self.failure.interrupt_cleanup_failed()
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2EntropyPciRestoreFailure::SerialPlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2EntropyPciRestoreFailure::StoragePlatform(source)
+                    if source.has_incomplete_cleanup()
+            )
+            || matches!(
+                self.failure.as_ref(),
+                HvfSnapshotV2EntropyPciRestoreFailure::Publication(
+                    VirtioPciPublicationError::Rollback { .. }
+                )
+            )
+    }
+
+    /// Returns whether retry safety cannot be proven.
+    pub fn is_terminal(&self) -> bool {
+        self.committed || self.has_incomplete_cleanup()
+    }
+}
+
+impl fmt::Debug for HvfSnapshotV2EntropyPciRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HvfSnapshotV2EntropyPciRestoreError")
+            .field("stage", &self.stage)
+            .field("terminal", &self.is_terminal())
+            .field("cleanup_failed", &self.has_incomplete_cleanup())
+            .field("failure", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for HvfSnapshotV2EntropyPciRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact-2.8 PCI entropy owner reconstruction failed at {:?} ({})",
+            self.stage,
+            if self.is_terminal() {
+                "terminal"
+            } else {
+                "retryable"
+            }
+        )
+    }
+}
+
+impl std::error::Error for HvfSnapshotV2EntropyPciRestoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.failure.as_ref())
     }
@@ -13396,6 +13681,21 @@ fn failed_snapshot_v2_root_after_platform(
     HvfSnapshotV2RootRestoreError::after_platform(stage, failure, cleanup)
 }
 
+fn snapshot_v2_entropy_pci_plan_matches(
+    entropy: &SnapshotV2EntropyRestorePlan,
+    plan: HvfSnapshotV2EntropyPciEndpointPlan,
+) -> bool {
+    let bangbang_runtime::snapshot_entropy_v2_8::PreparedSnapshotV2EntropyTransport::Pci(transport) =
+        entropy.transport()
+    else {
+        return false;
+    };
+    transport.origin() == StorageDeviceOrigin::Startup
+        && transport.sbdf() == plan.sbdf()
+        && transport.bar_range() == plan.bar_range()
+        && plan.route_count() == VIRTIO_RNG_QUEUE_SIZES.len().saturating_add(1)
+}
+
 fn validate_snapshot_v2_multi_block_mmio_resource_plan(
     bundle: &PreparedSnapshotV2MultiBlockMmioBundle,
     plan: &HvfSnapshotV2MultiBlockPlatformPlanParts,
@@ -15001,6 +15301,301 @@ impl OwnedHvfArm64BootSession {
             .entropy_retry_wakeup_scheduler
             .schedule_deadline(retry_deadline);
         Ok(RestoredHvfSnapshotV2EntropyMmioOwners {
+            session,
+            entropy_config: config,
+            storage_configs,
+        })
+    }
+
+    /// Reconstructs one exact-2.8 serial plus PCI entropy destination.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_entropy_pci(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        endpoint_plan: HvfSnapshotV2EntropyPciEndpointPlan,
+        entropy: SnapshotV2EntropyRestorePlan,
+    ) -> Result<RestoredHvfSnapshotV2EntropyPciOwners, HvfSnapshotV2EntropyPciRestoreError> {
+        Self::restore_snapshot_v2_serial_entropy_pci_inner(
+            state,
+            memory,
+            process_shell,
+            serial_input,
+            endpoint_plan,
+            entropy,
+            false,
+        )
+    }
+
+    /// Injects failure after PCI publication for signed rollback
+    /// certification.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_entropy_pci_with_scheduler_fault(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        endpoint_plan: HvfSnapshotV2EntropyPciEndpointPlan,
+        entropy: SnapshotV2EntropyRestorePlan,
+    ) -> Result<RestoredHvfSnapshotV2EntropyPciOwners, HvfSnapshotV2EntropyPciRestoreError> {
+        Self::restore_snapshot_v2_serial_entropy_pci_inner(
+            state,
+            memory,
+            process_shell,
+            serial_input,
+            endpoint_plan,
+            entropy,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_snapshot_v2_serial_entropy_pci_inner(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        endpoint_plan: HvfSnapshotV2EntropyPciEndpointPlan,
+        entropy: SnapshotV2EntropyRestorePlan,
+        inject_scheduler_failure: bool,
+    ) -> Result<RestoredHvfSnapshotV2EntropyPciOwners, HvfSnapshotV2EntropyPciRestoreError> {
+        if !snapshot_v2_entropy_pci_plan_matches(&entropy, endpoint_plan) {
+            return Err(HvfSnapshotV2EntropyPciRestoreError::preflight(
+                HvfSnapshotV2EntropyPciRestoreStage::ResourcePlan,
+                HvfSnapshotV2EntropyPciRestoreFailure::ResourcePlan,
+            ));
+        }
+        let session = Self::restore_snapshot_v2_serial_only_inner(
+            state,
+            memory,
+            HvfSnapshotV2SerialProcessShell::SerialOnly {
+                shell: process_shell,
+                process: HvfSnapshotV2SerialOnlyProcessConfig::with_exact_pci_msi_interrupt_count(
+                    endpoint_plan.msi_interrupt_count(),
+                ),
+            },
+            serial_input,
+        )
+        .map_err(HvfSnapshotV2EntropyPciRestoreError::serial_platform)?;
+        Self::attach_snapshot_v2_entropy_pci(
+            session,
+            endpoint_plan,
+            entropy,
+            None,
+            inject_scheduler_failure,
+        )
+    }
+
+    /// Reconstructs one exact-2.8 storage, serial, and PCI entropy
+    /// destination without publishing it.
+    #[doc(hidden)]
+    pub fn restore_snapshot_v2_serial_storage_entropy_pci(
+        state: HvfSnapshotV2PlatformState,
+        memory: GuestMemory,
+        process_shell: HvfSnapshotV2RestoredSerialShell,
+        serial_input: Option<SerialStdioInput>,
+        bundle: PreparedSnapshotV2StorageBundle,
+        plan: HvfSnapshotV2StorageEntropyPciPlatformPlan,
+        entropy: SnapshotV2EntropyRestorePlan,
+    ) -> Result<RestoredHvfSnapshotV2EntropyPciOwners, HvfSnapshotV2EntropyPciRestoreError> {
+        let (storage_plan, endpoint_plan) = plan.into_parts();
+        if !snapshot_v2_entropy_pci_plan_matches(&entropy, endpoint_plan) {
+            return Err(HvfSnapshotV2EntropyPciRestoreError::preflight(
+                HvfSnapshotV2EntropyPciRestoreStage::ResourcePlan,
+                HvfSnapshotV2EntropyPciRestoreFailure::ResourcePlan,
+            ));
+        }
+        let restored = Self::restore_snapshot_v2_storage_pci_inner(
+            state,
+            memory,
+            HvfSnapshotV2StorageProcessShell::Restored(process_shell),
+            serial_input,
+            bundle,
+            storage_plan,
+            None,
+        )
+        .map_err(HvfSnapshotV2EntropyPciRestoreError::storage_platform)?;
+        let (session, storage_configs) = restored.into_parts();
+        Self::attach_snapshot_v2_entropy_pci(
+            session,
+            endpoint_plan,
+            entropy,
+            Some(storage_configs),
+            false,
+        )
+    }
+
+    fn attach_snapshot_v2_entropy_pci(
+        mut session: OwnedHvfArm64BootSession,
+        endpoint_plan: HvfSnapshotV2EntropyPciEndpointPlan,
+        entropy: SnapshotV2EntropyRestorePlan,
+        storage_configs: Option<CaptureReadyStorageConfigs>,
+        inject_scheduler_failure: bool,
+    ) -> Result<RestoredHvfSnapshotV2EntropyPciOwners, HvfSnapshotV2EntropyPciRestoreError> {
+        let owner_is_vacant = session.runtime_resources.entropy_device.is_none()
+            && session.runtime_resources.pci_entropy_device.is_none()
+            && session.entropy_interrupt_line.is_none()
+            && session.entropy_retry_wakeup_scheduler.thread.is_none()
+            && session.pci_data_devices.as_ref().is_some_and(|manager| {
+                manager.entropy.is_none()
+                    && manager.network.is_empty()
+                    && manager.balloon.is_none()
+                    && manager.vsock.is_none()
+                    && manager.memory_hotplug.is_none()
+                    && manager.endpoint_count() == endpoint_plan.preceding_endpoint_count()
+                    && manager.block.len().saturating_add(manager.pmem.len())
+                        == endpoint_plan.preceding_endpoint_count()
+            });
+        if !owner_is_vacant {
+            return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyPciRestoreStage::ResourcePlan,
+                HvfSnapshotV2EntropyPciRestoreFailure::ResourcePlan,
+            ));
+        }
+
+        let mut interrupts = match session.pci_data_devices.as_ref() {
+            Some(manager) => match manager.shared_msi_registry() {
+                Ok(interrupts) => interrupts,
+                Err(source) => {
+                    return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                        session,
+                        HvfSnapshotV2EntropyPciRestoreStage::InterruptRoutes,
+                        HvfSnapshotV2EntropyPciRestoreFailure::PciData(source),
+                    ));
+                }
+            },
+            None => {
+                return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                    session,
+                    HvfSnapshotV2EntropyPciRestoreStage::ResourcePlan,
+                    HvfSnapshotV2EntropyPciRestoreFailure::ResourcePlan,
+                ));
+            }
+        };
+        let entropy =
+            match entropy.into_pci_endpoint(endpoint_plan.bar_region_id(), interrupts.registry()) {
+                Ok(entropy) => entropy,
+                Err(source) => {
+                    let cleanup = interrupts.release().err();
+                    return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                        session,
+                        HvfSnapshotV2EntropyPciRestoreStage::Endpoint,
+                        HvfSnapshotV2EntropyPciRestoreFailure::Endpoint { source, cleanup },
+                    ));
+                }
+            };
+        if entropy.endpoint().sbdf() != endpoint_plan.sbdf()
+            || entropy.endpoint().bar_range() != endpoint_plan.bar_range()
+            || entropy.endpoint().region_id() != endpoint_plan.bar_region_id()
+        {
+            drop(entropy);
+            let cleanup = interrupts.release().err();
+            return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyPciRestoreStage::ResourcePlan,
+                HvfSnapshotV2EntropyPciRestoreFailure::ResourcePlanCleanup { cleanup },
+            ));
+        }
+        let (config, _queue_ranges, _retry, retry_deadline, origin, endpoint) =
+            entropy.into_parts();
+        if origin != StorageDeviceOrigin::Startup {
+            drop(endpoint);
+            let cleanup = interrupts.release().err();
+            return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyPciRestoreStage::ResourcePlan,
+                HvfSnapshotV2EntropyPciRestoreFailure::ResourcePlanCleanup { cleanup },
+            ));
+        }
+
+        let publication = {
+            let manager = match session.pci_data_devices.as_mut() {
+                Some(manager) => manager,
+                None => {
+                    drop(endpoint);
+                    let cleanup = interrupts.release().err();
+                    return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                        session,
+                        HvfSnapshotV2EntropyPciRestoreStage::ResourcePlan,
+                        HvfSnapshotV2EntropyPciRestoreFailure::ResourcePlanCleanup { cleanup },
+                    ));
+                }
+            };
+            let dispatcher_owner = Arc::clone(&manager.dispatcher);
+            let segment = manager.validation.segment().clone();
+            let mut dispatcher = match dispatcher_owner.lock() {
+                Ok(dispatcher) => dispatcher,
+                Err(_) => {
+                    drop(endpoint);
+                    let cleanup = interrupts.release().err();
+                    return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                        session,
+                        HvfSnapshotV2EntropyPciRestoreStage::Publication,
+                        HvfSnapshotV2EntropyPciRestoreFailure::DispatcherUnavailable { cleanup },
+                    ));
+                }
+            };
+            match endpoint.publish(
+                manager.validation.bar_allocator_mut(),
+                segment,
+                &mut dispatcher,
+                interrupts,
+            ) {
+                Ok(published) => {
+                    // This transfer is deliberately immediate and infallible:
+                    // no published endpoint can exist outside the canonical
+                    // manager owner, even when a later scheduler step fails.
+                    manager.entropy = Some(HvfArm64BootPciEntropyDevice {
+                        published,
+                        queue_deliveries: 0,
+                    });
+                    Ok(())
+                }
+                Err(source) => Err(source),
+            }
+        };
+        if let Err(source) = publication {
+            return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyPciRestoreStage::Publication,
+                HvfSnapshotV2EntropyPciRestoreFailure::Publication(source),
+            ));
+        }
+
+        session.entropy_source = VirtioRngOsEntropySource::new();
+        session.entropy_device_metrics = SharedEntropyDeviceMetrics::default();
+        session.entropy_retry_wakeup = HvfArm64BootLimiterRetryWakeupToken::default();
+        if inject_scheduler_failure {
+            return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                session,
+                HvfSnapshotV2EntropyPciRestoreStage::RetryScheduler,
+                HvfSnapshotV2EntropyPciRestoreFailure::InjectedRetryScheduler,
+            ));
+        }
+        let vcpu_control = session.runner.control();
+        session.entropy_retry_wakeup_scheduler =
+            match HvfArm64BootLimiterRetryWakeupScheduler::start_with_cancellation(
+                ENTROPY_RETRY_WAKEUP_SCHEDULER_THREAD_NAME,
+                session.entropy_retry_wakeup.clone(),
+                move || vcpu_control.request_wakeup(),
+            ) {
+                Ok(scheduler) => scheduler,
+                Err(source) => {
+                    return Err(HvfSnapshotV2EntropyPciRestoreError::after_platform(
+                        session,
+                        HvfSnapshotV2EntropyPciRestoreStage::RetryScheduler,
+                        HvfSnapshotV2EntropyPciRestoreFailure::RetryScheduler(source.kind()),
+                    ));
+                }
+            };
+
+        // Deadline publication is intentionally the final graph operation.
+        session
+            .entropy_retry_wakeup_scheduler
+            .schedule_deadline(retry_deadline);
+        Ok(RestoredHvfSnapshotV2EntropyPciOwners {
             session,
             entropy_config: config,
             storage_configs,
@@ -26287,6 +26882,12 @@ fn pci_all_virtio_gic_msi_configuration(
 pub(crate) fn pci_root_restore_gic_msi_configuration()
 -> Result<HvfGicMsiConfiguration, HvfArm64BootPciDataError> {
     let fixed_demand = pci_all_virtio_resource_demand(0, 0, 0, None, false, false, false)?;
+    pci_all_virtio_gic_msi_configuration_for_fixed_demand(fixed_demand)
+}
+
+pub(crate) fn pci_entropy_restore_gic_msi_configuration()
+-> Result<HvfGicMsiConfiguration, HvfArm64BootPciDataError> {
+    let fixed_demand = pci_all_virtio_resource_demand(0, 0, 0, None, false, true, false)?;
     pci_all_virtio_gic_msi_configuration_for_fixed_demand(fixed_demand)
 }
 
@@ -38594,6 +39195,45 @@ mod tests {
         assert!(diagnostics.contains("<redacted>"));
         assert!(diagnostics.contains("cleanup_failed"));
         assert!(!diagnostics.contains("secret-entropy-cleanup"));
+    }
+
+    #[test]
+    fn native_v2_entropy_pci_errors_distinguish_commit_from_cleanup_failure() {
+        let retryable = super::HvfSnapshotV2EntropyPciRestoreError::preflight(
+            super::HvfSnapshotV2EntropyPciRestoreStage::ResourcePlan,
+            super::HvfSnapshotV2EntropyPciRestoreFailure::ResourcePlan,
+        );
+        assert!(!retryable.is_terminal());
+        assert!(!retryable.has_incomplete_cleanup());
+
+        let committed = super::HvfSnapshotV2EntropyPciRestoreError::serial_platform(
+            super::HvfSnapshotV2SerialOnlyRestoreError::PciOwner {
+                source: super::HvfArm64BootPciDataError::new("secret-pci-owner/path"),
+                cleanup: None,
+            },
+        );
+        assert!(committed.is_terminal());
+        assert!(!committed.has_incomplete_cleanup());
+
+        let incomplete = super::HvfSnapshotV2EntropyPciRestoreError::serial_platform(
+            super::HvfSnapshotV2SerialOnlyRestoreError::RetryScheduler {
+                scheduler: "entropy-retry",
+                source: io::ErrorKind::PermissionDenied,
+                cleanup: Some(Box::new(
+                    super::HvfArm64BootSessionShutdownError::DestroyVm {
+                        source: super::BackendError::Hypervisor(
+                            "secret-pci-cleanup/path".to_string(),
+                        ),
+                    },
+                )),
+            },
+        );
+        assert!(incomplete.is_terminal());
+        assert!(incomplete.has_incomplete_cleanup());
+        let diagnostics = format!("{incomplete:?} {incomplete}");
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(diagnostics.contains("cleanup_failed"));
+        assert!(!diagnostics.contains("secret-pci-cleanup"));
     }
 
     #[test]

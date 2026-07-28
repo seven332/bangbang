@@ -25,6 +25,7 @@ mod snapshot;
 mod snapshot_bundle;
 mod snapshot_restore;
 mod snapshot_v2;
+mod snapshot_v2_entropy_platform;
 mod snapshot_v2_multi_block_platform;
 mod snapshot_v2_platform;
 mod snapshot_v2_storage_platform;
@@ -150,6 +151,12 @@ pub use snapshot_v2::{
     encode_hvf_snapshot_v2_serial_state, encode_hvf_snapshot_v2_state,
     encode_hvf_snapshot_v2_storage_state,
 };
+pub use snapshot_v2_entropy_platform::{
+    HvfSnapshotV2EntropyPciEndpointPlan, HvfSnapshotV2StorageEntropyPciPlatformPlan,
+    PrepareHvfSnapshotV2EntropyPciPlatformPlanError,
+    prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan,
+    prepare_hvf_snapshot_v2_storage_entropy_pci_platform_plan,
+};
 pub use snapshot_v2_multi_block_platform::{
     HvfSnapshotV2MultiBlockMmioRecordPlan, HvfSnapshotV2MultiBlockPciPlan,
     HvfSnapshotV2MultiBlockPciRecordPlan, HvfSnapshotV2MultiBlockPlatformPlan,
@@ -216,21 +223,22 @@ pub use startup::{
     HvfArm64BootVsockNotificationDispatchError, HvfArm64BootVsockNotificationDispatches,
     HvfArm64BootVsockTransportState, HvfSnapshotV2EntropyMmioRestoreError,
     HvfSnapshotV2EntropyMmioRestoreFailure, HvfSnapshotV2EntropyMmioRestoreStage,
-    HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure, HvfSnapshotV2MultiBlockMmioRestoreError,
-    HvfSnapshotV2MultiBlockMmioRestoreFailure, HvfSnapshotV2MultiBlockMmioRestoreStage,
-    HvfSnapshotV2MultiBlockPciRestoreCleanupFailure, HvfSnapshotV2MultiBlockPciRestoreError,
-    HvfSnapshotV2MultiBlockPciRestoreFailure, HvfSnapshotV2MultiBlockPciRestoreStage,
-    HvfSnapshotV2RootRestoreCleanupFailure, HvfSnapshotV2RootRestoreError,
-    HvfSnapshotV2RootRestoreFailure, HvfSnapshotV2RootRestoreStage,
+    HvfSnapshotV2EntropyPciRestoreError, HvfSnapshotV2EntropyPciRestoreFailure,
+    HvfSnapshotV2EntropyPciRestoreStage, HvfSnapshotV2MultiBlockMmioRestoreCleanupFailure,
+    HvfSnapshotV2MultiBlockMmioRestoreError, HvfSnapshotV2MultiBlockMmioRestoreFailure,
+    HvfSnapshotV2MultiBlockMmioRestoreStage, HvfSnapshotV2MultiBlockPciRestoreCleanupFailure,
+    HvfSnapshotV2MultiBlockPciRestoreError, HvfSnapshotV2MultiBlockPciRestoreFailure,
+    HvfSnapshotV2MultiBlockPciRestoreStage, HvfSnapshotV2RootRestoreCleanupFailure,
+    HvfSnapshotV2RootRestoreError, HvfSnapshotV2RootRestoreFailure, HvfSnapshotV2RootRestoreStage,
     HvfSnapshotV2SerialOnlyRestoreError, HvfSnapshotV2StorageMmioRestoreCleanupFailure,
     HvfSnapshotV2StorageMmioRestoreError, HvfSnapshotV2StorageMmioRestoreFailure,
     HvfSnapshotV2StorageMmioRestoreStage, HvfSnapshotV2StoragePciRestoreCleanupFailure,
     HvfSnapshotV2StoragePciRestoreError, HvfSnapshotV2StoragePciRestoreFailure,
     HvfSnapshotV2StoragePciRestoreStage, OwnedHvfArm64BootSession,
     PreparedHvfArm64BootPciNetworkRemoval, RestoredHvfArm64BootSession,
-    RestoredHvfSnapshotV2EntropyMmioOwners, RestoredHvfSnapshotV2MultiBlockMmioOwners,
-    RestoredHvfSnapshotV2MultiBlockPciOwners, RestoredHvfSnapshotV2StorageMmioOwners,
-    RestoredHvfSnapshotV2StoragePciOwners,
+    RestoredHvfSnapshotV2EntropyMmioOwners, RestoredHvfSnapshotV2EntropyPciOwners,
+    RestoredHvfSnapshotV2MultiBlockMmioOwners, RestoredHvfSnapshotV2MultiBlockPciOwners,
+    RestoredHvfSnapshotV2StorageMmioOwners, RestoredHvfSnapshotV2StoragePciOwners,
 };
 pub use topology::{
     HvfVcpuTopology, HvfVcpuTopologyAllocation, HvfVcpuTopologyCreateStage, HvfVcpuTopologyError,

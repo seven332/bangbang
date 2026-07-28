@@ -383,12 +383,25 @@ impl fmt::Debug for HvfSnapshotV2RestoredSerialShell {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfSnapshotV2SerialOnlyProcessConfig {
     pci_enabled: bool,
+    exact_pci_msi_interrupt_count: Option<u32>,
 }
 
 impl HvfSnapshotV2SerialOnlyProcessConfig {
     /// Select the exact destination process PCI policy.
     pub const fn new(pci_enabled: bool) -> Self {
-        Self { pci_enabled }
+        Self {
+            pci_enabled,
+            exact_pci_msi_interrupt_count: None,
+        }
+    }
+
+    pub(crate) const fn with_exact_pci_msi_interrupt_count(
+        exact_pci_msi_interrupt_count: u32,
+    ) -> Self {
+        Self {
+            pci_enabled: true,
+            exact_pci_msi_interrupt_count: Some(exact_pci_msi_interrupt_count),
+        }
     }
 
     /// Returns whether the destination selected the product PCI host.
@@ -2477,11 +2490,14 @@ fn prepare_process_shell(
             HvfSnapshotV2ProcessShellRestore::SerialOnly { shell, process } => {
                 let policy_matches = match (process.pci_enabled(), gic.msi) {
                     (false, None) => true,
-                    (true, Some(msi)) => {
-                        pci_root_restore_gic_msi_configuration().is_ok_and(|expected| {
-                            msi.interrupt_range.count == expected.interrupt_count().get()
-                        })
-                    }
+                    (true, Some(msi)) => process.exact_pci_msi_interrupt_count.map_or_else(
+                        || {
+                            pci_root_restore_gic_msi_configuration().is_ok_and(|expected| {
+                                msi.interrupt_range.count == expected.interrupt_count().get()
+                            })
+                        },
+                        |expected| msi.interrupt_range.count == expected,
+                    ),
                     (false, Some(_)) | (true, None) => false,
                 };
                 if !policy_matches {

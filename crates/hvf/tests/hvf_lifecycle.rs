@@ -11888,6 +11888,335 @@ fn restores_signed_serial_entropy_mmio_owners_with_exact_retry_semantics() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn restores_signed_serial_entropy_pci_owners_with_exact_retry_semantics() {
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootEntropyDeviceConfig, HvfArm64BootEntropyTransportState,
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState,
+        HvfSnapshotV2EntropyPciRestoreStage, HvfSnapshotV2EntropyState, HvfSnapshotV2NativePath,
+        HvfSnapshotV2RestoredSerialShell, OwnedHvfArm64BootSession,
+        prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::{
+        EntropyConfigInput, EntropyMmioLayout, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
+    };
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryLayout};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransport;
+    use bangbang_runtime::snapshot_entropy_v2_8::{
+        SnapshotV2EntropyRestorePlan, SnapshotV2EntropyRetryState, SnapshotV2EntropyState,
+    };
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-serial-entropy-pci-kernel", &image)
+        .expect("serial PCI entropy kernel should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("serial PCI entropy boot source should configure");
+    let limiter = EntropyRateLimiterConfig::new(
+        Some(EntropyTokenBucketConfig::new(4, None, 60_000)),
+        Some(EntropyTokenBucketConfig::new(1, None, 60_000)),
+    );
+    controller
+        .handle_action(VmmAction::PutEntropy(
+            EntropyConfigInput::new().with_rate_limiter(limiter),
+        ))
+        .expect("serial PCI entropy device should configure");
+    let entropy_config = controller
+        .entropy_config()
+        .expect("serial PCI entropy configuration should exist");
+    let session_config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_entropy_device(HvfArm64BootEntropyDeviceConfig::new(
+        EntropyMmioLayout::new(GuestAddress::new(0x4000_7000), MmioRegionId::new(3001)),
+    ))
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+    ))
+    .with_pci_enabled();
+    let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed serial PCI entropy source should prepare");
+
+    let inactive_guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("inactive PCI entropy publishers should quiesce");
+    let inactive_now = Instant::now();
+    let inactive_capture = source
+        .capture_ready_entropy_state_at(Some(entropy_config), &inactive_guard, inactive_now)
+        .expect("inactive PCI entropy owner should capture")
+        .expect("inactive PCI entropy device should exist");
+    let entropy_base = match inactive_capture.transport() {
+        HvfArm64BootEntropyTransportState::Pci { bar_range, .. } => bar_range.start(),
+        HvfArm64BootEntropyTransportState::Mmio { .. } => {
+            panic!("PCI-enabled entropy source should own a PCI endpoint")
+        }
+    };
+    let inactive = inactive_capture
+        .try_to_snapshot_v2()
+        .expect("inactive PCI entropy capture should convert");
+    drop(inactive_guard);
+
+    let retry_after = activate_and_notify_entropy_capture_queue(&mut source, entropy_base, true);
+    assert!(retry_after > std::time::Duration::ZERO);
+    let active_guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("active PCI entropy publishers should quiesce");
+    let active_now = Instant::now();
+    let delayed = source
+        .capture_ready_entropy_state_at(Some(entropy_config), &active_guard, active_now)
+        .expect("delayed PCI entropy owner should capture")
+        .expect("delayed PCI entropy device should exist")
+        .try_to_snapshot_v2()
+        .expect("delayed PCI entropy capture should convert");
+    let serial_capture = source
+        .capture_ready_serial_state(controller.serial_config().clone(), &active_guard)
+        .expect("serial state should become capture-ready");
+    let serial = SnapshotV2SerialState::try_from_capture_ready(serial_capture)
+        .expect("serial capture should convert to exact 2.7");
+    drop(active_guard);
+    assert!(matches!(
+        delayed.retry(),
+        SnapshotV2EntropyRetryState::After { .. }
+    ));
+    let (config, queue, limiter, _retry, pending, virtio, transport) = delayed.clone().into_parts();
+    let immediate = SnapshotV2EntropyState::try_new(
+        config,
+        queue,
+        limiter,
+        SnapshotV2EntropyRetryState::Immediate,
+        pending,
+        virtio,
+        transport,
+    )
+    .expect("pending delayed PCI state should admit immediate retry");
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("serial PCI entropy source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("serial PCI entropy kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("serial PCI entropy boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = source
+        .capture_snapshot_v2_entropy_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("exact-2.8 serial PCI entropy platform should capture");
+    for entropy in [&inactive, &delayed, &immediate] {
+        HvfSnapshotV2EntropyState::try_new(
+            platform.clone(),
+            None,
+            serial.clone(),
+            Some(entropy.clone()),
+        )
+        .expect("exact-2.8 serial PCI entropy composition should validate");
+        assert!(matches!(
+            entropy.transport(),
+            SnapshotV2DeviceTransport::Pci(_)
+        ));
+    }
+
+    let layout = GuestMemoryLayout::new(source.runtime_resources().layout.ranges().to_vec())
+        .expect("serial PCI entropy destination layout should validate");
+    let source_memory = source
+        .guest_memory()
+        .expect("serial PCI entropy source memory should remain mapped");
+    let mut destination_memories = Vec::new();
+    destination_memories
+        .try_reserve_exact(4)
+        .expect("PCI destination memory vector should reserve");
+    for _ in 0..4 {
+        let mut destination =
+            GuestMemory::allocate(&layout).expect("serial PCI entropy destination should allocate");
+        let mut buffer = vec![0_u8; 64 * 1024];
+        for range in layout.ranges() {
+            let mut copied = 0_u64;
+            while copied < range.size() {
+                let remaining = range.size() - copied;
+                let count =
+                    usize::try_from(remaining.min(
+                        u64::try_from(buffer.len()).expect("copy buffer length should fit u64"),
+                    ))
+                    .expect("copy size should fit usize");
+                let address = range
+                    .start()
+                    .checked_add(copied)
+                    .expect("copy address should fit");
+                source_memory
+                    .read_slice(&mut buffer[..count], address)
+                    .expect("source guest bytes should read");
+                destination
+                    .write_slice(&buffer[..count], address)
+                    .expect("destination guest bytes should write");
+                copied += u64::try_from(count).expect("copy count should fit u64");
+            }
+        }
+        destination_memories.push(destination);
+    }
+    source
+        .shutdown()
+        .expect("signed serial PCI entropy source should shut down");
+
+    let restored_shell = || {
+        HvfSnapshotV2RestoredSerialShell::new(
+            SerialMmioDevice::from_capture_state_with_shared_output(
+                SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+                serial.device().clone(),
+            ),
+        )
+    };
+
+    let fault_now = Instant::now();
+    let fault_plan = SnapshotV2EntropyRestorePlan::prepare(
+        inactive.clone(),
+        &destination_memories[0],
+        fault_now,
+    )
+    .expect("fault PCI entropy plan should prepare");
+    let fault_endpoint_plan =
+        prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan(&platform, &fault_plan)
+            .expect("fault PCI entropy platform plan should prepare");
+    let fault =
+        OwnedHvfArm64BootSession::restore_snapshot_v2_serial_entropy_pci_with_scheduler_fault(
+            platform.clone(),
+            destination_memories.remove(0),
+            restored_shell(),
+            None,
+            fault_endpoint_plan,
+            fault_plan,
+        )
+        .expect_err("injected PCI entropy scheduler fault should reject");
+    assert_eq!(
+        fault.stage(),
+        HvfSnapshotV2EntropyPciRestoreStage::RetryScheduler
+    );
+    assert!(fault.is_terminal());
+    assert!(!fault.has_incomplete_cleanup());
+    let diagnostics = format!("{fault:?} {fault}");
+    assert!(diagnostics.contains("<redacted>"));
+    assert!(!diagnostics.contains(&entropy_base.raw_value().to_string()));
+
+    for (name, expected) in [
+        ("none", inactive),
+        ("delayed", delayed),
+        ("immediate", immediate),
+    ] {
+        let restore_now = Instant::now();
+        let restore_plan = SnapshotV2EntropyRestorePlan::prepare(
+            expected.clone(),
+            &destination_memories[0],
+            restore_now,
+        )
+        .unwrap_or_else(|error| panic!("{name} PCI entropy plan should prepare: {error:?}"));
+        let endpoint_plan =
+            prepare_hvf_snapshot_v2_serial_entropy_pci_platform_plan(&platform, &restore_plan)
+                .unwrap_or_else(|error| {
+                    panic!("{name} PCI entropy platform plan should prepare: {error:?}")
+                });
+        let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_entropy_pci(
+            platform.clone(),
+            destination_memories.remove(0),
+            restored_shell(),
+            None,
+            endpoint_plan,
+            restore_plan,
+        )
+        .unwrap_or_else(|error| panic!("{name} PCI entropy owners should restore: {error:?}"));
+        assert_eq!(owners.entropy_config(), entropy_config);
+        assert!(owners.storage_configs().is_none());
+        assert!(
+            owners
+                .session()
+                .shared_entropy_device_metrics()
+                .snapshot()
+                .is_empty()
+        );
+        let (mut destination, returned_config, storage_configs) = owners.into_parts();
+        assert_eq!(returned_config, entropy_config);
+        assert!(storage_configs.is_none());
+        assert!(destination.runtime_resources().entropy_device.is_none());
+        assert!(destination.runtime_resources().pci_entropy_device.is_none());
+        assert!(destination.uses_pci_data_devices());
+        let guard = destination
+            .quiesce_limiter_retry_wakeups()
+            .unwrap_or_else(|error| panic!("{name} retry publishers should quiesce: {error:?}"));
+        let recaptured = destination
+            .capture_ready_entropy_state_at(Some(returned_config), &guard, restore_now)
+            .unwrap_or_else(|error| panic!("{name} PCI entropy owner should recapture: {error:?}"))
+            .expect("restored PCI entropy device should exist")
+            .try_to_snapshot_v2()
+            .unwrap_or_else(|error| {
+                panic!("{name} PCI entropy recapture should convert: {error:?}")
+            });
+        assert_eq!(
+            recaptured, expected,
+            "{name} PCI entropy state should be exact"
+        );
+        assert!(matches!(
+            recaptured.transport(),
+            SnapshotV2DeviceTransport::Pci(_)
+        ));
+        drop(guard);
+        if name == "none" {
+            let SnapshotV2DeviceTransport::Pci(transport) = recaptured.transport() else {
+                panic!("restored inactive entropy should retain PCI placement");
+            };
+            let retry_after = activate_and_notify_entropy_capture_queue(
+                &mut destination,
+                transport.bar_range().start(),
+                true,
+            );
+            assert!(retry_after > std::time::Duration::ZERO);
+            assert!(
+                !destination
+                    .shared_entropy_device_metrics()
+                    .snapshot()
+                    .is_empty()
+            );
+        }
+        destination.shutdown().unwrap_or_else(|error| {
+            panic!("{name} PCI entropy destination should shut down: {error}")
+        });
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn restores_signed_storage_serial_entropy_mmio_owner_graph() {
     use std::io::Cursor;
     use std::time::Instant;
@@ -12131,6 +12460,256 @@ fn restores_signed_storage_serial_entropy_mmio_owner_graph() {
     restored
         .shutdown()
         .expect("restored storage entropy destination should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn restores_signed_storage_serial_entropy_pci_owner_graph() {
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    use bangbang_hvf::{
+        HvfArm64BootEntropyDeviceConfig, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSnapshotV2CaptureInput, HvfSnapshotV2BootState, HvfSnapshotV2EntropyState,
+        HvfSnapshotV2NativePath, HvfSnapshotV2RestoredSerialShell, OwnedHvfArm64BootSession,
+        prepare_hvf_snapshot_v2_storage_entropy_pci_platform_plan,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::{
+        BlockFileBacking, BlockMmioLayout, DriveConfigInput, DriveIoEngine,
+    };
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::{EntropyConfigInput, EntropyMmioLayout};
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryLayout};
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::serial::{
+        SerialMmioDevice, SharedSerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::snapshot_device_v2::{
+        SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
+    };
+    use bangbang_runtime::snapshot_device_v2_6::SnapshotV2StorageRestorePlan;
+    use bangbang_runtime::snapshot_entropy_v2_8::SnapshotV2EntropyRestorePlan;
+    use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
+    use bangbang_runtime::storage_capture::CaptureReadyStorageConfigs;
+    use bangbang_runtime::vsock::VsockMmioLayout;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("restore-storage-entropy-pci-kernel", &image)
+        .expect("storage PCI entropy kernel should create");
+    let root = TempFile::new_len("restore-storage-entropy-pci-root", 4096)
+        .expect("storage PCI entropy root should create");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("storage PCI entropy boot source should configure");
+    controller
+        .handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", root.path(), true)
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync),
+        ))
+        .expect("storage PCI entropy root should configure");
+    controller
+        .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+        .expect("storage PCI entropy device should configure");
+    let entropy_config = controller
+        .entropy_config()
+        .expect("storage PCI entropy configuration should exist");
+    let session_config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
+        NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        bangbang_runtime::rtc::RtcMmioLayout::new(
+            GuestAddress::new(0x4000_1000),
+            MmioRegionId::new(10),
+        ),
+    )
+    .with_entropy_device(HvfArm64BootEntropyDeviceConfig::new(
+        EntropyMmioLayout::new(GuestAddress::new(0x4000_7000), MmioRegionId::new(3001)),
+    ))
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        MmioRegionId::new(20),
+        GuestAddress::new(0x4000_2000),
+        SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+    ))
+    .with_pci_enabled();
+    let mut source = OwnedHvfArm64BootSession::new(&controller, session_config)
+        .expect("signed storage PCI entropy source should prepare");
+    let source_configs =
+        CaptureReadyStorageConfigs::new(controller.drive_configs().to_vec(), Vec::new());
+    let guard = source
+        .quiesce_limiter_retry_wakeups()
+        .expect("storage PCI entropy publishers should quiesce");
+    let capture_now = Instant::now();
+    let graph = source
+        .capture_snapshot_v2_storage_device_graph_at(&source_configs, &guard, capture_now)
+        .expect("PCI storage graph should capture");
+    assert_eq!(graph.transport_kind(), SnapshotV2DeviceTransportKind::Pci);
+    let entropy = source
+        .capture_ready_entropy_state_at(Some(entropy_config), &guard, capture_now)
+        .expect("storage PCI entropy owner should capture")
+        .expect("storage PCI entropy device should exist")
+        .try_to_snapshot_v2()
+        .expect("storage PCI entropy capture should convert");
+    assert!(matches!(
+        entropy.transport(),
+        SnapshotV2DeviceTransport::Pci(_)
+    ));
+    let serial = SnapshotV2SerialState::try_from_capture_ready(
+        source
+            .capture_ready_serial_state(controller.serial_config().clone(), &guard)
+            .expect("storage PCI serial state should capture"),
+    )
+    .expect("storage PCI serial capture should convert");
+    drop(guard);
+
+    source
+        .pause_for_snapshot_v2_capture()
+        .expect("storage PCI entropy source should pause");
+    let boot = HvfSnapshotV2BootState::try_new(
+        HvfSnapshotV2NativePath::try_new(kernel.path().as_os_str())
+            .expect("storage PCI entropy kernel path should validate"),
+        None,
+        None,
+    )
+    .expect("storage PCI entropy boot metadata should validate");
+    let mut memory_writer = Cursor::new(Vec::new());
+    let platform = source
+        .capture_snapshot_v2_entropy_platform_with_cancel(
+            HvfArm64BootSnapshotV2CaptureInput::new(boot),
+            &mut memory_writer,
+            |_| false,
+        )
+        .expect("storage PCI entropy exact-2.8 platform should capture");
+    HvfSnapshotV2EntropyState::try_new(
+        platform.clone(),
+        Some(graph.clone()),
+        serial.clone(),
+        Some(entropy.clone()),
+    )
+    .expect("storage, serial, and PCI entropy composition should validate");
+
+    let layout = GuestMemoryLayout::new(source.runtime_resources().layout.ranges().to_vec())
+        .expect("storage PCI entropy destination layout should validate");
+    let mut destination =
+        GuestMemory::allocate(&layout).expect("storage PCI entropy destination should allocate");
+    let source_memory = source
+        .guest_memory()
+        .expect("storage PCI entropy source memory should remain mapped");
+    let mut buffer = vec![0_u8; 64 * 1024];
+    for range in layout.ranges() {
+        let mut copied = 0_u64;
+        while copied < range.size() {
+            let remaining = range.size() - copied;
+            let count = usize::try_from(
+                remaining
+                    .min(u64::try_from(buffer.len()).expect("copy buffer length should fit u64")),
+            )
+            .expect("copy size should fit usize");
+            let address = range
+                .start()
+                .checked_add(copied)
+                .expect("copy address should fit");
+            source_memory
+                .read_slice(&mut buffer[..count], address)
+                .expect("storage PCI entropy source bytes should read");
+            destination
+                .write_slice(&buffer[..count], address)
+                .expect("storage PCI entropy destination bytes should write");
+            copied += u64::try_from(count).expect("copy count should fit u64");
+        }
+    }
+    source
+        .shutdown()
+        .expect("signed storage PCI entropy source should shut down");
+
+    let restore_now = Instant::now();
+    let entropy_plan =
+        SnapshotV2EntropyRestorePlan::prepare(entropy.clone(), &destination, restore_now)
+            .expect("storage PCI entropy restore plan should prepare");
+    let backing = BlockFileBacking::open_snapshot(
+        std::path::Path::new(graph.block_records()[0].config().selector()),
+        graph.block_records()[0].config().is_read_only(),
+    )
+    .expect("storage PCI entropy block backing should reopen")
+    .0;
+    let bundle = SnapshotV2StorageRestorePlan::prepare(graph.clone(), &destination, restore_now)
+        .expect("storage PCI entropy graph restore plan should prepare")
+        .prepare_backings(vec![backing], Vec::new(), || false)
+        .expect("storage PCI entropy backing bundle should prepare");
+    let combined_plan = prepare_hvf_snapshot_v2_storage_entropy_pci_platform_plan(
+        &platform,
+        &bundle,
+        &entropy_plan,
+    )
+    .expect("storage PCI entropy combined plan should prepare");
+    assert_eq!(combined_plan.storage().pci().record_count(), 1);
+    assert_eq!(combined_plan.entropy().preceding_endpoint_count(), 1);
+    let shell = HvfSnapshotV2RestoredSerialShell::new(
+        SerialMmioDevice::from_capture_state_with_shared_output(
+            SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
+            serial.device().clone(),
+        ),
+    );
+    let owners = OwnedHvfArm64BootSession::restore_snapshot_v2_serial_storage_entropy_pci(
+        platform,
+        destination,
+        shell,
+        None,
+        bundle,
+        combined_plan,
+        entropy_plan,
+    )
+    .unwrap_or_else(|error| panic!("storage PCI entropy owners should restore: {error:?}"));
+    assert_eq!(owners.entropy_config(), entropy_config);
+    assert_eq!(
+        owners
+            .storage_configs()
+            .expect("restored PCI storage configurations should exist"),
+        &source_configs
+    );
+    let (mut restored, returned_entropy_config, returned_storage_configs) = owners.into_parts();
+    let returned_storage_configs =
+        returned_storage_configs.expect("restored PCI storage configurations should be retained");
+    assert_eq!(returned_storage_configs, source_configs);
+    assert!(restored.uses_pci_data_devices());
+    assert!(restored.runtime_resources().block_devices.is_empty());
+    assert!(restored.runtime_resources().entropy_device.is_none());
+    assert!(restored.runtime_resources().pci_entropy_device.is_none());
+    assert!(
+        restored
+            .shared_entropy_device_metrics()
+            .snapshot()
+            .is_empty()
+    );
+
+    let guard = restored
+        .quiesce_limiter_retry_wakeups()
+        .expect("restored storage PCI entropy publishers should quiesce");
+    let recaptured_entropy = restored
+        .capture_ready_entropy_state_at(Some(returned_entropy_config), &guard, restore_now)
+        .expect("restored storage PCI entropy owner should capture")
+        .expect("restored storage PCI entropy device should exist")
+        .try_to_snapshot_v2()
+        .expect("restored storage PCI entropy capture should convert");
+    assert_eq!(recaptured_entropy, entropy);
+    let recaptured_graph = restored
+        .capture_snapshot_v2_storage_device_graph_at(&returned_storage_configs, &guard, restore_now)
+        .expect("restored PCI storage graph should recapture");
+    assert_eq!(recaptured_graph, graph);
+    drop(guard);
+    restored
+        .shutdown()
+        .expect("restored storage PCI entropy destination should shut down");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
