@@ -1224,7 +1224,7 @@ mod tests {
             false,
         );
 
-        for byte in [b'a', b'b'] {
+        for byte in *b"ab" {
             let mut prepared = prepare_native_v2_serial_restore_bundle(
                 None,
                 state.clone(),
