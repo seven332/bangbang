@@ -8,10 +8,11 @@ use std::collections::TryReserveError;
 use std::fmt;
 
 use crate::serial::{
-    SERIAL_RECEIVE_FIFO_CAPACITY, SerialMmioCaptureState, SerialMmioCaptureStateError,
-    SerialRateLimiterConfig,
+    CaptureReadySerialState, SERIAL_RECEIVE_FIFO_CAPACITY, SerialConfig, SerialMmioCaptureState,
+    SerialMmioCaptureStateError, SerialRateLimiterConfig,
 };
 use crate::snapshot_format::SnapshotFormatVersion;
+use crate::snapshot_restore::MAX_SNAPSHOT_RESTORE_RESOURCES;
 
 mod codec;
 
@@ -34,6 +35,26 @@ pub const NATIVE_V2_SERIAL_STATE_MAX_BYTES: usize = NATIVE_V2_SERIAL_STATE_HEADE
     + SERIAL_RECEIVE_FIFO_CAPACITY;
 
 const REDACTED: &str = "<redacted>";
+
+trait CaptureReservePolicy {
+    fn reserve_string(
+        &mut self,
+        value: &mut String,
+        additional: usize,
+    ) -> Result<(), TryReserveError>;
+}
+
+struct FallibleCaptureReserve;
+
+impl CaptureReservePolicy for FallibleCaptureReserve {
+    fn reserve_string(
+        &mut self,
+        value: &mut String,
+        additional: usize,
+    ) -> Result<(), TryReserveError> {
+        value.try_reserve_exact(additional)
+    }
+}
 
 /// Reconstructible destination endpoint intent.
 #[derive(Clone, PartialEq, Eq)]
@@ -98,6 +119,65 @@ pub struct SnapshotV2SerialState {
 }
 
 impl SnapshotV2SerialState {
+    /// Checks the inert source configuration and complete future restore
+    /// resource count without allocating or touching a live capture owner.
+    pub fn preflight_capture(
+        config: &SerialConfig,
+        storage_resource_count: usize,
+    ) -> Result<(), SnapshotV2SerialStateCaptureError> {
+        let serial_resource_count = match config.serial_out_path() {
+            Some(path) => {
+                let selector = path
+                    .to_str()
+                    .ok_or(SnapshotV2SerialStateCaptureError::InvalidEndpointIntent)?;
+                validate_configured_selector(selector)
+                    .map_err(|_| SnapshotV2SerialStateCaptureError::InvalidEndpointIntent)?;
+                1
+            }
+            None => 0,
+        };
+        let resource_count = storage_resource_count
+            .checked_add(serial_resource_count)
+            .ok_or(SnapshotV2SerialStateCaptureError::RestoreResourceCapacity)?;
+        if resource_count > MAX_SNAPSHOT_RESTORE_RESOURCES {
+            return Err(SnapshotV2SerialStateCaptureError::RestoreResourceCapacity);
+        }
+        Ok(())
+    }
+
+    /// Converts one selected capture-ready source value into inert exact-2.7
+    /// state without retaining any source endpoint ownership.
+    pub fn try_from_capture_ready(
+        captured: CaptureReadySerialState,
+    ) -> Result<Self, SnapshotV2SerialStateCaptureError> {
+        Self::try_from_capture_ready_with_policy(captured, &mut FallibleCaptureReserve)
+    }
+
+    fn try_from_capture_ready_with_policy<R: CaptureReservePolicy>(
+        captured: CaptureReadySerialState,
+        reserve: &mut R,
+    ) -> Result<Self, SnapshotV2SerialStateCaptureError> {
+        let (config, device) = captured.into_parts();
+        Self::preflight_capture(&config, 0)?;
+        let rate_limiter = config.rate_limiter();
+        let endpoint_intent = match config.serial_out_path() {
+            Some(path) => {
+                let selector = path
+                    .to_str()
+                    .ok_or(SnapshotV2SerialStateCaptureError::InvalidEndpointIntent)?;
+                let mut owned = String::new();
+                reserve
+                    .reserve_string(&mut owned, selector.len())
+                    .map_err(SnapshotV2SerialStateCaptureError::Allocation)?;
+                owned.push_str(selector);
+                SnapshotV2SerialEndpointIntent::ConfiguredOutput { selector: owned }
+            }
+            None => SnapshotV2SerialEndpointIntent::DefaultProcessStdio,
+        };
+        Self::try_new(endpoint_intent, rate_limiter, device)
+            .map_err(|_| SnapshotV2SerialStateCaptureError::InvalidEndpointIntent)
+    }
+
     /// Constructs one checked serial value from inert endpoint/configuration
     /// facts and already validated guest-visible UART state.
     pub fn try_new(
@@ -178,6 +258,10 @@ fn validate_endpoint_intent(
     let SnapshotV2SerialEndpointIntent::ConfiguredOutput { selector } = endpoint_intent else {
         return Ok(());
     };
+    validate_configured_selector(selector)
+}
+
+fn validate_configured_selector(selector: &str) -> Result<(), SnapshotV2SerialStateBuildError> {
     if selector.is_empty()
         || selector.len() > NATIVE_V2_SERIAL_STATE_MAX_SELECTOR_BYTES
         || selector.chars().any(char::is_control)
@@ -185,6 +269,43 @@ fn validate_endpoint_intent(
         return Err(SnapshotV2SerialStateBuildError::InvalidEndpointIntent);
     }
     Ok(())
+}
+
+/// Failure while converting one trusted live capture into exact-2.7 state.
+pub enum SnapshotV2SerialStateCaptureError {
+    /// The committed configured endpoint has no canonical bounded selector.
+    InvalidEndpointIntent,
+    /// Storage plus a future configured serial sink exceeds the complete limit.
+    RestoreResourceCapacity,
+    /// The bounded configured selector could not be copied.
+    Allocation(TryReserveError),
+}
+
+impl fmt::Debug for SnapshotV2SerialStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2SerialStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidEndpointIntent => "native-v2 captured serial endpoint intent is invalid",
+            Self::RestoreResourceCapacity => {
+                "native-v2 captured serial restore resource capacity is exceeded"
+            }
+            Self::Allocation(_) => "native-v2 captured serial allocation failed",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2SerialStateCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Allocation(source) => Some(source),
+            Self::InvalidEndpointIntent | Self::RestoreResourceCapacity => None,
+        }
+    }
 }
 
 /// Failure while constructing trusted exact-2.7 serial state.

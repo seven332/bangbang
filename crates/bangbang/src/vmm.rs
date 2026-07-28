@@ -44,20 +44,21 @@ use bangbang_hvf::{
     HvfSnapshotV2MultiBlockPlatformPlan, HvfSnapshotV2MultiBlockProcessConfig,
     HvfSnapshotV2MultiBlockState, HvfSnapshotV2NativePath, HvfSnapshotV2PlatformRestoreError,
     HvfSnapshotV2PlatformState, HvfSnapshotV2RootProcessConfig, HvfSnapshotV2RootResourcePlan,
-    HvfSnapshotV2RootRestoreError, HvfSnapshotV2State, HvfSnapshotV2StorageMmioPlatformPlan,
-    HvfSnapshotV2StorageMmioProcessConfig, HvfSnapshotV2StorageMmioRestoreError,
-    HvfSnapshotV2StoragePciPlatformPlan, HvfSnapshotV2StoragePciRestoreError,
-    HvfSnapshotV2StorageState, HvfVcpuRunControl, HvfVcpuRunCoordinatorError,
-    HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession, PrepareHvfSnapshotV1LoadError,
-    PrepareHvfSnapshotV2MultiBlockPlatformPlanError, PrepareHvfSnapshotV2RootPlanError,
-    PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
+    HvfSnapshotV2RootRestoreError, HvfSnapshotV2SerialState, HvfSnapshotV2State,
+    HvfSnapshotV2StorageMmioPlatformPlan, HvfSnapshotV2StorageMmioProcessConfig,
+    HvfSnapshotV2StorageMmioRestoreError, HvfSnapshotV2StoragePciPlatformPlan,
+    HvfSnapshotV2StoragePciRestoreError, HvfSnapshotV2StorageState, HvfVcpuRunControl,
+    HvfVcpuRunCoordinatorError, HvfVcpuRunStepOutcome, OwnedHvfArm64BootSession,
+    PrepareHvfSnapshotV1LoadError, PrepareHvfSnapshotV2MultiBlockPlatformPlanError,
+    PrepareHvfSnapshotV2RootPlanError, PrepareHvfSnapshotV2StorageMmioPlatformPlanError,
     PrepareHvfSnapshotV2StoragePciPlatformPlanError, PreparedHvfArm64BootPciNetworkRemoval,
     PreparedHvfSnapshotV1Load, PreparedHvfSnapshotV1State, RestoredHvfSnapshotV2Platform,
     decode_hvf_snapshot_v2_multi_block_state, decode_hvf_snapshot_v2_platform_state,
     decode_hvf_snapshot_v2_state, decode_hvf_snapshot_v2_storage_state,
-    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_state,
-    encode_hvf_snapshot_v2_storage_state, prepare_hvf_snapshot_v2_multi_block_platform_plan,
-    prepare_hvf_snapshot_v2_root_plan, prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
+    encode_hvf_snapshot_v2_multi_block_state, encode_hvf_snapshot_v2_serial_state,
+    encode_hvf_snapshot_v2_state, encode_hvf_snapshot_v2_storage_state,
+    prepare_hvf_snapshot_v2_multi_block_platform_plan, prepare_hvf_snapshot_v2_root_plan,
+    prepare_hvf_snapshot_v2_storage_mmio_platform_plan,
     prepare_hvf_snapshot_v2_storage_pci_platform_plan, restore_hvf_snapshot_v2_process_platform,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
@@ -169,6 +170,9 @@ use bangbang_runtime::snapshot_memory::{
     SnapshotMemoryIoStage, SnapshotMemoryWriteError, write_snapshot_memory_image_with_cancel,
 };
 use bangbang_runtime::snapshot_memory_v2::{SnapshotV2MemoryIoStage, SnapshotV2MemoryWriteError};
+use bangbang_runtime::snapshot_serial_v2_7::{
+    SnapshotV2SerialState, SnapshotV2SerialStateCaptureError,
+};
 use bangbang_runtime::startup::{
     Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice,
     Arm64BootNetworkInterface, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
@@ -647,6 +651,11 @@ enum NativeV2SnapshotCaptureProfile {
         storage_configs: CaptureReadyStorageConfigs,
         expected_transport: SnapshotV2DeviceTransportKind,
     },
+    Serial {
+        serial: SnapshotV2SerialState,
+        storage_configs: CaptureReadyStorageConfigs,
+        expected_transport: SnapshotV2DeviceTransportKind,
+    },
 }
 
 struct NativeV2RootCandidateProductProfile {
@@ -881,6 +890,12 @@ pub(crate) enum NativeV2SnapshotCaptureError {
     Serial {
         source: HvfArm64BootSerialCaptureError,
     },
+    SerialState {
+        source: SnapshotV2SerialStateCaptureError,
+    },
+    StorageProfile {
+        source: SnapshotV2StorageDeviceGraphCaptureError,
+    },
     NonCanonicalSerial,
     Root {
         source: NativeV2SnapshotRootCaptureError,
@@ -926,6 +941,8 @@ impl NativeV2SnapshotCaptureError {
             Self::Supervisor { .. }
             | Self::Auxiliary { .. }
             | Self::Serial { .. }
+            | Self::SerialState { .. }
+            | Self::StorageProfile { .. }
             | Self::NonCanonicalSerial
             | Self::Encode { .. }
             | Self::Compose { .. }
@@ -1132,6 +1149,15 @@ impl fmt::Display for NativeV2SnapshotCaptureError {
             Self::Serial { source } => {
                 write!(formatter, "native-v2 serial capture failed: {source}")
             }
+            Self::SerialState { source } => {
+                write!(
+                    formatter,
+                    "native-v2 serial state conversion failed: {source}"
+                )
+            }
+            Self::StorageProfile { source } => {
+                write!(formatter, "native-v2 storage profile rejected: {source}")
+            }
             Self::NonCanonicalSerial => {
                 formatter.write_str("native-v2 source serial state is noncanonical")
             }
@@ -1181,6 +1207,8 @@ impl std::error::Error for NativeV2SnapshotCaptureError {
         match self {
             Self::Supervisor { source } | Self::Auxiliary { source } => Some(source),
             Self::Serial { source } => Some(source),
+            Self::SerialState { source } => Some(source),
+            Self::StorageProfile { source } => Some(source),
             Self::Root { source } => Some(source),
             Self::MultiBlock { source } => Some(source),
             Self::Storage { source } => Some(source),
@@ -10123,6 +10151,7 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     type RootState: Send + 'static;
     type MultiBlockState: Send + 'static;
     type StorageState: Send + 'static;
+    type SerialState: Send + 'static;
 
     fn capture_native_v2_serial(
         &self,
@@ -10180,6 +10209,13 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
         cancellation: &NativeV2SnapshotCaptureCancellation,
     ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError>;
 
+    fn capture_native_v2_serial_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError>;
+
     fn compose_native_v2_root(
         &self,
         platform: Self::PlatformState,
@@ -10211,6 +10247,18 @@ pub(crate) trait NativeV2SnapshotCaptureSession: BootRunLoopSession {
     fn encode_native_v2_storage(
         &self,
         state: &Self::StorageState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
+
+    fn compose_native_v2_serial(
+        &self,
+        platform: Self::PlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+    ) -> Result<Self::SerialState, HvfSnapshotV2BuildError>;
+
+    fn encode_native_v2_serial(
+        &self,
+        state: &Self::SerialState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError>;
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError>;
@@ -10650,6 +10698,7 @@ where
     type RootState = HvfSnapshotV2State;
     type MultiBlockState = HvfSnapshotV2MultiBlockState;
     type StorageState = HvfSnapshotV2StorageState;
+    type SerialState = HvfSnapshotV2SerialState;
 
     fn capture_native_v2_serial(
         &self,
@@ -10832,6 +10881,18 @@ where
             })
     }
 
+    fn capture_native_v2_serial_platform(
+        &mut self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        output: &mut BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: &NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+        self.session
+            .capture_snapshot_v2_serial_platform_with_cancel(input, output, |_| {
+                cancellation.is_cancelled()
+            })
+    }
+
     fn compose_native_v2_root(
         &self,
         platform: Self::PlatformState,
@@ -10875,6 +10936,22 @@ where
         state: &Self::StorageState,
     ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
         encode_hvf_snapshot_v2_storage_state(state)
+    }
+
+    fn compose_native_v2_serial(
+        &self,
+        platform: Self::PlatformState,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+    ) -> Result<Self::SerialState, HvfSnapshotV2BuildError> {
+        HvfSnapshotV2SerialState::try_new(platform, graph, serial)
+    }
+
+    fn encode_native_v2_serial(
+        &self,
+        state: &Self::SerialState,
+    ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+        encode_hvf_snapshot_v2_serial_state(state)
     }
 
     fn recover_native_v2_source(&mut self) -> Result<(), HvfVcpuRunCoordinatorError> {
@@ -16103,6 +16180,30 @@ where
     }
 }
 
+fn preflight_native_v2_serial_capture(
+    serial_config: &SerialConfig,
+    storage_configs: &CaptureReadyStorageConfigs,
+) -> Result<(), NativeV2SnapshotCaptureError> {
+    let storage_resource_count = storage_configs
+        .drives()
+        .len()
+        .checked_add(storage_configs.pmem().len())
+        .ok_or(NativeV2SnapshotCaptureError::SerialState {
+            source: SnapshotV2SerialStateCaptureError::RestoreResourceCapacity,
+        })?;
+    SnapshotV2SerialState::preflight_capture(serial_config, storage_resource_count)
+        .map_err(|source| NativeV2SnapshotCaptureError::SerialState { source })?;
+    if storage_resource_count != 0 {
+        SnapshotV2StorageDeviceGraph::preflight_capture_configs(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            storage_configs.drives(),
+            storage_configs.pmem(),
+        )
+        .map_err(|source| NativeV2SnapshotCaptureError::StorageProfile { source })?;
+    }
+    Ok(())
+}
+
 fn capture_canonical_native_v2_serial<S>(
     session: &S,
     serial_config: SerialConfig,
@@ -16274,6 +16375,56 @@ where
                     .encode_native_v2_storage(&state)
                     .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
             }
+            NativeV2SnapshotCaptureProfile::Serial {
+                serial,
+                storage_configs,
+                expected_transport,
+            } => {
+                let graph =
+                    if storage_configs.drives().is_empty() && storage_configs.pmem().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            session
+                                .capture_native_v2_storage(
+                                    &storage_configs,
+                                    expected_transport,
+                                    guard,
+                                    Instant::now(),
+                                    cancellation,
+                                )
+                                .map_err(|source| match source {
+                                    NativeV2SnapshotStorageCaptureError::Cancelled { stage } => {
+                                        native_v2_snapshot_cancelled(
+                                            NativeV2SnapshotCaptureStage::Device(stage),
+                                        )
+                                    }
+                                    source => NativeV2SnapshotCaptureError::Storage { source },
+                                })?,
+                        )
+                    };
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Memory(
+                            SnapshotV2MemoryIoStage::InitialPosition,
+                        ),
+                    ));
+                }
+                let platform = session
+                    .capture_native_v2_serial_platform(input, &mut output, cancellation)
+                    .map_err(native_v2_platform_capture_error)?;
+                if cancellation.is_cancelled() {
+                    return Err(native_v2_snapshot_cancelled(
+                        NativeV2SnapshotCaptureStage::Encode,
+                    ));
+                }
+                let state = session
+                    .compose_native_v2_serial(platform, graph, serial)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Compose { source })?;
+                session
+                    .encode_native_v2_serial(&state)
+                    .map_err(|source| NativeV2SnapshotCaptureError::Encode { source })?
+            }
         };
         if cancellation.is_cancelled() {
             return Err(native_v2_snapshot_cancelled(
@@ -16439,6 +16590,116 @@ where
         .map_err(native_v2_snapshot_publication_error_from_boot_run_loop_command)
     }
 
+    fn capture_native_v2_serial_candidate(
+        &self,
+        input: HvfArm64BootSnapshotV2CaptureInput,
+        serial_config: SerialConfig,
+        storage_configs: CaptureReadyStorageConfigs,
+        expected_transport: SnapshotV2DeviceTransportKind,
+        output: BoxedNativeV2SnapshotMemoryOutput,
+        cancellation: NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Vec<u8>, Box<NativeV2SnapshotPublicationTransactionError>> {
+        preflight_native_v2_serial_capture(&serial_config, &storage_configs)
+            .map_err(native_v2_snapshot_transaction_error_before_staging)?;
+        let active_capture = self
+            .register_snapshot_capture_raw(cancellation.clone())
+            .map_err(|source| {
+                native_v2_snapshot_transaction_error_before_staging(
+                    NativeV2SnapshotCaptureError::Supervisor { source },
+                )
+            })?;
+        if !cancellation.begin_operation() {
+            return Err(native_v2_snapshot_transaction_error_before_staging(
+                native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+            ));
+        }
+        let completion_cancellation = cancellation.clone();
+        let preserve_terminal_result = Arc::new(AtomicBool::new(false));
+        let completion_terminal_result = Arc::clone(&preserve_terminal_result);
+        let terminal_status = Arc::clone(&self.status);
+        let terminal_admission = Arc::clone(&self.admission);
+        let terminal_pause_gate = Arc::clone(&self.pause_gate);
+
+        self.run_snapshot_quiesced_preserving_result_if(
+            move |session| {
+                let _active_capture = active_capture;
+                let guard = session
+                    .quiesce_snapshot_auxiliary_work()
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Auxiliary { source },
+                        )
+                    })?;
+                if cancellation.is_cancelled() {
+                    drop(guard);
+                    return Err(native_v2_snapshot_transaction_error_before_staging(
+                        native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::Source),
+                    ));
+                }
+                let serial = session
+                    .capture_native_v2_serial(serial_config, &guard)
+                    .map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::Serial { source },
+                        )
+                    })?;
+                let serial =
+                    SnapshotV2SerialState::try_from_capture_ready(serial).map_err(|source| {
+                        native_v2_snapshot_transaction_error_before_staging(
+                            NativeV2SnapshotCaptureError::SerialState { source },
+                        )
+                    })?;
+
+                let result = capture_and_recover_native_v2_state(
+                    session,
+                    input,
+                    NativeV2SnapshotCaptureProfile::Serial {
+                        serial,
+                        storage_configs,
+                        expected_transport,
+                    },
+                    &guard,
+                    output,
+                    &cancellation,
+                    Ok,
+                )
+                .map_err(native_v2_snapshot_transaction_error_before_staging)
+                .and_then(|state| {
+                    if cancellation.is_cancelled() || !cancellation.try_seal_commit() {
+                        Err(native_v2_snapshot_transaction_error_before_staging(
+                            native_v2_snapshot_cancelled(NativeV2SnapshotCaptureStage::CommitSeal),
+                        ))
+                    } else {
+                        session.native_v2_candidate_commit_sealed();
+                        Ok(state)
+                    }
+                });
+
+                let terminal_capture = result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.producer())
+                    .is_some_and(|producer| producer.source().is_terminal());
+                if terminal_capture {
+                    preserve_terminal_result.store(true, Ordering::Release);
+                    terminal_status.record(BootRunLoopWorkerStatus::Failed(
+                        "terminal native-v2 capture failure".to_string(),
+                    ));
+                    terminal_admission.shutdown();
+                    terminal_pause_gate.shutdown();
+                    let _ = session.run_loop_control().request_stop();
+                }
+                drop(guard);
+                result
+            },
+            move || {
+                completion_cancellation.is_commit_sealed()
+                    || completion_terminal_result.load(Ordering::Acquire)
+            },
+        )
+        .map_err(native_v2_snapshot_publication_error_from_boot_run_loop_command)
+    }
+
     fn publish_native_v2_snapshot_to_destination(
         &self,
         input: HvfArm64BootSnapshotV2CaptureInput,
@@ -16565,6 +16826,20 @@ type HvfNativeV2RootCandidateCapture =
 
 const _: HvfNativeV2RootCandidateCapture =
     HvfBootRunLoopSupervisor::capture_native_v2_root_candidate;
+
+type HvfNativeV2SerialCandidateCapture =
+    fn(
+        &HvfBootRunLoopSupervisor,
+        HvfArm64BootSnapshotV2CaptureInput,
+        SerialConfig,
+        CaptureReadyStorageConfigs,
+        SnapshotV2DeviceTransportKind,
+        BoxedNativeV2SnapshotMemoryOutput,
+        NativeV2SnapshotCaptureCancellation,
+    ) -> Result<Vec<u8>, Box<NativeV2SnapshotPublicationTransactionError>>;
+
+const _: HvfNativeV2SerialCandidateCapture =
+    HvfBootRunLoopSupervisor::capture_native_v2_serial_candidate;
 
 fn native_v1_snapshot_cancelled(
     stage: NativeV1SnapshotCaptureStage,
@@ -17731,6 +18006,13 @@ mod tests {
         SerialMmioDevice, SerialOutput, SerialOutputFile, SerialOutputMetrics,
         SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
     };
+    #[cfg(target_os = "macos")]
+    use bangbang_runtime::serial::{
+        SERIAL_INTERRUPT_IDENTIFICATION_NO_INTERRUPT_PENDING,
+        SERIAL_INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE, SERIAL_LINE_STATUS_DATA_READY,
+        SERIAL_LINE_STATUS_DEFAULT, SERIAL_RECEIVE_FIFO_CAPACITY, SerialMmioCaptureState,
+        SerialMmioCaptureStateParts, SerialMmioState,
+    };
     use bangbang_runtime::snapshot::{
         SnapshotCreateInput, SnapshotLoadInput, SnapshotMemoryBackend, SnapshotMemoryBackendType,
         SnapshotType, SnapshotV1ControllerCommit, SnapshotV2ControllerCommit,
@@ -17760,14 +18042,17 @@ mod tests {
     };
     use bangbang_runtime::snapshot_format_v2::{
         NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY, NATIVE_V2_LEGACY_PLATFORM_VERSION,
-        NATIVE_V2_MEMORY_COMPONENT_KEY, SnapshotV2Component, SnapshotV2ComponentDisposition,
-        decode_snapshot_v2_state_with_compatibility_version,
+        NATIVE_V2_MEMORY_COMPONENT_KEY, NATIVE_V2_SERIAL_COMPONENT_KEY, SnapshotV2Component,
+        SnapshotV2ComponentDisposition, decode_snapshot_v2_state_with_compatibility_version,
         encode_snapshot_v2_state_with_compatibility_version,
     };
     use bangbang_runtime::snapshot_memory::{SnapshotMemoryBinding, write_snapshot_memory_image};
     use bangbang_runtime::snapshot_memory_v2::{
         SnapshotV2MemoryBinding, write_snapshot_v2_memory_image_with_cancel,
         write_snapshot_v2_memory_image_with_compatibility_version_and_cancel,
+    };
+    use bangbang_runtime::snapshot_serial_v2_7::{
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     };
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkInterface,
@@ -20268,6 +20553,13 @@ mod tests {
         graph: SnapshotV2StorageDeviceGraph,
     }
 
+    #[derive(Debug)]
+    struct FakeNativeV2SerialState {
+        binding: SnapshotV2MemoryBinding,
+        graph: Option<SnapshotV2StorageDeviceGraph>,
+        serial: SnapshotV2SerialState,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FakeNativeV2RootFailure {
         Inventory,
@@ -20385,6 +20677,8 @@ mod tests {
         native_snapshot_cancel_before_seal: Option<NativeV1SnapshotCaptureCancellation>,
         native_snapshot_publication_error: Option<BackendError>,
         native_v2_serial_canonical: bool,
+        native_v2_serial_state: Option<bangbang_runtime::serial::SerialMmioCaptureState>,
+        native_v2_serial_wrong_owner: bool,
         native_v2_pause_error: bool,
         native_v2_recovery_error: bool,
         native_v2_root_transport: Option<SnapshotV2DeviceTransportKind>,
@@ -20449,6 +20743,8 @@ mod tests {
                 native_snapshot_cancel_before_seal: None,
                 native_snapshot_publication_error: None,
                 native_v2_serial_canonical: true,
+                native_v2_serial_state: None,
+                native_v2_serial_wrong_owner: false,
                 native_v2_pause_error: false,
                 native_v2_recovery_error: false,
                 native_v2_root_transport: Some(SnapshotV2DeviceTransportKind::Mmio),
@@ -20533,6 +20829,21 @@ mod tests {
         #[cfg(target_os = "macos")]
         const fn with_native_v2_noncanonical_serial(mut self) -> Self {
             self.native_v2_serial_canonical = false;
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        fn with_native_v2_serial_state(
+            mut self,
+            state: bangbang_runtime::serial::SerialMmioCaptureState,
+        ) -> Self {
+            self.native_v2_serial_state = Some(state);
+            self
+        }
+
+        #[cfg(target_os = "macos")]
+        const fn with_native_v2_serial_wrong_owner(mut self) -> Self {
+            self.native_v2_serial_wrong_owner = true;
             self
         }
 
@@ -21175,6 +21486,7 @@ mod tests {
         type RootState = FakeNativeV2RootState;
         type MultiBlockState = FakeNativeV2MultiBlockState;
         type StorageState = FakeNativeV2StorageState;
+        type SerialState = FakeNativeV2SerialState;
 
         fn capture_native_v2_serial(
             &self,
@@ -21185,6 +21497,12 @@ mod tests {
                 .lock()
                 .expect("fake native snapshot events should lock")
                 .push("v2-serial");
+            if self.native_v2_serial_wrong_owner {
+                return Err(HvfArm64BootSerialCaptureError::WrongQuiescenceGuard);
+            }
+            if let Some(state) = &self.native_v2_serial_state {
+                return Ok(CaptureReadySerialState::new(config, state.clone()));
+            }
             let mut device = SerialMmioDevice::discarding();
             if !self.native_v2_serial_canonical {
                 device
@@ -21474,6 +21792,41 @@ mod tests {
             Ok(binding)
         }
 
+        fn capture_native_v2_serial_platform(
+            &mut self,
+            _input: HvfArm64BootSnapshotV2CaptureInput,
+            output: &mut super::BoxedNativeV2SnapshotMemoryOutput,
+            cancellation: &NativeV2SnapshotCaptureCancellation,
+        ) -> Result<Self::PlatformState, HvfArm64BootSnapshotV2CaptureError> {
+            assert!(
+                !self.native_snapshot_panic,
+                "fake native-v2 snapshot capture panic"
+            );
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-serial-platform");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("platform", self.native_v2_topology_generation));
+            let memory = self
+                .native_snapshot_memory
+                .as_ref()
+                .expect("fake native-v2 memory should be configured");
+            let binding = write_snapshot_v2_memory_image_with_compatibility_version_and_cancel(
+                memory,
+                output,
+                NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+                |_| cancellation.is_cancelled(),
+            )
+            .map_err(|source| HvfArm64BootSnapshotV2CaptureError::MemoryImage { source })?;
+            if let Some(cancel) = &self.native_snapshot_cancel_before_seal {
+                cancel.cancel();
+            }
+            Ok(binding)
+        }
+
         fn compose_native_v2_root(
             &self,
             platform: Self::PlatformState,
@@ -21654,6 +22007,88 @@ mod tests {
             };
             encode_snapshot_v2_state_with_compatibility_version(
                 NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                &[],
+                &components,
+            )
+            .map_err(HvfSnapshotV2EncodeError::Container)
+        }
+
+        fn compose_native_v2_serial(
+            &self,
+            platform: Self::PlatformState,
+            graph: Option<SnapshotV2StorageDeviceGraph>,
+            serial: SnapshotV2SerialState,
+        ) -> Result<Self::SerialState, HvfSnapshotV2BuildError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-serial-compose");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("compose", self.native_v2_topology_generation));
+            Ok(FakeNativeV2SerialState {
+                binding: platform,
+                graph,
+                serial,
+            })
+        }
+
+        fn encode_native_v2_serial(
+            &self,
+            state: &Self::SerialState,
+        ) -> Result<Vec<u8>, HvfSnapshotV2EncodeError> {
+            self.native_snapshot_events
+                .lock()
+                .expect("fake native snapshot events should lock")
+                .push("v2-serial-encode");
+            self.native_v2_generation_events
+                .lock()
+                .expect("fake native-v2 generations should lock")
+                .push(("encode", self.native_v2_topology_generation));
+            let memory = state
+                .binding
+                .encode()
+                .map_err(HvfSnapshotV2EncodeError::Memory)?;
+            let serial = state
+                .serial
+                .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+                .map_err(HvfSnapshotV2EncodeError::SerialState)?;
+            let memory_component = SnapshotV2Component::new(
+                NATIVE_V2_MEMORY_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &memory,
+            );
+            let graph = state
+                .graph
+                .as_ref()
+                .map(|graph| {
+                    graph
+                        .encode(NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION)
+                        .map_err(HvfSnapshotV2EncodeError::StorageDeviceGraph)
+                })
+                .transpose()?;
+            let graph_component = graph.as_ref().map(|graph| {
+                SnapshotV2Component::new(
+                    NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY,
+                    SnapshotV2ComponentDisposition::Semantic,
+                    graph,
+                )
+            });
+            let serial_component = SnapshotV2Component::new(
+                NATIVE_V2_SERIAL_COMPONENT_KEY,
+                SnapshotV2ComponentDisposition::Semantic,
+                &serial,
+            );
+            let mut components = vec![memory_component];
+            if let Some(graph) = graph_component {
+                components.push(graph);
+            }
+            if !self.native_v2_invalid_candidate_state {
+                components.push(serial_component);
+            }
+            encode_snapshot_v2_state_with_compatibility_version(
+                NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
                 &[],
                 &components,
             )
@@ -22654,6 +23089,84 @@ mod tests {
         )
         .expect("test boot metadata should validate");
         HvfArm64BootSnapshotV2CaptureInput::new(boot)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_v2_serial_empty_input_ready_state() -> SerialMmioCaptureState {
+        SerialMmioCaptureState::try_from_parts(SerialMmioCaptureStateParts {
+            legacy_state: SerialMmioState::new(0, 3, 0, 0, 12, 0),
+            interrupt_identification: SERIAL_INTERRUPT_IDENTIFICATION_NO_INTERRUPT_PENDING,
+            line_status: SERIAL_LINE_STATUS_DEFAULT,
+            modem_status: 0,
+            receive_bytes: Vec::new(),
+            receive_interrupt_intent_pending: false,
+            input_ready_intent_pending: true,
+        })
+        .expect("empty input-ready serial state should validate")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_v2_serial_full_receive_interrupt_state() -> SerialMmioCaptureState {
+        SerialMmioCaptureState::try_from_parts(SerialMmioCaptureStateParts {
+            legacy_state: SerialMmioState::new(1, 3, 8, 0x5a, 12, 0),
+            interrupt_identification: SERIAL_INTERRUPT_IDENTIFICATION_RECEIVED_DATA_AVAILABLE,
+            line_status: SERIAL_LINE_STATUS_DEFAULT | SERIAL_LINE_STATUS_DATA_READY,
+            modem_status: 0,
+            receive_bytes: (0..SERIAL_RECEIVE_FIFO_CAPACITY)
+                .map(|index| u8::try_from(index).expect("serial FIFO index should fit"))
+                .collect(),
+            receive_interrupt_intent_pending: true,
+            input_ready_intent_pending: false,
+        })
+        .expect("full receive-interrupt serial state should validate")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_v2_storage_configs(count: usize) -> CaptureReadyStorageConfigs {
+        let drives = (0..count)
+            .map(|index| {
+                DriveConfigInput::new(
+                    format!("drive{index}"),
+                    format!("drive{index}"),
+                    format!("/private/storage-{index}.img"),
+                    index == 0,
+                )
+                .with_is_read_only(true)
+                .with_io_engine(DriveIoEngine::Sync)
+                .validate()
+                .expect("serial capture storage config should validate")
+            })
+            .collect();
+        CaptureReadyStorageConfigs::new(drives, Vec::new())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn decode_fake_native_v2_serial_candidate(
+        bytes: &[u8],
+    ) -> (SnapshotV2SerialState, Option<SnapshotV2StorageDeviceGraph>) {
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            bytes,
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        )
+        .expect("fake exact-2.7 candidate should decode structurally");
+        let serial = SnapshotV2SerialState::decode(
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            structural
+                .component(NATIVE_V2_SERIAL_COMPONENT_KEY)
+                .expect("fake exact-2.7 candidate should contain serial")
+                .payload(),
+        )
+        .expect("fake exact-2.7 serial component should decode");
+        let graph = structural
+            .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
+            .map(|component| {
+                SnapshotV2StorageDeviceGraph::decode(
+                    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                    component.payload(),
+                )
+                .expect("fake exact-2.7 storage component should decode")
+            });
+        (serial, graph)
     }
 
     #[cfg(target_os = "macos")]
@@ -36090,6 +36603,446 @@ mod tests {
             |vmm| vmm.pci_enabled = true,
             NativeV2RootCandidateProfileError::IncompatibleProcessMode,
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_serial_only_candidate_preserves_input_ready_state_and_recaptures() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let expected_serial = native_v2_serial_empty_input_ready_state();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_native_v2_serial_state(expected_serial.clone())
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let generations = session.native_v2_generation_events();
+        let auxiliary = session.snapshot_auxiliary_quiescence();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(79).expect("non-zero"))
+                .expect("serial-only candidate supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 79);
+        supervisor.pause().expect("serial-only source should pause");
+
+        let first = supervisor
+            .capture_native_v2_serial_candidate(
+                native_v2_test_capture_input(),
+                SerialConfig::default(),
+                CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                SnapshotV2DeviceTransportKind::Mmio,
+                Box::new(Cursor::new(Vec::new())),
+                NativeV2SnapshotCaptureCancellation::default(),
+            )
+            .expect("serial-only exact-2.7 candidate should capture");
+        let (serial, graph) = decode_fake_native_v2_serial_candidate(&first);
+        assert!(graph.is_none());
+        assert!(serial.endpoint_intent().is_default_process_stdio());
+        assert_eq!(serial.rate_limiter(), None);
+        assert_eq!(serial.device(), &expected_serial);
+        assert!(serial.device().input_ready_intent_pending());
+        assert!(!serial.device().receive_interrupt_intent_pending());
+        assert!(serial.device().receive_bytes().is_empty());
+        assert_eq!(
+            decode_snapshot_v2_state_with_compatibility_version(
+                &first,
+                NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            )
+            .expect("serial-only candidate should decode")
+            .metadata()
+            .component_count(),
+            2
+        );
+        assert_eq!(
+            events
+                .lock()
+                .expect("serial-only events should lock")
+                .as_slice(),
+            [
+                "aux-acquire",
+                "v2-serial",
+                "v2-pause",
+                "v2-serial-platform",
+                "v2-serial-compose",
+                "v2-serial-encode",
+                "v2-recover",
+                "v2-candidate-sealed",
+                "aux-drop",
+            ]
+        );
+        assert_eq!(
+            generations
+                .lock()
+                .expect("serial-only generations should lock")
+                .as_slice(),
+            [
+                ("pause", 1),
+                ("platform", 1),
+                ("compose", 1),
+                ("encode", 1),
+                ("recover", 1),
+                ("seal", 1),
+            ]
+        );
+
+        let second = supervisor
+            .capture_native_v2_serial_candidate(
+                native_v2_test_capture_input(),
+                SerialConfig::default(),
+                CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                SnapshotV2DeviceTransportKind::Pci,
+                Box::new(Cursor::new(Vec::new())),
+                NativeV2SnapshotCaptureCancellation::default(),
+            )
+            .expect("recovered serial-only source should recapture");
+        let (second_serial, second_graph) = decode_fake_native_v2_serial_candidate(&second);
+        assert_eq!(second_serial, serial);
+        assert_eq!(second_graph, graph);
+        let first_structural = decode_snapshot_v2_state_with_compatibility_version(
+            &first,
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        )
+        .expect("first serial-only candidate should decode");
+        let second_structural = decode_snapshot_v2_state_with_compatibility_version(
+            &second,
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        )
+        .expect("second serial-only candidate should decode");
+        assert_eq!(
+            first_structural
+                .component(NATIVE_V2_SERIAL_COMPONENT_KEY)
+                .expect("first serial component should exist")
+                .payload(),
+            second_structural
+                .component(NATIVE_V2_SERIAL_COMPONENT_KEY)
+                .expect("second serial component should exist")
+                .payload()
+        );
+        assert_eq!(
+            serial
+                .encode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION)
+                .expect("captured serial should re-encode"),
+            first_structural
+                .component(NATIVE_V2_SERIAL_COMPONENT_KEY)
+                .expect("first serial component should exist")
+                .payload()
+        );
+        assert_eq!(auxiliary.acquire_count.load(Ordering::SeqCst), 2);
+        assert_eq!(auxiliary.drop_count.load(Ordering::SeqCst), 2);
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_configured_serial_candidate_preserves_full_rx_and_optional_storage_transport() {
+        for (case, transport) in [
+            ("mmio", SnapshotV2DeviceTransportKind::Mmio),
+            ("pci", SnapshotV2DeviceTransportKind::Pci),
+        ] {
+            let control = FakeRunLoopControl::default();
+            let drop_count = Arc::new(AtomicU64::new(0));
+            let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+            let expected_serial = native_v2_serial_full_receive_interrupt_state();
+            let session =
+                FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+                    .with_native_snapshot_memory(1)
+                    .with_native_v2_serial_state(expected_serial.clone())
+                    .with_native_v2_root_transport(transport)
+                    .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                    .with_wait_for_stop(false)
+                    .with_wait_for_wakeup(true);
+            let events = session.native_snapshot_events();
+            let supervisor =
+                BootRunLoopSupervisor::start(session, NonZeroUsize::new(80).expect("non-zero"))
+                    .expect("configured serial candidate supervisor should start");
+            assert_eq!(max_steps_receiver.recv().expect("worker should start"), 80);
+            supervisor
+                .pause()
+                .expect("configured serial source should pause");
+            let limiter = SerialRateLimiterConfig::new(4096, Some(256), 1_000);
+            let serial_config = SerialConfigInput::new()
+                .with_serial_out_path("serial-log")
+                .with_rate_limiter(limiter)
+                .validate()
+                .expect("configured serial should validate");
+
+            let encoded = supervisor
+                .capture_native_v2_serial_candidate(
+                    native_v2_test_capture_input(),
+                    serial_config,
+                    native_v2_storage_configs(1),
+                    transport,
+                    Box::new(Cursor::new(Vec::new())),
+                    NativeV2SnapshotCaptureCancellation::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{case} configured serial candidate should capture: {error}")
+                });
+            let (serial, graph) = decode_fake_native_v2_serial_candidate(&encoded);
+            assert_eq!(
+                serial.endpoint_intent().configured_selector(),
+                Some("serial-log")
+            );
+            assert_eq!(serial.rate_limiter(), Some(limiter));
+            assert_eq!(serial.device(), &expected_serial);
+            assert_eq!(
+                serial.device().receive_bytes().len(),
+                SERIAL_RECEIVE_FIFO_CAPACITY
+            );
+            assert!(serial.device().receive_interrupt_intent_pending());
+            assert!(!serial.device().input_ready_intent_pending());
+            assert_eq!(
+                graph
+                    .as_ref()
+                    .expect("storage-bearing candidate should contain graph")
+                    .transport_kind(),
+                transport
+            );
+            let debug = format!("{serial:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains("serial-log"));
+            assert_eq!(
+                events
+                    .lock()
+                    .expect("configured serial events should lock")
+                    .as_slice(),
+                [
+                    "aux-acquire",
+                    "v2-serial",
+                    "v2-pause",
+                    "v2-storage-normalize",
+                    "v2-storage-transport",
+                    "v2-serial-platform",
+                    "v2-serial-compose",
+                    "v2-serial-encode",
+                    "v2-recover",
+                    "v2-candidate-sealed",
+                    "aux-drop",
+                ]
+            );
+            assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+            drop(supervisor);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_serial_capture_preflight_enforces_complete_resource_edges_before_dispatch() {
+        let configured = SerialConfigInput::new()
+            .with_serial_out_path("serial-log")
+            .validate()
+            .expect("configured serial should validate");
+        super::preflight_native_v2_serial_capture(
+            &SerialConfig::default(),
+            &native_v2_storage_configs(64),
+        )
+        .expect("default serial plus 64 storage resources should fit");
+        super::preflight_native_v2_serial_capture(&configured, &native_v2_storage_configs(63))
+            .expect("configured serial plus 63 storage resources should fit");
+
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session = FakeRunLoopSession::new(control, Arc::clone(&drop_count), max_steps_sender)
+            .with_native_snapshot_memory(1)
+            .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+            .with_wait_for_stop(false)
+            .with_wait_for_wakeup(true);
+        let events = session.native_snapshot_events();
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(81).expect("non-zero"))
+                .expect("serial preflight supervisor should start");
+        assert_eq!(max_steps_receiver.recv().expect("worker should start"), 81);
+        supervisor
+            .pause()
+            .expect("serial preflight source should pause");
+
+        for (serial_config, storage_count) in
+            [(SerialConfig::default(), 65), (configured.clone(), 64)]
+        {
+            let error = supervisor
+                .capture_native_v2_serial_candidate(
+                    native_v2_test_capture_input(),
+                    serial_config,
+                    native_v2_storage_configs(storage_count),
+                    SnapshotV2DeviceTransportKind::Mmio,
+                    Box::new(Cursor::new(Vec::new())),
+                    NativeV2SnapshotCaptureCancellation::default(),
+                )
+                .expect_err("complete resource overflow should fail before dispatch");
+            assert!(matches!(
+                error.producer().map(|producer| producer.source()),
+                Some(NativeV2SnapshotPublicationProducerError::Capture(
+                    NativeV2SnapshotCaptureError::SerialState {
+                        source:
+                            bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialStateCaptureError::RestoreResourceCapacity,
+                    }
+                ))
+            ));
+        }
+
+        let private_selector = "private-selector".repeat(
+            bangbang_runtime::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_MAX_SELECTOR_BYTES
+                / "private-selector".len()
+                + 1,
+        );
+        let oversized = SerialConfigInput::new()
+            .with_serial_out_path(private_selector.clone())
+            .validate()
+            .expect("live serial config should accept the snapshot-oversized selector");
+        let error = supervisor
+            .capture_native_v2_serial_candidate(
+                native_v2_test_capture_input(),
+                oversized,
+                CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                SnapshotV2DeviceTransportKind::Mmio,
+                Box::new(Cursor::new(Vec::new())),
+                NativeV2SnapshotCaptureCancellation::default(),
+            )
+            .expect_err("noncanonical selector should fail before dispatch");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::SerialState {
+                    source:
+                        bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialStateCaptureError::InvalidEndpointIntent,
+                }
+            ))
+        ));
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains(&private_selector));
+        assert!(
+            events
+                .lock()
+                .expect("preflight events should lock")
+                .is_empty()
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+
+        drop(supervisor);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_v2_serial_capture_preserves_wrong_owner_and_cancellation_recovery() {
+        let wrong_owner_control = FakeRunLoopControl::default();
+        let wrong_owner_drops = Arc::new(AtomicU64::new(0));
+        let (wrong_owner_sender, wrong_owner_receiver) = mpsc::channel();
+        let wrong_owner_session = FakeRunLoopSession::new(
+            wrong_owner_control,
+            Arc::clone(&wrong_owner_drops),
+            wrong_owner_sender,
+        )
+        .with_native_snapshot_memory(1)
+        .with_native_v2_serial_wrong_owner()
+        .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+        .with_wait_for_stop(false)
+        .with_wait_for_wakeup(true);
+        let wrong_owner_events = wrong_owner_session.native_snapshot_events();
+        let wrong_owner = BootRunLoopSupervisor::start(
+            wrong_owner_session,
+            NonZeroUsize::new(82).expect("non-zero"),
+        )
+        .expect("wrong-owner supervisor should start");
+        assert_eq!(
+            wrong_owner_receiver.recv().expect("worker should start"),
+            82
+        );
+        wrong_owner
+            .pause()
+            .expect("wrong-owner source should pause");
+        let error = wrong_owner
+            .capture_native_v2_serial_candidate(
+                native_v2_test_capture_input(),
+                SerialConfig::default(),
+                CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                SnapshotV2DeviceTransportKind::Mmio,
+                Box::new(Cursor::new(Vec::new())),
+                NativeV2SnapshotCaptureCancellation::default(),
+            )
+            .expect_err("wrong serial owner should fail before topology pause");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Serial {
+                    source: HvfArm64BootSerialCaptureError::WrongQuiescenceGuard,
+                }
+            ))
+        ));
+        assert_eq!(
+            wrong_owner_events
+                .lock()
+                .expect("wrong-owner events should lock")
+                .as_slice(),
+            ["aux-acquire", "v2-serial", "aux-drop"]
+        );
+        assert_eq!(wrong_owner.status(), BootRunLoopWorkerStatus::Paused);
+        drop(wrong_owner);
+        assert_eq!(wrong_owner_drops.load(Ordering::SeqCst), 1);
+
+        let cancellation = NativeV2SnapshotCaptureCancellation::default();
+        let cancel_control = FakeRunLoopControl::default();
+        let cancel_drops = Arc::new(AtomicU64::new(0));
+        let (cancel_sender, cancel_receiver) = mpsc::channel();
+        let cancel_session =
+            FakeRunLoopSession::new(cancel_control, Arc::clone(&cancel_drops), cancel_sender)
+                .with_native_snapshot_memory(1)
+                .with_native_snapshot_cancel_before_seal(cancellation.clone())
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let cancel_events = cancel_session.native_snapshot_events();
+        let cancelled =
+            BootRunLoopSupervisor::start(cancel_session, NonZeroUsize::new(83).expect("non-zero"))
+                .expect("cancellation supervisor should start");
+        assert_eq!(cancel_receiver.recv().expect("worker should start"), 83);
+        cancelled.pause().expect("cancellation source should pause");
+        let error = cancelled
+            .capture_native_v2_serial_candidate(
+                native_v2_test_capture_input(),
+                SerialConfig::default(),
+                CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                SnapshotV2DeviceTransportKind::Mmio,
+                Box::new(Cursor::new(Vec::new())),
+                cancellation,
+            )
+            .expect_err("serial platform cancellation should fail closed");
+        assert!(matches!(
+            error.producer().map(|producer| producer.source()),
+            Some(NativeV2SnapshotPublicationProducerError::Capture(
+                NativeV2SnapshotCaptureError::Cancelled {
+                    stage: NativeV2SnapshotCaptureStage::Encode,
+                }
+            ))
+        ));
+        assert!(
+            cancel_events
+                .lock()
+                .expect("cancellation events should lock")
+                .ends_with(&["v2-serial-platform", "v2-recover", "aux-drop"])
+        );
+        assert_eq!(cancelled.status(), BootRunLoopWorkerStatus::Paused);
+        cancelled
+            .capture_native_v2_serial_candidate(
+                native_v2_test_capture_input(),
+                SerialConfig::default(),
+                CaptureReadyStorageConfigs::new(Vec::new(), Vec::new()),
+                SnapshotV2DeviceTransportKind::Mmio,
+                Box::new(Cursor::new(Vec::new())),
+                NativeV2SnapshotCaptureCancellation::default(),
+            )
+            .expect("recovered serial source should accept a fresh capture");
+        assert_eq!(cancelled.status(), BootRunLoopWorkerStatus::Paused);
+        drop(cancelled);
+        assert_eq!(cancel_drops.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(target_os = "macos")]
