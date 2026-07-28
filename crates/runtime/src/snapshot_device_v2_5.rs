@@ -848,6 +848,14 @@ pub(crate) fn validate_virtio(
     state: &SnapshotV2VirtioState,
     expected_features: u64,
 ) -> Result<(), GraphValidationError> {
+    validate_virtio_with_queue_size(state, expected_features, VIRTIO_BLOCK_QUEUE_SIZE)
+}
+
+pub(crate) fn validate_virtio_with_queue_size(
+    state: &SnapshotV2VirtioState,
+    expected_features: u64,
+    expected_queue_size: u16,
+) -> Result<(), GraphValidationError> {
     if state.available_features() != expected_features
         || state.driver_features() & !state.available_features() != 0
         || state.queues().len() != 1
@@ -887,7 +895,7 @@ pub(crate) fn validate_virtio(
         return Err(GraphValidationError::Virtio);
     }
     let queue = state.queues().first().ok_or(GraphValidationError::Virtio)?;
-    validate_queue(queue)?;
+    validate_queue_with_size(queue, expected_queue_size)?;
     if state.is_activated() && !queue.ready() {
         return Err(GraphValidationError::Virtio);
     }
@@ -927,10 +935,11 @@ pub(crate) fn validate_virtio(
     Ok(())
 }
 
-pub(crate) fn validate_queue(
+fn validate_queue_with_size(
     queue: &SnapshotV2VirtioQueueState,
+    expected_queue_size: u16,
 ) -> Result<(), GraphValidationError> {
-    if queue.max_size() != VIRTIO_BLOCK_QUEUE_SIZE
+    if queue.max_size() != expected_queue_size
         || (queue.size() != 0
             && (!queue.size().is_power_of_two() || queue.size() > queue.max_size()))
         || (queue.ready() && queue.size() == 0)
