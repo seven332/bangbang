@@ -16,6 +16,9 @@ use bangbang_runtime::pmem::{
     PmemFileBacking, SnapshotPmemFileBackingError, SnapshotPmemFileBackingReservation,
     aligned_pmem_mapping_len,
 };
+use bangbang_runtime::serial::{
+    SerialOutputFile, SnapshotSerialOutputError, SnapshotSerialOutputReservation,
+};
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceGraph;
 use bangbang_runtime::snapshot_device_v2_5::{
     PreparedSnapshotV2MultiBlockBundle, SnapshotV2MultiBlockBundleError,
@@ -32,13 +35,15 @@ use bangbang_runtime::snapshot_restore::{
     SnapshotRestoreManifestError, SnapshotRestorePublicId, SnapshotRestoreResourceClass,
     SnapshotRestoreResourceKey, SnapshotRestoreTakeError,
 };
-use bangbang_session::GrantAccess;
+use bangbang_runtime::snapshot_serial_v2_7::SnapshotV2SerialState;
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
+use bangbang_session::{GrantAccess, ResourceRole};
 
 use crate::contained_session::{
     ContainedSnapshotRestoreAuthority, ContainedSnapshotRestoreError,
     ContainedSnapshotRestoreFileRequest, ContainedSnapshotRestoreTransaction, GrantAuthority,
-    GrantClaimError, PreparedDriveBackingClaim, PreparedSnapshotBackingClaim, grant_reference_id,
+    GrantClaimError, PreparedDriveBackingClaim, PreparedSnapshotBackingClaim,
+    PreparedSnapshotFileClaim, grant_reference_id,
 };
 #[cfg(test)]
 use crate::contained_session::{
@@ -65,7 +70,9 @@ pub(crate) enum SnapshotRestoreResourceStage {
     DrivePreflight,
     DrivePreparation,
     PmemPreparation,
+    SerialPreparation,
     StoragePreflight,
+    SerialPreflight,
     RootPreparation,
     VsockPreparation,
     Binding,
@@ -81,6 +88,7 @@ pub(crate) enum SnapshotRestoreResourceErrorKind {
     RootBacking(SnapshotRootBackingLeaseError),
     DriveBacking(SnapshotDriveBackingPreparationError),
     PmemBacking(SnapshotPmemFileBackingError),
+    SerialOutput(SnapshotSerialOutputError),
     Vsock(VsockRestoreError),
     Binding(SnapshotRestoreBindingRejectionReason),
     Incomplete { missing_count: usize },
@@ -89,6 +97,7 @@ pub(crate) enum SnapshotRestoreResourceErrorKind {
     OwnerClassMismatch,
     InvalidDriveSet,
     InvalidStorageSet,
+    InvalidSerialSet,
     DriveProjection,
     Cancelled,
 }
@@ -120,6 +129,10 @@ impl fmt::Debug for SnapshotRestoreResourceErrorKind {
                 .debug_tuple("SnapshotRestoreResourceErrorKind::PmemBacking")
                 .field(source)
                 .finish(),
+            Self::SerialOutput(source) => formatter
+                .debug_tuple("SnapshotRestoreResourceErrorKind::SerialOutput")
+                .field(source)
+                .finish(),
             Self::Vsock(source) => formatter
                 .debug_tuple("SnapshotRestoreResourceErrorKind::Vsock")
                 .field(source)
@@ -149,6 +162,9 @@ impl fmt::Debug for SnapshotRestoreResourceErrorKind {
             Self::InvalidStorageSet => {
                 formatter.write_str("SnapshotRestoreResourceErrorKind::InvalidStorageSet")
             }
+            Self::InvalidSerialSet => {
+                formatter.write_str("SnapshotRestoreResourceErrorKind::InvalidSerialSet")
+            }
             Self::DriveProjection => {
                 formatter.write_str("SnapshotRestoreResourceErrorKind::DriveProjection")
             }
@@ -166,6 +182,7 @@ impl fmt::Display for SnapshotRestoreResourceErrorKind {
             Self::RootBacking(source) => source.fmt(formatter),
             Self::DriveBacking(source) => source.fmt(formatter),
             Self::PmemBacking(source) => source.fmt(formatter),
+            Self::SerialOutput(source) => source.fmt(formatter),
             Self::Vsock(source) => source.fmt(formatter),
             Self::Binding(reason) => reason.fmt(formatter),
             Self::Incomplete { .. } => {
@@ -183,6 +200,9 @@ impl fmt::Display for SnapshotRestoreResourceErrorKind {
             }
             Self::InvalidStorageSet => {
                 formatter.write_str("snapshot restore storage resource set is invalid")
+            }
+            Self::InvalidSerialSet => {
+                formatter.write_str("snapshot restore serial resource set is invalid")
             }
             Self::DriveProjection => {
                 formatter.write_str("snapshot restore drive projection is invalid")
@@ -276,6 +296,7 @@ impl std::error::Error for SnapshotRestoreResourceError {
             SnapshotRestoreResourceErrorKind::RootBacking(source) => Some(source),
             SnapshotRestoreResourceErrorKind::DriveBacking(source) => Some(source),
             SnapshotRestoreResourceErrorKind::PmemBacking(source) => Some(source),
+            SnapshotRestoreResourceErrorKind::SerialOutput(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Vsock(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Take(source) => Some(source),
             SnapshotRestoreResourceErrorKind::Binding(_)
@@ -284,6 +305,7 @@ impl std::error::Error for SnapshotRestoreResourceError {
             | SnapshotRestoreResourceErrorKind::OwnerClassMismatch
             | SnapshotRestoreResourceErrorKind::InvalidDriveSet
             | SnapshotRestoreResourceErrorKind::InvalidStorageSet
+            | SnapshotRestoreResourceErrorKind::InvalidSerialSet
             | SnapshotRestoreResourceErrorKind::DriveProjection
             | SnapshotRestoreResourceErrorKind::Cancelled => None,
         }
@@ -898,6 +920,21 @@ struct ReservedDirectSnapshotDriveRestoreResource {
     reservation: ReservedDirectSnapshotFileBacking,
 }
 
+impl ReservedDirectSnapshotDriveRestoreResource {
+    fn identity(&self) -> (u64, u64) {
+        match &self.reservation {
+            ReservedDirectSnapshotFileBacking::Block(reservation) => {
+                let identity = reservation.identity();
+                (identity.device(), identity.inode())
+            }
+            ReservedDirectSnapshotFileBacking::Pmem(reservation) => {
+                let identity = reservation.identity();
+                (identity.device(), identity.inode())
+            }
+        }
+    }
+}
+
 impl fmt::Debug for PreparedSnapshotDriveRestoreResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1319,6 +1356,396 @@ impl RequestedSnapshotStorageRestoreResources {
     }
 }
 
+struct RequestedSnapshotSerialSinkRestoreResource {
+    key: SnapshotRestoreResourceKey,
+    selector: PathBuf,
+}
+
+impl fmt::Debug for RequestedSnapshotSerialSinkRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestedSnapshotSerialSinkRestoreResource")
+            .field("key", &self.key)
+            .field("selector", &"<redacted>")
+            .finish()
+    }
+}
+
+struct PreparedSnapshotSerialSinkRestoreResource {
+    key: SnapshotRestoreResourceKey,
+    output: SerialOutputFile,
+    claim: Option<PreparedSnapshotFileClaim>,
+}
+
+impl PreparedSnapshotSerialSinkRestoreResource {
+    fn abort(self) -> SnapshotRestoreAbortOutcome {
+        let Self {
+            key: _,
+            output,
+            claim,
+        } = self;
+        drop(output);
+        match claim {
+            Some(claim) => {
+                if claim.abort().is_err() {
+                    SnapshotRestoreAbortOutcome::terminal(true)
+                } else {
+                    SnapshotRestoreAbortOutcome::retryable()
+                }
+            }
+            None => SnapshotRestoreAbortOutcome::retryable(),
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotSerialSinkRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotSerialSinkRestoreResource")
+            .field("key", &self.key)
+            .field("output", &"<owned>")
+            .field("claim", &self.claim.as_ref().map(|_| "<provisional>"))
+            .finish()
+    }
+}
+
+enum PreparedSnapshotSerialRestoreResource {
+    Storage(PreparedSnapshotDriveRestoreResource),
+    Serial(PreparedSnapshotSerialSinkRestoreResource),
+}
+
+impl PreparedSnapshotSerialRestoreResource {
+    fn key(&self) -> &SnapshotRestoreResourceKey {
+        match self {
+            Self::Storage(resource) => &resource.key,
+            Self::Serial(resource) => &resource.key,
+        }
+    }
+
+    fn abort(self) -> SnapshotRestoreAbortOutcome {
+        match self {
+            Self::Storage(resource) => resource.abort(),
+            Self::Serial(resource) => resource.abort(),
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotSerialRestoreResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage(resource) => formatter
+                .debug_tuple("PreparedSnapshotSerialRestoreResource::Storage")
+                .field(resource)
+                .finish(),
+            Self::Serial(resource) => formatter
+                .debug_tuple("PreparedSnapshotSerialRestoreResource::Serial")
+                .field(resource)
+                .finish(),
+        }
+    }
+}
+
+/// Complete exact-2.7 storage plus configured-serial resource request before
+/// host authority is touched.
+pub(crate) struct RequestedSnapshotSerialRestoreResources {
+    drives: Vec<RequestedSnapshotDriveRestoreResource>,
+    resource_keys: Vec<SnapshotRestoreResourceKey>,
+    serial: Option<RequestedSnapshotSerialSinkRestoreResource>,
+    bindings: SnapshotRestoreBindings<PreparedSnapshotSerialRestoreResource>,
+    block_count: usize,
+    pmem_count: usize,
+}
+
+impl RequestedSnapshotSerialRestoreResources {
+    pub(crate) fn try_from_native_v2_serial_state(
+        graph: Option<&SnapshotV2StorageDeviceGraph>,
+        serial_state: &SnapshotV2SerialState,
+    ) -> Result<Self, SnapshotRestoreResourceError> {
+        let manifest =
+            SnapshotRestoreManifest::try_from_native_v2_serial_state(graph, serial_state).map_err(
+                |source| {
+                    SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::Manifest,
+                        SnapshotRestoreResourceErrorKind::Manifest(source),
+                    )
+                },
+            )?;
+        let storage_count = graph.map_or(0, SnapshotV2StorageDeviceGraph::record_count);
+        let mut drives = Vec::new();
+        let mut drive_keys = Vec::new();
+        drives
+            .try_reserve_exact(storage_count)
+            .map_err(manifest_allocation_error)?;
+        drive_keys
+            .try_reserve_exact(storage_count)
+            .map_err(manifest_allocation_error)?;
+        if let Some(graph) = graph {
+            for record in graph.block_records() {
+                let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id())
+                    .map_err(|source| {
+                        SnapshotRestoreResourceError::retryable(
+                            SnapshotRestoreResourceStage::Manifest,
+                            SnapshotRestoreResourceErrorKind::Manifest(
+                                SnapshotRestoreManifestError::PublicId { source },
+                            ),
+                        )
+                    })?;
+                let key = SnapshotRestoreResourceKey::new(
+                    record.key(),
+                    public_id,
+                    SnapshotRestoreResourceClass::BlockBacking,
+                );
+                drives.push(RequestedSnapshotDriveRestoreResource {
+                    key: key.clone(),
+                    selector: PathBuf::from(record.config().selector()),
+                    is_read_only: record.config().is_read_only(),
+                    expected_len: record.block().backing_bytes(),
+                    kind: SnapshotRestoreFileKind::Block,
+                });
+                drive_keys.push(key);
+            }
+            for record in graph.pmem_records() {
+                let public_id = SnapshotRestorePublicId::try_from(record.config().pmem_id())
+                    .map_err(|source| {
+                        SnapshotRestoreResourceError::retryable(
+                            SnapshotRestoreResourceStage::Manifest,
+                            SnapshotRestoreResourceErrorKind::Manifest(
+                                SnapshotRestoreManifestError::PublicId { source },
+                            ),
+                        )
+                    })?;
+                let key = SnapshotRestoreResourceKey::new(
+                    record.key(),
+                    public_id,
+                    SnapshotRestoreResourceClass::PmemBacking,
+                );
+                drives.push(RequestedSnapshotDriveRestoreResource {
+                    key: key.clone(),
+                    selector: PathBuf::from(record.config().selector()),
+                    is_read_only: record.config().is_read_only(),
+                    expected_len: record.pmem().file_bytes(),
+                    kind: SnapshotRestoreFileKind::Pmem {
+                        expected_mapped_len: record.pmem().mapped_bytes(),
+                    },
+                });
+                drive_keys.push(key);
+            }
+        }
+
+        let mut resource_keys = Vec::new();
+        resource_keys
+            .try_reserve_exact(manifest.len())
+            .map_err(manifest_allocation_error)?;
+        resource_keys.extend(manifest.resources().iter().cloned());
+        let configured_selector = serial_state.endpoint_intent().configured_selector();
+        let serial = configured_selector.and_then(|selector| {
+            resource_keys.get(drive_keys.len()).cloned().map(|key| {
+                RequestedSnapshotSerialSinkRestoreResource {
+                    key,
+                    selector: PathBuf::from(selector),
+                }
+            })
+        });
+        let expected_count = storage_count
+            .checked_add(usize::from(configured_selector.is_some()))
+            .ok_or_else(|| {
+                SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::SerialPreflight,
+                    SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+                )
+            })?;
+        let valid_drives = drives.len() == storage_count
+            && drive_keys.len() == storage_count
+            && drives.iter().zip(&drive_keys).all(|(drive, key)| {
+                drive.key == *key
+                    && drive.key.resource_class() == drive.kind.resource_class()
+                    && drive.expected_len != 0
+                    && drive.kind.expected_mapped_len().is_none_or(|expected| {
+                        aligned_pmem_mapping_len(drive.expected_len) == Some(expected)
+                    })
+            });
+        let valid_serial = match (&serial, configured_selector) {
+            (None, None) => true,
+            (Some(serial), Some(_)) => {
+                serial.key.resource_class() == SnapshotRestoreResourceClass::SerialSink
+                    && serial.key.public_id().as_str()
+                        == bangbang_runtime::snapshot_restore::NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if !valid_drives
+            || !valid_serial
+            || resource_keys.len() != expected_count
+            || resource_keys.get(..storage_count) != Some(drive_keys.as_slice())
+            || resource_keys
+                .get(storage_count..)
+                .is_none_or(|keys| keys.len() != usize::from(serial.is_some()))
+        {
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::SerialPreflight,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            ));
+        }
+        let bindings = manifest.try_into_bindings().map_err(|source| {
+            SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::BindingAllocation,
+                SnapshotRestoreResourceErrorKind::BindingAllocation(source),
+            )
+        })?;
+        Ok(Self {
+            drives,
+            resource_keys,
+            serial,
+            bindings,
+            block_count: graph.map_or(0, |graph| graph.block_records().len()),
+            pmem_count: graph.map_or(0, |graph| graph.pmem_records().len()),
+        })
+    }
+
+    pub(crate) fn prepare(
+        self,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PreparedSnapshotSerialRestoreResources, SnapshotRestoreResourceError> {
+        let Self {
+            drives,
+            resource_keys,
+            serial,
+            mut bindings,
+            block_count,
+            pmem_count,
+        } = self;
+        if cancelled() {
+            return Err(cancelled_batch_error());
+        }
+
+        let (prepared, contained_transaction) = if resource_keys.is_empty() {
+            (Vec::new(), None)
+        } else {
+            match authority {
+                Some(authority) => prepare_contained_serial_restore_resources(
+                    &drives,
+                    serial.as_ref(),
+                    authority,
+                    &cancelled,
+                )?,
+                None => (
+                    prepare_direct_serial_restore_resources(&drives, serial.as_ref(), &cancelled)?,
+                    None,
+                ),
+            }
+        };
+        if cancelled() {
+            let outcome = abort_serial_restore_resources(prepared)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(cancelled_batch_error().with_abort_outcome(outcome));
+        }
+        if prepared.len() != resource_keys.len()
+            || prepared
+                .iter()
+                .zip(&resource_keys)
+                .any(|(owner, key)| owner.key() != key)
+        {
+            let outcome = abort_serial_restore_resources(prepared)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Binding,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+
+        let mut prepared = prepared.into_iter();
+        for key in &resource_keys {
+            let Some(owner) = prepared.next() else {
+                let outcome = abort_serial_restore_resource_iter(prepared)
+                    .merge(abort_serial_restore_bindings(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Binding,
+                    SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+                )
+                .with_abort_outcome(outcome));
+            };
+            if owner.key() != key {
+                let outcome = owner
+                    .abort()
+                    .merge(abort_serial_restore_resource_iter(prepared))
+                    .merge(abort_serial_restore_bindings(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Binding,
+                    SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+                )
+                .with_abort_outcome(outcome));
+            }
+            if let Err(rejection) = bindings.bind(key, owner) {
+                let reason = rejection.reason();
+                let outcome = rejection
+                    .into_value()
+                    .abort()
+                    .merge(abort_serial_restore_resource_iter(prepared))
+                    .merge(abort_serial_restore_bindings(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Binding,
+                    SnapshotRestoreResourceErrorKind::Binding(reason),
+                )
+                .with_abort_outcome(outcome));
+            }
+        }
+        if let Some(extra) = prepared.next() {
+            let outcome =
+                abort_serial_restore_resource_iter(std::iter::once(extra).chain(prepared))
+                    .merge(abort_serial_restore_bindings(bindings.into_values()))
+                    .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Binding,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        let bindings = match bindings.complete() {
+            Ok(bindings) => bindings,
+            Err(incomplete) => {
+                let missing_count = incomplete.missing_count();
+                let outcome =
+                    abort_serial_restore_bindings(incomplete.into_bindings().into_values())
+                        .merge(abort_contained_transaction(contained_transaction));
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::Completion,
+                    SnapshotRestoreResourceErrorKind::Incomplete { missing_count },
+                )
+                .with_abort_outcome(outcome));
+            }
+        };
+        let prepared = PreparedSnapshotSerialRestoreResources {
+            resource_keys,
+            bindings,
+            contained_transaction,
+            block_count,
+            pmem_count,
+            expects_serial: serial.is_some(),
+        };
+        if cancelled() {
+            let outcome = prepared.abort();
+            return Err(cancelled_batch_error().with_abort_outcome(outcome));
+        }
+        Ok(prepared)
+    }
+}
+
+impl fmt::Debug for RequestedSnapshotSerialRestoreResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestedSnapshotSerialRestoreResources")
+            .field("resource_count", &self.resource_keys.len())
+            .field("has_serial", &self.serial.is_some())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
 impl fmt::Debug for RequestedSnapshotStorageRestoreResources {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1351,6 +1778,15 @@ fn prepare_direct_drives(
     file_set_kind: SnapshotRestoreFileSetKind,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<PreparedSnapshotDriveRestoreResource>, SnapshotRestoreResourceError> {
+    let reservations = reserve_direct_drives(drives, file_set_kind, cancelled)?;
+    prepare_reserved_direct_drives(drives, reservations, file_set_kind, cancelled)
+}
+
+fn reserve_direct_drives(
+    drives: &[RequestedSnapshotDriveRestoreResource],
+    file_set_kind: SnapshotRestoreFileSetKind,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<ReservedDirectSnapshotDriveRestoreResource>, SnapshotRestoreResourceError> {
     for drive in drives {
         if cancelled() {
             return Err(cancelled_batch_error());
@@ -1469,7 +1905,15 @@ fn prepare_direct_drives(
             reservation,
         });
     }
+    Ok(reservations)
+}
 
+fn prepare_reserved_direct_drives(
+    drives: &[RequestedSnapshotDriveRestoreResource],
+    reservations: Vec<ReservedDirectSnapshotDriveRestoreResource>,
+    file_set_kind: SnapshotRestoreFileSetKind,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<PreparedSnapshotDriveRestoreResource>, SnapshotRestoreResourceError> {
     if cancelled() {
         return Err(cancelled_batch_error());
     }
@@ -1722,6 +2166,287 @@ fn prepare_contained_drives(
     Ok(prepared)
 }
 
+fn prepare_direct_serial_restore_resources(
+    drives: &[RequestedSnapshotDriveRestoreResource],
+    serial: Option<&RequestedSnapshotSerialSinkRestoreResource>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<PreparedSnapshotSerialRestoreResource>, SnapshotRestoreResourceError> {
+    if let Some(serial) = serial
+        && (serial.key.resource_class() != SnapshotRestoreResourceClass::SerialSink
+            || grant_reference_id(&serial.selector)
+                .map_err(|_| {
+                    SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::SerialPreflight,
+                        SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+                    )
+                })?
+                .is_some())
+    {
+        return Err(SnapshotRestoreResourceError::retryable(
+            SnapshotRestoreResourceStage::SerialPreflight,
+            SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+        ));
+    }
+    let resource_count = drives
+        .len()
+        .checked_add(usize::from(serial.is_some()))
+        .ok_or_else(|| {
+            SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::SerialPreflight,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+        })?;
+    let mut owners = Vec::new();
+    owners
+        .try_reserve_exact(resource_count)
+        .map_err(manifest_allocation_error)?;
+    let reservations =
+        reserve_direct_drives(drives, SnapshotRestoreFileSetKind::Storage, cancelled)?;
+    let mut identities = HashSet::new();
+    identities.try_reserve(resource_count).map_err(|_| {
+        SnapshotRestoreResourceError::retryable(
+            SnapshotRestoreResourceStage::SerialPreflight,
+            SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+        )
+    })?;
+    for reservation in &reservations {
+        if !identities.insert(reservation.identity()) {
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::SerialPreflight,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            ));
+        }
+    }
+    let serial_reservation = match serial {
+        Some(serial) => {
+            let reservation =
+                SnapshotSerialOutputReservation::open(&serial.selector).map_err(|source| {
+                    SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::SerialPreparation,
+                        SnapshotRestoreResourceErrorKind::SerialOutput(source),
+                    )
+                })?;
+            let identity = reservation.identity();
+            if !identities.insert((identity.device(), identity.inode())) {
+                return Err(SnapshotRestoreResourceError::retryable(
+                    SnapshotRestoreResourceStage::SerialPreflight,
+                    SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+                ));
+            }
+            Some(reservation)
+        }
+        None => None,
+    };
+    if cancelled() {
+        return Err(cancelled_batch_error());
+    }
+    let prepared_drives = prepare_reserved_direct_drives(
+        drives,
+        reservations,
+        SnapshotRestoreFileSetKind::Storage,
+        cancelled,
+    )?;
+    owners.extend(
+        prepared_drives
+            .into_iter()
+            .map(PreparedSnapshotSerialRestoreResource::Storage),
+    );
+    if cancelled() {
+        let outcome = abort_serial_restore_resources(owners);
+        return Err(cancelled_batch_error().with_abort_outcome(outcome));
+    }
+    match (serial, serial_reservation) {
+        (Some(request), Some(reservation)) => {
+            let (output, identity) = reservation.into_output().map_err(|source| {
+                SnapshotRestoreResourceError::retryable(
+                    SnapshotRestoreResourceStage::SerialPreparation,
+                    SnapshotRestoreResourceErrorKind::SerialOutput(source),
+                )
+                .with_abort_outcome(abort_serial_restore_resources(std::mem::take(&mut owners)))
+            })?;
+            if !identities.contains(&(identity.device(), identity.inode())) {
+                drop(output);
+                return Err(SnapshotRestoreResourceError::terminal(
+                    SnapshotRestoreResourceStage::SerialPreparation,
+                    SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+                )
+                .with_abort_outcome(abort_serial_restore_resources(owners)));
+            }
+            owners.push(PreparedSnapshotSerialRestoreResource::Serial(
+                PreparedSnapshotSerialSinkRestoreResource {
+                    key: request.key.clone(),
+                    output,
+                    claim: None,
+                },
+            ));
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::SerialPreparation,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(abort_serial_restore_resources(owners)));
+        }
+    }
+    Ok(owners)
+}
+
+fn prepare_contained_serial_restore_resources(
+    drives: &[RequestedSnapshotDriveRestoreResource],
+    serial: Option<&RequestedSnapshotSerialSinkRestoreResource>,
+    authority: &ContainedSnapshotRestoreAuthority,
+    cancelled: &impl Fn() -> bool,
+) -> Result<
+    (
+        Vec<PreparedSnapshotSerialRestoreResource>,
+        Option<ContainedSnapshotRestoreTransaction>,
+    ),
+    SnapshotRestoreResourceError,
+> {
+    let resource_count = drives
+        .len()
+        .checked_add(usize::from(serial.is_some()))
+        .ok_or_else(|| {
+            SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::SerialPreflight,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+        })?;
+    let mut requests = Vec::new();
+    let mut owners = Vec::new();
+    requests
+        .try_reserve_exact(resource_count)
+        .map_err(manifest_allocation_error)?;
+    owners
+        .try_reserve_exact(resource_count)
+        .map_err(manifest_allocation_error)?;
+    for drive in drives {
+        requests.push(ContainedSnapshotRestoreFileRequest::new(
+            &drive.selector,
+            drive.kind.grant_role(),
+            if drive.is_read_only {
+                GrantAccess::ReadOnly
+            } else {
+                GrantAccess::ReadWrite
+            },
+            Some(drive.expected_len),
+        ));
+    }
+    if let Some(serial) = serial {
+        requests.push(ContainedSnapshotRestoreFileRequest::new(
+            &serial.selector,
+            ResourceRole::SerialSink,
+            GrantAccess::WriteOnly,
+            None,
+        ));
+    }
+    let reserved = authority
+        .prepare_files(&requests, None, cancelled)
+        .map_err(snapshot_contained_error)?;
+    let (mut claims, vsock, transaction) = reserved
+        .into_file_parts()
+        .map_err(snapshot_contained_error)?;
+    let valid_claims = vsock.is_none()
+        && claims.len() == resource_count
+        && claims
+            .iter()
+            .zip(drives)
+            .all(|(claim, drive)| claim.role() == drive.kind.grant_role())
+        && match serial {
+            Some(_) => claims
+                .last()
+                .is_some_and(|claim| claim.role() == ResourceRole::SerialSink),
+            None => true,
+        };
+    if !valid_claims {
+        let outcome = abort_contained_vsock_facets(vsock)
+            .merge(abort_prepared_drive_claims(claims))
+            .merge(abort_contained_transaction(Some(transaction)));
+        return Err(SnapshotRestoreResourceError::terminal(
+            SnapshotRestoreResourceStage::SerialPreflight,
+            SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+        )
+        .with_abort_outcome(outcome));
+    }
+    let serial_claim = if serial.is_some() { claims.pop() } else { None };
+    let prepared_drives = match prepare_contained_drives(
+        drives,
+        claims,
+        SnapshotRestoreFileSetKind::Storage,
+        cancelled,
+    ) {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            let (source, resources, claims) = *failure;
+            let outcome = abort_optional_snapshot_file_claim(serial_claim)
+                .merge(abort_prepared_drive_claims(claims))
+                .merge(abort_prepared_drive_resources(resources))
+                .merge(abort_contained_transaction(Some(transaction)));
+            return Err(source.with_abort_outcome(outcome));
+        }
+    };
+    owners.extend(
+        prepared_drives
+            .into_iter()
+            .map(PreparedSnapshotSerialRestoreResource::Storage),
+    );
+    if cancelled() {
+        let outcome = abort_optional_snapshot_file_claim(serial_claim)
+            .merge(abort_serial_restore_resources(owners))
+            .merge(abort_contained_transaction(Some(transaction)));
+        return Err(cancelled_batch_error().with_abort_outcome(outcome));
+    }
+    match (serial, serial_claim) {
+        (Some(request), Some(mut claim)) => {
+            let file = match claim.take_snapshot_serial_sink_for_reference(&request.selector) {
+                Ok(file) => file,
+                Err(_) => {
+                    let outcome = abort_optional_snapshot_file_claim(Some(claim))
+                        .merge(abort_serial_restore_resources(owners))
+                        .merge(abort_contained_transaction(Some(transaction)));
+                    return Err(SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::SerialPreparation,
+                        SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+                    )
+                    .with_abort_outcome(outcome));
+                }
+            };
+            let output = match SerialOutputFile::from_file(file) {
+                Ok(output) => output,
+                Err(_) => {
+                    let outcome = abort_optional_snapshot_file_claim(Some(claim))
+                        .merge(abort_serial_restore_resources(owners))
+                        .merge(abort_contained_transaction(Some(transaction)));
+                    return Err(SnapshotRestoreResourceError::retryable(
+                        SnapshotRestoreResourceStage::SerialPreparation,
+                        SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+                    )
+                    .with_abort_outcome(outcome));
+                }
+            };
+            owners.push(PreparedSnapshotSerialRestoreResource::Serial(
+                PreparedSnapshotSerialSinkRestoreResource {
+                    key: request.key.clone(),
+                    output,
+                    claim: Some(claim),
+                },
+            ));
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            let outcome = abort_serial_restore_resources(owners)
+                .merge(abort_contained_transaction(Some(transaction)));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::SerialPreparation,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+    }
+    Ok((owners, Some(transaction)))
+}
+
 fn snapshot_drive_observation_matches(
     drive: &RequestedSnapshotDriveRestoreResource,
     backing: &BlockFileBacking,
@@ -1806,6 +2531,43 @@ fn abort_drive_bindings(
         outcome = outcome.merge(resource.abort());
     }
     outcome
+}
+
+fn abort_optional_snapshot_file_claim(
+    claim: Option<PreparedSnapshotFileClaim>,
+) -> SnapshotRestoreAbortOutcome {
+    match claim {
+        Some(claim) => {
+            if claim.abort().is_err() {
+                SnapshotRestoreAbortOutcome::terminal(true)
+            } else {
+                SnapshotRestoreAbortOutcome::retryable()
+            }
+        }
+        None => SnapshotRestoreAbortOutcome::retryable(),
+    }
+}
+
+fn abort_serial_restore_resources(
+    resources: Vec<PreparedSnapshotSerialRestoreResource>,
+) -> SnapshotRestoreAbortOutcome {
+    abort_serial_restore_resource_iter(resources.into_iter())
+}
+
+fn abort_serial_restore_resource_iter(
+    resources: impl DoubleEndedIterator<Item = PreparedSnapshotSerialRestoreResource>,
+) -> SnapshotRestoreAbortOutcome {
+    let mut outcome = SnapshotRestoreAbortOutcome::retryable();
+    for resource in resources.rev() {
+        outcome = outcome.merge(resource.abort());
+    }
+    outcome
+}
+
+fn abort_serial_restore_bindings(
+    resources: impl DoubleEndedIterator<Item = PreparedSnapshotSerialRestoreResource>,
+) -> SnapshotRestoreAbortOutcome {
+    abort_serial_restore_resource_iter(resources)
 }
 
 pub(crate) struct PreparedSnapshotMultiDriveRestoreResources {
@@ -2132,6 +2894,222 @@ impl fmt::Debug for PreparedSnapshotStorageRestoreResources {
     }
 }
 
+pub(crate) struct PreparedSnapshotSerialRestoreResources {
+    resource_keys: Vec<SnapshotRestoreResourceKey>,
+    bindings: PreparedSnapshotRestoreBindings<PreparedSnapshotSerialRestoreResource>,
+    contained_transaction: Option<ContainedSnapshotRestoreTransaction>,
+    block_count: usize,
+    pmem_count: usize,
+    expects_serial: bool,
+}
+
+impl PreparedSnapshotSerialRestoreResources {
+    pub(crate) fn into_serial_batch(
+        mut self,
+    ) -> Result<PreparedSnapshotSerialRestoreBatch, SnapshotRestoreResourceError> {
+        let expected_count = self
+            .block_count
+            .checked_add(self.pmem_count)
+            .and_then(|count| count.checked_add(usize::from(self.expects_serial)));
+        if expected_count != Some(self.resource_keys.len()) {
+            let outcome = self.abort();
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Take,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        let mut owners = Vec::new();
+        if owners.try_reserve_exact(self.resource_keys.len()).is_err() {
+            let outcome = self.abort();
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::Take,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        for key in &self.resource_keys {
+            match self.bindings.take(key) {
+                Ok(owner) if owner.key() == key => owners.push(owner),
+                Ok(owner) => {
+                    owners.push(owner);
+                    let outcome = self.abort_with_taken(owners);
+                    return Err(SnapshotRestoreResourceError::terminal(
+                        SnapshotRestoreResourceStage::Take,
+                        SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+                    )
+                    .with_abort_outcome(outcome));
+                }
+                Err(source) => {
+                    let outcome = self.abort_with_taken(owners);
+                    return Err(SnapshotRestoreResourceError::terminal(
+                        SnapshotRestoreResourceStage::Take,
+                        SnapshotRestoreResourceErrorKind::Take(source),
+                    )
+                    .with_abort_outcome(outcome));
+                }
+            }
+        }
+        let Self {
+            resource_keys: _,
+            bindings,
+            contained_transaction,
+            block_count,
+            pmem_count,
+            expects_serial,
+        } = self;
+        if let Err(unconsumed) = bindings.finish() {
+            let unconsumed_count = unconsumed.unconsumed_count();
+            let outcome = abort_serial_restore_bindings(unconsumed.into_bindings().into_values())
+                .merge(abort_serial_restore_resources(owners))
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::Unconsumed { unconsumed_count },
+            )
+            .with_abort_outcome(outcome));
+        }
+        let valid_order = owners.iter().enumerate().all(|(index, owner)| {
+            if index < block_count {
+                matches!(
+                    owner,
+                    PreparedSnapshotSerialRestoreResource::Storage(
+                        PreparedSnapshotDriveRestoreResource {
+                            key,
+                            backing: PreparedSnapshotFileBacking::Block(_),
+                            ..
+                        }
+                    ) if key.resource_class() == SnapshotRestoreResourceClass::BlockBacking
+                )
+            } else if index < block_count.saturating_add(pmem_count) {
+                matches!(
+                    owner,
+                    PreparedSnapshotSerialRestoreResource::Storage(
+                        PreparedSnapshotDriveRestoreResource {
+                            key,
+                            backing: PreparedSnapshotFileBacking::Pmem(_),
+                            ..
+                        }
+                    ) if key.resource_class() == SnapshotRestoreResourceClass::PmemBacking
+                )
+            } else {
+                expects_serial
+                    && matches!(
+                        owner,
+                        PreparedSnapshotSerialRestoreResource::Serial(resource)
+                            if resource.key.resource_class()
+                                == SnapshotRestoreResourceClass::SerialSink
+                    )
+            }
+        });
+        if !valid_order {
+            let outcome = abort_serial_restore_resources(owners)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        let mut blocks = Vec::new();
+        let mut pmems = Vec::new();
+        let mut claims = Vec::new();
+        if blocks.try_reserve_exact(block_count).is_err()
+            || pmems.try_reserve_exact(pmem_count).is_err()
+            || claims.try_reserve_exact(owners.len()).is_err()
+        {
+            let outcome = abort_serial_restore_resources(owners)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::retryable(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        let mut serial = None;
+        for owner in owners {
+            match owner {
+                PreparedSnapshotSerialRestoreResource::Storage(
+                    PreparedSnapshotDriveRestoreResource {
+                        key,
+                        backing,
+                        claim,
+                    },
+                ) => {
+                    match backing {
+                        PreparedSnapshotFileBacking::Block(backing) => {
+                            blocks.push(PreparedSnapshotBlockRestoreBacking { key, backing });
+                        }
+                        PreparedSnapshotFileBacking::Pmem(backing) => {
+                            pmems.push(PreparedSnapshotPmemRestoreBacking { key, backing });
+                        }
+                    }
+                    if let Some(claim) = claim {
+                        claims.push(claim);
+                    }
+                }
+                PreparedSnapshotSerialRestoreResource::Serial(
+                    PreparedSnapshotSerialSinkRestoreResource { key, output, claim },
+                ) => {
+                    serial = Some(PreparedSnapshotSerialRestoreOutput { key, output });
+                    if let Some(claim) = claim {
+                        claims.push(claim);
+                    }
+                }
+            }
+        }
+        if blocks.len() != block_count
+            || pmems.len() != pmem_count
+            || serial.is_some() != expects_serial
+        {
+            drop(blocks);
+            drop(pmems);
+            drop(serial);
+            let outcome = abort_prepared_drive_claims(claims)
+                .merge(abort_contained_transaction(contained_transaction));
+            return Err(SnapshotRestoreResourceError::terminal(
+                SnapshotRestoreResourceStage::Finish,
+                SnapshotRestoreResourceErrorKind::InvalidSerialSet,
+            )
+            .with_abort_outcome(outcome));
+        }
+        Ok(PreparedSnapshotSerialRestoreBatch {
+            blocks,
+            pmems,
+            serial,
+            completion: PreparedSnapshotDriveRestoreCompletion {
+                claims,
+                contained_transaction,
+            },
+        })
+    }
+
+    fn abort(self) -> SnapshotRestoreAbortOutcome {
+        abort_serial_restore_bindings(self.bindings.into_values())
+            .merge(abort_contained_transaction(self.contained_transaction))
+    }
+
+    fn abort_with_taken(
+        self,
+        taken: Vec<PreparedSnapshotSerialRestoreResource>,
+    ) -> SnapshotRestoreAbortOutcome {
+        abort_serial_restore_bindings(self.bindings.into_values())
+            .merge(abort_serial_restore_resources(taken))
+            .merge(abort_contained_transaction(self.contained_transaction))
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotSerialRestoreResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotSerialRestoreResources")
+            .field("resource_count", &self.resource_keys.len())
+            .field("remaining_count", &self.bindings.remaining_count())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
 pub(crate) struct PreparedSnapshotBlockRestoreBacking {
     key: SnapshotRestoreResourceKey,
     backing: BlockFileBacking,
@@ -2204,6 +3182,61 @@ impl fmt::Debug for PreparedSnapshotStorageRestoreBatch {
     }
 }
 
+/// Prepared configured serial output correlated to its exact manifest key.
+pub(crate) struct PreparedSnapshotSerialRestoreOutput {
+    key: SnapshotRestoreResourceKey,
+    output: SerialOutputFile,
+}
+
+impl PreparedSnapshotSerialRestoreOutput {
+    pub(crate) fn into_parts(self) -> (SnapshotRestoreResourceKey, SerialOutputFile) {
+        (self.key, self.output)
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotSerialRestoreOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotSerialRestoreOutput")
+            .field("key", &self.key)
+            .field("output", &"<owned>")
+            .finish()
+    }
+}
+
+/// Exact graph-ordered storage and optional serial output owners.
+pub(crate) struct PreparedSnapshotSerialRestoreBatch {
+    blocks: Vec<PreparedSnapshotBlockRestoreBacking>,
+    pmems: Vec<PreparedSnapshotPmemRestoreBacking>,
+    serial: Option<PreparedSnapshotSerialRestoreOutput>,
+    completion: PreparedSnapshotDriveRestoreCompletion,
+}
+
+impl PreparedSnapshotSerialRestoreBatch {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<PreparedSnapshotBlockRestoreBacking>,
+        Vec<PreparedSnapshotPmemRestoreBacking>,
+        Option<PreparedSnapshotSerialRestoreOutput>,
+        PreparedSnapshotDriveRestoreCompletion,
+    ) {
+        (self.blocks, self.pmems, self.serial, self.completion)
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotSerialRestoreBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotSerialRestoreBatch")
+            .field("block_count", &self.blocks.len())
+            .field("pmem_count", &self.pmems.len())
+            .field("has_serial", &self.serial.is_some())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Exact graph-ordered block resources ready for pathless device construction.
 pub(crate) struct PreparedSnapshotRestoreDriveBatch {
     drive_configs: DriveConfigs,
@@ -2234,7 +3267,7 @@ impl fmt::Debug for PreparedSnapshotRestoreDriveBatch {
 }
 
 pub(crate) struct PreparedSnapshotDriveRestoreCompletion {
-    claims: Vec<PreparedDriveBackingClaim>,
+    claims: Vec<PreparedSnapshotFileClaim>,
     contained_transaction: Option<ContainedSnapshotRestoreTransaction>,
 }
 
@@ -3470,6 +4503,28 @@ impl RequestedSnapshotRestoreResources {
             .into_storage_batch()
     }
 
+    /// Typed exact-2.7 resource producer retained for the next pathless serial
+    /// construction slice.
+    pub(crate) fn prepare_native_v2_serial_state<F>(
+        graph: Option<&SnapshotV2StorageDeviceGraph>,
+        serial: &SnapshotV2SerialState,
+        authority: Option<&ContainedSnapshotRestoreAuthority>,
+        cancelled: F,
+    ) -> Result<PreparedSnapshotSerialRestoreBatch, SnapshotRestoreResourceError>
+    where
+        F: Fn() -> bool,
+    {
+        let _batch_parts = PreparedSnapshotSerialRestoreBatch::into_parts;
+        let _serial_parts = PreparedSnapshotSerialRestoreOutput::into_parts;
+        let _block_parts = PreparedSnapshotBlockRestoreBacking::into_parts;
+        let _pmem_parts = PreparedSnapshotPmemRestoreBacking::into_parts;
+        let _commit = PreparedSnapshotDriveRestoreCompletion::commit;
+        let _abort = PreparedSnapshotDriveRestoreCompletion::abort;
+        RequestedSnapshotSerialRestoreResources::try_from_native_v2_serial_state(graph, serial)?
+            .prepare(authority, cancelled)?
+            .into_serial_batch()
+    }
+
     pub(crate) fn try_from_native_v2_device_graph(
         graph: &SnapshotV2DeviceGraph,
     ) -> Result<Self, SnapshotRestoreResourceError> {
@@ -3481,6 +4536,7 @@ impl RequestedSnapshotRestoreResources {
         let _profile_3_producer = Self::prepare_native_v2_storage_device_graph::<fn() -> bool>;
         let _profile_3_bundle_producer =
             Self::prepare_native_v2_storage_restore_bundle::<fn() -> bool>;
+        let _profile_4_producer = Self::prepare_native_v2_serial_state::<fn() -> bool>;
         Self::try_from_native_v2_device_graph_and_vsock(graph, None)
     }
 
@@ -4318,6 +5374,7 @@ mod tests {
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
+    use bangbang_runtime::serial::SerialOutput;
     use bangbang_runtime::snapshot::SnapshotVsockOverride;
     use bangbang_runtime::snapshot_device_v2::{
         NATIVE_V2_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2DeviceTransportKind,
@@ -4330,6 +5387,9 @@ mod tests {
     };
     use bangbang_runtime::snapshot_restore::{
         SnapshotRestoreBindingRejectionReason, SnapshotRestorePublicId,
+    };
+    use bangbang_runtime::snapshot_serial_v2_7::{
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialEndpointIntent,
     };
     use bangbang_runtime::virtio_mmio::VirtioMmioRegisterHandler;
     use bangbang_runtime::vsock::{
@@ -4523,6 +5583,59 @@ mod tests {
         )
     }
 
+    fn serial_fixture_state(selector: Option<&Path>) -> SnapshotV2SerialState {
+        let fixture =
+            include_str!("../../runtime/src/snapshot_serial_v2_7/fixtures/configured.hex");
+        let bytes = fixture
+            .trim()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
+                u8::from_str_radix(pair, 16).expect("fixture hex should decode")
+            })
+            .collect::<Vec<_>>();
+        let decoded =
+            SnapshotV2SerialState::decode(NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, &bytes)
+                .expect("serial fixture should decode");
+        let (_, rate_limiter, device) = decoded.into_parts();
+        let endpoint = match selector {
+            Some(selector) => SnapshotV2SerialEndpointIntent::try_configured_output(
+                selector
+                    .to_str()
+                    .expect("test serial selector should be UTF-8"),
+            )
+            .expect("configured test selector should validate"),
+            None => SnapshotV2SerialEndpointIntent::default_process_stdio(),
+        };
+        SnapshotV2SerialState::try_new(endpoint, rate_limiter, device)
+            .expect("serial fixture state should validate")
+    }
+
+    fn contained_serial_request(
+        graph: Option<&SnapshotV2StorageDeviceGraph>,
+        serial: &SnapshotV2SerialState,
+        storage_references: Option<(&Path, &Path)>,
+        serial_reference: Option<&Path>,
+    ) -> RequestedSnapshotSerialRestoreResources {
+        let mut request =
+            RequestedSnapshotSerialRestoreResources::try_from_native_v2_serial_state(graph, serial)
+                .expect("serial restore request should derive");
+        if let Some((block, pmem)) = storage_references {
+            assert_eq!(request.drives.len(), 2);
+            request.drives[0].selector = block.to_path_buf();
+            request.drives[1].selector = pmem.to_path_buf();
+        }
+        if let Some(serial_reference) = serial_reference {
+            request
+                .serial
+                .as_mut()
+                .expect("configured serial request should exist")
+                .selector = serial_reference.to_path_buf();
+        }
+        request
+    }
+
     fn contained_storage_request(
         graph: &SnapshotV2StorageDeviceGraph,
         block_reference: &Path,
@@ -4567,6 +5680,16 @@ mod tests {
                 .prepare_file_claim(pmem_reference, ResourceRole::PmemBacking, pmem_access)
                 .expect("pmem grant inspection should succeed")
                 .expect("pmem reference should remain contained"),
+        );
+    }
+
+    fn assert_serial_grant_reusable(fixture: &TestContainedRestoreAuthority, reference: &Path) {
+        drop(
+            fixture
+                .grants()
+                .prepare_file_claim(reference, ResourceRole::SerialSink, GrantAccess::WriteOnly)
+                .expect("serial grant inspection should succeed")
+                .expect("serial reference should remain contained"),
         );
     }
 
@@ -5308,6 +6431,397 @@ mod tests {
         completion
             .commit()
             .expect("mixed pmem-root direct completion should commit");
+    }
+
+    #[test]
+    fn exact_2_7_default_serial_is_resource_free_and_direct_configured_output_is_pinned() {
+        let root = TempRoot::new("serial-resource-free-root", b"root");
+        let fixture = contained_restore_authority_for_test(root.path(), false);
+        fixture.invalidate_generation();
+        let default = serial_fixture_state(None);
+        let batch = RequestedSnapshotRestoreResources::prepare_native_v2_serial_state(
+            None,
+            &default,
+            Some(fixture.authority()),
+            || false,
+        )
+        .expect("resource-free default serial should not touch contained authority");
+        let (blocks, pmems, serial, completion) = batch.into_parts();
+        assert!(blocks.is_empty());
+        assert!(pmems.is_empty());
+        assert!(serial.is_none());
+        completion
+            .commit()
+            .expect("resource-free completion should commit");
+
+        let sink = TempRoot::new("serial-direct-output", b"seed");
+        let configured = serial_fixture_state(Some(sink.path()));
+        let batch = RequestedSnapshotRestoreResources::prepare_native_v2_serial_state(
+            None,
+            &configured,
+            None,
+            || false,
+        )
+        .expect("direct configured serial should prepare");
+        let diagnostic = format!("{batch:?}");
+        assert!(!diagnostic.contains(sink.path().to_string_lossy().as_ref()));
+        let (blocks, pmems, serial, completion) = batch.into_parts();
+        assert!(blocks.is_empty());
+        assert!(pmems.is_empty());
+        let (key, mut output) = serial.expect("configured output should exist").into_parts();
+        assert_eq!(
+            key.resource_class(),
+            SnapshotRestoreResourceClass::SerialSink
+        );
+        assert_eq!(key.device_key().kind(), 3);
+        assert_eq!(key.device_key().instance(), 0);
+        output
+            .write_byte(b'!')
+            .expect("prepared direct output should write");
+        drop(output);
+        assert_eq!(
+            fs::read(sink.path()).expect("serial sink should read"),
+            b"seed!"
+        );
+        completion
+            .commit()
+            .expect("direct serial completion should commit");
+    }
+
+    #[test]
+    fn exact_2_7_contained_serial_claim_aborts_and_rebinds_as_one_generation() {
+        let sink = TempRoot::new("serial-contained-output", b"seed");
+        let reference = PathBuf::from("bangbang-grant:serial0");
+        let configured = serial_fixture_state(Some(&reference));
+        let fixture = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[(
+                "serial0",
+                ResourceRole::SerialSink,
+                GrantAccess::WriteOnly,
+                sink.path(),
+            )]),
+            false,
+        );
+
+        let batch = contained_serial_request(None, &configured, None, Some(&reference))
+            .prepare(Some(fixture.authority()), || false)
+            .expect("contained serial should prepare")
+            .into_serial_batch()
+            .expect("contained serial batch should consume exactly");
+        let (blocks, pmems, serial, completion) = batch.into_parts();
+        assert!(blocks.is_empty());
+        assert!(pmems.is_empty());
+        let (_, mut output) = serial
+            .expect("contained serial owner should exist")
+            .into_parts();
+        output
+            .write_byte(b'a')
+            .expect("contained serial output should write");
+        drop(output);
+        completion
+            .abort()
+            .expect("contained serial abort should restore claim and generation");
+
+        let rebound = contained_serial_request(None, &configured, None, Some(&reference))
+            .prepare(Some(fixture.authority()), || false)
+            .expect("aborted serial claim should rebind")
+            .into_serial_batch()
+            .expect("rebound serial batch should consume exactly");
+        let (_, _, serial, completion) = rebound.into_parts();
+        drop(serial);
+        completion
+            .commit()
+            .expect("rebound serial completion should commit");
+        assert_eq!(
+            fs::read(sink.path()).expect("contained serial sink should read"),
+            b"seeda"
+        );
+    }
+
+    #[test]
+    fn exact_2_7_mixed_contained_storage_and_serial_share_one_rollback() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let block =
+            TempRoot::new_sized_at(block_path, graph.block_records()[0].block().backing_bytes());
+        let pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+        let sink = TempRoot::new("serial-mixed-output", b"");
+        let block_reference = PathBuf::from("bangbang-grant:block0");
+        let pmem_reference = PathBuf::from("bangbang-grant:pmem0");
+        let serial_reference = PathBuf::from("bangbang-grant:serial0");
+        let configured = serial_fixture_state(Some(&serial_reference));
+        let block_access = grant_access(graph.block_records()[0].config().is_read_only());
+        let pmem_access = grant_access(graph.pmem_records()[0].config().is_read_only());
+        let fixture = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[
+                (
+                    "block0",
+                    ResourceRole::DriveBacking,
+                    block_access,
+                    block.path(),
+                ),
+                ("pmem0", ResourceRole::PmemBacking, pmem_access, pmem.path()),
+                (
+                    "serial0",
+                    ResourceRole::SerialSink,
+                    GrantAccess::WriteOnly,
+                    sink.path(),
+                ),
+            ]),
+            false,
+        );
+        let batch = contained_serial_request(
+            Some(&graph),
+            &configured,
+            Some((&block_reference, &pmem_reference)),
+            Some(&serial_reference),
+        )
+        .prepare(Some(fixture.authority()), || false)
+        .expect("mixed contained exact-2.7 resources should prepare")
+        .into_serial_batch()
+        .expect("mixed contained exact-2.7 batch should consume exactly");
+        let (blocks, pmems, serial, completion) = batch.into_parts();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(pmems.len(), 1);
+        assert_eq!(
+            serial
+                .as_ref()
+                .expect("serial owner should exist")
+                .key
+                .resource_class(),
+            SnapshotRestoreResourceClass::SerialSink
+        );
+        drop(blocks);
+        drop(pmems);
+        drop(serial);
+        completion
+            .abort()
+            .expect("mixed contained exact-2.7 completion should rollback");
+        assert_storage_grants_reusable(
+            &fixture,
+            &block_reference,
+            block_access,
+            &pmem_reference,
+            pmem_access,
+        );
+        assert_serial_grant_reusable(&fixture, &serial_reference);
+    }
+
+    #[test]
+    fn exact_2_7_serial_preflight_rejects_aliases_authority_crossing_and_cancellation() {
+        let block_path = unique_short_path();
+        let pmem_path = unique_pmem_short_path();
+        let serial_path = unique_path("serial-alias");
+        let graph = storage_fixture_graph(&block_path, &pmem_path);
+        let block = TempRoot::new_sized_at(
+            block_path.clone(),
+            graph.block_records()[0].block().backing_bytes(),
+        );
+        let _pmem = TempRoot::new_sized_at(pmem_path, graph.pmem_records()[0].pmem().file_bytes());
+        fs::hard_link(block.path(), &serial_path).expect("serial alias should create");
+        let _serial_alias = TempRoot {
+            path: serial_path.clone(),
+        };
+        let configured_alias = serial_fixture_state(Some(&serial_path));
+        let alias_error = RequestedSnapshotRestoreResources::prepare_native_v2_serial_state(
+            Some(&graph),
+            &configured_alias,
+            None,
+            || false,
+        )
+        .expect_err("serial and storage descriptor aliases must reject");
+        assert_eq!(
+            alias_error.stage,
+            SnapshotRestoreResourceStage::SerialPreflight
+        );
+        assert_eq!(
+            alias_error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+
+        let direct_reference = PathBuf::from("bangbang-grant:serial0");
+        let configured_reference = serial_fixture_state(Some(&direct_reference));
+        let direct_error = RequestedSnapshotRestoreResources::prepare_native_v2_serial_state(
+            None,
+            &configured_reference,
+            None,
+            || false,
+        )
+        .expect_err("direct serial must reject grant syntax without path fallback");
+        assert_eq!(
+            direct_error.stage,
+            SnapshotRestoreResourceStage::SerialPreflight
+        );
+
+        let sink = TempRoot::new("serial-no-path-fallback", b"");
+        let ambient = unique_path("ambient-serial-path");
+        let configured_ambient = serial_fixture_state(Some(&ambient));
+        let fixture = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[(
+                "serial0",
+                ResourceRole::SerialSink,
+                GrantAccess::WriteOnly,
+                sink.path(),
+            )]),
+            false,
+        );
+        let contained_error = RequestedSnapshotRestoreResources::prepare_native_v2_serial_state(
+            None,
+            &configured_ambient,
+            Some(fixture.authority()),
+            || false,
+        )
+        .expect_err("contained serial must reject ambient paths without fallback");
+        assert_eq!(
+            contained_error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert!(!ambient.exists());
+        assert_serial_grant_reusable(&fixture, &direct_reference);
+
+        let cancellation_calls = Cell::new(0_u8);
+        let cancellation_error =
+            contained_serial_request(None, &configured_reference, None, Some(&direct_reference))
+                .prepare(Some(fixture.authority()), || {
+                    let next = cancellation_calls.get().saturating_add(1);
+                    cancellation_calls.set(next);
+                    next >= 4
+                })
+                .expect_err("post-inspection serial cancellation should rollback");
+        assert_eq!(
+            cancellation_error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+        assert_eq!(
+            cancellation_error.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert_serial_grant_reusable(&fixture, &direct_reference);
+        let diagnostics =
+            format!("{alias_error:?} {direct_error:?} {contained_error:?} {cancellation_error:?}");
+        for private in [&serial_path, &direct_reference, &ambient, sink.path()] {
+            assert!(!diagnostics.contains(private.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[test]
+    fn exact_2_7_contained_serial_rejects_missing_wrong_and_consumed_claims() {
+        let sink = TempRoot::new("serial-exact-claims", b"");
+        let reference = PathBuf::from("bangbang-grant:serial0");
+        let configured = serial_fixture_state(Some(&reference));
+
+        let missing = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[]),
+            false,
+        );
+        let missing_error = contained_serial_request(None, &configured, None, Some(&reference))
+            .prepare(Some(missing.authority()), || false)
+            .expect_err("missing serial grant should reject");
+        assert_eq!(
+            missing_error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+
+        let wrong = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[(
+                "serial0",
+                ResourceRole::PmemBacking,
+                GrantAccess::ReadWrite,
+                sink.path(),
+            )]),
+            false,
+        );
+        let wrong_error = contained_serial_request(None, &configured, None, Some(&reference))
+            .prepare(Some(wrong.authority()), || false)
+            .expect_err("wrong serial role and access should reject");
+        assert_eq!(
+            wrong_error.stage,
+            SnapshotRestoreResourceStage::ContainedReservation
+        );
+
+        let exact = contained_restore_authority_with_grants_for_test(
+            snapshot_storage_grant_authority_for_test(&[(
+                "serial0",
+                ResourceRole::SerialSink,
+                GrantAccess::WriteOnly,
+                sink.path(),
+            )]),
+            false,
+        );
+        let mut prepared = contained_serial_request(None, &configured, None, Some(&reference))
+            .prepare(Some(exact.authority()), || false)
+            .expect("exact serial claim should prepare");
+        let key = prepared.resource_keys[0].clone();
+        let consumed = prepared
+            .bindings
+            .take(&key)
+            .expect("serial owner should be consumable once");
+        let consumed_error = prepared
+            .into_serial_batch()
+            .expect_err("already consumed serial owner should reject");
+        assert_eq!(consumed_error.stage, SnapshotRestoreResourceStage::Take);
+        assert_eq!(
+            consumed_error.disposition,
+            SnapshotRestoreResourceDisposition::Terminal
+        );
+        let outcome = consumed.abort();
+        assert_eq!(
+            outcome.disposition,
+            SnapshotRestoreResourceDisposition::Retryable
+        );
+        assert_serial_grant_reusable(&exact, &reference);
+
+        let diagnostics = format!("{missing_error:?} {wrong_error:?} {consumed_error:?}");
+        assert!(!diagnostics.contains(reference.to_string_lossy().as_ref()));
+        assert!(!diagnostics.contains(sink.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn exact_2_7_serial_worker_and_launcher_death_are_terminal_and_redacted() {
+        for (name, invalidate_grants) in [("worker", true), ("launcher", false)] {
+            let sink = TempRoot::new(&format!("serial-{name}-death"), b"");
+            let reference = PathBuf::from(format!("bangbang-grant:serial-{name}"));
+            let configured = serial_fixture_state(Some(&reference));
+            let fixture = contained_restore_authority_with_grants_for_test(
+                snapshot_storage_grant_authority_for_test(&[(
+                    if invalidate_grants {
+                        "serial-worker"
+                    } else {
+                        "serial-launcher"
+                    },
+                    ResourceRole::SerialSink,
+                    GrantAccess::WriteOnly,
+                    sink.path(),
+                )]),
+                false,
+            );
+            let batch = contained_serial_request(None, &configured, None, Some(&reference))
+                .prepare(Some(fixture.authority()), || false)
+                .expect("serial death fixture should prepare")
+                .into_serial_batch()
+                .expect("serial death fixture should consume exactly");
+            let (_, _, serial, completion) = batch.into_parts();
+            drop(serial);
+            if invalidate_grants {
+                fixture.invalidate_grants();
+            } else {
+                fixture.invalidate_generation();
+            }
+            let error = completion
+                .abort()
+                .expect_err("authority death must make completion terminal");
+            assert_eq!(
+                error.disposition(),
+                SnapshotRestoreResourceDisposition::Terminal
+            );
+            let diagnostic = format!("{error:?} {error}");
+            assert!(!diagnostic.contains(reference.to_string_lossy().as_ref()));
+            assert!(!diagnostic.contains(sink.path().to_string_lossy().as_ref()));
+            if !invalidate_grants {
+                assert_serial_grant_reusable(&fixture, &reference);
+            }
+        }
     }
 
     #[test]

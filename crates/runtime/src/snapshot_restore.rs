@@ -9,6 +9,7 @@ use crate::snapshot_device_v2::{
     SnapshotV2DeviceGraph, SnapshotV2DeviceKey,
 };
 use crate::snapshot_device_v2_6::SnapshotV2StorageDeviceGraph;
+use crate::snapshot_serial_v2_7::SnapshotV2SerialState;
 
 /// Maximum number of logical resources in one snapshot restore transaction.
 ///
@@ -19,6 +20,9 @@ pub const MAX_SNAPSHOT_RESTORE_RESOURCES: usize = 64;
 
 /// Maximum UTF-8 byte length of one snapshot restore public identifier.
 pub const MAX_SNAPSHOT_RESTORE_PUBLIC_ID_BYTES: usize = NATIVE_V2_DEVICE_GRAPH_MAX_DRIVE_ID_BYTES;
+
+/// Stable public identity of the singleton configured serial restore sink.
+pub const NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID: &str = "serial0";
 
 const REDACTED: &str = "<redacted>";
 
@@ -134,6 +138,8 @@ pub enum SnapshotRestoreResourceClass {
     PmemBacking,
     /// Destination endpoint for a restored virtio-vsock device.
     VsockEndpoint,
+    /// Destination output for the restored singleton serial device.
+    SerialSink,
 }
 
 impl SnapshotRestoreResourceClass {
@@ -289,6 +295,61 @@ impl SnapshotRestoreManifest {
             ));
         }
         Self::try_new(resources, overrides)
+    }
+
+    /// Derives the complete exact-2.7 storage and configured-serial resource
+    /// set.
+    ///
+    /// Default process stdio is destination-local and contributes no logical
+    /// resource. A configured output contributes the stable singleton serial
+    /// sink after every canonical block and pmem backing.
+    pub fn try_from_native_v2_serial_state(
+        graph: Option<&SnapshotV2StorageDeviceGraph>,
+        serial: &SnapshotV2SerialState,
+    ) -> Result<Self, SnapshotRestoreManifestError> {
+        let storage_count = graph.map_or(0, SnapshotV2StorageDeviceGraph::record_count);
+        let serial_count = usize::from(serial.endpoint_intent().configured_selector().is_some());
+        let resource_count = storage_count
+            .checked_add(serial_count)
+            .ok_or(SnapshotRestoreManifestError::TooManyResources)?;
+        if resource_count > MAX_SNAPSHOT_RESTORE_RESOURCES {
+            return Err(SnapshotRestoreManifestError::TooManyResources);
+        }
+
+        let mut resources = Vec::new();
+        resources
+            .try_reserve_exact(resource_count)
+            .map_err(|source| SnapshotRestoreManifestError::AllocationFailed { source })?;
+        if let Some(graph) = graph {
+            for record in graph.block_records() {
+                let public_id = SnapshotRestorePublicId::try_from(record.config().drive_id())
+                    .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+                resources.push(SnapshotRestoreResourceKey::new(
+                    record.key(),
+                    public_id,
+                    SnapshotRestoreResourceClass::BlockBacking,
+                ));
+            }
+            for record in graph.pmem_records() {
+                let public_id = SnapshotRestorePublicId::try_from(record.config().pmem_id())
+                    .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+                resources.push(SnapshotRestoreResourceKey::new(
+                    record.key(),
+                    public_id,
+                    SnapshotRestoreResourceClass::PmemBacking,
+                ));
+            }
+        }
+        if serial_count == 1 {
+            let public_id = SnapshotRestorePublicId::try_from(NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID)
+                .map_err(|source| SnapshotRestoreManifestError::PublicId { source })?;
+            resources.push(SnapshotRestoreResourceKey::new(
+                SnapshotV2DeviceKey::serial(),
+                public_id,
+                SnapshotRestoreResourceClass::SerialSink,
+            ));
+        }
+        Self::try_new(resources, Vec::new())
     }
 
     fn try_new_with_reserve(
@@ -872,6 +933,14 @@ mod tests {
 
     use super::*;
     use crate::snapshot_device_v2::snapshot_v2_device_key_for_test;
+    use crate::snapshot_device_v2_6::NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION;
+    use crate::snapshot_serial_v2_7::NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION;
+
+    const DEFAULT_SERIAL_HEX: &str = include_str!("snapshot_serial_v2_7/fixtures/default.hex");
+    const CONFIGURED_SERIAL_HEX: &str =
+        include_str!("snapshot_serial_v2_7/fixtures/configured.hex");
+    const MIXED_STORAGE_HEX: &str =
+        include_str!("snapshot_device_v2_6/fixtures/mixed-pmem-root-pci.hex");
 
     fn public_id(value: impl Into<String>) -> SnapshotRestorePublicId {
         SnapshotRestorePublicId::try_from(value.into())
@@ -895,6 +964,42 @@ mod tests {
         Vec::<u8>::new()
             .try_reserve_exact(usize::MAX)
             .expect_err("impossible allocation should fail")
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        let value = value.trim();
+        assert!(value.len().is_multiple_of(2));
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(
+                    std::str::from_utf8(pair).expect("hex pair should be UTF-8"),
+                    16,
+                )
+                .expect("fixture should be hexadecimal")
+            })
+            .collect()
+    }
+
+    fn serial_state(configured: bool) -> SnapshotV2SerialState {
+        SnapshotV2SerialState::decode(
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            &decode_hex(if configured {
+                CONFIGURED_SERIAL_HEX
+            } else {
+                DEFAULT_SERIAL_HEX
+            }),
+        )
+        .expect("serial fixture should decode")
+    }
+
+    fn storage_graph() -> SnapshotV2StorageDeviceGraph {
+        SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &decode_hex(MIXED_STORAGE_HEX),
+        )
+        .expect("storage fixture should decode")
     }
 
     fn maximum_keys() -> Vec<SnapshotRestoreResourceKey> {
@@ -1054,6 +1159,71 @@ mod tests {
             SnapshotRestoreManifest::try_new(vec![block_later, wrong_class], Vec::new()),
             Err(SnapshotRestoreManifestError::ResourceClassConflict)
         ));
+    }
+
+    #[test]
+    fn exact_2_7_manifest_adds_only_the_stable_configured_serial_sink() {
+        let default =
+            SnapshotRestoreManifest::try_from_native_v2_serial_state(None, &serial_state(false))
+                .expect("default serial manifest should validate");
+        assert!(default.is_empty());
+
+        let configured =
+            SnapshotRestoreManifest::try_from_native_v2_serial_state(None, &serial_state(true))
+                .expect("configured serial manifest should validate");
+        assert_eq!(configured.len(), 1);
+        let serial = &configured.resources()[0];
+        assert_eq!(
+            serial.resource_class(),
+            SnapshotRestoreResourceClass::SerialSink
+        );
+        assert_eq!(serial.device_key().kind(), 3);
+        assert_eq!(serial.device_key().instance(), 0);
+        assert_eq!(
+            serial.public_id().as_str(),
+            NATIVE_V2_SERIAL_RESTORE_PUBLIC_ID
+        );
+        assert!(matches!(
+            SnapshotRestoreManifest::try_new(vec![serial.clone()], vec![serial.clone()]),
+            Err(SnapshotRestoreManifestError::UnsupportedOverrideClass)
+        ));
+    }
+
+    #[test]
+    fn exact_2_7_manifest_keeps_storage_canonical_and_serial_last() {
+        let graph = storage_graph();
+        let storage = SnapshotRestoreManifest::try_from_native_v2_serial_state(
+            Some(&graph),
+            &serial_state(false),
+        )
+        .expect("storage default-serial manifest should validate");
+        assert_eq!(storage.len(), graph.record_count());
+        assert!(storage.resources().iter().all(|resource| {
+            matches!(
+                resource.resource_class(),
+                SnapshotRestoreResourceClass::BlockBacking
+                    | SnapshotRestoreResourceClass::PmemBacking
+            )
+        }));
+
+        let configured = SnapshotRestoreManifest::try_from_native_v2_serial_state(
+            Some(&graph),
+            &serial_state(true),
+        )
+        .expect("storage configured-serial manifest should validate");
+        assert_eq!(configured.len(), graph.record_count() + 1);
+        assert_eq!(
+            &configured.resources()[..graph.record_count()],
+            storage.resources()
+        );
+        assert_eq!(
+            configured
+                .resources()
+                .last()
+                .expect("serial sink should be last")
+                .resource_class(),
+            SnapshotRestoreResourceClass::SerialSink
+        );
     }
 
     #[test]
