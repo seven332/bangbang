@@ -11638,8 +11638,10 @@ mod macos_arm64 {
                 socket,
                 "/serial",
                 &format!(
-                    r#"{{"serial_out_path":{}}}"#,
-                    json_string(path_text(serial))
+                    r#"{{"serial_out_path":{},"rate_limiter":{{"size":{},"refill_time":{}}}}}"#,
+                    json_string(path_text(serial)),
+                    crate::snapshot_serial::CONFIGURED_RATE_LIMITER_SIZE,
+                    crate::snapshot_serial::CONFIGURED_RATE_LIMITER_REFILL_TIME_MS,
                 ),
             ),
             "PUT configured serial snapshot output",
@@ -11775,7 +11777,14 @@ mod macos_arm64 {
             decoded.serial().endpoint_intent().configured_selector(),
             Some(path_text(selector))
         );
-        assert_eq!(decoded.serial().rate_limiter(), None);
+        assert_eq!(
+            decoded.serial().rate_limiter(),
+            Some(bangbang_runtime::serial::SerialRateLimiterConfig::new(
+                crate::snapshot_serial::CONFIGURED_RATE_LIMITER_SIZE,
+                None,
+                crate::snapshot_serial::CONFIGURED_RATE_LIMITER_REFILL_TIME_MS,
+            ))
+        );
         let device = decoded.serial().device();
         let legacy = device.legacy_state();
         assert_eq!(

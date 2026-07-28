@@ -13,6 +13,8 @@ pub const RESTORED_FAILURE_MARKER: &str = "BB_SERIAL_SNAPSHOT_RESTORED_FAIL\n";
 pub const CONFIGURED_SOURCE_MARKER: &str = "BB_SERIAL_CONFIGURED_SOURCE\n";
 pub const CONFIGURED_RESTORED_MARKER: &str = "BB_SERIAL_CONFIGURED_RESTORED\n";
 pub const CONFIGURED_FAILURE_MARKER: &str = "BB_SERIAL_CONFIGURED_FAIL\n";
+pub const CONFIGURED_RATE_LIMITER_SIZE: u64 = 32;
+pub const CONFIGURED_RATE_LIMITER_REFILL_TIME_MS: u64 = 3_600_000;
 
 pub const SOURCE_PREFIX_BYTE: u8 = b'A';
 pub const SOURCE_ONLY_SUFFIX_BYTE: u8 = b'B';
@@ -222,6 +224,18 @@ pub fn assert_guest_images() {
     );
     assert!(source_input().len() > SERIAL_RECEIVE_FIFO_CAPACITY);
     assert_eq!(destination_input().len(), DESTINATION_SUFFIX_LEN);
+    let configured_limiter_size = usize::try_from(CONFIGURED_RATE_LIMITER_SIZE)
+        .expect("configured serial limiter size should fit");
+    for marker in [
+        CONFIGURED_SOURCE_MARKER,
+        CONFIGURED_RESTORED_MARKER,
+        CONFIGURED_FAILURE_MARKER,
+    ] {
+        assert!(marker.len() <= configured_limiter_size);
+    }
+    assert!(
+        CONFIGURED_SOURCE_MARKER.len() + CONFIGURED_RESTORED_MARKER.len() > configured_limiter_size
+    );
 }
 
 fn emit_configure_uart(assembler: &mut Assembler) {

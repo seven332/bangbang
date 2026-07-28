@@ -11725,7 +11725,15 @@ fn configure_and_start_serial_snapshot_grant_source(
             &http_put(
                 socket,
                 "/serial",
-                &serde_json::json!({"serial_out_path": SNAPSHOT_SERIAL_SINK_REF}).to_string(),
+                &serde_json::json!({
+                    "serial_out_path": SNAPSHOT_SERIAL_SINK_REF,
+                    "rate_limiter": {
+                        "size": snapshot_serial::CONFIGURED_RATE_LIMITER_SIZE,
+                        "refill_time":
+                            snapshot_serial::CONFIGURED_RATE_LIMITER_REFILL_TIME_MS,
+                    },
+                })
+                .to_string(),
             ),
             204,
             "PUT production serial snapshot output",
