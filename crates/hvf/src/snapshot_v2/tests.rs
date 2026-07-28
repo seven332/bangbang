@@ -2,10 +2,14 @@ use std::io::Cursor;
 
 use bangbang_runtime::machine::MachineConfigInput;
 use bangbang_runtime::memory::{GuestMemory, aarch64};
+use bangbang_runtime::pci::{PCI_BAR64_START, PCI_FIRST_ENDPOINT_DEVICE, PCI_LAST_ENDPOINT_DEVICE};
 use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransportKind;
 use bangbang_runtime::snapshot_device_v2_5::NATIVE_V2_MULTI_BLOCK_DEVICE_GRAPH_MAX_BYTES;
 use bangbang_runtime::snapshot_device_v2_6::{
     NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
+};
+use bangbang_runtime::snapshot_entropy_v2_8::{
+    NATIVE_V2_ENTROPY_STATE_HEADER_BYTES, NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES,
 };
 use bangbang_runtime::snapshot_format_v2::{
     NATIVE_V2_COMPONENT_DIRECTORY_ENTRY_BYTES, NATIVE_V2_LEGACY_PLATFORM_VERSION,
@@ -21,6 +25,7 @@ use bangbang_runtime::snapshot_serial_v2_7::{
     NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION, SnapshotV2SerialState,
     SnapshotV2SerialStateDecodeError,
 };
+use bangbang_runtime::virtio_pci::VIRTIO_PCI_CAPABILITY_BAR_SIZE;
 
 use super::*;
 use crate::snapshot_bundle::tests::fixture as native_v1_fixture;
@@ -42,10 +47,15 @@ const SERIAL_DEFAULT_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_serial_v2_7/fixtures/default.hex");
 const SERIAL_CONFIGURED_FIXTURE_HEX: &str =
     include_str!("../../../runtime/src/snapshot_serial_v2_7/fixtures/configured.hex");
+const ENTROPY_INACTIVE_MMIO_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_entropy_v2_8/fixtures/inactive-mmio.hex");
+const ENTROPY_ACTIVE_PCI_FIXTURE_HEX: &str =
+    include_str!("../../../runtime/src/snapshot_entropy_v2_8/fixtures/active-pci.hex");
 const DETERMINISTIC_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.4-fixture-id!";
 const DETERMINISTIC_MULTI_BLOCK_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.5-fixture-id!";
 const DETERMINISTIC_STORAGE_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.6-fixture-id!";
 const DETERMINISTIC_SERIAL_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.7-fixture-id!";
+const DETERMINISTIC_ENTROPY_MEMORY_IMAGE_ID: [u8; 16] = *b"v2.8-fixture-id!";
 const COMPLETE_STATE_FINGERPRINTS: [(usize, u64); 2] = [
     (4_887, 10_136_861_786_457_474_800),
     (4_983, 7_169_128_621_506_763_529),
@@ -350,6 +360,13 @@ fn deterministic_minor_seven_platform_fixture() -> HvfSnapshotV2PlatformState {
     )
 }
 
+fn deterministic_minor_eight_platform_fixture() -> HvfSnapshotV2PlatformState {
+    deterministic_device_graph_platform_fixture(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        DETERMINISTIC_ENTROPY_MEMORY_IMAGE_ID,
+    )
+}
+
 fn deterministic_device_graph_platform_fixture(
     version: SnapshotFormatVersion,
     image_id: [u8; 16],
@@ -439,6 +456,63 @@ fn complete_serial_state_fixture(
         serial,
     )
     .expect("complete minor-seven fixture should validate")
+}
+
+fn complete_entropy_state_fixture(
+    graph_hex: Option<&str>,
+    serial_hex: &str,
+    entropy_hex: Option<&str>,
+    relocate_pci_entropy: bool,
+) -> HvfSnapshotV2EntropyState {
+    let device_graph = graph_hex.map(|graph_hex| {
+        SnapshotV2StorageDeviceGraph::decode(
+            NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+            &fixture_bytes(graph_hex),
+        )
+        .expect("immutable profile-3 graph payload should decode")
+    });
+    let serial = SnapshotV2SerialState::decode(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        &fixture_bytes(serial_hex),
+    )
+    .expect("immutable serial payload should decode");
+    let entropy = entropy_hex.map(|entropy_hex| {
+        let mut bytes = fixture_bytes(entropy_hex);
+        if relocate_pci_entropy {
+            relocate_entropy_pci_fixture(&mut bytes);
+        }
+        SnapshotV2EntropyState::decode(NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION, &bytes)
+            .expect("immutable entropy payload should decode")
+    });
+    HvfSnapshotV2EntropyState::try_new(
+        deterministic_minor_eight_platform_fixture(),
+        device_graph,
+        serial,
+        entropy,
+    )
+    .expect("complete minor-eight fixture should validate")
+}
+
+fn relocate_entropy_pci_fixture(bytes: &mut [u8]) {
+    let transport_directory_offset =
+        NATIVE_V2_ENTROPY_STATE_HEADER_BYTES + 2 * NATIVE_V2_ENTROPY_STATE_SECTION_ENTRY_BYTES;
+    let payload_offset = transport_directory_offset + 8;
+    let transport_offset = usize::try_from(u64::from_le_bytes(
+        bytes[payload_offset..payload_offset + 8]
+            .try_into()
+            .expect("transport directory offset should fit"),
+    ))
+    .expect("transport directory offset should fit usize");
+    bytes[transport_offset + 11] = PCI_LAST_ENDPOINT_DEVICE;
+    let endpoint_index = u64::from(PCI_LAST_ENDPOINT_DEVICE - PCI_FIRST_ENDPOINT_DEVICE);
+    let bar_start = PCI_BAR64_START
+        .checked_add(
+            endpoint_index
+                .checked_mul(VIRTIO_PCI_CAPABILITY_BAR_SIZE)
+                .expect("fixture BAR offset should fit"),
+        )
+        .expect("fixture BAR address should fit");
+    bytes[transport_offset + 16..transport_offset + 24].copy_from_slice(&bar_start.to_le_bytes());
 }
 
 fn decode_platform(bytes: &[u8]) -> Result<HvfSnapshotV2PlatformState, HvfSnapshotV2DecodeError> {
@@ -1100,6 +1174,189 @@ fn internal_exact_minor_seven_serial_only_mmio_and_pci_states_round_trip() {
             NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION
         );
     }
+}
+
+#[test]
+fn internal_exact_minor_eight_entropy_compositions_encode_nested_versions_canonically() {
+    let cases = [
+        (
+            None,
+            SERIAL_DEFAULT_FIXTURE_HEX,
+            None,
+            None,
+            false,
+            false,
+            false,
+        ),
+        (
+            Some(STORAGE_MMIO_GRAPH_FIXTURE_HEX),
+            SERIAL_CONFIGURED_FIXTURE_HEX,
+            None,
+            Some(SnapshotV2DeviceTransportKind::Mmio),
+            true,
+            false,
+            false,
+        ),
+        (
+            None,
+            SERIAL_DEFAULT_FIXTURE_HEX,
+            Some(ENTROPY_INACTIVE_MMIO_FIXTURE_HEX),
+            Some(SnapshotV2DeviceTransportKind::Mmio),
+            false,
+            true,
+            false,
+        ),
+        (
+            Some(STORAGE_PCI_GRAPH_FIXTURE_HEX),
+            SERIAL_CONFIGURED_FIXTURE_HEX,
+            Some(ENTROPY_ACTIVE_PCI_FIXTURE_HEX),
+            Some(SnapshotV2DeviceTransportKind::Pci),
+            true,
+            true,
+            true,
+        ),
+    ];
+
+    for (
+        graph_hex,
+        serial_hex,
+        entropy_hex,
+        expected_transport,
+        has_storage,
+        has_entropy,
+        relocate_pci_entropy,
+    ) in cases
+    {
+        let original = complete_entropy_state_fixture(
+            graph_hex,
+            serial_hex,
+            entropy_hex,
+            relocate_pci_entropy,
+        );
+        let encoded = encode_hvf_snapshot_v2_entropy_state(&original)
+            .expect("complete minor-eight entropy state should encode");
+        let structural = decode_snapshot_v2_state_with_compatibility_version(
+            &encoded,
+            NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        )
+        .expect("minor-eight entropy composition should decode structurally");
+
+        let keys = structural
+            .components()
+            .map(SnapshotV2Component::key)
+            .collect::<Vec<_>>();
+        let mut expected_keys = vec![
+            NATIVE_V2_MEMORY_COMPONENT_KEY,
+            NATIVE_V2_MACHINE_COMPONENT_KEY,
+            NATIVE_V2_GLOBAL_COMPONENT_KEY,
+            NATIVE_V2_TOPOLOGY_COMPONENT_KEY,
+        ];
+        expected_keys.extend(
+            (0..u32::try_from(original.platform().vcpus().len())
+                .expect("fixture vCPU count should fit"))
+                .map(native_v2_vcpu_component_key),
+        );
+        expected_keys.push(NATIVE_V2_TIME_COMPONENT_KEY);
+        if has_storage {
+            expected_keys.push(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY);
+        }
+        expected_keys.push(NATIVE_V2_SERIAL_COMPONENT_KEY);
+        if has_entropy {
+            expected_keys.push(NATIVE_V2_ENTROPY_COMPONENT_KEY);
+        }
+        assert_eq!(keys, expected_keys);
+
+        let serial = SnapshotV2SerialState::decode(
+            NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+            structural
+                .component(NATIVE_V2_SERIAL_COMPONENT_KEY)
+                .expect("minor-eight composition should contain serial")
+                .payload(),
+        )
+        .expect("nested exact-2.7 serial should decode");
+        assert_eq!(&serial, original.serial());
+
+        let graph = structural
+            .component(NATIVE_V2_DEVICE_GRAPH_COMPONENT_KEY)
+            .map(|component| {
+                SnapshotV2StorageDeviceGraph::decode(
+                    NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+                    component.payload(),
+                )
+                .expect("nested exact-2.6 storage graph should decode")
+            });
+        assert_eq!(graph.as_ref(), original.device_graph());
+
+        let entropy = structural
+            .component(NATIVE_V2_ENTROPY_COMPONENT_KEY)
+            .map(|component| {
+                SnapshotV2EntropyState::decode(
+                    NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+                    component.payload(),
+                )
+                .expect("nested exact-2.8 entropy state should decode")
+            });
+        assert_eq!(entropy.as_ref(), original.entropy());
+        assert_eq!(
+            graph
+                .as_ref()
+                .map(SnapshotV2StorageDeviceGraph::transport_kind)
+                .or_else(|| { entropy.as_ref().map(|state| state.transport().kind()) }),
+            expected_transport
+        );
+        assert_eq!(
+            encode_hvf_snapshot_v2_entropy_state(&original)
+                .expect("minor-eight composition should re-encode"),
+            encoded
+        );
+        let debug = format!("{original:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("serial-log"));
+    }
+}
+
+#[test]
+fn exact_minor_eight_composition_rejects_transport_and_placement_conflicts() {
+    let graph = SnapshotV2StorageDeviceGraph::decode(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &fixture_bytes(STORAGE_MMIO_GRAPH_FIXTURE_HEX),
+    )
+    .expect("MMIO storage fixture should decode");
+    let serial = SnapshotV2SerialState::decode(
+        NATIVE_V2_SERIAL_STATE_COMPATIBILITY_VERSION,
+        &fixture_bytes(SERIAL_CONFIGURED_FIXTURE_HEX),
+    )
+    .expect("serial fixture should decode");
+    let entropy = SnapshotV2EntropyState::decode(
+        NATIVE_V2_ENTROPY_STATE_COMPATIBILITY_VERSION,
+        &fixture_bytes(ENTROPY_ACTIVE_PCI_FIXTURE_HEX),
+    )
+    .expect("PCI entropy fixture should decode");
+
+    assert!(matches!(
+        HvfSnapshotV2EntropyState::try_new(
+            deterministic_minor_eight_platform_fixture(),
+            Some(graph),
+            serial.clone(),
+            Some(entropy.clone()),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
+
+    let pci_graph = SnapshotV2StorageDeviceGraph::decode(
+        NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION,
+        &fixture_bytes(STORAGE_PCI_GRAPH_FIXTURE_HEX),
+    )
+    .expect("PCI storage fixture should decode");
+    assert!(matches!(
+        HvfSnapshotV2EntropyState::try_new(
+            deterministic_minor_eight_platform_fixture(),
+            Some(pci_graph),
+            serial,
+            Some(entropy),
+        ),
+        Err(HvfSnapshotV2BuildError::CrossComponent)
+    ));
 }
 
 #[test]

@@ -8,9 +8,19 @@
 use std::fmt;
 
 use crate::entropy::{
-    EntropyConfig, EntropyRateLimiterConfig, EntropyTokenBucketConfig, VIRTIO_RNG_QUEUE_SIZE,
+    EntropyConfig, EntropyRateLimiterConfig, EntropyTokenBucketConfig, VIRTIO_RNG_DEVICE_ID,
+    VIRTIO_RNG_QUEUE_SIZE, VirtioRngDeviceCaptureState, VirtioRngMmioCaptureState,
+    VirtioRngPciCaptureState, VirtioRngRetryCaptureState, VirtioRngTokenBucketCaptureState,
 };
-use crate::snapshot_device_v2::{SnapshotV2DeviceTransport, SnapshotV2VirtioState};
+use crate::interrupt::GuestInterruptLine;
+use crate::memory::GuestMemoryRange;
+use crate::mmio::MmioRegion;
+use crate::pci::PciSbdf;
+use crate::snapshot_device_v2::{
+    SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2VirtioState,
+    capture_mmio_common_for_device_with_config_status_gate, capture_mmio_transport,
+    capture_pci_common_for_device, capture_pci_transport_parts,
+};
 use crate::snapshot_device_v2_5::{
     queue_ranges, validate_mmio, validate_pci, validate_virtio_with_queue_size,
 };
@@ -274,6 +284,54 @@ pub struct SnapshotV2EntropyState {
 }
 
 impl SnapshotV2EntropyState {
+    /// Converts one checked MMIO live capture without retaining source
+    /// ownership.
+    pub fn try_from_mmio_capture(
+        config: EntropyConfig,
+        retry: VirtioRngRetryCaptureState,
+        region: MmioRegion,
+        interrupt_line: GuestInterruptLine,
+        captured: &VirtioRngMmioCaptureState,
+    ) -> Result<Self, SnapshotV2EntropyStateCaptureError> {
+        let virtio = capture_mmio_common_for_device_with_config_status_gate(
+            captured.transport(),
+            VIRTIO_RNG_DEVICE_ID,
+            VIRTIO_MMIO_VERSION_1_FEATURE,
+            false,
+        )
+        .map_err(capture_common_error)?;
+        let transport = capture_mmio_transport(region, interrupt_line, captured.transport())
+            .map(SnapshotV2DeviceTransport::Mmio)
+            .map_err(capture_common_error)?;
+        capture_entropy_state(config, retry, captured.device(), virtio, transport)
+    }
+
+    /// Converts one checked startup-origin PCI live capture without retaining
+    /// source ownership.
+    pub fn try_from_pci_capture(
+        config: EntropyConfig,
+        retry: VirtioRngRetryCaptureState,
+        sbdf: PciSbdf,
+        bar_range: GuestMemoryRange,
+        captured: &VirtioRngPciCaptureState,
+    ) -> Result<Self, SnapshotV2EntropyStateCaptureError> {
+        let virtio = capture_pci_common_for_device(
+            captured.transport(),
+            VIRTIO_RNG_DEVICE_ID,
+            VIRTIO_MMIO_VERSION_1_FEATURE,
+        )
+        .map_err(capture_common_error)?;
+        let transport = capture_pci_transport_parts(
+            StorageDeviceOrigin::Startup,
+            sbdf,
+            bar_range,
+            captured.transport(),
+        )
+        .map(SnapshotV2DeviceTransport::Pci)
+        .map_err(capture_common_error)?;
+        capture_entropy_state(config, retry, captured.device(), virtio, transport)
+    }
+
     /// Constructs one complete checked entropy continuation.
     pub fn try_new(
         config: EntropyConfig,
@@ -387,6 +445,115 @@ impl fmt::Debug for SnapshotV2EntropyState {
     }
 }
 
+fn capture_entropy_state(
+    config: EntropyConfig,
+    retry: VirtioRngRetryCaptureState,
+    device: &VirtioRngDeviceCaptureState,
+    virtio: SnapshotV2VirtioState,
+    transport: SnapshotV2DeviceTransport,
+) -> Result<SnapshotV2EntropyState, SnapshotV2EntropyStateCaptureError> {
+    if device.config() != config
+        || device.available_features() != virtio.available_features()
+        || device.negotiated_features() != virtio.driver_features()
+        || device.active_queue().is_some() != virtio.is_activated()
+    {
+        return Err(SnapshotV2EntropyStateCaptureError::Device);
+    }
+
+    let active_queue = device
+        .active_queue()
+        .map(|queue| {
+            let next_available = queue
+                .next_available()
+                .wrapping_add(u16::from(device.has_pending_rate_limited_queue()));
+            SnapshotV2EntropyQueueState::try_new(
+                next_available,
+                queue.next_used(),
+                VIRTIO_RNG_QUEUE_SIZE,
+            )
+        })
+        .transpose()
+        .map_err(|_| SnapshotV2EntropyStateCaptureError::Queue)?;
+    let rate_limiter = device.rate_limiter();
+    let rate_limiter_config = config.rate_limiter();
+    let limiter = SnapshotV2EntropyLimiterState::try_new(
+        rate_limiter_config,
+        capture_bucket(
+            rate_limiter_config.and_then(EntropyRateLimiterConfig::bandwidth),
+            rate_limiter.bandwidth(),
+        )?,
+        capture_bucket(
+            rate_limiter_config.and_then(EntropyRateLimiterConfig::ops),
+            rate_limiter.ops(),
+        )?,
+    )
+    .map_err(|_| SnapshotV2EntropyStateCaptureError::Limiter)?;
+    let retry = match retry {
+        VirtioRngRetryCaptureState::None => SnapshotV2EntropyRetryState::None,
+        VirtioRngRetryCaptureState::Immediate => SnapshotV2EntropyRetryState::Immediate,
+        VirtioRngRetryCaptureState::After { remaining_nanos } => {
+            SnapshotV2EntropyRetryState::try_after(remaining_nanos)
+                .map_err(|_| SnapshotV2EntropyStateCaptureError::Retry)?
+        }
+    };
+
+    SnapshotV2EntropyState::try_new(
+        config,
+        active_queue,
+        limiter,
+        retry,
+        device.has_pending_rate_limited_queue(),
+        virtio,
+        transport,
+    )
+    .map_err(capture_build_error)
+}
+
+fn capture_common_error(
+    source: SnapshotV2DeviceGraphCaptureError,
+) -> SnapshotV2EntropyStateCaptureError {
+    if source == SnapshotV2DeviceGraphCaptureError::Allocation {
+        SnapshotV2EntropyStateCaptureError::Allocation
+    } else {
+        SnapshotV2EntropyStateCaptureError::Common { source }
+    }
+}
+
+fn capture_build_error(
+    source: SnapshotV2EntropyStateBuildError,
+) -> SnapshotV2EntropyStateCaptureError {
+    match source {
+        SnapshotV2EntropyStateBuildError::Queue => SnapshotV2EntropyStateCaptureError::Queue,
+        SnapshotV2EntropyStateBuildError::Limiter
+        | SnapshotV2EntropyStateBuildError::Configuration => {
+            SnapshotV2EntropyStateCaptureError::Limiter
+        }
+        SnapshotV2EntropyStateBuildError::Retry => SnapshotV2EntropyStateCaptureError::Retry,
+        source => SnapshotV2EntropyStateCaptureError::Build { source },
+    }
+}
+
+fn capture_bucket(
+    config: Option<EntropyTokenBucketConfig>,
+    captured: Option<VirtioRngTokenBucketCaptureState>,
+) -> Result<Option<SnapshotV2EntropyBucketState>, SnapshotV2EntropyStateCaptureError> {
+    match (config, captured) {
+        (Some(config), Some(captured)) if config.is_enabled() && captured.config() == config => {
+            SnapshotV2EntropyBucketState::try_new(
+                config,
+                captured.budget(),
+                captured.one_time_burst(),
+                captured.age_nanos(),
+            )
+            .map(Some)
+            .map_err(|_| SnapshotV2EntropyStateCaptureError::Limiter)
+        }
+        (Some(config), None) if !config.is_enabled() => Ok(None),
+        (None, None) => Ok(None),
+        _ => Err(SnapshotV2EntropyStateCaptureError::Limiter),
+    }
+}
+
 pub(crate) fn validate_entropy_state(
     state: &SnapshotV2EntropyState,
 ) -> Result<(), SnapshotV2EntropyStateBuildError> {
@@ -478,6 +645,61 @@ fn validate_bucket_relationship(
             Ok(())
         }
         _ => Err(SnapshotV2EntropyStateBuildError::Limiter),
+    }
+}
+
+/// Failure while converting one trusted live capture into exact-2.8 state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotV2EntropyStateCaptureError {
+    /// A bounded common-state collection could not be allocated.
+    Allocation,
+    /// Repeated device and transport state disagree.
+    Device,
+    /// Active queue cursors are inconsistent.
+    Queue,
+    /// Captured limiter configuration and state disagree.
+    Limiter,
+    /// Captured retry disposition is noncanonical.
+    Retry,
+    /// Common virtio or transport capture failed.
+    Common {
+        /// Redacted common capture category.
+        source: SnapshotV2DeviceGraphCaptureError,
+    },
+    /// Complete converted state failed its final semantic gate.
+    Build {
+        /// Redacted exact-2.8 build category.
+        source: SnapshotV2EntropyStateBuildError,
+    },
+}
+
+impl fmt::Debug for SnapshotV2EntropyStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for SnapshotV2EntropyStateCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Allocation => "native-v2 captured entropy state allocation failed",
+            Self::Device => "native-v2 captured entropy device state is inconsistent",
+            Self::Queue => "native-v2 captured entropy queue state is invalid",
+            Self::Limiter => "native-v2 captured entropy limiter state is invalid",
+            Self::Retry => "native-v2 captured entropy retry state is invalid",
+            Self::Common { .. } => "native-v2 captured entropy transport state is invalid",
+            Self::Build { .. } => "native-v2 captured entropy state is invalid",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2EntropyStateCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Common { source } => Some(source),
+            Self::Build { source } => Some(source),
+            Self::Allocation | Self::Device | Self::Queue | Self::Limiter | Self::Retry => None,
+        }
     }
 }
 

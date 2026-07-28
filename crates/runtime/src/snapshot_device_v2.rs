@@ -2151,7 +2151,21 @@ pub(crate) fn capture_mmio_common_for_device(
     expected_device_id: u32,
     expected_features: u64,
 ) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
-    if !state.requires_device_config_write_status() {
+    capture_mmio_common_for_device_with_config_status_gate(
+        state,
+        expected_device_id,
+        expected_features,
+        true,
+    )
+}
+
+pub(crate) fn capture_mmio_common_for_device_with_config_status_gate(
+    state: &VirtioMmioTransportState,
+    expected_device_id: u32,
+    expected_features: u64,
+    expected_device_config_write_status: bool,
+) -> Result<SnapshotV2VirtioState, SnapshotV2DeviceGraphCaptureError> {
+    if state.requires_device_config_write_status() != expected_device_config_write_status {
         return Err(SnapshotV2DeviceGraphCaptureError::InvalidMmioState);
     }
     let mut intents = Vec::new();

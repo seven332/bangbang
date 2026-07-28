@@ -11309,6 +11309,9 @@ fn capture_ready_vsock_resets_signed_mmio_and_pci_owners() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn capture_ready_entropy_traverses_signed_mmio_and_pci_owners() {
+    use bangbang_runtime::snapshot_device_v2::SnapshotV2DeviceTransport;
+    use bangbang_runtime::snapshot_entropy_v2_8::SnapshotV2EntropyRetryState;
+
     use std::time::Instant;
 
     use bangbang_hvf::{
@@ -11401,6 +11404,15 @@ fn capture_ready_entropy_traverses_signed_mmio_and_pci_owners() {
     assert!(state.device().rate_limiter().bandwidth().is_some());
     assert!(state.device().rate_limiter().ops().is_some());
     assert!(!state.transport().is_device_activated());
+    let mmio_snapshot = mmio_first
+        .try_to_snapshot_v2()
+        .expect("signed inactive MMIO capture should convert to exact 2.8");
+    assert!(matches!(
+        mmio_snapshot.transport(),
+        SnapshotV2DeviceTransport::Mmio(_)
+    ));
+    assert_eq!(mmio_snapshot.active_queue(), None);
+    assert_eq!(mmio_snapshot.retry(), SnapshotV2EntropyRetryState::None);
     assert!(!format!("{mmio_first:?}").contains("40007000"));
     assert!(matches!(
         mmio_session.capture_ready_entropy_state_at(None, &mmio_guard, now),
@@ -11446,6 +11458,21 @@ fn capture_ready_entropy_traverses_signed_mmio_and_pci_owners() {
             .map(|queue| (queue.next_available(), queue.next_used())),
         Some((1, 1))
     );
+    let mmio_pending_snapshot = mmio_pending
+        .try_to_snapshot_v2()
+        .expect("signed pending MMIO capture should convert to exact 2.8");
+    assert_eq!(
+        mmio_pending_snapshot
+            .active_queue()
+            .map(|queue| (queue.next_available(), queue.next_used())),
+        Some((2, 1))
+    );
+    assert!(mmio_pending_snapshot.has_pending_work());
+    assert!(matches!(
+        mmio_pending_snapshot.retry(),
+        SnapshotV2EntropyRetryState::After { remaining_nanos }
+            if remaining_nanos > 0 && remaining_nanos <= 60_000_000_000
+    ));
     drop(mmio_pending_guard);
     mmio_session
         .shutdown()
@@ -11479,6 +11506,15 @@ fn capture_ready_entropy_traverses_signed_mmio_and_pci_owners() {
     assert!(state.device().rate_limiter().bandwidth().is_some());
     assert!(state.device().rate_limiter().ops().is_some());
     assert!(!state.transport().is_device_activated());
+    let pci_snapshot = pci
+        .try_to_snapshot_v2()
+        .expect("signed inactive PCI capture should convert to exact 2.8");
+    assert!(matches!(
+        pci_snapshot.transport(),
+        SnapshotV2DeviceTransport::Pci(_)
+    ));
+    assert_eq!(pci_snapshot.active_queue(), None);
+    assert_eq!(pci_snapshot.retry(), SnapshotV2EntropyRetryState::None);
     assert!(!format!("{pci:?}").contains("40007000"));
     drop(pci_guard);
 
@@ -11516,6 +11552,21 @@ fn capture_ready_entropy_traverses_signed_mmio_and_pci_owners() {
             .map(|queue| (queue.next_available(), queue.next_used())),
         Some((1, 1))
     );
+    let pci_pending_snapshot = pci_pending
+        .try_to_snapshot_v2()
+        .expect("signed pending PCI capture should convert to exact 2.8");
+    assert_eq!(
+        pci_pending_snapshot
+            .active_queue()
+            .map(|queue| (queue.next_available(), queue.next_used())),
+        Some((2, 1))
+    );
+    assert!(pci_pending_snapshot.has_pending_work());
+    assert!(matches!(
+        pci_pending_snapshot.retry(),
+        SnapshotV2EntropyRetryState::After { remaining_nanos }
+            if remaining_nanos > 0 && remaining_nanos <= 60_000_000_000
+    ));
     drop(pci_pending_guard);
     pci_session
         .shutdown()

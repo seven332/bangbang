@@ -707,6 +707,18 @@ fn diagnostics_redact_entropy_values_and_placement() {
         format!("{:?}", SnapshotV2EntropyStateDecodeError::InvalidValue),
         "InvalidValue"
     );
+    assert_eq!(
+        capture_common_error(SnapshotV2DeviceGraphCaptureError::Allocation),
+        SnapshotV2EntropyStateCaptureError::Allocation
+    );
+    assert_eq!(
+        capture_build_error(SnapshotV2EntropyStateBuildError::Retry),
+        SnapshotV2EntropyStateCaptureError::Retry
+    );
+    assert_eq!(
+        format!("{:?}", SnapshotV2EntropyStateCaptureError::Allocation),
+        "native-v2 captured entropy state allocation failed"
+    );
 }
 
 fn replace_u16(bytes: &mut [u8], offset: usize, value: u16) {
