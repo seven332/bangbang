@@ -174,9 +174,11 @@ evidence.
 ## Explicit exclusions
 
 These slices do not implement runtime root block/pmem insertion or removal,
-vhost-user block, async/io_uring, automatic guest PCI notification, PCI state
-in native-v1 snapshots, pmem dirty tracking, externally
-certified vmnet connectivity, or Firecracker's KVM eventfd, timerfd, and
-interrupt-controller implementation identities. PCI snapshot profiles remain
-rejected before artifact mutation. Apple-approved production vmnet credentials
+automatic guest PCI notification, PCI state in native-v1 snapshots, pmem dirty
+tracking, externally certified vmnet connectivity, or Firecracker's KVM
+eventfd, timerfd, and interrupt-controller implementation identities. Later
+storage work adds vhost-user block and portable Async, while native-v2 2.6
+profile 3 persists startup- or runtime-origin regular-file block and pmem
+endpoints. Network and every other optional-device snapshot profile still
+reject before artifact mutation. Apple-approved production vmnet credentials
 and real external connectivity remain #1351/#1378 work.

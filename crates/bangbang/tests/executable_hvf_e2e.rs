@@ -33,6 +33,7 @@ mod macos_arm64 {
         NATIVE_V2_STORAGE_DEVICE_GRAPH_COMPATIBILITY_VERSION, SnapshotV2StorageDeviceGraph,
     };
     use bangbang_runtime::snapshot_format_v2::decode_snapshot_v2_state_with_compatibility_version;
+    use bangbang_runtime::storage_capture::StorageRetryState;
 
     use crate::macos_virtual_block::{
         MacosVirtualBlock, MacosVirtualBlockAccess, MacosVirtualBlockSize,
@@ -309,6 +310,16 @@ mod macos_arm64 {
     const SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE: u8 = 0x24;
     const SNAPSHOT_BLOCK_AUDIT_BYTE: u8 = 0x31;
     const SNAPSHOT_BLOCK_PARTUUID: &str = "1617-CAFE";
+    const SNAPSHOT_PMEM_SECTOR_SIZE: usize = 512;
+    const SNAPSHOT_PMEM_FILE_BYTES: usize =
+        bangbang_runtime::pmem::VIRTIO_PMEM_ALIGNMENT as usize + (16 * 1024);
+    const SNAPSHOT_PMEM_MAPPED_BYTES: u64 = 2 * bangbang_runtime::pmem::VIRTIO_PMEM_ALIGNMENT;
+    const SNAPSHOT_PMEM_WRITABLE_INITIAL_BYTE: u8 = 0x41;
+    const SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE: u8 = 0x42;
+    const SNAPSHOT_PMEM_WRITABLE_DESTINATION_ONE_BYTE: u8 = 0x43;
+    const SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE: u8 = 0x44;
+    const SNAPSHOT_PMEM_READ_ONLY_BYTE: u8 = 0x51;
+    const SNAPSHOT_PMEM_LIMITER_REFILL_MS: u64 = 5000;
     const ROOTFS_BOOT_TIMER_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 nomodule swiotlb=noforce init=/usr/local/bin/init";
     const DIRECT_ROOTFS_ENTROPY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-read=1";
@@ -11812,33 +11823,37 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_certifies_native_v2_multi_block_epochs_over_mmio_and_pci() {
+    fn signed_executable_certifies_native_v2_storage_epochs_over_mmio_and_pci() {
         for enable_pci in [false, true] {
             for rooted in [true, false] {
                 let test_dir = TestDir::new();
                 let instance_id = test_dir.instance_id();
-                run_native_v2_multi_block_epoch_case(
-                    test_dir.path(),
-                    &instance_id,
-                    enable_pci,
-                    rooted,
-                );
+                run_native_v2_storage_epoch_case(test_dir.path(), &instance_id, enable_pci, rooted);
             }
         }
     }
 
-    fn run_native_v2_multi_block_epoch_case(
+    fn run_native_v2_storage_epoch_case(
         test_root: &Path,
         instance_id: &str,
         enable_pci: bool,
         rooted: bool,
     ) {
         let transport = if enable_pci { "pci" } else { "mmio" };
-        let root_kind = if rooted { "rooted" } else { "rootless" };
-        let case = format!("{transport}-{root_kind}");
-        let source_socket = test_root.join(format!("nve-{case}-s.sock"));
-        let paused_socket = test_root.join(format!("nve-{case}-p.sock"));
-        let resumed_socket = test_root.join(format!("nve-{case}-r.sock"));
+        let product = if rooted {
+            "pmem-only-rooted"
+        } else {
+            "mixed-rootless"
+        };
+        let case = format!("{transport}-{product}");
+        let socket_case = format!(
+            "{}{}",
+            if enable_pci { "p" } else { "m" },
+            if rooted { "r" } else { "x" }
+        );
+        let source_socket = test_root.join(format!("e-{socket_case}-s"));
+        let paused_socket = test_root.join(format!("e-{socket_case}-p"));
+        let resumed_socket = test_root.join(format!("e-{socket_case}-r"));
         let state_path = test_root.join(format!("nve-{case}.state"));
         let memory_path = test_root.join(format!("nve-{case}.memory"));
         let recaptured_state_path = test_root.join(format!("nve-{case}-recaptured.state"));
@@ -11849,13 +11864,22 @@ mod macos_arm64 {
         let drive_a_path = test_root.join(format!("nve-{case}-a.img"));
         let drive_b_path = test_root.join(format!("nve-{case}-b.img"));
         let audit_path = test_root.join(format!("nve-{case}-audit.img"));
+        let writable_pmem_path = test_root.join(format!("nve-{case}-pmem-rw.img"));
+        let read_only_pmem_path = test_root.join(format!("nve-{case}-pmem-ro.img"));
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
         let process_args: &[&str] = if enable_pci { &["--enable-pci"] } else { &[] };
 
-        create_snapshot_block_epoch_backing(&drive_a_path, SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE);
-        create_snapshot_block_epoch_backing(&drive_b_path, SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE);
-        create_snapshot_block_epoch_backing(&audit_path, SNAPSHOT_BLOCK_AUDIT_BYTE);
+        if !rooted {
+            create_snapshot_block_epoch_backing(&drive_a_path, SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE);
+            create_snapshot_block_epoch_backing(&drive_b_path, SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE);
+            create_snapshot_block_epoch_backing(&audit_path, SNAPSHOT_BLOCK_AUDIT_BYTE);
+        }
+        create_snapshot_pmem_epoch_backing(
+            &writable_pmem_path,
+            SNAPSHOT_PMEM_WRITABLE_INITIAL_BYTE,
+        );
+        create_snapshot_pmem_epoch_backing(&read_only_pmem_path, SNAPSHOT_PMEM_READ_ONLY_BYTE);
 
         let source = BangbangProcess::start_with_extra_args(
             &source_socket,
@@ -11883,38 +11907,62 @@ mod macos_arm64 {
             ),
             "PUT native-v2 epoch source /boot-source",
         );
+        if !rooted {
+            assert_no_content_response(
+                &http_put_json(
+                    &source_socket,
+                    "/drives/primary",
+                    &format!(
+                        r#"{{"drive_id":"primary","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Unsafe","io_engine":"Async","rate_limiter":{{"ops":{{"size":1,"refill_time":1000}}}}}}"#,
+                        json_string(path_text(&drive_a_path))
+                    ),
+                ),
+                "PUT native-v2 epoch Async Unsafe primary",
+            );
+            assert_no_content_response(
+                &http_put_json(
+                    &source_socket,
+                    "/drives/data",
+                    &format!(
+                        r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync","partuuid":"{SNAPSHOT_BLOCK_PARTUUID}"}}"#,
+                        json_string(path_text(&drive_b_path))
+                    ),
+                ),
+                "PUT native-v2 epoch Sync Writeback data",
+            );
+            assert_no_content_response(
+                &http_put_json(
+                    &source_socket,
+                    "/drives/audit",
+                    &format!(
+                        r#"{{"drive_id":"audit","path_on_host":{},"is_root_device":false,"is_read_only":true,"cache_type":"Unsafe","io_engine":"Async"}}"#,
+                        json_string(path_text(&audit_path))
+                    ),
+                ),
+                "PUT native-v2 epoch read-only audit",
+            );
+        }
         assert_no_content_response(
             &http_put_json(
                 &source_socket,
-                "/drives/primary",
+                "/pmem/epoch_rw",
                 &format!(
-                    r#"{{"drive_id":"primary","path_on_host":{},"is_root_device":{rooted},"is_read_only":false,"cache_type":"Unsafe","io_engine":"Async","rate_limiter":{{"ops":{{"size":1,"refill_time":1000}}}}}}"#,
-                    json_string(path_text(&drive_a_path))
+                    r#"{{"id":"epoch_rw","path_on_host":{},"root_device":{rooted},"read_only":false,"rate_limiter":{{"ops":{{"size":1,"refill_time":{SNAPSHOT_PMEM_LIMITER_REFILL_MS}}}}}}}"#,
+                    json_string(path_text(&writable_pmem_path))
                 ),
             ),
-            "PUT native-v2 epoch Async Unsafe primary",
+            "PUT native-v2 epoch writable pmem",
         );
         assert_no_content_response(
             &http_put_json(
                 &source_socket,
-                "/drives/data",
+                "/pmem/epoch_ro",
                 &format!(
-                    r#"{{"drive_id":"data","path_on_host":{},"is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync","partuuid":"{SNAPSHOT_BLOCK_PARTUUID}"}}"#,
-                    json_string(path_text(&drive_b_path))
+                    r#"{{"id":"epoch_ro","path_on_host":{},"root_device":false,"read_only":true}}"#,
+                    json_string(path_text(&read_only_pmem_path))
                 ),
             ),
-            "PUT native-v2 epoch Sync Writeback data",
-        );
-        assert_no_content_response(
-            &http_put_json(
-                &source_socket,
-                "/drives/audit",
-                &format!(
-                    r#"{{"drive_id":"audit","path_on_host":{},"is_root_device":false,"is_read_only":true,"cache_type":"Unsafe","io_engine":"Async"}}"#,
-                    json_string(path_text(&audit_path))
-                ),
-            ),
-            "PUT native-v2 epoch read-only audit",
+            "PUT native-v2 epoch read-only pmem",
         );
         assert_no_content_response(
             &http_put_json(
@@ -11935,21 +11983,39 @@ mod macos_arm64 {
             ),
             "PUT native-v2 epoch source InstanceStart",
         );
-        wait_for_snapshot_block_epoch(
-            &drive_b_path,
-            SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+        wait_for_snapshot_pmem_epoch(
+            &writable_pmem_path,
+            SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE,
             GUEST_EXECUTION_TIMEOUT,
-            &format!("{case} source pre-capture data epoch"),
+            &format!("{case} source pre-capture pmem epoch"),
         );
-        assert_snapshot_block_epoch(
-            &drive_a_path,
-            SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
-            &format!("{case} source pre-capture primary epoch"),
+        wait_for_snapshot_pmem_throttle(
+            &source_socket,
+            &source_metrics_path,
+            GUEST_EXECUTION_TIMEOUT,
+            &format!("{case} source pending pmem limiter"),
         );
-        assert_snapshot_block_epoch(
-            &audit_path,
-            SNAPSHOT_BLOCK_AUDIT_BYTE,
-            &format!("{case} source audit epoch"),
+        if !rooted {
+            assert_snapshot_block_epoch(
+                &drive_a_path,
+                SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
+                &format!("{case} source pre-capture primary epoch"),
+            );
+            assert_snapshot_block_epoch(
+                &drive_b_path,
+                SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+                &format!("{case} source pre-capture data epoch"),
+            );
+            assert_snapshot_block_epoch(
+                &audit_path,
+                SNAPSHOT_BLOCK_AUDIT_BYTE,
+                &format!("{case} source audit epoch"),
+            );
+        }
+        assert_snapshot_pmem_epoch(
+            &read_only_pmem_path,
+            SNAPSHOT_PMEM_READ_ONLY_BYTE,
+            &format!("{case} source read-only pmem epoch"),
         );
         assert_no_content_response(
             &http_json(&source_socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
@@ -11963,9 +12029,16 @@ mod macos_arm64 {
             ),
             "PUT native-v2 epoch source FlushMetrics",
         );
-        assert_snapshot_block_metrics(
+        if !rooted {
+            assert_snapshot_block_metrics(
+                &source_metrics_path,
+                true,
+                &format!("{case} source metrics"),
+            );
+        }
+        assert_snapshot_pmem_metrics(
             &source_metrics_path,
-            true,
+            false,
             &format!("{case} source metrics"),
         );
 
@@ -11987,7 +12060,7 @@ mod macos_arm64 {
         let state_before = fs::read(&state_path).expect("native-v2 epoch state should read");
         let memory_before = fs::read(&memory_path).expect("native-v2 epoch memory should read");
         let graph_before = native_v2_device_graph(&state_path);
-        assert_snapshot_block_graph(&graph_before, enable_pci, rooted, &case);
+        assert_snapshot_storage_graph(&graph_before, enable_pci, rooted, &case);
         let source_output = source.terminate();
         assert_clean_shutdown(
             source_output,
@@ -12028,22 +12101,45 @@ mod macos_arm64 {
         );
         let paused_config = http_get(&paused_socket, "/vm/config");
         assert_ok_response(&paused_config, "GET restored native-v2 epoch VM config");
-        assert_eq!(paused_config.matches(r#""drive_id":"#).count(), 3);
+        assert_eq!(
+            paused_config.matches(r#""drive_id":"#).count(),
+            if rooted { 0 } else { 3 }
+        );
         for expected in [
-            r#""drive_id":"primary""#,
-            r#""drive_id":"data""#,
-            r#""drive_id":"audit""#,
-            r#""cache_type":"Unsafe""#,
-            r#""cache_type":"Writeback""#,
-            r#""io_engine":"Async""#,
-            r#""io_engine":"Sync""#,
-            SNAPSHOT_BLOCK_PARTUUID,
+            r#""id":"epoch_rw""#,
+            r#""id":"epoch_ro""#,
+            r#""read_only":false"#,
+            r#""read_only":true"#,
+            r#""rate_limiter""#,
         ] {
             assert_response_contains(
                 &paused_config,
                 expected,
                 "GET restored native-v2 epoch VM config",
             );
+        }
+        assert_eq!(
+            paused_config.contains(r#""root_device":true"#),
+            rooted,
+            "{case} restored pmem root role should be exact"
+        );
+        if !rooted {
+            for expected in [
+                r#""drive_id":"primary""#,
+                r#""drive_id":"data""#,
+                r#""drive_id":"audit""#,
+                r#""cache_type":"Unsafe""#,
+                r#""cache_type":"Writeback""#,
+                r#""io_engine":"Async""#,
+                r#""io_engine":"Sync""#,
+                SNAPSHOT_BLOCK_PARTUUID,
+            ] {
+                assert_response_contains(
+                    &paused_config,
+                    expected,
+                    "GET restored native-v2 epoch mixed VM config",
+                );
+            }
         }
         let recapture_body = format!(
             r#"{{"snapshot_type":"Full","snapshot_path":{},"mem_file_path":{}}}"#,
@@ -12061,7 +12157,7 @@ mod macos_arm64 {
             "PUT restored native-v2 epoch destination /snapshot/create",
         );
         let recaptured_graph = native_v2_device_graph(&recaptured_state_path);
-        assert_snapshot_block_stable_graph(
+        assert_snapshot_storage_stable_graph(
             &graph_before,
             &recaptured_graph,
             &format!("{case} restored destination recapture"),
@@ -12079,57 +12175,74 @@ mod macos_arm64 {
             &paused_socket,
             &format!("{case} explicitly resumed native-v2 epoch destination"),
         );
-        assert_snapshot_block_epoch(
-            &drive_a_path,
-            SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE,
-            &format!("{case} destination-one primary epoch"),
+        if !rooted {
+            assert_snapshot_block_epoch(
+                &drive_a_path,
+                SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE,
+                &format!("{case} destination-one primary epoch"),
+            );
+            assert_snapshot_block_epoch(
+                &drive_b_path,
+                SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE,
+                &format!("{case} destination-one data epoch"),
+            );
+            assert_snapshot_block_epoch(
+                &audit_path,
+                SNAPSHOT_BLOCK_AUDIT_BYTE,
+                &format!("{case} destination-one audit epoch"),
+            );
+            assert_snapshot_block_metrics(
+                &paused_metrics_path,
+                true,
+                &format!("{case} paused destination metrics"),
+            );
+        }
+        assert_snapshot_pmem_epoch(
+            &writable_pmem_path,
+            SNAPSHOT_PMEM_WRITABLE_DESTINATION_ONE_BYTE,
+            &format!("{case} destination-one writable pmem epoch"),
         );
-        assert_snapshot_block_epoch(
-            &drive_b_path,
-            SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE,
-            &format!("{case} destination-one data epoch"),
+        assert_snapshot_pmem_epoch(
+            &read_only_pmem_path,
+            SNAPSHOT_PMEM_READ_ONLY_BYTE,
+            &format!("{case} destination-one read-only pmem epoch"),
         );
-        assert_snapshot_block_epoch(
-            &audit_path,
-            SNAPSHOT_BLOCK_AUDIT_BYTE,
-            &format!("{case} destination-one audit epoch"),
-        );
-        assert_snapshot_block_metrics(
+        assert_snapshot_pmem_metrics(
             &paused_metrics_path,
             true,
             &format!("{case} paused destination metrics"),
         );
 
-        if !rooted {
-            let resumed = BangbangProcess::start_with_extra_args(
+        let resumed = BangbangProcess::start_with_extra_args(
+            &resumed_socket,
+            &format!("{instance_id}-native-v2-epoch-{case}-resumed"),
+            process_args,
+        );
+        configure_snapshot_destination_metrics(
+            &resumed_socket,
+            &resumed_metrics_path,
+            &format!("{case} automatic destination"),
+        );
+        assert_no_content_response(
+            &http_json_with_io_timeout(
                 &resumed_socket,
-                &format!("{instance_id}-native-v2-epoch-{case}-resumed"),
-                process_args,
-            );
-            configure_snapshot_destination_metrics(
-                &resumed_socket,
-                &resumed_metrics_path,
-                &format!("{case} automatic destination"),
-            );
-            assert_no_content_response(
-                &http_json_with_io_timeout(
-                    &resumed_socket,
-                    "PUT",
-                    "/snapshot/load",
-                    &snapshot_root_load_body(&state_path, &memory_path, true),
-                    GUEST_EXECUTION_TIMEOUT,
-                ),
-                "PUT native-v2 epoch automatic destination /snapshot/load",
-            );
-            let resumed_output = resumed.wait_for_exit_with_timeout(
+                "PUT",
+                "/snapshot/load",
+                &snapshot_root_load_body(&state_path, &memory_path, true),
                 GUEST_EXECUTION_TIMEOUT,
-                &format!("{case} automatically resumed native-v2 epoch guest poweroff"),
-            );
-            assert_clean_shutdown(
-                resumed_output,
-                &resumed_socket,
-                &format!("{case} automatically resumed native-v2 epoch destination"),
-            );
+            ),
+            "PUT native-v2 epoch automatic destination /snapshot/load",
+        );
+        let resumed_output = resumed.wait_for_exit_with_timeout(
+            GUEST_EXECUTION_TIMEOUT,
+            &format!("{case} automatically resumed native-v2 epoch guest poweroff"),
+        );
+        assert_clean_shutdown(
+            resumed_output,
+            &resumed_socket,
+            &format!("{case} automatically resumed native-v2 epoch destination"),
+        );
+        if !rooted {
             assert_snapshot_block_epoch(
                 &drive_a_path,
                 SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE,
@@ -12151,6 +12264,21 @@ mod macos_arm64 {
                 &format!("{case} automatic destination metrics"),
             );
         }
+        assert_snapshot_pmem_epoch(
+            &writable_pmem_path,
+            SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE,
+            &format!("{case} destination-two writable pmem epoch"),
+        );
+        assert_snapshot_pmem_epoch(
+            &read_only_pmem_path,
+            SNAPSHOT_PMEM_READ_ONLY_BYTE,
+            &format!("{case} destination-two read-only pmem epoch"),
+        );
+        assert_snapshot_pmem_metrics(
+            &resumed_metrics_path,
+            true,
+            &format!("{case} automatic destination metrics"),
+        );
 
         assert_eq!(
             fs::read(&state_path).expect("final native-v2 epoch state should read"),
@@ -12176,13 +12304,23 @@ mod macos_arm64 {
         });
     }
 
+    fn create_snapshot_pmem_epoch_backing(path: &Path, initial: u8) {
+        let mut bytes = vec![0_u8; SNAPSHOT_PMEM_FILE_BYTES];
+        bytes[..SNAPSHOT_PMEM_SECTOR_SIZE].fill(initial);
+        fs::write(path, bytes).unwrap_or_else(|error| {
+            panic!(
+                "snapshot pmem epoch backing {} should write: {error}",
+                path.display()
+            )
+        });
+    }
+
     fn snapshot_block_epoch(value: u8) -> Vec<u8> {
         vec![value; SNAPSHOT_BLOCK_SECTOR_SIZE]
     }
 
-    fn wait_for_snapshot_block_epoch(path: &Path, value: u8, timeout: Duration, context: &str) {
-        wait_for_file_prefix_marker(path, &snapshot_block_epoch(value), timeout)
-            .unwrap_or_else(|error| panic!("{context} should become visible: {error}"));
+    fn snapshot_pmem_epoch(value: u8) -> Vec<u8> {
+        vec![value; SNAPSHOT_PMEM_SECTOR_SIZE]
     }
 
     fn assert_snapshot_block_epoch(path: &Path, value: u8, context: &str) {
@@ -12193,6 +12331,57 @@ mod macos_arm64 {
             Some(snapshot_block_epoch(value).as_slice()),
             "{context} should retain the exact sector epoch"
         );
+    }
+
+    fn wait_for_snapshot_pmem_epoch(path: &Path, value: u8, timeout: Duration, context: &str) {
+        wait_for_file_prefix_marker(path, &snapshot_pmem_epoch(value), timeout)
+            .unwrap_or_else(|error| panic!("{context} should become visible: {error}"));
+    }
+
+    fn assert_snapshot_pmem_epoch(path: &Path, value: u8, context: &str) {
+        let bytes =
+            fs::read(path).unwrap_or_else(|error| panic!("{context} backing should read: {error}"));
+        assert_eq!(
+            bytes.get(..SNAPSHOT_PMEM_SECTOR_SIZE),
+            Some(snapshot_pmem_epoch(value).as_slice()),
+            "{context} should retain the exact external-prefix epoch"
+        );
+        assert_eq!(
+            bytes.len(),
+            SNAPSHOT_PMEM_FILE_BYTES,
+            "{context} should retain the exact unaligned file length"
+        );
+    }
+
+    fn wait_for_snapshot_pmem_throttle(
+        socket: &Path,
+        metrics: &Path,
+        timeout: Duration,
+        context: &str,
+    ) {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .expect("snapshot pmem throttle deadline should fit");
+        loop {
+            assert_no_content_response(
+                &http_put_json(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+                &format!("PUT {context} FlushMetrics"),
+            );
+            if snapshot_pmem_metric_total_if_readable(
+                metrics,
+                "epoch_rw",
+                "rate_limiter_throttled_events",
+            ) > 0
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context} should report a throttled pmem request before timeout; metrics:\n{}",
+                fs::read_to_string(metrics).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn configure_snapshot_destination_metrics(socket: &Path, metrics: &Path, context: &str) {
@@ -12206,7 +12395,7 @@ mod macos_arm64 {
         );
     }
 
-    fn assert_snapshot_block_graph(
+    fn assert_snapshot_storage_graph(
         graph: &SnapshotV2StorageDeviceGraph,
         enable_pci: bool,
         rooted: bool,
@@ -12214,8 +12403,8 @@ mod macos_arm64 {
     ) {
         assert_eq!(
             graph.block_records().len(),
-            3,
-            "{case} should capture three drives"
+            if rooted { 0 } else { 3 },
+            "{case} should capture the exact product block shape"
         );
         assert_eq!(
             graph.transport_kind(),
@@ -12226,39 +12415,113 @@ mod macos_arm64 {
             },
             "{case} should retain the selected transport"
         );
-        let primary = graph
-            .block_records()
-            .iter()
-            .find(|record| record.config().drive_id() == "primary")
-            .expect("epoch graph should contain primary");
-        assert_eq!(primary.is_root(), rooted);
-        assert!(!primary.config().is_read_only());
-        assert_eq!(primary.config().cache_type(), DriveCacheType::Unsafe);
-        assert_eq!(primary.config().io_engine(), DriveIoEngine::Async);
-        assert!(primary.config().rate_limiter().is_some());
+        if !rooted {
+            let primary = graph
+                .block_records()
+                .iter()
+                .find(|record| record.config().drive_id() == "primary")
+                .expect("mixed epoch graph should contain primary");
+            assert!(!primary.is_root());
+            assert!(!primary.config().is_read_only());
+            assert_eq!(primary.config().cache_type(), DriveCacheType::Unsafe);
+            assert_eq!(primary.config().io_engine(), DriveIoEngine::Async);
+            assert!(primary.config().rate_limiter().is_some());
 
-        let data = graph
-            .block_records()
-            .iter()
-            .find(|record| record.config().drive_id() == "data")
-            .expect("epoch graph should contain data");
-        assert!(!data.is_root());
-        assert!(!data.config().is_read_only());
-        assert_eq!(data.config().cache_type(), DriveCacheType::Writeback);
-        assert_eq!(data.config().io_engine(), DriveIoEngine::Sync);
-        assert_eq!(data.config().partuuid(), Some(SNAPSHOT_BLOCK_PARTUUID));
+            let data = graph
+                .block_records()
+                .iter()
+                .find(|record| record.config().drive_id() == "data")
+                .expect("mixed epoch graph should contain data");
+            assert!(!data.is_root());
+            assert!(!data.config().is_read_only());
+            assert_eq!(data.config().cache_type(), DriveCacheType::Writeback);
+            assert_eq!(data.config().io_engine(), DriveIoEngine::Sync);
+            assert_eq!(data.config().partuuid(), Some(SNAPSHOT_BLOCK_PARTUUID));
 
-        let audit = graph
-            .block_records()
+            let audit = graph
+                .block_records()
+                .iter()
+                .find(|record| record.config().drive_id() == "audit")
+                .expect("mixed epoch graph should contain audit");
+            assert!(!audit.is_root());
+            assert!(audit.config().is_read_only());
+            assert_eq!(audit.config().io_engine(), DriveIoEngine::Async);
+        }
+
+        assert_eq!(
+            graph.pmem_records().len(),
+            2,
+            "{case} should capture the complete pmem vector"
+        );
+        let writable = graph
+            .pmem_records()
             .iter()
-            .find(|record| record.config().drive_id() == "audit")
-            .expect("epoch graph should contain audit");
-        assert!(!audit.is_root());
-        assert!(audit.config().is_read_only());
-        assert_eq!(audit.config().io_engine(), DriveIoEngine::Async);
+            .find(|record| record.config().pmem_id() == "epoch_rw")
+            .expect("epoch graph should contain writable pmem");
+        let read_only = graph
+            .pmem_records()
+            .iter()
+            .find(|record| record.config().pmem_id() == "epoch_ro")
+            .expect("epoch graph should contain read-only pmem");
+        assert_eq!(graph.root_key(), rooted.then_some(writable.key()));
+        assert_eq!(writable.is_root(), rooted);
+        assert!(!writable.config().is_read_only());
+        assert!(writable.config().rate_limiter().is_some());
+        assert_eq!(
+            writable.pmem().file_bytes(),
+            SNAPSHOT_PMEM_FILE_BYTES as u64
+        );
+        assert_eq!(writable.pmem().mapped_bytes(), SNAPSHOT_PMEM_MAPPED_BYTES);
+        assert_eq!(
+            writable.pmem().guest_range().size(),
+            SNAPSHOT_PMEM_MAPPED_BYTES
+        );
+        assert_eq!(
+            writable.pmem().config_space().size(),
+            SNAPSHOT_PMEM_MAPPED_BYTES
+        );
+        assert!(writable.pmem().active_queue().is_some());
+        assert!(writable.pmem().limiter().ops().is_some());
+        assert!(writable.pmem().pending_rate_limited_queue());
+        assert!(matches!(
+            writable.pmem().retry(),
+            StorageRetryState::After { remaining_nanos } if remaining_nanos > 0
+        ));
+        assert!(writable.virtio().is_activated());
+        assert_eq!(writable.virtio().queues().len(), 1);
+        assert_eq!(writable.transport().kind(), graph.transport_kind());
+
+        assert!(!read_only.is_root());
+        assert!(read_only.config().is_read_only());
+        assert!(read_only.config().rate_limiter().is_none());
+        assert_eq!(
+            read_only.pmem().file_bytes(),
+            SNAPSHOT_PMEM_FILE_BYTES as u64
+        );
+        assert_eq!(read_only.pmem().mapped_bytes(), SNAPSHOT_PMEM_MAPPED_BYTES);
+        assert_eq!(
+            read_only.pmem().guest_range().size(),
+            SNAPSHOT_PMEM_MAPPED_BYTES
+        );
+        assert_eq!(
+            read_only.pmem().config_space().size(),
+            SNAPSHOT_PMEM_MAPPED_BYTES
+        );
+        assert!(!read_only.pmem().pending_rate_limited_queue());
+        assert_eq!(read_only.pmem().retry(), StorageRetryState::None);
+        assert!(read_only.pmem().limiter().is_empty());
+        assert!(read_only.virtio().is_activated());
+        assert_eq!(read_only.transport().kind(), graph.transport_kind());
+        assert!(
+            !writable
+                .pmem()
+                .guest_range()
+                .overlaps(read_only.pmem().guest_range()),
+            "{case} pmem guest ranges must remain distinct"
+        );
     }
 
-    fn assert_snapshot_block_stable_graph(
+    fn assert_snapshot_storage_stable_graph(
         expected: &SnapshotV2StorageDeviceGraph,
         actual: &SnapshotV2StorageDeviceGraph,
         context: &str,
@@ -12275,10 +12538,85 @@ mod macos_arm64 {
             "{context} record count"
         );
         assert_eq!(
-            actual.pmem_records(),
-            expected.pmem_records(),
-            "{context} pmem records"
+            actual.pmem_records().len(),
+            expected.pmem_records().len(),
+            "{context} pmem record count"
         );
+        for (expected, actual) in expected.pmem_records().iter().zip(actual.pmem_records()) {
+            assert_eq!(actual.key(), expected.key(), "{context} pmem key");
+            assert_eq!(
+                actual.config(),
+                expected.config(),
+                "{context} pmem configuration"
+            );
+            assert_eq!(
+                actual.pmem().file_bytes(),
+                expected.pmem().file_bytes(),
+                "{context} pmem file bytes"
+            );
+            assert_eq!(
+                actual.pmem().mapped_bytes(),
+                expected.pmem().mapped_bytes(),
+                "{context} pmem mapped bytes"
+            );
+            assert_eq!(
+                actual.pmem().guest_range(),
+                expected.pmem().guest_range(),
+                "{context} pmem guest range"
+            );
+            assert_eq!(
+                actual.pmem().config_space(),
+                expected.pmem().config_space(),
+                "{context} pmem config space"
+            );
+            assert_eq!(
+                actual.pmem().active_queue(),
+                expected.pmem().active_queue(),
+                "{context} pmem active queue"
+            );
+            for (name, expected_bucket, actual_bucket) in [
+                (
+                    "bandwidth",
+                    expected.pmem().limiter().bandwidth(),
+                    actual.pmem().limiter().bandwidth(),
+                ),
+                (
+                    "ops",
+                    expected.pmem().limiter().ops(),
+                    actual.pmem().limiter().ops(),
+                ),
+            ] {
+                assert_eq!(
+                    actual_bucket.map(|bucket| (bucket.budget(), bucket.remaining_burst())),
+                    expected_bucket.map(|bucket| (bucket.budget(), bucket.remaining_burst())),
+                    "{context} pmem {name} limiter value"
+                );
+                assert!(
+                    actual_bucket
+                        .zip(expected_bucket)
+                        .is_none_or(|(actual, expected)| {
+                            actual.age_nanos() >= expected.age_nanos()
+                        }),
+                    "{context} pmem {name} limiter age should advance monotonically"
+                );
+            }
+            assert_eq!(
+                actual.pmem().pending_rate_limited_queue(),
+                expected.pmem().pending_rate_limited_queue(),
+                "{context} pmem pending rate-limited queue"
+            );
+            assert_snapshot_retry_progress(
+                expected.pmem().retry(),
+                actual.pmem().retry(),
+                &format!("{context} pmem retry"),
+            );
+            assert_eq!(actual.virtio(), expected.virtio(), "{context} pmem virtio");
+            assert_eq!(
+                actual.transport(),
+                expected.transport(),
+                "{context} pmem transport"
+            );
+        }
         for (expected, actual) in expected.block_records().iter().zip(actual.block_records()) {
             assert_eq!(actual.key(), expected.key(), "{context} record key");
             assert_eq!(
@@ -12308,10 +12646,10 @@ mod macos_arm64 {
                 expected_block.active_queue(),
                 "{context} active request cursor"
             );
-            assert_eq!(
-                actual_block.retry(),
+            assert_snapshot_retry_progress(
                 expected_block.retry(),
-                "{context} retry disposition"
+                actual_block.retry(),
+                &format!("{context} retry disposition"),
             );
             for (name, expected_bucket, actual_bucket) in [
                 (
@@ -12341,6 +12679,31 @@ mod macos_arm64 {
                 expected.transport(),
                 "{context} transport continuation"
             );
+        }
+    }
+
+    fn assert_snapshot_retry_progress(
+        expected: StorageRetryState,
+        actual: StorageRetryState,
+        context: &str,
+    ) {
+        match (expected, actual) {
+            (StorageRetryState::None, StorageRetryState::None)
+            | (StorageRetryState::Immediate, StorageRetryState::Immediate) => {}
+            (
+                StorageRetryState::After {
+                    remaining_nanos: expected,
+                },
+                StorageRetryState::After {
+                    remaining_nanos: actual,
+                },
+            ) => assert!(
+                actual > 0 && actual <= expected,
+                "{context} should retain a positive nonincreasing retry duration: expected={expected}, actual={actual}"
+            ),
+            (expected, actual) => {
+                panic!("{context} retry kind changed: expected={expected:?}, actual={actual:?}")
+            }
         }
     }
 
@@ -12387,6 +12750,51 @@ mod macos_arm64 {
                     path.display()
                 )
             })
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()?
+                    .get(&section)?
+                    .get(field)?
+                    .as_u64()
+            })
+            .fold(0, u64::saturating_add)
+    }
+
+    fn assert_snapshot_pmem_metrics(path: &Path, expect_retry: bool, context: &str) {
+        let output = fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!("{context} metrics {} should read: {error}", path.display())
+        });
+        assert!(
+            snapshot_pmem_metric_total_if_readable(path, "epoch_rw", "queue_event_count") > 0,
+            "{context} should report writable pmem queue events; metrics:\n{output}"
+        );
+        assert!(
+            snapshot_pmem_metric_total_if_readable(
+                path,
+                "epoch_rw",
+                "rate_limiter_throttled_events"
+            ) > 0,
+            "{context} should report a throttled writable pmem request; metrics:\n{output}"
+        );
+        if expect_retry {
+            assert!(
+                snapshot_pmem_metric_total_if_readable(
+                    path,
+                    "epoch_rw",
+                    "rate_limiter_event_count"
+                ) > 0,
+                "{context} should report restored pmem limiter progress; metrics:\n{output}"
+            );
+        }
+    }
+
+    fn snapshot_pmem_metric_total_if_readable(path: &Path, pmem_id: &str, field: &str) -> u64 {
+        let section = format!("pmem_{pmem_id}");
+        let Ok(output) = fs::read_to_string(path) else {
+            return 0;
+        };
+        output
             .lines()
             .filter_map(|line| {
                 serde_json::from_str::<serde_json::Value>(line)

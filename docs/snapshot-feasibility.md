@@ -2,24 +2,29 @@
 
 This document records the implemented boundary and remaining roadmap for
 Firecracker-shaped snapshot APIs on macOS with Hypervisor.framework. bangbang
-supports a public bangbang-native v2.5 Full/File lifecycle with a rooted or
-rootless ordered vector of regular-file block devices. It retains exact
-single-root native-v2 2.4, device-free native-v2 2.3, and frozen native-v1
-File/Uffd loading for compatibility. Broader Firecracker snapshot-file and
-migration compatibility remains out of scope.
+supports a public bangbang-native v2.6 Full/File lifecycle with a rooted or
+rootless ordered regular-file block-and-pmem profile-3 graph. It retains exact
+block-only native-v2 2.5, single-root
+native-v2 2.4, device-free native-v2 2.3, and frozen native-v1 File/Uffd
+loading for compatibility. Broader Firecracker snapshot-file and migration
+compatibility remains out of scope.
 
 The immutable native-v2 `2.0.0` profile contains no semantic
 component, `2.1.x` adds one state-bound demand-paged File/COW memory image, and
 `2.2.x` adds a permanent typed multi-vCPU HVF platform graph. Legacy `2.3.0`
 appends portable PL031, PVTime, VMGenID, and VMClock state and clone policies.
 Exact `2.4.0` adds mandatory device-graph kind 7 with profile 1's one
-read-only File/Sync root. Current `2.5.0` retains kind 7 and activates profile
-2: 1–64 ordered regular-file block records over MMIO or the product PCI
-endpoint budget. The graph may be rootless or select the first record as root
-and may mix read-only/read-write, Sync/Async, Unsafe/Writeback, partuuid, and
-limiter state. The public process reconstructs the complete multi-vCPU
-platform, time/identity ownership, and block owners through one newly
-authorized complete-set transaction. Optional devices remain excluded, and the
+read-only File/Sync root. Exact `2.5.0` retains kind 7 and activates profile 2
+with 1–64 ordered regular-file block records. Current `2.6.0` activates
+profile 3 with 1–64 ordered regular-file storage records spanning block and
+pmem over MMIO or the product PCI endpoint budget. The graph may be rootless
+or select the first cross-storage record as root. Block records retain
+read-only/read-write, Sync/Async, Unsafe/Writeback, partuuid, and limiter
+state; pmem records retain read-only/root, exact file and mapped length,
+limiter/retry, queue, interrupt, mapping, and transport state. The public
+process reconstructs the complete multi-vCPU platform, time/identity
+ownership, and all storage owners through one newly authorized complete-set
+transaction. Optional devices other than pmem remain excluded, and the
 unavoidable default UART must remain canonical before capture.
 `LazyGuestMemory` remains the backend-neutral
 private-anonymous
@@ -35,59 +40,60 @@ path adds Linux UFFD wire compatibility.
 bangbang implements two classified native state families, exact-version
 inspection, bound guest-memory image I/O, and one macOS no-clobber two-file
 publisher/loader. The current public writer captures an accepted paused
-native-v2 2.5 profile-2 source into a state/memory pair. A fresh process
+native-v2 2.6 profile-3 source into a state/memory pair. A fresh process
 consumes that pair through retained read-only private File/COW mappings and one
-exact complete-set backing transaction, commits the complete destination
+exact block-and-pmem complete-set backing transaction, commits the complete destination
 initially paused, and optionally resumes through the ordinary lifecycle path.
-The public loader also recognizes singleton-root native-v2 2.4, device-free
-native-v2 2.3, and frozen native-v1 state, routing the latter to the unchanged
-eager File or macOS pager compatibility path.
+The public loader also recognizes block-only native-v2 2.5, singleton-root
+native-v2 2.4, device-free native-v2 2.3, and frozen native-v1 state, routing
+the latter to the unchanged eager File or macOS pager compatibility path.
 
-The generalized internal destination foundation also prepares one complete
-host-free root/vsock resource request through a coherent contained-session
-transaction. A feature-gated disposable signed bundle now certifies exact
-root-file and socket-directory/broker authority, prepublication abort and
-reuse, nine deterministic cancellation checkpoints, one-time typed
-take/adopt/commit, launcher-opened root identity after pathname replacement,
+The generalized destination foundation prepares one complete typed storage
+resource request through a coherent direct or contained-session transaction.
+The normal production bundle certifies exact block/pmem authority,
+prepublication abort and reuse, deterministic cancellation, one-time typed
+take/adopt/commit, launcher-opened identity after pathname replacement,
 prepared and active cleanup, both independent process-death orders,
-replacement-safe socket ownership, concurrent same-ID isolation, and
-redaction without a new entitlement, ambient path, protocol, or steady helper.
-The normal bundle excludes that probe. This is delivery evidence for internal
-resource preparation only: current public native-v2 bytes, placement, load
-invocation, restored-guest behavior, override behavior, clones, and portability
-remain unchanged.
+cross-class alias rejection, concurrent same-ID isolation, and redaction
+without a new entitlement, ambient path, protocol, or steady helper. Profile 3
+uses this boundary in the public load path; other optional-device overrides,
+clones, and broad portability remain unchanged.
 
 - `PUT /snapshot/create` and `PUT /snapshot/load` parse and normalize complete
   request bodies into debug-redacted API and runtime values before reaching VMM
 action policy. Paths and override contents are never logged or echoed.
 - Create is paused-state-only and supports only `Full` for a 1–32-vCPU source
-  with a configured boot source and 1–64 ordered regular-file block devices,
-  no optional devices/MMDS, default serial configuration, and a live UART
-  exactly equal to the canonical empty reset-compatible device model. The
-  graph may be rootless or have one first root and may mix access, engine,
-  cache, partuuid, and limiter state. Every record uses the process-selected
-  MMIO or PCI transport; PCI remains bounded by the 31-endpoint product budget.
+  with a configured boot source and 1–64 ordered regular-file block and pmem
+  devices, no optional devices other than pmem or MMDS, default serial
+  configuration, and a live UART exactly equal to the canonical empty
+  reset-compatible device model. The graph may be rootless or have one first
+  cross-storage root. Block records may mix access, engine, cache, partuuid,
+  and limiter state; pmem records retain access, limiter, exact file/mapped
+  geometry, and mapping state. Every record uses the process-selected MMIO or
+  PCI transport; PCI remains bounded by the 31-endpoint product budget.
   Unsupported modes fail before storage work.
   Unsupported broad storage profiles run the live non-persisting preflight
   described below, then fail before contained grant claims, artifact staging,
   or native state capture.
-- The profile-2 device graph persists each ordered configuration, block
-  runtime, limiter/retry state, queue continuation, common virtio state, and
-  transport state. MMIO carries each fixed placement, register, queue, and
-  interrupt state; PCI carries each endpoint identity, BAR and capability
-  state, queue selection, MSI-X table/PBA/vector state, and shared registry
-  placement needed to recreate the complete owner vector. This activation does
-  not generalize PCI persistence to balloon, network, pmem, vsock, entropy,
-  virtio-mem, vhost-user, or host-adapter state.
+- The profile-3 device graph persists each ordered block or pmem
+  configuration, runtime, limiter/retry state, queue continuation, common
+  virtio state, and transport state. MMIO carries each fixed placement,
+  register, queue, and interrupt state; PCI carries each endpoint identity,
+  BAR and capability state, queue selection, MSI-X table/PBA/vector state, and
+  shared registry placement needed to recreate the complete owner vector. Pmem
+  additionally binds exact file length, aligned mapped length, and guest
+  range/configuration-space state. This activation does not generalize PCI
+  persistence to balloon, network, vsock, entropy, virtio-mem, vhost-user, or
+  host-adapter state.
 - Before applying those native-v2 profile exclusions, paused create asks
   the boot owner for one complete capture-ready storage traversal. It reconciles
   every configured startup or runtime block/pmem device with its authoritative
   live MMIO or PCI owner, rejects any live vhost-user block backend first, and
   returns a redacted in-memory state aggregate. Async generations are stopped
   together, drained together, and have every completion plus its MMIO SPI or PCI
-  MSI-X interrupt published before state capture and same-generation reopen. A
-  admitted regular-file vector feeds the exact 2.5 profile-2 graph. Vhost-user
-  and any broader optional-device inventory remain followed by profile
+  MSI-X interrupt published before state capture and same-generation reopen.
+  An admitted regular-file vector feeds the exact 2.6 profile-3 graph.
+  Vhost-user and any broader optional-device inventory remain followed by profile
   rejection, so they publish no artifact bytes and create no load contract.
 - An admitted create holds one scoped supervisor transaction from FIFO
   admission through publication. It failure-atomically quiesces block, PMEM,
@@ -140,7 +146,7 @@ action policy. Paths and override contents are never logged or echoed.
   invocation, restored acknowledgement/reconnect/override proof,
   clone/versioning, and portability. The signed source resume is deliberately
   not described as artifact restore.
-- `--snapshot-version` prints the current writer version `v2.5.0`.
+- `--snapshot-version` prints the current writer version `v2.6.0`.
   `--describe-snapshot <PATH>` opens a bounded regular file with the same
   nonblocking, path-redacted startup-file policy, classifies and fully
   validates either native-v1 or native-v2, and prints its exact embedded
@@ -160,8 +166,9 @@ action policy. Paths and override contents are never logged or echoed.
   selectors. It duplicates state for one bounded family decode without
   consuming the registry, then atomically takes the tagged
   `SnapshotStateInput` and `SnapshotMemoryInput` files. Current native-v2
-  additionally derives the ordered drive requests from the graph and resolves
-  the entire keyed vector through one exact destination authority transaction.
+  additionally derives the ordered block and pmem requests from the graph and
+  resolves the entire keyed vector through one exact destination authority
+  transaction.
   Missing, extra, reordered, aliased, wrong-access, wrong-role/kind,
   wrong-size, changed-geometry, and consumed resources reject before
   construction. The complete batch remains provisional until
@@ -180,22 +187,23 @@ action policy. Paths and override contents are never logged or echoed.
   and load the committed pair. The public process transaction supplies the
   publisher-owned staging writer to complete capture and requires a composite
   commit; the public load transaction consumes only that committed kind-2 pair.
-- Signed Apple Silicon executable coverage retains the exact real-root smoke
-  and adds rooted/rootless × MMIO/PCI profile-2 certification with three mixed
-  drives. A deterministic initrd validates seeded content, forces limiter
-  retry, persists both writable pre-capture epochs, rejects read-only writes,
-  observes the restored graph Paused, recaptures, resumes, and advances both
-  writable epochs. A second fresh rootless destination loads the same immutable
-  state/memory pair and observes the first destination's external epoch before
-  advancing it again.
+- Signed Apple Silicon executable coverage retains the exact 2.5 block
+  regression and adds rooted pmem-only/rootless mixed × MMIO/PCI profile-3
+  certification. A deterministic initrd validates seeded block/pmem content,
+  forces limiter retry, persists writable pre-capture epochs, rejects
+  read-only writes, observes the restored graph Paused, recaptures, resumes,
+  and advances the writable epochs. Fresh destinations load the same immutable
+  state/memory pair, observe prior shared external prefixes, and verify a zero
+  private pmem tail before advancing again.
 - Signed production-bundle coverage repeats that four-cell protocol with exact
-  external kernel/initrd/metrics/drive/output grants, pathname replacement,
-  granted early description, explicit and automatic resume, retained
-  descriptor identity, collision preservation, and rootless-MMIO worker-first
-  and launcher-first cleanup after Paused publication. State/memory inputs and
-  their File/COW guest mappings remain immutable/private. Writable external
-  drive backings deliberately are shared rather than COW-isolated and require
-  operator serialization. A separate signed frozen native-v1 File fixture
+  external kernel/initrd/metrics/block/pmem/output grants, pathname
+  replacement, granted early description, explicit and automatic resume,
+  retained descriptor identity, collision preservation, and rootless-MMIO
+  worker-first and launcher-first cleanup after Paused publication.
+  State/memory inputs and their File/COW guest mappings remain
+  immutable/private. Writable external block and pmem prefixes deliberately
+  are shared rather than COW-isolated and require operator serialization; pmem
+  private tails are volatile. A separate signed frozen native-v1 File fixture
   reaches the same public family dispatcher.
 
 ## Native V1 State Envelope
@@ -324,7 +332,7 @@ binding header followed by one 24-byte entry per ordered guest extent:
 | Offset | Width | Field | Native-v2 memory rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | bytes `BANGM2A\0` |
-| 8..14 | 6 | semantic version | admitted `2.1.x`, `2.2.x`, `2.3.x`, exact `2.4.0`, or exact `2.5.0`; current writer emits `2.5.0` |
+| 8..14 | 6 | semantic version | admitted `2.1.x`, `2.2.x`, `2.3.x`, exact `2.4.0`, exact `2.5.0`, or exact `2.6.0`; current writer emits `2.6.0` |
 | 14 | 2 | header bytes | exact `64` |
 | 16 | 4 | flags | must be zero |
 | 20 | 4 | guest granule | exact `4096` bytes |
@@ -517,11 +525,11 @@ reinterpreted as a 2.4 device profile. Structural and memory compatibility for
 semantics, optional ordinary resume, collision/cancellation behavior, and
 Firecracker/unknown rejection remain unchanged. Exact 2.4 profile 1 continues
 to reject extra drives, writable or non-Sync roots, and every broader device
-shape; it is not reinterpreted as current profile 2.
+shape; it is not reinterpreted as profile 2 or current profile 3.
 
-### Native V2 2.5 Multi-Block Activation
+### Native V2 2.5 Multi-Block Compatibility
 
-#1616 advances only the current writer to exact `2.5.0`; #1617 certifies its
+#1616 advanced the then-current writer to exact `2.5.0`; #1617 certifies its
 public direct and production boundaries. Kind `7` remains mandatory, but its
 payload selects profile 2 and carries an ordered directory of 1–64 regular-file
 block records. Each record owns four closed sections: stable public
@@ -557,17 +565,47 @@ normal-bundle matrices exercise all three mixed records, pre-capture
 persistence, post-load read/write/flush, limiter progress, queue interrupts,
 Paused observation, recapture, explicit/automatic resume, fresh VM/metrics/
 Async ownership, retained descriptor identity, and worker/launcher death
-cleanup. PMEM, network, balloon, virtio-mem, entropy, vsock, MMDS,
-noncanonical serial, native-v2 Uffd, Diff, overrides/editing, Firecracker bytes,
-and broad migration portability remain fail-closed or separate Wave 6 work.
+cleanup. Pmem support is added only by current profile 3; exact 2.5 continues
+to reject pmem, network, balloon, virtio-mem, entropy, vsock, MMDS,
+noncanonical serial, native-v2 Uffd, Diff, overrides/editing, Firecracker
+bytes, and broad migration portability.
+
+### Native V2 2.6 Block-and-Pmem Activation
+
+#1634 certifies the current exact `2.6.0` profile 3. Kind `7` carries an
+ordered directory of 1–64 regular-file block and pmem records, with at least
+one record and at most one first cross-storage root. Block sections retain the
+profile-2 configuration/runtime/common-virtio/transport model. Pmem sections
+bind exact ID, access/root/limiter configuration; file and aligned mapped
+length; queue, feature, interrupt, limiter/retry, and flush continuation; and
+one exact MMIO mapping or modern PCI endpoint.
+
+Load derives one complete typed block/pmem request. Direct mode opens exact
+ordinary files; contained mode atomically resolves exact `DriveBacking` and
+`PmemBacking` grants. Missing, extra, swapped, cross-class aliased,
+wrong-role/kind/access/length, changed geometry, consumed authority, and
+cancellation reject before construction or roll back the complete batch.
+Construction, controller, completion, worker-death, and launcher-death faults
+leave no partial published destination or leaked authority.
+
+The signed direct and normal-production matrices run rooted pmem-only and
+rootless mixed block/pmem cells over MMIO and PCI. Writable pmem file prefixes
+are deliberately shared and advance across fresh destinations; read-only peers
+remain unchanged. Each backing length is 2 MiB plus one 16-KiB Apple-Silicon
+host page, while the 2-MiB-aligned mapping tail remains private and reads zero
+through guest DAX on every fresh mapping. State and memory artifacts remain
+immutable, destination File/COW RAM stays private, recapture is graph-stable,
+and limiter/queue/interrupt ownership continues after explicit or automatic
+resume. This is a bangbang-native same-backing contract, not Firecracker
+artifact interoperability or broad migration portability.
 
 ### Native V2 HVF Platform State Profile
 
 Minor 2 defines the base editor-friendly platform graph, minor 3 appends its
 portable time/clone-identity component, minor 4 appends device-graph profile 1,
-and minor 5 retains the same component key with profile 2. Every directory
-entry is semantic, singleton kinds appear exactly once, and per-vCPU instances
-are contiguous:
+minor 5 retains the same component key with profile 2, and minor 6 selects
+profile 3. Every directory entry is semantic, singleton kinds appear exactly
+once, and per-vCPU instances are contiguous:
 
 | Key | Payload | Cardinality |
 | --- | --- | --- |
@@ -577,19 +615,19 @@ are contiguous:
 | `(4, 0)` | `BANGTP2\0` stable topology and PSCI lifecycle state | exactly one |
 | `(5, i)` | `BANGVC2\0` complete state for vCPU index/MPIDR `i` | `i = 0..vcpu_count-1` |
 | `(6, 0)` | `BANGTM2\0` portable PL031/PVTime/VMGenID/VMClock state and policies | exactly one, after all vCPUs |
-| `(7, 0)` | `BANGD2A\0` exact profile-1 singleton root or profile-2 ordered multi-block graph | exactly one in 2.4/2.5, after time state |
+| `(7, 0)` | `BANGD2A\0` exact profile-1 singleton root, profile-2 ordered block graph, or profile-3 ordered block-and-pmem graph | exactly one in 2.4/2.5/2.6, after time state |
 
 The legacy platform scan requires 6–37 entries in that exact key order; the
 current graph-bearing profiles require 7–38. All validate before
 payload-dependent allocation. Kinds 2–6 require profile 1; kind 7 requires
-profile 1 at exact 2.4 or profile 2 at exact 2.5. Every payload requires its
+profile 1 at exact 2.4, profile 2 at exact 2.5, or profile 3 at exact 2.6. Every payload requires its
 exact fixed header size, zero flags/reserved fields, exact checked lengths, and
 complete consumption.
 
 Kind 2 stores the checked machine configuration, bounded native kernel/initrd
 path bytes, optional UTF-8 boot arguments, deterministic live-FDT
 placement/size, a redacted checksum identity, and one version-defined FDT
-profile word. Exact 2.3 requires the legacy zero value; exact 2.4 and 2.5
+profile word. Exact 2.3 requires the legacy zero value; exact 2.4, 2.5, and 2.6
 require the product value proving that VMM-owned source admission used the
 canonical process shell. Paths are inert metadata: construction and decode neither
 resolve nor open them. A custom CPU-template receipt contains at most 256
@@ -669,7 +707,7 @@ already-authorized `GuestMemory`. Exact ranges, retained live-FDT
 address/length/checksum, destination cache facts, time metadata, guest ABI
 bytes, PVTime records, identity destinations, and notification lines are
 checked before VM creation. Legacy 2.3 additionally parses those bytes as its
-exact default process shell. Graph-bearing 2.4 and current 2.5 instead require
+exact default process shell. Graph-bearing 2.4, 2.5, and current 2.6 instead require
 the source-product profile word and derive the canonical product shell from
 the typed machine, transport, interrupt, and device graph after checking every
 cross-binding. The
@@ -692,10 +730,12 @@ destination can recapture to a fresh memory/state identity for another restore.
 The focused platform deliberately reconstructs no general optional virtio
 device or host endpoint. The process adapter validates the exact legacy FDT
 shell or graph-bearing typed product profile, composes the authorized profile-1
-root or profile-2 block owners, adds a fresh output-only or buffered UART, and
+root, profile-2 block owners, or profile-3 block-and-pmem owners, adds a fresh
+output-only or buffered UART, and
 commits that owner into the normal lifecycle initially `Paused`. Public
-native-v2 activation uses this exact boundary; general serial input and optional-device
-serialization/restoration remain in their device slices.
+native-v2 activation uses this exact boundary; general serial input and
+serialization/restoration for optional devices other than pmem remain in
+their device slices.
 
 ### Stable Paused vCPU Topology State
 
@@ -734,9 +774,10 @@ introduced this value as kind 4 and #1569 composes it with the complete
 reviewed multi-vCPU register aggregate for unpublished paused reconstruction;
 legacy `2.3.0` retains that exact topology payload and appends the
 time/clone-identity component. Exact `2.4.0` retains both and appends the
-single-root device graph; current `2.5.0` retains the same platform/time
-payloads and replaces only kind 7's profile with the ordered regular-file block
-vector. Complete optional production-resource ownership remains outside it.
+single-root device graph; exact `2.5.0` retains the same platform/time payloads
+and selects kind 7's ordered regular-file block profile; current `2.6.0`
+selects the ordered block-and-pmem profile. Production-resource ownership for
+optional devices other than pmem remains outside it.
 
 ## Native V1 Guest-Memory Image and Binding
 
@@ -2036,7 +2077,8 @@ when each slice landed; later rows supersede earlier deferred-work clauses.
 | Private paused-process native-v2 restoration (implemented) | #1577 admits only pristine File/COW destinations, classifies direct or contained state before resource adoption, retains decoded machine facts and inert boot metadata, validates the exact default arm64 FDT/UART/RTC/time shell, and commits a closed focused supervisor plus controller into the normal process lifecycle initially Paused. Fresh buffered or stdout-only serial never inherits source bytes or opens stdin; requested resume uses the ordinary action gate. Pre-adoption failures are retryable, while owner, commit, or ambiguous-cleanup failures share the terminal construction latch with boot and native-v1 restore. Public load remains native-v1. | State-first family and descriptor/profile rejection; exact hostile FDT node/range/interrupt/identity checks; fresh serial and controller adoption; session/commit/cleanup/terminal-latch faults; repeated immutable File/COW loads; and a signed two-vCPU source recapture followed by paused and resume-requested restore into two fresh normal processes with lifecycle and clean-shutdown proof. |
 | Public native-v2 Full/File activation (implemented) | #1578 routes public paused `Full` create to the then-current `2.3.0` producer and performs one-open family dispatch on load: frozen native-v1 retains File/Uffd compatibility, native-v2 retains File/COW, and pinned Firecracker or unknown bytes reject without fallback. Both families publish Paused before optional resume; v2 Uffd, Diff, custom or mutated serial, drives/devices/MMDS/PCI/boot timer, overrides, editing, and broad portability remain fail-closed. At that slice the CLI reported `v2.3.0` and described the exact validated v1/v2 version. | Runtime/VMM/API/process family, hostile-input, collision/cancellation, observability, redaction, retry/terminal, and immutable-pair tests; signed frozen-v1 File dispatch; signed public two-vCPU direct v2 Paused/explicit+automatic resume, private COW writes, repeated isolated destinations, artifact immutability, Uffd rejection, and real closed-stdout terminal cleanup; signed App Sandbox CLI plus production state/memory grant, retained-descriptor, staging-recovery, and launcher/worker lifecycle evidence. |
 | Native-v2 2.4 root activation (implemented compatibility profile) | #1589 advanced only the then-current writer to `2.4.0`, preserved exact device-free 2.3 compatibility, and admitted one read-only File/Sync root over MMIO or PCI. The mandatory device graph binds configuration, block runtime, common virtio, and transport state to the same state/memory candidate. Public load validates the complete graph, authorizes the inert root selector at the destination, keeps the backing lease provisional through owner construction, and commits it only with the Paused session/controller handoff. Exact 2.4 remains readable with those unchanged limits. | Exact 2.3/2.4 version and graph boundary fixtures; hostile graph/candidate/transport/backing mutations; MMIO/PCI public create/load and controller-handoff fault injection; collision, redaction, retry, terminal, and lease cleanup tests; signed direct two-vCPU root create/restore and signed production root-grant identity across replacement, explicit/automatic resume, immutable artifacts, and cleanup. |
-| Native-v2 2.5 regular-file multi-block activation and certification (implemented) | #1616 advances the current writer to exact `2.5.0` profile 2 with rooted or rootless ordered vectors of 1–64 regular-file block devices over MMIO or the product PCI budget. Mixed RO/RW, Sync/Async, Unsafe/Writeback, partuuid, limiter/retry, queue, interrupt, and transport state bind to the same immutable state/memory pair. Load derives one exact keyed complete-set transaction with no fallback or per-drive override and commits every lease/fresh Async generation with the Paused session. File/COW memory is private; externally managed writable drive bytes are deliberately shared and require operator serialization. Vhost-user and optional devices remain excluded. | #1617's finite create/load stage matrix; hostile profile/graph/state-memory/authority/geometry/transport/Async/controller/completion/cancellation/cleanup injections; exact retryable/terminal/redaction checks; signed direct and normal-production rooted/rootless × MMIO/PCI deterministic all-drive pre/post-capture persistence, limiter/interrupt progress, recapture, fresh destination ownership, explicit/automatic resume, immutable state/memory, shared writable epochs, retained grants, collision/replacement safety, and both worker/launcher death orders. |
+| Native-v2 2.5 regular-file multi-block activation and certification (implemented compatibility profile) | #1616 advanced the then-current writer to exact `2.5.0` profile 2 with rooted or rootless ordered vectors of 1–64 regular-file block devices over MMIO or the product PCI budget. Mixed RO/RW, Sync/Async, Unsafe/Writeback, partuuid, limiter/retry, queue, interrupt, and transport state bind to the same immutable state/memory pair. Load derives one exact keyed complete-set transaction with no fallback or per-drive override and commits every lease/fresh Async generation with the Paused session. File/COW memory is private; externally managed writable drive bytes are deliberately shared and require operator serialization. Vhost-user and optional devices remain excluded from exact 2.5. | #1617's finite create/load stage matrix; hostile profile/graph/state-memory/authority/geometry/transport/Async/controller/completion/cancellation/cleanup injections; exact retryable/terminal/redaction checks; signed direct and normal-production rooted/rootless × MMIO/PCI deterministic all-drive pre/post-capture persistence, limiter/interrupt progress, recapture, fresh destination ownership, explicit/automatic resume, immutable state/memory, shared writable epochs, retained grants, collision/replacement safety, and both worker/launcher death orders. |
+| Native-v2 2.6 regular-file block-and-pmem activation and certification (implemented) | #1634 advances the current writer to exact `2.6.0` profile 3 with 1–64 ordered block/pmem records, rooted or rootless across the storage classes. It persists exact configuration/runtime/limiter/queue/interrupt/mapping and MMIO/PCI transport state, then resolves one direct or contained keyed complete-set transaction without ambient fallback. State/memory and File/COW RAM remain immutable/private; writable external block and pmem prefixes deliberately share bytes, while each fresh pmem private tail starts zero. | Fixed profile-3 fixtures; hostile missing/extra/swapped/aliased/role/kind/access/length/geometry/cancellation/construction/controller/completion/cleanup tests; signed direct and normal-production rooted pmem-only/rootless mixed × MMIO/PCI pre/post-capture persistence, read-only protection, limiter/interrupt progress, recapture, explicit/automatic resume, immutable-pair reuse, shared writable epochs, fresh zero DAX tails, exact grants, replacement safety, and worker/launcher death cleanup. |
 | Supervisor lease and admission (foundation implemented) | #1160 adds atomic admission/FIFO ordering, worker-side pause revalidation, one scoped lease-owned operation, normal-command rejection, structured release, and out-of-band shutdown invalidation. Real capture work and admission across the remaining owners are deferred. | Supervisor and `ProcessVmm` unit tests plus API/process pause-state tests. |
 | Auxiliary quiescence and complete publication transaction (implemented for native-v1 baseline) | #1162 introduced acknowledged RAII quiescence for block and entropy; #1389 added the topology-wide SMP pause barrier and PMEM guard; #1390 includes network, acquires all four failure-atomically, drains tokens only after complete acknowledgement, preserves in-flight/deferred/deadline work, and holds the worker lease through commit plus the post-publication hook. Process API/MMDS/controller and periodic work are serialized by the synchronous owner borrow. | Deterministic scheduler, supervisor, cancellation/seal, publication-visibility, process/API serialization, and fresh-retry tests plus combined signed SMP pause and one-vCPU baseline publication evidence. |
 | Complete dirty epochs and public tracking (implemented) | #1395 supplies fail-closed HVF protection/fault retry. #1396 adds the shared `GuestMemory` bitmap, exact initial/reprotected DFSC `0x07`/`0x0f` ownership checks, every current bounded host/device writer, conservative discard, protected wholly-dirty dynamic RAM, destination load ordering, and post-visible-Full reset/rollback/poison semantics. Machine and load tracking flags are enabled without adding Diff artifacts. | Exact/repeated/concurrent host and CPU union, discard, dynamic mapping, load override/VMGenID, publication/cancellation/reset failures, and public transaction tests plus signed normal boot/load, two-vCPU current-device, and two-epoch exact-set evidence. |

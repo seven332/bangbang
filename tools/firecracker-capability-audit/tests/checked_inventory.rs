@@ -545,8 +545,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 233);
-    assert_eq!(count(Disposition::AuditRequired), 165);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 235);
+    assert_eq!(count(Disposition::AuditRequired), 163);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -770,8 +770,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 233);
-    assert_eq!(count(Disposition::AuditRequired), 165);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 235);
+    assert_eq!(count(Disposition::AuditRequired), 163);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -982,8 +982,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 233);
-    assert_eq!(count(Disposition::AuditRequired), 165);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 235);
+    assert_eq!(count(Disposition::AuditRequired), 163);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 }
@@ -1059,7 +1059,7 @@ fn delivery_closure_policy_is_stable() {
         "semantic.hotplug:runtime-device-manager",
         "semantic.transport:pci-msi-and-coexistence",
     ];
-    const STORAGE_TERMINAL: [&str; 38] = [
+    const STORAGE_TERMINAL: [&str; 40] = [
         "api-operation:PATCH /drives/{drive_id}",
         "api-operation:PATCH /pmem/{id}",
         "api-operation:PUT /drives/{drive_id}",
@@ -1095,12 +1095,10 @@ fn delivery_closure_policy_is_stable() {
         "corpus:block-io-engine",
         "corpus:block-vhost-user",
         "corpus:patch-block",
+        "corpus:pmem",
         "non-swagger-route:DELETE /drives/{drive_id}",
         "non-swagger-route:DELETE /pmem/{id}",
         "semantic.storage:block-sync-async-vhost-and-limits",
-    ];
-    const STORAGE_WAVE_6: [&str; 2] = [
-        "corpus:pmem",
         "semantic.storage:pmem-root-mapping-flush-and-state",
     ];
     const WAVE_6_ISSUE_URL: &str = "https://github.com/seven332/bangbang/issues/1490";
@@ -1252,8 +1250,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 233);
-    assert_eq!(count(Disposition::AuditRequired), 165);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 235);
+    assert_eq!(count(Disposition::AuditRequired), 163);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 17);
 
@@ -1357,10 +1355,7 @@ fn delivery_closure_policy_is_stable() {
         );
     }
 
-    let storage_ids = STORAGE_TERMINAL
-        .into_iter()
-        .chain(STORAGE_WAVE_6)
-        .collect::<BTreeSet<_>>();
+    let storage_ids = STORAGE_TERMINAL.into_iter().collect::<BTreeSet<_>>();
     assert_eq!(
         storage_ids.len(),
         40,
@@ -1386,19 +1381,6 @@ fn delivery_closure_policy_is_stable() {
             "terminal storage summary still names future storage work: {id}"
         );
     }
-    for id in STORAGE_WAVE_6 {
-        let capability = by_id.get(id).expect("Wave 6 storage record must exist");
-        assert_eq!(
-            capability.disposition,
-            Disposition::AuditRequired,
-            "Wave 6 storage handoff must remain audit-owned: {id}"
-        );
-        assert!(
-            capability.summary.contains("Wave 6"),
-            "Wave 6 storage handoff must name its owner: {id}"
-        );
-    }
-
     let storage_contract = std::fs::read_to_string(
         repository_root.join("compat/firecracker/v1.16.0/storage-contract.md"),
     )

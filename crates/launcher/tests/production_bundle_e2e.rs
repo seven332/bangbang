@@ -169,6 +169,8 @@ const SNAPSHOT_METRICS_ID: &str = "grant-snapshot-metrics-1368";
 const SNAPSHOT_ROOT_ID: &str = "grant-snapshot-root-1589";
 const SNAPSHOT_DATA_ID: &str = "grant-snapshot-data-1616";
 const SNAPSHOT_AUDIT_ID: &str = "grant-snapshot-audit-1616";
+const SNAPSHOT_PMEM_RW_ID: &str = "grant-snapshot-pmem-rw-1634";
+const SNAPSHOT_PMEM_RO_ID: &str = "grant-snapshot-pmem-ro-1634";
 const SNAPSHOT_STATE_OUTPUT_ID: &str = "grant-snapshot-state-output-1368";
 const SNAPSHOT_MEMORY_OUTPUT_ID: &str = "grant-snapshot-memory-output-1368";
 const SNAPSHOT_STATE_INPUT_ID: &str = "grant-snapshot-state-input-1368";
@@ -180,6 +182,8 @@ const SNAPSHOT_METRICS_REF: &str = "bangbang-grant:grant-snapshot-metrics-1368";
 const SNAPSHOT_ROOT_REF: &str = "bangbang-grant:grant-snapshot-root-1589";
 const SNAPSHOT_DATA_REF: &str = "bangbang-grant:grant-snapshot-data-1616";
 const SNAPSHOT_AUDIT_REF: &str = "bangbang-grant:grant-snapshot-audit-1616";
+const SNAPSHOT_PMEM_RW_REF: &str = "bangbang-grant:grant-snapshot-pmem-rw-1634";
+const SNAPSHOT_PMEM_RO_REF: &str = "bangbang-grant:grant-snapshot-pmem-ro-1634";
 const SNAPSHOT_STATE_OUTPUT_REF: &str =
     "bangbang-grant:grant-snapshot-state-output-1368/state-1368.snap";
 const SNAPSHOT_MEMORY_OUTPUT_REF: &str =
@@ -211,6 +215,16 @@ const SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE: u8 = 0x23;
 const SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE: u8 = 0x24;
 const SNAPSHOT_BLOCK_AUDIT_BYTE: u8 = 0x31;
 const SNAPSHOT_BLOCK_PARTUUID: &str = "1617-CAFE";
+const SNAPSHOT_PMEM_SECTOR_SIZE: usize = 512;
+const SNAPSHOT_PMEM_FILE_BYTES: usize = (2 * 1024 * 1024) + (16 * 1024);
+const SNAPSHOT_PMEM_WRITABLE_INITIAL_BYTE: u8 = 0x41;
+const SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE: u8 = 0x42;
+const SNAPSHOT_PMEM_WRITABLE_DESTINATION_ONE_BYTE: u8 = 0x43;
+const SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE: u8 = 0x44;
+const SNAPSHOT_PMEM_READ_ONLY_BYTE: u8 = 0x51;
+const SNAPSHOT_PMEM_WRITABLE_REPLACEMENT_BYTE: u8 = 0xf1;
+const SNAPSHOT_PMEM_READ_ONLY_REPLACEMENT_BYTE: u8 = 0xf2;
+const SNAPSHOT_PMEM_LIMITER_REFILL_MS: u64 = 5000;
 const GRANTED_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
 const GRANTED_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_MULTISTREAM_OK";
 const GRANTED_VSOCK_EXCHANGES: &[(u32, &[u8], &[u8])] = &[
@@ -1568,7 +1582,7 @@ fn run_native_v2_snapshot_grant_case(bundle: &Path, enable_pci: bool) {
 }
 
 #[test]
-fn normal_bundle_certifies_native_v2_multi_block_epochs_over_mmio_and_pci() {
+fn normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci() {
     let bundle = production_bundle();
     for enable_pci in [false, true] {
         for rooted in [true, false] {
@@ -1579,12 +1593,16 @@ fn normal_bundle_certifies_native_v2_multi_block_epochs_over_mmio_and_pci() {
 
 fn run_native_v2_snapshot_epoch_grant_case(bundle: &Path, enable_pci: bool, rooted: bool) {
     let transport = if enable_pci { "pci" } else { "mmio" };
-    let root_kind = if rooted { "rooted" } else { "rootless" };
-    let case = format!("{transport}-{root_kind}");
+    let product = if rooted {
+        "pmem-only-rooted"
+    } else {
+        "mixed-rootless"
+    };
+    let case = format!("{transport}-{product}");
     initialize_worker_container(bundle);
     let baseline_sessions = session_entries();
 
-    let source_fixture = SnapshotEpochSourceGrantFixture::new(&case);
+    let source_fixture = SnapshotEpochSourceGrantFixture::new(&case, rooted);
     let mut source = spawn_ready_snapshot_epoch_grant_api_launcher(
         bundle,
         &source_fixture.manifest,
@@ -1597,10 +1615,20 @@ fn run_native_v2_snapshot_epoch_grant_case(bundle: &Path, enable_pci: bool, root
     configure_and_pause_snapshot_epoch_source(
         &source,
         &source_fixture.opened_metrics,
-        &source_fixture.opened_root_backing,
-        &source_fixture.opened_data_backing,
-        &source_fixture.opened_audit_backing,
+        source_fixture.opened_blocks.as_ref(),
+        &source_fixture.opened_writable_pmem,
+        &source_fixture.opened_read_only_pmem,
         rooted,
+    );
+    assert_snapshot_pmem_epoch(
+        &source_fixture.writable_pmem,
+        SNAPSHOT_PMEM_WRITABLE_REPLACEMENT_BYTE,
+        &format!("{case} source writable replacement pathname"),
+    );
+    assert_snapshot_pmem_epoch(
+        &source_fixture.read_only_pmem,
+        SNAPSHOT_PMEM_READ_ONLY_REPLACEMENT_BYTE,
+        &format!("{case} source read-only replacement pathname"),
     );
 
     let create_body = snapshot_create_body();
@@ -1614,20 +1642,32 @@ fn run_native_v2_snapshot_epoch_grant_case(bundle: &Path, enable_pci: bool, root
     assert!(artifacts.memory.is_file(), "{case} memory should publish");
     let state_before = fs::read(&artifacts.state).expect("epoch snapshot state should read");
     let memory_before = fs::read(&artifacts.memory).expect("epoch snapshot memory should read");
-    assert_snapshot_block_epoch(
-        &artifacts.root,
-        SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
-        &format!("{case} source primary epoch"),
+    if let Some(blocks) = artifacts.blocks.as_ref() {
+        assert_snapshot_block_epoch(
+            &blocks.root,
+            SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
+            &format!("{case} source primary epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &blocks.data,
+            SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+            &format!("{case} source data epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &blocks.audit,
+            SNAPSHOT_BLOCK_AUDIT_BYTE,
+            &format!("{case} source audit epoch"),
+        );
+    }
+    assert_snapshot_pmem_epoch(
+        &artifacts.writable_pmem,
+        SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE,
+        &format!("{case} source writable pmem epoch"),
     );
-    assert_snapshot_block_epoch(
-        &artifacts.data,
-        SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
-        &format!("{case} source data epoch"),
-    );
-    assert_snapshot_block_epoch(
-        &artifacts.audit,
-        SNAPSHOT_BLOCK_AUDIT_BYTE,
-        &format!("{case} source audit epoch"),
+    assert_snapshot_pmem_epoch(
+        &artifacts.read_only_pmem,
+        SNAPSHOT_PMEM_READ_ONLY_BYTE,
+        &format!("{case} source read-only pmem epoch"),
     );
 
     assert_http_status(
@@ -1732,69 +1772,93 @@ fn run_native_v2_snapshot_epoch_grant_case(bundle: &Path, enable_pci: bool, root
             .success(),
         "{case} explicitly resumed epoch destination should power off"
     );
-    assert_snapshot_block_epoch(
-        &next.root,
-        SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE,
-        &format!("{case} destination-one primary epoch"),
+    if let Some(blocks) = next.blocks.as_ref() {
+        assert_snapshot_block_epoch(
+            &blocks.root,
+            SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_ONE_BYTE,
+            &format!("{case} destination-one primary epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &blocks.data,
+            SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE,
+            &format!("{case} destination-one data epoch"),
+        );
+        assert_snapshot_block_epoch(
+            &blocks.audit,
+            SNAPSHOT_BLOCK_AUDIT_BYTE,
+            &format!("{case} destination-one audit epoch"),
+        );
+        assert_snapshot_block_metrics(
+            &paused_fixture.opened_metrics,
+            true,
+            &format!("{case} paused destination metrics"),
+        );
+    }
+    assert_snapshot_pmem_epoch(
+        &next.writable_pmem,
+        SNAPSHOT_PMEM_WRITABLE_DESTINATION_ONE_BYTE,
+        &format!("{case} destination-one writable pmem epoch"),
     );
-    assert_snapshot_block_epoch(
-        &next.data,
-        SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_ONE_BYTE,
-        &format!("{case} destination-one data epoch"),
+    assert_snapshot_pmem_epoch(
+        &next.read_only_pmem,
+        SNAPSHOT_PMEM_READ_ONLY_BYTE,
+        &format!("{case} destination-one read-only pmem epoch"),
     );
-    assert_snapshot_block_epoch(
-        &next.audit,
-        SNAPSHOT_BLOCK_AUDIT_BYTE,
-        &format!("{case} destination-one audit epoch"),
-    );
-    assert_snapshot_block_metrics(
+    assert_snapshot_pmem_metrics(
         &paused_fixture.opened_metrics,
         true,
         &format!("{case} paused destination metrics"),
     );
+    assert_snapshot_pmem_epoch(
+        &paused_fixture.sources.writable_pmem,
+        SNAPSHOT_PMEM_WRITABLE_REPLACEMENT_BYTE,
+        &format!("{case} paused writable replacement pathname"),
+    );
+    assert_snapshot_pmem_epoch(
+        &paused_fixture.sources.read_only_pmem,
+        SNAPSHOT_PMEM_READ_ONLY_REPLACEMENT_BYTE,
+        &format!("{case} paused read-only replacement pathname"),
+    );
     assert_eq!(session_entries(), baseline_sessions);
 
-    let final_artifacts = if rooted {
-        next
-    } else {
-        let resumed_fixture =
-            SnapshotEpochInputGrantFixture::new(&format!("{case}-automatic"), next);
-        let mut resumed = spawn_ready_snapshot_epoch_grant_api_launcher(
-            bundle,
-            &resumed_fixture.manifest,
-            &resumed_fixture.api_socket(),
-            resumed_fixture.sensitive_strings(),
-            &format!("snapshot-epoch-{case}-automatic"),
-            enable_pci,
-        );
-        let final_artifacts = resumed_fixture.replace_source_pathnames();
-        configure_snapshot_epoch_destination_metrics(
-            &resumed,
-            &format!("{case} automatic destination"),
-        );
-        assert_http_status(
-            &http_put(&resumed.socket, "/snapshot/load", &snapshot_load_body(true)),
-            204,
-            "load and automatically resume epoch snapshot",
-        );
-        assert!(
-            resumed
-                .wait(&format!("{case} automatically resumed epoch destination"))
-                .success(),
-            "{case} automatically resumed epoch destination should power off"
-        );
+    let resumed_fixture = SnapshotEpochInputGrantFixture::new(&format!("{case}-automatic"), next);
+    let mut resumed = spawn_ready_snapshot_epoch_grant_api_launcher(
+        bundle,
+        &resumed_fixture.manifest,
+        &resumed_fixture.api_socket(),
+        resumed_fixture.sensitive_strings(),
+        &format!("snapshot-epoch-{case}-automatic"),
+        enable_pci,
+    );
+    let final_artifacts = resumed_fixture.replace_source_pathnames();
+    configure_snapshot_epoch_destination_metrics(
+        &resumed,
+        &format!("{case} automatic destination"),
+    );
+    assert_http_status(
+        &http_put(&resumed.socket, "/snapshot/load", &snapshot_load_body(true)),
+        204,
+        "load and automatically resume epoch snapshot",
+    );
+    assert!(
+        resumed
+            .wait(&format!("{case} automatically resumed epoch destination"))
+            .success(),
+        "{case} automatically resumed epoch destination should power off"
+    );
+    if let Some(blocks) = final_artifacts.blocks.as_ref() {
         assert_snapshot_block_epoch(
-            &final_artifacts.root,
+            &blocks.root,
             SNAPSHOT_BLOCK_DRIVE_A_DESTINATION_TWO_BYTE,
             &format!("{case} destination-two primary epoch"),
         );
         assert_snapshot_block_epoch(
-            &final_artifacts.data,
+            &blocks.data,
             SNAPSHOT_BLOCK_DRIVE_B_DESTINATION_TWO_BYTE,
             &format!("{case} destination-two data epoch"),
         );
         assert_snapshot_block_epoch(
-            &final_artifacts.audit,
+            &blocks.audit,
             SNAPSHOT_BLOCK_AUDIT_BYTE,
             &format!("{case} destination-two audit epoch"),
         );
@@ -1803,9 +1867,33 @@ fn run_native_v2_snapshot_epoch_grant_case(bundle: &Path, enable_pci: bool, root
             true,
             &format!("{case} automatic destination metrics"),
         );
-        assert_eq!(session_entries(), baseline_sessions);
-        final_artifacts
-    };
+    }
+    assert_snapshot_pmem_epoch(
+        &final_artifacts.writable_pmem,
+        SNAPSHOT_PMEM_WRITABLE_DESTINATION_TWO_BYTE,
+        &format!("{case} destination-two writable pmem epoch"),
+    );
+    assert_snapshot_pmem_epoch(
+        &final_artifacts.read_only_pmem,
+        SNAPSHOT_PMEM_READ_ONLY_BYTE,
+        &format!("{case} destination-two read-only pmem epoch"),
+    );
+    assert_snapshot_pmem_metrics(
+        &resumed_fixture.opened_metrics,
+        true,
+        &format!("{case} automatic destination metrics"),
+    );
+    assert_snapshot_pmem_epoch(
+        &resumed_fixture.sources.writable_pmem,
+        SNAPSHOT_PMEM_WRITABLE_REPLACEMENT_BYTE,
+        &format!("{case} automatic writable replacement pathname"),
+    );
+    assert_snapshot_pmem_epoch(
+        &resumed_fixture.sources.read_only_pmem,
+        SNAPSHOT_PMEM_READ_ONLY_REPLACEMENT_BYTE,
+        &format!("{case} automatic read-only replacement pathname"),
+    );
+    assert_eq!(session_entries(), baseline_sessions);
 
     assert_eq!(
         fs::read(&final_artifacts.state).expect("final epoch state should read"),
@@ -1827,10 +1915,10 @@ enum SnapshotEpochDeathOrder {
 
 fn run_snapshot_epoch_paused_death_case(
     bundle: &Path,
-    artifacts: SnapshotArtifactSet,
+    artifacts: SnapshotEpochArtifactSet,
     order: SnapshotEpochDeathOrder,
     baseline_sessions: &[PathBuf],
-) -> SnapshotArtifactSet {
+) -> SnapshotEpochArtifactSet {
     let order_name = match order {
         SnapshotEpochDeathOrder::WorkerFirst => "worker-first",
         SnapshotEpochDeathOrder::LauncherFirst => "launcher-first",
@@ -1864,9 +1952,17 @@ fn run_snapshot_epoch_paused_death_case(
     );
     let state_before = fs::read(&opened.state).expect("death-case state should read");
     let memory_before = fs::read(&opened.memory).expect("death-case memory should read");
-    let root_before = fs::read(&opened.root).expect("death-case primary should read");
-    let data_before = fs::read(&opened.data).expect("death-case data should read");
-    let audit_before = fs::read(&opened.audit).expect("death-case audit should read");
+    let blocks = opened
+        .blocks
+        .as_ref()
+        .expect("rootless MMIO death case should retain mixed block artifacts");
+    let root_before = fs::read(&blocks.root).expect("death-case primary should read");
+    let data_before = fs::read(&blocks.data).expect("death-case data should read");
+    let audit_before = fs::read(&blocks.audit).expect("death-case audit should read");
+    let writable_pmem_before =
+        fs::read(&opened.writable_pmem).expect("death-case writable pmem should read");
+    let read_only_pmem_before =
+        fs::read(&opened.read_only_pmem).expect("death-case read-only pmem should read");
     assert_eq!(session_entries().len(), baseline_sessions.len() + 1);
 
     match order {
@@ -1875,7 +1971,7 @@ fn run_snapshot_epoch_paused_death_case(
             // SAFETY: The worker is the one live child of this unreaped launcher.
             assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
             assert_eq!(
-                running.wait("profile-2 worker-first death").code(),
+                running.wait("profile-3 worker-first death").code(),
                 Some(128 + libc::SIGKILL)
             );
         }
@@ -1887,12 +1983,12 @@ fn run_snapshot_epoch_paused_death_case(
             // observes authenticated lifecycle EOF independently.
             assert_eq!(unsafe { libc::kill(launcher, libc::SIGKILL) }, 0);
             assert_eq!(
-                running.wait("profile-2 launcher-first death").signal(),
+                running.wait("profile-3 launcher-first death").signal(),
                 Some(libc::SIGKILL)
             );
             assert!(
                 worker_exit.wait(PROCESS_TIMEOUT),
-                "profile-2 worker should observe launcher death"
+                "profile-3 worker should observe launcher death"
             );
         }
     }
@@ -1908,16 +2004,24 @@ fn run_snapshot_epoch_paused_death_case(
         memory_before
     );
     assert_eq!(
-        fs::read(&opened.root).expect("death-case primary should remain"),
+        fs::read(&blocks.root).expect("death-case primary should remain"),
         root_before
     );
     assert_eq!(
-        fs::read(&opened.data).expect("death-case data should remain"),
+        fs::read(&blocks.data).expect("death-case data should remain"),
         data_before
     );
     assert_eq!(
-        fs::read(&opened.audit).expect("death-case audit should remain"),
+        fs::read(&blocks.audit).expect("death-case audit should remain"),
         audit_before
+    );
+    assert_eq!(
+        fs::read(&opened.writable_pmem).expect("death-case writable pmem should remain"),
+        writable_pmem_before
+    );
+    assert_eq!(
+        fs::read(&opened.read_only_pmem).expect("death-case read-only pmem should remain"),
+        read_only_pmem_before
     );
     assert_no_snapshot_staging(&fixture.state_directory);
     assert_no_snapshot_staging(&fixture.memory_directory);
@@ -7055,6 +7159,22 @@ struct SnapshotArtifactSet {
     audit: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct SnapshotEpochBlockArtifacts {
+    root: PathBuf,
+    data: PathBuf,
+    audit: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotEpochArtifactSet {
+    state: PathBuf,
+    memory: PathBuf,
+    blocks: Option<SnapshotEpochBlockArtifacts>,
+    writable_pmem: PathBuf,
+    read_only_pmem: PathBuf,
+}
+
 #[derive(Debug)]
 struct SnapshotSourceGrantFixture {
     _root: TestDir,
@@ -7273,22 +7393,22 @@ struct SnapshotEpochSourceGrantFixture {
     kernel: PathBuf,
     initrd: PathBuf,
     metrics: PathBuf,
-    root_backing: PathBuf,
-    data_backing: PathBuf,
-    audit_backing: PathBuf,
+    blocks: Option<SnapshotEpochBlockArtifacts>,
+    writable_pmem: PathBuf,
+    read_only_pmem: PathBuf,
     api_directory: PathBuf,
     state_directory: PathBuf,
     memory_directory: PathBuf,
     opened_kernel: PathBuf,
     opened_initrd: PathBuf,
     opened_metrics: PathBuf,
-    opened_root_backing: PathBuf,
-    opened_data_backing: PathBuf,
-    opened_audit_backing: PathBuf,
+    opened_blocks: Option<SnapshotEpochBlockArtifacts>,
+    opened_writable_pmem: PathBuf,
+    opened_read_only_pmem: PathBuf,
 }
 
 impl SnapshotEpochSourceGrantFixture {
-    fn new(case: &str) -> Self {
+    fn new(case: &str, rooted: bool) -> Self {
         let root = TestDir::new(&format!("snapshot-epoch-source-{case}"));
         let canonical_root =
             fs::canonicalize(root.path()).expect("snapshot epoch source root should canonicalize");
@@ -7301,88 +7421,116 @@ impl SnapshotEpochSourceGrantFixture {
         let kernel = canonical_root.join("snapshot-kernel.image");
         let initrd = canonical_root.join("snapshot-initrd.cpio");
         let metrics = canonical_root.join("snapshot.metrics");
-        let root_backing = canonical_root.join("snapshot-primary.img");
-        let data_backing = canonical_root.join("snapshot-data.img");
-        let audit_backing = canonical_root.join("snapshot-audit.img");
+        let blocks = (!rooted).then(|| SnapshotEpochBlockArtifacts {
+            root: canonical_root.join("snapshot-primary.img"),
+            data: canonical_root.join("snapshot-data.img"),
+            audit: canonical_root.join("snapshot-audit.img"),
+        });
+        let writable_pmem = canonical_root.join("snapshot-pmem-rw.img");
+        let read_only_pmem = canonical_root.join("snapshot-pmem-ro.img");
         let api_directory = socket_root.path().join("a");
         let state_directory = canonical_root.join("state-output");
         let memory_directory = canonical_root.join("memory-output");
         let opened_kernel = canonical_root.join("opened-snapshot-kernel.image");
         let opened_initrd = canonical_root.join("opened-snapshot-initrd.cpio");
         let opened_metrics = canonical_root.join("opened-snapshot.metrics");
-        let opened_root_backing = canonical_root.join("opened-snapshot-primary.img");
-        let opened_data_backing = canonical_root.join("opened-snapshot-data.img");
-        let opened_audit_backing = canonical_root.join("opened-snapshot-audit.img");
+        let opened_blocks = blocks.as_ref().map(|_| SnapshotEpochBlockArtifacts {
+            root: canonical_root.join("opened-snapshot-primary.img"),
+            data: canonical_root.join("opened-snapshot-data.img"),
+            audit: canonical_root.join("opened-snapshot-audit.img"),
+        });
+        let opened_writable_pmem = canonical_root.join("opened-snapshot-pmem-rw.img");
+        let opened_read_only_pmem = canonical_root.join("opened-snapshot-pmem-ro.img");
 
         hard_link_or_copy_fixture(&guest_kernel(), &kernel, "snapshot epoch guest kernel");
         hard_link_or_copy_fixture(&guest_initrd(), &initrd, "snapshot epoch guest initrd");
         fs::write(&metrics, b"").expect("snapshot epoch metrics fixture should write");
-        create_snapshot_block_epoch_backing(&root_backing, SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE);
-        create_snapshot_block_epoch_backing(&data_backing, SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE);
-        create_snapshot_block_epoch_backing(&audit_backing, SNAPSHOT_BLOCK_AUDIT_BYTE);
+        if let Some(blocks) = blocks.as_ref() {
+            create_snapshot_block_epoch_backing(&blocks.root, SNAPSHOT_BLOCK_DRIVE_A_INITIAL_BYTE);
+            create_snapshot_block_epoch_backing(&blocks.data, SNAPSHOT_BLOCK_DRIVE_B_INITIAL_BYTE);
+            create_snapshot_block_epoch_backing(&blocks.audit, SNAPSHOT_BLOCK_AUDIT_BYTE);
+        }
+        create_snapshot_pmem_epoch_backing(&writable_pmem, SNAPSHOT_PMEM_WRITABLE_INITIAL_BYTE);
+        create_snapshot_pmem_epoch_backing(&read_only_pmem, SNAPSHOT_PMEM_READ_ONLY_BYTE);
         fs::create_dir(&api_directory).expect("epoch API directory should create");
         fs::create_dir(&state_directory).expect("epoch state output directory should create");
         fs::create_dir(&memory_directory).expect("epoch memory output directory should create");
 
-        let manifest_json = serde_json::json!({
-            "version": 1,
-            "grants": [
-                {
-                    "id": SNAPSHOT_KERNEL_ID,
-                    "role": "kernel-image",
-                    "access": "read-only",
-                    "source": path_text(&kernel),
-                },
-                {
-                    "id": SNAPSHOT_INITRD_ID,
-                    "role": "initrd-image",
-                    "access": "read-only",
-                    "source": path_text(&initrd),
-                },
-                {
-                    "id": SNAPSHOT_METRICS_ID,
-                    "role": "metrics-sink",
-                    "access": "write-only",
-                    "source": path_text(&metrics),
-                },
-                {
+        let mut grants = vec![
+            serde_json::json!({
+                "id": SNAPSHOT_KERNEL_ID,
+                "role": "kernel-image",
+                "access": "read-only",
+                "source": path_text(&kernel),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_INITRD_ID,
+                "role": "initrd-image",
+                "access": "read-only",
+                "source": path_text(&initrd),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_METRICS_ID,
+                "role": "metrics-sink",
+                "access": "write-only",
+                "source": path_text(&metrics),
+            }),
+        ];
+        if let Some(blocks) = blocks.as_ref() {
+            grants.extend([
+                serde_json::json!({
                     "id": SNAPSHOT_ROOT_ID,
                     "role": "drive-backing",
                     "access": "read-write",
-                    "source": path_text(&root_backing),
-                },
-                {
+                    "source": path_text(&blocks.root),
+                }),
+                serde_json::json!({
                     "id": SNAPSHOT_DATA_ID,
                     "role": "drive-backing",
                     "access": "read-write",
-                    "source": path_text(&data_backing),
-                },
-                {
+                    "source": path_text(&blocks.data),
+                }),
+                serde_json::json!({
                     "id": SNAPSHOT_AUDIT_ID,
                     "role": "drive-backing",
                     "access": "read-only",
-                    "source": path_text(&audit_backing),
-                },
-                {
-                    "id": API_SOCKET_DIRECTORY_ID,
-                    "role": "api-socket-directory",
-                    "access": "create-children",
-                    "source": path_text(&api_directory),
-                },
-                {
-                    "id": SNAPSHOT_STATE_OUTPUT_ID,
-                    "role": "snapshot-output-directory",
-                    "access": "create-children",
-                    "source": path_text(&state_directory),
-                },
-                {
-                    "id": SNAPSHOT_MEMORY_OUTPUT_ID,
-                    "role": "snapshot-output-directory",
-                    "access": "create-children",
-                    "source": path_text(&memory_directory),
-                },
-            ],
-        });
+                    "source": path_text(&blocks.audit),
+                }),
+            ]);
+        }
+        grants.extend([
+            serde_json::json!({
+                "id": SNAPSHOT_PMEM_RW_ID,
+                "role": "pmem-backing",
+                "access": "read-write",
+                "source": path_text(&writable_pmem),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_PMEM_RO_ID,
+                "role": "pmem-backing",
+                "access": "read-only",
+                "source": path_text(&read_only_pmem),
+            }),
+            serde_json::json!({
+                "id": API_SOCKET_DIRECTORY_ID,
+                "role": "api-socket-directory",
+                "access": "create-children",
+                "source": path_text(&api_directory),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_STATE_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(&state_directory),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_MEMORY_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(&memory_directory),
+            }),
+        ]);
+        let manifest_json = serde_json::json!({"version": 1, "grants": grants});
         fs::write(
             &manifest,
             serde_json::to_vec(&manifest_json).expect("snapshot epoch manifest should serialize"),
@@ -7396,18 +7544,18 @@ impl SnapshotEpochSourceGrantFixture {
             kernel,
             initrd,
             metrics,
-            root_backing,
-            data_backing,
-            audit_backing,
+            blocks,
+            writable_pmem,
+            read_only_pmem,
             api_directory,
             state_directory,
             memory_directory,
             opened_kernel,
             opened_initrd,
             opened_metrics,
-            opened_root_backing,
-            opened_data_backing,
-            opened_audit_backing,
+            opened_blocks,
+            opened_writable_pmem,
+            opened_read_only_pmem,
         }
     }
 
@@ -7416,11 +7564,20 @@ impl SnapshotEpochSourceGrantFixture {
             (&self.kernel, &self.opened_kernel),
             (&self.initrd, &self.opened_initrd),
             (&self.metrics, &self.opened_metrics),
-            (&self.root_backing, &self.opened_root_backing),
-            (&self.data_backing, &self.opened_data_backing),
-            (&self.audit_backing, &self.opened_audit_backing),
+            (&self.writable_pmem, &self.opened_writable_pmem),
+            (&self.read_only_pmem, &self.opened_read_only_pmem),
         ] {
             fs::rename(source, opened).expect("launcher-opened snapshot epoch file should move");
+        }
+        if let (Some(blocks), Some(opened)) = (&self.blocks, &self.opened_blocks) {
+            for (source, opened) in [
+                (&blocks.root, &opened.root),
+                (&blocks.data, &opened.data),
+                (&blocks.audit, &opened.audit),
+            ] {
+                fs::rename(source, opened)
+                    .expect("launcher-opened snapshot epoch block file should move");
+            }
         }
         fs::write(&self.kernel, b"replacement kernel must not boot")
             .expect("replacement snapshot epoch kernel should write");
@@ -7428,19 +7585,29 @@ impl SnapshotEpochSourceGrantFixture {
             .expect("replacement snapshot epoch initrd should write");
         fs::write(&self.metrics, b"replacement metrics must remain unused\n")
             .expect("replacement snapshot epoch metrics should write");
-        fs::write(&self.root_backing, vec![0xff_u8; 4096])
-            .expect("replacement snapshot epoch primary should write");
-        fs::write(&self.data_backing, vec![0xee_u8; 4096])
-            .expect("replacement snapshot epoch data should write");
-        fs::write(&self.audit_backing, vec![0xdd_u8; 4096])
-            .expect("replacement snapshot epoch audit should write");
+        create_snapshot_pmem_epoch_backing(
+            &self.writable_pmem,
+            SNAPSHOT_PMEM_WRITABLE_REPLACEMENT_BYTE,
+        );
+        create_snapshot_pmem_epoch_backing(
+            &self.read_only_pmem,
+            SNAPSHOT_PMEM_READ_ONLY_REPLACEMENT_BYTE,
+        );
+        if let Some(blocks) = self.blocks.as_ref() {
+            fs::write(&blocks.root, vec![0xff_u8; 4096])
+                .expect("replacement snapshot epoch primary should write");
+            fs::write(&blocks.data, vec![0xee_u8; 4096])
+                .expect("replacement snapshot epoch data should write");
+            fs::write(&blocks.audit, vec![0xdd_u8; 4096])
+                .expect("replacement snapshot epoch audit should write");
+        }
     }
 
-    fn artifacts(&self) -> SnapshotArtifactSet {
+    fn artifacts(&self) -> SnapshotEpochArtifactSet {
         self.artifacts_with_children(SNAPSHOT_STATE_CHILD, SNAPSHOT_MEMORY_CHILD)
     }
 
-    fn repeated_artifacts(&self) -> SnapshotArtifactSet {
+    fn repeated_artifacts(&self) -> SnapshotEpochArtifactSet {
         self.artifacts_with_children(SNAPSHOT_REPEAT_STATE_CHILD, SNAPSHOT_REPEAT_MEMORY_CHILD)
     }
 
@@ -7452,49 +7619,45 @@ impl SnapshotEpochSourceGrantFixture {
         &self,
         state_child: &str,
         memory_child: &str,
-    ) -> SnapshotArtifactSet {
-        SnapshotArtifactSet {
+    ) -> SnapshotEpochArtifactSet {
+        SnapshotEpochArtifactSet {
             state: self.state_directory.join(state_child),
             memory: self.memory_directory.join(memory_child),
-            root: self.opened_root_backing.clone(),
-            data: self.opened_data_backing.clone(),
-            audit: self.opened_audit_backing.clone(),
+            blocks: self.opened_blocks.clone(),
+            writable_pmem: self.opened_writable_pmem.clone(),
+            read_only_pmem: self.opened_read_only_pmem.clone(),
         }
     }
 
     fn sensitive_strings(&self) -> Vec<String> {
-        [
+        let mut sensitive = [
             path_text(&self.manifest),
             path_text(&self.kernel),
             path_text(&self.initrd),
             path_text(&self.metrics),
-            path_text(&self.root_backing),
-            path_text(&self.data_backing),
-            path_text(&self.audit_backing),
+            path_text(&self.writable_pmem),
+            path_text(&self.read_only_pmem),
             path_text(&self.api_directory),
             path_text(&self.state_directory),
             path_text(&self.memory_directory),
             path_text(&self.opened_kernel),
             path_text(&self.opened_initrd),
             path_text(&self.opened_metrics),
-            path_text(&self.opened_root_backing),
-            path_text(&self.opened_data_backing),
-            path_text(&self.opened_audit_backing),
+            path_text(&self.opened_writable_pmem),
+            path_text(&self.opened_read_only_pmem),
             SNAPSHOT_KERNEL_ID,
             SNAPSHOT_INITRD_ID,
             SNAPSHOT_METRICS_ID,
-            SNAPSHOT_ROOT_ID,
-            SNAPSHOT_DATA_ID,
-            SNAPSHOT_AUDIT_ID,
+            SNAPSHOT_PMEM_RW_ID,
+            SNAPSHOT_PMEM_RO_ID,
             API_SOCKET_DIRECTORY_ID,
             SNAPSHOT_STATE_OUTPUT_ID,
             SNAPSHOT_MEMORY_OUTPUT_ID,
             SNAPSHOT_KERNEL_REF,
             SNAPSHOT_INITRD_REF,
             SNAPSHOT_METRICS_REF,
-            SNAPSHOT_ROOT_REF,
-            SNAPSHOT_DATA_REF,
-            SNAPSHOT_AUDIT_REF,
+            SNAPSHOT_PMEM_RW_REF,
+            SNAPSHOT_PMEM_RO_REF,
             API_SOCKET_REF,
             API_SOCKET_CHILD,
             SNAPSHOT_STATE_OUTPUT_REF,
@@ -7508,7 +7671,28 @@ impl SnapshotEpochSourceGrantFixture {
         ]
         .into_iter()
         .map(str::to_owned)
-        .collect()
+        .collect::<Vec<_>>();
+        if let (Some(blocks), Some(opened)) = (&self.blocks, &self.opened_blocks) {
+            sensitive.extend(
+                [
+                    path_text(&blocks.root),
+                    path_text(&blocks.data),
+                    path_text(&blocks.audit),
+                    path_text(&opened.root),
+                    path_text(&opened.data),
+                    path_text(&opened.audit),
+                    SNAPSHOT_ROOT_ID,
+                    SNAPSHOT_DATA_ID,
+                    SNAPSHOT_AUDIT_ID,
+                    SNAPSHOT_ROOT_REF,
+                    SNAPSHOT_DATA_REF,
+                    SNAPSHOT_AUDIT_REF,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        sensitive
     }
 }
 
@@ -7652,8 +7836,8 @@ struct SnapshotEpochInputGrantFixture {
     _root: TestDir,
     _socket_root: TestDir,
     manifest: PathBuf,
-    sources: SnapshotArtifactSet,
-    opened: SnapshotArtifactSet,
+    sources: SnapshotEpochArtifactSet,
+    opened: SnapshotEpochArtifactSet,
     metrics: PathBuf,
     opened_metrics: PathBuf,
     api_directory: PathBuf,
@@ -7662,7 +7846,7 @@ struct SnapshotEpochInputGrantFixture {
 }
 
 impl SnapshotEpochInputGrantFixture {
-    fn new(case: &str, sources: SnapshotArtifactSet) -> Self {
+    fn new(case: &str, sources: SnapshotEpochArtifactSet) -> Self {
         let root = TestDir::new(&format!("snapshot-epoch-input-{case}"));
         let canonical_root =
             fs::canonicalize(root.path()).expect("snapshot epoch input root should canonicalize");
@@ -7681,72 +7865,95 @@ impl SnapshotEpochInputGrantFixture {
         fs::create_dir(&api_directory).expect("snapshot epoch input API directory should create");
         fs::create_dir(&state_directory).expect("epoch recapture state directory should create");
         fs::create_dir(&memory_directory).expect("epoch recapture memory directory should create");
-        let opened = SnapshotArtifactSet {
+        let opened = SnapshotEpochArtifactSet {
             state: replacement_opened_path(&sources.state, case),
             memory: replacement_opened_path(&sources.memory, case),
-            root: replacement_opened_path(&sources.root, case),
-            data: replacement_opened_path(&sources.data, case),
-            audit: replacement_opened_path(&sources.audit, case),
+            blocks: sources
+                .blocks
+                .as_ref()
+                .map(|blocks| SnapshotEpochBlockArtifacts {
+                    root: replacement_opened_path(&blocks.root, case),
+                    data: replacement_opened_path(&blocks.data, case),
+                    audit: replacement_opened_path(&blocks.audit, case),
+                }),
+            writable_pmem: replacement_opened_path(&sources.writable_pmem, case),
+            read_only_pmem: replacement_opened_path(&sources.read_only_pmem, case),
         };
-        let manifest_json = serde_json::json!({
-            "version": 1,
-            "grants": [
-                {
-                    "id": SNAPSHOT_STATE_INPUT_ID,
-                    "role": "snapshot-state-input",
-                    "access": "read-only",
-                    "source": path_text(&sources.state),
-                },
-                {
-                    "id": SNAPSHOT_MEMORY_INPUT_ID,
-                    "role": "snapshot-memory-input",
-                    "access": "read-only",
-                    "source": path_text(&sources.memory),
-                },
-                {
+        let mut grants = vec![
+            serde_json::json!({
+                "id": SNAPSHOT_STATE_INPUT_ID,
+                "role": "snapshot-state-input",
+                "access": "read-only",
+                "source": path_text(&sources.state),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_MEMORY_INPUT_ID,
+                "role": "snapshot-memory-input",
+                "access": "read-only",
+                "source": path_text(&sources.memory),
+            }),
+        ];
+        if let Some(blocks) = sources.blocks.as_ref() {
+            grants.extend([
+                serde_json::json!({
                     "id": SNAPSHOT_ROOT_ID,
                     "role": "drive-backing",
                     "access": "read-write",
-                    "source": path_text(&sources.root),
-                },
-                {
+                    "source": path_text(&blocks.root),
+                }),
+                serde_json::json!({
                     "id": SNAPSHOT_DATA_ID,
                     "role": "drive-backing",
                     "access": "read-write",
-                    "source": path_text(&sources.data),
-                },
-                {
+                    "source": path_text(&blocks.data),
+                }),
+                serde_json::json!({
                     "id": SNAPSHOT_AUDIT_ID,
                     "role": "drive-backing",
                     "access": "read-only",
-                    "source": path_text(&sources.audit),
-                },
-                {
-                    "id": SNAPSHOT_METRICS_ID,
-                    "role": "metrics-sink",
-                    "access": "write-only",
-                    "source": path_text(&metrics),
-                },
-                {
-                    "id": API_SOCKET_DIRECTORY_ID,
-                    "role": "api-socket-directory",
-                    "access": "create-children",
-                    "source": path_text(&api_directory),
-                },
-                {
-                    "id": SNAPSHOT_STATE_OUTPUT_ID,
-                    "role": "snapshot-output-directory",
-                    "access": "create-children",
-                    "source": path_text(&state_directory),
-                },
-                {
-                    "id": SNAPSHOT_MEMORY_OUTPUT_ID,
-                    "role": "snapshot-output-directory",
-                    "access": "create-children",
-                    "source": path_text(&memory_directory),
-                },
-            ],
-        });
+                    "source": path_text(&blocks.audit),
+                }),
+            ]);
+        }
+        grants.extend([
+            serde_json::json!({
+                "id": SNAPSHOT_PMEM_RW_ID,
+                "role": "pmem-backing",
+                "access": "read-write",
+                "source": path_text(&sources.writable_pmem),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_PMEM_RO_ID,
+                "role": "pmem-backing",
+                "access": "read-only",
+                "source": path_text(&sources.read_only_pmem),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_METRICS_ID,
+                "role": "metrics-sink",
+                "access": "write-only",
+                "source": path_text(&metrics),
+            }),
+            serde_json::json!({
+                "id": API_SOCKET_DIRECTORY_ID,
+                "role": "api-socket-directory",
+                "access": "create-children",
+                "source": path_text(&api_directory),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_STATE_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(&state_directory),
+            }),
+            serde_json::json!({
+                "id": SNAPSHOT_MEMORY_OUTPUT_ID,
+                "role": "snapshot-output-directory",
+                "access": "create-children",
+                "source": path_text(&memory_directory),
+            }),
+        ]);
+        let manifest_json = serde_json::json!({"version": 1, "grants": grants});
         fs::write(
             &manifest,
             serde_json::to_vec(&manifest_json)
@@ -7767,27 +7974,46 @@ impl SnapshotEpochInputGrantFixture {
         }
     }
 
-    fn replace_source_pathnames(&self) -> SnapshotArtifactSet {
+    fn replace_source_pathnames(&self) -> SnapshotEpochArtifactSet {
         for (source, opened) in [
             (&self.sources.state, &self.opened.state),
             (&self.sources.memory, &self.opened.memory),
-            (&self.sources.root, &self.opened.root),
-            (&self.sources.data, &self.opened.data),
-            (&self.sources.audit, &self.opened.audit),
+            (&self.sources.writable_pmem, &self.opened.writable_pmem),
+            (&self.sources.read_only_pmem, &self.opened.read_only_pmem),
             (&self.metrics, &self.opened_metrics),
         ] {
             fs::rename(source, opened).expect("launcher-opened snapshot epoch input should move");
+        }
+        if let (Some(sources), Some(opened)) = (&self.sources.blocks, &self.opened.blocks) {
+            for (source, opened) in [
+                (&sources.root, &opened.root),
+                (&sources.data, &opened.data),
+                (&sources.audit, &opened.audit),
+            ] {
+                fs::rename(source, opened)
+                    .expect("launcher-opened snapshot epoch block input should move");
+            }
         }
         fs::write(&self.sources.state, b"replacement state must not load")
             .expect("replacement snapshot epoch state should write");
         fs::write(&self.sources.memory, b"replacement memory must not load")
             .expect("replacement snapshot epoch memory should write");
-        fs::write(&self.sources.root, vec![0xff_u8; 4096])
-            .expect("replacement snapshot epoch primary must not load");
-        fs::write(&self.sources.data, vec![0xee_u8; 4096])
-            .expect("replacement snapshot epoch data must not load");
-        fs::write(&self.sources.audit, vec![0xdd_u8; 4096])
-            .expect("replacement snapshot epoch audit must not load");
+        create_snapshot_pmem_epoch_backing(
+            &self.sources.writable_pmem,
+            SNAPSHOT_PMEM_WRITABLE_REPLACEMENT_BYTE,
+        );
+        create_snapshot_pmem_epoch_backing(
+            &self.sources.read_only_pmem,
+            SNAPSHOT_PMEM_READ_ONLY_REPLACEMENT_BYTE,
+        );
+        if let Some(blocks) = self.sources.blocks.as_ref() {
+            fs::write(&blocks.root, vec![0xff_u8; 4096])
+                .expect("replacement snapshot epoch primary must not load");
+            fs::write(&blocks.data, vec![0xee_u8; 4096])
+                .expect("replacement snapshot epoch data must not load");
+            fs::write(&blocks.audit, vec![0xdd_u8; 4096])
+                .expect("replacement snapshot epoch audit must not load");
+        }
         fs::write(&self.metrics, b"replacement metrics must remain unused\n")
             .expect("replacement snapshot epoch metrics should write");
         self.opened.clone()
@@ -7797,29 +8023,27 @@ impl SnapshotEpochInputGrantFixture {
         self.api_directory.join(API_SOCKET_CHILD)
     }
 
-    fn recaptured_artifacts(&self) -> SnapshotArtifactSet {
-        SnapshotArtifactSet {
+    fn recaptured_artifacts(&self) -> SnapshotEpochArtifactSet {
+        SnapshotEpochArtifactSet {
             state: self.state_directory.join(SNAPSHOT_STATE_CHILD),
             memory: self.memory_directory.join(SNAPSHOT_MEMORY_CHILD),
-            root: self.opened.root.clone(),
-            data: self.opened.data.clone(),
-            audit: self.opened.audit.clone(),
+            blocks: self.opened.blocks.clone(),
+            writable_pmem: self.opened.writable_pmem.clone(),
+            read_only_pmem: self.opened.read_only_pmem.clone(),
         }
     }
 
     fn sensitive_strings(&self) -> Vec<String> {
-        [
+        let mut sensitive = [
             path_text(&self.manifest),
             path_text(&self.sources.state),
             path_text(&self.sources.memory),
-            path_text(&self.sources.root),
-            path_text(&self.sources.data),
-            path_text(&self.sources.audit),
+            path_text(&self.sources.writable_pmem),
+            path_text(&self.sources.read_only_pmem),
             path_text(&self.opened.state),
             path_text(&self.opened.memory),
-            path_text(&self.opened.root),
-            path_text(&self.opened.data),
-            path_text(&self.opened.audit),
+            path_text(&self.opened.writable_pmem),
+            path_text(&self.opened.read_only_pmem),
             path_text(&self.metrics),
             path_text(&self.opened_metrics),
             path_text(&self.api_directory),
@@ -7827,18 +8051,16 @@ impl SnapshotEpochInputGrantFixture {
             path_text(&self.memory_directory),
             SNAPSHOT_STATE_INPUT_ID,
             SNAPSHOT_MEMORY_INPUT_ID,
-            SNAPSHOT_ROOT_ID,
-            SNAPSHOT_DATA_ID,
-            SNAPSHOT_AUDIT_ID,
+            SNAPSHOT_PMEM_RW_ID,
+            SNAPSHOT_PMEM_RO_ID,
             SNAPSHOT_METRICS_ID,
             API_SOCKET_DIRECTORY_ID,
             SNAPSHOT_STATE_OUTPUT_ID,
             SNAPSHOT_MEMORY_OUTPUT_ID,
             SNAPSHOT_STATE_INPUT_REF,
             SNAPSHOT_MEMORY_INPUT_REF,
-            SNAPSHOT_ROOT_REF,
-            SNAPSHOT_DATA_REF,
-            SNAPSHOT_AUDIT_REF,
+            SNAPSHOT_PMEM_RW_REF,
+            SNAPSHOT_PMEM_RO_REF,
             SNAPSHOT_METRICS_REF,
             API_SOCKET_REF,
             API_SOCKET_CHILD,
@@ -7849,7 +8071,28 @@ impl SnapshotEpochInputGrantFixture {
         ]
         .into_iter()
         .map(str::to_owned)
-        .collect()
+        .collect::<Vec<_>>();
+        if let (Some(sources), Some(opened)) = (&self.sources.blocks, &self.opened.blocks) {
+            sensitive.extend(
+                [
+                    path_text(&sources.root),
+                    path_text(&sources.data),
+                    path_text(&sources.audit),
+                    path_text(&opened.root),
+                    path_text(&opened.data),
+                    path_text(&opened.audit),
+                    SNAPSHOT_ROOT_ID,
+                    SNAPSHOT_DATA_ID,
+                    SNAPSHOT_AUDIT_ID,
+                    SNAPSHOT_ROOT_REF,
+                    SNAPSHOT_DATA_REF,
+                    SNAPSHOT_AUDIT_REF,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
+        sensitive
     }
 }
 
@@ -10682,11 +10925,16 @@ fn configure_and_pause_snapshot_source(running: &RunningApiLauncher, metrics_pat
 fn configure_and_pause_snapshot_epoch_source(
     running: &RunningApiLauncher,
     metrics_path: &Path,
-    primary_path: &Path,
-    data_path: &Path,
-    audit_path: &Path,
+    blocks: Option<&SnapshotEpochBlockArtifacts>,
+    writable_pmem_path: &Path,
+    read_only_pmem_path: &Path,
     rooted: bool,
 ) {
+    assert_eq!(
+        blocks.is_none(),
+        rooted,
+        "rooted epoch products should be pmem-only"
+    );
     for (path, body, context) in [
         (
             "/machine-config",
@@ -10710,55 +10958,109 @@ fn configure_and_pause_snapshot_epoch_source(
             }),
             "PUT snapshot epoch boot source",
         ),
-        (
-            "/drives/primary",
-            serde_json::json!({
-                "drive_id": "primary",
-                "path_on_host": SNAPSHOT_ROOT_REF,
-                "is_root_device": rooted,
-                "is_read_only": false,
-                "cache_type": "Unsafe",
-                "io_engine": "Async",
-                "rate_limiter": {
-                    "ops": {
-                        "size": 1,
-                        "refill_time": 1000,
-                    },
-                },
-            }),
-            "PUT snapshot epoch writable Async Unsafe primary",
-        ),
-        (
-            "/drives/data",
-            serde_json::json!({
-                "drive_id": "data",
-                "path_on_host": SNAPSHOT_DATA_REF,
-                "is_root_device": false,
-                "is_read_only": false,
-                "cache_type": "Writeback",
-                "io_engine": "Sync",
-                "partuuid": SNAPSHOT_BLOCK_PARTUUID,
-            }),
-            "PUT snapshot epoch writable Sync Writeback data",
-        ),
-        (
-            "/drives/audit",
-            serde_json::json!({
-                "drive_id": "audit",
-                "path_on_host": SNAPSHOT_AUDIT_REF,
-                "is_root_device": false,
-                "is_read_only": true,
-                "cache_type": "Unsafe",
-                "io_engine": "Async",
-            }),
-            "PUT snapshot epoch read-only Async Unsafe audit",
-        ),
     ] {
         assert_http_status(
             &http_put(
                 &running.socket,
                 path,
                 &serde_json::to_string(&body).expect("snapshot epoch request should serialize"),
+            ),
+            204,
+            context,
+        );
+    }
+    if blocks.is_some() {
+        for (path, body, context) in [
+            (
+                "/drives/primary",
+                serde_json::json!({
+                    "drive_id": "primary",
+                    "path_on_host": SNAPSHOT_ROOT_REF,
+                    "is_root_device": false,
+                    "is_read_only": false,
+                    "cache_type": "Unsafe",
+                    "io_engine": "Async",
+                    "rate_limiter": {
+                        "ops": {
+                            "size": 1,
+                            "refill_time": 1000,
+                        },
+                    },
+                }),
+                "PUT snapshot epoch writable Async Unsafe primary",
+            ),
+            (
+                "/drives/data",
+                serde_json::json!({
+                    "drive_id": "data",
+                    "path_on_host": SNAPSHOT_DATA_REF,
+                    "is_root_device": false,
+                    "is_read_only": false,
+                    "cache_type": "Writeback",
+                    "io_engine": "Sync",
+                    "partuuid": SNAPSHOT_BLOCK_PARTUUID,
+                }),
+                "PUT snapshot epoch writable Sync Writeback data",
+            ),
+            (
+                "/drives/audit",
+                serde_json::json!({
+                    "drive_id": "audit",
+                    "path_on_host": SNAPSHOT_AUDIT_REF,
+                    "is_root_device": false,
+                    "is_read_only": true,
+                    "cache_type": "Unsafe",
+                    "io_engine": "Async",
+                }),
+                "PUT snapshot epoch read-only Async Unsafe audit",
+            ),
+        ] {
+            assert_http_status(
+                &http_put(
+                    &running.socket,
+                    path,
+                    &serde_json::to_string(&body)
+                        .expect("snapshot epoch block request should serialize"),
+                ),
+                204,
+                context,
+            );
+        }
+    }
+    for (path, body, context) in [
+        (
+            "/pmem/epoch_rw",
+            serde_json::json!({
+                "id": "epoch_rw",
+                "path_on_host": SNAPSHOT_PMEM_RW_REF,
+                "root_device": rooted,
+                "read_only": false,
+                "rate_limiter": {
+                    "ops": {
+                        "size": 1,
+                        "refill_time": SNAPSHOT_PMEM_LIMITER_REFILL_MS,
+                    },
+                },
+            }),
+            "PUT snapshot epoch writable pmem",
+        ),
+        (
+            "/pmem/epoch_ro",
+            serde_json::json!({
+                "id": "epoch_ro",
+                "path_on_host": SNAPSHOT_PMEM_RO_REF,
+                "root_device": false,
+                "read_only": true,
+            }),
+            "PUT snapshot epoch read-only pmem",
+        ),
+    ] {
+        assert_http_status(
+            &http_put(
+                &running.socket,
+                path,
+                &serde_json::to_string(&body)
+                    .expect("snapshot epoch pmem request should serialize"),
             ),
             204,
             context,
@@ -10773,21 +11075,39 @@ fn configure_and_pause_snapshot_epoch_source(
         204,
         "start snapshot epoch source",
     );
-    wait_for_snapshot_block_epoch(
-        data_path,
-        SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+    wait_for_snapshot_pmem_epoch(
+        writable_pmem_path,
+        SNAPSHOT_PMEM_WRITABLE_PRE_CAPTURE_BYTE,
         PROCESS_TIMEOUT,
-        "contained source data pre-capture epoch",
+        "contained source pmem pre-capture epoch",
     );
-    assert_snapshot_block_epoch(
-        primary_path,
-        SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
-        "contained source primary pre-capture epoch",
+    wait_for_snapshot_pmem_throttle(
+        &running.socket,
+        metrics_path,
+        PROCESS_TIMEOUT,
+        "contained source pending pmem limiter",
     );
-    assert_snapshot_block_epoch(
-        audit_path,
-        SNAPSHOT_BLOCK_AUDIT_BYTE,
-        "contained source audit epoch",
+    if let Some(blocks) = blocks {
+        assert_snapshot_block_epoch(
+            &blocks.root,
+            SNAPSHOT_BLOCK_DRIVE_A_PRE_CAPTURE_BYTE,
+            "contained source primary pre-capture epoch",
+        );
+        assert_snapshot_block_epoch(
+            &blocks.data,
+            SNAPSHOT_BLOCK_DRIVE_B_PRE_CAPTURE_BYTE,
+            "contained source data pre-capture epoch",
+        );
+        assert_snapshot_block_epoch(
+            &blocks.audit,
+            SNAPSHOT_BLOCK_AUDIT_BYTE,
+            "contained source audit epoch",
+        );
+    }
+    assert_snapshot_pmem_epoch(
+        read_only_pmem_path,
+        SNAPSHOT_PMEM_READ_ONLY_BYTE,
+        "contained source read-only pmem epoch",
     );
     assert_http_status(
         &http_request(&running.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
@@ -10803,7 +11123,10 @@ fn configure_and_pause_snapshot_epoch_source(
         204,
         "flush snapshot epoch source metrics",
     );
-    assert_snapshot_block_metrics(metrics_path, true, "contained source metrics");
+    if blocks.is_some() {
+        assert_snapshot_block_metrics(metrics_path, true, "contained source metrics");
+    }
+    assert_snapshot_pmem_metrics(metrics_path, false, "contained source metrics");
 }
 
 fn configure_snapshot_epoch_destination_metrics(running: &RunningApiLauncher, context: &str) {
@@ -10823,16 +11146,10 @@ fn assert_snapshot_epoch_public_config(socket: &Path, rooted: bool, context: &st
     let config = http_get(socket, "/vm/config");
     assert_http_status(&config, 200, "read restored snapshot epoch configuration");
     for expected in [
-        r#""drive_id":"primary""#,
-        r#""drive_id":"data""#,
-        r#""drive_id":"audit""#,
-        r#""is_read_only":false"#,
-        r#""is_read_only":true"#,
-        r#""cache_type":"Unsafe""#,
-        r#""cache_type":"Writeback""#,
-        r#""io_engine":"Async""#,
-        r#""io_engine":"Sync""#,
-        SNAPSHOT_BLOCK_PARTUUID,
+        r#""id":"epoch_rw""#,
+        r#""id":"epoch_ro""#,
+        r#""read_only":false"#,
+        r#""read_only":true"#,
         r#""rate_limiter""#,
     ] {
         assert!(
@@ -10841,15 +11158,34 @@ fn assert_snapshot_epoch_public_config(socket: &Path, rooted: bool, context: &st
         );
     }
     assert_eq!(
-        config.contains(r#""is_root_device":true"#),
+        config.contains(r#""root_device":true"#),
         rooted,
-        "{context} restored root role should be exact"
+        "{context} restored pmem root role should be exact"
     );
     assert_eq!(
         config.matches(r#""drive_id":"#).count(),
-        3,
-        "{context} restore should publish exactly three drives"
+        if rooted { 0 } else { 3 },
+        "{context} restore should publish the exact block shape"
     );
+    if !rooted {
+        for expected in [
+            r#""drive_id":"primary""#,
+            r#""drive_id":"data""#,
+            r#""drive_id":"audit""#,
+            r#""is_read_only":false"#,
+            r#""is_read_only":true"#,
+            r#""cache_type":"Unsafe""#,
+            r#""cache_type":"Writeback""#,
+            r#""io_engine":"Async""#,
+            r#""io_engine":"Sync""#,
+            SNAPSHOT_BLOCK_PARTUUID,
+        ] {
+            assert!(
+                config.contains(expected),
+                "{context} restored mixed configuration should contain {expected}; response:\n{config}"
+            );
+        }
+    }
 }
 
 fn create_snapshot_block_epoch_backing(path: &Path, initial: u8) {
@@ -10863,13 +11199,23 @@ fn create_snapshot_block_epoch_backing(path: &Path, initial: u8) {
     });
 }
 
+fn create_snapshot_pmem_epoch_backing(path: &Path, initial: u8) {
+    let mut bytes = vec![0_u8; SNAPSHOT_PMEM_FILE_BYTES];
+    bytes[..SNAPSHOT_PMEM_SECTOR_SIZE].fill(initial);
+    fs::write(path, bytes).unwrap_or_else(|error| {
+        panic!(
+            "snapshot pmem epoch backing {} should write: {error}",
+            path.display()
+        )
+    });
+}
+
 fn snapshot_block_epoch(value: u8) -> Vec<u8> {
     vec![value; SNAPSHOT_BLOCK_SECTOR_SIZE]
 }
 
-fn wait_for_snapshot_block_epoch(path: &Path, value: u8, timeout: Duration, context: &str) {
-    wait_for_file_prefix(path, &snapshot_block_epoch(value), timeout)
-        .unwrap_or_else(|error| panic!("{context} should become visible: {error}"));
+fn snapshot_pmem_epoch(value: u8) -> Vec<u8> {
+    vec![value; SNAPSHOT_PMEM_SECTOR_SIZE]
 }
 
 fn assert_snapshot_block_epoch(path: &Path, value: u8, context: &str) {
@@ -10880,6 +11226,58 @@ fn assert_snapshot_block_epoch(path: &Path, value: u8, context: &str) {
         Some(snapshot_block_epoch(value).as_slice()),
         "{context} should retain the exact sector epoch"
     );
+}
+
+fn wait_for_snapshot_pmem_epoch(path: &Path, value: u8, timeout: Duration, context: &str) {
+    wait_for_file_prefix(path, &snapshot_pmem_epoch(value), timeout)
+        .unwrap_or_else(|error| panic!("{context} should become visible: {error}"));
+}
+
+fn assert_snapshot_pmem_epoch(path: &Path, value: u8, context: &str) {
+    let bytes =
+        fs::read(path).unwrap_or_else(|error| panic!("{context} backing should read: {error}"));
+    assert_eq!(
+        bytes.get(..SNAPSHOT_PMEM_SECTOR_SIZE),
+        Some(snapshot_pmem_epoch(value).as_slice()),
+        "{context} should retain the exact external-prefix epoch"
+    );
+    assert_eq!(
+        bytes.len(),
+        SNAPSHOT_PMEM_FILE_BYTES,
+        "{context} should retain the exact unaligned file length"
+    );
+}
+
+fn wait_for_snapshot_pmem_throttle(
+    socket: &Path,
+    metrics: &Path,
+    timeout: Duration,
+    context: &str,
+) {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .expect("snapshot pmem throttle deadline should fit");
+    loop {
+        assert_http_status(
+            &http_put(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            204,
+            &format!("PUT {context} FlushMetrics"),
+        );
+        if snapshot_pmem_metric_total_if_readable(
+            metrics,
+            "epoch_rw",
+            "rate_limiter_throttled_events",
+        ) > 0
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context} should report a throttled pmem request before timeout; metrics:\n{}",
+            fs::read_to_string(metrics).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {
@@ -10916,6 +11314,28 @@ fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &st
     }
 }
 
+fn assert_snapshot_pmem_metrics(path: &Path, expect_retry: bool, context: &str) {
+    let output = fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!("{context} metrics {} should read: {error}", path.display())
+    });
+    assert!(
+        snapshot_pmem_metric_total_if_readable(path, "epoch_rw", "queue_event_count") > 0,
+        "{context} should report writable pmem queue events; metrics:\n{output}"
+    );
+    assert!(
+        snapshot_pmem_metric_total_if_readable(path, "epoch_rw", "rate_limiter_throttled_events")
+            > 0,
+        "{context} should report a throttled writable pmem request; metrics:\n{output}"
+    );
+    if expect_retry {
+        assert!(
+            snapshot_pmem_metric_total_if_readable(path, "epoch_rw", "rate_limiter_event_count")
+                > 0,
+            "{context} should report restored pmem limiter progress; metrics:\n{output}"
+        );
+    }
+}
+
 fn snapshot_block_metric_total(path: &Path, drive_id: &str, field: &str) -> u64 {
     let section = format!("block_{drive_id}");
     fs::read_to_string(path)
@@ -10925,6 +11345,23 @@ fn snapshot_block_metric_total(path: &Path, drive_id: &str, field: &str) -> u64 
                 path.display()
             )
         })
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get(&section)?
+                .get(field)?
+                .as_u64()
+        })
+        .fold(0, u64::saturating_add)
+}
+
+fn snapshot_pmem_metric_total_if_readable(path: &Path, pmem_id: &str, field: &str) -> u64 {
+    let section = format!("pmem_{pmem_id}");
+    let Ok(output) = fs::read_to_string(path) else {
+        return 0;
+    };
+    output
         .lines()
         .filter_map(|line| {
             serde_json::from_str::<serde_json::Value>(line)

@@ -47,9 +47,10 @@ claims mechanically visible.
   packet I/O, guest lifecycle, signed evidence, shared capacity/identity, and
   the completed live aggregate boundary.
 - [`storage-contract.md`](storage-contract.md) is the #1471 aggregate storage
-  ledger. It pins the exact 40-record family, 38 terminal outcomes, the two
-  Wave 6 pmem snapshot handoffs, field-specific implementation evidence, and
-  signed direct/production coexistence and cleanup proof.
+  ledger, completed by #1634's pmem snapshot certification. It pins the exact
+  40-record family with 40 terminal outcomes, field-specific implementation
+  evidence, and signed direct/production live plus native-v2 2.6
+  create/load/cleanup proof.
 - [`balloon-contract.md`](balloon-contract.md) is the #1473 balloon ledger. It
   pins all 52 records, promotes the 50 complete API/path/property/schema leaves,
   records publication-safe paired PFN accounting and coherent MMIO/PCI
@@ -398,14 +399,13 @@ exact file grants plus a connect-only vhost directory, proves pathname
 replacement resistance, redaction, child/frontend/session cleanup, unchanged
 entitlements, and no helper. Owner capacity preflight now rejects before a
 vhost request, pmem grant claim, direct open/map, or public configuration
-change. The checked [`storage-contract.md`](storage-contract.md) terminalizes
-38 of the exact 40 records: the previous ten remain terminal and 24 API
-records, three block corpora, and the block semantic aggregate are promoted.
-Exactly `corpus:pmem` and
-`semantic.storage:pmem-root-mapping-flush-and-state` remain
-`audit-required` for Wave 6 optional-device serialization/restore. At that
-storage-closure checkpoint the overlay was 114 `implemented-and-verified`, 284 `audit-required`,
-three `missing-platform-feasible`, and 17 `proven-platform-impossible` records.
+change. The checked [`storage-contract.md`](storage-contract.md) first
+terminalized 38 of the exact 40 records at #1471. #1634 then certifies rooted
+pmem-only and rootless mixed block/pmem native-v2 2.6 profile-3 create/load
+over MMIO and PCI through signed direct and normal-production/App-Sandbox
+matrices. It promotes the final `corpus:pmem` and
+`semantic.storage:pmem-root-mapping-flush-and-state` records, leaving all 40
+storage records terminal.
 
 #1473 completes the live and capture-ready balloon slice under #1440. It
 prepares fallible compact PFN accounting before used-ring publication, commits
@@ -627,9 +627,12 @@ public native-v2 `2.5.0` activation for a rooted or rootless ordered vector of
 1–64 regular-file block devices. #1617 certifies active all-drive
 pre/post-capture persistence, exact failure boundaries, and the signed direct
 and normal-production matrix. Exact `2.4.0` and device-free `2.3.0` remain
-loadable. This widens no broad inventory disposition: optional devices/MMDS,
-Diff, tools, Firecracker interoperability, and broad portability remain
-audited, so the current overlay is 233/165/3/17.
+loadable. #1634 advances the current writer to `2.6.0` profile 3 with ordered
+regular-file block and pmem devices, exact complete-set authority, and signed
+rooted/rootless × MMIO/PCI persistence certification. Exact block-only
+`2.5.0` remains loadable. Other optional devices/MMDS, Diff, tools,
+Firecracker interoperability, and broad portability remain audited, so the
+current overlay is 235/163/3/17.
 
 ## Commands
 
