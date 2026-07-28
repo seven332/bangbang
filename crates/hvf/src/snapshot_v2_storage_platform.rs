@@ -40,7 +40,10 @@ use crate::snapshot_v2_platform::{
     PROCESS_RTC_MMIO_BASE, PROCESS_RTC_MMIO_REGION_ID, PROCESS_SERIAL_MMIO_BASE,
     PROCESS_SERIAL_MMIO_REGION_ID,
 };
-use crate::startup::{PCI_ENDPOINT_SLOT_COUNT, pci_root_restore_gic_msi_configuration};
+use crate::startup::{
+    PCI_ENDPOINT_SLOT_COUNT, pci_entropy_restore_gic_msi_configuration,
+    pci_root_restore_gic_msi_configuration,
+};
 
 const REDACTED: &str = "<redacted>";
 
@@ -940,6 +943,19 @@ pub fn prepare_hvf_snapshot_v2_storage_pci_platform_plan(
     prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
         platform,
         bundle,
+        false,
+        &mut SystemStoragePciPlatformPlanReserve,
+    )
+}
+
+pub(crate) fn prepare_hvf_snapshot_v2_storage_pci_platform_plan_for_entropy(
+    platform: &HvfSnapshotV2PlatformState,
+    bundle: &PreparedSnapshotV2StorageBundle,
+) -> Result<HvfSnapshotV2StoragePciPlatformPlan, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
+    prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
+        platform,
+        bundle,
+        true,
         &mut SystemStoragePciPlatformPlanReserve,
     )
 }
@@ -947,6 +963,7 @@ pub fn prepare_hvf_snapshot_v2_storage_pci_platform_plan(
 fn prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
     platform: &HvfSnapshotV2PlatformState,
     bundle: &PreparedSnapshotV2StorageBundle,
+    allow_entropy_msi_profile: bool,
     reserve: &mut impl StoragePciPlatformPlanReserve,
 ) -> Result<HvfSnapshotV2StoragePciPlatformPlan, PrepareHvfSnapshotV2StoragePciPlatformPlanError> {
     if !platform.machine().fdt().is_product_process_profile()
@@ -997,7 +1014,10 @@ fn prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
         .ok_or(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
     let expected_msi = pci_root_restore_gic_msi_configuration()
         .map_err(|_| PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan)?;
-    if msi.interrupt_range.count != expected_msi.interrupt_count().get() {
+    let entropy_msi_matches = allow_entropy_msi_profile
+        && pci_entropy_restore_gic_msi_configuration()
+            .is_ok_and(|expected| msi.interrupt_range.count == expected.interrupt_count().get());
+    if msi.interrupt_range.count != expected_msi.interrupt_count().get() && !entropy_msi_matches {
         return Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::ResourcePlan);
     }
     let address_plan = Arm64PciAddressPlan::firecracker_v1_16()
@@ -1279,7 +1299,7 @@ fn plan_pci_record(
     })
 }
 
-fn register_active_pci_routes(
+pub(crate) fn register_active_pci_routes(
     state: &bangbang_runtime::snapshot_device_v2::SnapshotV2PciDeviceState,
     active_routes: &mut Vec<(u64, u32)>,
 ) -> bool {
@@ -1493,7 +1513,7 @@ fn mmio_region_conflicts_with_platform(
     Ok(false)
 }
 
-fn queue_ranges_conflict_with_pci_platform(
+pub(crate) fn queue_ranges_conflict_with_pci_platform(
     platform: &HvfSnapshotV2PlatformState,
     queue_ranges: Option<[GuestMemoryRange; 3]>,
     gic: &HvfGicMetadata,
@@ -1749,9 +1769,9 @@ pub(crate) mod tests {
         PmemRootless,
     }
 
-    struct StorageFixture {
-        platform: HvfSnapshotV2PlatformState,
-        bundle: PreparedSnapshotV2StorageBundle,
+    pub(crate) struct StorageFixture {
+        pub(crate) platform: HvfSnapshotV2PlatformState,
+        pub(crate) bundle: PreparedSnapshotV2StorageBundle,
         _files: Vec<TempBacking>,
     }
 
@@ -1994,6 +2014,10 @@ pub(crate) mod tests {
             bundle,
             _files: files,
         }
+    }
+
+    pub(crate) fn rootless_block_pci_fixture() -> StorageFixture {
+        pci_fixture(BLOCK_ROOTLESS_PCI_HEX)
     }
 
     pub(crate) fn pci_fdt_plan_fixture() -> (
@@ -2359,6 +2383,7 @@ pub(crate) mod tests {
                 prepare_hvf_snapshot_v2_storage_pci_platform_plan_with(
                     &fixture.platform,
                     &fixture.bundle,
+                    false,
                     &mut FailingReserve { calls: 0, fail_at },
                 ),
                 Err(PrepareHvfSnapshotV2StoragePciPlatformPlanError::Allocation)

@@ -1,9 +1,15 @@
 use super::codec::{self, ReservePolicy};
 use super::*;
 
+use std::sync::Arc;
+
 use crate::entropy::{EntropyMmioDeviceRegistration, VirtioRngRetryCaptureState};
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
+use crate::message_interrupt::{
+    GuestMessage, GuestMessageInterrupt, GuestMessageInterruptRegistry,
+    GuestMessageInterruptSignalError,
+};
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO, PCI_SEGMENT_ZERO,
@@ -39,6 +45,39 @@ const ACTIVE_DATA: GuestAddress = GuestAddress::new(0x18_0000);
 const AVAILABLE_INDEX_OFFSET: u64 = 2;
 const AVAILABLE_RING_OFFSET: u64 = 4;
 const USED_INDEX_OFFSET: u64 = 2;
+
+#[derive(Debug)]
+struct TestMessageRoute(GuestMessage);
+
+impl GuestMessageInterrupt for TestMessageRoute {
+    fn matches(&self, message: GuestMessage) -> bool {
+        self.0 == message
+    }
+
+    fn signal(&self, message: GuestMessage) -> Result<(), GuestMessageInterruptSignalError> {
+        if self.matches(message) {
+            Ok(())
+        } else {
+            Err(GuestMessageInterruptSignalError::new(
+                "test route rejected an unknown message",
+                false,
+            ))
+        }
+    }
+}
+
+fn entropy_message_registry(route_count: usize) -> GuestMessageInterruptRegistry {
+    let messages = [
+        GuestMessage::new(0x0800_0040, 64),
+        GuestMessage::new(0x0800_0040, 96),
+    ];
+    let routes: Vec<Arc<dyn GuestMessageInterrupt>> = messages
+        .into_iter()
+        .take(route_count)
+        .map(|message| Arc::new(TestMessageRoute(message)) as Arc<dyn GuestMessageInterrupt>)
+        .collect();
+    GuestMessageInterruptRegistry::new(routes).expect("entropy message registry should validate")
+}
 
 fn inactive_mmio_state() -> SnapshotV2EntropyState {
     let bandwidth = EntropyTokenBucketConfig::new(0, Some(7), 100);
@@ -523,6 +562,77 @@ fn pci_restore_plan_rejects_mmio_handler_materialization() {
     assert_eq!(
         error.to_string(),
         "native-v2 entropy restore plan is not MMIO"
+    );
+}
+
+#[test]
+fn active_pci_restore_plan_materializes_exact_retained_endpoint() {
+    let state = active_pci_state();
+    let mut memory = restore_memory();
+    write_pending_queue(&mut memory, ACTIVE_DESCRIPTOR_TABLE, 7, 6);
+    let now = Instant::now();
+    let prepared = SnapshotV2EntropyRestorePlan::prepare(state.clone(), &memory, now)
+        .expect("active PCI restore plan should prepare")
+        .into_pci_endpoint(MmioRegionId::new(700), entropy_message_registry(2))
+        .expect("active PCI endpoint should materialize");
+
+    assert_eq!(prepared.config(), state.config());
+    assert!(prepared.queue_ranges().is_some());
+    assert_eq!(
+        prepared.retry(),
+        SnapshotV2EntropyRetryState::try_after(75_000_000).expect("delayed retry should validate")
+    );
+    assert_eq!(
+        prepared.retry_deadline(),
+        now.checked_add(Duration::from_millis(75))
+    );
+    assert_eq!(prepared.origin(), StorageDeviceOrigin::Startup);
+    assert_eq!(prepared.endpoint().sbdf(), pci_transport().sbdf());
+    assert_eq!(prepared.endpoint().bar_range(), pci_transport().bar_range());
+    assert_eq!(prepared.endpoint().region_id(), MmioRegionId::new(700));
+
+    let debug = format!("{prepared:?}");
+    assert!(debug.contains("<redacted>"));
+    for sentinel in ["1048576", "134217792", "25000000", "75000000"] {
+        assert!(!debug.contains(sentinel));
+    }
+}
+
+#[test]
+fn pci_endpoint_materialization_rejects_wrong_transport_and_route_geometry() {
+    let memory = restore_memory();
+    let wrong_transport =
+        SnapshotV2EntropyRestorePlan::prepare(inactive_mmio_state(), &memory, Instant::now())
+            .expect("inactive MMIO restore plan should prepare")
+            .into_pci_endpoint(MmioRegionId::new(700), entropy_message_registry(2))
+            .expect_err("MMIO plan must not materialize a PCI endpoint");
+    assert!(matches!(
+        wrong_transport,
+        SnapshotV2EntropyPciEndpointError::WrongTransport
+    ));
+    assert_eq!(
+        wrong_transport.to_string(),
+        "native-v2 entropy restore plan is not PCI"
+    );
+
+    let mut memory = restore_memory();
+    write_pending_queue(&mut memory, ACTIVE_DESCRIPTOR_TABLE, 7, 6);
+    let route_error =
+        SnapshotV2EntropyRestorePlan::prepare(active_pci_state(), &memory, Instant::now())
+            .expect("active PCI restore plan should prepare")
+            .into_pci_endpoint(MmioRegionId::new(700), entropy_message_registry(1))
+            .expect_err("one route cannot satisfy entropy MSI-X geometry");
+    assert!(matches!(
+        route_error,
+        SnapshotV2EntropyPciEndpointError::Endpoint(VirtioPciEndpointError::MessageRouteCount {
+            expected: 2,
+            actual: 1
+        })
+    ));
+    assert!(format!("{route_error:?}").contains("<redacted>"));
+    assert_eq!(
+        route_error.to_string(),
+        "native-v2 entropy PCI endpoint reconstruction failed"
     );
 }
 

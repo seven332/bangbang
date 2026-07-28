@@ -17,7 +17,8 @@ use crate::entropy::{
 };
 use crate::interrupt::GuestInterruptLine;
 use crate::memory::{GuestMemory, GuestMemoryRange};
-use crate::mmio::MmioRegion;
+use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::PciSbdf;
 use crate::snapshot_device_v2::{
     SnapshotV2DeviceGraphCaptureError, SnapshotV2DeviceTransport, SnapshotV2DeviceTransportKind,
@@ -30,11 +31,13 @@ use crate::snapshot_device_v2_5::{
 };
 use crate::snapshot_format::SnapshotFormatVersion;
 use crate::storage_capture::StorageDeviceOrigin;
-use crate::virtio::VirtioDeviceType;
+use crate::virtio::{UnsupportedVirtioDeviceConfig, VirtioDeviceType};
 use crate::virtio_mmio::{
     VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioQueueState, VirtioMmioTransportState,
 };
-use crate::virtio_pci::{VirtioPciIdentity, VirtioPciTransportState};
+use crate::virtio_pci::{
+    PreparedVirtioPciEndpoint, VirtioPciEndpointError, VirtioPciIdentity, VirtioPciTransportState,
+};
 
 mod codec;
 
@@ -667,6 +670,56 @@ impl SnapshotV2EntropyRestorePlan {
             handler,
         })
     }
+
+    /// Consumes a checked PCI plan into one complete retained endpoint.
+    ///
+    /// The caller supplies one fresh destination message registry and the
+    /// dispatcher region reserved by the destination platform plan. The
+    /// returned value still owns no route resources, dispatcher registration,
+    /// BAR/function lease, entropy source, metrics, scheduler, or VM
+    /// authority.
+    #[doc(hidden)]
+    pub fn into_pci_endpoint(
+        self,
+        region_id: MmioRegionId,
+        messages: GuestMessageInterruptRegistry,
+    ) -> Result<PreparedSnapshotV2EntropyPciEndpoint, SnapshotV2EntropyPciEndpointError> {
+        let Self {
+            config,
+            queue_ranges,
+            retry,
+            retry_deadline,
+            transport,
+        } = self;
+        let PreparedSnapshotV2EntropyTransport::Pci(pci) = transport else {
+            return Err(SnapshotV2EntropyPciEndpointError::WrongTransport);
+        };
+        let (origin, sbdf, bar_range, identity, device, retained) = pci.into_parts();
+        let activation_is_active = device.is_activated();
+        let endpoint = PreparedVirtioPciEndpoint::new(
+            identity,
+            &VIRTIO_RNG_QUEUE_SIZES,
+            UnsupportedVirtioDeviceConfig,
+            device,
+            activation_is_active,
+            false,
+            &retained,
+            sbdf,
+            bar_range,
+            region_id,
+            messages,
+        )
+        .map_err(SnapshotV2EntropyPciEndpointError::Endpoint)?;
+
+        Ok(PreparedSnapshotV2EntropyPciEndpoint {
+            config,
+            queue_ranges,
+            retry,
+            retry_deadline,
+            origin,
+            endpoint,
+        })
+    }
 }
 
 impl fmt::Debug for SnapshotV2EntropyRestorePlan {
@@ -941,6 +994,126 @@ impl fmt::Debug for PreparedSnapshotV2EntropyPciTransport {
             .debug_struct("PreparedSnapshotV2EntropyPciTransport")
             .field("state", &REDACTED)
             .finish()
+    }
+}
+
+/// One checked exact-2.8 entropy endpoint awaiting destination PCI
+/// publication.
+#[doc(hidden)]
+pub struct PreparedSnapshotV2EntropyPciEndpoint {
+    config: EntropyConfig,
+    queue_ranges: Option<[GuestMemoryRange; 3]>,
+    retry: SnapshotV2EntropyRetryState,
+    retry_deadline: Option<Instant>,
+    origin: StorageDeviceOrigin,
+    endpoint: PreparedVirtioPciEndpoint<UnsupportedVirtioDeviceConfig, VirtioRngDevice>,
+}
+
+/// Consumed checked entropy continuation and retained PCI endpoint.
+#[doc(hidden)]
+pub type PreparedSnapshotV2EntropyPciEndpointParts = (
+    EntropyConfig,
+    Option<[GuestMemoryRange; 3]>,
+    SnapshotV2EntropyRetryState,
+    Option<Instant>,
+    StorageDeviceOrigin,
+    PreparedVirtioPciEndpoint<UnsupportedVirtioDeviceConfig, VirtioRngDevice>,
+);
+
+impl PreparedSnapshotV2EntropyPciEndpoint {
+    /// Returns the exact public entropy configuration.
+    pub const fn config(&self) -> EntropyConfig {
+        self.config
+    }
+
+    /// Returns loaded-memory ranges occupied by an active queue.
+    pub const fn queue_ranges(&self) -> Option<[GuestMemoryRange; 3]> {
+        self.queue_ranges
+    }
+
+    /// Returns the retained retry disposition.
+    pub const fn retry(&self) -> SnapshotV2EntropyRetryState {
+        self.retry
+    }
+
+    /// Returns the destination-local deadline without scheduling it.
+    pub const fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_deadline
+    }
+
+    /// Returns the retained startup/runtime origin.
+    pub const fn origin(&self) -> StorageDeviceOrigin {
+        self.origin
+    }
+
+    /// Returns the complete retained endpoint before publication.
+    pub const fn endpoint(
+        &self,
+    ) -> &PreparedVirtioPciEndpoint<UnsupportedVirtioDeviceConfig, VirtioRngDevice> {
+        &self.endpoint
+    }
+
+    /// Consumes the checked continuation and retained endpoint.
+    pub fn into_parts(self) -> PreparedSnapshotV2EntropyPciEndpointParts {
+        (
+            self.config,
+            self.queue_ranges,
+            self.retry,
+            self.retry_deadline,
+            self.origin,
+            self.endpoint,
+        )
+    }
+}
+
+impl fmt::Debug for PreparedSnapshotV2EntropyPciEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotV2EntropyPciEndpoint")
+            .field("state", &REDACTED)
+            .finish()
+    }
+}
+
+/// Failure while binding a checked entropy plan to a destination PCI
+/// registry.
+#[doc(hidden)]
+pub enum SnapshotV2EntropyPciEndpointError {
+    /// The checked plan selects MMIO rather than PCI.
+    WrongTransport,
+    /// The retained endpoint could not be reconstructed exactly.
+    Endpoint(VirtioPciEndpointError),
+}
+
+impl fmt::Debug for SnapshotV2EntropyPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::WrongTransport => "wrong-transport",
+            Self::Endpoint(_) => "endpoint",
+        };
+        formatter
+            .debug_struct("SnapshotV2EntropyPciEndpointError")
+            .field("kind", &kind)
+            .field("source", &REDACTED)
+            .finish()
+    }
+}
+
+impl fmt::Display for SnapshotV2EntropyPciEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongTransport => "native-v2 entropy restore plan is not PCI",
+            Self::Endpoint(_) => "native-v2 entropy PCI endpoint reconstruction failed",
+        })
+    }
+}
+
+impl std::error::Error for SnapshotV2EntropyPciEndpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WrongTransport => None,
+            Self::Endpoint(source) => Some(source),
+        }
     }
 }
 
